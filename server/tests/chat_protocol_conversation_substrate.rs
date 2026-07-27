@@ -5506,6 +5506,7 @@ mod historical_control_loader {
     // below; malformed terminal families remain fail-closed.
     // -----------------------------------------------------------------------
     pub(crate) mod recovery_leg {
+        use std::collections::BTreeSet;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         use async_trait::async_trait;
@@ -10096,6 +10097,120 @@ mod historical_control_loader {
             assert_eq!((event_count, recipient_count, outbox_count), (0, 0, 0));
         }
 
+        async fn g6_lifecycle_durable_snapshot(
+            tx: &mut Transaction<'_, Postgres>,
+            conversation_id: Uuid,
+            key_package_ref: &[u8; 32],
+            protocol_instance_id: Uuid,
+            conversation_marker: &[u8],
+        ) -> Vec<(String, String)> {
+            let mut snapshot = Vec::new();
+            for table in [
+                "application_intervals",
+                "application_schedule_terminal_proofs",
+                "entry_recipients",
+                "welcome_bundles",
+                "recovery_work_items",
+                "message_sends",
+                "entries",
+                "key_package_reservations",
+                "reset_requests",
+                "leaf_recovery_requests",
+                "leave_requests",
+                "member_devices",
+                "participants",
+                "metadata_snapshots",
+                "transitions",
+                "generation_states",
+                "generations",
+                "conversations",
+            ] {
+                let sql = format!(
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT * FROM chat.{table} WHERE conversation_id=$1) row"
+                );
+                let rows: String = sqlx::query_scalar(&sql)
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap_or_else(|error| panic!("snapshot chat.{table}: {error}"));
+                snapshot.push((table.to_owned(), rows));
+            }
+            for (name, sql) in [
+                (
+                    "welcome_deliveries",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT delivery.* FROM chat.welcome_deliveries delivery \
+                       JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                       WHERE bundle.conversation_id=$1) row",
+                ),
+                (
+                    "welcome_dispositions",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT disposition.* FROM chat.welcome_dispositions disposition \
+                       JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                       WHERE bundle.conversation_id=$1) row",
+                ),
+            ] {
+                let rows: String = sqlx::query_scalar(sql)
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap_or_else(|error| panic!("snapshot chat.{name}: {error}"));
+                snapshot.push((name.to_owned(), rows));
+            }
+            for (name, sql) in [
+                (
+                    "events",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT event.* FROM chat.events event \
+                       WHERE event.protocol_instance_id=$1 \
+                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                ),
+                (
+                    "event_recipients",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT recipient.* FROM chat.event_recipients recipient \
+                       JOIN chat.events event USING(event_position) \
+                       WHERE event.protocol_instance_id=$1 \
+                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                ),
+                (
+                    "outbox",
+                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                       ORDER BY to_jsonb(row)::text)::text,'[]') \
+                     FROM (SELECT outbox.* FROM chat.outbox outbox \
+                       JOIN chat.events event USING(event_position) \
+                       WHERE event.protocol_instance_id=$1 \
+                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                ),
+            ] {
+                let rows: String = sqlx::query_scalar(sql)
+                    .bind(protocol_instance_id)
+                    .bind(conversation_marker)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap_or_else(|error| panic!("snapshot chat.{name}: {error}"));
+                snapshot.push((name.to_owned(), rows));
+            }
+            let package: String = sqlx::query_scalar(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                   ORDER BY to_jsonb(row)::text)::text,'[]') \
+                 FROM (SELECT * FROM chat.key_packages WHERE key_package_ref=$1) row",
+            )
+            .bind(key_package_ref.to_vec())
+            .fetch_one(&mut **tx)
+            .await
+            .expect("snapshot exact lifecycle KeyPackage");
+            snapshot.push(("key_packages".to_owned(), package));
+            snapshot
+        }
+
         async fn seed_g6_pending_invitation(
             tx: &mut Transaction<'_, Postgres>,
             inviter: &str,
@@ -11680,6 +11795,13 @@ mod historical_control_loader {
             .execute(&pool)
             .await
             .expect("ensure protocol instance");
+            let protocol_instance_id: Uuid = sqlx::query_scalar(
+                "SELECT protocol_instance_id FROM chat.protocol_instances WHERE singleton",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read lifecycle protocol instance");
+            let conversation_marker = conversation_id.hyphenated().to_string().into_bytes();
 
             let relationship_authority = RelationshipAuthority::new(
                 fixed_production_relationship_policy_config()
@@ -12039,6 +12161,24 @@ mod historical_control_loader {
             apply_conversation_persistence_plan(&mut tx, &policy_plan, &policy_context)
                 .await
                 .expect("apply lifecycle Policy");
+            let retained_invitee_period_id: Uuid = sqlx::query_scalar(
+                r#"SELECT participant_period_id
+                     FROM chat.participants
+                    WHERE conversation_id=$1 AND user_did=$2
+                      AND status='pending' AND role='member' AND current_membership
+                      AND invitation_transition_id=$3 AND invitation_entry_id=$4
+                      AND invited_at=$5
+                      AND acceptance_transition_id IS NULL
+                      AND acceptance_entry_id IS NULL AND accepted_at IS NULL"#,
+            )
+            .bind(conversation_id)
+            .bind(&invitee.did)
+            .bind(creation_transition_id)
+            .bind(entry.entry_id)
+            .bind(trusted_at)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("capture exact pending invitee participant period before Acceptance");
 
             sqlx::query(
                 r#"INSERT INTO chat.key_packages(
@@ -12268,6 +12408,186 @@ mod historical_control_loader {
                     1,
                 )
             );
+            let acceptance_graph_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       participant.participant_period_id=$5
+                       AND participant.status='active' AND participant.role='member'
+                       AND participant.current_membership
+                       AND participant.invitation_transition_id=$6
+                       AND participant.invitation_entry_id=$7
+                       AND participant.invited_at=$8
+                       AND participant.acceptance_transition_id=$9
+                       AND participant.acceptance_entry_id=$10
+                       AND participant.accepted_at=$8
+                       AND request.requester_did=$2 AND request.requester_device_id=$3
+                       AND request.requester_key_id=$4 AND request.requester_auth_generation=1
+                       AND request.recovery_kind='add'
+                       AND request.source='acceptConversation'
+                       AND request.bound_state_version=2
+                       AND request.bound_group_id=$11 AND request.bound_epoch=$12
+                       AND request.bound_group_context_hash=$13
+                       AND request.bound_confirmation_tag=$14
+                       AND request.reservation_request_id=request.recovery_request_id
+                       AND request.replaced_leaf_period_id IS NULL
+                       AND request.status='open'
+                       AND request.signed_request_bytes=$15
+                       AND request.signing_transcript_bytes=$16
+                       AND request.request_digest=$17 AND request.signature=$18
+                       AND request.requested_at=$8 AND request.expires_at=$19
+                       AND request.fulfilling_transition_id IS NULL
+                       AND request.terminal_transition_id IS NULL
+                       AND request.terminal_revocation_id IS NULL
+                       AND request.terminal_at IS NULL
+                       AND reservation.key_package_ref=$20
+                       AND reservation.requester_did=$2
+                       AND reservation.requester_device_id=$3
+                       AND reservation.requester_key_id=$4
+                       AND reservation.requester_auth_generation=1
+                       AND reservation.recipient_did=$2
+                       AND reservation.recipient_device_id=$3
+                       AND reservation.bound_state_version=2
+                       AND reservation.bound_group_id=$11
+                       AND reservation.bound_epoch=$12
+                       AND reservation.bound_group_context_hash=$13
+                       AND reservation.bound_confirmation_tag=$14
+                       AND reservation.purpose='leafRecovery'
+                       AND reservation.expires_at=$19
+                       AND reservation.status='active'
+                       AND reservation.consumed_transition_id IS NULL
+                       AND reservation.terminal_transition_id IS NULL
+                       AND reservation.terminal_revocation_id IS NULL
+                       AND reservation.terminal_request_digest IS NULL
+                       AND reservation.terminal_at IS NULL
+                       AND reservation.created_at=$8
+                       AND package.wrapper_bytes=$21
+                       AND package.wrapper_sha256=$22
+                       AND package.owner_did=$2 AND package.owner_device_id=$3
+                       AND package.owner_key_id=$4 AND package.owner_auth_generation=1
+                       AND package.not_before=$23 AND package.not_after=$24
+                       AND package.status='reserved'
+                       AND package.terminal_transition_id IS NULL
+                       AND package.terminal_revocation_id IS NULL
+                       AND package.terminal_at IS NULL AND package.created_at=$8
+                       AND entry.entry_kind='blue.catbird.chat.defs#participantAcceptanceEntry'
+                       AND entry.accepted_payload_bytes=$25
+                       AND entry.accepted_payload_sha256=$26
+                       AND entry.signed_request_bytes=$15
+                       AND entry.request_digest=$17 AND entry.signature=$18
+                       AND entry.server_fields_bytes=$27
+                       AND entry.outer_entry_fingerprint=$28
+                       AND entry.actor_did=$2 AND entry.actor_device_id=$3
+                       AND entry.actor_key_id=$4 AND entry.actor_auth_generation=1
+                       AND entry.generation=0 AND entry.state_version=2
+                       AND entry.transition_id=$9 AND entry.received_at=$8
+                       AND transition.kind='acceptConversation'
+                       AND transition.actor_did=$2 AND transition.actor_device_id=$3
+                       AND transition.actor_key_id=$4
+                       AND transition.actor_auth_generation=1
+                       AND transition.actor_role='member'
+                       AND transition.actor_device_status='active'
+                       AND transition.signed_request_bytes=$15
+                       AND transition.unsigned_projection_bytes=$29
+                       AND transition.signing_transcript_bytes=$16
+                       AND transition.request_digest=$17 AND transition.signature=$18
+                       AND transition.prior_generation=0
+                       AND transition.prior_state_version=1
+                       AND transition.next_generation=0
+                       AND transition.next_state_version=2
+                       AND transition.retired_generation IS NULL
+                       AND transition.successor_generation IS NULL
+                       AND transition.metadata_snapshot_id IS NULL
+                       AND transition.entry_seq=3 AND transition.accepted_at=$8
+                   )
+                  FROM chat.participants participant
+                  JOIN chat.leaf_recovery_requests request
+                    ON request.conversation_id=participant.conversation_id
+                   AND request.recovery_request_id=$1
+                  JOIN chat.key_package_reservations reservation
+                    ON reservation.recovery_request_id=request.recovery_request_id
+                  JOIN chat.key_packages package
+                    ON package.key_package_ref=reservation.key_package_ref
+                  JOIN chat.entries entry
+                    ON entry.conversation_id=participant.conversation_id
+                   AND entry.seq=3 AND entry.entry_id=$10
+                  JOIN chat.transitions transition
+                    ON transition.transition_id=$9
+                 WHERE participant.conversation_id=$30 AND participant.user_did=$2"#,
+            )
+            .bind(Uuid::from_bytes(acceptance.request_id))
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(retained_invitee_period_id)
+            .bind(creation_transition_id)
+            .bind(entry.entry_id)
+            .bind(trusted_at)
+            .bind(acceptance.transition_id)
+            .bind(acceptance.entry_id)
+            .bind(acceptance_state.coordinate().group_id().to_vec())
+            .bind(i64::try_from(acceptance_state.coordinate().epoch()).unwrap())
+            .bind(acceptance_state.coordinate().group_context_hash().to_vec())
+            .bind(acceptance_state.coordinate().confirmation_tag().to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(expires_at)
+            .bind(key_package_ref.to_vec())
+            .bind(&key_package_wrapper)
+            .bind(Sha256::digest(&key_package_wrapper).to_vec())
+            .bind(package_not_before)
+            .bind(package_not_after)
+            .bind(&acceptance.public_row_json)
+            .bind(Sha256::digest(&acceptance.public_row_json).to_vec())
+            .bind(&acceptance.server_fields)
+            .bind(acceptance.outer_fingerprint.to_vec())
+            .bind(&acceptance.unsigned_projection)
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read complete exact Acceptance durable graph");
+            assert!(acceptance_graph_exact);
+            let acceptance_total_cardinality: bool = sqlx::query_scalar(
+                r#"SELECT
+                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.generations WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.generation_states WHERE conversation_id=$1)=3
+                    AND (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1)=3
+                    AND (SELECT count(*) FROM chat.entries WHERE conversation_id=$1)=3
+                    AND (SELECT count(*) FROM chat.metadata_snapshots WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.participants WHERE conversation_id=$1)=3
+                    AND (SELECT count(*) FROM chat.participants
+                          WHERE conversation_id=$1 AND current_membership)=2
+                    AND (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.leaf_recovery_requests
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.key_package_reservations
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.welcome_bundles
+                          WHERE conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.entry_recipients
+                          WHERE conversation_id=$1)=8
+                    AND (SELECT count(*) FROM chat.events event
+                          WHERE event.protocol_instance_id=$2
+                            AND position($3::bytea IN event.payload_bytes)>0)=3
+                    AND (SELECT count(*) FROM chat.event_recipients recipient
+                          JOIN chat.events event USING(event_position)
+                          WHERE event.protocol_instance_id=$2
+                            AND position($3::bytea IN event.payload_bytes)>0)=8
+                    AND (SELECT count(*) FROM chat.outbox outbox
+                          JOIN chat.events event USING(event_position)
+                          WHERE event.protocol_instance_id=$2
+                            AND position($3::bytea IN event.payload_bytes)>0)=3"#,
+            )
+            .bind(conversation_id)
+            .bind(protocol_instance_id)
+            .bind(&conversation_marker)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read exact total Acceptance cardinalities");
+            assert!(acceptance_total_cardinality);
 
             sqlx::query("SET CONSTRAINTS ALL DEFERRED")
                 .execute(&mut *tx)
@@ -12323,30 +12643,112 @@ mod historical_control_loader {
                 .await
                 .expect("load lifecycle Fulfillment relationship")
                 .expect("Fulfillment fallback exists");
-            let fulfillment_row: Value = serde_json::from_slice(&fulfillment.public_row_json)
-                .expect("parse lifecycle Fulfillment row for tamper negatives");
-            let mut tampered_commit = fulfillment_row.clone();
-            tampered_commit["signedRequest"]["body"]["commit"]["bytes"] =
-                json!(STANDARD.encode([0x99_u8; 8]));
-            let mut tampered_aad = fulfillment_row.clone();
-            tampered_aad["signedRequest"]["body"]["aad"]["prior"]["epoch"] =
-                json!(acceptance_state.coordinate().epoch() + 1);
-            let mut tampered_welcome = fulfillment_row.clone();
-            tampered_welcome["signedRequest"]["body"]["manifest"]["welcomeBundle"]
-                ["opaqueWelcome"] = json!(STANDARD.encode([0x98_u8; 8]));
-            let mut tampered_provenance = fulfillment_row;
-            tampered_provenance["signedRequest"]["body"]["manifest"]["leafChanges"][0]
-                ["recoveryRequestId"] = json!(Uuid::new_v4());
-            for (label, candidate) in [
-                ("Commit", tampered_commit),
-                ("AAD", tampered_aad),
-                ("Welcome", tampered_welcome),
-                ("request/package provenance", tampered_provenance),
+            let invalid_commit_bytes = vec![0x99_u8; 8];
+            let invalid_commit = resign_genuine_fulfillment_entry(&entry, &fulfillment, |body| {
+                body["commit"]["bytes"] = json!(STANDARD.encode(&invalid_commit_bytes));
+                body["commit"]["sha256"] =
+                    json!(STANDARD.encode(Sha256::digest(&invalid_commit_bytes)));
+            });
+            let invalid_aad = resign_genuine_fulfillment_entry(&entry, &fulfillment, |body| {
+                body["aad"]["prior"]["epoch"] = json!(acceptance_state.coordinate().epoch() + 1);
+            });
+            let invalid_welcome_bytes = vec![0x98_u8; 8];
+            let invalid_welcome = resign_genuine_fulfillment_entry(&entry, &fulfillment, |body| {
+                body["manifest"]["welcomeBundle"]["opaqueWelcome"] =
+                    json!(STANDARD.encode(&invalid_welcome_bytes));
+                body["manifest"]["welcomeBundle"]["sha256"] =
+                    json!(STANDARD.encode(Sha256::digest(&invalid_welcome_bytes)));
+            });
+            let foreign_request_id = Uuid::new_v4();
+            let foreign_request = resign_genuine_fulfillment_entry(&entry, &fulfillment, |body| {
+                let request_id = json!(foreign_request_id);
+                body["recoveryRequestId"] = request_id.clone();
+                body["manifest"]["leafRecoveryRequestId"] = request_id.clone();
+                body["manifest"]["leafChanges"][0]["recoveryRequestId"] = request_id.clone();
+                body["manifest"]["welcomeBundle"]["deliveries"][0]["provenance"]
+                    ["recoveryRequestId"] = request_id;
+            });
+            let foreign_package_ref = [0xa7_u8; 32];
+            let foreign_package = resign_genuine_fulfillment_entry(&entry, &fulfillment, |body| {
+                let package_ref = json!(STANDARD.encode(foreign_package_ref));
+                body["manifest"]["leafChanges"][0]["keyPackageRef"] = package_ref.clone();
+                body["manifest"]["welcomeBundle"]["deliveries"][0]["provenance"]["keyPackageRef"] =
+                    package_ref;
+            });
+            for (label, (candidate_row, candidate_wrapper)) in [
+                ("invalid OpenMLS Commit", invalid_commit),
+                ("AAD/coordinate mismatch", invalid_aad),
+                ("invalid Welcome crypto", invalid_welcome),
+                ("foreign open request", foreign_request),
+                ("foreign package provenance", foreign_package),
             ] {
-                let candidate = serde_json::to_vec(&candidate).expect("serialize tampered row");
+                decode_and_verify_signed_mutation(&candidate_wrapper, &entry.public_key)
+                    .unwrap_or_else(|error| {
+                        panic!("{label} must retain the authorized Ed25519 signature: {error}")
+                    });
+                let before_semantic_rejection = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let candidate = decode_and_verify_control_entry(&candidate_row, &entry.public_key)
+                    .unwrap_or_else(|error| {
+                        panic!("{label} must reach the production control binder: {error}")
+                    });
+                let candidate = rebind_persisted_control_entry(
+                    candidate,
+                    &candidate_wrapper,
+                    &entry.public_key,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{label} must rebind its exact signed wrapper: {error}")
+                });
+                let candidate_package = hydrate_locked_reserved_recovery_package(
+                    &mut tx,
+                    locked_acceptance.head(),
+                    Uuid::from_bytes(acceptance.request_id),
+                )
+                .await
+                .expect("relock exact package for semantic negative");
+                let semantic_error = fulfillment_hydration
+                    .plan_recovery_fulfillment_entry(
+                        &locked_acceptance,
+                        candidate,
+                        &fulfillment_actor_registration,
+                        &target_registration,
+                        candidate_package,
+                        Vec::new(),
+                        &fulfillment_relationship,
+                        &fulfillment_relationship_authority,
+                        &fulfillment_decision,
+                        &acceptance_trusted,
+                    )
+                    .expect_err("semantic mutation must fail the production fulfillment planner");
                 assert!(
-                    decode_and_verify_control_entry(&candidate, &entry.public_key).is_err(),
-                    "tampered {label} must fail closed"
+                    matches!(
+                        semantic_error,
+                        crate::chat_protocol::state_machine::StateMachineError::InvalidPublicState
+                            | crate::chat_protocol::state_machine::StateMachineError::InvalidTransition
+                            | crate::chat_protocol::state_machine::StateMachineError::InvalidWelcomeMapping
+                            | crate::chat_protocol::state_machine::StateMachineError::LeafRecoveryNotFound
+                            | crate::chat_protocol::state_machine::StateMachineError::InvalidHydrationAuthority
+                    ),
+                    "unexpected {label} rejection: {semantic_error:?}"
+                );
+                let after_semantic_rejection = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                assert_eq!(
+                    after_semantic_rejection, before_semantic_rejection,
+                    "{label} changed durable rows before semantic rejection"
                 );
             }
             let wrong_target_verified =
@@ -12437,13 +12839,17 @@ mod historical_control_loader {
                 broken_fulfillment,
                 ExecutorError::InconsistentPlan(_)
             ));
-            sqlx::query("SAVEPOINT g6_extra_recovery_delta")
-                .execute(&mut *tx)
-                .await
-                .expect("isolate extra recovery-delta mutation");
             let extra_recovery_delta_plan = fulfillment_plan
                 .clone()
                 .with_extra_untracked_recovery_request_for_test();
+            let before_extra_recovery_delta = g6_lifecycle_durable_snapshot(
+                &mut tx,
+                conversation_id,
+                &key_package_ref,
+                protocol_instance_id,
+                &conversation_marker,
+            )
+            .await;
             let extra_recovery_delta = apply_conversation_persistence_plan(
                 &mut tx,
                 &extra_recovery_delta_plan,
@@ -12455,14 +12861,31 @@ mod historical_control_loader {
                 extra_recovery_delta,
                 ExecutorError::InconsistentPlan(_)
             ));
-            sqlx::query("ROLLBACK TO SAVEPOINT g6_extra_recovery_delta")
-                .execute(&mut *tx)
-                .await
-                .expect("restore transaction after extra recovery-delta mutation");
-            sqlx::query("RELEASE SAVEPOINT g6_extra_recovery_delta")
-                .execute(&mut *tx)
-                .await
-                .expect("release extra recovery-delta savepoint");
+            let head_after_extra_delta: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq \
+                   FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read head after rejected extra recovery delta");
+            assert_eq!(
+                head_after_extra_delta,
+                (2, 4),
+                "malformed fulfillment must fail before the first head write"
+            );
+            let after_extra_recovery_delta = g6_lifecycle_durable_snapshot(
+                &mut tx,
+                conversation_id,
+                &key_package_ref,
+                protocol_instance_id,
+                &conversation_marker,
+            )
+            .await;
+            assert_eq!(
+                after_extra_recovery_delta, before_extra_recovery_delta,
+                "malformed fulfillment changed durable rows before rejection"
+            );
             apply_conversation_persistence_plan(&mut tx, &fulfillment_plan, &fulfillment_context)
                 .await
                 .expect("apply lifecycle Fulfillment");
@@ -12637,30 +13060,201 @@ mod historical_control_loader {
             .await
             .expect("read exact participant-leaf-interval chain");
             assert!(exact_period_chain);
-            let exact_events: Vec<String> = sqlx::query_scalar(
-                "SELECT event_kind FROM chat.events WHERE event_id=ANY($1) ORDER BY event_position",
+            let fulfillment_total_cardinality: bool = sqlx::query_scalar(
+                r#"SELECT
+                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.generations WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.generation_states WHERE conversation_id=$1)=4
+                    AND (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1)=4
+                    AND (SELECT count(*) FROM chat.entries WHERE conversation_id=$1)=4
+                    AND (SELECT count(*) FROM chat.metadata_snapshots WHERE conversation_id=$1)=2
+                    AND (SELECT count(*) FROM chat.participants WHERE conversation_id=$1)=3
+                    AND (SELECT count(*) FROM chat.participants
+                          WHERE conversation_id=$1 AND current_membership)=2
+                    AND (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)=2
+                    AND (SELECT count(*) FROM chat.member_devices
+                          WHERE conversation_id=$1 AND active)=2
+                    AND (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1)=2
+                    AND (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1 AND terminal_seq IS NULL)=2
+                    AND (SELECT count(*) FROM chat.leaf_recovery_requests
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.key_package_reservations
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.key_packages
+                          WHERE owner_did=$2 AND owner_device_id=$3)=1
+                    AND (SELECT count(*) FROM chat.welcome_bundles
+                          WHERE conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.welcome_deliveries delivery
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                          WHERE bundle.conversation_id=$1)=1
+                    AND (SELECT count(*) FROM chat.entry_recipients
+                          WHERE conversation_id=$1)=10
+                    AND (SELECT count(*) FROM chat.events event
+                          WHERE event.protocol_instance_id=$4
+                            AND position($5::bytea IN event.payload_bytes)>0)=4
+                    AND (SELECT count(*) FROM chat.event_recipients recipient
+                          JOIN chat.events event USING(event_position)
+                          WHERE event.protocol_instance_id=$4
+                            AND position($5::bytea IN event.payload_bytes)>0)=10
+                    AND (SELECT count(*) FROM chat.outbox outbox
+                          JOIN chat.events event USING(event_position)
+                          WHERE event.protocol_instance_id=$4
+                            AND position($5::bytea IN event.payload_bytes)>0)=4
+                    AND (SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.leave_requests WHERE conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.application_schedule_terminal_proofs
+                          WHERE conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.welcome_dispositions disposition
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                          WHERE bundle.conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.recovery_work_items
+                          WHERE conversation_id=$1)=0
+                    AND (SELECT count(*) FROM chat.message_sends WHERE conversation_id=$1)=0"#,
             )
-            .bind(vec![
-                creation_context.events[0].event_id,
-                policy_context.events[0].event_id,
-                acceptance_context.events[0].event_id,
-                fulfillment_context.events[0].event_id,
-            ])
+            .bind(conversation_id)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(protocol_instance_id)
+            .bind(&conversation_marker)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read exact total Fulfillment cardinalities");
+            assert!(fulfillment_total_cardinality);
+
+            let mut participant_set: Vec<(String, String, String, bool)> = sqlx::query_as(
+                "SELECT user_did,status,role,current_membership \
+                   FROM chat.participants WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
             .fetch_all(&mut *tx)
             .await
-            .expect("read exact lifecycle event set");
+            .expect("read exact lifecycle participant set");
+            participant_set.sort();
+            let mut expected_participant_set = vec![
+                (
+                    entry.actor_did.clone(),
+                    "active".to_owned(),
+                    "admin".to_owned(),
+                    true,
+                ),
+                (
+                    invitee.did.clone(),
+                    "active".to_owned(),
+                    "member".to_owned(),
+                    true,
+                ),
+                (
+                    decoy.did.clone(),
+                    "pending".to_owned(),
+                    "member".to_owned(),
+                    false,
+                ),
+            ];
+            expected_participant_set.sort();
+            assert_eq!(participant_set, expected_participant_set);
+            let mut leaf_set: Vec<(String, Uuid, bool)> = sqlx::query_as(
+                "SELECT user_did,device_id,active FROM chat.member_devices \
+                  WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("read exact lifecycle leaf-period set");
+            leaf_set.sort();
+            let mut expected_leaf_set = vec![
+                (entry.actor_did.clone(), entry.actor_device_id, true),
+                (invitee.did.clone(), invitee.device_id, true),
+            ];
+            expected_leaf_set.sort();
+            assert_eq!(leaf_set, expected_leaf_set);
+            let mut interval_set: Vec<(String, Uuid, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT recipient_did,recipient_device_id,start_seq,terminal_seq \
+                   FROM chat.application_intervals WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("read exact lifecycle interval set");
+            interval_set.sort();
+            let mut expected_interval_set = vec![
+                (entry.actor_did.clone(), entry.actor_device_id, 1, None),
+                (invitee.did.clone(), invitee.device_id, 4, None),
+            ];
+            expected_interval_set.sort();
+            assert_eq!(interval_set, expected_interval_set);
+            let entry_set: Vec<(i64, Uuid, String)> = sqlx::query_as(
+                "SELECT seq,entry_id,entry_kind FROM chat.entries \
+                  WHERE conversation_id=$1 ORDER BY seq",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("read exact lifecycle entry set");
             assert_eq!(
-                exact_events,
+                entry_set,
                 vec![
-                    "conversationChanged",
-                    "conversationChanged",
-                    "conversationChanged",
-                    "welcomeAvailable",
+                    (
+                        1,
+                        entry.entry_id,
+                        "blue.catbird.chat.defs#creationEntry".to_owned(),
+                    ),
+                    (
+                        2,
+                        policy.entry.entry_id,
+                        "blue.catbird.chat.defs#policyEntry".to_owned(),
+                    ),
+                    (
+                        3,
+                        acceptance.entry_id,
+                        "blue.catbird.chat.defs#participantAcceptanceEntry".to_owned(),
+                    ),
+                    (
+                        4,
+                        fulfillment.entry_id,
+                        "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry".to_owned(),
+                    ),
                 ]
             );
-            let conversation_marker = conversation_id.hyphenated().to_string().into_bytes();
-            let unfiltered_delivery_graph: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
-                r#"SELECT event.event_id,event.event_kind,
+            let transition_set: Vec<(Uuid, String, i64)> = sqlx::query_as(
+                "SELECT transition_id,kind,entry_seq FROM chat.transitions \
+                  WHERE conversation_id=$1 ORDER BY entry_seq",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("read exact lifecycle transition set");
+            assert_eq!(
+                transition_set,
+                vec![
+                    (creation_transition_id, "creation".to_owned(), 1),
+                    (policy.transition_id, "policy".to_owned(), 2),
+                    (acceptance.transition_id, "acceptConversation".to_owned(), 3,),
+                    (fulfillment.transition_id, "leafRecovery".to_owned(), 4),
+                ]
+            );
+            let metadata_set: Vec<(i64, Uuid, Uuid, i64)> = sqlx::query_as(
+                "SELECT state_version,producing_transition_id,origin_transition_id,metadata_version \
+                   FROM chat.metadata_snapshots WHERE conversation_id=$1 ORDER BY state_version",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("read exact lifecycle metadata set");
+            assert_eq!(
+                metadata_set,
+                vec![
+                    (0, creation_transition_id, creation_transition_id, 1),
+                    (3, fulfillment.transition_id, creation_transition_id, 1,),
+                ]
+            );
+            let creation_payload = format!("g6-lifecycle-creation-{conversation_id}");
+            let policy_payload = format!("g6-lifecycle-policy-{conversation_id}");
+            let acceptance_payload = format!("g6-lifecycle-acceptance-{conversation_id}");
+            let fulfillment_payload = format!("g6-lifecycle-fulfillment-{conversation_id}");
+            let unfiltered_delivery_graph: Vec<(String, Uuid, String, i64, i64)> = sqlx::query_as(
+                r#"SELECT convert_from(event.payload_bytes,'UTF8'),event.event_id,event.event_kind,
                           count(DISTINCT (recipient.user_did,recipient.device_id)),
                           count(DISTINCT outbox.outbox_id)
                      FROM chat.events event
@@ -12671,137 +13265,197 @@ mod historical_control_loader {
                     GROUP BY event.event_position,event.event_id,event.event_kind
                     ORDER BY event.event_position"#,
             )
-            .bind(creation_context.protocol_instance_id)
+            .bind(protocol_instance_id)
             .bind(&conversation_marker)
             .fetch_all(&mut *tx)
             .await
             .expect("read unfiltered protocol/conversation lifecycle topology");
-            let expected_delivery_graph = [
-                &creation_context,
-                &policy_context,
-                &acceptance_context,
-                &fulfillment_context,
-            ]
-            .into_iter()
-            .map(|context| {
-                let event = &context.events[0];
-                (
-                    event.event_id,
-                    match event.event_kind {
-                        EventKind::ConversationChanged => "conversationChanged",
-                        EventKind::WelcomeAvailable => "welcomeAvailable",
-                        _ => panic!("unexpected lifecycle event kind"),
-                    }
-                    .to_owned(),
-                    i64::try_from(event.recipients.len()).unwrap(),
-                    i64::try_from(event.outbox.len()).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
+            let event_ids = unfiltered_delivery_graph
+                .iter()
+                .map(|(_, event_id, _, _, _)| *event_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(event_ids.len(), 4);
+            assert!(event_ids
+                .iter()
+                .all(|event_id| event_id.get_version_num() == 4));
             assert_eq!(
-                unfiltered_delivery_graph, expected_delivery_graph,
+                unfiltered_delivery_graph
+                    .iter()
+                    .map(|(payload, _, kind, recipients, outbox)| (
+                        payload.clone(),
+                        kind.clone(),
+                        *recipients,
+                        *outbox,
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        creation_payload.clone(),
+                        "conversationChanged".to_owned(),
+                        3,
+                        1,
+                    ),
+                    (
+                        policy_payload.clone(),
+                        "conversationChanged".to_owned(),
+                        3,
+                        1,
+                    ),
+                    (
+                        acceptance_payload.clone(),
+                        "conversationChanged".to_owned(),
+                        2,
+                        1,
+                    ),
+                    (
+                        fulfillment_payload.clone(),
+                        "welcomeAvailable".to_owned(),
+                        2,
+                        1,
+                    ),
+                ],
                 "unfiltered fresh-conversation event cardinality/topology is exact"
             );
-            let unfiltered_recipients: Vec<(Uuid, String, Uuid, String, Option<i64>)> =
+            let mut unfiltered_recipients: Vec<(String, String, Uuid, String, Option<String>)> =
                 sqlx::query_as(
-                    r#"SELECT event.event_id,recipient.user_did,recipient.device_id,
+                    r#"SELECT convert_from(event.payload_bytes,'UTF8'),
+                              recipient.user_did,recipient.device_id,
                               recipient.entitlement_kind,
-                              recipient.audience_predecessor_position
+                              convert_from(predecessor.payload_bytes,'UTF8')
                          FROM chat.events event
                          JOIN chat.event_recipients recipient USING(event_position)
+                         LEFT JOIN chat.events predecessor
+                           ON predecessor.event_position=recipient.audience_predecessor_position
                         WHERE event.protocol_instance_id=$1
                           AND position($2::bytea IN event.payload_bytes)>0
                         ORDER BY event.event_position,recipient.user_did,recipient.device_id"#,
                 )
-                .bind(creation_context.protocol_instance_id)
+                .bind(protocol_instance_id)
                 .bind(&conversation_marker)
                 .fetch_all(&mut *tx)
                 .await
                 .expect("read exact unfiltered lifecycle recipient topology");
-            let expected_recipients = [
-                &creation_context,
-                &policy_context,
-                &acceptance_context,
-                &fulfillment_context,
-            ]
-            .into_iter()
-            .flat_map(|context| {
-                context.events.iter().flat_map(|event| {
-                    event
-                        .recipients
-                        .iter()
-                        .map(move |(device, entitlement, predecessor)| {
-                            (
-                                event.event_id,
-                                String::from_utf8(device.principal().as_bytes().to_vec())
-                                    .expect("canonical recipient DID is UTF-8"),
-                                Uuid::from_bytes(*device.device_id()),
-                                match entitlement {
-                                    EventEntitlementKind::Participant => "participant",
-                                    EventEntitlementKind::Leaf => "leaf",
-                                    EventEntitlementKind::Welcome => "welcome",
-                                    EventEntitlementKind::Recovery => "recovery",
-                                    EventEntitlementKind::HistoricalSchedule => {
-                                        "historicalSchedule"
-                                    }
-                                }
-                                .to_owned(),
-                                *predecessor,
-                            )
-                        })
-                })
-            })
-            .collect::<Vec<_>>();
+            let mut expected_recipients = vec![
+                (
+                    creation_payload.clone(),
+                    entry.actor_did.clone(),
+                    entry.actor_device_id,
+                    "participant".to_owned(),
+                    None,
+                ),
+                (
+                    creation_payload.clone(),
+                    invitee.did.clone(),
+                    invitee.device_id,
+                    "participant".to_owned(),
+                    None,
+                ),
+                (
+                    creation_payload.clone(),
+                    decoy.did.clone(),
+                    decoy.device_id,
+                    "participant".to_owned(),
+                    None,
+                ),
+                (
+                    policy_payload.clone(),
+                    entry.actor_did.clone(),
+                    entry.actor_device_id,
+                    "participant".to_owned(),
+                    Some(creation_payload.clone()),
+                ),
+                (
+                    policy_payload.clone(),
+                    invitee.did.clone(),
+                    invitee.device_id,
+                    "participant".to_owned(),
+                    Some(creation_payload.clone()),
+                ),
+                (
+                    policy_payload.clone(),
+                    decoy.did.clone(),
+                    decoy.device_id,
+                    "participant".to_owned(),
+                    Some(creation_payload.clone()),
+                ),
+                (
+                    acceptance_payload.clone(),
+                    entry.actor_did.clone(),
+                    entry.actor_device_id,
+                    "participant".to_owned(),
+                    Some(policy_payload.clone()),
+                ),
+                (
+                    acceptance_payload.clone(),
+                    invitee.did.clone(),
+                    invitee.device_id,
+                    "participant".to_owned(),
+                    Some(policy_payload.clone()),
+                ),
+                (
+                    fulfillment_payload.clone(),
+                    entry.actor_did.clone(),
+                    entry.actor_device_id,
+                    "participant".to_owned(),
+                    Some(acceptance_payload.clone()),
+                ),
+                (
+                    fulfillment_payload.clone(),
+                    invitee.did.clone(),
+                    invitee.device_id,
+                    "participant".to_owned(),
+                    Some(acceptance_payload.clone()),
+                ),
+            ];
+            unfiltered_recipients.sort();
+            expected_recipients.sort();
             assert_eq!(
                 unfiltered_recipients, expected_recipients,
                 "unfiltered event audience preserves every identity, entitlement, and predecessor"
             );
-            let unfiltered_outbox: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-                r#"SELECT event.event_id,outbox.outbox_id,outbox.work_kind,outbox.status
+            let unfiltered_outbox: Vec<(String, Uuid, String, String)> = sqlx::query_as(
+                r#"SELECT convert_from(event.payload_bytes,'UTF8'),
+                          outbox.outbox_id,outbox.work_kind,outbox.status
                      FROM chat.events event
                      JOIN chat.outbox outbox USING(event_position)
                     WHERE event.protocol_instance_id=$1
                       AND position($2::bytea IN event.payload_bytes)>0
                     ORDER BY event.event_position,outbox.outbox_id"#,
             )
-            .bind(creation_context.protocol_instance_id)
+            .bind(protocol_instance_id)
             .bind(&conversation_marker)
             .fetch_all(&mut *tx)
             .await
             .expect("read exact unfiltered lifecycle outbox topology");
-            let expected_outbox = [
-                &creation_context,
-                &policy_context,
-                &acceptance_context,
-                &fulfillment_context,
-            ]
-            .into_iter()
-            .flat_map(|context| {
-                context.events.iter().flat_map(|event| {
-                    let mut rows = event
-                        .outbox
-                        .iter()
-                        .map(|(outbox_id, kind)| {
-                            (
-                                event.event_id,
-                                *outbox_id,
-                                match kind {
-                                    OutboxWorkKind::Stream => "stream",
-                                    OutboxWorkKind::Notification => "notification",
-                                    OutboxWorkKind::Recovery => "recovery",
-                                }
-                                .to_owned(),
-                                "pending".to_owned(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    rows.sort_by_key(|(_, outbox_id, _, _)| *outbox_id);
-                    rows
-                })
-            })
-            .collect::<Vec<_>>();
+            let outbox_ids = unfiltered_outbox
+                .iter()
+                .map(|(_, outbox_id, _, _)| *outbox_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(outbox_ids.len(), 4);
+            assert!(outbox_ids
+                .iter()
+                .all(|outbox_id| outbox_id.get_version_num() == 4));
             assert_eq!(
-                unfiltered_outbox, expected_outbox,
+                unfiltered_outbox
+                    .iter()
+                    .map(|(payload, _, kind, status)| {
+                        (payload.clone(), kind.clone(), status.clone())
+                    })
+                    .collect::<Vec<_>>(),
+                vec![
+                    (creation_payload, "stream".to_owned(), "pending".to_owned(),),
+                    (policy_payload, "stream".to_owned(), "pending".to_owned(),),
+                    (
+                        acceptance_payload,
+                        "stream".to_owned(),
+                        "pending".to_owned(),
+                    ),
+                    (
+                        fulfillment_payload,
+                        "stream".to_owned(),
+                        "pending".to_owned(),
+                    ),
+                ],
                 "unfiltered outbox preserves every identity, kind, and pending state"
             );
             let unrelated_effects: (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
@@ -12849,7 +13503,7 @@ mod historical_control_loader {
                 "SELECT count(*) FROM chat.events \
                   WHERE protocol_instance_id=$1 AND position($2::bytea IN payload_bytes)>0",
             )
-            .bind(creation_context.protocol_instance_id)
+            .bind(protocol_instance_id)
             .bind(&conversation_marker)
             .fetch_one(&pool)
             .await
@@ -17460,6 +18114,31 @@ mod historical_control_loader {
                 outer_entry_fingerprint: *decoded.outer_control_fingerprint(),
                 opaque_welcome,
             }
+        }
+
+        fn resign_genuine_fulfillment_entry(
+            entry: &RealCreationEntry,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            mutate_body: impl FnOnce(&mut Value),
+        ) -> (Vec<u8>, Vec<u8>) {
+            let mut public_row: Value = serde_json::from_slice(&fulfillment.public_row_json)
+                .expect("parse genuine fulfillment for semantic mutation");
+            mutate_body(&mut public_row["signedRequest"]["body"]);
+            public_row["signedRequest"]["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let unsigned_wrapper = serde_json::to_vec(&public_row["signedRequest"])
+                .expect("serialize unsigned semantic mutation");
+            let canonical = decode_canonical_signed_mutation(&unsigned_wrapper)
+                .expect("semantic mutation remains a canonical signed request");
+            let signature = entry
+                .signing_key()
+                .sign(canonical.transcript_bytes())
+                .to_bytes();
+            public_row["signedRequest"]["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&public_row["signedRequest"])
+                .expect("serialize re-signed semantic mutation");
+            let public_row_json =
+                serde_json::to_vec(&public_row).expect("serialize semantic control row");
+            (public_row_json, raw_wrapper)
         }
 
         fn encoded_fixture_tree_summary(entry: &RealCreationEntry) -> (Vec<u8>, [u8; 32]) {

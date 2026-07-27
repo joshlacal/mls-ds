@@ -15497,6 +15497,7 @@ pub(crate) use executor::{
 
 mod executor {
     use chrono::{DateTime, Utc};
+    use sha2::Digest;
     use uuid::Uuid;
 
     use std::collections::{BTreeSet, HashMap};
@@ -15530,9 +15531,10 @@ mod executor {
         LeafRecord, LeafRecoveryKind, LeaveRequestStatus, ManifestParticipantChange,
         MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRecord,
         ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
-        PublicGroupSnapshotCoordinate, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-        ResetRequestStatus, ServerTimestamp, SignedMutationKind, StateChange,
-        TransitionBodyBinding, TransitionEffects, WelcomeStatus,
+        PublicGroupSnapshotCoordinate, RecoveryRequest, RecoveryRequestStatus, RecoveryReservation,
+        RecoverySource, ReservationStatus, ResetRequest, ResetRequestStatus, ServerTimestamp,
+        SignedMutationKind, StateChange, TransitionBodyBinding, TransitionEffects, WelcomeStatus,
+        WelcomeWork, WorkTerminalEvidence,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
     use super::{Engine, URL_SAFE_NO_PAD};
@@ -16231,6 +16233,592 @@ mod executor {
             ));
         }
         Ok(())
+    }
+
+    fn terminal_is_exact_transition(
+        terminal: &Option<WorkTerminalEvidence>,
+        producer: &super::TransitionEvidence,
+    ) -> bool {
+        matches!(terminal, Some(WorkTerminalEvidence::Transition(value)) if value == producer)
+    }
+
+    fn recovery_request_identity_is_unchanged(
+        before: &RecoveryRequest,
+        after: &RecoveryRequest,
+    ) -> bool {
+        before.request_id == after.request_id
+            && before.target == after.target
+            && before.kind == after.kind
+            && before.source == after.source
+            && before.bound_coordinate == after.bound_coordinate
+            && before.key_package_ref == after.key_package_ref
+            && before.received_at == after.received_at
+            && before.expires_at == after.expires_at
+            && before.terminal.is_none()
+    }
+
+    fn recovery_reservation_identity_is_unchanged(
+        before: &RecoveryReservation,
+        after: &RecoveryReservation,
+    ) -> bool {
+        before.request_id == after.request_id
+            && before.target == after.target
+            && before.bound_coordinate == after.bound_coordinate
+            && before.key_package_ref == after.key_package_ref
+            && before.received_at == after.received_at
+            && before.expires_at == after.expires_at
+            && before.package_not_after == after.package_not_after
+            && before.terminal.is_none()
+    }
+
+    fn reset_request_identity_is_unchanged(before: &ResetRequest, after: &ResetRequest) -> bool {
+        before.request_id == after.request_id
+            && before.requester == after.requester
+            && before.bound_coordinate == after.bound_coordinate
+            && before.received_at == after.received_at
+            && before.expires_at == after.expires_at
+            && before.origin == after.origin
+            && before.terminal.is_none()
+    }
+
+    fn leave_request_identity_is_unchanged(
+        before: &super::LeaveRequest,
+        after: &super::LeaveRequest,
+    ) -> bool {
+        before.request_id == after.request_id
+            && before.requester == after.requester
+            && before.bound_coordinate == after.bound_coordinate
+            && before.received_at == after.received_at
+            && before.expires_at == after.expires_at
+            && before.origin == after.origin
+            && before.fulfilled_participant == after.fulfilled_participant
+            && before.terminal.is_none()
+    }
+
+    fn welcome_identity_is_unchanged(before: &WelcomeWork, after: &WelcomeWork) -> bool {
+        before.welcome_id == after.welcome_id
+            && before.recipient == after.recipient
+            && before.transition_seq == after.transition_seq
+            && before.coordinate == after.coordinate
+            && before.recovery_request_id == after.recovery_request_id
+            && before.key_package_ref == after.key_package_ref
+            && before.opaque_welcome == after.opaque_welcome
+            && before.sha256 == after.sha256
+            && before.expires_at == after.expires_at
+            && before.terminal.is_none()
+    }
+
+    fn interval_identity_is_unchanged(
+        before: &super::AccessInterval,
+        after: &super::AccessInterval,
+    ) -> bool {
+        before.recipient == after.recipient
+            && before.generation == after.generation
+            && before.opening == after.opening
+            && before.opening_kind == after.opening_kind
+            && before.opening_context == after.opening_context
+            && before.end.is_none()
+    }
+
+    fn leaf_matches_hydration(leaf: &LeafRecord, row: &LeafHydrationRow) -> bool {
+        leaf.device == row.device
+            && leaf.leaf_index == row.leaf_index
+            && leaf.basic_credential == row.basic_credential
+            && leaf.signature_key == row.signature_key
+            && leaf.encryption_key == row.encryption_key
+            && leaf.key_package_ref == row.key_package_ref
+    }
+
+    /// Pure, complete effect-family validation for a leaf-recovery fulfillment.
+    /// This runs before the first repository writer. It classifies the arm's four
+    /// own edges and every legal prior-bound supersession/staling edge, proves the
+    /// cross-family request/package bijections, and validates the target leaf /
+    /// interval shape. The write phase retains applied-count reconciliation as a
+    /// second fence.
+    fn preflight_leaf_recovery_fulfillment(
+        effects: &TransitionEffects,
+        hydration: &ConversationStateHydration,
+        ctx: &ExecutionContext,
+        transition_id: Uuid,
+        seq_i64: i64,
+    ) -> Result<FamilyCounts, ExecutorError> {
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "fulfillment revocation/welcome/quota CAS",
+            ));
+        }
+        if effects
+            .metadata_change()
+            .and_then(StateChange::after)
+            .is_none()
+            || ctx.metadata_author.is_none()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment carries no complete metadata re-encryption",
+            ));
+        }
+
+        let producer = &hydration.producer;
+        if producer.transition_id != *transition_id.as_bytes()
+            || i64::try_from(producer.seq).ok() != Some(seq_i64)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment producer disagrees with allocated transition/sequence",
+            ));
+        }
+
+        let mut own_request: Option<&RecoveryRequest> = None;
+        let mut superseded_requests = BTreeSet::new();
+        for change in effects.recovery_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment recovery request change is not terminal",
+                ));
+            };
+            if !recovery_request_identity_is_unchanged(before, after)
+                || !terminal_is_exact_transition(&after.terminal, producer)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment recovery request identity/terminal drift",
+                ));
+            }
+            match (before.status, after.status) {
+                (RecoveryRequestStatus::Open, RecoveryRequestStatus::Fulfilled) => {
+                    if own_request.replace(after).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment carries multiple own recovery requests",
+                        ));
+                    }
+                }
+                (RecoveryRequestStatus::Open, RecoveryRequestStatus::Superseded) => {
+                    if !superseded_requests.insert((after.request_id, after.key_package_ref)) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats a superseded recovery request",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment recovery request change has an illegal direction",
+                    ))
+                }
+            }
+        }
+        let own_request = own_request.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no own fulfilled recovery request",
+        ))?;
+
+        let mut own_reservation: Option<&RecoveryReservation> = None;
+        let mut superseded_reservations = BTreeSet::new();
+        for change in effects.reservation_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment reservation change is not terminal",
+                ));
+            };
+            if !recovery_reservation_identity_is_unchanged(before, after)
+                || !terminal_is_exact_transition(&after.terminal, producer)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment reservation identity/terminal drift",
+                ));
+            }
+            match (before.status, after.status) {
+                (ReservationStatus::Active, ReservationStatus::Consumed) => {
+                    if own_reservation.replace(after).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment carries multiple own reservations",
+                        ));
+                    }
+                }
+                (ReservationStatus::Active, ReservationStatus::Released) => {
+                    if !superseded_reservations.insert((after.request_id, after.key_package_ref)) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats a released reservation",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment reservation change has an illegal direction",
+                    ))
+                }
+            }
+        }
+        let own_reservation = own_reservation.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no own consumed reservation",
+        ))?;
+        if own_request.request_id != own_reservation.request_id
+            || own_request.target != own_reservation.target
+            || own_request.bound_coordinate != own_reservation.bound_coordinate
+            || own_request.key_package_ref != own_reservation.key_package_ref
+            || own_request.received_at != own_reservation.received_at
+            || own_request.expires_at != own_reservation.expires_at
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment own request/reservation are not bijective",
+            ));
+        }
+
+        verify_recovery_package_consistency(
+            effects,
+            &own_request.key_package_ref,
+            PackageStatus::Reserved,
+            PackageStatus::Consumed,
+        )?;
+        let mut own_packages = 0usize;
+        let mut superseded_packages = BTreeSet::new();
+        for edge in effects.package_transitions() {
+            match (edge.from, edge.to) {
+                (PackageStatus::Reserved, PackageStatus::Consumed)
+                    if edge.request_id == own_request.request_id
+                        && edge.key_package_ref == own_request.key_package_ref =>
+                {
+                    own_packages += 1;
+                }
+                (PackageStatus::Reserved, PackageStatus::Available) => {
+                    if !superseded_packages.insert((edge.request_id, edge.key_package_ref)) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats a reactivated package",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment package edge has an illegal direction/binding",
+                    ))
+                }
+            }
+        }
+        if own_packages != 1
+            || superseded_requests != superseded_reservations
+            || superseded_requests != superseded_packages
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment recovery/request/package supersessions are not bijective",
+            ));
+        }
+        for (request_id, key_package_ref) in &superseded_requests {
+            let request = effects
+                .recovery_request_changes()
+                .iter()
+                .find_map(|change| {
+                    change.after().filter(|after| {
+                        after.request_id == *request_id
+                            && after.key_package_ref == *key_package_ref
+                            && after.status == RecoveryRequestStatus::Superseded
+                    })
+                })
+                .expect("superseded request key was collected from this family");
+            let reservation = effects
+                .reservation_changes()
+                .iter()
+                .find_map(|change| {
+                    change.after().filter(|after| {
+                        after.request_id == *request_id
+                            && after.key_package_ref == *key_package_ref
+                            && after.status == ReservationStatus::Released
+                    })
+                })
+                .expect("released reservation key was collected from this family");
+            let binding = effects
+                .recovery_package_cas()
+                .iter()
+                .find(|binding| {
+                    binding.request_id == *request_id
+                        && binding.key_package_ref == *key_package_ref
+                        && binding.expected_status == PackageStatus::Reserved
+                        && binding.successor_status == PackageStatus::Available
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "superseded package CAS is missing",
+                ))?;
+            if request.target != reservation.target
+                || request.target != binding.target
+                || request.bound_coordinate != reservation.bound_coordinate
+                || request.bound_coordinate != binding.bound_coordinate
+                || request.received_at != reservation.received_at
+                || request.expires_at != reservation.expires_at
+                || reservation.package_not_after != binding.package_not_after
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound request/reservation/package identities drift",
+                ));
+            }
+        }
+
+        let own_cas = effects
+            .recovery_package_cas()
+            .iter()
+            .filter(|binding| {
+                binding.request_id == own_request.request_id
+                    && binding.key_package_ref == own_request.key_package_ref
+                    && binding.expected_status == PackageStatus::Reserved
+                    && binding.successor_status == PackageStatus::Consumed
+            })
+            .collect::<Vec<_>>();
+        if own_cas.len() != 1
+            || own_cas[0].target != own_request.target
+            || own_cas[0].bound_coordinate != own_request.bound_coordinate
+            || own_cas[0].package_not_after != own_reservation.package_not_after
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment package CAS disagrees with own open work",
+            ));
+        }
+
+        let mut own_welcome: Option<&WelcomeWork> = None;
+        let mut superseded_welcomes = BTreeSet::new();
+        for change in effects.welcome_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(after))
+                    if after.status == WelcomeStatus::Pending && after.terminal.is_none() =>
+                {
+                    if own_welcome.replace(after).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment carries multiple own pending welcomes",
+                        ));
+                    }
+                }
+                (Some(before), Some(after))
+                    if welcome_identity_is_unchanged(before, after)
+                        && before.status == WelcomeStatus::Pending
+                        && after.status == WelcomeStatus::Superseded
+                        && terminal_is_exact_transition(&after.terminal, producer) =>
+                {
+                    if !superseded_welcomes.insert(after.welcome_id) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats a superseded Welcome",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment welcome change has an illegal shape",
+                    ))
+                }
+            }
+        }
+        let own_welcome = own_welcome.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no own pending welcome",
+        ))?;
+        if own_welcome.recipient != own_request.target
+            || own_welcome.recovery_request_id != own_request.request_id
+            || own_welcome.key_package_ref != own_request.key_package_ref
+            || own_welcome.coordinate != hydration.coordinate
+            || i64::try_from(own_welcome.transition_seq).ok() != Some(seq_i64)
+            || own_welcome.expires_at != own_reservation.package_not_after
+            || own_welcome.sha256
+                != <[u8; 32]>::from(sha2::Sha256::digest(&own_welcome.opaque_welcome))
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment pending Welcome is not bijective with own work/successor",
+            ));
+        }
+        let disposition_welcomes = ctx
+            .welcome_dispositions
+            .iter()
+            .map(|input| *input.welcome_id.as_bytes())
+            .collect::<BTreeSet<_>>();
+        if disposition_welcomes.len() != ctx.welcome_dispositions.len()
+            || disposition_welcomes != superseded_welcomes
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment Welcome dispositions are not bijective",
+            ));
+        }
+
+        let mut staled_resets = BTreeSet::new();
+        for change in effects.reset_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment reset request change is not terminal",
+                ));
+            };
+            if !reset_request_identity_is_unchanged(before, after)
+                || before.status != ResetRequestStatus::Pending
+                || after.status != ResetRequestStatus::Stale
+                || !terminal_is_exact_transition(&after.terminal, producer)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment reset request change is not exact prior-bound staling",
+                ));
+            }
+            if !staled_resets.insert(after.request_id) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment repeats a staled reset request",
+                ));
+            }
+        }
+        let mut staled_leaves = BTreeSet::new();
+        for change in effects.leave_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment leave request change is not terminal",
+                ));
+            };
+            if !leave_request_identity_is_unchanged(before, after)
+                || before.status != LeaveRequestStatus::Pending
+                || after.status != LeaveRequestStatus::Stale
+                || !terminal_is_exact_transition(&after.terminal, producer)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment leave request change is not exact prior-bound staling",
+                ));
+            }
+            if !staled_leaves.insert(after.request_id) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment repeats a staled leave request",
+                ));
+            }
+        }
+
+        let target = &own_request.target;
+        let mut target_leaf_is_replace = None;
+        let mut changed_leaf_devices = BTreeSet::new();
+        for change in effects.leaf_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(after))
+                    if after.device() == target
+                        && hydration
+                            .leaves
+                            .iter()
+                            .any(|row| leaf_matches_hydration(after, row)) =>
+                {
+                    if target_leaf_is_replace.replace(false).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats the target leaf change",
+                        ));
+                    }
+                }
+                (Some(before), Some(after))
+                    if before.device() == target
+                        && after.device() == target
+                        && before != after
+                        && hydration
+                            .leaves
+                            .iter()
+                            .any(|row| leaf_matches_hydration(after, row)) =>
+                {
+                    if target_leaf_is_replace.replace(true).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "fulfillment repeats the target leaf change",
+                        ));
+                    }
+                }
+                (Some(before), Some(after))
+                    if before.device() == after.device()
+                        && hydration
+                            .leaves
+                            .iter()
+                            .any(|row| leaf_matches_hydration(after, row)) => {}
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment carries an unexpected leaf change",
+                    ))
+                }
+            }
+            let device = change
+                .after()
+                .expect("every accepted fulfillment leaf change has an after")
+                .device()
+                .clone();
+            if !changed_leaf_devices.insert(device) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment repeats a changed leaf device",
+                ));
+            }
+        }
+        let is_replace = target_leaf_is_replace.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no target leaf change",
+        ))?;
+        if is_replace != (own_request.kind == LeafRecoveryKind::Replace)
+            || (!is_replace && own_request.kind != LeafRecoveryKind::Add)
+            || hydration
+                .leaves
+                .iter()
+                .filter(|leaf| &leaf.device == target)
+                .count()
+                != 1
+            || ctx.opened_leaves.len() != 1
+            || ctx
+                .opened_leaves
+                .iter()
+                .filter(|leaf| &leaf.device == target)
+                .count()
+                != 1
+            || ctx.leaf_period_ids.len() != 1
+            || ctx.closing_leaf_periods.len() != usize::from(is_replace)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment target leaf/context shape disagrees with request kind",
+            ));
+        }
+
+        let mut opened_intervals = 0usize;
+        let mut closed_intervals = 0usize;
+        for change in effects.interval_changes() {
+            match (change.before(), change.after()) {
+                (None, Some(after))
+                    if after.recipient() == target
+                        && after.opening_kind() == super::OpeningKind::Add
+                        && after.opening == *producer
+                        && after.generation == hydration.coordinate.generation()
+                        && after.end().is_none()
+                        && after.opening_context() == &hydration.coordinate =>
+                {
+                    opened_intervals += 1;
+                }
+                (Some(before), Some(after))
+                    if interval_identity_is_unchanged(before, after)
+                        && before.recipient() == target
+                        && after.recipient() == target
+                        && after.end().is_some_and(|end| {
+                            end.kind() == CloseKind::Replace && end.evidence == *producer
+                        }) =>
+                {
+                    closed_intervals += 1;
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "fulfillment interval change has an illegal shape/binding",
+                    ))
+                }
+            }
+        }
+        if opened_intervals != 1 || closed_intervals != usize::from(is_replace) {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment interval changes do not match the request kind",
+            ));
+        }
+
+        let prior_bound = FamilyCounts {
+            requests: superseded_requests.len(),
+            reservations: superseded_reservations.len(),
+            packages: superseded_packages.len(),
+            welcomes: superseded_welcomes.len(),
+            reset_requests: staled_resets.len(),
+            leave_requests: staled_leaves.len(),
+        };
+        reconcile_coordinate_change_families(
+            effects,
+            &FamilyCounts {
+                requests: 1,
+                reservations: 1,
+                packages: 1,
+                welcomes: 1,
+                reset_requests: 0,
+                leave_requests: 0,
+            },
+            &prior_bound,
+        )?;
+        Ok(prior_bound)
     }
 
     /// Apply one `ConversationPersistencePlan` inside the caller's transaction.
@@ -17820,6 +18408,8 @@ mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "fulfillment adds no pending welcome",
             ))?;
+        let preflight_prior_bound =
+            preflight_leaf_recovery_fulfillment(effects, hydration, ctx, transition_id, seq_i64)?;
 
         // 1. Head CAS sv+1.
         transition::cas_conversation_head(
@@ -18225,6 +18815,11 @@ mod executor {
         .await?;
         superseded.reset_requests = staled.reset_requests;
         superseded.leave_requests = staled.leave_requests;
+        if superseded != preflight_prior_bound {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment applied prior-bound counts disagree with preflight",
+            ));
+        }
         // Silent-drop guard: this arm's OWN edges are exactly one fulfilled request +
         // consumed reservation + Reserved->Consumed package + new pending welcome; every
         // OTHER delta MUST be a supersession/staling the calls above applied. Reject any
@@ -22252,7 +22847,7 @@ mod executor {
     /// `write_prior_bound_supersessions` / `write_welcome_supersessions` wrote) and
     /// the arm's OWN edges, so the reconciliation `own + superseded == total` holds
     /// per family (see `reconcile_coordinate_change_families`).
-    #[derive(Default)]
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct FamilyCounts {
         requests: usize,
         reservations: usize,
