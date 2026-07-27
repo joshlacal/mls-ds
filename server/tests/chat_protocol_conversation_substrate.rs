@@ -5537,9 +5537,9 @@ mod historical_control_loader {
             seed_real_creation_graph, seed_real_creation_graph_with_public_state_and_group_info,
         };
         use crate::chat_protocol::public_state::{
-            encode_public_tree_summary, load_persisted_active_snapshot, process_commit,
-            rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
-            ActivePublicState, GenesisGroupInfoExpectations,
+            decode_public_tree_summary, encode_public_tree_summary, load_persisted_active_snapshot,
+            process_commit, rebind_active_snapshot, verify_genesis_group_info,
+            verify_recovery_welcome, ActivePublicState, GenesisGroupInfoExpectations,
         };
         use crate::chat_protocol::relationship_policy::{
             fixed_production_relationship_policy_config, AdmissionOperation, AdmissionRequest,
@@ -12340,6 +12340,66 @@ mod historical_control_loader {
                 .await
                 .expect("force lifecycle Acceptance constraints");
 
+            let (acceptance_tree_summary, acceptance_tree_summary_sha256) =
+                encode_public_tree_summary(acceptance_state.binding().tree_summary())
+                    .expect("encode independently verified Acceptance tree summary")
+                    .into_parts();
+            assert!(
+                acceptance_state.verified_group_info_sha256().is_none()
+                    && acceptance_state
+                        .verified_group_info_signature_key()
+                        .is_none(),
+                "coordinate-only Acceptance state carries no direct GroupInfo proof"
+            );
+            let acceptance_state_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       state.conversation_id=$1
+                       AND state.generation=0 AND state.state_version=2
+                       AND state.group_id=$2 AND state.epoch=$3
+                       AND state.group_context_hash=$4 AND state.confirmation_tag=$5
+                       AND state.lifecycle='active'
+                       AND state.state_kind='acceptConversation'
+                       AND state.producing_transition_id=$6
+                       AND state.public_snapshot_bytes=$7 AND state.snapshot_sha256=$8
+                       AND state.tree_summary_bytes=$9 AND state.tree_summary_sha256=$10
+                       AND state.leaf_count=$11 AND state.created_at=$12
+                       AND generation.group_id=$2 AND generation.lifecycle='active'
+                       AND generation.genesis_group_info_bytes=$13
+                       AND generation.genesis_group_info_sha256=$14
+                       AND generation.current_state_version=2
+                       AND generation.activated_seq=1 AND generation.activated_at=$12
+                       AND generation.superseded_seq IS NULL
+                       AND generation.superseded_at IS NULL
+                   )
+                  FROM chat.generation_states state
+                  JOIN chat.generations generation
+                    ON generation.conversation_id=state.conversation_id
+                   AND generation.generation=state.generation
+                 WHERE state.conversation_id=$1
+                   AND state.generation=0 AND state.state_version=2"#,
+            )
+            .bind(conversation_id)
+            .bind(acceptance_state.coordinate().group_id().to_vec())
+            .bind(i64::try_from(acceptance_state.coordinate().epoch()).unwrap())
+            .bind(acceptance_state.coordinate().group_context_hash().to_vec())
+            .bind(acceptance_state.coordinate().confirmation_tag().to_vec())
+            .bind(acceptance.transition_id)
+            .bind(acceptance_state.snapshot())
+            .bind(acceptance_state.snapshot_sha256().to_vec())
+            .bind(&acceptance_tree_summary)
+            .bind(acceptance_tree_summary_sha256.to_vec())
+            .bind(i64::try_from(acceptance_state.binding().tree_summary().leaves().len()).unwrap())
+            .bind(trusted_at)
+            .bind(&genesis_group_info)
+            .bind(Sha256::digest(&genesis_group_info).to_vec())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read exact Acceptance generation-state projection");
+            assert!(
+                acceptance_state_exact,
+                "Acceptance state must persist the exact production-verified snapshot/tree"
+            );
+
             #[allow(clippy::type_complexity)]
             let acceptance_exact: (
                 i64,
@@ -12811,6 +12871,12 @@ mod historical_control_loader {
             let fulfillment_plan = fulfillment_planned
                 .into_persistence_plan()
                 .expect("seal lifecycle Fulfillment plan");
+            let expected_fulfillment_metadata = fulfillment_plan
+                .state()
+                .metadata
+                .as_ref()
+                .expect("Fulfillment plan carries verified metadata re-encryption")
+                .clone();
             let fulfillment_context = hydrate_execution_context(
                 &mut tx,
                 &fulfillment_plan,
@@ -12893,6 +12959,316 @@ mod historical_control_loader {
                 .execute(&mut *tx)
                 .await
                 .expect("force lifecycle Fulfillment constraints");
+
+            let (fulfillment_tree_summary, fulfillment_tree_summary_sha256) =
+                encode_public_tree_summary(committed.binding().tree_summary())
+                    .expect("encode independently verified Fulfillment tree summary")
+                    .into_parts();
+            assert!(
+                committed.verified_group_info_sha256().is_none()
+                    && committed.verified_group_info_signature_key().is_none(),
+                "Commit successor state carries no direct GroupInfo proof"
+            );
+            let expected_basic_credential =
+                format!("{}#{}", invitee.did, invitee.device_id).into_bytes();
+            let expected_leaf = committed
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .find(|leaf| leaf.basic_credential() == expected_basic_credential)
+                .expect("fresh committed tree contains the recovered target leaf");
+            let fulfillment_state_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       state.conversation_id=$1
+                       AND state.generation=0 AND state.state_version=3
+                       AND state.group_id=$2 AND state.epoch=$3
+                       AND state.group_context_hash=$4 AND state.confirmation_tag=$5
+                       AND state.lifecycle='active' AND state.state_kind='commit'
+                       AND state.producing_transition_id=$6
+                       AND state.public_snapshot_bytes=$7 AND state.snapshot_sha256=$8
+                       AND state.tree_summary_bytes=$9 AND state.tree_summary_sha256=$10
+                       AND state.leaf_count=$11 AND state.created_at=$12
+                       AND generation.group_id=$2 AND generation.lifecycle='active'
+                       AND generation.genesis_group_info_bytes=$13
+                       AND generation.genesis_group_info_sha256=$14
+                       AND generation.current_state_version=3
+                       AND generation.activated_seq=1 AND generation.activated_at=$12
+                       AND generation.superseded_seq IS NULL
+                       AND generation.superseded_at IS NULL
+                   )
+                  FROM chat.generation_states state
+                  JOIN chat.generations generation
+                    ON generation.conversation_id=state.conversation_id
+                   AND generation.generation=state.generation
+                 WHERE state.conversation_id=$1
+                   AND state.generation=0 AND state.state_version=3"#,
+            )
+            .bind(conversation_id)
+            .bind(committed.coordinate().group_id().to_vec())
+            .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+            .bind(committed.coordinate().group_context_hash().to_vec())
+            .bind(committed.coordinate().confirmation_tag().to_vec())
+            .bind(fulfillment.transition_id)
+            .bind(committed.snapshot())
+            .bind(committed.snapshot_sha256().to_vec())
+            .bind(&fulfillment_tree_summary)
+            .bind(fulfillment_tree_summary_sha256.to_vec())
+            .bind(i64::try_from(committed.binding().tree_summary().leaves().len()).unwrap())
+            .bind(trusted_at)
+            .bind(&genesis_group_info)
+            .bind(Sha256::digest(&genesis_group_info).to_vec())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read exact Fulfillment generation-state projection");
+            assert!(
+                fulfillment_state_exact,
+                "Fulfillment state must persist the exact production-verified snapshot/tree"
+            );
+            let persisted_fulfillment_tree: Vec<u8> = sqlx::query_scalar(
+                "SELECT tree_summary_bytes FROM chat.generation_states \
+                  WHERE conversation_id=$1 AND generation=0 AND state_version=3",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read persisted Fulfillment tree summary");
+            let decoded_fulfillment_tree = decode_public_tree_summary(
+                &persisted_fulfillment_tree,
+                &fulfillment_tree_summary_sha256,
+            )
+            .expect("persisted Fulfillment tree is canonical and digest-bound");
+            assert_eq!(
+                &decoded_fulfillment_tree,
+                committed.binding().tree_summary(),
+                "persisted Fulfillment tree is the production-verified OpenMLS tree"
+            );
+            let persisted_target_leaf = decoded_fulfillment_tree
+                .leaves()
+                .iter()
+                .find(|leaf| leaf.basic_credential() == expected_basic_credential)
+                .expect("persisted Fulfillment tree contains the recovered target");
+            assert_eq!(
+                persisted_target_leaf.encryption_key(),
+                expected_leaf.encryption_key(),
+                "persisted canonical tree retains the exact XWing encryption key"
+            );
+
+            let fulfillment_metadata_snapshot_id: Uuid = sqlx::query_scalar(
+                "SELECT metadata_snapshot_id FROM chat.metadata_snapshots \
+                  WHERE conversation_id=$1 AND generation=0 AND state_version=3 \
+                    AND producing_transition_id=$2",
+            )
+            .bind(conversation_id)
+            .bind(fulfillment.transition_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read exact Fulfillment metadata snapshot identity");
+            assert_eq!(
+                fulfillment_metadata_snapshot_id.get_version_num(),
+                4,
+                "Fulfillment metadata snapshot identity is canonical UUIDv4"
+            );
+
+            let fulfillment_entry_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       entry.entry_id=$2
+                       AND entry.entry_kind='blue.catbird.chat.defs#leafRecoveryFulfillmentEntry'
+                       AND entry.accepted_payload_bytes=$3
+                       AND entry.accepted_payload_sha256=$4
+                       AND entry.signed_request_bytes=$5
+                       AND entry.request_digest=$6 AND entry.signature=$7
+                       AND entry.server_fields_bytes=$8
+                       AND entry.outer_entry_fingerprint=$9
+                       AND entry.actor_did=$10 AND entry.actor_device_id=$11
+                       AND entry.actor_key_id=$12 AND entry.actor_auth_generation=1
+                       AND entry.generation=0 AND entry.state_version=3
+                       AND entry.transition_id=$13 AND entry.message_id IS NULL
+                       AND entry.received_at=$14
+                       AND transition.signed_request_bytes=$5
+                       AND transition.unsigned_projection_bytes=$15
+                       AND transition.signing_transcript_bytes=$16
+                       AND transition.request_digest=$6 AND transition.signature=$7
+                   )
+                  FROM chat.entries entry
+                  JOIN chat.transitions transition
+                    ON transition.conversation_id=entry.conversation_id
+                   AND transition.transition_id=entry.transition_id
+                   AND transition.entry_seq=entry.seq
+                 WHERE entry.conversation_id=$1 AND entry.seq=4"#,
+            )
+            .bind(conversation_id)
+            .bind(fulfillment.entry_id)
+            .bind(&fulfillment.public_row_json)
+            .bind(Sha256::digest(&fulfillment.public_row_json).to_vec())
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(&fulfillment.server_fields_dag_cbor)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(fulfillment.transition_id)
+            .bind(trusted_at)
+            .bind(&fulfillment.canonical_projection)
+            .bind(&fulfillment.signing_transcript)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read complete exact Fulfillment entry projection");
+            assert!(fulfillment_entry_exact);
+
+            let fulfillment_transition_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       transition.conversation_id=$1 AND transition.transition_id=$2
+                       AND transition.kind='leafRecovery'
+                       AND transition.actor_did=$3 AND transition.actor_device_id=$4
+                       AND transition.actor_key_id=$5
+                       AND transition.actor_auth_generation=1
+                       AND transition.actor_role='admin'
+                       AND transition.actor_device_status='active'
+                       AND transition.signed_request_bytes=$6
+                       AND transition.unsigned_projection_bytes=$7
+                       AND transition.signing_transcript_bytes=$8
+                       AND transition.request_digest=$9 AND transition.signature=$10
+                       AND transition.prior_generation=0
+                       AND transition.prior_state_version=2
+                       AND transition.next_generation=0
+                       AND transition.next_state_version=3
+                       AND transition.retired_generation IS NULL
+                       AND transition.retired_state_version IS NULL
+                       AND transition.successor_generation IS NULL
+                       AND transition.successor_state_version IS NULL
+                       AND transition.reset_request_id IS NULL
+                       AND transition.close_transition_id IS NULL
+                       AND transition.metadata_snapshot_id=$11
+                       AND transition.entry_seq=4 AND transition.accepted_at=$12
+                   )
+                  FROM chat.transitions transition
+                 WHERE transition.conversation_id=$1 AND transition.transition_id=$2"#,
+            )
+            .bind(conversation_id)
+            .bind(fulfillment.transition_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.canonical_projection)
+            .bind(&fulfillment.signing_transcript)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(fulfillment_metadata_snapshot_id)
+            .bind(trusted_at)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read complete exact Fulfillment transition projection");
+            assert!(fulfillment_transition_exact);
+
+            let fulfillment_metadata_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       metadata.metadata_snapshot_id=$1
+                       AND metadata.conversation_id=$2
+                       AND metadata.generation=0 AND metadata.state_version=3
+                       AND metadata.group_id=$3 AND metadata.epoch=$4
+                       AND metadata.group_context_hash=$5
+                       AND metadata.confirmation_tag=$6
+                       AND metadata.producing_transition_id=$7
+                       AND metadata.origin_transition_id=$8
+                       AND metadata.metadata_version=$9
+                       AND metadata.nonce=$10 AND metadata.ciphertext=$11
+                       AND metadata.ciphertext_sha256=$12
+                       AND metadata.ciphertext_size=$13
+                       AND metadata.avatar_blob_id IS NULL
+                       AND metadata.avatar_ciphertext_sha256 IS NULL
+                       AND metadata.avatar_ciphertext_size IS NULL
+                       AND metadata.avatar_purpose IS NULL
+                       AND metadata.avatar_binding_origin_transition_id IS NULL
+                       AND metadata.avatar_binding_metadata_version IS NULL
+                       AND metadata.avatar_binding_owner_did IS NULL
+                       AND metadata.avatar_binding_owner_device_id IS NULL
+                       AND metadata.author_did=$14 AND metadata.author_device_id=$15
+                       AND metadata.author_key_id=$16 AND metadata.author_public_key=$17
+                       AND metadata.author_auth_generation=$18
+                       AND metadata.author_origin_seq=$19
+                       AND metadata.author_role='admin'
+                       AND metadata.author_device_status='active'
+                       AND metadata.created_at=$20
+                   )
+                  FROM chat.metadata_snapshots metadata
+                 WHERE metadata.metadata_snapshot_id=$1"#,
+            )
+            .bind(fulfillment_metadata_snapshot_id)
+            .bind(conversation_id)
+            .bind(committed.coordinate().group_id().to_vec())
+            .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+            .bind(committed.coordinate().group_context_hash().to_vec())
+            .bind(committed.coordinate().confirmation_tag().to_vec())
+            .bind(fulfillment.transition_id)
+            .bind(Uuid::from_bytes(
+                *expected_fulfillment_metadata.origin_transition_id(),
+            ))
+            .bind(i64::try_from(expected_fulfillment_metadata.metadata_version()).unwrap())
+            .bind(expected_fulfillment_metadata.nonce().to_vec())
+            .bind(expected_fulfillment_metadata.ciphertext())
+            .bind(expected_fulfillment_metadata.ciphertext_sha256().to_vec())
+            .bind(i64::try_from(expected_fulfillment_metadata.ciphertext().len()).unwrap())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&entry.public_key)
+            .bind(
+                i64::try_from(expected_fulfillment_metadata.author_auth_generation_at_origin())
+                    .unwrap(),
+            )
+            .bind(i64::try_from(expected_fulfillment_metadata.author_origin_seq()).unwrap())
+            .bind(trusted_at)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read complete exact Fulfillment metadata projection");
+            assert!(fulfillment_metadata_exact);
+
+            let fulfillment_welcome_exact: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       bundle.welcome_id=$1 AND bundle.conversation_id=$2
+                       AND bundle.transition_id=$3 AND bundle.entry_seq=4
+                       AND bundle.generation=0 AND bundle.state_version=3
+                       AND bundle.group_id=$4 AND bundle.epoch=$5
+                       AND bundle.group_context_hash=$6
+                       AND bundle.confirmation_tag=$7
+                       AND bundle.wrapper_bytes=$8 AND bundle.wrapper_sha256=$9
+                       AND bundle.created_at=$10
+                       AND delivery.welcome_id=bundle.welcome_id
+                       AND delivery.recipient_did=$11
+                       AND delivery.recipient_device_id=$12
+                       AND delivery.recovery_request_id=$13
+                       AND delivery.key_package_ref=$14
+                       AND delivery.expires_at=$15
+                       AND delivery.status='pending'
+                       AND delivery.terminal_at IS NULL
+                   )
+                  FROM chat.welcome_bundles bundle
+                  JOIN chat.welcome_deliveries delivery USING(welcome_id)
+                 WHERE bundle.conversation_id=$2 AND bundle.welcome_id=$1"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(conversation_id)
+            .bind(fulfillment.transition_id)
+            .bind(committed.coordinate().group_id().to_vec())
+            .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+            .bind(committed.coordinate().group_context_hash().to_vec())
+            .bind(committed.coordinate().confirmation_tag().to_vec())
+            .bind(&fulfillment.opaque_welcome)
+            .bind(Sha256::digest(&fulfillment.opaque_welcome).to_vec())
+            .bind(trusted_at)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(Uuid::from_bytes(acceptance.request_id))
+            .bind(key_package_ref.to_vec())
+            .bind(package_not_after)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read complete exact Fulfillment Welcome projection");
+            assert!(fulfillment_welcome_exact);
 
             let fulfillment_exact: (
                 i64,
@@ -12995,15 +13371,6 @@ mod historical_control_loader {
                     1,
                 )
             );
-            let expected_basic_credential =
-                format!("{}#{}", invitee.did, invitee.device_id).into_bytes();
-            let expected_leaf = committed
-                .binding()
-                .tree_summary()
-                .leaves()
-                .iter()
-                .find(|leaf| leaf.basic_credential() == expected_basic_credential)
-                .expect("fresh committed tree contains the recovered target leaf");
             let exact_period_chain: bool = sqlx::query_scalar(
                 r#"SELECT count(*)=1 AND bool_and(
                        participant.status='active' AND participant.current_membership
