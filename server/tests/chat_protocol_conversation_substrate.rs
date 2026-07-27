@@ -10879,13 +10879,18 @@ mod historical_control_loader {
             let mut wrong_group_info = fixture.genesis_group_info.clone();
             let last = wrong_group_info.last_mut().expect("GroupInfo is not empty");
             *last ^= 1;
+            let creation_event_payload = serde_json::to_vec(&json!({
+                "kind": "g6Creation",
+                "conversationId": conversation_id.hyphenated().to_string(),
+            }))
+            .expect("serialize conversation-scoped Creation event payload");
             let artifact_error = hydrate_execution_context(
                 &mut tx,
                 &plan,
                 ExecutionContextArtifacts {
                     accepted_control_entry_bytes: Some(entry.public_row_json.clone()),
                     genesis_group_info_bytes: Some(wrong_group_info),
-                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    primary_event_payload: Some(creation_event_payload.clone()),
                     welcome_disposition_event_payloads: Vec::new(),
                 },
             )
@@ -10915,7 +10920,7 @@ mod historical_control_loader {
                 ExecutionContextArtifacts {
                     accepted_control_entry_bytes: Some(mutated_control_entry),
                     genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
-                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    primary_event_payload: Some(creation_event_payload.clone()),
                     welcome_disposition_event_payloads: Vec::new(),
                 },
             )
@@ -10931,7 +10936,7 @@ mod historical_control_loader {
                 ExecutionContextArtifacts {
                     accepted_control_entry_bytes: Some(entry.public_row_json.clone()),
                     genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
-                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    primary_event_payload: Some(creation_event_payload),
                     welcome_disposition_event_payloads: Vec::new(),
                 },
             )
@@ -11109,7 +11114,13 @@ mod historical_control_loader {
                         non_add_policy.entry.accepted_payload_bytes.clone(),
                     ),
                     genesis_group_info_bytes: None,
-                    primary_event_payload: Some(b"{\"kind\":\"g6PolicyRemove\"}".to_vec()),
+                    primary_event_payload: Some(
+                        serde_json::to_vec(&json!({
+                            "kind": "g6PolicyRemove",
+                            "conversationId": conversation_id.hyphenated().to_string(),
+                        }))
+                        .expect("serialize conversation-scoped Policy event payload"),
+                    ),
                     welcome_disposition_event_payloads: Vec::new(),
                 },
             )
@@ -11289,6 +11300,42 @@ mod historical_control_loader {
                     "conversationChanged".to_owned(),
                     "conversationChanged".to_owned()
                 ]
+            );
+            let conversation_marker = conversation_id.hyphenated().to_string().into_bytes();
+            let exact_delivery_graph: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
+                "SELECT event.event_id,event.event_kind,\
+                        count(DISTINCT (recipient.user_did,recipient.device_id)),\
+                        count(DISTINCT outbox.outbox_id) \
+                   FROM chat.events event \
+                   LEFT JOIN chat.event_recipients recipient USING(event_position) \
+                   LEFT JOIN chat.outbox outbox USING(event_position) \
+                  WHERE event.protocol_instance_id=$1 \
+                    AND position($2::bytea IN event.payload_bytes)>0 \
+                  GROUP BY event.event_position,event.event_id,event.event_kind \
+                  ORDER BY event.event_position",
+            )
+            .bind(context.protocol_instance_id)
+            .bind(&conversation_marker)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("project all protocol/conversation-scoped event topology");
+            assert_eq!(
+                exact_delivery_graph,
+                vec![
+                    (
+                        context.events[0].event_id,
+                        "conversationChanged".to_owned(),
+                        2,
+                        1,
+                    ),
+                    (
+                        non_add_context.events[0].event_id,
+                        "conversationChanged".to_owned(),
+                        2,
+                        1,
+                    ),
+                ],
+                "protocol/conversation event graph contains an unexpected event or topology row"
             );
             assert_eq!(
                 CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst),
