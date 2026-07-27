@@ -20,15 +20,16 @@ use super::relationship_policy::{
 
 use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
 use super::repository::core::{
-    LockedConversationHeadGuard, LockedDirectConversationLookupGuard, LockedDirectLookupOutcome,
-    LockedInvitationQuotaGuard,
+    LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
+    LockedDirectLookupOutcome, LockedInvitationQuotaGuard, LockedRecoveryPackageGuard,
+    LockedRecoveryPackageStatus, LockedRecoveryPackageUse,
 };
 #[cfg(not(test))]
 use super::repository::core::{
-    LockedConversationStateGuard, LockedRecoveryPackageGuard, LockedRecoveryPackageStatus,
-    LockedRecoveryPackageUse, LockedRevocationFanoutGuard, LockedRevocationPackageGuard,
-    LockedRevocationTargetGuard, LockedRevocationTargetStatus, LockedWelcomeGuard,
+    LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
+    LockedRevocationTargetStatus, LockedWelcomeGuard,
 };
+use super::repository::relationship::LockedNoPendingAdmissionGuard;
 
 use super::{
     public_state::{
@@ -1113,7 +1114,6 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
     pub(crate) fn from_locked_conversation(
         locked: &LockedConversationStateGuard,
     ) -> Result<Self, StateMachineError> {
@@ -1125,6 +1125,7 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
+            #[cfg(not(test))]
             locked: LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: head.prior_coordinate().copied(),
@@ -1134,6 +1135,16 @@ impl HydrationAuthority {
                 locked_graph_digest: Some(*locked.locked_graph_digest()),
                 locked_snapshot_digest: locked.locked_snapshot_digest().copied(),
             },
+            #[cfg(test)]
+            locked: Some(LockedHydrationBinding {
+                transaction_id: head.transaction_id().to_owned(),
+                expected_prior: head.prior_coordinate().copied(),
+                expected_next_entry_seq: head.next_entry_seq(),
+                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
+                locked_head_digest: *head.durable_row_digest(),
+                locked_graph_digest: Some(*locked.locked_graph_digest()),
+                locked_snapshot_digest: locked.locked_snapshot_digest().copied(),
+            }),
         })
     }
 
@@ -1227,21 +1238,23 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
     fn require_same_locked_conversation(
         &self,
         locked: &LockedConversationStateGuard,
     ) -> Result<(), StateMachineError> {
         let head = locked.head();
+        let binding = self
+            .locked_binding()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
         let locked_at = ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?;
-        if head.transaction_id() != self.locked.transaction_id
+        if head.transaction_id() != binding.transaction_id
             || head.conversation_id().as_bytes() != &self.expected_conversation_id
-            || head.prior_coordinate() != self.locked.expected_prior.as_ref()
-            || head.next_entry_seq() != self.locked.expected_next_entry_seq
-            || locked_at != self.locked.locked_at
-            || head.durable_row_digest() != &self.locked.locked_head_digest
-            || self.locked.locked_graph_digest != Some(*locked.locked_graph_digest())
-            || self.locked.locked_snapshot_digest != locked.locked_snapshot_digest().copied()
+            || head.prior_coordinate() != binding.expected_prior.as_ref()
+            || head.next_entry_seq() != binding.expected_next_entry_seq
+            || locked_at != binding.locked_at
+            || head.durable_row_digest() != &binding.locked_head_digest
+            || binding.locked_graph_digest != Some(*locked.locked_graph_digest())
+            || binding.locked_snapshot_digest != locked.locked_snapshot_digest().copied()
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
@@ -1600,6 +1613,126 @@ impl HydrationAuthority {
         ))
     }
 
+    /// Closed creator-only GROUP Creation branch. The repository guard proves
+    /// that the exact locked quota scope is empty; the signed manifest and
+    /// deterministic planner must independently derive zero pending
+    /// recipients, so this branch cannot bypass admission for an Add.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_creation_without_pending_admission(
+        &self,
+        entry: VerifiedControlEntry,
+        registration: &LockedRegistrationProjection,
+        head: &LockedConversationHeadGuard,
+        quota_guard: LockedInvitationQuotaGuard,
+        no_admission: LockedNoPendingAdmissionGuard,
+        trusted_now: &TrustedRequestInstant,
+    ) -> Result<CreationDecision, StateMachineError> {
+        let group_info_bytes = match entry.mutation().projection() {
+            VerifiedMutationProjection::Creation(value) => {
+                checked_artifact_bytes(&value.genesis_group_info())?
+            }
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        let transition = self.transition_from_control(&entry)?;
+        if !registration.authorizes_transition(&transition) {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let (kind, next, manifest) = match transition.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Creation {
+                kind,
+                next,
+                manifest,
+                ..
+            }) => (*kind, *next, manifest),
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if kind != ConversationKind::Group || manifest.actor_leaf != *registration.actor() {
+            return Err(StateMachineError::InvalidCreation);
+        }
+        let invitees = manifest
+            .participants
+            .iter()
+            .filter(|participant| participant.principal != *registration.actor().principal())
+            .map(|participant| participant.principal.clone())
+            .collect::<Vec<_>>();
+        if !invitees.is_empty()
+            || !no_admission.authorizes_creation(head, &quota_guard, registration)
+        {
+            return Err(StateMachineError::InvalidPolicyAuthority);
+        }
+        self.require_same_locked_head(head)?;
+        let public_state = verify_genesis_group_info(
+            &group_info_bytes,
+            GenesisGroupInfoExpectations {
+                coordinate: next,
+                expected_basic_credential: &registration.actor().basic_credential(),
+                expected_signature_key: registration.registered_mls_signature_key(),
+                now_unix_seconds: u64::try_from(transition.received_at.unix_millis() / 1_000)
+                    .map_err(|_| StateMachineError::InvalidServerTime)?,
+                max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_members: MAX_PARTICIPANTS,
+            },
+        )?;
+        let authority = transition.clone();
+        let decision = plan_creation_inner(
+            None,
+            CreationCommand {
+                kind,
+                creator: registration.actor().clone(),
+                invitees,
+                transition,
+                public_state,
+            },
+        )?;
+        let CreationDecision::Create(plan) = decision else {
+            return Err(StateMachineError::InvalidCreation);
+        };
+        let pending_recipients = plan
+            .state
+            .participants
+            .iter()
+            .filter(|participant| participant.status == ParticipantStatus::Pending)
+            .map(|participant| {
+                String::from_utf8(participant.principal.as_bytes().to_vec())
+                    .map_err(|_| StateMachineError::InvalidPolicyAuthority)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !pending_recipients.is_empty()
+            || plan.effects.participant_changes.iter().any(|change| {
+                matches!(
+                    (&change.before, &change.after),
+                    (None, Some(after))
+                        if after.principal != *registration.actor().principal()
+                            || after.status == ParticipantStatus::Pending
+                )
+            })
+        {
+            return Err(StateMachineError::InvalidPolicyAuthority);
+        }
+        let quota_cas = invitation_quota_cas_from_guard(
+            &quota_guard,
+            registration.actor().principal(),
+            &pending_recipients,
+            registration.transaction_id(),
+            registration.trusted_read_at(),
+        )?;
+        if registration.trusted_read_at()
+            != ServerTimestamp::from_trusted_request_instant(trusted_now)?
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(CreationDecision::Create(
+            plan.bind_transition_authority(
+                authority,
+                head,
+                registration.transaction_id(),
+                registration.trusted_read_at(),
+            )?
+            .bind_invitation_quota_cas(quota_cas)?,
+        ))
+    }
+
     /// Consume the exact signed Policy body and the complete relationship
     /// projection under the conversation lock. No caller-selected roster or
     /// participant-change command crosses this seam.
@@ -1676,6 +1809,96 @@ impl HydrationAuthority {
             quota_guard.would_exceed(),
         )
         .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
+        if registration.trusted_read_at()
+            != ServerTimestamp::from_trusted_request_instant(trusted_now)?
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        plan.bind_transition_authority(
+            authority,
+            head,
+            registration.transaction_id(),
+            registration.trusted_read_at(),
+        )?
+        .bind_invitation_quota_cas(quota_cas)?
+        .bind_terminal_package_guards(
+            prior,
+            terminal_packages,
+            registration.transaction_id(),
+        )
+    }
+
+    /// Closed Policy branch for mutations whose signed, deterministic
+    /// participant delta adds nobody. The no-admission guard is repository
+    /// minted from the same locked head/graph/registration/quota read-set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_policy_without_pending_admission(
+        &self,
+        locked: &LockedConversationStateGuard,
+        entry: VerifiedControlEntry,
+        registration: &LockedRegistrationProjection,
+        terminal_packages: Vec<LockedRecoveryPackageGuard>,
+        quota_guard: LockedInvitationQuotaGuard,
+        no_admission: LockedNoPendingAdmissionGuard,
+        trusted_now: &TrustedRequestInstant,
+    ) -> Result<PlannedTransition, StateMachineError> {
+        self.require_same_locked_conversation(locked)?;
+        let prior = locked.state();
+        let head = locked.head();
+        let transition = self.transition_from_control(&entry)?;
+        if !registration.authorizes_transition(&transition)
+            || !no_admission.authorizes_non_add_policy(locked, &quota_guard, registration)
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        if matches!(
+            transition.body_binding.as_ref(),
+            Some(TransitionBodyBinding::Policy {
+                participant_changes,
+                ..
+            }) if participant_changes
+                .iter()
+                .any(|change| matches!(change, ManifestParticipantChange::Add(_)))
+        ) {
+            return Err(StateMachineError::InvalidPolicyAuthority);
+        }
+        let actor = registration.actor().clone();
+        let authority = transition.clone();
+        let plan = plan_policy_transition(
+            prior,
+            PolicyCommand {
+                actor: actor.clone(),
+                transition,
+                relationship_evidence_digest: no_admission.evidence_digest(),
+            },
+        )?;
+        let pending_recipients = plan
+            .effects
+            .participant_changes
+            .iter()
+            .filter_map(|change| match (&change.before, &change.after) {
+                (None, Some(after)) if after.status == ParticipantStatus::Pending => {
+                    String::from_utf8(after.principal.as_bytes().to_vec()).ok()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !pending_recipients.is_empty()
+            || plan
+                .effects
+                .participant_changes
+                .iter()
+                .any(|change| matches!((&change.before, &change.after), (None, Some(_))))
+        {
+            return Err(StateMachineError::InvalidPolicyAuthority);
+        }
+        let quota_cas = invitation_quota_cas_from_guard(
+            &quota_guard,
+            actor.principal(),
+            &pending_recipients,
+            registration.transaction_id(),
+            registration.trusted_read_at(),
+        )?;
         if registration.trusted_read_at()
             != ServerTimestamp::from_trusted_request_instant(trusted_now)?
         {
@@ -5686,7 +5909,6 @@ impl LockedRecoveryReservationProjection {
     }
 }
 
-#[cfg(not(test))]
 fn reserved_package_cas_for_request(
     guard: LockedRecoveryPackageGuard,
     request: &RecoveryRequest,
@@ -9195,7 +9417,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_terminal_package_guards(
         mut self,
         prior: &ConversationState,

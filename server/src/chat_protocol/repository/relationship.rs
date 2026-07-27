@@ -123,6 +123,106 @@ pub(crate) struct LockedTrafficFallbackScope {
     durable_read_set_digest: [u8; 32],
 }
 
+/// Closed authority for the exact branch where a signed Creation or Policy
+/// mutation introduces no pending participant and therefore requires no
+/// external declaration/relationship reads.
+pub(crate) struct LockedNoPendingAdmissionGuard {
+    transaction_id: String,
+    operation_scope: ProjectionOperationScope,
+    conversation_id: [u8; 16],
+    inviter_did: String,
+    head_digest: [u8; 32],
+    graph_digest: Option<[u8; 32]>,
+    quota_digest: [u8; 32],
+    registration_digest: [u8; 32],
+    durable_read_set_digest: [u8; 32],
+}
+
+impl LockedNoPendingAdmissionGuard {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(crate) fn operation_scope(&self) -> ProjectionOperationScope {
+        self.operation_scope
+    }
+
+    pub(crate) fn conversation_id(&self) -> &[u8; 16] {
+        &self.conversation_id
+    }
+
+    pub(crate) fn inviter_did(&self) -> &str {
+        &self.inviter_did
+    }
+
+    pub(crate) fn evidence_digest(&self) -> [u8; 32] {
+        self.durable_read_set_digest
+    }
+
+    pub(crate) fn authorizes_creation(
+        &self,
+        head: &LockedConversationHeadGuard,
+        quota: &LockedInvitationQuotaGuard,
+        registration: &LockedRegistrationProjection,
+    ) -> bool {
+        self.binding_is_valid()
+            && self.operation_scope == ProjectionOperationScope::Creation
+            && self.graph_digest.is_none()
+            && self.matches_common(head, quota, registration)
+    }
+
+    pub(crate) fn authorizes_non_add_policy(
+        &self,
+        locked: &LockedConversationStateGuard,
+        quota: &LockedInvitationQuotaGuard,
+        registration: &LockedRegistrationProjection,
+    ) -> bool {
+        self.binding_is_valid()
+            && self.operation_scope == ProjectionOperationScope::PendingAdd
+            && self.graph_digest == Some(*locked.locked_graph_digest())
+            && self.matches_common(locked.head(), quota, registration)
+    }
+
+    fn matches_common(
+        &self,
+        head: &LockedConversationHeadGuard,
+        quota: &LockedInvitationQuotaGuard,
+        registration: &LockedRegistrationProjection,
+    ) -> bool {
+        self.transaction_id == head.transaction_id()
+            && self.transaction_id == quota.transaction_id()
+            && self.transaction_id == registration.transaction_id()
+            && self.conversation_id == *head.conversation_id().as_bytes()
+            && self.conversation_id == *registration.conversation_id()
+            && self.inviter_did == quota.inviter_did()
+            && registration.actor().principal().as_bytes() == self.inviter_did.as_bytes()
+            && quota.new_recipient_dids().is_empty()
+            && quota.recipient_facts().is_empty()
+            && self.head_digest == *head.durable_row_digest()
+            && self.quota_digest == *quota.durable_row_digest()
+            && self.registration_digest == *registration.durable_row_digest()
+            && self.durable_read_set_digest
+                == no_pending_admission_digest(
+                    &self.transaction_id,
+                    self.operation_scope,
+                    &self.conversation_id,
+                    &self.inviter_did,
+                    &self.head_digest,
+                    self.graph_digest.as_ref(),
+                    &self.quota_digest,
+                    &self.registration_digest,
+                )
+    }
+
+    fn binding_is_valid(&self) -> bool {
+        canonical_transaction_id(&self.transaction_id)
+            && self.head_digest != [0; 32]
+            && self.quota_digest != [0; 32]
+            && self.registration_digest != [0; 32]
+            && self.durable_read_set_digest != [0; 32]
+    }
+}
+
 #[cfg(not(test))]
 enum TrustedRelationshipDecisionScope {
     Relationship {
@@ -435,6 +535,154 @@ impl LockedTrafficFallbackScope {
             &self.durable_read_set_digest,
         )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn no_pending_admission_digest(
+    transaction_id: &str,
+    operation_scope: ProjectionOperationScope,
+    conversation_id: &[u8; 16],
+    inviter_did: &str,
+    head_digest: &[u8; 32],
+    graph_digest: Option<&[u8; 32]>,
+    quota_digest: &[u8; 32],
+    registration_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-NO-PENDING-ADMISSION\0");
+    digest.update((transaction_id.len() as u64).to_be_bytes());
+    digest.update(transaction_id.as_bytes());
+    digest.update([match operation_scope {
+        ProjectionOperationScope::Creation => 0,
+        ProjectionOperationScope::PendingAdd => 1,
+        _ => u8::MAX,
+    }]);
+    digest.update(conversation_id);
+    digest.update((inviter_did.len() as u64).to_be_bytes());
+    digest.update(inviter_did.as_bytes());
+    digest.update(head_digest);
+    match graph_digest {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value);
+        }
+        None => digest.update([0]),
+    }
+    digest.update(quota_digest);
+    digest.update(registration_digest);
+    digest.finalize().into()
+}
+
+pub(crate) fn seal_group_creation_no_pending_admission(
+    head: &LockedConversationHeadGuard,
+    quota: &LockedInvitationQuotaGuard,
+    registration: &LockedRegistrationProjection,
+) -> Result<LockedNoPendingAdmissionGuard, RelationshipRepositoryError> {
+    if head.prior_coordinate().is_some()
+        || head.next_entry_seq() != 1
+        || head.transaction_id() != quota.transaction_id()
+        || !quota.new_recipient_dids().is_empty()
+        || !quota.recipient_facts().is_empty()
+        || head.durable_row_digest() == &[0; 32]
+        || quota.durable_row_digest() == &[0; 32]
+    {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    let inviter_did = authenticated_registration_actor(
+        registration,
+        head.transaction_id(),
+        head.conversation_id().as_bytes(),
+    )?;
+    if inviter_did != quota.inviter_did() {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    let operation_scope = ProjectionOperationScope::Creation;
+    let conversation_id = *head.conversation_id().as_bytes();
+    let head_digest = *head.durable_row_digest();
+    let quota_digest = *quota.durable_row_digest();
+    let registration_digest = *registration.durable_row_digest();
+    let durable_read_set_digest = no_pending_admission_digest(
+        head.transaction_id(),
+        operation_scope,
+        &conversation_id,
+        &inviter_did,
+        &head_digest,
+        None,
+        &quota_digest,
+        &registration_digest,
+    );
+    let guard = LockedNoPendingAdmissionGuard {
+        transaction_id: head.transaction_id().to_owned(),
+        operation_scope,
+        conversation_id,
+        inviter_did,
+        head_digest,
+        graph_digest: None,
+        quota_digest,
+        registration_digest,
+        durable_read_set_digest,
+    };
+    if !guard.authorizes_creation(head, quota, registration) {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    Ok(guard)
+}
+
+pub(crate) fn seal_non_add_policy_no_pending_admission(
+    locked: &LockedConversationStateGuard,
+    quota: &LockedInvitationQuotaGuard,
+    registration: &LockedRegistrationProjection,
+) -> Result<LockedNoPendingAdmissionGuard, RelationshipRepositoryError> {
+    let head = locked.head();
+    if head.transaction_id() != quota.transaction_id()
+        || !quota.new_recipient_dids().is_empty()
+        || !quota.recipient_facts().is_empty()
+        || head.durable_row_digest() == &[0; 32]
+        || locked.locked_graph_digest() == &[0; 32]
+        || quota.durable_row_digest() == &[0; 32]
+    {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    let inviter_did = authenticated_registration_actor(
+        registration,
+        head.transaction_id(),
+        locked.state().coordinate().conversation_id(),
+    )?;
+    if inviter_did != quota.inviter_did() || !locked_state_has_active_member(locked, &inviter_did)?
+    {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    let operation_scope = ProjectionOperationScope::PendingAdd;
+    let conversation_id = *head.conversation_id().as_bytes();
+    let head_digest = *head.durable_row_digest();
+    let graph_digest = Some(*locked.locked_graph_digest());
+    let quota_digest = *quota.durable_row_digest();
+    let registration_digest = *registration.durable_row_digest();
+    let durable_read_set_digest = no_pending_admission_digest(
+        head.transaction_id(),
+        operation_scope,
+        &conversation_id,
+        &inviter_did,
+        &head_digest,
+        graph_digest.as_ref(),
+        &quota_digest,
+        &registration_digest,
+    );
+    let guard = LockedNoPendingAdmissionGuard {
+        transaction_id: head.transaction_id().to_owned(),
+        operation_scope,
+        conversation_id,
+        inviter_did,
+        head_digest,
+        graph_digest,
+        quota_digest,
+        registration_digest,
+        durable_read_set_digest,
+    };
+    if !guard.authorizes_non_add_policy(locked, quota, registration) {
+        return Err(RelationshipRepositoryError::InvalidProjection);
+    }
+    Ok(guard)
 }
 
 pub(crate) fn seal_group_creation_fallback_scope(

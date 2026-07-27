@@ -2899,10 +2899,9 @@ pub(crate) async fn hydrate_locked_invitation_quota(
     let inviter_recent_24h: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.participants \
          WHERE created_by_did=$1 AND invitation_transition_id IS NOT NULL \
-           AND created_at >= $2 - INTERVAL '24 hours'",
+           AND created_at >= now() - INTERVAL '24 hours'",
     )
     .bind(inviter_did)
-    .bind(locked_at)
     .fetch_one(&mut **transaction)
     .await?;
     let inviter_recent_24h = quota_count(inviter_recent_24h)?;

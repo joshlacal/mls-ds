@@ -73,6 +73,13 @@ mod chat_protocol {
         pub mod auth {
             pub use crate::repository::auth::*;
         }
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
         pub mod core {
             #![allow(dead_code)]
             include!(concat!(

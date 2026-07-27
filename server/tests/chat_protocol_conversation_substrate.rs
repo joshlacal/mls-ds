@@ -131,11 +131,18 @@ fn g6_execution_context_facade_is_production_reachable() {
 #[test]
 fn g6_creation_facade_is_production_reachable() {
     use chat_protocol::repository::core::hydrate_locked_invitation_quota;
+    use chat_protocol::repository::relationship::{
+        seal_group_creation_no_pending_admission, seal_non_add_policy_no_pending_admission,
+    };
     use chat_protocol::state_machine::HydrationAuthority;
 
     fn reachable<T>(_value: T) {}
     reachable(hydrate_locked_invitation_quota);
     reachable(HydrationAuthority::from_locked_creation_head);
+    reachable(seal_group_creation_no_pending_admission);
+    reachable(seal_non_add_policy_no_pending_admission);
+    reachable(HydrationAuthority::plan_creation_without_pending_admission);
+    reachable(HydrationAuthority::plan_policy_without_pending_admission);
 }
 
 use std::time::Duration;
@@ -277,6 +284,102 @@ async fn g6_invitation_quota_allows_an_exact_empty_recipient_scope() {
     tx.rollback()
         .await
         .expect("rollback inviter-only quota proof");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated append-only gate database"]
+async fn g6_invitation_quota_uses_the_trigger_transaction_window_not_trusted_request_time() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let inviter = random_plc_did();
+    let recipients = [random_plc_did(), random_plc_did()];
+    let seeded_at = clock_now_millis(&pool).await;
+    for did in std::iter::once(&inviter).chain(recipients.iter()) {
+        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+            .bind(did)
+            .bind(seeded_at)
+            .execute(&pool)
+            .await
+            .expect("append unique rolling-window principal");
+    }
+    let inviter_device = Uuid::new_v4();
+    sqlx::query(
+        r#"INSERT INTO chat.devices(
+            user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+            capabilities,created_at,updated_at
+        ) VALUES($1,$2,'g6-window-inviter','active',$3,1,chat.protocol_capabilities(),$4,$4)"#,
+    )
+    .bind(&inviter)
+    .bind(inviter_device)
+    .bind(URL_SAFE_NO_PAD.encode(Sha256::digest(inviter_device.as_bytes())))
+    .bind(seeded_at)
+    .execute(&pool)
+    .await
+    .expect("append unique rolling-window inviter device");
+
+    let mut tx = pool.begin().await.expect("begin rolling-window proof");
+    let transaction_now: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', now())")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("sample the trigger transaction timestamp");
+    let outside_trigger_window =
+        transaction_now - chrono::Duration::hours(24) - chrono::Duration::milliseconds(1);
+    let inside_trigger_window =
+        transaction_now - chrono::Duration::hours(24) + chrono::Duration::milliseconds(1);
+    for (recipient, created_at) in recipients
+        .iter()
+        .zip([outside_trigger_window, inside_trigger_window])
+    {
+        let conversation_id = Uuid::new_v4();
+        let transition_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO chat.conversations(
+                conversation_id,kind,lifecycle,current_generation,
+                current_state_version,next_entry_seq,created_at
+            ) VALUES($1,'group','active',0,0,2,$2)"#,
+        )
+        .bind(conversation_id)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .expect("insert rollback-only quota conversation");
+        sqlx::query(
+            r#"INSERT INTO chat.participants(
+                participant_period_id,conversation_id,user_did,status,role,
+                role_transition_id,role_changed_at,created_by_did,
+                created_by_device_id,invitation_transition_id,
+                invitation_entry_id,invited_at,current_membership,created_at
+            ) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(conversation_id)
+        .bind(recipient)
+        .bind(transition_id)
+        .bind(created_at)
+        .bind(&inviter)
+        .bind(inviter_device)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .expect("insert rollback-only historical invitation");
+    }
+
+    // Deliberately earlier than transaction `now()`: the older row is inside
+    // this caller-selected window but outside the deferred trigger's window.
+    let trusted_locked_at = transaction_now - chrono::Duration::hours(1);
+    let guard = hydrate_locked_invitation_quota(&mut tx, &inviter, &[], trusted_locked_at)
+        .await
+        .expect("hydrate transaction-stable invitation quota");
+    assert_eq!(
+        guard.inviter_recent_24h(),
+        1,
+        "only the row inside transaction now()-24h matches the deferred trigger"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback historical invitation fixtures");
 }
 
 #[tokio::test]
@@ -5403,6 +5506,8 @@ mod historical_control_loader {
     // below; malformed terminal families remain fail-closed.
     // -----------------------------------------------------------------------
     pub(crate) mod recovery_leg {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
         use async_trait::async_trait;
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -5420,7 +5525,7 @@ mod historical_control_loader {
         use serde::Serialize;
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
-        use sqlx::{PgPool, Postgres, Transaction};
+        use sqlx::{PgPool, Postgres, Row, Transaction};
         use url::Url;
         use uuid::Uuid;
 
@@ -5439,7 +5544,8 @@ mod historical_control_loader {
             fixed_production_relationship_policy_config, AdmissionOperation, AdmissionRequest,
             AllocatedProjectionRevisionGuard as PolicyProjectionRevisionGuard, ProjectionClock,
             ProjectionOperationScope, PublicGet, PublicResponse, PublicTransport,
-            RelationshipAuthority, TransportError, TrustedRelationshipPersistenceInstant,
+            RelationshipAuthority, RelationshipProjection, TransportError,
+            TrustedRelationshipDecisionInstant, TrustedRelationshipPersistenceInstant,
         };
         use crate::chat_protocol::repository::auth::{
             authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
@@ -5456,11 +5562,12 @@ mod historical_control_loader {
             load_welcome_hydration_rows, map_recovery_control_evidence_error,
             recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
             select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
-            FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
-            RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
+            FulfilledRecoveryTerminalColumns, InvitationQuotaHydrationError,
+            LockedConversationHeadGuard, RecoveryHydrationError, RecoveryPackageHydrationError,
+            WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
-            EntryEntitlementKind, EventEntitlementKind, EventKind,
+            EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
         };
         use crate::chat_protocol::repository::execution_context::{
             apply_device_revocation_batch_sequential, hydrate_execution_context,
@@ -5470,6 +5577,7 @@ mod historical_control_loader {
         use crate::chat_protocol::repository::relationship::{
             allocate_projection_revision, load_fallback_relationship_projection,
             persist_relationship_projection, seal_group_creation_fallback_scope,
+            seal_group_creation_no_pending_admission, seal_non_add_policy_no_pending_admission,
         };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
@@ -5486,11 +5594,11 @@ mod historical_control_loader {
             CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
             DeviceRevocationEvidence, ExecutionActor, ExecutionAuthority, ExecutionContext,
             ExecutorError, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
-            LeaveRequestStatus, ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
-            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-            RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
-            SpineArtifacts, TransitionEvidence, WelcomeExpiryAuthority, WelcomeStatus,
-            WorkTerminalHydrationRow,
+            LeaveRequestStatus, LockedRegistrationProjection, ParticipantRole, ParticipantStatus,
+            PlanAuthority, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
+            RecoverySource, ReservationStatus, RevocationPackageCasBinding,
+            RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
+            WelcomeExpiryAuthority, WelcomeStatus, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -5506,9 +5614,12 @@ mod historical_control_loader {
             XWING_CIPHERSUITE,
         };
         use crate::common;
+        use crate::random_plc_did;
 
         #[derive(Clone, Copy)]
         struct CreationRelationshipTransport;
+
+        static CREATION_RELATIONSHIP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
         fn query_values(url: &Url, key: &str) -> Vec<String> {
             url.query_pairs()
@@ -5520,6 +5631,7 @@ mod historical_control_loader {
         #[async_trait]
         impl PublicTransport for CreationRelationshipTransport {
             async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+                CREATION_RELATIONSHIP_CALLS.fetch_add(1, AtomicOrdering::SeqCst);
                 let path = request.url.path();
                 if path.starts_with("/did:plc:") {
                     let actor = path.trim_start_matches('/');
@@ -8989,6 +9101,54 @@ mod historical_control_loader {
             entry
         }
 
+        fn creator_only_entry_from_invited(entry: &RealCreationEntry) -> RealCreationEntry {
+            let mut creator_only = RealCreationEntry {
+                cid: entry.cid,
+                entry_id: entry.entry_id,
+                public_row_json: entry.public_row_json.clone(),
+                raw_wrapper: entry.raw_wrapper.clone(),
+                public_key: entry.public_key.clone(),
+                outer_entry_fingerprint: entry.outer_entry_fingerprint,
+                actor_did: entry.actor_did.clone(),
+                actor_device_id: entry.actor_device_id,
+                actor_key_id: entry.actor_key_id.clone(),
+                signing_seed: entry.signing_seed,
+                head_next_entry_seq: entry.head_next_entry_seq,
+            };
+            let mut wrapper: Value =
+                serde_json::from_slice(&creator_only.raw_wrapper).expect("parse invited Creation");
+            wrapper["body"]["manifest"]["participants"]
+                .as_array_mut()
+                .expect("Creation participants")
+                .retain(|participant| {
+                    participant["userDid"].as_str() == Some(creator_only.actor_did.as_str())
+                });
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let canonical =
+                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
+                    .expect("creator-only Creation canonicalizes");
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(
+                    creator_only
+                        .signing_key()
+                        .sign(canonical.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            creator_only.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let mut row: Value = serde_json::from_slice(&creator_only.public_row_json)
+                .expect("parse invited Creation row");
+            row["signedRequest"] = wrapper;
+            creator_only.public_row_json = serde_json::to_vec(&row).unwrap();
+            creator_only.outer_entry_fingerprint = *decode_and_verify_control_entry(
+                &creator_only.public_row_json,
+                &creator_only.public_key,
+            )
+            .expect("creator-only Creation verifies")
+            .outer_control_fingerprint();
+            creator_only
+        }
+
         pub(crate) fn build_fresh_add_crypto_fixture(
             cid: Uuid,
             add_transition_id: Uuid,
@@ -9252,6 +9412,893 @@ mod historical_control_loader {
             )
         }
 
+        async fn assert_exact_g6_creation_persistence(
+            tx: &mut Transaction<'_, Postgres>,
+            plan: &ConversationPersistencePlan,
+            context: &ExecutionContext,
+            trusted_at: DateTime<Utc>,
+        ) {
+            let coordinate = plan
+                .successor_coordinate()
+                .expect("Creation has one successor coordinate");
+            let conversation_id = Uuid::from_bytes(*coordinate.conversation_id());
+            let control = context
+                .authority
+                .control_entry()
+                .expect("Creation execution authority retains the exact control entry");
+            let signed: Value =
+                serde_json::from_slice(&control.signed_request_bytes).expect("parse Creation body");
+            let transition_id =
+                Uuid::parse_str(signed["body"]["transitionId"].as_str().unwrap()).unwrap();
+            let metadata = plan
+                .effects()
+                .metadata_change()
+                .and_then(|change| change.after())
+                .expect("Creation carries metadata");
+            let metadata_author = context
+                .metadata_author
+                .as_ref()
+                .expect("Creation carries metadata author columns");
+
+            let exact_head: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       kind='group' AND lifecycle='active'
+                       AND current_generation=$2 AND current_state_version=$3
+                       AND next_entry_seq=2
+                       AND direct_did_low IS NULL AND direct_did_high IS NULL
+                       AND created_at=$4
+                       AND close_transition_id IS NULL AND close_generation IS NULL
+                       AND close_state_version IS NULL AND close_seq IS NULL AND closed_at IS NULL
+                   ) FROM chat.conversations WHERE conversation_id=$1"#,
+            )
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation head");
+            assert!(exact_head, "Creation head projection is exact");
+
+            let exact_generation: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       group_id=$3 AND lifecycle='active'
+                       AND genesis_group_info_bytes=$4 AND genesis_group_info_sha256=$5
+                       AND current_state_version=$6 AND activated_seq=1 AND activated_at=$7
+                       AND superseded_seq IS NULL AND superseded_at IS NULL
+                   ) FROM chat.generations WHERE conversation_id=$1 AND generation=$2"#,
+            )
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(coordinate.group_id().as_slice())
+            .bind(&context.spine.genesis_group_info_bytes)
+            .bind(&context.spine.genesis_group_info_sha256)
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation generation");
+            assert!(exact_generation, "Creation generation projection is exact");
+
+            let exact_state: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       group_id=$4 AND epoch=$5 AND group_context_hash=$6 AND confirmation_tag=$7
+                       AND lifecycle='active' AND state_kind='creation'
+                       AND producing_transition_id=$8
+                       AND public_snapshot_bytes=$9 AND snapshot_sha256=$10
+                       AND tree_summary_bytes=$11 AND tree_summary_sha256=$12
+                       AND leaf_count=$13 AND created_at=$14
+                   ) FROM chat.generation_states
+                   WHERE conversation_id=$1 AND generation=$2 AND state_version=$3"#,
+            )
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(coordinate.group_id().as_slice())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().as_slice())
+            .bind(coordinate.confirmation_tag().as_slice())
+            .bind(transition_id)
+            .bind(&context.spine.public_snapshot_bytes)
+            .bind(&context.spine.public_snapshot_sha256)
+            .bind(&context.spine.tree_summary_bytes)
+            .bind(&context.spine.tree_summary_sha256)
+            .bind(context.spine.leaf_count)
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation generation state");
+            assert!(exact_state, "Creation generation-state projection is exact");
+
+            let exact_entry: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       entry_id=$3 AND entry_kind=$4
+                       AND accepted_payload_bytes=$5 AND accepted_payload_sha256=$6
+                       AND signed_request_bytes=$7 AND request_digest=$8 AND signature=$9
+                       AND server_fields_bytes=$10 AND outer_entry_fingerprint=$11
+                       AND actor_did=$12 AND actor_device_id=$13 AND actor_key_id=$14
+                       AND actor_auth_generation=$15
+                       AND generation=$16 AND state_version=$17 AND transition_id=$18
+                       AND message_id IS NULL AND received_at=$19
+                   ) FROM chat.entries WHERE conversation_id=$1 AND seq=$2"#,
+            )
+            .bind(conversation_id)
+            .bind(1_i64)
+            .bind(control.entry_id)
+            .bind(&control.entry_kind)
+            .bind(&control.accepted_payload_bytes)
+            .bind(&control.accepted_payload_sha256)
+            .bind(&control.signed_request_bytes)
+            .bind(&control.request_digest)
+            .bind(&control.signature)
+            .bind(&control.server_fields_bytes)
+            .bind(&control.outer_entry_fingerprint)
+            .bind(&context.actor.user_did)
+            .bind(context.actor.device_id)
+            .bind(&context.actor.key_id)
+            .bind(context.actor.auth_generation)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(transition_id)
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation entry");
+            assert!(exact_entry, "Creation entry projection is exact");
+
+            let exact_transition: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       conversation_id=$2 AND kind='creation'
+                       AND actor_did=$3 AND actor_device_id=$4 AND actor_key_id=$5
+                       AND actor_auth_generation=$6 AND actor_role='admin'
+                       AND actor_device_status='active'
+                       AND signed_request_bytes=$7 AND unsigned_projection_bytes=$8
+                       AND signing_transcript_bytes=$9 AND request_digest=$10 AND signature=$11
+                       AND prior_generation IS NULL AND prior_state_version IS NULL
+                       AND next_generation=$12 AND next_state_version=$13
+                       AND retired_generation IS NULL AND retired_state_version IS NULL
+                       AND successor_generation IS NULL AND successor_state_version IS NULL
+                       AND reset_request_id IS NULL AND close_transition_id IS NULL
+                       AND metadata_snapshot_id=$14 AND entry_seq=1 AND accepted_at=$15
+                   ) FROM chat.transitions WHERE transition_id=$1"#,
+            )
+            .bind(transition_id)
+            .bind(conversation_id)
+            .bind(&context.actor.user_did)
+            .bind(context.actor.device_id)
+            .bind(&context.actor.key_id)
+            .bind(context.actor.auth_generation)
+            .bind(&control.signed_request_bytes)
+            .bind(&control.unsigned_projection_bytes)
+            .bind(&control.signing_transcript_bytes)
+            .bind(&control.request_digest)
+            .bind(&control.signature)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(metadata_author.metadata_snapshot_id)
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation transition");
+            assert!(exact_transition, "Creation transition projection is exact");
+
+            let exact_metadata: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       conversation_id=$2 AND generation=$3 AND state_version=$4
+                       AND group_id=$5 AND epoch=$6 AND group_context_hash=$7 AND confirmation_tag=$8
+                       AND producing_transition_id=$9 AND origin_transition_id=$9
+                       AND metadata_version=$10 AND nonce=$11 AND ciphertext=$12
+                       AND ciphertext_sha256=$13 AND ciphertext_size=$14
+                       AND avatar_blob_id IS NULL AND avatar_ciphertext_sha256 IS NULL
+                       AND avatar_ciphertext_size IS NULL AND avatar_purpose IS NULL
+                       AND avatar_binding_origin_transition_id IS NULL
+                       AND avatar_binding_metadata_version IS NULL
+                       AND avatar_binding_owner_did IS NULL AND avatar_binding_owner_device_id IS NULL
+                       AND author_did=$15 AND author_device_id=$16 AND author_key_id=$17
+                       AND author_public_key=$18 AND author_auth_generation=$19
+                       AND author_origin_seq=1 AND author_role=$20
+                       AND author_device_status=$21 AND created_at=$22
+                   ) FROM chat.metadata_snapshots WHERE metadata_snapshot_id=$1"#,
+            )
+            .bind(metadata_author.metadata_snapshot_id)
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(coordinate.group_id().as_slice())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().as_slice())
+            .bind(coordinate.confirmation_tag().as_slice())
+            .bind(transition_id)
+            .bind(i64::try_from(metadata.metadata_version()).unwrap())
+            .bind(metadata.nonce().as_slice())
+            .bind(metadata.ciphertext())
+            .bind(metadata.ciphertext_sha256().as_slice())
+            .bind(i64::try_from(metadata.ciphertext().len()).unwrap())
+            .bind(&context.actor.user_did)
+            .bind(context.actor.device_id)
+            .bind(&metadata_author.author_key_id)
+            .bind(&metadata_author.author_public_key)
+            .bind(context.actor.auth_generation)
+            .bind(&metadata_author.author_role)
+            .bind(&metadata_author.author_device_status)
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation metadata");
+            assert!(exact_metadata, "Creation metadata projection is exact");
+
+            assert_eq!(
+                plan.state().participants.len(),
+                context.participant_period_ids.len()
+            );
+            for (participant, period_id) in plan
+                .state()
+                .participants
+                .iter()
+                .zip(&context.participant_period_ids)
+            {
+                let did = String::from_utf8(participant.principal.as_bytes().to_vec()).unwrap();
+                let status = match participant.status {
+                    ParticipantStatus::Active => "active",
+                    ParticipantStatus::Pending => "pending",
+                };
+                let role = match participant.role {
+                    ParticipantRole::Member => "member",
+                    ParticipantRole::Admin => "admin",
+                };
+                let invited = participant.invitation.is_some();
+                let exact_participant: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                           conversation_id=$2 AND user_did=$3 AND status=$4 AND role=$5
+                           AND role_transition_id=$6 AND role_changed_at=$7
+                           AND created_by_did=$8 AND created_by_device_id=$9
+                           AND (($10 AND invitation_transition_id=$6 AND invitation_entry_id=$11
+                                      AND invited_at=$7)
+                                OR (NOT $10 AND invitation_transition_id IS NULL
+                                      AND invitation_entry_id IS NULL AND invited_at IS NULL))
+                           AND acceptance_transition_id IS NULL AND acceptance_entry_id IS NULL
+                           AND accepted_at IS NULL AND removing_transition_id IS NULL
+                           AND removing_seq IS NULL AND removed_at IS NULL
+                           AND current_membership AND created_at=$7
+                       ) FROM chat.participants WHERE participant_period_id=$1"#,
+                )
+                .bind(*period_id)
+                .bind(conversation_id)
+                .bind(&did)
+                .bind(status)
+                .bind(role)
+                .bind(transition_id)
+                .bind(trusted_at)
+                .bind(&context.actor.user_did)
+                .bind(context.actor.device_id)
+                .bind(invited)
+                .bind(control.entry_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("project exact Creation participant");
+                assert!(
+                    exact_participant,
+                    "participant projection is exact for {did}"
+                );
+            }
+
+            assert_eq!(plan.state().leaves.len(), 1);
+            assert_eq!(context.opened_leaves.len(), 1);
+            assert_eq!(context.leaf_period_ids.len(), 1);
+            let leaf = &plan.state().leaves[0];
+            let leaf_columns = &context.opened_leaves[0];
+            let leaf_did = String::from_utf8(leaf.device.principal().as_bytes().to_vec()).unwrap();
+            let leaf_participant = plan
+                .state()
+                .participants
+                .iter()
+                .position(|participant| participant.principal == *leaf.device.principal())
+                .unwrap();
+            let exact_leaf: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       participant_period_id=$2 AND conversation_id=$3 AND generation=$4
+                       AND user_did=$5 AND device_id=$6 AND leaf_index=$7
+                       AND basic_credential=$8 AND leaf_signature_key=$9
+                       AND leaf_key_id=$10 AND leaf_auth_generation=$11
+                       AND origin='genesis' AND join_key_package_ref IS NULL
+                       AND joined_state_version=$12 AND joined_transition_id=$13 AND joined_seq=1
+                       AND removed_state_version IS NULL AND removed_transition_id IS NULL
+                       AND removed_seq IS NULL AND removed_at IS NULL AND active AND created_at=$14
+                   ) FROM chat.member_devices WHERE leaf_period_id=$1"#,
+            )
+            .bind(context.leaf_period_ids[0])
+            .bind(context.participant_period_ids[leaf_participant])
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(&leaf_did)
+            .bind(Uuid::from_bytes(*leaf.device.device_id()))
+            .bind(i64::from(leaf.leaf_index))
+            .bind(&leaf.basic_credential)
+            .bind(&leaf.signature_key)
+            .bind(&leaf_columns.leaf_key_id)
+            .bind(leaf_columns.leaf_auth_generation)
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(transition_id)
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation leaf");
+            assert!(exact_leaf, "Creation leaf projection is exact");
+
+            let exact_interval: bool = sqlx::query_scalar(
+                r#"SELECT count(*)=1 AND bool_and(
+                       conversation_id=$2 AND generation=$3 AND recipient_did=$4
+                       AND recipient_device_id=$5 AND start_seq=1 AND opening_kind='creation'
+                       AND opening_transition_id=$1 AND opening_outer_entry_fingerprint=$6
+                       AND opening_state_version=$7 AND opening_group_id=$8 AND opening_epoch=$9
+                       AND opening_group_context_hash=$10 AND opening_confirmation_tag=$11
+                       AND opening_leaf_period_id=$12
+                       AND terminal_seq IS NULL AND closing_state_version IS NULL
+                       AND closing_transition_id IS NULL AND closing_outer_entry_fingerprint IS NULL
+                       AND closing_kind IS NULL AND closing_leaf_period_id IS NULL
+                       AND removed_at IS NULL AND created_at=$13
+                   ) FROM chat.application_intervals WHERE membership_interval_id=$1"#,
+            )
+            .bind(transition_id)
+            .bind(conversation_id)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(&leaf_did)
+            .bind(Uuid::from_bytes(*leaf.device.device_id()))
+            .bind(&control.outer_entry_fingerprint)
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(coordinate.group_id().as_slice())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().as_slice())
+            .bind(coordinate.confirmation_tag().as_slice())
+            .bind(context.leaf_period_ids[0])
+            .bind(trusted_at)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("project exact Creation application interval");
+            assert!(
+                exact_interval,
+                "Creation application interval projection is exact"
+            );
+
+            let entry_recipients: Vec<(String, Uuid, String)> = sqlx::query_as(
+                r#"SELECT user_did,device_id,entitlement_kind
+                     FROM chat.entry_recipients
+                    WHERE conversation_id=$1 AND seq=1
+                    ORDER BY user_did COLLATE "C",device_id"#,
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut **tx)
+            .await
+            .expect("project exact Creation entry audience");
+            let expected_entry_recipients = context
+                .entry_recipients
+                .iter()
+                .map(|(device, kind)| {
+                    (
+                        String::from_utf8(device.principal().as_bytes().to_vec()).unwrap(),
+                        Uuid::from_bytes(*device.device_id()),
+                        match kind {
+                            EntryEntitlementKind::Control => "control",
+                            EntryEntitlementKind::IntervalClose => "intervalClose",
+                            EntryEntitlementKind::ScheduleTerminal => "scheduleTerminal",
+                        }
+                        .to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(entry_recipients, expected_entry_recipients);
+
+            assert_eq!(context.events.len(), 1);
+            assert_eq!(context.events[0].event_kind, EventKind::ConversationChanged);
+            assert_eq!(context.events[0].recipients.len(), 2);
+            assert_eq!(context.events[0].outbox.len(), 1);
+            assert_eq!(
+                context.events[0].outbox,
+                vec![(context.events[0].outbox[0].0, OutboxWorkKind::Stream)]
+            );
+            for event in &context.events {
+                let row = sqlx::query(
+                    "SELECT event_position,event_kind,payload_bytes,payload_sha256,created_at,\
+                            protocol_instance_id FROM chat.events WHERE event_id=$1",
+                )
+                .bind(event.event_id)
+                .fetch_one(&mut **tx)
+                .await
+                .expect("project exact Creation event");
+                let position: i64 = row.get("event_position");
+                assert_eq!(
+                    row.get::<String, _>("event_kind"),
+                    match event.event_kind {
+                        EventKind::ConversationChanged => "conversationChanged",
+                        EventKind::ConversationClosed => "conversationClosed",
+                        EventKind::MessageAvailable => "messageAvailable",
+                        EventKind::WelcomeAvailable => "welcomeAvailable",
+                        EventKind::WelcomeDisposition => "welcomeDisposition",
+                        EventKind::ResetRequested => "resetRequested",
+                        EventKind::LeafRecovery => "leafRecovery",
+                        EventKind::LeaveRequest => "leaveRequest",
+                        EventKind::AccessEnded => "accessEnded",
+                        EventKind::Watermark => "watermark",
+                    }
+                );
+                assert_eq!(row.get::<Vec<u8>, _>("payload_bytes"), event.payload_bytes);
+                assert_eq!(
+                    row.get::<Vec<u8>, _>("payload_sha256"),
+                    Sha256::digest(&event.payload_bytes).to_vec()
+                );
+                assert_eq!(row.get::<DateTime<Utc>, _>("created_at"), trusted_at);
+                assert_eq!(
+                    row.get::<Uuid, _>("protocol_instance_id"),
+                    context.protocol_instance_id
+                );
+
+                let actual_fanout: Vec<(String, Uuid, String, Option<i64>)> = sqlx::query_as(
+                    r#"SELECT user_did,device_id,entitlement_kind,audience_predecessor_position
+                         FROM chat.event_recipients WHERE event_position=$1
+                         ORDER BY user_did COLLATE "C",device_id"#,
+                )
+                .bind(position)
+                .fetch_all(&mut **tx)
+                .await
+                .expect("project exact Creation event audience");
+                let expected_fanout = event
+                    .recipients
+                    .iter()
+                    .map(|(device, kind, predecessor)| {
+                        (
+                            String::from_utf8(device.principal().as_bytes().to_vec()).unwrap(),
+                            Uuid::from_bytes(*device.device_id()),
+                            match kind {
+                                EventEntitlementKind::Participant => "participant",
+                                EventEntitlementKind::Leaf => "leaf",
+                                EventEntitlementKind::Welcome => "welcome",
+                                EventEntitlementKind::Recovery => "recovery",
+                                EventEntitlementKind::HistoricalSchedule => "historicalSchedule",
+                            }
+                            .to_owned(),
+                            *predecessor,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual_fanout, expected_fanout);
+
+                let actual_outbox: Vec<(Uuid, String, String, i64, DateTime<Utc>, DateTime<Utc>)> =
+                    sqlx::query_as(
+                        "SELECT outbox_id,work_kind,status,attempt_count,next_attempt_at,created_at \
+                           FROM chat.outbox WHERE event_position=$1 ORDER BY work_kind",
+                    )
+                    .bind(position)
+                    .fetch_all(&mut **tx)
+                    .await
+                    .expect("project exact Creation outbox");
+                let mut expected_outbox = event
+                    .outbox
+                    .iter()
+                    .map(|(id, kind)| {
+                        (
+                            *id,
+                            match kind {
+                                OutboxWorkKind::Stream => "stream",
+                                OutboxWorkKind::Notification => "notification",
+                                OutboxWorkKind::Recovery => "recovery",
+                            }
+                            .to_owned(),
+                            "pending".to_owned(),
+                            0_i64,
+                            trusted_at,
+                            trusted_at,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                expected_outbox.sort_by(|left, right| left.1.cmp(&right.1));
+                assert_eq!(actual_outbox, expected_outbox);
+            }
+
+            for (table, count) in [
+                (
+                    "application_schedule_terminal_proofs",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.application_schedule_terminal_proofs \
+                         WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "key_package_reservations",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.key_package_reservations WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "reset_requests",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "leaf_recovery_requests",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.leaf_recovery_requests WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "leave_requests",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.leave_requests WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "welcome_bundles",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.welcome_bundles WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+                (
+                    "recovery_work_items",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.recovery_work_items WHERE conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut **tx)
+                    .await
+                    .unwrap(),
+                ),
+            ] {
+                assert_eq!(count, 0, "Creation unexpectedly touched {table}");
+            }
+        }
+
+        async fn assert_zero_g6_creation_residue(
+            pool: &PgPool,
+            conversation_id: Uuid,
+            context: &ExecutionContext,
+        ) {
+            for table in [
+                "application_intervals",
+                "application_schedule_terminal_proofs",
+                "entry_recipients",
+                "welcome_bundles",
+                "recovery_work_items",
+                "message_sends",
+                "entries",
+                "key_package_reservations",
+                "reset_requests",
+                "leaf_recovery_requests",
+                "leave_requests",
+                "member_devices",
+                "participants",
+                "metadata_snapshots",
+                "transitions",
+                "generation_states",
+                "generations",
+                "conversations",
+            ] {
+                let sql = format!("SELECT count(*) FROM chat.{table} WHERE conversation_id=$1");
+                let count: i64 = sqlx::query_scalar(&sql)
+                    .bind(conversation_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or_else(|error| panic!("query rollback residue for {table}: {error}"));
+                assert_eq!(count, 0, "rollback left residue in chat.{table}");
+            }
+            for (table, count) in [
+                (
+                    "welcome_deliveries",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.welcome_deliveries delivery \
+                         JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                         WHERE bundle.conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("query rolled-back welcome deliveries"),
+                ),
+                (
+                    "welcome_dispositions",
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM chat.welcome_dispositions disposition \
+                         JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                         WHERE bundle.conversation_id=$1",
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("query rolled-back welcome dispositions"),
+                ),
+            ] {
+                assert_eq!(count, 0, "rollback left residue in chat.{table}");
+            }
+            let event_ids = context
+                .events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>();
+            let event_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM chat.events WHERE event_id=ANY($1)")
+                    .bind(&event_ids)
+                    .fetch_one(pool)
+                    .await
+                    .expect("query rolled-back events");
+            let recipient_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.event_recipients recipient \
+                 JOIN chat.events event USING(event_position) WHERE event.event_id=ANY($1)",
+            )
+            .bind(&event_ids)
+            .fetch_one(pool)
+            .await
+            .expect("query rolled-back event recipients");
+            let outbox_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.outbox outbox \
+                 JOIN chat.events event USING(event_position) WHERE event.event_id=ANY($1)",
+            )
+            .bind(&event_ids)
+            .fetch_one(pool)
+            .await
+            .expect("query rolled-back outbox");
+            assert_eq!((event_count, recipient_count, outbox_count), (0, 0, 0));
+        }
+
+        async fn seed_g6_pending_invitation(
+            tx: &mut Transaction<'_, Postgres>,
+            inviter: &str,
+            inviter_device: Uuid,
+            recipient: &str,
+            at: DateTime<Utc>,
+        ) {
+            let conversation_id = Uuid::new_v4();
+            let transition_id = Uuid::new_v4();
+            sqlx::query(
+                r#"INSERT INTO chat.conversations(
+                    conversation_id,kind,lifecycle,current_generation,
+                    current_state_version,next_entry_seq,created_at
+                ) VALUES($1,'group','active',0,0,2,$2)"#,
+            )
+            .bind(conversation_id)
+            .bind(at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert rollback-only quota conversation");
+            sqlx::query(
+                r#"INSERT INTO chat.participants(
+                    participant_period_id,conversation_id,user_did,status,role,
+                    role_transition_id,role_changed_at,created_by_did,
+                    created_by_device_id,invitation_transition_id,
+                    invitation_entry_id,invited_at,current_membership,created_at
+                ) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(conversation_id)
+            .bind(recipient)
+            .bind(transition_id)
+            .bind(at)
+            .bind(inviter)
+            .bind(inviter_device)
+            .bind(Uuid::new_v4())
+            .execute(&mut **tx)
+            .await
+            .expect("insert rollback-only pending invitation");
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn assert_g6_creation_quota_denials<T: PublicTransport>(
+            tx: &mut Transaction<'_, Postgres>,
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            head: &LockedConversationHeadGuard,
+            registration: &LockedRegistrationProjection,
+            relationship: &RelationshipProjection,
+            relationship_authority: &RelationshipAuthority<T>,
+            relationship_decision: &TrustedRelationshipDecisionInstant,
+            trusted: &TrustedRequestInstant,
+            trusted_at: DateTime<Utc>,
+            dpop_jkt: &str,
+        ) {
+            let hydration = HydrationAuthority::from_locked_creation_head(head)
+                .expect("reuse exact locked Creation hydration");
+            for (savepoint, dimension, expected_inviter, expected_pair, expected_recipient) in [
+                ("g6_pair_limit", "pair", 5_u64, 5_u64, 5_u64),
+                ("g6_recipient_limit", "recipient", 0_u64, 0_u64, 100_u64),
+                ("g6_inviter_limit", "inviter", 100_u64, 0_u64, 0_u64),
+            ] {
+                sqlx::query(&format!("SAVEPOINT {savepoint}"))
+                    .execute(&mut **tx)
+                    .await
+                    .expect("open quota denial savepoint");
+
+                match dimension {
+                    "pair" => {
+                        for _ in 0..5 {
+                            seed_g6_pending_invitation(
+                                tx,
+                                &entry.actor_did,
+                                entry.actor_device_id,
+                                &invitee.did,
+                                trusted_at,
+                            )
+                            .await;
+                        }
+                    }
+                    "recipient" => {
+                        for _ in 0..100 {
+                            let fake_inviter = random_plc_did();
+                            let fake_device = Uuid::new_v4();
+                            sqlx::query(
+                                "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)",
+                            )
+                            .bind(&fake_inviter)
+                            .bind(trusted_at)
+                            .execute(&mut **tx)
+                            .await
+                            .expect("insert recipient-limit inviter");
+                            sqlx::query(
+                                r#"INSERT INTO chat.devices(
+                                    user_did,device_id,device_name,status,dpop_jkt,
+                                    auth_generation,capabilities,created_at,updated_at
+                                ) VALUES($1,$2,'g6-recipient-limit','active',$3,1,
+                                    chat.protocol_capabilities(),$4,$4)"#,
+                            )
+                            .bind(&fake_inviter)
+                            .bind(fake_device)
+                            .bind(dpop_jkt)
+                            .bind(trusted_at)
+                            .execute(&mut **tx)
+                            .await
+                            .expect("insert recipient-limit inviter device");
+                            seed_g6_pending_invitation(
+                                tx,
+                                &fake_inviter,
+                                fake_device,
+                                &invitee.did,
+                                trusted_at,
+                            )
+                            .await;
+                        }
+                    }
+                    "inviter" => {
+                        for _ in 0..100 {
+                            let fake_recipient = random_plc_did();
+                            sqlx::query(
+                                "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)",
+                            )
+                            .bind(&fake_recipient)
+                            .bind(trusted_at)
+                            .execute(&mut **tx)
+                            .await
+                            .expect("insert inviter-limit recipient");
+                            seed_g6_pending_invitation(
+                                tx,
+                                &entry.actor_did,
+                                entry.actor_device_id,
+                                &fake_recipient,
+                                trusted_at,
+                            )
+                            .await;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+
+                let quota = hydrate_locked_invitation_quota(
+                    tx,
+                    &entry.actor_did,
+                    std::slice::from_ref(&invitee.did),
+                    trusted_at,
+                )
+                .await
+                .expect("hydrate exact over-limit quota guard");
+                assert_eq!(quota.inviter_recent_24h(), expected_inviter, "{dimension}");
+                assert_eq!(quota.recipient_facts()[0].pair_live(), expected_pair);
+                assert_eq!(
+                    quota.recipient_facts()[0].recipient_live(),
+                    expected_recipient
+                );
+                assert!(quota.would_exceed(), "{dimension} successor must exceed");
+
+                let verified =
+                    decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                        .expect("verify exact over-limit Creation");
+                let verified =
+                    rebind_persisted_control_entry(verified, &entry.raw_wrapper, &entry.public_key)
+                        .expect("retain exact over-limit Creation wrapper");
+                let error = hydration
+                    .plan_creation(
+                        verified,
+                        registration,
+                        Some(head),
+                        None,
+                        relationship,
+                        relationship_authority,
+                        quota,
+                        relationship_decision,
+                        trusted,
+                    )
+                    .expect_err("production Creation planner must deny an exceeded quota");
+                assert!(
+                    matches!(
+                        error,
+                        crate::chat_protocol::state_machine::StateMachineError::InvalidPolicyAuthority
+                    ),
+                    "{dimension} denial returned {error:?}"
+                );
+
+                sqlx::query(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
+                    .execute(&mut **tx)
+                    .await
+                    .expect("rollback quota denial fixtures");
+                sqlx::query(&format!("RELEASE SAVEPOINT {savepoint}"))
+                    .execute(&mut **tx)
+                    .await
+                    .expect("release quota denial savepoint");
+            }
+
+            sqlx::query("SAVEPOINT g6_noncanonical_scopes")
+                .execute(&mut **tx)
+                .await
+                .expect("open noncanonical scope savepoint");
+            let second_recipient = random_plc_did();
+            sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+                .bind(&second_recipient)
+                .bind(trusted_at)
+                .execute(&mut **tx)
+                .await
+                .expect("insert reordered-scope principal");
+            let duplicate = hydrate_locked_invitation_quota(
+                tx,
+                &entry.actor_did,
+                &[invitee.did.clone(), invitee.did.clone()],
+                trusted_at,
+            )
+            .await
+            .expect_err("duplicate recipient scope fails closed");
+            assert!(matches!(
+                duplicate,
+                InvitationQuotaHydrationError::NonCanonicalScope
+            ));
+            let mut reordered = vec![invitee.did.clone(), second_recipient];
+            reordered.sort();
+            reordered.reverse();
+            let reordered_error =
+                hydrate_locked_invitation_quota(tx, &entry.actor_did, &reordered, trusted_at)
+                    .await
+                    .expect_err("reordered recipient scope fails closed");
+            assert!(matches!(
+                reordered_error,
+                InvitationQuotaHydrationError::NonCanonicalScope
+            ));
+            sqlx::query("ROLLBACK TO SAVEPOINT g6_noncanonical_scopes")
+                .execute(&mut **tx)
+                .await
+                .expect("rollback noncanonical scope fixtures");
+            sqlx::query("RELEASE SAVEPOINT g6_noncanonical_scopes")
+                .execute(&mut **tx)
+                .await
+                .expect("release noncanonical scope savepoint");
+        }
+
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_full_production_creation_path_applies_then_rolls_back_without_residue() {
@@ -9267,6 +10314,7 @@ mod historical_control_loader {
             );
             let conversation_id = Uuid::new_v4();
             let fixture = build_fresh_creation_crypto_fixture(conversation_id, trusted_at);
+            let creator_only_entry = creator_only_entry_from_invited(&fixture.entry);
             let entry = fixture.entry;
             let invitee = fixture.invitee;
             let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(Uuid::new_v4().as_bytes()));
@@ -9346,6 +10394,199 @@ mod historical_control_loader {
                     .expect("fixed production relationship configuration"),
                 CreationRelationshipTransport,
             );
+            let non_add_policy = genuine_policy_control(
+                &entry,
+                fixture.genesis.coordinate(),
+                2,
+                &trusted_text,
+                vec![GenuinePolicyChange::Remove(&invitee.did)],
+            );
+            let skipped_add_policy = genuine_policy_control(
+                &entry,
+                fixture.genesis.coordinate(),
+                2,
+                &trusted_text,
+                vec![GenuinePolicyChange::Add(&invitee.did)],
+            );
+            let non_add_policy_request = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.submitTransition",
+                    &trusted_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &dpop_jkt,
+                ),
+                decode_canonical_signed_mutation(&non_add_policy.entry.signed_request_bytes)
+                    .expect("non-add Policy canonicalizes for auth"),
+            )
+            .await
+            .expect("authorize exact non-add Policy")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => panic!("fresh non-add Policy replayed"),
+            };
+            let skipped_add_policy_request = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.submitTransition",
+                    &trusted_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &dpop_jkt,
+                ),
+                decode_canonical_signed_mutation(&skipped_add_policy.entry.signed_request_bytes)
+                    .expect("skipped-add Policy canonicalizes for auth"),
+            )
+            .await
+            .expect("authorize exact skipped-add Policy")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => {
+                    panic!("fresh skipped-add Policy replayed")
+                }
+            };
+
+            let creator_only_request = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.createConversation",
+                    &trusted_text,
+                    &creator_only_entry.actor_did,
+                    creator_only_entry.actor_device_id,
+                    &dpop_jkt,
+                ),
+                decode_canonical_signed_mutation(&creator_only_entry.raw_wrapper)
+                    .expect("creator-only Creation canonicalizes for auth"),
+            )
+            .await
+            .expect("authorize exact creator-only Creation")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => {
+                    panic!("fresh creator-only Creation replayed")
+                }
+            };
+            let calls_before_creator_only =
+                CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst);
+            let mut creator_only_tx = pool
+                .begin()
+                .await
+                .expect("begin creator-only Creation transaction");
+            let creator_only_business =
+                recheck_business_authority(&mut creator_only_tx, &creator_only_request)
+                    .await
+                    .expect("recheck creator-only actor authority");
+            let creator_only_head =
+                hydrate_locked_creation_head(&mut creator_only_tx, conversation_id, trusted_at)
+                    .await
+                    .expect("lock creator-only absent head");
+            let creator_only_quota = hydrate_locked_invitation_quota(
+                &mut creator_only_tx,
+                &creator_only_entry.actor_did,
+                &[],
+                trusted_at,
+            )
+            .await
+            .expect("lock exact empty creator-only quota");
+            let creator_only_hydration =
+                HydrationAuthority::from_locked_creation_head(&creator_only_head)
+                    .expect("mint creator-only hydration authority");
+            let creator_only_registration = creator_only_hydration
+                .locked_registration_from_guard(creator_only_business)
+                .expect("seal creator-only registration");
+            let creator_only_no_admission = seal_group_creation_no_pending_admission(
+                &creator_only_head,
+                &creator_only_quota,
+                &creator_only_registration,
+            )
+            .expect("seal exact no-pending Creation branch");
+            let creator_only_verified = decode_and_verify_control_entry(
+                &creator_only_entry.public_row_json,
+                &creator_only_entry.public_key,
+            )
+            .expect("verify exact creator-only Creation");
+            let creator_only_verified = rebind_persisted_control_entry(
+                creator_only_verified,
+                &creator_only_entry.raw_wrapper,
+                &creator_only_entry.public_key,
+            )
+            .expect("retain exact creator-only signed wrapper");
+            let creator_only_decision = creator_only_hydration
+                .plan_creation_without_pending_admission(
+                    creator_only_verified,
+                    &creator_only_registration,
+                    &creator_only_head,
+                    creator_only_quota,
+                    creator_only_no_admission,
+                    &trusted,
+                )
+                .expect("plan genuine creator-only Creation without admission");
+            let CreationDecision::Create(creator_only_planned) = creator_only_decision else {
+                panic!("creator-only group Creation is never ExistingDirect");
+            };
+            let creator_only_quota_cas = creator_only_planned
+                .effects()
+                .invitation_quota_cas()
+                .expect("creator-only plan retains exact empty quota binding");
+            assert!(creator_only_quota_cas.new_recipients().is_empty());
+            assert!(creator_only_quota_cas.recipient_facts().is_empty());
+            assert_eq!(
+                creator_only_quota_cas.expected_inviter_recent_24h(),
+                creator_only_quota_cas.successor_inviter_recent_24h(),
+                "empty scope consumes zero inviter quota"
+            );
+            let creator_only_plan = creator_only_planned
+                .into_persistence_plan()
+                .expect("seal creator-only persistence plan");
+            let creator_only_context = hydrate_execution_context(
+                &mut creator_only_tx,
+                &creator_only_plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(creator_only_entry.public_row_json.clone()),
+                    genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
+                    primary_event_payload: Some(b"{\"kind\":\"g6CreatorOnly\"}".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect("hydrate creator-only execution context");
+            apply_conversation_persistence_plan(
+                &mut creator_only_tx,
+                &creator_only_plan,
+                &creator_only_context,
+            )
+            .await
+            .expect("apply creator-only Creation");
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *creator_only_tx)
+                .await
+                .expect("force creator-only deferred constraints");
+            let creator_only_participants: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *creator_only_tx)
+            .await
+            .expect("read creator-only participant count");
+            assert_eq!(creator_only_participants, 1);
+            assert_eq!(
+                CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst),
+                calls_before_creator_only,
+                "creator-only Creation performs zero external relationship calls"
+            );
+
+            creator_only_tx
+                .rollback()
+                .await
+                .expect("rollback creator-only Creation");
+
             let mut roster = vec![entry.actor_did.clone(), invitee.did.clone()];
             roster.sort();
             let admission = AdmissionRequest {
@@ -9437,6 +10678,10 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate exact three-dimensional invitation quota");
+            assert_eq!(quota.inviter_recent_24h(), 0);
+            assert_eq!(quota.recipient_facts().len(), 1);
+            assert_eq!(quota.recipient_facts()[0].pair_live(), 0);
+            assert_eq!(quota.recipient_facts()[0].recipient_live(), 0);
             let hydration = HydrationAuthority::from_locked_creation_head(&head)
                 .expect("mint locked Creation hydration authority");
             let registration = hydration
@@ -9449,6 +10694,20 @@ mod historical_control_loader {
                     .await
                     .expect("load production fallback projection")
                     .expect("fresh fallback is present");
+            assert_g6_creation_quota_denials(
+                &mut tx,
+                &entry,
+                &invitee,
+                &head,
+                &registration,
+                &relationship,
+                &authority,
+                &relationship_decision,
+                &trusted,
+                trusted_at,
+                &dpop_jkt,
+            )
+            .await;
             let verified =
                 decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
                     .expect("verify exact accepted Creation control entry");
@@ -9497,6 +10756,22 @@ mod historical_control_loader {
             let CreationDecision::Create(planned) = decision else {
                 panic!("group Creation cannot return an existing direct conversation");
             };
+            let creation_quota = planned
+                .effects()
+                .invitation_quota_cas()
+                .expect("Creation retains exact quota successor");
+            assert_eq!(creation_quota.expected_inviter_recent_24h(), 0);
+            assert_eq!(creation_quota.successor_inviter_recent_24h(), 1);
+            assert_eq!(creation_quota.recipient_facts()[0].expected_pair_live(), 0);
+            assert_eq!(creation_quota.recipient_facts()[0].successor_pair_live(), 1);
+            assert_eq!(
+                creation_quota.recipient_facts()[0].expected_recipient_live(),
+                0
+            );
+            assert_eq!(
+                creation_quota.recipient_facts()[0].successor_recipient_live(),
+                1
+            );
             let plan = planned
                 .into_persistence_plan()
                 .expect("seal complete Creation persistence plan");
@@ -9561,44 +10836,172 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate exact production Creation execution context");
-            apply_conversation_persistence_plan(&mut tx, &plan, &context)
+            let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
                 .await
                 .expect("apply complete Creation persistence plan");
+            assert_eq!(applied.allocated_seq, 1);
+            assert_eq!(
+                applied.entry_id,
+                context.authority.control_entry().unwrap().entry_id
+            );
+            assert_eq!(applied.event_positions.len(), 1);
+            let durable_event_position: i64 =
+                sqlx::query_scalar("SELECT event_position FROM chat.events WHERE event_id=$1")
+                    .bind(context.events[0].event_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("project allocated Creation event position");
+            assert_eq!(applied.event_positions, vec![durable_event_position]);
             sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
                 .execute(&mut *tx)
                 .await
                 .expect("force all deferred Creation constraints");
+            assert_exact_g6_creation_persistence(&mut tx, &plan, &context, trusted_at).await;
+            let inviter_after_creation: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM chat.participants
+                    WHERE current_membership AND status='pending'
+                      AND created_by_did=$1 AND invited_at >= now() - INTERVAL '24 hours'"#,
+            )
+            .bind(&entry.actor_did)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project post-Creation inviter quota count");
+            assert_eq!(inviter_after_creation, 1);
 
-            let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
-                r#"SELECT
-                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1),
-                    (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1),
-                    (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
-                    (SELECT count(*) FROM chat.participants WHERE conversation_id=$1),
-                    (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)"#,
+            let participants_after_creation: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
             )
             .bind(conversation_id)
             .fetch_one(&mut *tx)
             .await
-            .expect("assert complete Creation rows");
-            assert_eq!(counts, (1, 1, 1, 2, 1));
+            .expect("read invited Creation participant count");
+            assert_eq!(participants_after_creation, 2);
+
+            let calls_before_non_add_policy =
+                CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst);
+            let locked_invited =
+                hydrate_locked_conversation_state(&mut tx, conversation_id, trusted_at)
+                    .await
+                    .expect("hydrate freshly persisted invited Group");
+            let policy_hydration = HydrationAuthority::from_locked_conversation(&locked_invited)
+                .expect("mint locked non-add Policy hydration authority");
+
+            let skipped_add_business =
+                recheck_business_authority(&mut tx, &skipped_add_policy_request)
+                    .await
+                    .expect("recheck exact skipped-add Policy authority");
+            let skipped_add_registration = policy_hydration
+                .locked_registration_from_guard(skipped_add_business)
+                .expect("seal skipped-add Policy registration");
+            let skipped_add_quota =
+                hydrate_locked_invitation_quota(&mut tx, &entry.actor_did, &[], trusted_at)
+                    .await
+                    .expect("lock deliberately empty skipped-add quota");
+            let skipped_add_no_admission = seal_non_add_policy_no_pending_admission(
+                &locked_invited,
+                &skipped_add_quota,
+                &skipped_add_registration,
+            )
+            .expect("seal deliberately empty skipped-add branch");
+            let skipped_add_verified = decode_and_verify_control_entry(
+                &skipped_add_policy.entry.accepted_payload_bytes,
+                &entry.public_key,
+            )
+            .expect("verify exact skipped-add Policy");
+            let skipped_add_verified = rebind_persisted_control_entry(
+                skipped_add_verified,
+                &skipped_add_policy.entry.signed_request_bytes,
+                &entry.public_key,
+            )
+            .expect("retain exact skipped-add Policy wrapper");
+            let skipped_add_error = policy_hydration
+                .plan_policy_without_pending_admission(
+                    &locked_invited,
+                    skipped_add_verified,
+                    &skipped_add_registration,
+                    Vec::new(),
+                    skipped_add_quota,
+                    skipped_add_no_admission,
+                    &trusted,
+                )
+                .expect_err("no-admission branch must reject a signed participant Add");
+            assert!(matches!(
+                skipped_add_error,
+                crate::chat_protocol::state_machine::StateMachineError::InvalidPolicyAuthority
+            ));
+
+            let non_add_business = recheck_business_authority(&mut tx, &non_add_policy_request)
+                .await
+                .expect("recheck exact non-add Policy authority");
+            let non_add_registration = policy_hydration
+                .locked_registration_from_guard(non_add_business)
+                .expect("seal non-add Policy registration");
+            let non_add_quota =
+                hydrate_locked_invitation_quota(&mut tx, &entry.actor_did, &[], trusted_at)
+                    .await
+                    .expect("lock exact empty non-add Policy quota");
+            let non_add_guard = seal_non_add_policy_no_pending_admission(
+                &locked_invited,
+                &non_add_quota,
+                &non_add_registration,
+            )
+            .expect("seal exact non-add Policy branch");
+            let non_add_verified = decode_and_verify_control_entry(
+                &non_add_policy.entry.accepted_payload_bytes,
+                &entry.public_key,
+            )
+            .expect("verify exact non-add Policy");
+            let non_add_verified = rebind_persisted_control_entry(
+                non_add_verified,
+                &non_add_policy.entry.signed_request_bytes,
+                &entry.public_key,
+            )
+            .expect("retain exact non-add Policy wrapper");
+            let non_add_planned = policy_hydration
+                .plan_policy_without_pending_admission(
+                    &locked_invited,
+                    non_add_verified,
+                    &non_add_registration,
+                    Vec::new(),
+                    non_add_quota,
+                    non_add_guard,
+                    &trusted,
+                )
+                .expect("plan genuine non-add Policy without admission");
+            let non_add_quota_cas = non_add_planned
+                .effects()
+                .invitation_quota_cas()
+                .expect("non-add Policy retains exact empty quota binding");
+            assert!(non_add_quota_cas.new_recipients().is_empty());
+            assert!(non_add_quota_cas.recipient_facts().is_empty());
+            assert_eq!(
+                non_add_quota_cas.expected_inviter_recent_24h(),
+                non_add_quota_cas.successor_inviter_recent_24h(),
+                "non-add Policy consumes zero inviter quota"
+            );
+            assert_eq!(non_add_planned.effects().before_counts().participants(), 2);
+            assert_eq!(non_add_planned.effects().after_counts().participants(), 1);
+            let post_policy_participants: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read rollback-only pre-Policy participant count");
+            assert_eq!(
+                post_policy_participants, 2,
+                "planning the non-add Policy performs no persistence itself"
+            );
+            assert_eq!(
+                CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst),
+                calls_before_non_add_policy,
+                "non-add Policy performs zero external relationship calls"
+            );
+
             tx.rollback()
                 .await
                 .expect("rollback all conversation-scoped Creation writes");
-
-            let residue: i64 = sqlx::query_scalar(
-                r#"SELECT
-                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1)
-                  + (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1)
-                  + (SELECT count(*) FROM chat.entries WHERE conversation_id=$1)
-                  + (SELECT count(*) FROM chat.participants WHERE conversation_id=$1)
-                  + (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)"#,
-            )
-            .bind(conversation_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read post-rollback Creation residue");
-            assert_eq!(residue, 0, "Creation rollback left conversation residue");
+            assert_zero_g6_creation_residue(&pool, conversation_id, &context).await;
 
             let (wrong_leaf_entry, _wrong_group_info) =
                 rebind_creation_to_a_different_leaf_key(entry, trusted_at);
@@ -10237,6 +11640,7 @@ mod historical_control_loader {
 
         enum GenuinePolicyChange<'a> {
             Add(&'a str),
+            Remove(&'a str),
             ChangeRole(&'a str, ParticipantRole),
         }
 
@@ -10257,14 +11661,14 @@ mod historical_control_loader {
         ) -> GenuinePolicyControl {
             changes.sort_by(|left, right| {
                 let left = match left {
-                    GenuinePolicyChange::Add(did) | GenuinePolicyChange::ChangeRole(did, _) => {
-                        did.as_bytes()
-                    }
+                    GenuinePolicyChange::Add(did)
+                    | GenuinePolicyChange::Remove(did)
+                    | GenuinePolicyChange::ChangeRole(did, _) => did.as_bytes(),
                 };
                 let right = match right {
-                    GenuinePolicyChange::Add(did) | GenuinePolicyChange::ChangeRole(did, _) => {
-                        did.as_bytes()
-                    }
+                    GenuinePolicyChange::Add(did)
+                    | GenuinePolicyChange::Remove(did)
+                    | GenuinePolicyChange::ChangeRole(did, _) => did.as_bytes(),
                 };
                 left.cmp(right)
             });
@@ -10293,6 +11697,10 @@ mod historical_control_loader {
                             "invitedByDeviceId": entry.actor_device_id,
                             "invitationTransitionId": transition_id,
                         },
+                    }),
+                    GenuinePolicyChange::Remove(did) => json!({
+                        "$type": "blue.catbird.chat.defs#removeParticipant",
+                        "userDid": did,
                     }),
                     GenuinePolicyChange::ChangeRole(did, role) => json!({
                         "$type": "blue.catbird.chat.defs#changeParticipantRole",
