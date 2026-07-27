@@ -7686,7 +7686,7 @@ impl RevocationPackageCasBinding {
 
     /// A batch-plan binding for an AVAILABLE (conversation_id == None) target
     /// package the device revocation revokes directly via
-    /// `apply_device_revocation_batch` step 3. That arm reads only
+    /// `apply_device_revocation_batch_prefix`. That arm reads only
     /// `conversation_id()` (to skip the Reserved ones the per-conversation arm
     /// owns) and `key_package_ref()`; the `Revoke` CAS takes `revocation_id` +
     /// `revoked_at` from the batch authority, not the binding — so the remaining
@@ -15083,8 +15083,10 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // `super::repository::*` paths resolve there as well. See the E2b-3 report.
 // ===========================================================================
 
+#[cfg(test)]
+pub(crate) use executor::apply_device_revocation_batch;
 pub(crate) use executor::{
-    apply_conversation_persistence_plan, apply_device_revocation_batch, AppliedTransition,
+    apply_conversation_persistence_plan, apply_device_revocation_batch_prefix, AppliedTransition,
     ControlEntryContent, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
     ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns, RecoveryOpenContext,
     ResetRequestRow, SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext,
@@ -16471,8 +16473,9 @@ mod executor {
     /// and supersedes their pending welcomes (Pending->Superseded) — ALL bound to
     /// the revocation id at `terminal_at == accepted_at`. The immutable
     /// `device_revocations` row + the registration revoke are batch-level
-    /// (`apply_device_revocation_batch`); this arm owns only the per-conversation
-    /// work terminalizations. Modeled on `apply_leaf_recovery_request`.
+    /// (`apply_device_revocation_batch_prefix`); this arm owns only the
+    /// per-conversation work terminalizations. Modeled on
+    /// `apply_leaf_recovery_request`.
     #[allow(clippy::too_many_arguments)]
     async fn apply_device_revocation(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -16677,31 +16680,12 @@ mod executor {
         Ok(counts)
     }
 
-    /// Apply a device-revocation BATCH: insert the immutable `device_revocations`
-    /// row + revoke the target registration ONCE, revoke every AVAILABLE target
-    /// package (the reserved ones are revoked per-conversation by
-    /// `apply_device_revocation`), then drive each conversation's entry-less
-    /// revocation plan. Bounded integration: the loop over `plan.conversations()`
-    /// is exactly the fanout the production `plan_device_revocation_batch`
-    /// assembles; a single-conversation caller passes one context. The
-    /// `revokeDevice` idempotency receipt the DEFERRED
-    /// `enforce_device_revocation_mapping` COMMIT trigger requires is written by
-    /// the request handler (the test seeds it), not here.
-    pub(crate) async fn apply_device_revocation_batch(
-        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fn preflight_device_revocation_batch(
         plan: &DeviceRevocationBatchPersistencePlan,
-        conversation_ctxs: &[ExecutionContext],
-    ) -> Result<Vec<AppliedTransition>, ExecutorError> {
-        // The complete batch shape is a pure preflight. No global revocation,
-        // registration, package, or conversation writer may run until every
-        // conversation/context pair has proven the exact entryless authority.
-        if plan.conversations().len() != conversation_ctxs.len() {
-            return Err(ExecutorError::InconsistentPlan(
-                "device revocation batch needs one execution context per conversation",
-            ));
-        }
+    ) -> Result<Uuid, ExecutorError> {
         let revocation_id = Uuid::from_bytes(*plan.authority().revocation_id());
-        for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
+        let mut conversation_ids = BTreeSet::new();
+        for conversation in plan.conversations() {
             if conversation.effects().kind() != PlanKind::DeviceRevocation {
                 return Err(ExecutorError::InconsistentPlan(
                     "device revocation batch contains a non-revocation conversation plan",
@@ -16720,14 +16704,30 @@ mod executor {
                     "device revocation batch conversation authority disagrees",
                 ));
             }
-            let operation_id =
-                require_execution_authority(PlanKind::DeviceRevocation, &ctx.authority)?;
-            if operation_id != revocation_id {
-                return Err(ExecutorError::MissingContext(
-                    "exact device revocation operation id",
+            let conversation_id =
+                Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+            if !conversation_ids.insert(conversation_id) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation batch repeats a conversation",
                 ));
             }
         }
+        Ok(revocation_id)
+    }
+
+    /// Apply the immutable/device-global prefix of a planned revocation batch:
+    /// insert the revocation row, revoke the registration once, and revoke every
+    /// AVAILABLE package. The caller owns the open transaction and must next
+    /// hydrate + apply each conversation in the plan's canonical order.
+    ///
+    /// This function never begins, commits, or rolls back a transaction. The
+    /// eventual handler owns the idempotency receipt required by the deferred
+    /// revocation mapping.
+    pub(crate) async fn apply_device_revocation_batch_prefix(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &DeviceRevocationBatchPersistencePlan,
+    ) -> Result<(), ExecutorError> {
+        let revocation_id = preflight_device_revocation_batch(plan)?;
         let evidence = plan.authority();
         let accepted_at = server_instant(evidence.accepted_at())?;
         let revocation_row = NewDeviceRevocation {
@@ -16755,16 +16755,8 @@ mod executor {
             revoked_at: accepted_at,
         };
 
-        // 1. The immutable device_revocations row (the terminal_revocation_id FK
-        //    target for every work-row terminalization below).
         insert_device_revocation(transaction, &revocation_row).await?;
-
-        // 2. The target registration revoke (devices active -> revoked + its key).
         cas_registration_revoke(transaction, &registration_revoke).await?;
-
-        // 3. Revoke the AVAILABLE target packages (conversation_id == None); the
-        //    Reserved ones (conversation_id == Some) are revoked by the
-        //    per-conversation arm, so revoking them here too would double-CAS.
         for binding in plan.revoked_packages() {
             if binding.conversation_id().is_none() {
                 transition::cas_key_package_status(
@@ -16779,8 +16771,33 @@ mod executor {
                 .await?;
             }
         }
+        Ok(())
+    }
 
-        // 4. Drive each conversation's entry-less revocation plan.
+    /// Compatibility seam for executor harnesses that construct contexts
+    /// directly. Production callers cannot prehydrate a revocation batch.
+    #[cfg(test)]
+    pub(crate) async fn apply_device_revocation_batch(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &DeviceRevocationBatchPersistencePlan,
+        conversation_ctxs: &[ExecutionContext],
+    ) -> Result<Vec<AppliedTransition>, ExecutorError> {
+        if plan.conversations().len() != conversation_ctxs.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation batch needs one execution context per conversation",
+            ));
+        }
+        let revocation_id = preflight_device_revocation_batch(plan)?;
+        for ctx in conversation_ctxs {
+            let operation_id =
+                require_execution_authority(PlanKind::DeviceRevocation, &ctx.authority)?;
+            if operation_id != revocation_id {
+                return Err(ExecutorError::MissingContext(
+                    "exact device revocation operation id",
+                ));
+            }
+        }
+        apply_device_revocation_batch_prefix(transaction, plan).await?;
         let mut applied = Vec::with_capacity(plan.conversations().len());
         for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
             applied

@@ -23,8 +23,10 @@ use super::delivery::{
 use super::transition::{ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
 use crate::chat_protocol::state_machine::{
-    ControlEntryContent, ConversationPersistencePlan, DeviceIdentity, EventFanout, ExecutionActor,
-    ExecutionAuthority, ExecutionContext, LeafPersistenceColumns, LeafRecoveryKind,
+    apply_conversation_persistence_plan, apply_device_revocation_batch_prefix, AppliedTransition,
+    ControlEntryContent, ConversationPersistencePlan, DeviceIdentity,
+    DeviceRevocationBatchPersistencePlan, EventFanout, ExecutionActor, ExecutionAuthority,
+    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
     MetadataAuthorColumns, ParticipantRole, PlanAuthority, PlanKind, PrincipalId,
     RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp, SpineArtifacts,
     WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
@@ -55,6 +57,51 @@ pub(crate) struct ExecutionContextArtifacts {
     /// One exact payload for every Pending -> Superseded Welcome delta, keyed by
     /// immutable Welcome ID. The facade derives the recipient and event kind.
     pub(crate) welcome_disposition_event_payloads: Vec<(Uuid, Vec<u8>)>,
+}
+
+/// Caller-supplied serialized artifacts keyed by the exact conversation whose
+/// sealed revocation plan consumes them. Keeping this as a sequence preserves
+/// duplicate detection; orchestration converts it to a map only after validating
+/// the complete set.
+#[derive(Clone, Debug)]
+pub(crate) struct ConversationExecutionArtifacts {
+    conversation_id: Uuid,
+    artifacts: ExecutionContextArtifacts,
+}
+
+impl ConversationExecutionArtifacts {
+    pub(crate) fn new(conversation_id: Uuid, artifacts: ExecutionContextArtifacts) -> Self {
+        Self {
+            conversation_id,
+            artifacts,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum SequentialDeviceRevocationError {
+    #[error("device revocation artifacts are missing for conversation {0}")]
+    MissingConversationArtifacts(Uuid),
+    #[error("device revocation artifacts repeat conversation {0}")]
+    DuplicateConversationArtifacts(Uuid),
+    #[error("device revocation artifacts include extra conversation {0}")]
+    ExtraConversationArtifacts(Uuid),
+    #[error("device revocation execution-context hydration failed")]
+    Hydration(ExecutionContextHydrationError),
+    #[error("device revocation persistence execution failed")]
+    Executor(ExecutorError),
+}
+
+impl From<ExecutionContextHydrationError> for SequentialDeviceRevocationError {
+    fn from(error: ExecutionContextHydrationError) -> Self {
+        Self::Hydration(error)
+    }
+}
+
+impl From<ExecutorError> for SequentialDeviceRevocationError {
+    fn from(error: ExecutorError) -> Self {
+        Self::Executor(error)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1412,4 +1459,73 @@ pub(crate) async fn hydrate_execution_context(
         welcome_response,
         welcome_dispositions,
     })
+}
+
+/// Apply a sealed device-revocation batch inside the caller-owned transaction.
+///
+/// The complete keyed artifact set is validated before the immutable/global
+/// prefix performs its first write. Conversations then run strictly in the
+/// planner's canonical order, with each context hydrated immediately before its
+/// persistence plan is applied. This ordering makes the prior conversation's
+/// newly appended device event visible to the next hydration's predecessor read.
+///
+/// The caller must already hold every revocation guard consumed by
+/// `plan_device_revocation_batch`; this seam acquires no revocation-specific
+/// target, fanout, package, or conversation guards. It does not begin, commit, or
+/// roll back the transaction and does not record an idempotency receipt.
+pub(crate) async fn apply_device_revocation_batch_sequential(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &DeviceRevocationBatchPersistencePlan,
+    artifact_inputs: Vec<ConversationExecutionArtifacts>,
+) -> Result<Vec<AppliedTransition>, SequentialDeviceRevocationError> {
+    let mut expected_ids = BTreeSet::new();
+    for conversation in plan.conversations() {
+        let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+        if !expected_ids.insert(conversation_id) {
+            return Err(SequentialDeviceRevocationError::Executor(
+                ExecutorError::InconsistentPlan("device revocation batch repeats a conversation"),
+            ));
+        }
+    }
+
+    let mut artifacts_by_id = BTreeMap::new();
+    for input in artifact_inputs {
+        if !expected_ids.contains(&input.conversation_id) {
+            return Err(SequentialDeviceRevocationError::ExtraConversationArtifacts(
+                input.conversation_id,
+            ));
+        }
+        if artifacts_by_id
+            .insert(input.conversation_id, input.artifacts)
+            .is_some()
+        {
+            return Err(
+                SequentialDeviceRevocationError::DuplicateConversationArtifacts(
+                    input.conversation_id,
+                ),
+            );
+        }
+    }
+    for conversation in plan.conversations() {
+        let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+        if !artifacts_by_id.contains_key(&conversation_id) {
+            return Err(
+                SequentialDeviceRevocationError::MissingConversationArtifacts(conversation_id),
+            );
+        }
+    }
+
+    apply_device_revocation_batch_prefix(transaction, plan).await?;
+
+    let mut applied = Vec::with_capacity(plan.conversations().len());
+    for conversation in plan.conversations() {
+        let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+        let artifacts = artifacts_by_id
+            .remove(&conversation_id)
+            .expect("complete artifact set was preflighted");
+        let context = hydrate_execution_context(transaction, conversation, artifacts).await?;
+        applied
+            .push(apply_conversation_persistence_plan(transaction, conversation, &context).await?);
+    }
+    Ok(applied)
 }

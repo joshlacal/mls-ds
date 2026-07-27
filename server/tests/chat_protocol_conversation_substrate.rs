@@ -5248,7 +5248,9 @@ mod historical_control_loader {
             EntryEntitlementKind, EventEntitlementKind, EventKind,
         };
         use crate::chat_protocol::repository::execution_context::{
-            hydrate_execution_context, ExecutionContextArtifacts,
+            apply_device_revocation_batch_sequential, hydrate_execution_context,
+            ConversationExecutionArtifacts, ExecutionContextArtifacts,
+            SequentialDeviceRevocationError,
         };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
@@ -5272,8 +5274,8 @@ mod historical_control_loader {
             WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
-            decode_and_verify_control_entry, decode_canonical_signed_mutation,
-            rebind_persisted_control_entry, SignedMutationKind,
+            decode_and_verify_control_entry, decode_and_verify_signed_mutation,
+            decode_canonical_signed_mutation, rebind_persisted_control_entry, SignedMutationKind,
         };
         use crate::chat_protocol::validation::ed25519_key_id;
         use crate::chat_protocol::wire::{
@@ -5603,6 +5605,13 @@ mod historical_control_loader {
                 Uuid::new_v4(),
             )
             .await;
+            g6_revocation_preflight_fixture_for_graph(pool, graph).await
+        }
+
+        async fn g6_revocation_preflight_fixture_for_graph(
+            pool: &PgPool,
+            graph: GenuinePolicyRoleGraph,
+        ) -> (GenuinePolicyRoleGraph, G6RevocationPreflightFixture) {
             let target = DeviceIdentity::new(
                 PrincipalId::new(graph.invitee.did.as_bytes().to_vec())
                     .expect("canonical target DID"),
@@ -5632,7 +5641,42 @@ mod historical_control_loader {
                 .await
                 .expect("rollback revocation aggregate read");
             let revocation_id = Uuid::new_v4();
-            let signing_transcript = Uuid::new_v4().as_bytes().to_vec();
+            let signed_at = accepted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let body = json!({
+                "$type": SignedMutationKind::DeviceRevocation.type_id(),
+                "signatureDomain":
+                    String::from_utf8(SignedMutationKind::DeviceRevocation.domain().to_vec())
+                        .expect("revocation signature domain is UTF-8"),
+                "actorDid": &graph.invitee.did,
+                "actorDeviceId": graph.invitee.device_id.hyphenated().to_string(),
+                "keyId": &graph.invitee.key_id,
+                "authGeneration": 1,
+                "targetDeviceId": graph.invitee.device_id.hyphenated().to_string(),
+                "targetAuthGeneration": 1,
+                "idempotencyKey": revocation_id.hyphenated().to_string(),
+                "signedAt": signed_at,
+            });
+            let mut wrapper = json!({
+                "body": body,
+                "signature": STANDARD.encode([0_u8; 64]),
+            });
+            let unsigned = decode_canonical_signed_mutation(
+                &serde_json::to_vec(&wrapper).expect("encode unsigned revocation"),
+            )
+            .expect("canonicalize genuine revocation");
+            let signing_transcript = unsigned.transcript_bytes().to_vec();
+            let signature = graph
+                .invitee
+                .signing_key
+                .sign(&signing_transcript)
+                .to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let signed_request = serde_json::to_vec(&wrapper).expect("encode signed revocation");
+            decode_and_verify_signed_mutation(
+                &signed_request,
+                graph.invitee.signing_key.verifying_key().as_bytes(),
+            )
+            .expect("genuine revocation verifies");
             let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
             let evidence = DeviceRevocationEvidence::for_test(
                 *revocation_id.as_bytes(),
@@ -5644,8 +5688,8 @@ mod historical_control_loader {
                 accepted,
                 accepted,
                 request_digest,
-                [0xC1; 64],
-                Uuid::new_v4().as_bytes().to_vec(),
+                signature,
+                signed_request,
                 signing_transcript,
             );
             let planned = plan_device_revocation(&conversation_state, evidence.clone())
@@ -5783,6 +5827,37 @@ mod historical_control_loader {
                     "invalid batch revoked an available package"
                 );
             }
+        }
+
+        async fn seed_g6_revoke_receipt(
+            transaction: &mut Transaction<'_, Postgres>,
+            fixture: &G6RevocationPreflightFixture,
+        ) {
+            let response_bytes = b"g6-sequential-revocation-ok".to_vec();
+            sqlx::query(
+                r#"
+                INSERT INTO chat.idempotency_records(
+                    principal_did,endpoint_nsid,operation_id,request_digest,
+                    accepted_request_bytes,signing_transcript_bytes,signature,
+                    completed_status,response_bytes,response_sha256,event_position,
+                    historical_jkt,current_jkt,completed_at
+                ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,
+                    $7,$8,NULL,$9,NULL,$10)
+                "#,
+            )
+            .bind(&fixture.target_did)
+            .bind(fixture.revocation_id)
+            .bind(fixture.evidence.request_digest().to_vec())
+            .bind(fixture.evidence.signed_request_bytes().to_vec())
+            .bind(fixture.evidence.signing_transcript_bytes().to_vec())
+            .bind(fixture.evidence.signature().to_vec())
+            .bind(&response_bytes)
+            .bind(Sha256::digest(&response_bytes).to_vec())
+            .bind(&fixture.target_key_id)
+            .bind(fixture.accepted_at)
+            .execute(&mut **transaction)
+            .await
+            .expect("seed caller-owned revokeDevice receipt");
         }
 
         async fn append_g6_available_package(
@@ -6037,6 +6112,251 @@ mod historical_control_loader {
             ));
             assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
             tx.rollback().await.expect("rollback batch plan-kind probe");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_sequential_revocation_chains_same_device_welcome_events() {
+            let pool = g6_gate_pool("sequential predecessor-chain proof").await;
+            let first_invitee = unique_acceptance_invitee();
+            let second_invitee = same_device_invitee(&first_invitee, Uuid::new_v4());
+
+            let first_graph = commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(first_invitee),
+            )
+            .await;
+            let second_graph = commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(second_invitee),
+            )
+            .await;
+            let first_welcome_id = first_graph.fulfillment.welcome_id;
+            let second_welcome_id = second_graph.fulfillment.welcome_id;
+            let second_cid = Uuid::from_bytes(second_graph.entry.cid);
+            let (_, fixture) = g6_revocation_preflight_fixture_for_graph(&pool, first_graph).await;
+
+            let accepted =
+                ServerTimestamp::from_unix_millis_for_test(fixture.accepted_at.timestamp_millis())
+                    .expect("canonical shared revocation instant");
+            let mut second_read = pool
+                .begin()
+                .await
+                .expect("begin second revocation aggregate read");
+            let second_locked = hydrate_locked_conversation_state(
+                &mut second_read,
+                second_cid,
+                fixture.accepted_at,
+            )
+            .await
+            .expect("hydrate second genuine revocation aggregate");
+            let second_state = second_locked.state().clone();
+            second_read
+                .rollback()
+                .await
+                .expect("rollback second aggregate read");
+            let second_planned = plan_device_revocation(&second_state, fixture.evidence.clone())
+                .expect("second genuine conversation plans same device revocation");
+            let second_plan = device_revocation_plan_for_test(
+                second_planned,
+                ConversationHeadCasBinding::for_test_internal(
+                    *second_cid.as_bytes(),
+                    *second_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                fixture.evidence.clone(),
+            );
+            let first_cid = Uuid::from_bytes(
+                *fixture
+                    .conversation_plan
+                    .state()
+                    .coordinate
+                    .conversation_id(),
+            );
+            let batch = fixture.batch(
+                Vec::new(),
+                vec![fixture.conversation_plan.clone(), second_plan],
+            );
+            let pre_batch_tail =
+                device_event_predecessor(&pool, &fixture.target_did, fixture.target_device_id)
+                    .await;
+            let artifacts = vec![
+                ConversationExecutionArtifacts::new(
+                    first_cid,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: None,
+                        welcome_disposition_event_payloads: vec![(
+                            first_welcome_id,
+                            b"g6-first-welcome-revoked".to_vec(),
+                        )],
+                    },
+                ),
+                ConversationExecutionArtifacts::new(
+                    second_cid,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: None,
+                        welcome_disposition_event_payloads: vec![(
+                            second_welcome_id,
+                            b"g6-second-welcome-revoked".to_vec(),
+                        )],
+                    },
+                ),
+            ];
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin sequential revocation proof");
+            seed_g6_revoke_receipt(&mut tx, &fixture).await;
+            let applied = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
+                .await
+                .expect("production sequential revocation orchestration applies");
+            assert_eq!(applied.len(), 2);
+            let first_event: (i64, Option<i64>) = sqlx::query_as(
+                r#"
+                SELECT disposition.event_position,recipient.audience_predecessor_position
+                  FROM chat.welcome_dispositions disposition
+                  JOIN chat.event_recipients recipient
+                    ON recipient.event_position=disposition.event_position
+                 WHERE disposition.welcome_id=$1
+                   AND recipient.user_did=$2 AND recipient.device_id=$3
+                "#,
+            )
+            .bind(first_welcome_id)
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read first sequential Welcome event");
+            let second_event: (i64, Option<i64>) = sqlx::query_as(
+                r#"
+                SELECT disposition.event_position,recipient.audience_predecessor_position
+                  FROM chat.welcome_dispositions disposition
+                  JOIN chat.event_recipients recipient
+                    ON recipient.event_position=disposition.event_position
+                 WHERE disposition.welcome_id=$1
+                   AND recipient.user_did=$2 AND recipient.device_id=$3
+                "#,
+            )
+            .bind(second_welcome_id)
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read second sequential Welcome event");
+            assert_eq!(
+                first_event.1, pre_batch_tail,
+                "first event starts at the pre-batch device tail"
+            );
+            assert_eq!(
+                second_event.1,
+                Some(first_event.0),
+                "second event observes the first event's new position"
+            );
+            println!(
+                "G6_CHAIN pre_batch_tail={pre_batch_tail:?} \
+                 first_position={} first_predecessor={:?} \
+                 second_position={} second_predecessor={:?}",
+                first_event.0, first_event.1, second_event.0, second_event.1
+            );
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tx)
+                .await
+                .expect("sequential revocation satisfies deferred mappings");
+            tx.rollback()
+                .await
+                .expect("rollback shared-device revocation proof");
+
+            let durable_status: (String, Option<Uuid>) = sqlx::query_as(
+                "SELECT status,revocation_id FROM chat.devices \
+                 WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read shared device after rollback");
+            assert_eq!(durable_status, ("active".to_owned(), None));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_sequential_revocation_rejects_missing_duplicate_and_extra_artifacts() {
+            let pool = g6_gate_pool("sequential artifact-set preflight").await;
+            let (_, fixture) = g6_revocation_preflight_fixture(&pool).await;
+            let (available_ref, binding) = append_g6_available_package(&pool, &fixture).await;
+            let cid = Uuid::from_bytes(
+                *fixture
+                    .conversation_plan
+                    .state()
+                    .coordinate
+                    .conversation_id(),
+            );
+            let batch = fixture.batch(vec![binding], vec![fixture.conversation_plan.clone()]);
+
+            let cases = [
+                ("missing", Vec::new()),
+                (
+                    "duplicate",
+                    vec![
+                        ConversationExecutionArtifacts::new(
+                            cid,
+                            ExecutionContextArtifacts::default(),
+                        ),
+                        ConversationExecutionArtifacts::new(
+                            cid,
+                            ExecutionContextArtifacts::default(),
+                        ),
+                    ],
+                ),
+                (
+                    "extra",
+                    vec![
+                        ConversationExecutionArtifacts::new(
+                            cid,
+                            ExecutionContextArtifacts::default(),
+                        ),
+                        ConversationExecutionArtifacts::new(
+                            Uuid::new_v4(),
+                            ExecutionContextArtifacts::default(),
+                        ),
+                    ],
+                ),
+            ];
+
+            for (case, artifacts) in cases {
+                let mut tx = pool.begin().await.expect("begin artifact-set probe");
+                let error = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
+                    .await
+                    .expect_err("invalid artifact set must fail before global writes");
+                match (case, error) {
+                    (
+                        "missing",
+                        SequentialDeviceRevocationError::MissingConversationArtifacts(actual),
+                    ) => assert_eq!(actual, cid),
+                    (
+                        "duplicate",
+                        SequentialDeviceRevocationError::DuplicateConversationArtifacts(actual),
+                    ) => assert_eq!(actual, cid),
+                    (
+                        "extra",
+                        SequentialDeviceRevocationError::ExtraConversationArtifacts(actual),
+                    ) => assert_ne!(actual, cid),
+                    (case, error) => panic!("unexpected {case} artifact-set error: {error:?}"),
+                }
+                assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, Some(available_ref))
+                    .await;
+                tx.rollback().await.expect("rollback artifact-set probe");
+            }
         }
 
         #[tokio::test]
@@ -8024,6 +8344,14 @@ mod historical_control_loader {
             cid: Uuid,
             add_transition_id: Uuid,
         ) -> FreshAddCryptoFixture {
+            build_fresh_add_crypto_fixture_for_invitee(cid, add_transition_id, corpus_invitee())
+        }
+
+        fn build_fresh_add_crypto_fixture_for_invitee(
+            cid: Uuid,
+            add_transition_id: Uuid,
+            invitee: AcceptanceInvitee,
+        ) -> FreshAddCryptoFixture {
             let mut entry = build_real_creation_entry(*cid.as_bytes());
             let provider =
                 openmls_libcrux_crypto::Provider::new().expect("fresh Add Alice provider");
@@ -8110,7 +8438,6 @@ mod historical_control_loader {
             entry =
                 bind_creation_entry_to_group_info(entry, &genesis_group_info, &genesis_coordinate);
 
-            let invitee = corpus_invitee();
             let bob_provider =
                 openmls_libcrux_crypto::Provider::new().expect("fresh Add Bob provider");
             let bob_public_key = invitee.signing_key.verifying_key().to_bytes().to_vec();
@@ -8720,6 +9047,44 @@ mod historical_control_loader {
             key_id: String,
             signing_key: SigningKey,
             participant_period_id: Uuid,
+        }
+
+        fn same_device_invitee(
+            invitee: &AcceptanceInvitee,
+            participant_period_id: Uuid,
+        ) -> AcceptanceInvitee {
+            AcceptanceInvitee {
+                did: invitee.did.clone(),
+                device_id: invitee.device_id,
+                key_id: invitee.key_id.clone(),
+                signing_key: SigningKey::from_bytes(&invitee.signing_key.to_bytes()),
+                participant_period_id,
+            }
+        }
+
+        fn unique_acceptance_invitee() -> AcceptanceInvitee {
+            let seed: [u8; 32] = Sha256::digest(
+                [b"g6-sequential-invitee".as_ref(), Uuid::new_v4().as_bytes()].concat(),
+            )
+            .into();
+            let signing_key = SigningKey::from_bytes(&seed);
+            let public_key = signing_key.verifying_key().to_bytes();
+            const PLC_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+            let did_suffix: String = seed
+                .iter()
+                .take(24)
+                .map(|byte| PLC_ALPHABET[usize::from(*byte % 32)] as char)
+                .collect();
+            AcceptanceInvitee {
+                did: format!("did:plc:{did_suffix}"),
+                device_id: Uuid::new_v4(),
+                key_id: ed25519_key_id(&public_key)
+                    .expect("unique invitee key id")
+                    .as_str()
+                    .to_owned(),
+                signing_key,
+                participant_period_id: Uuid::new_v4(),
+            }
         }
 
         fn creation_with_pending_invitee(
@@ -11123,6 +11488,21 @@ mod historical_control_loader {
             cid: Uuid,
             add_transition_id: Uuid,
         ) -> GenuinePolicyRoleGraph {
+            commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+                pool,
+                cid,
+                add_transition_id,
+                None,
+            )
+            .await
+        }
+
+        async fn commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+            pool: &PgPool,
+            cid: Uuid,
+            add_transition_id: Uuid,
+            invitee: Option<AcceptanceInvitee>,
+        ) -> GenuinePolicyRoleGraph {
             let fixed_cid = Uuid::parse_str(
                 corpus_manifest()["identifiers"]["conversationId"]
                     .as_str()
@@ -11140,6 +11520,10 @@ mod historical_control_loader {
                 commit_bytes,
                 welcome_bytes,
             ) = if cid == fixed_cid {
+                assert!(
+                    invitee.is_none(),
+                    "the fixed corpus graph has a fixed invitee"
+                );
                 let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
                 entry.head_next_entry_seq = 2;
                 let states = fixed_corpus_commit_states();
@@ -11158,7 +11542,12 @@ mod historical_control_loader {
                     corpus_file("welcome.mls"),
                 )
             } else {
-                let fresh = build_fresh_add_crypto_fixture(cid, add_transition_id);
+                let fresh = match invitee {
+                    Some(invitee) => {
+                        build_fresh_add_crypto_fixture_for_invitee(cid, add_transition_id, invitee)
+                    }
+                    None => build_fresh_add_crypto_fixture(cid, add_transition_id),
+                };
                 (
                     fresh.entry,
                     fresh.invitee,
