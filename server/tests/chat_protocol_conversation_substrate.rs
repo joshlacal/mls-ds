@@ -5340,10 +5340,21 @@ mod historical_control_loader {
                 .expect("connect to existing gate database");
 
             let corpus_key_package_ref = validate_exact_corpus_recovery_artifacts();
+            let manifest = corpus_manifest();
+            let evolved_cid =
+                Uuid::parse_str(manifest["identifiers"]["conversationId"].as_str().unwrap())
+                    .unwrap();
             if let Some(committed) =
-                find_committed_exact_corpus_graph(&pool, corpus_key_package_ref).await
+                find_committed_exact_corpus_graph(&pool, corpus_key_package_ref, evolved_cid).await
             {
-                assert_committed_exact_corpus_graph(&pool, &committed).await;
+                match (committed.state_version, committed.next_entry_seq) {
+                    (5, 7) => assert_committed_exact_corpus_graph(&pool, &committed).await,
+                    (8, 11) => {
+                        assert_eq!(committed.cid, evolved_cid);
+                        assert_terminal_family_b_final_graph(&pool, committed.cid).await;
+                    }
+                    head => panic!("unrecognized exact-corpus reusable head: {head:?}"),
+                }
                 return;
             }
             let corpus_ref_occupied: bool = sqlx::query_scalar(
@@ -7676,19 +7687,24 @@ mod historical_control_loader {
             bob_device_id: Uuid,
             request_id: Uuid,
             welcome_id: Uuid,
+            state_version: i64,
+            next_entry_seq: i64,
         }
 
         async fn find_committed_exact_corpus_graph(
             pool: &PgPool,
             key_package_ref: [u8; 32],
+            evolved_cid: Uuid,
         ) -> Option<GenuineGraphRefs> {
-            sqlx::query_as::<_, (Uuid, String, Uuid, Uuid, Uuid)>(
+            sqlx::query_as::<_, (Uuid, String, Uuid, Uuid, Uuid, i64, i64)>(
                 r#"
                 SELECT conversation.conversation_id,
                        request.requester_did,
                        request.requester_device_id,
                        request.recovery_request_id,
-                       bundle.welcome_id
+                       bundle.welcome_id,
+                       conversation.current_state_version,
+                       conversation.next_entry_seq
                   FROM chat.key_packages package
                   JOIN chat.key_package_reservations reservation
                     ON reservation.key_package_ref=package.key_package_ref
@@ -7706,23 +7722,43 @@ mod historical_control_loader {
                    AND request.status='fulfilled'
                    AND delivery.status='superseded'
                    AND conversation.current_generation=0
-                   AND conversation.current_state_version=5
-                   AND conversation.next_entry_seq=7
+                   AND (
+                        (
+                            conversation.current_state_version=5
+                            AND conversation.next_entry_seq=7
+                        )
+                        OR (
+                            conversation.conversation_id=$2
+                            AND conversation.current_state_version=8
+                            AND conversation.next_entry_seq=11
+                        )
+                   )
                  ORDER BY bundle.created_at
                  LIMIT 1
                 "#,
             )
             .bind(key_package_ref.to_vec())
+            .bind(evolved_cid)
             .fetch_optional(pool)
             .await
             .expect("look up committed exact-corpus graph")
             .map(
-                |(cid, bob_did, bob_device_id, request_id, welcome_id)| GenuineGraphRefs {
+                |(
                     cid,
                     bob_did,
                     bob_device_id,
                     request_id,
                     welcome_id,
+                    state_version,
+                    next_entry_seq,
+                )| GenuineGraphRefs {
+                    cid,
+                    bob_did,
+                    bob_device_id,
+                    request_id,
+                    welcome_id,
+                    state_version,
+                    next_entry_seq,
                 },
             )
         }
