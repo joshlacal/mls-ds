@@ -2040,11 +2040,82 @@ pub(crate) async fn hydrate_locked_available_recovery_package(
     target_auth_generation: i64,
     bound_coordinate: PublicGroupSnapshotCoordinate,
 ) -> Result<LockedRecoveryPackageGuard, RecoveryPackageHydrationError> {
+    if head.prior_coordinate() != Some(&bound_coordinate) {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+    hydrate_locked_available_recovery_package_at_coordinate(
+        transaction,
+        head,
+        request_id,
+        target_did,
+        target_device_id,
+        target_key_id,
+        target_auth_generation,
+        bound_coordinate,
+    )
+    .await
+}
+
+/// Acceptance advances only the coordinate while opening recovery work, so its
+/// request/reservation must bind the repository-derived successor rather than
+/// a caller-selected coordinate. The ordinary requestLeafRecovery loader above
+/// deliberately remains bound to the current locked head.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn hydrate_locked_available_acceptance_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &LockedConversationHeadGuard,
+    request_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+    target_key_id: &str,
+    target_auth_generation: i64,
+) -> Result<LockedRecoveryPackageGuard, RecoveryPackageHydrationError> {
+    let prior = head
+        .prior_coordinate()
+        .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let state_version = prior
+        .state_version()
+        .checked_add(1)
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let bound_coordinate = PublicGroupSnapshotCoordinate::new(
+        *prior.conversation_id(),
+        prior.generation(),
+        state_version,
+        *prior.group_id(),
+        prior.epoch(),
+        *prior.group_context_hash(),
+        *prior.confirmation_tag(),
+        prior.lifecycle(),
+    );
+    hydrate_locked_available_recovery_package_at_coordinate(
+        transaction,
+        head,
+        request_id,
+        target_did,
+        target_device_id,
+        target_key_id,
+        target_auth_generation,
+        bound_coordinate,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_locked_available_recovery_package_at_coordinate(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &LockedConversationHeadGuard,
+    request_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+    target_key_id: &str,
+    target_auth_generation: i64,
+    bound_coordinate: PublicGroupSnapshotCoordinate,
+) -> Result<LockedRecoveryPackageGuard, RecoveryPackageHydrationError> {
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
     if transaction_id != head.transaction_id()
-        || head.prior_coordinate() != Some(&bound_coordinate)
         || !whole_millis_nonnegative(head.locked_at())
         || !uuid_is_canonical_v4(request_id)
         || !uuid_is_canonical_v4(target_device_id)

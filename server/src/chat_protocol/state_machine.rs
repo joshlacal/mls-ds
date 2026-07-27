@@ -1940,7 +1940,6 @@ impl HydrationAuthority {
     /// the acceptance-scoped relationship projection.  The retained inviter
     /// remains the consent source and the accepting principal is the sole
     /// declaration recipient even though the successor marks them active.
-    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_acceptance_entry<T: PublicTransport>(
         &self,
@@ -2023,7 +2022,7 @@ impl HydrationAuthority {
         let transaction_id = registration.transaction_id().to_owned();
         let trusted_read_at = registration.trusted_read_at();
         let authority = transition.clone();
-        let plan = plan_accept_conversation_inner(
+        let mut plan = plan_accept_conversation_inner(
             prior,
             AcceptConversation {
                 actor,
@@ -2031,11 +2030,9 @@ impl HydrationAuthority {
                 recovery_request_id,
                 key_package_ref,
                 package_not_after,
-                registration,
-                reservation,
-                relationship_evidence_digest,
             },
         )?;
+        plan.effects.policy_evidence_digest = Some(relationship_evidence_digest);
         plan.bind_transition_authority(authority, head, &transaction_id, trusted_read_at)?
             .bind_recovery_package_cas(package_cas)?
             .bind_terminal_package_guards(prior, terminal_packages, &transaction_id)
@@ -2102,7 +2099,6 @@ impl HydrationAuthority {
     /// Final recovery Add: bind the committing actor, the target's current
     /// active registration, the exact reserved KeyPackage row, and a fresh
     /// complete block-only roster projection in one transaction.
-    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_recovery_fulfillment_entry<T: PublicTransport>(
         &self,
@@ -3545,7 +3541,6 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
     pub(crate) fn locked_recovery_reservation(
         &self,
         guard: LockedRecoveryPackageGuard,
@@ -5813,7 +5808,6 @@ pub(crate) struct LockedRecoveryReservationProjection {
     package_not_after: ServerTimestamp,
     claimed_at: ServerTimestamp,
     durable_row_digest: [u8; 32],
-    #[cfg(not(test))]
     transaction_id: String,
 }
 
@@ -5882,12 +5876,10 @@ impl LockedRecoveryReservationProjection {
         self.package_not_after
     }
 
-    #[cfg(not(test))]
     fn transaction_id(&self) -> &str {
         &self.transaction_id
     }
 
-    #[cfg(not(test))]
     fn available_package_cas(&self) -> RecoveryPackageCasBinding {
         RecoveryPackageCasBinding {
             transaction_id: self.transaction_id.clone(),
@@ -5927,6 +5919,10 @@ impl LockedRecoveryReservationProjection {
             package_not_after,
             claimed_at: evidence.received_at,
             durable_row_digest: [0x8d; 32],
+            // Pure state-machine tests never cross the locked repository
+            // facade; an empty transaction identity therefore remains
+            // deliberately unusable by every production package-CAS binder.
+            transaction_id: String::new(),
         }
     }
 }
@@ -9414,7 +9410,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_recovery_package_cas(
         mut self,
         binding: RecoveryPackageCasBinding,
@@ -9867,12 +9862,6 @@ pub(crate) struct AcceptConversation {
     pub(crate) recovery_request_id: [u8; 16],
     pub(crate) key_package_ref: [u8; 32],
     pub(crate) package_not_after: ServerTimestamp,
-    #[cfg(not(test))]
-    registration: LockedRegistrationProjection,
-    #[cfg(not(test))]
-    reservation: LockedRecoveryReservationProjection,
-    #[cfg(not(test))]
-    relationship_evidence_digest: [u8; 32],
 }
 
 fn plan_accept_conversation_inner(
@@ -9885,20 +9874,6 @@ fn plan_accept_conversation_inner(
         SignedMutationKind::ParticipantAcceptance,
     )?;
     require_transition_actor(&command.transition, &command.actor)?;
-    #[cfg(not(test))]
-    if !command
-        .registration
-        .authorizes_transition(&command.transition)
-        || !command
-            .reservation
-            .authorizes_acceptance(&command.transition)
-        || command.reservation.request_id != command.recovery_request_id
-        || command.reservation.target != command.actor
-        || command.reservation.key_package_ref != command.key_package_ref
-        || command.reservation.package_not_after != command.package_not_after
-    {
-        return Err(StateMachineError::InvalidHydrationAuthority);
-    }
     if !is_uuid_v4(&command.recovery_request_id) {
         return Err(StateMachineError::InvalidTransition);
     }
@@ -9918,10 +9893,6 @@ fn plan_accept_conversation_inner(
     let received_at = command.transition.received_at;
     let expires_at = recovery_expiry(received_at, command.package_not_after)?;
     let next_coordinate = coordinate_only_successor(&prior.coordinate)?;
-    #[cfg(not(test))]
-    if command.reservation.bound_coordinate != next_coordinate {
-        return Err(StateMachineError::InvalidHydrationAuthority);
-    }
     require_acceptance_body(
         &command.transition,
         &prior.coordinate,
@@ -9972,15 +9943,11 @@ fn plan_accept_conversation_inner(
     sort_recovery_requests(&mut state.recovery_requests);
     sort_recovery_reservations(&mut state.recovery_reservations);
     validate_state(&state)?;
-    let mut effects = complete_effects(
+    let effects = complete_effects(
         TransitionEffects::new(PlanKind::Acceptance),
         Some(prior),
         &state,
     );
-    #[cfg(not(test))]
-    {
-        effects.policy_evidence_digest = Some(command.relationship_evidence_digest);
-    }
     Ok(PlannedTransition {
         expected_prior: Some(prior.coordinate),
         retired_coordinate: None,
