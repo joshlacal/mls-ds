@@ -1592,6 +1592,135 @@ pub(crate) async fn cas_key_package_status(
     Ok(())
 }
 
+/// Full locked authority for releasing one prior-bound recovery package during
+/// a coordinate-changing transition. Unlike the generic semantic status CAS,
+/// this binds the transaction, immutable package row, requesting device/key,
+/// exact request/reservation pair, and every coordinate column.
+pub(crate) struct ReservedRecoveryPackageReleaseCas<'a> {
+    pub(crate) transaction_id: &'a str,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) request_id: Uuid,
+    pub(crate) target_did: &'a str,
+    pub(crate) target_device_id: Uuid,
+    pub(crate) target_key_id: &'a str,
+    pub(crate) target_auth_generation: i64,
+    pub(crate) generation: i64,
+    pub(crate) state_version: i64,
+    pub(crate) group_id: &'a [u8],
+    pub(crate) epoch: i64,
+    pub(crate) group_context_hash: &'a [u8],
+    pub(crate) confirmation_tag: &'a [u8],
+    pub(crate) key_package_ref: &'a [u8],
+    pub(crate) wrapper_sha256: &'a [u8],
+    pub(crate) package_not_after: DateTime<Utc>,
+    pub(crate) claimed_at: DateTime<Utc>,
+    pub(crate) locked_row_digest: &'a [u8],
+    pub(crate) authority_digest: &'a [u8],
+}
+
+/// Release a reserved package only while the exact locked Open-request /
+/// Active-reservation / Reserved-package triple still exists. The caller's
+/// authority seal is checked before the head CAS; this terminal writer consumes
+/// that same full binding rather than falling back to `(ref,status)`.
+pub(crate) async fn release_reserved_recovery_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &ReservedRecoveryPackageReleaseCas<'_>,
+) -> Result<(), TransitionRepositoryError> {
+    if binding.locked_row_digest == [0; 32] || binding.authority_digest == [0; 32] {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.key_packages AS kp
+           SET status = 'available',
+               terminal_transition_id = NULL,
+               terminal_revocation_id = NULL,
+               terminal_at = NULL
+         WHERE txid_current()::text = $1
+           AND kp.key_package_ref = $2
+           AND kp.wrapper_sha256 = $3
+           AND kp.owner_did = $4
+           AND kp.owner_device_id = $5
+           AND kp.owner_key_id = $6
+           AND kp.owner_auth_generation = $7
+           AND kp.not_after = $8
+           AND kp.status = 'reserved'
+           AND kp.terminal_transition_id IS NULL
+           AND kp.terminal_revocation_id IS NULL
+           AND kp.terminal_at IS NULL
+           AND EXISTS (
+                SELECT 1
+                  FROM chat.leaf_recovery_requests AS rr
+                  JOIN chat.key_package_reservations AS kr
+                    ON kr.recovery_request_id = rr.recovery_request_id
+                 WHERE rr.recovery_request_id = $9
+                   AND rr.conversation_id = $10
+                   AND rr.generation = $11
+                   AND rr.bound_state_version = $12
+                   AND rr.bound_group_id = $13
+                   AND rr.bound_epoch = $14
+                   AND rr.bound_group_context_hash = $15
+                   AND rr.bound_confirmation_tag = $16
+                   AND rr.requester_did = $4
+                   AND rr.requester_device_id = $5
+                   AND rr.requester_key_id = $6
+                   AND rr.requester_auth_generation = $7
+                   AND rr.reservation_request_id = $9
+                   AND rr.requested_at = $17
+                   AND rr.status = 'open'
+                   AND rr.fulfilling_transition_id IS NULL
+                   AND rr.terminal_transition_id IS NULL
+                   AND rr.terminal_revocation_id IS NULL
+                   AND rr.terminal_at IS NULL
+                   AND kr.key_package_ref = $2
+                   AND kr.conversation_id = $10
+                   AND kr.generation = $11
+                   AND kr.bound_state_version = $12
+                   AND kr.bound_group_id = $13
+                   AND kr.bound_epoch = $14
+                   AND kr.bound_group_context_hash = $15
+                   AND kr.bound_confirmation_tag = $16
+                   AND kr.requester_did = $4
+                   AND kr.requester_device_id = $5
+                   AND kr.requester_key_id = $6
+                   AND kr.requester_auth_generation = $7
+                   AND kr.recipient_did = $4
+                   AND kr.recipient_device_id = $5
+                   AND kr.created_at = $17
+                   AND kr.status = 'active'
+                   AND kr.consumed_transition_id IS NULL
+                   AND kr.terminal_transition_id IS NULL
+                   AND kr.terminal_revocation_id IS NULL
+                   AND kr.terminal_request_digest IS NULL
+                   AND kr.terminal_at IS NULL
+           )
+        "#,
+    )
+    .bind(binding.transaction_id)
+    .bind(binding.key_package_ref)
+    .bind(binding.wrapper_sha256)
+    .bind(binding.target_did)
+    .bind(binding.target_device_id)
+    .bind(binding.target_key_id)
+    .bind(binding.target_auth_generation)
+    .bind(binding.package_not_after)
+    .bind(binding.request_id)
+    .bind(binding.conversation_id)
+    .bind(binding.generation)
+    .bind(binding.state_version)
+    .bind(binding.group_id)
+    .bind(binding.epoch)
+    .bind(binding.group_context_hash)
+    .bind(binding.confirmation_tag)
+    .bind(binding.claimed_at)
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Family 6b — chat.device_revocations + the target-registration revoke.
 //

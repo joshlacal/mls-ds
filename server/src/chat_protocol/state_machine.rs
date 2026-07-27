@@ -2717,7 +2717,6 @@ impl HydrationAuthority {
     /// wrapper, active device row, transaction-bound KeyPackage selection,
     /// and the complete block-only relationship projection for the current
     /// logical roster. No artificial control entry ID or sequence is minted.
-    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_leaf_recovery_request_entry<T: PublicTransport>(
         &self,
@@ -2777,7 +2776,7 @@ impl HydrationAuthority {
             relationship_authority,
         )
         .map_err(relationship_consumption_error)?;
-        let plan = plan_leaf_recovery_request_inner(
+        let mut plan = plan_leaf_recovery_request_inner(
             prior,
             LeafRecoveryRequestCommand {
                 actor,
@@ -2787,11 +2786,13 @@ impl HydrationAuthority {
                 received_at,
                 package_not_after,
                 evidence,
+                #[cfg(not(test))]
                 registration,
+                #[cfg(not(test))]
                 reservation,
-                relationship_evidence_digest,
             },
         )?;
+        plan.effects.policy_evidence_digest = Some(relationship_evidence_digest);
         plan.bind_non_control_request_authority(authority, head, &transaction_id, trusted_read_at)?
             .bind_recovery_package_cas(package_cas)
     }
@@ -5880,7 +5881,7 @@ impl LockedRecoveryReservationProjection {
     }
 
     fn available_package_cas(&self) -> RecoveryPackageCasBinding {
-        RecoveryPackageCasBinding {
+        let mut binding = RecoveryPackageCasBinding {
             transaction_id: self.transaction_id.clone(),
             conversation_id: self.conversation_id,
             request_id: self.request_id,
@@ -5895,7 +5896,10 @@ impl LockedRecoveryReservationProjection {
             expected_status: PackageStatus::Available,
             successor_status: PackageStatus::Reserved,
             locked_row_digest: self.durable_row_digest,
-        }
+            authority_digest: [0; 32],
+        };
+        binding.authority_digest = recovery_package_cas_authority_digest(&binding);
+        binding
     }
 
     #[cfg(test)]
@@ -5999,7 +6003,7 @@ fn reserved_package_cas_for_request(
     {
         return Err(StateMachineError::InvalidHydrationAuthority);
     }
-    Ok(RecoveryPackageCasBinding {
+    let mut binding = RecoveryPackageCasBinding {
         transaction_id: transaction_id.to_owned(),
         conversation_id: *request.bound_coordinate.conversation_id(),
         request_id: request.request_id,
@@ -6014,7 +6018,10 @@ fn reserved_package_cas_for_request(
         expected_status: PackageStatus::Reserved,
         successor_status,
         locked_row_digest: *guard.durable_row_digest(),
-    })
+        authority_digest: [0; 32],
+    };
+    binding.authority_digest = recovery_package_cas_authority_digest(&binding);
+    Ok(binding)
 }
 
 #[cfg(test)]
@@ -7873,6 +7880,54 @@ pub(crate) struct RecoveryPackageCasBinding {
     expected_status: PackageStatus,
     successor_status: PackageStatus,
     locked_row_digest: [u8; 32],
+    /// Domain-separated seal over every retained locked-row/CAS authority
+    /// column. This makes drift in any non-semantic guard field detectable
+    /// before the conversation-head CAS.
+    authority_digest: [u8; 32],
+}
+
+fn recovery_package_cas_authority_digest(binding: &RecoveryPackageCasBinding) -> [u8; 32] {
+    fn status_byte(status: PackageStatus) -> u8 {
+        match status {
+            PackageStatus::Available => 1,
+            PackageStatus::Reserved => 2,
+            PackageStatus::Consumed => 3,
+            PackageStatus::Expired => 4,
+            PackageStatus::Revoked => 5,
+        }
+    }
+
+    let coordinate = &binding.bound_coordinate;
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-PACKAGE-CAS-AUTHORITY\0");
+    digest.update((binding.transaction_id.len() as u64).to_be_bytes());
+    digest.update(binding.transaction_id.as_bytes());
+    digest.update(binding.conversation_id);
+    digest.update(binding.request_id);
+    digest.update((binding.target.principal().as_bytes().len() as u64).to_be_bytes());
+    digest.update(binding.target.principal().as_bytes());
+    digest.update(binding.target.device_id());
+    digest.update(binding.target_key_id);
+    digest.update(binding.target_auth_generation.to_be_bytes());
+    digest.update(coordinate.conversation_id());
+    digest.update(coordinate.generation().to_be_bytes());
+    digest.update(coordinate.state_version().to_be_bytes());
+    digest.update(coordinate.group_id());
+    digest.update(coordinate.epoch().to_be_bytes());
+    digest.update(coordinate.group_context_hash());
+    digest.update(coordinate.confirmation_tag());
+    digest.update([match coordinate.lifecycle() {
+        PublicGroupSnapshotLifecycle::Active => 1,
+        PublicGroupSnapshotLifecycle::Superseded => 2,
+    }]);
+    digest.update(binding.key_package_ref);
+    digest.update(binding.key_package_wrapper_sha256);
+    digest.update(binding.package_not_after.unix_millis().to_be_bytes());
+    digest.update(binding.claimed_at.unix_millis().to_be_bytes());
+    digest.update([status_byte(binding.expected_status)]);
+    digest.update([status_byte(binding.successor_status)]);
+    digest.update(binding.locked_row_digest);
+    digest.finalize().into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8282,6 +8337,9 @@ impl RecoveryPackageCasBinding {
     }
     pub(crate) fn locked_row_digest(&self) -> &[u8; 32] {
         &self.locked_row_digest
+    }
+    pub(crate) fn authority_digest(&self) -> &[u8; 32] {
+        &self.authority_digest
     }
 }
 
@@ -8808,17 +8866,19 @@ fn package_cas_bijection_valid(effects: &TransitionEffects) -> bool {
                 == 1
         })
         && effects.recovery_package_cas.iter().all(|binding| {
-            effects
-                .package_transitions
-                .iter()
-                .filter(|edge| {
-                    binding.request_id == edge.request_id
-                        && binding.key_package_ref == edge.key_package_ref
-                        && binding.expected_status == edge.from
-                        && binding.successor_status == edge.to
-                })
-                .count()
-                == 1
+            binding.authority_digest == recovery_package_cas_authority_digest(binding)
+                && binding.locked_row_digest != [0; 32]
+                && effects
+                    .package_transitions
+                    .iter()
+                    .filter(|edge| {
+                        binding.request_id == edge.request_id
+                            && binding.key_package_ref == edge.key_package_ref
+                            && binding.expected_status == edge.from
+                            && binding.successor_status == edge.to
+                    })
+                    .count()
+                    == 1
         })
 }
 
@@ -9159,7 +9219,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_non_control_request_authority(
         mut self,
         evidence: RequestEvidence,
@@ -10024,8 +10083,6 @@ pub(crate) struct LeafRecoveryRequestCommand {
     registration: LockedRegistrationProjection,
     #[cfg(not(test))]
     reservation: LockedRecoveryReservationProjection,
-    #[cfg(not(test))]
-    relationship_evidence_digest: [u8; 32],
 }
 
 fn plan_leaf_recovery_request_inner(
@@ -10103,15 +10160,11 @@ fn plan_leaf_recovery_request_inner(
     sort_recovery_requests(&mut state.recovery_requests);
     sort_recovery_reservations(&mut state.recovery_reservations);
     validate_state(&state)?;
-    let mut effects = complete_effects(
+    let effects = complete_effects(
         TransitionEffects::new(PlanKind::RecoveryRequest),
         Some(prior),
         &state,
     );
-    #[cfg(not(test))]
-    {
-        effects.policy_evidence_digest = Some(command.relationship_evidence_digest);
-    }
     Ok(PlannedTransition {
         expected_prior: Some(prior.coordinate),
         retired_coordinate: None,
@@ -12088,9 +12141,8 @@ pub(crate) fn persistence_plan_for_test(
                 .filter_map(|change| change.after())
                 .find(|request| request.request_id == edge.request_id)
             {
-                effects
-                    .recovery_package_cas
-                    .push(RecoveryPackageCasBinding {
+                effects.recovery_package_cas.push({
+                    let mut binding = RecoveryPackageCasBinding {
                         transaction_id: head_cas.transaction_id.clone(),
                         conversation_id: *request.bound_coordinate.conversation_id(),
                         request_id: edge.request_id,
@@ -12105,7 +12157,11 @@ pub(crate) fn persistence_plan_for_test(
                         expected_status: edge.from,
                         successor_status: edge.to,
                         locked_row_digest: [1u8; 32],
-                    });
+                        authority_digest: [0u8; 32],
+                    };
+                    binding.authority_digest = recovery_package_cas_authority_digest(&binding);
+                    binding
+                });
             }
         }
     }
@@ -12338,6 +12394,17 @@ impl ConversationPersistencePlan {
         self
     }
 
+    /// Drift one immutable, non-semantic field of the exact reserved-package
+    /// guard while preserving request/ref/status bijection. Reset must reject
+    /// this before its head CAS; a verifier that consults only PackageTransition
+    /// summaries will incorrectly accept it.
+    pub(crate) fn with_reset_recovery_package_wrapper_digest_corrupted_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.recovery_package_cas.first_mut() {
+            binding.key_package_wrapper_sha256[0] ^= 0x40;
+        }
+        self
+    }
+
     /// Inject an EXTRA recovery-request delta that is neither the arm's own edge
     /// (`Open->Fulfilled`) nor a valid supersession (`Open->Superseded`): an
     /// `Open->Expired` change cloned from the plan's first request. A
@@ -12373,6 +12440,22 @@ impl ConversationPersistencePlan {
             .and_then(|change| change.after.as_mut())
         {
             after.status = WelcomeStatus::Expired;
+        }
+        self
+    }
+
+    /// Corrupt one field of the Reset arm's closed-interval transition
+    /// evidence. The plan remains cardinality- and identity-coherent, so only
+    /// an exhaustive pre-CAS validation of the actual interval changes can
+    /// reject it before any durable writer runs.
+    pub(crate) fn with_reset_interval_evidence_corrupted_for_test(mut self) -> Self {
+        if let Some(end) = self
+            .effects
+            .interval_changes
+            .iter_mut()
+            .find_map(|change| change.after.as_mut()?.end.as_mut())
+        {
+            end.evidence.outer_entry_fingerprint[0] ^= 0x80;
         }
         self
     }
@@ -15519,12 +15602,13 @@ mod executor {
     use super::{
         classify_role_producer, coordinate_is_in_lineage, coordinate_only_successor,
         initial_participant_role, invitation_matches_participant,
-        revocation_package_cas_bijection_valid, validate_transition_evidence, CloseKind,
-        ConversationKind, DeviceIdentity, DeviceRevocationBatchPersistencePlan, LeafHydrationRow,
-        LeafRecord, LeafRecoveryKind, LeaveRequestStatus, ManifestParticipantChange,
-        MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRecord,
-        ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
-        PublicGroupSnapshotCoordinate, RecoveryRequest, RecoveryRequestStatus, RecoveryReservation,
+        recovery_package_cas_authority_digest, revocation_package_cas_bijection_valid,
+        validate_transition_evidence, CloseKind, ConversationKind, DeviceIdentity,
+        DeviceRevocationBatchPersistencePlan, LeafHydrationRow, LeafRecord, LeafRecoveryKind,
+        LeaveRequestStatus, ManifestParticipantChange, MetadataSnapshotBinding, PackageStatus,
+        ParticipantHydrationRow, ParticipantRecord, ParticipantRole, ParticipantStatus,
+        PlanAuthority, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
+        RecoveryOriginEvidence, RecoveryRequest, RecoveryRequestStatus, RecoveryReservation,
         RecoverySource, ReservationStatus, ResetRequest, ResetRequestStatus, ServerTimestamp,
         SignedMutationKind, StateChange, TransitionBodyBinding, TransitionEffects, WelcomeStatus,
         WelcomeWork, WorkTerminalEvidence,
@@ -16191,6 +16275,14 @@ mod executor {
                 ));
             }
         }
+        if cas.iter().any(|binding| {
+            binding.authority_digest != recovery_package_cas_authority_digest(binding)
+                || binding.locked_row_digest == [0; 32]
+        }) {
+            return Err(ExecutorError::InconsistentPlan(
+                "recovery package CAS authority seal or locked-row digest drift",
+            ));
+        }
         Ok(())
     }
 
@@ -16342,18 +16434,19 @@ mod executor {
                 "reset producer disagrees with allocated transition/sequence",
             ));
         }
-        let signed_request_id = match producer.body_binding.as_ref() {
+        let (signed_request_id, signed_metadata) = match producer.body_binding.as_ref() {
             Some(super::TransitionBodyBinding::ResetActivation {
                 reset_request_id,
                 prior: bound_prior,
                 retired: bound_retired,
                 successor,
+                metadata,
                 ..
             }) if bound_prior == prior
                 && bound_retired == retired
                 && successor == &hydration.coordinate =>
             {
-                *reset_request_id
+                (*reset_request_id, metadata)
             }
             _ => {
                 return Err(ExecutorError::InconsistentPlan(
@@ -16401,7 +16494,7 @@ mod executor {
                 }
             }
         }
-        let own_reset = own_reset.ok_or(ExecutorError::InconsistentPlan(
+        let _own_reset = own_reset.ok_or(ExecutorError::InconsistentPlan(
             "reset consumes no exact signed pending request",
         ))?;
 
@@ -16480,6 +16573,65 @@ mod executor {
                 "reset recovery request/reservation/package families are not bijective",
             ));
         }
+        let head = effects.head_cas().ok_or(ExecutorError::InconsistentPlan(
+            "reset recovery package authority has no head binding",
+        ))?;
+        for binding in effects.recovery_package_cas() {
+            let request = effects
+                .recovery_request_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|request| {
+                    request.request_id == binding.request_id
+                        && request.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "reset package authority has no exact recovery request",
+                ))?;
+            let reservation = effects
+                .reservation_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|reservation| {
+                    reservation.request_id == binding.request_id
+                        && reservation.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "reset package authority has no exact reservation",
+                ))?;
+            let (origin_key_id, origin_auth_generation) = match &request.origin {
+                RecoveryOriginEvidence::Acceptance(value) => {
+                    let authority =
+                        value
+                            .authority
+                            .as_ref()
+                            .ok_or(ExecutorError::InconsistentPlan(
+                                "reset recovery acceptance has no signing authority",
+                            ))?;
+                    (authority.key_id, authority.auth_generation)
+                }
+                RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
+            };
+            if binding.transaction_id != head.transaction_id
+                || binding.conversation_id != *prior.conversation_id()
+                || binding.target != request.target
+                || binding.target != reservation.target
+                || binding.target_key_id != origin_key_id
+                || binding.target_auth_generation != origin_auth_generation
+                || binding.bound_coordinate != *prior
+                || binding.bound_coordinate != request.bound_coordinate
+                || binding.bound_coordinate != reservation.bound_coordinate
+                || binding.package_not_after != reservation.package_not_after
+                || binding.claimed_at != request.received_at
+                || binding.claimed_at != reservation.received_at
+                || binding.expected_status != PackageStatus::Reserved
+                || binding.successor_status != PackageStatus::Available
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset recovery package CAS authority drift",
+                ));
+            }
+        }
 
         let mut welcome_ids = BTreeSet::new();
         for change in effects.welcome_changes() {
@@ -16540,8 +16692,9 @@ mod executor {
             ));
         }
         if hydration.leaves[0].device != ctx.opened_leaves[0].device
-            || hydration.leaves[0].device != own_reset.requester
-            || effects.opened_intervals()[0] != own_reset.requester
+            || device_did(&hydration.leaves[0].device)? != ctx.actor.user_did
+            || device_uuid(&hydration.leaves[0].device) != ctx.actor.device_id
+            || effects.opened_intervals()[0] != hydration.leaves[0].device
         {
             return Err(ExecutorError::InconsistentPlan(
                 "reset successor is not the singleton activator leaf/interval",
@@ -16562,6 +16715,237 @@ mod executor {
         {
             return Err(ExecutorError::InconsistentPlan(
                 "reset old leaf/interval closure context is incomplete",
+            ));
+        }
+
+        // Validate every actual leaf delta. Reset closes the complete prior
+        // generation and installs one successor leaf. `diff_by_key` may omit
+        // the activator when its leaf bytes are identical across generations,
+        // so completeness is the closed-device set minus at most that one
+        // unchanged activator; every delta that is present remains fully
+        // load-bearing.
+        let successor_device = &hydration.leaves[0].device;
+        let mut changed_before_devices = BTreeSet::new();
+        let mut changed_after_devices = BTreeSet::new();
+        for change in effects.leaf_changes() {
+            match (change.before(), change.after()) {
+                (Some(before), None)
+                    if before.device != *successor_device
+                        && closed_devices.contains(&before.device) =>
+                {
+                    if !changed_before_devices.insert(before.device.clone()) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset repeats an old leaf delta",
+                        ));
+                    }
+                }
+                (Some(before), Some(after))
+                    if before.device == *successor_device
+                        && after.device == *successor_device
+                        && before != after
+                        && leaf_matches_hydration(after, &hydration.leaves[0])
+                        && closed_devices.contains(&before.device) =>
+                {
+                    if !changed_before_devices.insert(before.device.clone())
+                        || !changed_after_devices.insert(after.device.clone())
+                    {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset repeats the successor leaf delta",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset leaf change has an illegal shape/content",
+                    ))
+                }
+            }
+        }
+        let mut accounted_old_leaves = changed_before_devices;
+        accounted_old_leaves.insert(successor_device.clone());
+        if accounted_old_leaves != closed_devices || changed_after_devices.len() > 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset leaf deltas do not account for the prior/successor leaves",
+            ));
+        }
+
+        // Validate every actual interval delta, including the complete
+        // TransitionEvidence value. This is deliberately before the head CAS:
+        // writers must never persist a caller-mutated closing fingerprint.
+        let mut closed_interval_devices = BTreeSet::new();
+        let mut opened_interval_devices = BTreeSet::new();
+        for change in effects.interval_changes() {
+            match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if interval_identity_is_unchanged(before, after)
+                        && before.generation == prior.generation()
+                        && after.end.as_ref().is_some_and(|end| {
+                            end.kind == CloseKind::Reset && end.evidence == *producer
+                        }) =>
+                {
+                    if !closed_interval_devices.insert(after.recipient.clone()) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset repeats a closed interval",
+                        ));
+                    }
+                }
+                (None, Some(after))
+                    if after.recipient == *successor_device
+                        && after.generation == hydration.coordinate.generation()
+                        && after.opening == *producer
+                        && after.opening_kind == super::OpeningKind::Reset
+                        && after.opening_context == hydration.coordinate
+                        && after.end.is_none() =>
+                {
+                    if !opened_interval_devices.insert(after.recipient.clone()) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset repeats the successor interval",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset interval change has an illegal shape/evidence",
+                    ))
+                }
+            }
+        }
+        if closed_interval_devices != closed_devices
+            || opened_interval_devices != BTreeSet::from([successor_device.clone()])
+            || effects.interval_changes().len()
+                != closed_devices
+                    .len()
+                    .checked_add(1)
+                    .ok_or(ExecutorError::ValueOutOfRange)?
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset interval changes are not complete/bijective",
+            ));
+        }
+
+        // The actual metadata delta must be the exact signed ResetActivation
+        // binding and the context columns must be the same authenticated author.
+        let metadata_change = effects
+            .metadata_change()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "reset metadata change is missing",
+            ))?;
+        let (Some(before_metadata), Some(after_metadata)) =
+            (metadata_change.before(), metadata_change.after())
+        else {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset metadata change is not a complete replacement",
+            ));
+        };
+        let metadata_author = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "reset metadata author columns",
+            ))?;
+        if after_metadata != signed_metadata
+            || before_metadata == after_metadata
+            || after_metadata.coordinate_conversation_id() != hydration.coordinate.conversation_id()
+            || after_metadata.coordinate_generation() != hydration.coordinate.generation()
+            || after_metadata.coordinate_epoch() != hydration.coordinate.epoch()
+            || after_metadata.coordinate_group_context_hash()
+                != hydration.coordinate.group_context_hash()
+            || after_metadata.author() != successor_device
+            || metadata_author.author_role != "admin"
+            || metadata_author.author_device_status != "active"
+            || metadata_author.author_key_id
+                != URL_SAFE_NO_PAD.encode(after_metadata.author_key_id())
+            || metadata_author.author_public_key != after_metadata.signature_public_key()
+            || u64::try_from(ctx.actor.auth_generation).ok()
+                != Some(after_metadata.author_auth_generation_at_origin())
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset metadata delta/context does not bind the signed successor",
+            ));
+        }
+
+        // Validate entry/event shapes exhaustively. UUIDs and predecessors are
+        // server-minted, but every security-relevant recipient, entitlement,
+        // event kind, and outbox direction is fixed here before any write.
+        let entry_devices = ctx
+            .entry_recipients
+            .iter()
+            .map(|(device, entitlement)| {
+                if *entitlement != EntryEntitlementKind::IntervalClose {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset entry recipient has the wrong entitlement",
+                    ));
+                }
+                Ok(device.clone())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if entry_devices != closed_devices || entry_devices.len() != ctx.entry_recipients.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset entry audience is not complete/bijective",
+            ));
+        }
+        let disposition_devices = ctx
+            .welcome_dispositions
+            .iter()
+            .map(|input| {
+                let welcome = effects
+                    .welcome_changes()
+                    .iter()
+                    .find_map(|change| {
+                        change.after().filter(|after| {
+                            after.welcome_id == *input.welcome_id.as_bytes()
+                                && after.status == WelcomeStatus::Superseded
+                        })
+                    })
+                    .ok_or(ExecutorError::InconsistentPlan(
+                        "reset Welcome disposition has no exact delta",
+                    ))?;
+                let event = &input.event;
+                if !super::is_uuid_v4(event.event_id.as_bytes())
+                    || event.event_kind != EventKind::WelcomeDisposition
+                    || event.payload_bytes.is_empty()
+                    || event.recipients.len() != 1
+                    || event.recipients[0].0 != welcome.recipient
+                    || event.recipients[0].1 != EventEntitlementKind::Welcome
+                    || event.outbox.len() != 1
+                    || !super::is_uuid_v4(event.outbox[0].0.as_bytes())
+                    || event.outbox[0].1 != OutboxWorkKind::Stream
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset Welcome disposition event has an illegal shape",
+                    ));
+                }
+                Ok(welcome.recipient.clone())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let primary = &ctx.events[0];
+        let primary_devices = primary
+            .recipients
+            .iter()
+            .map(|(device, entitlement, _)| {
+                if *entitlement != EventEntitlementKind::Participant {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset primary event has the wrong entitlement",
+                    ));
+                }
+                Ok(device.clone())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let expected_primary = entry_devices
+            .difference(&disposition_devices)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !super::is_uuid_v4(primary.event_id.as_bytes())
+            || primary.event_kind != EventKind::ConversationChanged
+            || primary.payload_bytes.is_empty()
+            || primary_devices != expected_primary
+            || primary_devices.len() != primary.recipients.len()
+            || primary.outbox.len() != 1
+            || !super::is_uuid_v4(primary.outbox[0].0.as_bytes())
+            || primary.outbox[0].1 != OutboxWorkKind::Stream
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset primary event has an illegal shape/audience",
             ));
         }
         Ok(Uuid::from_bytes(signed_request_id))
@@ -22968,6 +23352,56 @@ mod executor {
         applied_at: DateTime<Utc>,
     ) -> Result<FamilyCounts, ExecutorError> {
         let mut counts = FamilyCounts::default();
+        // Consume the exact locked package authority while its paired durable
+        // request/reservation rows are still in the Open/Active pre-state.
+        // Terminalizing those rows first would force this writer to fall back
+        // to a semantic `(ref,status)` edge and discard the guard.
+        for edge in effects.package_transitions() {
+            if edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available {
+                let mut matches = effects.recovery_package_cas().iter().filter(|binding| {
+                    binding.request_id == edge.request_id
+                        && binding.key_package_ref == edge.key_package_ref
+                        && binding.expected_status == edge.from
+                        && binding.successor_status == edge.to
+                });
+                let binding = matches.next().ok_or(ExecutorError::InconsistentPlan(
+                    "prior-bound package edge has no exact locked authority",
+                ))?;
+                if matches.next().is_some() {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound package edge has duplicate locked authority",
+                    ));
+                }
+                let target_did = device_did(&binding.target)?;
+                let target_key_id = URL_SAFE_NO_PAD.encode(binding.target_key_id);
+                transition::release_reserved_recovery_package(
+                    transaction,
+                    &transition::ReservedRecoveryPackageReleaseCas {
+                        transaction_id: &binding.transaction_id,
+                        conversation_id: Uuid::from_bytes(binding.conversation_id),
+                        request_id: Uuid::from_bytes(binding.request_id),
+                        target_did: &target_did,
+                        target_device_id: device_uuid(&binding.target),
+                        target_key_id: &target_key_id,
+                        target_auth_generation: checked_i64(binding.target_auth_generation)?,
+                        generation: checked_i64(binding.bound_coordinate.generation())?,
+                        state_version: checked_i64(binding.bound_coordinate.state_version())?,
+                        group_id: binding.bound_coordinate.group_id(),
+                        epoch: checked_i64(binding.bound_coordinate.epoch())?,
+                        group_context_hash: binding.bound_coordinate.group_context_hash(),
+                        confirmation_tag: binding.bound_coordinate.confirmation_tag(),
+                        key_package_ref: &binding.key_package_ref,
+                        wrapper_sha256: &binding.key_package_wrapper_sha256,
+                        package_not_after: server_instant(binding.package_not_after)?,
+                        claimed_at: server_instant(binding.claimed_at)?,
+                        locked_row_digest: &binding.locked_row_digest,
+                        authority_digest: &binding.authority_digest,
+                    },
+                )
+                .await?;
+                counts.packages += 1;
+            }
+        }
         for change in effects.recovery_request_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
                 if before.status() == RecoveryRequestStatus::Open
@@ -23002,18 +23436,6 @@ mod executor {
                     .await?;
                     counts.reservations += 1;
                 }
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available {
-                transition::cas_key_package_status(
-                    transaction,
-                    &edge.key_package_ref,
-                    RepoPackageStatus::Reserved,
-                    &PackageSuccessor::Reactivate,
-                )
-                .await?;
-                counts.packages += 1;
             }
         }
         Ok(counts)

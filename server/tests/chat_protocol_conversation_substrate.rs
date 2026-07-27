@@ -5535,7 +5535,7 @@ mod historical_control_loader {
         };
         use super::reset_leave_leg::{
             build_real_control_request_entry_with_id_at_and_signed_at, build_real_reset_activation,
-            build_real_reset_activation_with_group_info_at, mutate_real_reset_activation,
+            build_real_reset_activation_with_lifetime_for_test, mutate_real_reset_activation,
             RealResetActivation, RESET_ENTRY_KIND,
         };
         use super::{
@@ -5600,13 +5600,14 @@ mod historical_control_loader {
             ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
             ConversationPersistencePlan, ConversationState, ConversationStateHydration,
             CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
-            DeviceRevocationEvidence, ExecutionActor, ExecutionAuthority, ExecutionContext,
-            ExecutorError, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
-            LeaveRequestStatus, LockedRegistrationProjection, ParticipantRole, ParticipantStatus,
-            PlanAuthority, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
-            RecoverySource, ReservationStatus, RevocationPackageCasBinding,
-            RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
-            WelcomeExpiryAuthority, WelcomeStatus, WorkTerminalHydrationRow,
+            DeviceRevocationEvidence, DurableSignedRequestEnvelope, ExecutionActor,
+            ExecutionAuthority, ExecutionContext, ExecutorError, HistoricalRehydrationAuthority,
+            HydrationAuthority, LeafRecoveryKind, LeaveRequestStatus, LockedRegistrationProjection,
+            ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
+            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
+            RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
+            SpineArtifacts, TransitionEvidence, WelcomeExpiryAuthority, WelcomeStatus,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -11630,6 +11631,7 @@ mod historical_control_loader {
 
         async fn run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
             include_reset: bool,
+            delegated_reset_request: bool,
         ) {
             let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
             let trusted_at: DateTime<Utc> =
@@ -11712,16 +11714,54 @@ mod historical_control_loader {
                 0x56,
                 0x57,
             );
-            let reset_request_at = trusted_at + chrono::Duration::seconds(1);
+            let prior_bound_recovery_at = trusted_at + chrono::Duration::seconds(1);
+            let prior_bound_recovery_text =
+                prior_bound_recovery_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let prior_bound_recovery_signed_text = (prior_bound_recovery_at
+                - chrono::Duration::milliseconds(500))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let prior_bound_recovery_request_id = *Uuid::new_v4().as_bytes();
+            let prior_bound_recovery_request = build_signed_recovery_request_at(
+                &entry,
+                prior_bound_recovery_request_id,
+                committed.coordinate(),
+                &prior_bound_recovery_signed_text,
+            );
+            let (prior_bound_key_package_ref, prior_bound_key_package_wrapper) =
+                build_real_creator_key_package_at(
+                    &entry,
+                    prior_bound_recovery_at,
+                    package_not_before,
+                    package_not_after,
+                );
+            let reset_request_at = trusted_at + chrono::Duration::seconds(2);
             let reset_request_text = reset_request_at.to_rfc3339_opts(SecondsFormat::Millis, true);
             let reset_request_signed_text = (reset_request_at
                 - chrono::Duration::milliseconds(500))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
-            let reset_activation_at = trusted_at + chrono::Duration::seconds(2);
+            let reset_activation_at = trusted_at + chrono::Duration::seconds(3);
             let reset_activation_text =
                 reset_activation_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let delegated_reset_request_entry = RealCreationEntry {
+                cid: entry.cid,
+                entry_id: entry.entry_id,
+                public_row_json: entry.public_row_json.clone(),
+                raw_wrapper: entry.raw_wrapper.clone(),
+                public_key: invitee.signing_key.verifying_key().to_bytes().to_vec(),
+                outer_entry_fingerprint: entry.outer_entry_fingerprint,
+                actor_did: invitee.did.clone(),
+                actor_device_id: invitee.device_id,
+                actor_key_id: invitee.key_id.clone(),
+                signing_seed: invitee.signing_key.to_bytes(),
+                head_next_entry_seq: entry.head_next_entry_seq,
+            };
+            let reset_request_signer = if delegated_reset_request {
+                &delegated_reset_request_entry
+            } else {
+                &entry
+            };
             let reset_request = build_real_control_request_entry_with_id_at_and_signed_at(
-                &entry,
+                reset_request_signer,
                 SignedMutationKind::ResetRequest,
                 RESET_ENTRY_KIND,
                 5,
@@ -11759,6 +11799,14 @@ mod historical_control_loader {
                 reset_request.request_id,
                 committed.coordinate(),
                 6,
+                Value::Array(reset_participants.clone()),
+                reset_activation_at,
+            );
+            let non_admin_reset_activation = build_real_reset_activation(
+                &delegated_reset_request_entry,
+                reset_request.request_id,
+                committed.coordinate(),
+                6,
                 Value::Array(reset_participants),
                 reset_activation_at,
             );
@@ -11770,6 +11818,10 @@ mod historical_control_loader {
             );
             let acceptance_trusted = TrustedRequestInstant::from_canonical_for_test(
                 CanonicalTimestamp::parse(&trusted_text).expect("Acceptance time canonical"),
+            );
+            let prior_bound_recovery_trusted = TrustedRequestInstant::from_canonical_for_test(
+                CanonicalTimestamp::parse(&prior_bound_recovery_text)
+                    .expect("prior-bound recovery time canonical"),
             );
             let actor_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(Uuid::new_v4().as_bytes()));
 
@@ -11993,6 +12045,47 @@ mod historical_control_loader {
                 .await
                 .expect("commit lifecycle Fulfillment fallback");
 
+            let recovery_request_relationship_authority = RelationshipAuthority::new(
+                fixed_production_relationship_policy_config()
+                    .expect("fixed recovery-request relationship configuration"),
+                CreationRelationshipTransport,
+            );
+            let mut recovery_request_roster = vec![entry.actor_did.clone(), invitee.did.clone()];
+            recovery_request_roster.sort();
+            let live_recovery_request =
+                crate::relationship_policy_source::collect_block_projection(
+                    &recovery_request_relationship_authority,
+                    &FixedProjectionClock(prior_bound_recovery_at),
+                    PolicyProjectionRevisionGuard::for_test(1),
+                    ProjectionOperationScope::RecoveryReservation,
+                    recovery_request_roster,
+                )
+                .await
+                .expect("collect lifecycle recovery-request relationship projection");
+            let mut fallback_tx = pool.begin().await.expect("begin recovery-request fallback");
+            let recovery_request_allocation = allocate_projection_revision(&mut fallback_tx)
+                .await
+                .expect("allocate recovery-request projection revision");
+            let (allocation_id, projection_revision) =
+                recovery_request_allocation.into_allocation();
+            let sealed_recovery_request = live_recovery_request
+                .export_persisted_fallback(
+                    PolicyProjectionRevisionGuard::for_test_allocation(
+                        allocation_id,
+                        projection_revision,
+                    ),
+                    &recovery_request_relationship_authority,
+                    &TrustedRelationshipPersistenceInstant::for_test(prior_bound_recovery_at),
+                )
+                .expect("seal lifecycle recovery-request fallback");
+            persist_relationship_projection(&mut fallback_tx, sealed_recovery_request)
+                .await
+                .expect("persist lifecycle recovery-request fallback");
+            fallback_tx
+                .commit()
+                .await
+                .expect("commit lifecycle recovery-request fallback");
+
             let creation_request = match authorize_signed_request(
                 &pool,
                 crate::dpop::repository_test_evidence::ordinary_device_with_binding(
@@ -12073,6 +12166,28 @@ mod historical_control_loader {
                 AuthorizationOutcome::FirstExecution(authority) => authority,
                 AuthorizationOutcome::CompletedReplay(_) => panic!("fresh Fulfillment replayed"),
             };
+            let prior_bound_recovery_authority = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.requestLeafRecovery",
+                    &prior_bound_recovery_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &actor_jkt,
+                ),
+                decode_canonical_signed_mutation(&prior_bound_recovery_request.raw_wrapper)
+                    .expect("prior-bound recovery request canonical for authorization"),
+            )
+            .await
+            .expect("authorize prior-bound recovery request")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => {
+                    panic!("fresh prior-bound recovery request replayed")
+                }
+            };
             let reset_request_authority = match authorize_signed_request(
                 &pool,
                 crate::dpop::repository_test_evidence::ordinary_device_with_binding(
@@ -12080,9 +12195,13 @@ mod historical_control_loader {
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.requestReset",
                     &reset_request_text,
-                    &entry.actor_did,
-                    entry.actor_device_id,
-                    &actor_jkt,
+                    &reset_request_signer.actor_did,
+                    reset_request_signer.actor_device_id,
+                    if delegated_reset_request {
+                        &invitee.key_id
+                    } else {
+                        &actor_jkt
+                    },
                 ),
                 decode_canonical_signed_mutation(&reset_request.raw_wrapper)
                     .expect("ResetRequest canonical for authorization"),
@@ -12113,6 +12232,28 @@ mod historical_control_loader {
                 AuthorizationOutcome::FirstExecution(authority) => authority,
                 AuthorizationOutcome::CompletedReplay(_) => {
                     panic!("fresh ResetActivation replayed")
+                }
+            };
+            let non_admin_reset_activation_authority = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.activateReset",
+                    &reset_activation_text,
+                    &invitee.did,
+                    invitee.device_id,
+                    &invitee.key_id,
+                ),
+                decode_canonical_signed_mutation(&non_admin_reset_activation.raw_wrapper)
+                    .expect("non-admin ResetActivation canonical for authorization"),
+            )
+            .await
+            .expect("authorize genuine non-admin ResetActivation")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => {
+                    panic!("fresh non-admin ResetActivation replayed")
                 }
             };
 
@@ -13951,6 +14092,143 @@ mod historical_control_loader {
                 sqlx::query("SET CONSTRAINTS ALL DEFERRED")
                     .execute(&mut *tx)
                     .await
+                    .expect("defer constraints for prior-bound recovery request");
+                sqlx::query(
+                    r#"INSERT INTO chat.key_packages(
+                        key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                        owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                        status,created_at
+                    ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#,
+                )
+                .bind(prior_bound_key_package_ref.to_vec())
+                .bind(&prior_bound_key_package_wrapper)
+                .bind(Sha256::digest(&prior_bound_key_package_wrapper).to_vec())
+                .bind(
+                    Sha256::digest(
+                        [
+                            b"g6-reset-prior-bound-init".as_ref(),
+                            conversation_id.as_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .to_vec(),
+                )
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(package_not_before)
+                .bind(package_not_after)
+                .bind(trusted_at)
+                .execute(&mut *tx)
+                .await
+                .expect("insert genuine prior-bound Reset KeyPackage");
+                let locked_before_recovery = hydrate_locked_conversation_state(
+                    &mut tx,
+                    conversation_id,
+                    prior_bound_recovery_at,
+                )
+                .await
+                .expect("lock exact post-Fulfillment graph for recovery request");
+                let recovery_request_hydration =
+                    HydrationAuthority::from_locked_conversation(&locked_before_recovery)
+                        .expect("mint prior-bound recovery-request authority");
+                let recovery_request_business =
+                    recheck_business_authority(&mut tx, &prior_bound_recovery_authority)
+                        .await
+                        .expect("recheck prior-bound recovery-request authority");
+                let recovery_request_registration = recovery_request_hydration
+                    .locked_registration_from_guard(recovery_request_business)
+                    .expect("seal prior-bound recovery-request registration");
+                let available_package = hydrate_locked_available_recovery_package(
+                    &mut tx,
+                    locked_before_recovery.head(),
+                    Uuid::from_bytes(prior_bound_recovery_request_id),
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &entry.actor_key_id,
+                    1,
+                    *committed.coordinate(),
+                )
+                .await
+                .expect("lock exact prior-bound available package");
+                assert_eq!(
+                    available_package.key_package_ref(),
+                    &prior_bound_key_package_ref
+                );
+                let recovery_request_reservation = recovery_request_hydration
+                    .locked_recovery_reservation(
+                        available_package,
+                        &recovery_request_registration,
+                    )
+                    .expect("seal prior-bound recovery reservation");
+                let recovery_request_scope = seal_recovery_fallback_scope(
+                    &locked_before_recovery,
+                    &recovery_request_registration,
+                    ProjectionOperationScope::RecoveryReservation,
+                )
+                .expect("seal recovery-request relationship scope");
+                let (recovery_relationship, recovery_decision) =
+                    load_fallback_relationship_projection(
+                        &mut tx,
+                        recovery_request_scope,
+                        &recovery_request_relationship_authority,
+                    )
+                    .await
+                    .expect("load recovery-request relationship")
+                    .expect("recovery-request fallback exists");
+                let recovery_request_mutation = decode_and_verify_signed_mutation(
+                    &prior_bound_recovery_request.raw_wrapper,
+                    &entry.public_key,
+                )
+                .expect("verify prior-bound recovery request");
+                let recovery_request_plan = recovery_request_hydration
+                    .plan_leaf_recovery_request_entry(
+                        &locked_before_recovery,
+                        DurableSignedRequestEnvelope::new(
+                            *conversation_id.as_bytes(),
+                            &prior_bound_recovery_trusted,
+                        )
+                        .expect("bind recovery request durable envelope"),
+                        recovery_request_mutation,
+                        recovery_request_registration,
+                        recovery_request_reservation,
+                        &recovery_relationship,
+                        &recovery_request_relationship_authority,
+                        &recovery_decision,
+                        &prior_bound_recovery_trusted,
+                    )
+                    .expect("plan genuine prior-bound recovery request")
+                    .into_persistence_plan()
+                    .expect("seal prior-bound recovery request plan");
+                let recovery_request_context = hydrate_execution_context(
+                    &mut tx,
+                    &recovery_request_plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: Some(
+                            format!("g6-prior-bound-recovery-{conversation_id}").into_bytes(),
+                        ),
+                        welcome_disposition_event_payloads: Vec::new(),
+                    },
+                )
+                .await
+                .expect("hydrate prior-bound recovery request context");
+                apply_conversation_persistence_plan(
+                    &mut tx,
+                    &recovery_request_plan,
+                    &recovery_request_context,
+                )
+                .await
+                .expect("apply prior-bound recovery request");
+                sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("force prior-bound recovery request constraints");
+
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
                     .expect("defer constraints for ResetRequest");
                 let locked_fulfillment = hydrate_locked_conversation_state(
                     &mut tx,
@@ -13987,13 +14265,13 @@ mod historical_control_loader {
                     .expect("seal lifecycle ResetRequest registration");
                 let reset_request_verified = decode_and_verify_control_entry(
                     &reset_request.public_row_json,
-                    &entry.public_key,
+                    &reset_request_signer.public_key,
                 )
                 .expect("verify lifecycle ResetRequest");
                 let reset_request_verified = rebind_persisted_control_entry(
                     reset_request_verified,
                     &reset_request.raw_wrapper,
-                    &entry.public_key,
+                    &reset_request_signer.public_key,
                 )
                 .expect("rebind lifecycle ResetRequest");
                 let reset_request_plan = reset_request_hydration
@@ -14054,6 +14332,62 @@ mod historical_control_loader {
                 let reset_activation_registration = reset_activation_hydration
                     .locked_registration_from_guard(reset_activation_business)
                     .expect("seal lifecycle ResetActivation registration");
+                let non_admin_hydration =
+                    HydrationAuthority::from_locked_conversation(&locked_reset_request)
+                        .expect("mint non-admin ResetActivation authority");
+                let non_admin_business =
+                    recheck_business_authority(&mut tx, &non_admin_reset_activation_authority)
+                        .await
+                        .expect("recheck genuine non-admin ResetActivation authority");
+                let non_admin_registration = non_admin_hydration
+                    .locked_registration_from_guard(non_admin_business)
+                    .expect("seal genuine non-admin ResetActivation registration");
+                let non_admin_verified = decode_and_verify_control_entry(
+                    &non_admin_reset_activation.public_row_json,
+                    &delegated_reset_request_entry.public_key,
+                )
+                .expect("verify genuine non-admin ResetActivation");
+                let non_admin_verified = rebind_persisted_control_entry(
+                    non_admin_verified,
+                    &non_admin_reset_activation.raw_wrapper,
+                    &delegated_reset_request_entry.public_key,
+                )
+                .expect("rebind genuine non-admin ResetActivation");
+                let before_non_admin = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let non_admin_error = non_admin_hydration
+                    .plan_reset_activation_entry(
+                        &locked_reset_request,
+                        non_admin_verified,
+                        &non_admin_registration,
+                        Vec::new(),
+                    )
+                    .expect_err("active member cannot activate a Reset");
+                assert!(
+                    matches!(
+                        non_admin_error,
+                        crate::chat_protocol::state_machine::StateMachineError::AdminRequired
+                    ),
+                    "genuine member activation must fail specifically at admin policy: {non_admin_error:?}"
+                );
+                let after_non_admin = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                assert_eq!(
+                    after_non_admin, before_non_admin,
+                    "genuine non-admin ResetActivation changed durable rows"
+                );
                 let mut invalid_group_info = reset_activation.group_info.clone();
                 let invalid_group_info_last = invalid_group_info.len() - 1;
                 invalid_group_info[invalid_group_info_last] ^= 1;
@@ -14085,9 +14419,36 @@ mod historical_control_loader {
                     singleton_manifest(&credential_entry),
                     reset_activation_at,
                 );
-                let mut signature_entry =
-                    build_real_creation_entry(*Uuid::new_v4().as_bytes());
-                signature_entry.cid = entry.cid;
+                let signature_seed: [u8; 32] = Sha256::digest(
+                    [
+                        b"CATBIRD-G6-RESET-SIGNATURE-KEY-ONLY\0".as_ref(),
+                        conversation_id.as_bytes(),
+                    ]
+                    .concat(),
+                )
+                .into();
+                let signature_signer = SigningKey::from_bytes(&signature_seed);
+                let signature_public_key =
+                    signature_signer.verifying_key().to_bytes().to_vec();
+                let signature_entry = RealCreationEntry {
+                    cid: entry.cid,
+                    entry_id: entry.entry_id,
+                    public_row_json: entry.public_row_json.clone(),
+                    raw_wrapper: entry.raw_wrapper.clone(),
+                    public_key: signature_public_key.clone(),
+                    outer_entry_fingerprint: entry.outer_entry_fingerprint,
+                    actor_did: entry.actor_did.clone(),
+                    actor_device_id: entry.actor_device_id,
+                    actor_key_id: ed25519_key_id(&signature_public_key)
+                        .expect("alternate Reset GroupInfo key id")
+                        .as_str()
+                        .to_owned(),
+                    signing_seed: signature_seed,
+                    head_next_entry_seq: entry.head_next_entry_seq,
+                };
+                assert_eq!(signature_entry.actor_did, entry.actor_did);
+                assert_eq!(signature_entry.actor_device_id, entry.actor_device_id);
+                assert_ne!(signature_entry.public_key, entry.public_key);
                 let signature_group_info = build_real_reset_activation(
                     &signature_entry,
                     reset_request.request_id,
@@ -14096,14 +14457,18 @@ mod historical_control_loader {
                     singleton_manifest(&signature_entry),
                     reset_activation_at,
                 );
-                let lifetime_group_info = build_real_reset_activation_with_group_info_at(
+                let reset_received_unix =
+                    u64::try_from(reset_activation_at.timestamp()).expect("positive Reset time");
+                let lifetime_group_info = build_real_reset_activation_with_lifetime_for_test(
                     &entry,
                     reset_request.request_id,
                     committed.coordinate(),
                     6,
                     singleton_manifest(&entry),
                     reset_activation_at,
-                    reset_activation_at - chrono::Duration::hours(2),
+                    reset_received_unix,
+                    reset_received_unix + 3_600,
+                    reset_received_unix + 1,
                 );
                 let replace_group_info =
                     |alternate: &RealResetActivation| -> (Vec<u8>, Vec<u8>) {
@@ -14200,17 +14565,6 @@ mod historical_control_loader {
                         replace_group_info(&credential_group_info),
                     ),
                     (
-                        "GroupInfo signature-key mismatch",
-                        replace_group_info(&signature_group_info),
-                    ),
-                    (
-                        "GroupInfo lifetime mismatch",
-                        (
-                            lifetime_group_info.public_row_json.clone(),
-                            lifetime_group_info.raw_wrapper.clone(),
-                        ),
-                    ),
-                    (
                         "wrong registered actor",
                         mutate_real_reset_activation(&entry, &reset_activation, |body| {
                             body["actorDid"] = json!(invitee.did);
@@ -14273,6 +14627,76 @@ mod historical_control_loader {
                     .await;
                     assert_eq!(after, before, "{label} changed durable rows");
                 }
+                for (label, (candidate_row, candidate_wrapper)) in [
+                    (
+                        "GroupInfo signature-key-only mismatch",
+                        replace_group_info(&signature_group_info),
+                    ),
+                    (
+                        "GroupInfo lifetime excludes locked receivedAt",
+                        (
+                            lifetime_group_info.public_row_json.clone(),
+                            lifetime_group_info.raw_wrapper.clone(),
+                        ),
+                    ),
+                ] {
+                    let row_json: Value =
+                        serde_json::from_slice(&candidate_row).expect("parse isolated Reset row");
+                    assert_eq!(
+                        row_json["receivedAt"].as_str(),
+                        Some(reset_activation_text.as_str()),
+                        "{label} keeps the public receivedAt at the locked instant"
+                    );
+                    decode_and_verify_signed_mutation(&candidate_wrapper, &entry.public_key)
+                        .unwrap_or_else(|error| {
+                            panic!("{label} must retain the base actor signature: {error}")
+                        });
+                    let before = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    let candidate =
+                        decode_and_verify_control_entry(&candidate_row, &entry.public_key)
+                            .unwrap_or_else(|error| {
+                                panic!("{label} must pass outer control decoding: {error}")
+                            });
+                    let candidate = rebind_persisted_control_entry(
+                        candidate,
+                        &candidate_wrapper,
+                        &entry.public_key,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label} must pass exact persisted-row rebind: {error}")
+                    });
+                    let error = reset_activation_hydration
+                        .plan_reset_activation_entry(
+                            &locked_reset_request,
+                            candidate,
+                            &reset_activation_registration,
+                            Vec::new(),
+                        )
+                        .expect_err("isolated GroupInfo negative must fail the production verifier");
+                    assert!(
+                        matches!(
+                            error,
+                            crate::chat_protocol::state_machine::StateMachineError::InvalidPublicState
+                        ),
+                        "{label} must fail specifically at the public-state verifier, got {error:?}"
+                    );
+                    let after = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(after, before, "{label} changed durable rows");
+                }
                 let reset_activation_verified = decode_and_verify_control_entry(
                     &reset_activation.public_row_json,
                     &entry.public_key,
@@ -14284,12 +14708,19 @@ mod historical_control_loader {
                     &entry.public_key,
                 )
                 .expect("rebind lifecycle ResetActivation");
+                let terminal_reset_package = hydrate_locked_reserved_recovery_package(
+                    &mut tx,
+                    locked_reset_request.head(),
+                    Uuid::from_bytes(prior_bound_recovery_request_id),
+                )
+                .await
+                .expect("lock exact prior-bound package for Reset terminalization");
                 let reset_activation_plan = reset_activation_hydration
                     .plan_reset_activation_entry(
                         &locked_reset_request,
                         reset_activation_verified,
                         &reset_activation_registration,
-                        Vec::new(),
+                        vec![terminal_reset_package],
                     )
                     .expect("plan genuine lifecycle ResetActivation")
                     .into_persistence_plan()
@@ -14375,6 +14806,49 @@ mod historical_control_loader {
                 )
                 .await
                 .expect("hydrate lifecycle ResetActivation context");
+                let drifted_package_guard_plan = reset_activation_plan
+                    .clone()
+                    .with_reset_recovery_package_wrapper_digest_corrupted_for_test();
+                let before_drifted_package_guard = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &prior_bound_key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let drifted_package_guard_error = apply_conversation_persistence_plan(
+                    &mut tx,
+                    &drifted_package_guard_plan,
+                    &reset_activation_context,
+                )
+                .await
+                .expect_err("drifted Reset package guard must fail before CAS");
+                assert!(matches!(
+                    drifted_package_guard_error,
+                    ExecutorError::InconsistentPlan(_)
+                ));
+                let head_after_drifted_package_guard: (i64, i64, i64) = sqlx::query_as(
+                    r#"SELECT current_generation,current_state_version,next_entry_seq
+                         FROM chat.conversations WHERE conversation_id=$1"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read head after drifted package-guard rejection");
+                assert_eq!(head_after_drifted_package_guard, (0, 3, 6));
+                let after_drifted_package_guard = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &prior_bound_key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                assert_eq!(
+                    after_drifted_package_guard, before_drifted_package_guard,
+                    "drifted Reset package guard changed durable rows before rejection"
+                );
                 let malformed_reset_plan = reset_activation_plan
                     .clone()
                     .with_welcome_supersession_corrupted_for_test();
@@ -14419,6 +14893,50 @@ mod historical_control_loader {
                     "malformed Reset plan changed durable rows before rejection"
                 );
 
+                let malformed_interval_plan = reset_activation_plan
+                    .clone()
+                    .with_reset_interval_evidence_corrupted_for_test();
+                let before_malformed_interval = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let malformed_interval_error = apply_conversation_persistence_plan(
+                    &mut tx,
+                    &malformed_interval_plan,
+                    &reset_activation_context,
+                )
+                .await
+                .expect_err("malformed Reset interval evidence must fail before CAS");
+                assert!(matches!(
+                    malformed_interval_error,
+                    ExecutorError::InconsistentPlan(_)
+                ));
+                let head_after_malformed_interval: (i64, i64, i64) = sqlx::query_as(
+                    r#"SELECT current_generation,current_state_version,next_entry_seq
+                         FROM chat.conversations WHERE conversation_id=$1"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read head after malformed Reset interval rejection");
+                assert_eq!(head_after_malformed_interval, (0, 3, 6));
+                let after_malformed_interval = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                assert_eq!(
+                    after_malformed_interval, before_malformed_interval,
+                    "malformed Reset interval evidence changed durable rows before rejection"
+                );
+
                 apply_conversation_persistence_plan(
                     &mut tx,
                     &reset_activation_plan,
@@ -14458,6 +14976,247 @@ mod historical_control_loader {
                         Some(reset_activation.transition_id),
                         Some(reset_activation_at),
                     )
+                );
+                let reset_request_projection_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                            request.requester_did=$3
+                            AND request.requester_device_id=$4
+                            AND request.requester_key_id=$5
+                            AND request.requester_auth_generation=1
+                            AND request.prior_generation=0
+                            AND request.prior_state_version=3
+                            AND request.prior_group_id=$6
+                            AND request.prior_epoch=$7
+                            AND request.prior_group_context_hash=$8
+                            AND request.prior_confirmation_tag=$9
+                            AND request.reason='manualRecovery'
+                            AND request.status='consumed'
+                            AND request.signed_request_bytes=$10
+                            AND request.signing_transcript_bytes=$11
+                            AND request.request_digest=$12
+                            AND request.signature=$13
+                            AND request.received_at=$14
+                            AND request.expires_at=$14 + interval '24 hours'
+                            AND request.terminal_transition_id=$15
+                            AND request.terminal_at=$16)
+                       FROM chat.reset_requests request
+                      WHERE request.reset_request_id=$1
+                        AND request.conversation_id=$2"#,
+                )
+                .bind(Uuid::from_bytes(reset_request.request_id))
+                .bind(conversation_id)
+                .bind(&reset_request_signer.actor_did)
+                .bind(reset_request_signer.actor_device_id)
+                .bind(&reset_request_signer.actor_key_id)
+                .bind(committed.coordinate().group_id().to_vec())
+                .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+                .bind(committed.coordinate().group_context_hash().to_vec())
+                .bind(committed.coordinate().confirmation_tag().to_vec())
+                .bind(&reset_request.raw_wrapper)
+                .bind(&reset_request.signing_transcript)
+                .bind(&reset_request.request_digest)
+                .bind(&reset_request.signature)
+                .bind(reset_request_at)
+                .bind(reset_activation.transition_id)
+                .bind(reset_activation_at)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact signed ResetRequest projection");
+                assert!(
+                    reset_request_projection_exact,
+                    "ResetRequest must retain exact requester, prior, reason, expiry, and signed provenance"
+                );
+                let recovery_release_exact: bool = sqlx::query_scalar(
+                    r#"SELECT
+                        (SELECT count(*)=1 AND bool_and(
+                            request.conversation_id=$2
+                            AND request.generation=0
+                            AND request.requester_did=$3
+                            AND request.requester_device_id=$4
+                            AND request.requester_key_id=$5
+                            AND request.requester_auth_generation=1
+                            AND request.bound_state_version=3
+                            AND request.bound_group_id=$6
+                            AND request.bound_epoch=$7
+                            AND request.bound_group_context_hash=$8
+                            AND request.bound_confirmation_tag=$9
+                            AND request.status='superseded'
+                            AND request.signed_request_bytes=$10
+                            AND request.signing_transcript_bytes=$11
+                            AND request.request_digest=$12
+                            AND request.signature=$13
+                            AND request.requested_at=$14
+                            AND request.terminal_transition_id=$15
+                            AND request.terminal_at=$16)
+                           FROM chat.leaf_recovery_requests request
+                          WHERE request.recovery_request_id=$1)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            reservation.key_package_ref=$17
+                            AND reservation.conversation_id=$2
+                            AND reservation.generation=0
+                            AND reservation.requester_did=$3
+                            AND reservation.requester_device_id=$4
+                            AND reservation.requester_key_id=$5
+                            AND reservation.requester_auth_generation=1
+                            AND reservation.recipient_did=$3
+                            AND reservation.recipient_device_id=$4
+                            AND reservation.bound_state_version=3
+                            AND reservation.bound_group_id=$6
+                            AND reservation.bound_epoch=$7
+                            AND reservation.bound_group_context_hash=$8
+                            AND reservation.bound_confirmation_tag=$9
+                            AND reservation.status='released'
+                            AND reservation.terminal_transition_id=$15
+                            AND reservation.terminal_at=$16
+                            AND reservation.created_at=$14)
+                           FROM chat.key_package_reservations reservation
+                          WHERE reservation.recovery_request_id=$1)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            package.wrapper_bytes=$18
+                            AND package.wrapper_sha256=digest($18::bytea,'sha256')
+                            AND package.owner_did=$3
+                            AND package.owner_device_id=$4
+                            AND package.owner_key_id=$5
+                            AND package.owner_auth_generation=1
+                            AND package.not_after=$19
+                            AND package.status='available'
+                            AND package.terminal_transition_id IS NULL
+                            AND package.terminal_revocation_id IS NULL
+                            AND package.terminal_at IS NULL)
+                           FROM chat.key_packages package
+                          WHERE package.key_package_ref=$17)"#,
+                )
+                .bind(Uuid::from_bytes(prior_bound_recovery_request_id))
+                .bind(conversation_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(committed.coordinate().group_id().to_vec())
+                .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+                .bind(committed.coordinate().group_context_hash().to_vec())
+                .bind(committed.coordinate().confirmation_tag().to_vec())
+                .bind(&prior_bound_recovery_request.raw_wrapper)
+                .bind(&prior_bound_recovery_request.signing_transcript)
+                .bind(&prior_bound_recovery_request.request_digest)
+                .bind(&prior_bound_recovery_request.signature)
+                .bind(prior_bound_recovery_at)
+                .bind(reset_activation.transition_id)
+                .bind(reset_activation_at)
+                .bind(prior_bound_key_package_ref.to_vec())
+                .bind(&prior_bound_key_package_wrapper)
+                .bind(package_not_after)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset recovery request/reservation/package release graph");
+                assert!(
+                    recovery_release_exact,
+                    "Reset must terminalize the exact locked prior-bound recovery triple"
+                );
+
+                let successor_leaf_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                            leaf.participant_period_id=participant.participant_period_id
+                            AND participant.user_did=$2
+                            AND participant.status='active'
+                            AND participant.role='admin'
+                            AND participant.current_membership
+                            AND leaf.user_did=$2
+                            AND leaf.device_id=$3
+                            AND leaf.leaf_index=0
+                            AND leaf.basic_credential=convert_to($2 || '#' || $3::text,'UTF8')
+                            AND leaf.leaf_signature_key=$4
+                            AND leaf.leaf_key_id=$5
+                            AND leaf.leaf_auth_generation=1
+                            AND leaf.origin='genesis'
+                            AND leaf.join_key_package_ref IS NULL
+                            AND leaf.joined_state_version=0
+                            AND leaf.joined_transition_id=$6
+                            AND leaf.joined_seq=6
+                            AND leaf.removed_state_version IS NULL
+                            AND leaf.removed_transition_id IS NULL
+                            AND leaf.removed_seq IS NULL
+                            AND leaf.removed_at IS NULL
+                            AND leaf.active)
+                       FROM chat.member_devices leaf
+                       JOIN chat.participants participant
+                         ON participant.participant_period_id=leaf.participant_period_id
+                      WHERE leaf.conversation_id=$1 AND leaf.generation=1"#,
+                )
+                .bind(conversation_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.public_key)
+                .bind(&entry.actor_key_id)
+                .bind(reset_activation.transition_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset successor leaf provenance");
+                assert!(
+                    successor_leaf_exact,
+                    "Reset successor must contain exactly the authenticated admin genesis leaf"
+                );
+
+                let reset_metadata_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                            metadata.generation=1
+                            AND metadata.state_version=0
+                            AND metadata.group_id=$2
+                            AND metadata.epoch=0
+                            AND metadata.group_context_hash=$3
+                            AND metadata.confirmation_tag=$4
+                            AND metadata.producing_transition_id=$5
+                            AND metadata.origin_transition_id=$5
+                            AND metadata.metadata_version=2
+                            AND metadata.nonce=$6
+                            AND metadata.ciphertext=$7
+                            AND metadata.ciphertext_sha256=digest($7::bytea,'sha256')
+                            AND metadata.ciphertext_size=16
+                            AND metadata.avatar_blob_id IS NULL
+                            AND metadata.author_did=$8
+                            AND metadata.author_device_id=$9
+                            AND metadata.author_key_id=$10
+                            AND metadata.author_public_key=$11
+                            AND metadata.author_auth_generation=1
+                            AND metadata.author_origin_seq=6
+                            AND metadata.author_role='admin'
+                            AND metadata.author_device_status='active'
+                            AND metadata.created_at=$12)
+                       FROM chat.metadata_snapshots metadata
+                      WHERE metadata.conversation_id=$1
+                        AND metadata.producing_transition_id=$5"#,
+                )
+                .bind(conversation_id)
+                .bind(reset_activation.successor_public_state.coordinate().group_id().to_vec())
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .group_context_hash()
+                        .to_vec(),
+                )
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .confirmation_tag()
+                        .to_vec(),
+                )
+                .bind(reset_activation.transition_id)
+                .bind(vec![0xb1_u8; 12])
+                .bind(vec![0xb2_u8; 16])
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(&entry.public_key)
+                .bind(reset_activation_at)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset signed metadata replacement");
+                assert!(
+                    reset_metadata_exact,
+                    "Reset must persist the exact signed metadata and author provenance"
                 );
                 #[allow(clippy::type_complexity)]
                 let reset_spines: Vec<(
@@ -14517,6 +15276,109 @@ mod historical_control_loader {
                 assert_eq!(
                     reset_spines[1].4,
                     reset_activation.successor_public_state.snapshot()
+                );
+                let expected_successor_tree = encode_public_tree_summary(
+                    reset_activation
+                        .successor_public_state
+                        .binding()
+                        .tree_summary(),
+                )
+                .expect("independently encode expected Reset successor tree");
+                let reset_generation_spines_exact: bool = sqlx::query_scalar(
+                    r#"SELECT
+                        (SELECT count(*)=1 AND bool_and(
+                            generation.group_id=$2
+                            AND generation.lifecycle='superseded'
+                            AND generation.current_state_version=4
+                            AND generation.superseded_seq=6
+                            AND generation.superseded_at=$3)
+                           FROM chat.generations generation
+                          WHERE generation.conversation_id=$1
+                            AND generation.generation=0)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            generation.group_id=$4
+                            AND generation.lifecycle='active'
+                            AND generation.genesis_group_info_bytes=$5
+                            AND generation.genesis_group_info_sha256=digest($5::bytea,'sha256')
+                            AND generation.current_state_version=0
+                            AND generation.activated_seq=6
+                            AND generation.activated_at=$3
+                            AND generation.superseded_seq IS NULL
+                            AND generation.superseded_at IS NULL)
+                           FROM chat.generations generation
+                          WHERE generation.conversation_id=$1
+                            AND generation.generation=1)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            state.group_id=$2
+                            AND state.epoch=$6
+                            AND state.group_context_hash=$7
+                            AND state.confirmation_tag=$8
+                            AND state.lifecycle='superseded'
+                            AND state.state_kind='resetRetirement'
+                            AND state.producing_transition_id=$9
+                            AND state.created_at=$3)
+                           FROM chat.generation_states state
+                          WHERE state.conversation_id=$1
+                            AND state.generation=0 AND state.state_version=4)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            state.group_id=$4
+                            AND state.epoch=0
+                            AND state.group_context_hash=$10
+                            AND state.confirmation_tag=$11
+                            AND state.lifecycle='active'
+                            AND state.state_kind='resetSuccessor'
+                            AND state.producing_transition_id=$9
+                            AND state.public_snapshot_bytes=$12
+                            AND state.snapshot_sha256=digest($12::bytea,'sha256')
+                            AND state.tree_summary_bytes=$13
+                            AND state.tree_summary_sha256=$14
+                            AND state.leaf_count=1
+                            AND state.created_at=$3)
+                           FROM chat.generation_states state
+                          WHERE state.conversation_id=$1
+                            AND state.generation=1 AND state.state_version=0)"#,
+                )
+                .bind(conversation_id)
+                .bind(committed.coordinate().group_id().to_vec())
+                .bind(reset_activation_at)
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .group_id()
+                        .to_vec(),
+                )
+                .bind(&reset_activation.group_info)
+                .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+                .bind(committed.coordinate().group_context_hash().to_vec())
+                .bind(committed.coordinate().confirmation_tag().to_vec())
+                .bind(reset_activation.transition_id)
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .group_context_hash()
+                        .to_vec(),
+                )
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .confirmation_tag()
+                        .to_vec(),
+                )
+                .bind(reset_activation.successor_public_state.snapshot())
+                .bind(expected_successor_tree.bytes())
+                .bind(expected_successor_tree.sha256().to_vec())
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset generations and full two-spine graph");
+                assert!(
+                    reset_generation_spines_exact,
+                    "Reset generations/spines must bind full coordinates, producer, time, and independent successor tree"
                 );
                 let successor_group_info: (Vec<u8>, Vec<u8>) = sqlx::query_as(
                     r#"SELECT genesis_group_info_bytes,genesis_group_info_sha256
@@ -14612,6 +15474,82 @@ mod historical_control_loader {
                 .await
                 .expect("read exact signed Reset entries and transition provenance");
                 assert!(reset_entry_transition_exact);
+                let reset_activation_entry_transition_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                            entry.entry_id=$3
+                            AND entry.entry_kind='blue.catbird.chat.defs#resetActivationEntry'
+                            AND entry.accepted_payload_bytes=$4
+                            AND entry.accepted_payload_sha256=digest($4::bytea,'sha256')
+                            AND entry.signed_request_bytes=$5
+                            AND entry.request_digest=$6
+                            AND entry.signature=$7
+                            AND entry.server_fields_bytes=$8
+                            AND entry.outer_entry_fingerprint=$9
+                            AND entry.actor_did=$10
+                            AND entry.actor_device_id=$11
+                            AND entry.actor_key_id=$12
+                            AND entry.actor_auth_generation=1
+                            AND entry.generation=1
+                            AND entry.state_version=0
+                            AND entry.transition_id=$2
+                            AND entry.message_id IS NULL
+                            AND entry.received_at=$13
+                            AND transition.kind='resetActivation'
+                            AND transition.actor_did=$10
+                            AND transition.actor_device_id=$11
+                            AND transition.actor_key_id=$12
+                            AND transition.actor_auth_generation=1
+                            AND transition.actor_role='admin'
+                            AND transition.actor_device_status='active'
+                            AND transition.signed_request_bytes=$5
+                            AND transition.unsigned_projection_bytes=$14
+                            AND transition.signing_transcript_bytes=$15
+                            AND transition.request_digest=$6
+                            AND transition.signature=$7
+                            AND transition.prior_generation=0
+                            AND transition.prior_state_version=3
+                            AND transition.next_generation=1
+                            AND transition.next_state_version=0
+                            AND transition.retired_generation=0
+                            AND transition.retired_state_version=4
+                            AND transition.successor_generation=1
+                            AND transition.successor_state_version=0
+                            AND transition.reset_request_id=$16
+                            AND transition.close_transition_id IS NULL
+                            AND transition.metadata_snapshot_id=metadata.metadata_snapshot_id
+                            AND transition.entry_seq=6
+                            AND transition.accepted_at=$13)
+                       FROM chat.entries entry
+                       JOIN chat.transitions transition
+                         ON transition.transition_id=entry.transition_id
+                       JOIN chat.metadata_snapshots metadata
+                         ON metadata.metadata_snapshot_id=transition.metadata_snapshot_id
+                      WHERE entry.conversation_id=$1 AND entry.seq=6
+                        AND transition.transition_id=$2"#,
+                )
+                .bind(conversation_id)
+                .bind(reset_activation.transition_id)
+                .bind(reset_activation.entry_id)
+                .bind(&reset_activation.public_row_json)
+                .bind(&reset_activation.raw_wrapper)
+                .bind(&reset_activation.request_digest)
+                .bind(&reset_activation.signature)
+                .bind(&reset_activation.server_fields_dag_cbor)
+                .bind(&reset_activation.outer_entry_fingerprint)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&entry.actor_key_id)
+                .bind(reset_activation_at)
+                .bind(&reset_activation.canonical_projection)
+                .bind(&reset_activation.signing_transcript)
+                .bind(Uuid::from_bytes(reset_request.request_id))
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read full ResetActivation entry/transition/metadata identity");
+                assert!(
+                    reset_activation_entry_transition_exact,
+                    "ResetActivation entry and transition must preserve every signed and coordinate column"
+                );
 
                 #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
                 struct DurableResetInterval {
@@ -14663,6 +15601,155 @@ mod historical_control_loader {
                             closing_kind: None,
                         },
                     ]
+                );
+                let reset_participants_leaves_intervals_exact: bool = sqlx::query_scalar(
+                    r#"SELECT
+                        (SELECT count(*)=3
+                            AND count(*) FILTER (
+                                WHERE user_did=$2 AND status='active' AND role='admin'
+                                  AND current_membership
+                                  AND removing_transition_id IS NULL)=1
+                            AND count(*) FILTER (
+                                WHERE user_did=$3 AND status='active' AND role='member'
+                                  AND current_membership
+                                  AND acceptance_transition_id=$4
+                                  AND removing_transition_id IS NULL)=1
+                            AND count(*) FILTER (
+                                WHERE user_did=$5 AND status='pending' AND role='member'
+                                  AND NOT current_membership
+                                  AND removing_transition_id=$6
+                                  AND removing_seq=2
+                                  AND removed_at=$7)=1
+                           FROM chat.participants
+                          WHERE conversation_id=$1)
+                        AND
+                        (SELECT count(*)=2 AND bool_and(
+                            generation=0
+                            AND NOT active
+                            AND removed_state_version=4
+                            AND removed_transition_id=$8
+                            AND removed_seq=6
+                            AND removed_at=$9)
+                           FROM chat.member_devices
+                          WHERE conversation_id=$1 AND generation=0)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            recipient_did=$2
+                            AND recipient_device_id=$10
+                            AND start_seq=1
+                            AND opening_kind='creation'
+                            AND opening_transition_id=$11
+                            AND opening_outer_entry_fingerprint=$12
+                            AND opening_state_version=0
+                            AND opening_group_id=$13
+                            AND opening_epoch=$14
+                            AND opening_group_context_hash=$15
+                            AND opening_confirmation_tag=$16
+                            AND terminal_seq=6
+                            AND closing_state_version=4
+                            AND closing_transition_id=$8
+                            AND closing_outer_entry_fingerprint=$17
+                            AND closing_kind='reset'
+                            AND closing_leaf_period_id=opening_leaf_period_id
+                            AND removed_at=$9)
+                           FROM chat.application_intervals
+                          WHERE conversation_id=$1 AND generation=0 AND start_seq=1)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            recipient_did=$3
+                            AND recipient_device_id=$18
+                            AND start_seq=4
+                            AND opening_kind='add'
+                            AND opening_transition_id=$19
+                            AND opening_outer_entry_fingerprint=$20
+                            AND opening_state_version=3
+                            AND opening_group_id=$21
+                            AND opening_epoch=$22
+                            AND opening_group_context_hash=$23
+                            AND opening_confirmation_tag=$24
+                            AND terminal_seq=6
+                            AND closing_state_version=4
+                            AND closing_transition_id=$8
+                            AND closing_outer_entry_fingerprint=$17
+                            AND closing_kind='reset'
+                            AND closing_leaf_period_id=opening_leaf_period_id
+                            AND removed_at=$9)
+                           FROM chat.application_intervals
+                          WHERE conversation_id=$1 AND generation=0 AND start_seq=4)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            recipient_did=$2
+                            AND recipient_device_id=$10
+                            AND start_seq=6
+                            AND opening_kind='reset'
+                            AND opening_transition_id=$8
+                            AND opening_outer_entry_fingerprint=$17
+                            AND opening_state_version=0
+                            AND opening_group_id=$25
+                            AND opening_epoch=0
+                            AND opening_group_context_hash=$26
+                            AND opening_confirmation_tag=$27
+                            AND terminal_seq IS NULL
+                            AND closing_state_version IS NULL
+                            AND closing_transition_id IS NULL
+                            AND closing_outer_entry_fingerprint IS NULL
+                            AND closing_kind IS NULL
+                            AND closing_leaf_period_id IS NULL
+                            AND removed_at IS NULL)
+                           FROM chat.application_intervals
+                          WHERE conversation_id=$1 AND generation=1)"#,
+                )
+                .bind(conversation_id)
+                .bind(&entry.actor_did)
+                .bind(&invitee.did)
+                .bind(acceptance.transition_id)
+                .bind(&decoy.did)
+                .bind(policy.transition_id)
+                .bind(trusted_at)
+                .bind(reset_activation.transition_id)
+                .bind(reset_activation_at)
+                .bind(entry.actor_device_id)
+                .bind(creation_transition_id)
+                .bind(entry.outer_entry_fingerprint.to_vec())
+                .bind(genesis.coordinate().group_id().to_vec())
+                .bind(i64::try_from(genesis.coordinate().epoch()).unwrap())
+                .bind(genesis.coordinate().group_context_hash().to_vec())
+                .bind(genesis.coordinate().confirmation_tag().to_vec())
+                .bind(&reset_activation.outer_entry_fingerprint)
+                .bind(invitee.device_id)
+                .bind(fulfillment.transition_id)
+                .bind(fulfillment.outer_entry_fingerprint.to_vec())
+                .bind(committed.coordinate().group_id().to_vec())
+                .bind(i64::try_from(committed.coordinate().epoch()).unwrap())
+                .bind(committed.coordinate().group_context_hash().to_vec())
+                .bind(committed.coordinate().confirmation_tag().to_vec())
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .group_id()
+                        .to_vec(),
+                )
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .group_context_hash()
+                        .to_vec(),
+                )
+                .bind(
+                    reset_activation
+                        .successor_public_state
+                        .coordinate()
+                        .confirmation_tag()
+                        .to_vec(),
+                )
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset participants/leaves/interval evidence graph");
+                assert!(
+                    reset_participants_leaves_intervals_exact,
+                    "Reset durable membership graph must preserve exact periods and interval evidence"
                 );
                 let reset_entry_recipient_count: i64 = sqlx::query_scalar(
                     r#"SELECT count(*) FROM chat.entry_recipients
@@ -14730,6 +15817,113 @@ mod historical_control_loader {
                         1,
                         1,
                     )
+                );
+                let reset_events_outbox_exact: bool = sqlx::query_scalar(
+                    r#"SELECT
+                        (SELECT count(*)=1 AND bool_and(
+                            event.event_kind='resetRequested'
+                            AND event.payload_sha256=digest($2::bytea,'sha256')
+                            AND event.created_at=$5
+                            AND event.protocol_instance_id=$6
+                            AND outbox.work_kind='stream'
+                            AND outbox.status='pending'
+                            AND outbox.attempt_count=0
+                            AND outbox.next_attempt_at=$5
+                            AND outbox.lease_owner IS NULL
+                            AND outbox.lease_expires_at IS NULL
+                            AND outbox.delivered_at IS NULL
+                            AND outbox.created_at=$5)
+                           FROM chat.events event
+                           JOIN chat.outbox outbox
+                             ON outbox.event_position=event.event_position
+                          WHERE event.payload_bytes=$2)
+                        AND
+                        (SELECT count(*)=2
+                            AND count(*) FILTER (
+                                WHERE recipient.user_did=$7
+                                  AND recipient.device_id=$8
+                                  AND recipient.entitlement_kind='participant'
+                                  AND predecessor.payload_bytes=$3)=1
+                            AND count(*) FILTER (
+                                WHERE recipient.user_did=$9
+                                  AND recipient.device_id=$10
+                                  AND recipient.entitlement_kind='participant'
+                                  AND predecessor.payload_bytes=$4)=1
+                           FROM chat.events event
+                           JOIN chat.event_recipients recipient USING(event_position)
+                           JOIN chat.events predecessor
+                             ON predecessor.event_position=recipient.audience_predecessor_position
+                          WHERE event.payload_bytes=$2)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            event.event_kind='conversationChanged'
+                            AND event.payload_sha256=digest($11::bytea,'sha256')
+                            AND event.created_at=$12
+                            AND event.protocol_instance_id=$6
+                            AND recipient.user_did=$7
+                            AND recipient.device_id=$8
+                            AND recipient.entitlement_kind='participant'
+                            AND predecessor.payload_bytes=$2
+                            AND outbox.work_kind='stream'
+                            AND outbox.status='pending'
+                            AND outbox.attempt_count=0
+                            AND outbox.next_attempt_at=$12
+                            AND outbox.lease_owner IS NULL
+                            AND outbox.lease_expires_at IS NULL
+                            AND outbox.delivered_at IS NULL
+                            AND outbox.created_at=$12)
+                           FROM chat.events event
+                           JOIN chat.event_recipients recipient USING(event_position)
+                           JOIN chat.events predecessor
+                             ON predecessor.event_position=recipient.audience_predecessor_position
+                           JOIN chat.outbox outbox
+                             ON outbox.event_position=event.event_position
+                          WHERE event.payload_bytes=$11)
+                        AND
+                        (SELECT count(*)=1 AND bool_and(
+                            event.event_kind='welcomeDisposition'
+                            AND event.payload_sha256=digest($13::bytea,'sha256')
+                            AND event.created_at=$12
+                            AND event.protocol_instance_id=$6
+                            AND recipient.user_did=$9
+                            AND recipient.device_id=$10
+                            AND recipient.entitlement_kind='welcome'
+                            AND predecessor.payload_bytes=$2
+                            AND outbox.work_kind='stream'
+                            AND outbox.status='pending'
+                            AND outbox.attempt_count=0
+                            AND outbox.next_attempt_at=$12
+                            AND outbox.lease_owner IS NULL
+                            AND outbox.lease_expires_at IS NULL
+                            AND outbox.delivered_at IS NULL
+                            AND outbox.created_at=$12)
+                           FROM chat.events event
+                           JOIN chat.event_recipients recipient USING(event_position)
+                           JOIN chat.events predecessor
+                             ON predecessor.event_position=recipient.audience_predecessor_position
+                           JOIN chat.outbox outbox
+                             ON outbox.event_position=event.event_position
+                          WHERE event.payload_bytes=$13)"#,
+                )
+                .bind(conversation_id)
+                .bind(format!("g6-reset-request-{conversation_id}").into_bytes())
+                .bind(format!("g6-prior-bound-recovery-{conversation_id}").into_bytes())
+                .bind(format!("g6-prior-bound-recovery-{conversation_id}").into_bytes())
+                .bind(reset_request_at)
+                .bind(protocol_instance_id)
+                .bind(&entry.actor_did)
+                .bind(entry.actor_device_id)
+                .bind(&invitee.did)
+                .bind(invitee.device_id)
+                .bind(format!("g6-reset-activation-{conversation_id}").into_bytes())
+                .bind(reset_activation_at)
+                .bind(format!("g6-reset-welcome-{conversation_id}").into_bytes())
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset request/activation/Welcome event graph");
+                assert!(
+                    reset_events_outbox_exact,
+                    "Reset events must have exact fixture recipients, entitlements, predecessors, protocol, and Stream/Pending outbox"
                 );
                 let reset_terminal_topology: (
                     i64,
@@ -14812,13 +16006,30 @@ mod historical_control_loader {
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
-            run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(false).await;
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false, false,
+                ),
+            )
+            .await;
         }
 
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_reset_lifecycle_uses_locked_production_planners_and_executor() {
-            run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true).await;
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true, false),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_delegated_reset_request_uses_member_requester_and_admin_activator() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true, true),
+            )
+            .await;
         }
 
         fn build_fresh_add_crypto_fixture_for_invitee(
@@ -15865,6 +17076,45 @@ mod historical_control_loader {
             }
         }
 
+        fn build_signed_recovery_request_at(
+            entry: &RealCreationEntry,
+            request_id: [u8; 16],
+            prior: &PublicGroupSnapshotCoordinate,
+            signed_at: &str,
+        ) -> SignedRecoveryRequest {
+            let signing_key = entry.signing_key();
+            let kind = SignedMutationKind::LeafRecoveryRequest;
+            let body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": signed_at,
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+                "prior": coordinate_json(prior),
+                "recoveryKind": "replace",
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("dynamic recovery request canonicalizes");
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            decode_and_verify_signed_mutation(&raw_wrapper, &entry.public_key)
+                .expect("dynamic recovery request verifies");
+            SignedRecoveryRequest {
+                raw_wrapper,
+                request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                signature: signature.to_vec(),
+                signing_transcript,
+            }
+        }
+
         struct RecoverySeed {
             request_id: [u8; 16],
             key_package_ref: [u8; 32],
@@ -15876,6 +17126,20 @@ mod historical_control_loader {
         fn build_real_creator_key_package(
             entry: &RealCreationEntry,
             evaluated_at: DateTime<Utc>,
+        ) -> ([u8; 32], Vec<u8>) {
+            build_real_creator_key_package_at(
+                entry,
+                evaluated_at,
+                instant(KP_NOT_BEFORE),
+                instant(KP_NOT_AFTER),
+            )
+        }
+
+        fn build_real_creator_key_package_at(
+            entry: &RealCreationEntry,
+            evaluated_at: DateTime<Utc>,
+            not_before: DateTime<Utc>,
+            not_after: DateTime<Utc>,
         ) -> ([u8; 32], Vec<u8>) {
             let provider =
                 openmls_libcrux_crypto::Provider::new().expect("real creator package provider");
@@ -15889,8 +17153,8 @@ mod historical_control_loader {
                 .expect("store real creator package signer");
             let credential = format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
             let lifetime = Lifetime::init(
-                u64::try_from(instant(KP_NOT_BEFORE).timestamp()).unwrap(),
-                u64::try_from(instant(KP_NOT_AFTER).timestamp()).unwrap(),
+                u64::try_from(not_before.timestamp()).unwrap(),
+                u64::try_from(not_after.timestamp()).unwrap(),
             );
             let package = KeyPackage::builder()
                 .key_package_lifetime(lifetime)
@@ -22968,6 +24232,31 @@ mod historical_control_loader {
         ) -> RealResetActivation {
             let group_info_unix_seconds =
                 u64::try_from(group_info_at.timestamp()).expect("reset GroupInfo time is positive");
+            build_real_reset_activation_with_lifetime_for_test(
+                entry,
+                reset_request_id,
+                prior_coordinate,
+                seq,
+                participants,
+                received_at,
+                group_info_unix_seconds - 60,
+                group_info_unix_seconds + 3_600,
+                group_info_unix_seconds,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn build_real_reset_activation_with_lifetime_for_test(
+            entry: &RealCreationEntry,
+            reset_request_id: [u8; 16],
+            prior_coordinate: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            participants: Value,
+            received_at: DateTime<Utc>,
+            lifetime_not_before: u64,
+            lifetime_not_after: u64,
+            validation_unix_seconds: u64,
+        ) -> RealResetActivation {
             let received_at_text = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
             let signed_at_text =
                 (received_at - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -22993,10 +24282,7 @@ mod historical_control_loader {
                 .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .use_ratchet_tree_extension(true)
                 .capabilities(capabilities)
-                .lifetime(Lifetime::init(
-                    group_info_unix_seconds - 60,
-                    group_info_unix_seconds + 3_600,
-                ))
+                .lifetime(Lifetime::init(lifetime_not_before, lifetime_not_after))
                 .build();
             let group_id = [0xd2_u8; 32];
             let group = MlsGroup::new_with_group_id(
@@ -23043,7 +24329,7 @@ mod historical_control_loader {
                 GroupInfoValidationPolicy {
                     expected_basic_credential: &credential,
                     expected_signature_key: &entry.public_key,
-                    now_unix_seconds: group_info_unix_seconds,
+                    now_unix_seconds: validation_unix_seconds,
                     max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_members: 1,
@@ -23073,7 +24359,7 @@ mod historical_control_loader {
                     coordinate: successor_coordinate,
                     expected_basic_credential: &credential,
                     expected_signature_key: &entry.public_key,
-                    now_unix_seconds: group_info_unix_seconds,
+                    now_unix_seconds: validation_unix_seconds,
                     max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_members: 1,
