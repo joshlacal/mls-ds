@@ -10020,7 +10020,9 @@ mod historical_control_loader {
             for table in [
                 "application_intervals",
                 "application_schedule_terminal_proofs",
+                "blob_bindings",
                 "entry_recipients",
+                "inventory_conversation_items",
                 "welcome_bundles",
                 "recovery_work_items",
                 "message_sends",
@@ -10114,7 +10116,9 @@ mod historical_control_loader {
             for table in [
                 "application_intervals",
                 "application_schedule_terminal_proofs",
+                "blob_bindings",
                 "entry_recipients",
+                "inventory_conversation_items",
                 "welcome_bundles",
                 "recovery_work_items",
                 "message_sends",
@@ -16121,6 +16125,8 @@ mod historical_control_loader {
                          WHERE conversation_id=$1 AND terminal_seq IS NULL
                         UNION ALL SELECT 'application_schedule_terminal_proofs',count(*)
                           FROM chat.application_schedule_terminal_proofs WHERE conversation_id=$1
+                        UNION ALL SELECT 'blob_bindings',count(*)
+                          FROM chat.blob_bindings WHERE conversation_id=$1
                         UNION ALL SELECT 'conversations',count(*)
                           FROM chat.conversations WHERE conversation_id=$1
                         UNION ALL SELECT 'entries',count(*)
@@ -16140,6 +16146,8 @@ mod historical_control_loader {
                           FROM chat.generations WHERE conversation_id=$1
                         UNION ALL SELECT 'generation_states',count(*)
                           FROM chat.generation_states WHERE conversation_id=$1
+                        UNION ALL SELECT 'inventory_conversation_items',count(*)
+                          FROM chat.inventory_conversation_items WHERE conversation_id=$1
                         UNION ALL SELECT 'key_package_reservations',count(*)
                           FROM chat.key_package_reservations WHERE conversation_id=$1
                         UNION ALL SELECT 'key_packages',count(DISTINCT package.key_package_ref)
@@ -16199,6 +16207,7 @@ mod historical_control_loader {
                         ("application_intervals".to_owned(), 3),
                         ("application_intervals.open".to_owned(), 1),
                         ("application_schedule_terminal_proofs".to_owned(), 0),
+                        ("blob_bindings".to_owned(), 0),
                         ("conversations".to_owned(), 1),
                         ("entries".to_owned(), 6),
                         ("entry_recipients".to_owned(), 14),
@@ -16206,6 +16215,7 @@ mod historical_control_loader {
                         ("events".to_owned(), 8),
                         ("generation_states".to_owned(), 6),
                         ("generations".to_owned(), 2),
+                        ("inventory_conversation_items".to_owned(), 0),
                         ("key_package_reservations".to_owned(), 2),
                         ("key_packages".to_owned(), 2),
                         ("leaf_recovery_requests".to_owned(), 2),
