@@ -21,8 +21,20 @@ mod common;
 mod frozen_public_state;
 
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/dpop.rs"]
+mod dpop;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/repository/mod.rs"]
+mod repository;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -37,6 +49,9 @@ mod chat_protocol {
     pub mod transcript {
         pub use crate::transcript::*;
     }
+    pub mod dpop {
+        pub use crate::dpop::*;
+    }
     pub mod snapshot {
         pub use catbird_server::chat_protocol::snapshot::*;
     }
@@ -50,7 +65,13 @@ mod chat_protocol {
             "/src/chat_protocol/public_state.rs"
         ));
     }
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
     pub mod repository {
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
         pub mod core {
             #![allow(dead_code)]
             include!(concat!(
@@ -79,6 +100,13 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/execution_context.rs"
             ));
         }
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
     }
     pub mod state_machine {
         #![allow(dead_code)]
@@ -100,6 +128,16 @@ fn g6_execution_context_facade_is_production_reachable() {
     reachable(ExecutionContextArtifacts::default());
 }
 
+#[test]
+fn g6_creation_facade_is_production_reachable() {
+    use chat_protocol::repository::core::hydrate_locked_invitation_quota;
+    use chat_protocol::state_machine::HydrationAuthority;
+
+    fn reachable<T>(_value: T) {}
+    reachable(hydrate_locked_invitation_quota);
+    reachable(HydrationAuthority::from_locked_creation_head);
+}
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -110,9 +148,10 @@ use uuid::Uuid;
 use chat_protocol::public_state::encode_public_tree_summary;
 use chat_protocol::repository::core::{
     hydrate_locked_conversation_head, hydrate_locked_creation_head,
-    hydrate_locked_direct_conversation_lookup, hydrate_locked_public_state,
-    ConversationHeadHydrationError, CreationHeadHydrationError, DirectConversationLookupError,
-    LockedDirectLookupOutcome, PublicStateHydrationError,
+    hydrate_locked_direct_conversation_lookup, hydrate_locked_invitation_quota,
+    hydrate_locked_public_state, ConversationHeadHydrationError, CreationHeadHydrationError,
+    DirectConversationLookupError, InvitationQuotaHydrationError, LockedDirectLookupOutcome,
+    PublicStateHydrationError,
 };
 use chat_protocol::snapshot::{
     PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
@@ -156,6 +195,165 @@ async fn clock_now_millis(pool: &PgPool) -> DateTime<Utc> {
         .fetch_one(pool)
         .await
         .expect("sample whole-millisecond database clock")
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated append-only gate database"]
+async fn g6_invitation_quota_hydrates_all_three_authoritative_dimensions() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let inviter = random_plc_did();
+    let mut recipients = vec![random_plc_did(), random_plc_did()];
+    recipients.sort();
+    let at = clock_now_millis(&pool).await;
+    for did in std::iter::once(&inviter).chain(recipients.iter()) {
+        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+            .bind(did)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .expect("append unique quota principal");
+    }
+
+    let mut tx = pool.begin().await.expect("begin quota proof");
+    let guard = hydrate_locked_invitation_quota(&mut tx, &inviter, &recipients, at)
+        .await
+        .expect("three-dimensional quota guard hydrates");
+    assert!(!guard.transaction_id().is_empty());
+    assert_eq!(guard.inviter_did(), inviter);
+    assert_eq!(guard.new_recipient_dids(), recipients);
+    assert_eq!(guard.inviter_recent_24h(), 0);
+    assert_eq!(guard.inviter_limit(), 100);
+    assert_eq!(guard.recipient_facts().len(), 2);
+    for (fact, did) in guard.recipient_facts().iter().zip(&recipients) {
+        assert_eq!(fact.recipient_did(), did);
+        assert_eq!(fact.pair_live(), 0);
+        assert_eq!(fact.pair_limit(), 5);
+        assert_eq!(fact.recipient_live(), 0);
+        assert_eq!(fact.recipient_limit(), 100);
+    }
+    assert!(!guard.would_exceed());
+    assert_ne!(guard.durable_row_digest(), &[0; 32]);
+    tx.rollback().await.expect("rollback quota proof");
+
+    let mut malformed = pool.begin().await.expect("begin malformed quota proof");
+    let error = hydrate_locked_invitation_quota(
+        &mut malformed,
+        &inviter,
+        &[recipients[1].clone(), recipients[0].clone()],
+        at,
+    )
+    .await
+    .expect_err("noncanonical recipient scope must fail closed");
+    assert!(matches!(
+        error,
+        InvitationQuotaHydrationError::NonCanonicalScope
+    ));
+    malformed
+        .rollback()
+        .await
+        .expect("rollback malformed quota proof");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated append-only gate database"]
+async fn g6_invitation_quota_allows_an_exact_empty_recipient_scope() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let inviter = random_plc_did();
+    let at = clock_now_millis(&pool).await;
+    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+        .bind(&inviter)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .expect("append unique inviter-only quota principal");
+    let mut tx = pool.begin().await.expect("begin inviter-only quota proof");
+    let guard = hydrate_locked_invitation_quota(&mut tx, &inviter, &[], at)
+        .await
+        .expect("empty recipient scope is an exact inviter-only guard");
+    assert_eq!(guard.inviter_did(), inviter);
+    assert!(guard.new_recipient_dids().is_empty());
+    assert!(guard.recipient_facts().is_empty());
+    assert!(!guard.would_exceed());
+    tx.rollback()
+        .await
+        .expect("rollback inviter-only quota proof");
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated append-only gate database"]
+async fn g6_locked_creation_rejects_a_control_entry_from_another_trusted_instant() {
+    use chat_protocol::state_machine::{HydrationAuthority, StateMachineError};
+    use chat_protocol::transcript::{
+        decode_and_verify_control_entry, rebind_persisted_control_entry,
+    };
+
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let conversation_id = Uuid::new_v4();
+    let fresh = historical_control_loader::recovery_leg::build_fresh_add_crypto_fixture(
+        conversation_id,
+        Uuid::new_v4(),
+    );
+    let entry = fresh.entry;
+    let row: serde_json::Value =
+        serde_json::from_slice(&entry.public_row_json).expect("parse genuine Creation row");
+    let matching_at = DateTime::parse_from_rfc3339(
+        row["receivedAt"]
+            .as_str()
+            .expect("Creation row has receivedAt"),
+    )
+    .expect("Creation receivedAt is RFC3339")
+    .with_timezone(&Utc);
+    let mut matching_tx = pool.begin().await.expect("begin matching Creation proof");
+    let matching_head =
+        hydrate_locked_creation_head(&mut matching_tx, conversation_id, matching_at)
+            .await
+            .expect("lock matching absent Creation head");
+    let matching_authority = HydrationAuthority::from_locked_creation_head(&matching_head)
+        .expect("mint matching locked Creation authority");
+    let matching_verified =
+        decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+            .expect("verify matching genuine signed Creation entry");
+    let matching_verified =
+        rebind_persisted_control_entry(matching_verified, &entry.raw_wrapper, &entry.public_key)
+            .expect("retain exact accepted Creation wrapper bytes");
+    let pure_verified = decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+        .expect("verify pure-control Creation entry");
+    let pure_verified =
+        rebind_persisted_control_entry(pure_verified, &entry.raw_wrapper, &entry.public_key)
+            .expect("retain pure-control accepted wrapper bytes");
+    HydrationAuthority::new(*conversation_id.as_bytes())
+        .expect("mint pure Creation authority")
+        .control_transition(pure_verified)
+        .expect("fresh XWing Creation passes the pure semantic derivation");
+    matching_authority
+        .control_transition(matching_verified)
+        .expect("the matching locked Creation entry must mint transition evidence");
+    matching_tx
+        .rollback()
+        .await
+        .expect("rollback matching Creation proof");
+
+    let locked_at = clock_now_millis(&pool).await;
+    let mut tx = pool.begin().await.expect("begin locked Creation mismatch");
+    let head = hydrate_locked_creation_head(&mut tx, conversation_id, locked_at)
+        .await
+        .expect("lock absent Creation head");
+    let authority = HydrationAuthority::from_locked_creation_head(&head)
+        .expect("mint locked Creation authority");
+    let verified = decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+        .expect("verify genuine signed Creation entry");
+    let verified = rebind_persisted_control_entry(verified, &entry.raw_wrapper, &entry.public_key)
+        .expect("retain mismatched-control accepted wrapper bytes");
+    let error = authority
+        .control_transition(verified)
+        .expect_err("a different receivedAt must not cross the locked Creation seam");
+    assert!(matches!(
+        error,
+        StateMachineError::InvalidHydrationAuthority
+    ));
+    tx.rollback()
+        .await
+        .expect("rollback locked Creation mismatch");
 }
 
 async fn seed_actor(pool: &PgPool) -> (String, Uuid, String) {
@@ -5204,7 +5402,8 @@ mod historical_control_loader {
     // (`fulfilled`/`consumed`) and real `acceptConversation` arms are exercised
     // below; malformed terminal families remain fail-closed.
     // -----------------------------------------------------------------------
-    mod recovery_leg {
+    pub(crate) mod recovery_leg {
+        use async_trait::async_trait;
         use base64::{
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine,
@@ -5222,6 +5421,7 @@ mod historical_control_loader {
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
         use sqlx::{PgPool, Postgres, Transaction};
+        use url::Url;
         use uuid::Uuid;
 
         use super::super::historical_control_path::{
@@ -5235,9 +5435,19 @@ mod historical_control_loader {
             rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
             ActivePublicState, GenesisGroupInfoExpectations,
         };
+        use crate::chat_protocol::relationship_policy::{
+            fixed_production_relationship_policy_config, AdmissionOperation, AdmissionRequest,
+            AllocatedProjectionRevisionGuard as PolicyProjectionRevisionGuard, ProjectionClock,
+            ProjectionOperationScope, PublicGet, PublicResponse, PublicTransport,
+            RelationshipAuthority, TransportError, TrustedRelationshipPersistenceInstant,
+        };
+        use crate::chat_protocol::repository::auth::{
+            authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
+        };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_available_recovery_package,
             hydrate_locked_conversation_head, hydrate_locked_conversation_state,
+            hydrate_locked_creation_head, hydrate_locked_invitation_quota,
             hydrate_locked_public_state, hydrate_locked_reserved_recovery_package,
             load_interval_hydration_rows, load_leaf_hydration_rows,
             load_leave_request_hydration_rows, load_metadata_provenance,
@@ -5257,6 +5467,10 @@ mod historical_control_loader {
             ConversationExecutionArtifacts, ExecutionContextArtifacts,
             ExecutionContextHydrationError, SequentialDeviceRevocationError,
         };
+        use crate::chat_protocol::repository::relationship::{
+            allocate_projection_revision, load_fallback_relationship_projection,
+            persist_relationship_projection, seal_group_creation_fallback_scope,
+        };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
             PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
@@ -5269,9 +5483,9 @@ mod historical_control_loader {
             plan_welcome_expiry_for_test, recovery_fulfillment_terminal_matches,
             ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
             ConversationPersistencePlan, ConversationState, ConversationStateHydration,
-            DeviceIdentity, DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence,
-            ExecutionActor, ExecutionAuthority, ExecutionContext, ExecutorError,
-            HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
+            CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
+            DeviceRevocationEvidence, ExecutionActor, ExecutionAuthority, ExecutionContext,
+            ExecutorError, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
             LeaveRequestStatus, ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
             RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
@@ -5282,7 +5496,9 @@ mod historical_control_loader {
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
             decode_canonical_signed_mutation, rebind_persisted_control_entry, SignedMutationKind,
         };
-        use crate::chat_protocol::validation::ed25519_key_id;
+        use crate::chat_protocol::validation::{
+            ed25519_key_id, CanonicalTimestamp, TrustedRequestInstant,
+        };
         use crate::chat_protocol::wire::{
             validate_group_info, validate_key_package, validate_public_commit,
             GroupInfoValidationPolicy, KeyPackageValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
@@ -5290,6 +5506,87 @@ mod historical_control_loader {
             XWING_CIPHERSUITE,
         };
         use crate::common;
+
+        #[derive(Clone, Copy)]
+        struct CreationRelationshipTransport;
+
+        fn query_values(url: &Url, key: &str) -> Vec<String> {
+            url.query_pairs()
+                .filter(|(name, _)| name == key)
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        }
+
+        #[async_trait]
+        impl PublicTransport for CreationRelationshipTransport {
+            async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+                let path = request.url.path();
+                if path.starts_with("/did:plc:") {
+                    let actor = path.trim_start_matches('/');
+                    return Ok(PublicResponse::json(
+                        200,
+                        json!({
+                            "id": actor,
+                            "service": [{
+                                "id": format!("{actor}#atproto_pds"),
+                                "type": "AtprotoPersonalDataServer",
+                                "serviceEndpoint": "https://pds.example.net",
+                            }],
+                        }),
+                    ));
+                }
+                if path == "/xrpc/com.atproto.repo.getRecord" {
+                    let actor = query_values(&request.url, "repo")
+                        .into_iter()
+                        .next()
+                        .expect("relationship record repo");
+                    return Ok(PublicResponse::json(
+                        200,
+                        json!({
+                            "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
+                            "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                            "value": {
+                                "$type": "chat.bsky.actor.declaration",
+                                "allowIncoming": "following",
+                                "allowGroupInvites": "following",
+                            },
+                        }),
+                    ));
+                }
+                if path == "/xrpc/app.bsky.graph.getRelationships" {
+                    let actor = query_values(&request.url, "actor")
+                        .into_iter()
+                        .next()
+                        .expect("relationship actor");
+                    let relationships = query_values(&request.url, "others")
+                        .into_iter()
+                        .map(|did| {
+                            json!({
+                                "$type": "app.bsky.graph.defs#relationship",
+                                "did": did,
+                                "following": format!(
+                                    "at://{actor}/app.bsky.graph.follow/g6creation"
+                                ),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(PublicResponse::json(
+                        200,
+                        json!({"actor": actor, "relationships": relationships}),
+                    ));
+                }
+                panic!("unexpected relationship request: {}", request.url);
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct FixedProjectionClock(DateTime<Utc>);
+
+        impl ProjectionClock for FixedProjectionClock {
+            fn now(&self) -> DateTime<Utc> {
+                self.0
+            }
+        }
 
         // Fixed millisecond instants (the state machine's `CanonicalTimestamp`
         // grammar is `...T...Z` at millisecond precision, which round-trips
@@ -8606,8 +8903,8 @@ mod historical_control_loader {
             }
         }
 
-        struct FreshAddCryptoFixture {
-            entry: RealCreationEntry,
+        pub(crate) struct FreshAddCryptoFixture {
+            pub(crate) entry: RealCreationEntry,
             invitee: AcceptanceInvitee,
             genesis_group_info: Vec<u8>,
             genesis: ActivePublicState,
@@ -8618,14 +8915,23 @@ mod historical_control_loader {
             welcome: Vec<u8>,
         }
 
+        struct FreshCreationCryptoFixture {
+            entry: RealCreationEntry,
+            invitee: AcceptanceInvitee,
+            genesis_group_info: Vec<u8>,
+            genesis: ActivePublicState,
+        }
+
         fn bind_creation_entry_to_group_info(
             mut entry: RealCreationEntry,
             group_info: &[u8],
             coordinate: &PublicGroupSnapshotCoordinate,
+            signed_at: &str,
+            received_at: &str,
         ) -> RealCreationEntry {
             let mut wrapper: Value =
                 serde_json::from_slice(&entry.raw_wrapper).expect("parse creation wrapper");
-            wrapper["body"]["signedAt"] = json!(CREATION_SIGNED_AT);
+            wrapper["body"]["signedAt"] = json!(signed_at);
             wrapper["body"]["next"] = coordinate_json(coordinate);
             wrapper["body"]["metadataSnapshot"]["coordinate"]["conversationId"] =
                 json!(STANDARD.encode(entry.cid));
@@ -8638,6 +8944,23 @@ mod historical_control_loader {
                 json!(STANDARD.encode(coordinate.group_context_hash()));
             wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
                 json!(STANDARD.encode(coordinate.confirmation_tag()));
+            let transition_id = wrapper["body"]["transitionId"].clone();
+            wrapper["body"]["metadataSnapshot"]["originTransitionId"] = transition_id.clone();
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDid"] =
+                json!(&entry.actor_did);
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDeviceId"] =
+                json!(entry.actor_device_id);
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorKeyId"] =
+                json!(&entry.actor_key_id);
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["signaturePublicKey"] =
+                json!(STANDARD.encode(&entry.public_key));
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["authGenerationAtOrigin"] = json!(1);
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["originTransitionId"] =
+                transition_id;
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["originSeq"] = json!(1);
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["roleAtOrigin"] = json!("admin");
+            wrapper["body"]["metadataSnapshot"]["authorProof"]["deviceStatusAtOrigin"] =
+                json!("active");
             wrapper["body"]["genesisGroupInfo"]["bytes"] = json!(STANDARD.encode(group_info));
             wrapper["body"]["genesisGroupInfo"]["sha256"] =
                 json!(STANDARD.encode(Sha256::digest(group_info)));
@@ -8657,7 +8980,7 @@ mod historical_control_loader {
             let mut row: Value =
                 serde_json::from_slice(&entry.public_row_json).expect("parse creation row");
             row["signedRequest"] = wrapper;
-            row["receivedAt"] = json!(CREATION_RECEIVED_AT);
+            row["receivedAt"] = json!(received_at);
             entry.public_row_json = serde_json::to_vec(&row).unwrap();
             entry.outer_entry_fingerprint =
                 *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
@@ -8666,11 +8989,717 @@ mod historical_control_loader {
             entry
         }
 
-        fn build_fresh_add_crypto_fixture(
+        pub(crate) fn build_fresh_add_crypto_fixture(
             cid: Uuid,
             add_transition_id: Uuid,
         ) -> FreshAddCryptoFixture {
             build_fresh_add_crypto_fixture_for_invitee(cid, add_transition_id, corpus_invitee())
+        }
+
+        fn build_fresh_creation_crypto_fixture(
+            cid: Uuid,
+            trusted_at: DateTime<Utc>,
+        ) -> FreshCreationCryptoFixture {
+            assert_eq!(trusted_at.timestamp_subsec_nanos() % 1_000_000, 0);
+            let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let received_at = trusted_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let lifetime = Lifetime::init(
+                u64::try_from((trusted_at - chrono::Duration::seconds(60)).timestamp()).unwrap(),
+                u64::try_from((trusted_at + chrono::Duration::hours(1)).timestamp()).unwrap(),
+            );
+            let mut entry = build_real_creation_entry(*cid.as_bytes());
+            let provider =
+                openmls_libcrux_crypto::Provider::new().expect("fresh Creation provider");
+            let signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                entry.signing_seed.to_vec(),
+                entry.public_key.clone(),
+            );
+            signer
+                .store(provider.storage())
+                .expect("store fresh Creation signer");
+            let actor_credential =
+                format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(XWING_CIPHERSUITE)
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .capabilities(exact_mls_capabilities())
+                .lifetime(lifetime)
+                .build();
+            let group_id: [u8; 32] = Sha256::digest(
+                [
+                    b"CATBIRD-G6-FRESH-CREATION-GROUP\0".as_ref(),
+                    cid.as_bytes(),
+                ]
+                .concat(),
+            )
+            .into();
+            let group = MlsGroup::new_with_group_id(
+                &provider,
+                &signer,
+                &config,
+                GroupId::from_slice(&group_id),
+                CredentialWithKey {
+                    credential: BasicCredential::new(actor_credential.clone()).into(),
+                    signature_key: entry.public_key.clone().into(),
+                },
+            )
+            .expect("create fresh XWing Creation group");
+            let genesis_group_info = group
+                .export_group_info(provider.crypto(), &signer, true)
+                .expect("export fresh Creation GroupInfo")
+                .tls_serialize_detached()
+                .expect("serialize fresh Creation GroupInfo");
+            let validated = validate_group_info(
+                &genesis_group_info,
+                GroupInfoValidationPolicy {
+                    expected_basic_credential: &actor_credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds: u64::try_from(trusted_at.timestamp()).unwrap(),
+                    max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 2,
+                },
+            )
+            .expect("production validates fresh Creation GroupInfo");
+            let coordinate = PublicGroupSnapshotCoordinate::new(
+                *cid.as_bytes(),
+                0,
+                0,
+                validated
+                    .group_id()
+                    .try_into()
+                    .expect("fresh Creation group id is 32 bytes"),
+                validated.epoch(),
+                *validated.group_context_hash(),
+                *validated.confirmation_tag(),
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let genesis = verify_genesis_group_info(
+                &genesis_group_info,
+                GenesisGroupInfoExpectations {
+                    coordinate,
+                    expected_basic_credential: &actor_credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds: u64::try_from(trusted_at.timestamp()).unwrap(),
+                    max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 2,
+                },
+            )
+            .expect("fresh Creation GroupInfo becomes public state");
+            entry = bind_creation_entry_to_group_info(
+                entry,
+                &genesis_group_info,
+                &coordinate,
+                &signed_at,
+                &received_at,
+            );
+
+            let invitee = unique_acceptance_invitee();
+            let mut wrapper: Value =
+                serde_json::from_slice(&entry.raw_wrapper).expect("parse Creation wrapper");
+            let transition_id = wrapper["body"]["transitionId"]
+                .as_str()
+                .expect("Creation transition id")
+                .to_owned();
+            wrapper["body"]["manifest"]["participants"]
+                .as_array_mut()
+                .expect("Creation participants")
+                .push(json!({
+                    "userDid": &invitee.did,
+                    "status": "pending",
+                    "role": "member",
+                    "invitationProvenance": {
+                        "invitationTransitionId": transition_id,
+                        "invitedByDid": &entry.actor_did,
+                        "invitedByDeviceId": entry.actor_device_id,
+                    },
+                }));
+            wrapper["body"]["manifest"]["participants"]
+                .as_array_mut()
+                .unwrap()
+                .sort_by(|left, right| {
+                    left["userDid"]
+                        .as_str()
+                        .unwrap()
+                        .cmp(right["userDid"].as_str().unwrap())
+                });
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let canonical =
+                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
+                    .expect("fresh Creation with invitee canonicalizes");
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(
+                    entry
+                        .signing_key()
+                        .sign(canonical.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let mut row: Value =
+                serde_json::from_slice(&entry.public_row_json).expect("parse Creation row");
+            row["signedRequest"] = wrapper;
+            entry.public_row_json = serde_json::to_vec(&row).unwrap();
+            entry.outer_entry_fingerprint =
+                *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("fresh invited Creation verifies")
+                    .outer_control_fingerprint();
+
+            FreshCreationCryptoFixture {
+                entry,
+                invitee,
+                genesis_group_info,
+                genesis,
+            }
+        }
+
+        fn rebind_creation_to_a_different_leaf_key(
+            entry: RealCreationEntry,
+            trusted_at: DateTime<Utc>,
+        ) -> (RealCreationEntry, Vec<u8>) {
+            let wrong_seed: [u8; 32] = Sha256::digest(
+                [
+                    b"CATBIRD-G6-WRONG-LEAF-KEY\0".as_ref(),
+                    Uuid::new_v4().as_bytes(),
+                ]
+                .concat(),
+            )
+            .into();
+            let wrong_key = SigningKey::from_bytes(&wrong_seed);
+            assert_ne!(
+                wrong_key.verifying_key().as_bytes(),
+                entry.public_key.as_slice()
+            );
+            let provider =
+                openmls_libcrux_crypto::Provider::new().expect("wrong-leaf Creation provider");
+            let signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                wrong_key.to_bytes().to_vec(),
+                wrong_key.verifying_key().to_bytes().to_vec(),
+            );
+            signer
+                .store(provider.storage())
+                .expect("store wrong-leaf signer");
+            let credential = format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let lifetime = Lifetime::init(
+                u64::try_from((trusted_at - chrono::Duration::seconds(60)).timestamp()).unwrap(),
+                u64::try_from((trusted_at + chrono::Duration::hours(1)).timestamp()).unwrap(),
+            );
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(XWING_CIPHERSUITE)
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .capabilities(exact_mls_capabilities())
+                .lifetime(lifetime)
+                .build();
+            let group_id: [u8; 32] =
+                Sha256::digest([b"CATBIRD-G6-WRONG-LEAF-GROUP\0".as_ref(), &entry.cid].concat())
+                    .into();
+            let group = MlsGroup::new_with_group_id(
+                &provider,
+                &signer,
+                &config,
+                GroupId::from_slice(&group_id),
+                CredentialWithKey {
+                    credential: BasicCredential::new(credential.clone()).into(),
+                    signature_key: wrong_key.verifying_key().to_bytes().to_vec().into(),
+                },
+            )
+            .expect("create wrong-leaf XWing group");
+            let group_info = group
+                .export_group_info(provider.crypto(), &signer, true)
+                .expect("export wrong-leaf GroupInfo")
+                .tls_serialize_detached()
+                .expect("serialize wrong-leaf GroupInfo");
+            let validated = validate_group_info(
+                &group_info,
+                GroupInfoValidationPolicy {
+                    expected_basic_credential: &credential,
+                    expected_signature_key: wrong_key.verifying_key().as_bytes(),
+                    now_unix_seconds: u64::try_from(trusted_at.timestamp()).unwrap(),
+                    max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 2,
+                },
+            )
+            .expect("wrong-leaf GroupInfo is independently valid");
+            let coordinate = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                0,
+                0,
+                validated.group_id().try_into().unwrap(),
+                validated.epoch(),
+                *validated.group_context_hash(),
+                *validated.confirmation_tag(),
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let received_at = trusted_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            (
+                bind_creation_entry_to_group_info(
+                    entry,
+                    &group_info,
+                    &coordinate,
+                    &signed_at,
+                    &received_at,
+                ),
+                group_info,
+            )
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_full_production_creation_path_applies_then_rolls_back_without_residue() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
+            let trusted_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("sample Creation trusted instant");
+            let trusted_text = trusted_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let trusted = TrustedRequestInstant::from_canonical_for_test(
+                CanonicalTimestamp::parse(&trusted_text).expect("trusted instant is canonical"),
+            );
+            let conversation_id = Uuid::new_v4();
+            let fixture = build_fresh_creation_crypto_fixture(conversation_id, trusted_at);
+            let entry = fixture.entry;
+            let invitee = fixture.invitee;
+            let dpop_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(Uuid::new_v4().as_bytes()));
+
+            for did in [&entry.actor_did, &invitee.did] {
+                sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+                    .bind(did)
+                    .bind(trusted_at)
+                    .execute(&pool)
+                    .await
+                    .expect("append unique Creation principal");
+            }
+            for (did, device_id, key_id, public_key, device_name, jkt) in [
+                (
+                    entry.actor_did.as_str(),
+                    entry.actor_device_id,
+                    entry.actor_key_id.as_str(),
+                    entry.public_key.as_slice(),
+                    "g6-creation-actor",
+                    dpop_jkt.as_str(),
+                ),
+                (
+                    invitee.did.as_str(),
+                    invitee.device_id,
+                    invitee.key_id.as_str(),
+                    invitee.signing_key.verifying_key().as_bytes().as_slice(),
+                    "g6-creation-invitee",
+                    invitee.key_id.as_str(),
+                ),
+            ] {
+                sqlx::query(
+                    r#"INSERT INTO chat.devices(
+                        user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+                        capabilities,created_at,updated_at
+                    ) VALUES($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5)"#,
+                )
+                .bind(did)
+                .bind(device_id)
+                .bind(device_name)
+                .bind(jkt)
+                .bind(trusted_at)
+                .execute(&pool)
+                .await
+                .expect("append unique Creation device");
+                sqlx::query(
+                    r#"INSERT INTO chat.device_keys(
+                        user_did,device_id,key_id,signing_public_key,
+                        enrollment_auth_generation,created_at
+                    ) VALUES($1,$2,$3,$4,1,$5)"#,
+                )
+                .bind(did)
+                .bind(device_id)
+                .bind(key_id)
+                .bind(public_key)
+                .bind(trusted_at)
+                .execute(&pool)
+                .await
+                .expect("append unique Creation device key");
+            }
+            sqlx::query(
+                r#"INSERT INTO chat.protocol_instances(
+                    singleton,protocol_instance_id,cursor_key_id,created_at
+                ) VALUES(TRUE,$1,$2,$3) ON CONFLICT (singleton) DO NOTHING"#,
+            )
+            .bind(
+                Uuid::parse_str("018f3f6a-7b2c-4d91-8a5e-0f123456789a")
+                    .expect("fixed DPoP protocol instance"),
+            )
+            .bind(&entry.actor_key_id)
+            .bind(trusted_at)
+            .execute(&pool)
+            .await
+            .expect("ensure protocol instance");
+
+            let authority = RelationshipAuthority::new(
+                fixed_production_relationship_policy_config()
+                    .expect("fixed production relationship configuration"),
+                CreationRelationshipTransport,
+            );
+            let mut roster = vec![entry.actor_did.clone(), invitee.did.clone()];
+            roster.sort();
+            let admission = AdmissionRequest {
+                inviter: entry.actor_did.clone(),
+                roster,
+                pending_recipients: vec![invitee.did.clone()],
+                operation: AdmissionOperation::Group,
+            };
+            let live = crate::relationship_policy_source::collect_admission_projection(
+                &authority,
+                &FixedProjectionClock(trusted_at),
+                PolicyProjectionRevisionGuard::for_test(1),
+                ProjectionOperationScope::Creation,
+                admission,
+            )
+            .await
+            .expect("collect exact live Creation relationship projection");
+            let mut fallback_tx = pool.begin().await.expect("begin fallback persistence");
+            let allocation = allocate_projection_revision(&mut fallback_tx)
+                .await
+                .expect("allocate fallback revision");
+            let (allocation_id, projection_revision) = allocation.into_allocation();
+            let sealed_fallback = live
+                .export_persisted_fallback(
+                    PolicyProjectionRevisionGuard::for_test_allocation(
+                        allocation_id,
+                        projection_revision,
+                    ),
+                    &authority,
+                    &TrustedRelationshipPersistenceInstant::for_test(trusted_at),
+                )
+                .expect("seal exact fallback relationship projection");
+            persist_relationship_projection(&mut fallback_tx, sealed_fallback)
+                .await
+                .expect("persist exact fallback relationship projection");
+            fallback_tx
+                .commit()
+                .await
+                .expect("commit append-only fallback prerequisite");
+
+            let canonical =
+                decode_canonical_signed_mutation(&entry.raw_wrapper).expect("Creation canonical");
+            let pre_replay = crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                Uuid::new_v4(),
+                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                "blue.catbird.chat.createConversation",
+                &trusted_text,
+                &entry.actor_did,
+                entry.actor_device_id,
+                &dpop_jkt,
+            );
+            let verified_request = match authorize_signed_request(&pool, pre_replay, canonical)
+                .await
+                .expect("authorize exact signed Creation request")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => panic!("fresh Creation replayed"),
+            };
+
+            let mut stale_quota_tx = pool.begin().await.expect("begin stale quota proof");
+            let stale_quota = hydrate_locked_invitation_quota(
+                &mut stale_quota_tx,
+                &entry.actor_did,
+                std::slice::from_ref(&invitee.did),
+                trusted_at,
+            )
+            .await
+            .expect("hydrate quota in a distinct transaction");
+            stale_quota_tx
+                .rollback()
+                .await
+                .expect("release stale quota transaction");
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin Creation business transaction");
+            let business_guard = recheck_business_authority(&mut tx, &verified_request)
+                .await
+                .expect("recheck exact actor authority under business locks");
+            let head = hydrate_locked_creation_head(&mut tx, conversation_id, trusted_at)
+                .await
+                .expect("hydrate absent Creation head");
+            let quota = hydrate_locked_invitation_quota(
+                &mut tx,
+                &entry.actor_did,
+                std::slice::from_ref(&invitee.did),
+                trusted_at,
+            )
+            .await
+            .expect("hydrate exact three-dimensional invitation quota");
+            let hydration = HydrationAuthority::from_locked_creation_head(&head)
+                .expect("mint locked Creation hydration authority");
+            let registration = hydration
+                .locked_registration_from_guard(business_guard)
+                .expect("seal authenticated registration projection");
+            let locked_scope = seal_group_creation_fallback_scope(&head, &quota, &registration)
+                .expect("seal exact Creation fallback scope");
+            let (relationship, relationship_decision) =
+                load_fallback_relationship_projection(&mut tx, locked_scope, &authority)
+                    .await
+                    .expect("load production fallback projection")
+                    .expect("fresh fallback is present");
+            let verified =
+                decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("verify exact accepted Creation control entry");
+            let verified =
+                rebind_persisted_control_entry(verified, &entry.raw_wrapper, &entry.public_key)
+                    .expect("retain exact accepted signed wrapper bytes");
+            let wrong_transaction_entry =
+                decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("verify wrong-transaction Creation entry");
+            let wrong_transaction_entry = rebind_persisted_control_entry(
+                wrong_transaction_entry,
+                &entry.raw_wrapper,
+                &entry.public_key,
+            )
+            .expect("retain wrong-transaction exact wrapper");
+            let wrong_transaction = hydration
+                .plan_creation(
+                    wrong_transaction_entry,
+                    &registration,
+                    Some(&head),
+                    None,
+                    &relationship,
+                    &authority,
+                    stale_quota,
+                    &relationship_decision,
+                    &trusted,
+                )
+                .expect_err("quota authority from another transaction must fail closed");
+            assert!(matches!(
+                wrong_transaction,
+                crate::chat_protocol::state_machine::StateMachineError::InvalidHydrationAuthority
+            ));
+            let decision = hydration
+                .plan_creation(
+                    verified,
+                    &registration,
+                    Some(&head),
+                    None,
+                    &relationship,
+                    &authority,
+                    quota,
+                    &relationship_decision,
+                    &trusted,
+                )
+                .expect("plan exact authenticated Creation");
+            let CreationDecision::Create(planned) = decision else {
+                panic!("group Creation cannot return an existing direct conversation");
+            };
+            let plan = planned
+                .into_persistence_plan()
+                .expect("seal complete Creation persistence plan");
+            let mut wrong_group_info = fixture.genesis_group_info.clone();
+            let last = wrong_group_info.last_mut().expect("GroupInfo is not empty");
+            *last ^= 1;
+            let artifact_error = hydrate_execution_context(
+                &mut tx,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(entry.public_row_json.clone()),
+                    genesis_group_info_bytes: Some(wrong_group_info),
+                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("wrong genesis GroupInfo must fail before persistence");
+            assert!(matches!(
+                artifact_error,
+                ExecutionContextHydrationError::ArtifactMismatch
+            ));
+            let conversation_rows_before_apply: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("assert artifact mismatch wrote no conversation");
+            assert_eq!(conversation_rows_before_apply, 0);
+
+            let mut mutated_control_entry: Value =
+                serde_json::from_slice(&entry.public_row_json).expect("parse control mutation");
+            mutated_control_entry["signedRequest"]["body"]["absence"] = json!(false);
+            let mutated_control_entry =
+                serde_json::to_vec(&mutated_control_entry).expect("serialize control mutation");
+            let mutation_error = hydrate_execution_context(
+                &mut tx,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(mutated_control_entry),
+                    genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
+                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("mutated accepted control bytes must fail before persistence");
+            assert!(matches!(
+                mutation_error,
+                ExecutionContextHydrationError::ControlEntryMismatch
+            ));
+            let context = hydrate_execution_context(
+                &mut tx,
+                &plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(entry.public_row_json.clone()),
+                    genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
+                    primary_event_payload: Some(b"{\"kind\":\"g6Creation\"}".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect("hydrate exact production Creation execution context");
+            apply_conversation_persistence_plan(&mut tx, &plan, &context)
+                .await
+                .expect("apply complete Creation persistence plan");
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tx)
+                .await
+                .expect("force all deferred Creation constraints");
+
+            let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+                r#"SELECT
+                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1),
+                    (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1),
+                    (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+                    (SELECT count(*) FROM chat.participants WHERE conversation_id=$1),
+                    (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)"#,
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("assert complete Creation rows");
+            assert_eq!(counts, (1, 1, 1, 2, 1));
+            tx.rollback()
+                .await
+                .expect("rollback all conversation-scoped Creation writes");
+
+            let residue: i64 = sqlx::query_scalar(
+                r#"SELECT
+                    (SELECT count(*) FROM chat.conversations WHERE conversation_id=$1)
+                  + (SELECT count(*) FROM chat.transitions WHERE conversation_id=$1)
+                  + (SELECT count(*) FROM chat.entries WHERE conversation_id=$1)
+                  + (SELECT count(*) FROM chat.participants WHERE conversation_id=$1)
+                  + (SELECT count(*) FROM chat.member_devices WHERE conversation_id=$1)"#,
+            )
+            .bind(conversation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read post-rollback Creation residue");
+            assert_eq!(residue, 0, "Creation rollback left conversation residue");
+
+            let (wrong_leaf_entry, _wrong_group_info) =
+                rebind_creation_to_a_different_leaf_key(entry, trusted_at);
+            let wrong_leaf_request = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.createConversation",
+                    &trusted_text,
+                    &wrong_leaf_entry.actor_did,
+                    wrong_leaf_entry.actor_device_id,
+                    &dpop_jkt,
+                ),
+                decode_canonical_signed_mutation(&wrong_leaf_entry.raw_wrapper)
+                    .expect("wrong-leaf Creation canonicalizes"),
+            )
+            .await
+            .expect("outer wrong-leaf Creation remains actor-authorized")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => panic!("fresh wrong-leaf replayed"),
+            };
+            let mut wrong_leaf_tx = pool.begin().await.expect("begin wrong-leaf proof");
+            let wrong_leaf_business =
+                recheck_business_authority(&mut wrong_leaf_tx, &wrong_leaf_request)
+                    .await
+                    .expect("wrong-leaf request retains production actor authority");
+            let wrong_leaf_head =
+                hydrate_locked_creation_head(&mut wrong_leaf_tx, conversation_id, trusted_at)
+                    .await
+                    .expect("lock absent wrong-leaf Creation head");
+            let wrong_leaf_quota = hydrate_locked_invitation_quota(
+                &mut wrong_leaf_tx,
+                &wrong_leaf_entry.actor_did,
+                std::slice::from_ref(&invitee.did),
+                trusted_at,
+            )
+            .await
+            .expect("lock wrong-leaf invitation quota");
+            let wrong_leaf_hydration =
+                HydrationAuthority::from_locked_creation_head(&wrong_leaf_head)
+                    .expect("mint wrong-leaf hydration authority");
+            let wrong_leaf_registration = wrong_leaf_hydration
+                .locked_registration_from_guard(wrong_leaf_business)
+                .expect("seal production registration for wrong-leaf proof");
+            let wrong_leaf_scope = seal_group_creation_fallback_scope(
+                &wrong_leaf_head,
+                &wrong_leaf_quota,
+                &wrong_leaf_registration,
+            )
+            .expect("seal wrong-leaf fallback scope");
+            let (wrong_leaf_relationship, wrong_leaf_decision) =
+                load_fallback_relationship_projection(
+                    &mut wrong_leaf_tx,
+                    wrong_leaf_scope,
+                    &authority,
+                )
+                .await
+                .expect("load wrong-leaf fallback")
+                .expect("wrong-leaf fallback is present");
+            let wrong_leaf_verified = decode_and_verify_control_entry(
+                &wrong_leaf_entry.public_row_json,
+                &wrong_leaf_entry.public_key,
+            )
+            .expect("outer wrong-leaf Creation verifies under the registered actor");
+            let wrong_leaf_verified = rebind_persisted_control_entry(
+                wrong_leaf_verified,
+                &wrong_leaf_entry.raw_wrapper,
+                &wrong_leaf_entry.public_key,
+            )
+            .expect("retain exact wrong-leaf wrapper");
+            let wrong_leaf_error = wrong_leaf_hydration
+                .plan_creation(
+                    wrong_leaf_verified,
+                    &wrong_leaf_registration,
+                    Some(&wrong_leaf_head),
+                    None,
+                    &wrong_leaf_relationship,
+                    &authority,
+                    wrong_leaf_quota,
+                    &wrong_leaf_decision,
+                    &trusted,
+                )
+                .expect_err("MLS leaf key different from registration must fail closed");
+            assert!(matches!(
+                wrong_leaf_error,
+                crate::chat_protocol::state_machine::StateMachineError::InvalidPublicState
+            ));
+            let wrong_leaf_writes: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *wrong_leaf_tx)
+            .await
+            .expect("assert wrong-leaf rejection wrote no conversation");
+            assert_eq!(wrong_leaf_writes, 0);
+            wrong_leaf_tx
+                .rollback()
+                .await
+                .expect("rollback wrong-leaf proof");
         }
 
         fn build_fresh_add_crypto_fixture_for_invitee(
@@ -8761,8 +9790,13 @@ mod historical_control_loader {
                 },
             )
             .expect("fresh Add genesis becomes production public state");
-            entry =
-                bind_creation_entry_to_group_info(entry, &genesis_group_info, &genesis_coordinate);
+            entry = bind_creation_entry_to_group_info(
+                entry,
+                &genesis_group_info,
+                &genesis_coordinate,
+                CREATION_SIGNED_AT,
+                CREATION_RECEIVED_AT,
+            );
 
             let bob_provider =
                 openmls_libcrux_crypto::Provider::new().expect("fresh Add Bob provider");

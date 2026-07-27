@@ -12,20 +12,20 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[cfg(not(test))]
 use super::relationship_policy::{
     consume_admission_projection, consume_block_projection, AdmissionOperation, AdmissionRequest,
     ProjectionOperationScope, PublicTransport, RelationshipAuthority, RelationshipProjection,
     TrustedRelationshipDecisionInstant,
 };
 
-#[cfg(not(test))]
 use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
-use super::repository::core::LockedConversationHeadGuard;
+use super::repository::core::{
+    LockedConversationHeadGuard, LockedDirectConversationLookupGuard, LockedDirectLookupOutcome,
+    LockedInvitationQuotaGuard,
+};
 #[cfg(not(test))]
 use super::repository::core::{
-    LockedConversationStateGuard, LockedDirectConversationLookupGuard, LockedDirectLookupOutcome,
-    LockedInvitationQuotaGuard, LockedRecoveryPackageGuard, LockedRecoveryPackageStatus,
+    LockedConversationStateGuard, LockedRecoveryPackageGuard, LockedRecoveryPackageStatus,
     LockedRecoveryPackageUse, LockedRevocationFanoutGuard, LockedRevocationPackageGuard,
     LockedRevocationTargetGuard, LockedRevocationTargetStatus, LockedWelcomeGuard,
 };
@@ -1137,7 +1137,6 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
     pub(crate) fn from_locked_creation_head(
         head: &LockedConversationHeadGuard,
     ) -> Result<Self, StateMachineError> {
@@ -1149,6 +1148,7 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
+            #[cfg(not(test))]
             locked: LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: None,
@@ -1158,7 +1158,28 @@ impl HydrationAuthority {
                 locked_graph_digest: None,
                 locked_snapshot_digest: None,
             },
+            #[cfg(test)]
+            locked: Some(LockedHydrationBinding {
+                transaction_id: head.transaction_id().to_owned(),
+                expected_prior: None,
+                expected_next_entry_seq: head.next_entry_seq(),
+                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
+                locked_head_digest: *head.durable_row_digest(),
+                locked_graph_digest: None,
+                locked_snapshot_digest: None,
+            }),
         })
+    }
+
+    fn locked_binding(&self) -> Option<&LockedHydrationBinding> {
+        #[cfg(not(test))]
+        {
+            Some(&self.locked)
+        }
+        #[cfg(test)]
+        {
+            self.locked.as_ref()
+        }
     }
 
     /// Bootstraps the hydration authority from an EXISTING conversation's
@@ -1227,18 +1248,20 @@ impl HydrationAuthority {
         Ok(())
     }
 
-    #[cfg(not(test))]
     fn require_same_locked_head(
         &self,
         head: &LockedConversationHeadGuard,
     ) -> Result<(), StateMachineError> {
+        let locked = self
+            .locked_binding()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
         let locked_at = ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?;
-        if head.transaction_id() != self.locked.transaction_id
+        if head.transaction_id() != locked.transaction_id
             || head.conversation_id().as_bytes() != &self.expected_conversation_id
-            || head.prior_coordinate() != self.locked.expected_prior.as_ref()
-            || head.next_entry_seq() != self.locked.expected_next_entry_seq
-            || locked_at != self.locked.locked_at
-            || head.durable_row_digest() != &self.locked.locked_head_digest
+            || head.prior_coordinate() != locked.expected_prior.as_ref()
+            || head.next_entry_seq() != locked.expected_next_entry_seq
+            || locked_at != locked.locked_at
+            || head.durable_row_digest() != &locked.locked_head_digest
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
@@ -1252,23 +1275,31 @@ impl HydrationAuthority {
         if entry.conversation_id().as_bytes() != &self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        #[cfg(not(test))]
-        if entry.seq() != self.locked.expected_next_entry_seq
-            || canonical_server_timestamp(entry.received_at())? != self.locked.locked_at
-        {
-            return Err(StateMachineError::InvalidHydrationAuthority);
+        if let Some(locked) = self.locked_binding() {
+            if entry.seq() != locked.expected_next_entry_seq
+                || canonical_server_timestamp(entry.received_at())? != locked.locked_at
+            {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
         }
         let (transition_id, body_binding) = match entry.mutation().projection() {
-            VerifiedMutationProjection::Creation(value) => (
-                *value.transition_id().as_bytes(),
-                TransitionBodyBinding::Creation {
-                    kind: parse_conversation_kind(value.conversation_kind())?,
-                    next: closed_coordinate(&value.next())?,
-                    manifest: parse_roster_manifest(&value.manifest())?,
-                    group_info_sha256: checked_artifact_sha256(&value.genesis_group_info())?,
-                    metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
-                },
-            ),
+            VerifiedMutationProjection::Creation(value) => {
+                let kind = parse_conversation_kind(value.conversation_kind())?;
+                let next = closed_coordinate(&value.next())?;
+                let manifest = parse_roster_manifest(&value.manifest())?;
+                let group_info_sha256 = checked_artifact_sha256(&value.genesis_group_info())?;
+                let metadata = parse_metadata_snapshot(&value.metadata_snapshot())?;
+                (
+                    *value.transition_id().as_bytes(),
+                    TransitionBodyBinding::Creation {
+                        kind,
+                        next,
+                        manifest,
+                        group_info_sha256,
+                        metadata,
+                    },
+                )
+            }
             VerifiedMutationProjection::CommitTransition(value) => (
                 *value.transition_id().as_bytes(),
                 TransitionBodyBinding::Commit {
@@ -1363,9 +1394,10 @@ impl HydrationAuthority {
         if !transition_binding_is_route_bound(&body_binding, &self.expected_conversation_id) {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        #[cfg(not(test))]
-        if transition_body_prior(&body_binding) != self.locked.expected_prior.as_ref() {
-            return Err(StateMachineError::InvalidHydrationAuthority);
+        if let Some(locked) = self.locked_binding() {
+            if transition_body_prior(&body_binding) != locked.expected_prior.as_ref() {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
         }
         validate_special_server_fields(entry, &body_binding)?;
         let mut evidence = TransitionEvidence {
@@ -1400,7 +1432,6 @@ impl HydrationAuthority {
         self.transition_from_control(&entry)
     }
 
-    #[cfg(not(test))]
     pub(crate) fn plan_creation<T: PublicTransport>(
         &self,
         entry: VerifiedControlEntry,
@@ -3204,10 +3235,10 @@ impl HydrationAuthority {
             status: row.status,
             trusted_read_at: ServerTimestamp::from_trusted_request_instant(trusted_read_at)?,
             durable_row_digest: row.durable_row_digest,
+            transaction_id: String::new(),
         })
     }
 
-    #[cfg(not(test))]
     pub(crate) fn locked_registration_from_guard(
         &self,
         guard: BusinessAuthorityGuard,
@@ -5303,7 +5334,6 @@ pub(crate) struct LockedRegistrationProjection {
     status: PersistedRegistrationStatus,
     trusted_read_at: ServerTimestamp,
     durable_row_digest: [u8; 32],
-    #[cfg(not(test))]
     transaction_id: String,
 }
 
@@ -5364,7 +5394,6 @@ impl LockedRegistrationProjection {
         self.trusted_read_at
     }
 
-    #[cfg(not(test))]
     pub(crate) fn transaction_id(&self) -> &str {
         &self.transaction_id
     }
@@ -5388,6 +5417,7 @@ impl LockedRegistrationProjection {
             status: PersistedRegistrationStatus::Active,
             trusted_read_at: evidence.received_at,
             durable_row_digest: [0x7a; 32],
+            transaction_id: String::new(),
         }
     }
 
@@ -7722,13 +7752,49 @@ impl RevocationPackageCasBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InvitationQuotaRecipientCasFact {
+    recipient: PrincipalId,
+    expected_pair_live: u64,
+    successor_pair_live: u64,
+    pair_limit: u64,
+    expected_recipient_live: u64,
+    successor_recipient_live: u64,
+    recipient_limit: u64,
+}
+
+impl InvitationQuotaRecipientCasFact {
+    pub(crate) fn recipient(&self) -> &PrincipalId {
+        &self.recipient
+    }
+    pub(crate) fn expected_pair_live(&self) -> u64 {
+        self.expected_pair_live
+    }
+    pub(crate) fn successor_pair_live(&self) -> u64 {
+        self.successor_pair_live
+    }
+    pub(crate) fn pair_limit(&self) -> u64 {
+        self.pair_limit
+    }
+    pub(crate) fn expected_recipient_live(&self) -> u64 {
+        self.expected_recipient_live
+    }
+    pub(crate) fn successor_recipient_live(&self) -> u64 {
+        self.successor_recipient_live
+    }
+    pub(crate) fn recipient_limit(&self) -> u64 {
+        self.recipient_limit
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InvitationQuotaCasBinding {
     transaction_id: String,
     inviter: PrincipalId,
     new_recipients: Vec<PrincipalId>,
-    expected_pending: u64,
-    successor_pending: u64,
-    quota_limit: u64,
+    expected_inviter_recent_24h: u64,
+    successor_inviter_recent_24h: u64,
+    inviter_limit: u64,
+    recipient_facts: Vec<InvitationQuotaRecipientCasFact>,
     locked_at: ServerTimestamp,
     locked_row_digest: [u8; 32],
 }
@@ -7743,14 +7809,17 @@ impl InvitationQuotaCasBinding {
     pub(crate) fn new_recipients(&self) -> &[PrincipalId] {
         &self.new_recipients
     }
-    pub(crate) fn expected_pending(&self) -> u64 {
-        self.expected_pending
+    pub(crate) fn expected_inviter_recent_24h(&self) -> u64 {
+        self.expected_inviter_recent_24h
     }
-    pub(crate) fn successor_pending(&self) -> u64 {
-        self.successor_pending
+    pub(crate) fn successor_inviter_recent_24h(&self) -> u64 {
+        self.successor_inviter_recent_24h
     }
-    pub(crate) fn quota_limit(&self) -> u64 {
-        self.quota_limit
+    pub(crate) fn inviter_limit(&self) -> u64 {
+        self.inviter_limit
+    }
+    pub(crate) fn recipient_facts(&self) -> &[InvitationQuotaRecipientCasFact] {
+        &self.recipient_facts
     }
     pub(crate) fn locked_at(&self) -> ServerTimestamp {
         self.locked_at
@@ -8672,6 +8741,56 @@ impl ConversationPersistencePlan {
     }
 }
 
+fn invitation_quota_recipient_facts_valid(binding: &InvitationQuotaCasBinding) -> bool {
+    binding.recipient_facts.len() == binding.new_recipients.len()
+        && binding
+            .recipient_facts
+            .iter()
+            .zip(&binding.new_recipients)
+            .all(|(fact, recipient)| {
+                fact.recipient == *recipient
+                    && fact.expected_pair_live <= MAX_PROTOCOL_INTEGER
+                    && fact.expected_recipient_live <= MAX_PROTOCOL_INTEGER
+                    && fact.expected_pair_live.checked_add(1) == Some(fact.successor_pair_live)
+                    && fact.expected_recipient_live.checked_add(1)
+                        == Some(fact.successor_recipient_live)
+                    && fact.pair_limit == 5
+                    && fact.recipient_limit == 100
+                    && fact.successor_pair_live <= fact.pair_limit
+                    && fact.successor_recipient_live <= fact.recipient_limit
+            })
+}
+
+#[cfg(test)]
+mod invitation_quota_binding_tests {
+    use super::*;
+
+    #[test]
+    fn overflow_cannot_wrap_to_a_zero_successor_fact() {
+        let recipient = PrincipalId::new(b"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".to_vec()).unwrap();
+        let binding = InvitationQuotaCasBinding {
+            transaction_id: "4242".to_owned(),
+            inviter: PrincipalId::new(b"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_vec()).unwrap(),
+            new_recipients: vec![recipient.clone()],
+            expected_inviter_recent_24h: 0,
+            successor_inviter_recent_24h: 1,
+            inviter_limit: 100,
+            recipient_facts: vec![InvitationQuotaRecipientCasFact {
+                recipient,
+                expected_pair_live: u64::MAX,
+                successor_pair_live: 0,
+                pair_limit: 5,
+                expected_recipient_live: u64::MAX,
+                successor_recipient_live: 0,
+                recipient_limit: 100,
+            }],
+            locked_at: ServerTimestamp::from_unix_millis(1).unwrap(),
+            locked_row_digest: [1; 32],
+        };
+        assert!(!invitation_quota_recipient_facts_valid(&binding));
+    }
+}
+
 impl PlannedTransition {
     #[cfg(test)]
     pub(crate) fn expected_prior(&self) -> Option<&PublicGroupSnapshotCoordinate> {
@@ -8703,7 +8822,6 @@ impl PlannedTransition {
         self.state
     }
 
-    #[cfg(not(test))]
     fn bind_transition_authority(
         mut self,
         evidence: TransitionEvidence,
@@ -8943,7 +9061,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_invitation_quota_cas(
         mut self,
         binding: InvitationQuotaCasBinding,
@@ -8962,15 +9079,19 @@ impl PlannedTransition {
             )
             .collect::<Vec<_>>();
         exact_new_recipients.sort();
+        let recipient_facts_valid = invitation_quota_recipient_facts_valid(&binding);
         if !matches!(self.effects.kind, PlanKind::Creation | PlanKind::Policy)
             || self.effects.invitation_quota_cas.is_some()
             || exact_new_recipients != binding.new_recipients
-            || binding.successor_pending
+            || binding.expected_inviter_recent_24h > MAX_PROTOCOL_INTEGER
+            || binding.successor_inviter_recent_24h
                 != binding
-                    .expected_pending
+                    .expected_inviter_recent_24h
                     .checked_add(binding.new_recipients.len() as u64)
                     .ok_or(StateMachineError::InvalidHydrationAuthority)?
-            || binding.successor_pending > binding.quota_limit
+            || binding.inviter_limit != 100
+            || binding.successor_inviter_recent_24h > binding.inviter_limit
+            || !recipient_facts_valid
             || binding.locked_row_digest == [0; 32]
             || self.effects.head_cas.as_ref().is_none_or(|head| {
                 head.transaction_id != binding.transaction_id || head.locked_at != binding.locked_at
@@ -9131,7 +9252,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     pub(crate) fn into_persistence_plan(
         self,
     ) -> Result<ConversationPersistencePlan, StateMachineError> {
@@ -10067,7 +10187,6 @@ fn welcome_cas_from_guard(
     })
 }
 
-#[cfg(not(test))]
 fn invitation_quota_cas_from_guard(
     guard: &LockedInvitationQuotaGuard,
     expected_inviter: &PrincipalId,
@@ -10084,8 +10203,8 @@ fn invitation_quota_cas_from_guard(
     {
         return Err(StateMachineError::InvalidHydrationAuthority);
     }
-    let successor_pending = guard
-        .current_pending()
+    let successor_inviter_recent_24h = guard
+        .inviter_recent_24h()
         .checked_add(guard.new_recipient_dids().len() as u64)
         .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
         .ok_or(StateMachineError::InvalidHydrationAuthority)?;
@@ -10094,13 +10213,37 @@ fn invitation_quota_cas_from_guard(
         .iter()
         .map(|did| PrincipalId::new(did.as_bytes().to_vec()))
         .collect::<Result<Vec<_>, _>>()?;
+    let recipient_facts = guard
+        .recipient_facts()
+        .iter()
+        .map(|fact| {
+            Ok(InvitationQuotaRecipientCasFact {
+                recipient: PrincipalId::new(fact.recipient_did().as_bytes().to_vec())?,
+                expected_pair_live: fact.pair_live(),
+                successor_pair_live: fact
+                    .pair_live()
+                    .checked_add(1)
+                    .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+                    .ok_or(StateMachineError::InvalidHydrationAuthority)?,
+                pair_limit: fact.pair_limit(),
+                expected_recipient_live: fact.recipient_live(),
+                successor_recipient_live: fact
+                    .recipient_live()
+                    .checked_add(1)
+                    .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+                    .ok_or(StateMachineError::InvalidHydrationAuthority)?,
+                recipient_limit: fact.recipient_limit(),
+            })
+        })
+        .collect::<Result<Vec<_>, StateMachineError>>()?;
     Ok(InvitationQuotaCasBinding {
         transaction_id: transaction_id.to_owned(),
         inviter: expected_inviter.clone(),
         new_recipients,
-        expected_pending: guard.current_pending(),
-        successor_pending,
-        quota_limit: guard.quota_limit(),
+        expected_inviter_recent_24h: guard.inviter_recent_24h(),
+        successor_inviter_recent_24h,
+        inviter_limit: guard.inviter_limit(),
+        recipient_facts,
         locked_at,
         locked_row_digest: *guard.durable_row_digest(),
     })
@@ -11687,13 +11830,8 @@ pub(crate) fn persistence_plan_for_test(
             })
             .collect();
         new_recipients.sort();
-        let successor_pending = transition
-            .state
-            .participants()
-            .iter()
-            .filter(|participant| participant.status() == ParticipantStatus::Pending)
-            .count() as u64;
-        let expected_pending = successor_pending.saturating_sub(new_recipients.len() as u64);
+        let expected_inviter_recent_24h = 0;
+        let successor_inviter_recent_24h = new_recipients.len() as u64;
         let inviter = transition
             .state
             .participants()
@@ -11709,13 +11847,27 @@ pub(crate) fn persistence_plan_for_test(
                     .cloned()
                     .unwrap_or_else(dummy_principal)
             });
+        let recipient_facts = new_recipients
+            .iter()
+            .cloned()
+            .map(|recipient| InvitationQuotaRecipientCasFact {
+                recipient,
+                expected_pair_live: 0,
+                successor_pair_live: 1,
+                pair_limit: 5,
+                expected_recipient_live: 0,
+                successor_recipient_live: 1,
+                recipient_limit: 100,
+            })
+            .collect();
         effects.invitation_quota_cas = Some(InvitationQuotaCasBinding {
             transaction_id: head_cas.transaction_id.clone(),
             inviter,
             new_recipients,
-            expected_pending,
-            successor_pending,
-            quota_limit: 100,
+            expected_inviter_recent_24h,
+            successor_inviter_recent_24h,
+            inviter_limit: 100,
+            recipient_facts,
             locked_at: head_cas.locked_at,
             locked_row_digest: [1u8; 32],
         });

@@ -116,13 +116,42 @@ pub(crate) enum LockedRevocationTargetStatus {
 /// Transaction-bound invitation quota snapshot for one exact inviter and
 /// exact newly-pending recipient set. Handlers cannot substitute a boolean or
 /// reuse the projection for another roster.
+const INVITATION_PAIR_LIVE_LIMIT: u64 = 5;
+const INVITATION_INVITER_ROLLING_24H_LIMIT: u64 = 100;
+const INVITATION_RECIPIENT_LIVE_LIMIT: u64 = 100;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LockedInvitationQuotaRecipientFact {
+    recipient_did: String,
+    pair_live: u64,
+    recipient_live: u64,
+}
+
+impl LockedInvitationQuotaRecipientFact {
+    pub(crate) fn recipient_did(&self) -> &str {
+        &self.recipient_did
+    }
+    pub(crate) fn pair_live(&self) -> u64 {
+        self.pair_live
+    }
+    pub(crate) fn pair_limit(&self) -> u64 {
+        INVITATION_PAIR_LIVE_LIMIT
+    }
+    pub(crate) fn recipient_live(&self) -> u64 {
+        self.recipient_live
+    }
+    pub(crate) fn recipient_limit(&self) -> u64 {
+        INVITATION_RECIPIENT_LIVE_LIMIT
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct LockedInvitationQuotaGuard {
     transaction_id: String,
     inviter_did: String,
     new_recipient_dids: Vec<String>,
-    current_pending: u64,
-    quota_limit: u64,
+    inviter_recent_24h: u64,
+    recipient_facts: Vec<LockedInvitationQuotaRecipientFact>,
     locked_at: DateTime<Utc>,
     durable_row_digest: [u8; 32],
 }
@@ -132,8 +161,8 @@ impl LockedInvitationQuotaGuard {
         transaction_id: String,
         inviter_did: String,
         new_recipient_dids: Vec<String>,
-        current_pending: u64,
-        quota_limit: u64,
+        inviter_recent_24h: u64,
+        recipient_facts: Vec<LockedInvitationQuotaRecipientFact>,
         locked_at: DateTime<Utc>,
         durable_row_digest: [u8; 32],
     ) -> Option<Self> {
@@ -143,9 +172,17 @@ impl LockedInvitationQuotaGuard {
                 .iter()
                 .any(|did| BareDid::parse(did).is_err())
             || new_recipient_dids.windows(2).any(|pair| pair[0] >= pair[1])
-            || quota_limit == 0
-            || quota_limit > MAX_PROTOCOL_INTEGER
-            || current_pending > MAX_PROTOCOL_INTEGER
+            || new_recipient_dids.iter().any(|did| did == &inviter_did)
+            || inviter_recent_24h > MAX_PROTOCOL_INTEGER
+            || recipient_facts.len() != new_recipient_dids.len()
+            || recipient_facts
+                .iter()
+                .zip(&new_recipient_dids)
+                .any(|(fact, did)| {
+                    fact.recipient_did != *did
+                        || fact.pair_live > MAX_PROTOCOL_INTEGER
+                        || fact.recipient_live > MAX_PROTOCOL_INTEGER
+                })
             || locked_at.timestamp_millis() < 0
             || locked_at.timestamp_subsec_nanos() % 1_000_000 != 0
             || durable_row_digest
@@ -153,8 +190,8 @@ impl LockedInvitationQuotaGuard {
                     &transaction_id,
                     &inviter_did,
                     &new_recipient_dids,
-                    current_pending,
-                    quota_limit,
+                    inviter_recent_24h,
+                    &recipient_facts,
                     locked_at,
                 )
         {
@@ -164,8 +201,8 @@ impl LockedInvitationQuotaGuard {
             transaction_id,
             inviter_did,
             new_recipient_dids,
-            current_pending,
-            quota_limit,
+            inviter_recent_24h,
+            recipient_facts,
             locked_at,
             durable_row_digest,
         })
@@ -180,11 +217,14 @@ impl LockedInvitationQuotaGuard {
     pub(crate) fn new_recipient_dids(&self) -> &[String] {
         &self.new_recipient_dids
     }
-    pub(crate) fn current_pending(&self) -> u64 {
-        self.current_pending
+    pub(crate) fn inviter_recent_24h(&self) -> u64 {
+        self.inviter_recent_24h
     }
-    pub(crate) fn quota_limit(&self) -> u64 {
-        self.quota_limit
+    pub(crate) fn inviter_limit(&self) -> u64 {
+        INVITATION_INVITER_ROLLING_24H_LIMIT
+    }
+    pub(crate) fn recipient_facts(&self) -> &[LockedInvitationQuotaRecipientFact] {
+        &self.recipient_facts
     }
     pub(crate) fn locked_at(&self) -> DateTime<Utc> {
         self.locked_at
@@ -193,9 +233,18 @@ impl LockedInvitationQuotaGuard {
         &self.durable_row_digest
     }
     pub(crate) fn would_exceed(&self) -> bool {
-        self.current_pending
+        self.inviter_recent_24h
             .checked_add(self.new_recipient_dids.len() as u64)
-            .is_none_or(|next| next > self.quota_limit)
+            .is_none_or(|next| next > INVITATION_INVITER_ROLLING_24H_LIMIT)
+            || self.recipient_facts.iter().any(|fact| {
+                fact.pair_live
+                    .checked_add(1)
+                    .is_none_or(|next| next > INVITATION_PAIR_LIVE_LIMIT)
+                    || fact
+                        .recipient_live
+                        .checked_add(1)
+                        .is_none_or(|next| next > INVITATION_RECIPIENT_LIVE_LIMIT)
+            })
     }
 }
 
@@ -203,8 +252,8 @@ fn invitation_quota_guard_digest(
     transaction_id: &str,
     inviter_did: &str,
     new_recipient_dids: &[String],
-    current_pending: u64,
-    quota_limit: u64,
+    inviter_recent_24h: u64,
+    recipient_facts: &[LockedInvitationQuotaRecipientFact],
     locked_at: DateTime<Utc>,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
@@ -218,10 +267,123 @@ fn invitation_quota_guard_digest(
         digest.update((did.len() as u64).to_be_bytes());
         digest.update(did.as_bytes());
     }
-    digest.update(current_pending.to_be_bytes());
-    digest.update(quota_limit.to_be_bytes());
+    digest.update(inviter_recent_24h.to_be_bytes());
+    digest.update(INVITATION_INVITER_ROLLING_24H_LIMIT.to_be_bytes());
+    digest.update((recipient_facts.len() as u64).to_be_bytes());
+    for fact in recipient_facts {
+        digest.update((fact.recipient_did.len() as u64).to_be_bytes());
+        digest.update(fact.recipient_did.as_bytes());
+        digest.update(fact.pair_live.to_be_bytes());
+        digest.update(INVITATION_PAIR_LIVE_LIMIT.to_be_bytes());
+        digest.update(fact.recipient_live.to_be_bytes());
+        digest.update(INVITATION_RECIPIENT_LIVE_LIMIT.to_be_bytes());
+    }
     digest.update(locked_at.timestamp_millis().to_be_bytes());
     digest.finalize().into()
+}
+
+#[cfg(test)]
+mod invitation_quota_guard_tests {
+    use super::*;
+
+    const INVITER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const RECIPIENT: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn guard(
+        inviter_recent_24h: u64,
+        pair_live: u64,
+        recipient_live: u64,
+    ) -> LockedInvitationQuotaGuard {
+        let transaction_id = "4242".to_owned();
+        let recipients = vec![RECIPIENT.to_owned()];
+        let facts = vec![LockedInvitationQuotaRecipientFact {
+            recipient_did: RECIPIENT.to_owned(),
+            pair_live,
+            recipient_live,
+        }];
+        let locked_at = DateTime::parse_from_rfc3339("2026-07-27T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let digest = invitation_quota_guard_digest(
+            &transaction_id,
+            INVITER,
+            &recipients,
+            inviter_recent_24h,
+            &facts,
+            locked_at,
+        );
+        LockedInvitationQuotaGuard::from_locked_row(
+            transaction_id,
+            INVITER.to_owned(),
+            recipients,
+            inviter_recent_24h,
+            facts,
+            locked_at,
+            digest,
+        )
+        .expect("canonical quota guard")
+    }
+
+    #[test]
+    fn below_all_three_limits_allows_one_new_pending_recipient() {
+        assert!(!guard(99, 4, 99).would_exceed());
+    }
+
+    #[test]
+    fn inviter_rolling_24h_limit_independently_rejects_successor() {
+        assert!(guard(100, 0, 0).would_exceed());
+    }
+
+    #[test]
+    fn pair_live_limit_independently_rejects_successor() {
+        assert!(guard(0, 5, 0).would_exceed());
+    }
+
+    #[test]
+    fn recipient_live_limit_independently_rejects_successor() {
+        assert!(guard(0, 0, 100).would_exceed());
+    }
+
+    #[test]
+    fn any_authoritative_fact_mutation_invalidates_the_closed_guard() {
+        let guard = guard(7, 3, 11);
+        let mut mutated = guard.recipient_facts.clone();
+        mutated[0].pair_live += 1;
+        assert!(LockedInvitationQuotaGuard::from_locked_row(
+            guard.transaction_id.clone(),
+            guard.inviter_did.clone(),
+            guard.new_recipient_dids.clone(),
+            guard.inviter_recent_24h,
+            mutated,
+            guard.locked_at,
+            guard.durable_row_digest,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn empty_recipient_scope_is_a_closed_inviter_only_witness() {
+        let transaction_id = "4242".to_owned();
+        let locked_at = DateTime::parse_from_rfc3339("2026-07-27T12:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let digest =
+            invitation_quota_guard_digest(&transaction_id, INVITER, &[], 100, &[], locked_at);
+        let guard = LockedInvitationQuotaGuard::from_locked_row(
+            transaction_id,
+            INVITER.to_owned(),
+            Vec::new(),
+            100,
+            Vec::new(),
+            locked_at,
+            digest,
+        )
+        .expect("empty scope remains exact and closed");
+        assert!(
+            !guard.would_exceed(),
+            "zero new invitations consume no quota"
+        );
+    }
 }
 
 /// Exact pending Welcome row locked after the conversation head in the same
@@ -2680,6 +2842,117 @@ pub(crate) async fn hydrate_locked_creation_head(
         durable_row_digest,
     )
     .ok_or(CreationHeadHydrationError::GuardInvariant)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum InvitationQuotaHydrationError {
+    #[error("clean-chat invitation quota scope is not canonical")]
+    NonCanonicalScope,
+    #[error("clean-chat invitation quota principal scope is incomplete")]
+    MissingPrincipal,
+    #[error("clean-chat invitation quota count is outside the protocol domain")]
+    CountOverflow,
+    #[error("clean-chat invitation quota guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat invitation quota database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Lock and read the exact three invitation-quota dimensions enforced by
+/// `chat.enforce_invitation_quota`: inviter rolling-24h creation count, and for
+/// each newly pending recipient the pair-live and recipient-live counts.
+pub(crate) async fn hydrate_locked_invitation_quota(
+    transaction: &mut Transaction<'_, Postgres>,
+    inviter_did: &str,
+    new_recipient_dids: &[String],
+    locked_at: DateTime<Utc>,
+) -> Result<LockedInvitationQuotaGuard, InvitationQuotaHydrationError> {
+    if BareDid::parse(inviter_did).is_err()
+        || new_recipient_dids
+            .iter()
+            .any(|did| BareDid::parse(did).is_err() || did == inviter_did)
+        || new_recipient_dids.windows(2).any(|pair| pair[0] >= pair[1])
+        || locked_at.timestamp_millis() < 0
+        || locked_at.timestamp_subsec_nanos() % 1_000_000 != 0
+    {
+        return Err(InvitationQuotaHydrationError::NonCanonicalScope);
+    }
+
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let mut principal_scope = new_recipient_dids.to_vec();
+    principal_scope.push(inviter_did.to_owned());
+    principal_scope.sort();
+    let locked_principals: Vec<String> = sqlx::query_scalar(
+        "SELECT user_did FROM chat.principals \
+         WHERE user_did = ANY($1::text[]) ORDER BY user_did FOR UPDATE",
+    )
+    .bind(&principal_scope)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if locked_principals != principal_scope {
+        return Err(InvitationQuotaHydrationError::MissingPrincipal);
+    }
+
+    let inviter_recent_24h: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants \
+         WHERE created_by_did=$1 AND invitation_transition_id IS NOT NULL \
+           AND created_at >= $2 - INTERVAL '24 hours'",
+    )
+    .bind(inviter_did)
+    .bind(locked_at)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let inviter_recent_24h = quota_count(inviter_recent_24h)?;
+
+    let mut recipient_facts = Vec::with_capacity(new_recipient_dids.len());
+    for recipient_did in new_recipient_dids {
+        let (pair_live, recipient_live): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM chat.participants \
+                 WHERE created_by_did=$1 AND user_did=$2 \
+                   AND current_membership AND status='pending'), \
+               (SELECT count(*) FROM chat.participants \
+                 WHERE user_did=$2 AND current_membership AND status='pending')",
+        )
+        .bind(inviter_did)
+        .bind(recipient_did)
+        .fetch_one(&mut **transaction)
+        .await?;
+        recipient_facts.push(LockedInvitationQuotaRecipientFact {
+            recipient_did: recipient_did.clone(),
+            pair_live: quota_count(pair_live)?,
+            recipient_live: quota_count(recipient_live)?,
+        });
+    }
+
+    let durable_row_digest = invitation_quota_guard_digest(
+        &transaction_id,
+        inviter_did,
+        new_recipient_dids,
+        inviter_recent_24h,
+        &recipient_facts,
+        locked_at,
+    );
+    LockedInvitationQuotaGuard::from_locked_row(
+        transaction_id,
+        inviter_did.to_owned(),
+        new_recipient_dids.to_vec(),
+        inviter_recent_24h,
+        recipient_facts,
+        locked_at,
+        durable_row_digest,
+    )
+    .ok_or(InvitationQuotaHydrationError::GuardInvariant)
+}
+
+fn quota_count(value: i64) -> Result<u64, InvitationQuotaHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(InvitationQuotaHydrationError::CountOverflow)
 }
 
 // ===========================================================================

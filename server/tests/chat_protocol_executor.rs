@@ -22,8 +22,20 @@
 mod common;
 
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/dpop.rs"]
+mod dpop;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/repository/mod.rs"]
+mod repository;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -51,7 +63,16 @@ mod chat_protocol {
             "/src/chat_protocol/public_state.rs"
         ));
     }
+    pub mod dpop {
+        pub use crate::dpop::*;
+    }
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
     pub mod repository {
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
         pub mod core {
             #![allow(dead_code)]
             include!(concat!(
