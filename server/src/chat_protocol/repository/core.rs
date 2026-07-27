@@ -5518,7 +5518,11 @@ pub(crate) struct ResetTerminalColumns {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResetTerminalSelection {
     Pending,
-    Transition {
+    StaleTransition {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    ConsumedTransition {
         transition_id: Uuid,
         terminal_at: DateTime<Utc>,
     },
@@ -5542,17 +5546,17 @@ pub(crate) fn select_reset_terminal(
                 terminal_at: columns.expires_at,
             })
         }
-        "stale" | "consumed"
-            if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() =>
-        {
-            if columns.status == "consumed" {
-                Err(ResetLeaveHydrationError::UnsupportedTerminal)
-            } else {
-                Ok(ResetTerminalSelection::Transition {
-                    transition_id: columns.terminal_transition_id.expect("shape checked"),
-                    terminal_at: columns.terminal_at.expect("shape checked"),
-                })
-            }
+        "stale" if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() => {
+            Ok(ResetTerminalSelection::StaleTransition {
+                transition_id: columns.terminal_transition_id.expect("shape checked"),
+                terminal_at: columns.terminal_at.expect("shape checked"),
+            })
+        }
+        "consumed" if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() => {
+            Ok(ResetTerminalSelection::ConsumedTransition {
+                transition_id: columns.terminal_transition_id.expect("shape checked"),
+                terminal_at: columns.terminal_at.expect("shape checked"),
+            })
         }
         "pending" | "stale" | "consumed" | "expired" => {
             Err(ResetLeaveHydrationError::TerminalMismatch)
@@ -5921,7 +5925,8 @@ pub(crate) async fn load_reset_request_hydration_rows(
         })?;
         let status = match selection {
             ResetTerminalSelection::Pending => ResetRequestStatus::Pending,
-            ResetTerminalSelection::Transition { .. } => ResetRequestStatus::Stale,
+            ResetTerminalSelection::StaleTransition { .. } => ResetRequestStatus::Stale,
+            ResetTerminalSelection::ConsumedTransition { .. } => ResetRequestStatus::Consumed,
             ResetTerminalSelection::Expiry { .. } => ResetRequestStatus::Expired,
         };
         let origin = load_control_request_origin(
@@ -5936,7 +5941,11 @@ pub(crate) async fn load_reset_request_hydration_rows(
 
         let terminal = match selection {
             ResetTerminalSelection::Pending => None,
-            ResetTerminalSelection::Transition {
+            ResetTerminalSelection::StaleTransition {
+                transition_id,
+                terminal_at,
+            }
+            | ResetTerminalSelection::ConsumedTransition {
                 transition_id,
                 terminal_at,
             } => {
@@ -5956,9 +5965,7 @@ pub(crate) async fn load_reset_request_hydration_rows(
                 let WorkTerminalHydrationRow::Transition(evidence) = &terminal else {
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 };
-                if evidence.received_at() != reset_leave_timestamp(terminal_at)? {
-                    return Err(ResetLeaveHydrationError::InvalidTerminal);
-                }
+                require_terminal_timestamp(evidence.received_at(), terminal_at)?;
                 Some(terminal)
             }
             ResetTerminalSelection::Expiry { terminal_at } => Some(
@@ -6128,10 +6135,10 @@ pub(crate) async fn load_leave_request_hydration_rows(
                 let WorkTerminalHydrationRow::Transition(evidence) = &terminal else {
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 };
-                if evidence.received_at() != reset_leave_timestamp(terminal_at)?
-                    || evidence
-                        .signed_authority()
-                        .is_none_or(|signed| signed.request_digest() != &terminal_request_digest)
+                require_terminal_timestamp(evidence.received_at(), terminal_at)?;
+                if evidence
+                    .signed_authority()
+                    .is_none_or(|signed| signed.request_digest() != &terminal_request_digest)
                 {
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 }
@@ -6315,6 +6322,17 @@ fn reset_leave_timestamp(
 ) -> Result<ServerTimestamp, ResetLeaveHydrationError> {
     ServerTimestamp::from_canonical_stored(&canonical_millis(value))
         .map_err(|_| ResetLeaveHydrationError::OutOfDomain)
+}
+
+pub(crate) fn require_terminal_timestamp(
+    evidence_received_at: ServerTimestamp,
+    terminal_at: DateTime<Utc>,
+) -> Result<(), ResetLeaveHydrationError> {
+    if evidence_received_at == reset_leave_timestamp(terminal_at)? {
+        Ok(())
+    } else {
+        Err(ResetLeaveHydrationError::InvalidTerminal)
+    }
 }
 
 // ===========================================================================

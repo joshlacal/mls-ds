@@ -2903,6 +2903,23 @@ mod historical_control_loader {
             entry,
             signed_creation_transition_id(entry),
             Some(public_state),
+            None,
+        )
+        .await
+    }
+
+    async fn seed_real_creation_graph_with_public_state_and_group_info(
+        pool: &PgPool,
+        entry: &RealCreationEntry,
+        public_state: &ActivePublicState,
+        group_info: &[u8],
+    ) -> Uuid {
+        seed_real_creation_graph_with_transition_id_and_public_state(
+            pool,
+            entry,
+            signed_creation_transition_id(entry),
+            Some(public_state),
+            Some(group_info),
         )
         .await
     }
@@ -3528,6 +3545,7 @@ mod historical_control_loader {
             entry,
             creation_transition_id,
             None,
+            None,
         )
         .await
     }
@@ -3537,6 +3555,7 @@ mod historical_control_loader {
         entry: &RealCreationEntry,
         creation_transition_id: Uuid,
         public_state: Option<&ActivePublicState>,
+        exact_group_info: Option<&[u8]>,
     ) -> Uuid {
         let conversation_id = Uuid::from_bytes(entry.cid);
         let participant_period_id = Uuid::new_v4();
@@ -3546,7 +3565,9 @@ mod historical_control_loader {
         let actor_device_id = entry.actor_device_id;
         let actor_key_id = &entry.actor_key_id;
         let actor_public_key = entry.public_key.clone();
-        let group_info = if public_state.is_some() {
+        let group_info = if let Some(group_info) = exact_group_info {
+            group_info.to_vec()
+        } else if public_state.is_some() {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/group-info.mls"),
@@ -4669,6 +4690,14 @@ mod historical_control_loader {
         };
         use chrono::{DateTime, SecondsFormat, Utc};
         use ed25519_dalek::{Signer, SigningKey};
+        use openmls::prelude::{
+            tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, CredentialType,
+            CredentialWithKey, GroupId, KeyPackage, Lifetime, MlsGroup, MlsGroupCreateConfig,
+            MlsMessageOut, ProtocolVersion,
+        };
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::OpenMlsProvider;
+        use serde::Serialize;
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
         use sqlx::{PgPool, Postgres, Transaction};
@@ -4677,10 +4706,13 @@ mod historical_control_loader {
         use super::super::historical_control_path::{
             build_real_corpus_creation_entry, build_real_creation_entry, RealCreationEntry,
         };
-        use super::seed_real_creation_graph;
+        use super::{
+            seed_real_creation_graph, seed_real_creation_graph_with_public_state_and_group_info,
+        };
         use crate::chat_protocol::public_state::{
             encode_public_tree_summary, load_persisted_active_snapshot, process_commit,
-            rebind_active_snapshot, verify_recovery_welcome, ActivePublicState,
+            rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
+            ActivePublicState, GenesisGroupInfoExpectations,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_conversation_head,
@@ -4720,8 +4752,10 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::validation::ed25519_key_id;
         use crate::chat_protocol::wire::{
-            validate_key_package, validate_public_commit, KeyPackageValidationPolicy,
+            validate_group_info, validate_key_package, validate_public_commit,
+            GroupInfoValidationPolicy, KeyPackageValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
             MAX_KEY_PACKAGE_WIRE_BYTES, MAX_PUBLIC_MESSAGE_WIRE_BYTES, MAX_WELCOME_WIRE_BYTES,
+            XWING_CIPHERSUITE,
         };
         use crate::common;
 
@@ -4732,6 +4766,8 @@ mod historical_control_loader {
         // deferred `assert_recovery_fulfillment_mapping` constraint requires.
         const KP_NOT_BEFORE: &str = "2026-07-27T03:05:08.000Z";
         const KP_NOT_AFTER: &str = "2026-07-28T03:06:08.000Z";
+        const CREATION_SIGNED_AT: &str = "2026-07-27T03:06:08.000Z";
+        const CREATION_RECEIVED_AT: &str = "2026-07-27T03:06:09.000Z";
         const POLICY_ADD_AT: &str = "2026-07-27T04:06:08.000Z";
         const SIGNED_AT: &str = "2026-07-27T04:06:08.500Z";
         const REQUESTED_AT: &str = "2026-07-27T04:06:09.000Z";
@@ -5984,17 +6020,17 @@ mod historical_control_loader {
                 .expect("rollback terminal-family B final read");
         }
 
-        struct FixedCorpusCommitStates {
+        pub(super) struct FixedCorpusCommitStates {
             genesis: ActivePublicState,
             add_prior: ActivePublicState,
-            added: ActivePublicState,
+            pub(super) added: ActivePublicState,
             generic: ActivePublicState,
             removed: ActivePublicState,
             rejoin_prior: ActivePublicState,
             rejoined: ActivePublicState,
         }
 
-        fn fixed_corpus_commit_states() -> FixedCorpusCommitStates {
+        pub(super) fn fixed_corpus_commit_states() -> FixedCorpusCommitStates {
             let manifest = corpus_manifest();
             let chain = &manifest["chain"];
             let cid = corpus_hex::<16>(&manifest["identifiers"]["conversationIdHex"]);
@@ -6597,6 +6633,75 @@ mod historical_control_loader {
                 .with_timezone(&Utc)
         }
 
+        fn exact_mls_capabilities() -> Capabilities {
+            Capabilities::new(
+                Some(&[ProtocolVersion::Mls10]),
+                Some(&[XWING_CIPHERSUITE]),
+                Some(&[]),
+                Some(&[]),
+                Some(&[CredentialType::Basic]),
+            )
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CommitAadCoordinate<'a> {
+            #[serde(with = "serde_bytes")]
+            conversation_id: &'a [u8],
+            generation: u64,
+            state_version: u64,
+            #[serde(with = "serde_bytes")]
+            group_id: &'a [u8],
+            epoch: u64,
+            #[serde(with = "serde_bytes")]
+            group_context_hash: &'a [u8],
+            #[serde(with = "serde_bytes")]
+            confirmation_tag: &'a [u8],
+            lifecycle: &'static str,
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CommitAadProjection<'a> {
+            protocol_version: &'static str,
+            #[serde(with = "serde_bytes")]
+            conversation_id: &'a [u8],
+            generation: u64,
+            #[serde(with = "serde_bytes")]
+            transition_id: &'a [u8],
+            prior: CommitAadCoordinate<'a>,
+        }
+
+        fn encode_commit_aad(
+            conversation_id: &[u8; 16],
+            transition_id: &Uuid,
+            prior: &PublicGroupSnapshotCoordinate,
+        ) -> Vec<u8> {
+            assert_eq!(prior.conversation_id(), conversation_id);
+            let projection = CommitAadProjection {
+                protocol_version: "1",
+                conversation_id,
+                generation: prior.generation(),
+                transition_id: transition_id.as_bytes(),
+                prior: CommitAadCoordinate {
+                    conversation_id,
+                    generation: prior.generation(),
+                    state_version: prior.state_version(),
+                    group_id: prior.group_id(),
+                    epoch: prior.epoch(),
+                    group_context_hash: prior.group_context_hash(),
+                    confirmation_tag: prior.confirmation_tag(),
+                    lifecycle: "active",
+                },
+            };
+            let mut aad = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".to_vec();
+            aad.extend(
+                serde_ipld_dagcbor::to_vec(&projection)
+                    .expect("encode canonical protocol Commit AAD"),
+            );
+            aad
+        }
+
         fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
             let mut value = [byte; 16];
             value[6] = 0x40 | (byte & 0x0f);
@@ -6625,7 +6730,7 @@ mod historical_control_loader {
                 .unwrap_or_else(|_| panic!("expected {N}-byte corpus value"))
         }
 
-        fn coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
+        pub(super) fn coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
             json!({
                 "conversationId": Uuid::from_bytes(*coordinate.conversation_id()),
                 "generation": coordinate.generation(),
@@ -6678,6 +6783,294 @@ mod historical_control_loader {
                 signing_key,
                 participant_period_id: Uuid::new_v4(),
             }
+        }
+
+        struct FreshAddCryptoFixture {
+            entry: RealCreationEntry,
+            invitee: AcceptanceInvitee,
+            genesis_group_info: Vec<u8>,
+            genesis: ActivePublicState,
+            committed: ActivePublicState,
+            key_package_ref: [u8; 32],
+            key_package_wrapper: Vec<u8>,
+            commit: Vec<u8>,
+            welcome: Vec<u8>,
+        }
+
+        fn bind_creation_entry_to_group_info(
+            mut entry: RealCreationEntry,
+            group_info: &[u8],
+            coordinate: &PublicGroupSnapshotCoordinate,
+        ) -> RealCreationEntry {
+            let mut wrapper: Value =
+                serde_json::from_slice(&entry.raw_wrapper).expect("parse creation wrapper");
+            wrapper["body"]["signedAt"] = json!(CREATION_SIGNED_AT);
+            wrapper["body"]["next"] = coordinate_json(coordinate);
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["conversationId"] =
+                json!(STANDARD.encode(entry.cid));
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["generation"] =
+                json!(coordinate.generation());
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
+                json!(STANDARD.encode(coordinate.group_id()));
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["epoch"] = json!(coordinate.epoch());
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["groupContextHash"] =
+                json!(STANDARD.encode(coordinate.group_context_hash()));
+            wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
+                json!(STANDARD.encode(coordinate.confirmation_tag()));
+            wrapper["body"]["genesisGroupInfo"]["bytes"] = json!(STANDARD.encode(group_info));
+            wrapper["body"]["genesisGroupInfo"]["sha256"] =
+                json!(STANDARD.encode(Sha256::digest(group_info)));
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let canonical =
+                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
+                    .expect("dynamic creation canonicalizes");
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(
+                    entry
+                        .signing_key()
+                        .sign(canonical.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let mut row: Value =
+                serde_json::from_slice(&entry.public_row_json).expect("parse creation row");
+            row["signedRequest"] = wrapper;
+            row["receivedAt"] = json!(CREATION_RECEIVED_AT);
+            entry.public_row_json = serde_json::to_vec(&row).unwrap();
+            entry.outer_entry_fingerprint =
+                *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("dynamic creation verifies")
+                    .outer_control_fingerprint();
+            entry
+        }
+
+        fn build_fresh_add_crypto_fixture(
+            cid: Uuid,
+            add_transition_id: Uuid,
+        ) -> FreshAddCryptoFixture {
+            let mut entry = build_real_creation_entry(*cid.as_bytes());
+            let provider =
+                openmls_libcrux_crypto::Provider::new().expect("fresh Add Alice provider");
+            let alice_signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                entry.signing_seed.to_vec(),
+                entry.public_key.clone(),
+            );
+            alice_signer
+                .store(provider.storage())
+                .expect("store fresh Add Alice signer");
+            let alice_credential =
+                format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let lifetime = Lifetime::init(
+                u64::try_from(instant(KP_NOT_BEFORE).timestamp()).unwrap(),
+                u64::try_from(instant(KP_NOT_AFTER).timestamp()).unwrap(),
+            );
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(XWING_CIPHERSUITE)
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .capabilities(exact_mls_capabilities())
+                .lifetime(lifetime)
+                .build();
+            let group_id: [u8; 32] =
+                Sha256::digest([b"CATBIRD-D2-FRESH-GROUP\0".as_ref(), cid.as_bytes()].concat())
+                    .into();
+            let mut alice_group = MlsGroup::new_with_group_id(
+                &provider,
+                &alice_signer,
+                &config,
+                GroupId::from_slice(&group_id),
+                CredentialWithKey {
+                    credential: BasicCredential::new(alice_credential.clone()).into(),
+                    signature_key: entry.public_key.clone().into(),
+                },
+            )
+            .expect("create fresh Add Alice group");
+            let genesis_group_info = alice_group
+                .export_group_info(provider.crypto(), &alice_signer, true)
+                .expect("export fresh Add genesis GroupInfo")
+                .tls_serialize_detached()
+                .expect("serialize fresh Add genesis GroupInfo");
+            let validated_genesis = validate_group_info(
+                &genesis_group_info,
+                GroupInfoValidationPolicy {
+                    expected_basic_credential: &alice_credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds: u64::try_from(instant(CREATION_RECEIVED_AT).timestamp())
+                        .unwrap(),
+                    max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 2,
+                },
+            )
+            .expect("production validates fresh Add genesis GroupInfo");
+            let genesis_coordinate = PublicGroupSnapshotCoordinate::new(
+                *cid.as_bytes(),
+                0,
+                0,
+                validated_genesis
+                    .group_id()
+                    .try_into()
+                    .expect("fresh group id is 32 bytes"),
+                validated_genesis.epoch(),
+                *validated_genesis.group_context_hash(),
+                *validated_genesis.confirmation_tag(),
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let genesis = verify_genesis_group_info(
+                &genesis_group_info,
+                GenesisGroupInfoExpectations {
+                    coordinate: genesis_coordinate,
+                    expected_basic_credential: &alice_credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds: u64::try_from(instant(CREATION_RECEIVED_AT).timestamp())
+                        .unwrap(),
+                    max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 2,
+                },
+            )
+            .expect("fresh Add genesis becomes production public state");
+            entry =
+                bind_creation_entry_to_group_info(entry, &genesis_group_info, &genesis_coordinate);
+
+            let invitee = corpus_invitee();
+            let bob_provider =
+                openmls_libcrux_crypto::Provider::new().expect("fresh Add Bob provider");
+            let bob_public_key = invitee.signing_key.verifying_key().to_bytes().to_vec();
+            let bob_signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                invitee.signing_key.to_bytes().to_vec(),
+                bob_public_key.clone(),
+            );
+            bob_signer
+                .store(bob_provider.storage())
+                .expect("store fresh Add Bob signer");
+            let bob_credential = format!("{}#{}", invitee.did, invitee.device_id).into_bytes();
+            let key_package = KeyPackage::builder()
+                .key_package_lifetime(lifetime)
+                .leaf_node_capabilities(exact_mls_capabilities())
+                .build(
+                    XWING_CIPHERSUITE,
+                    &bob_provider,
+                    &bob_signer,
+                    CredentialWithKey {
+                        credential: BasicCredential::new(bob_credential.clone()).into(),
+                        signature_key: bob_public_key.clone().into(),
+                    },
+                )
+                .expect("build fresh Add Bob KeyPackage")
+                .key_package()
+                .clone();
+            let key_package_wrapper = MlsMessageOut::from(key_package.clone())
+                .tls_serialize_detached()
+                .expect("serialize fresh Add Bob KeyPackage");
+            let validated_package = validate_key_package(
+                &key_package_wrapper,
+                KeyPackageValidationPolicy {
+                    expected_basic_credential: &bob_credential,
+                    expected_signature_key: &bob_public_key,
+                    now_unix_seconds: u64::try_from(instant(REQUESTED_AT).timestamp()).unwrap(),
+                    max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+                },
+            )
+            .expect("production validates fresh Add Bob KeyPackage");
+            let key_package_ref = *validated_package.key_package_ref();
+
+            let add_prior = rebound_state(&rebound_state(&genesis, 1), 2);
+            let aad = encode_commit_aad(cid.as_bytes(), &add_transition_id, add_prior.coordinate());
+            alice_group.set_aad(aad.clone());
+            let (commit_out, welcome_out, post_commit_group_info) = alice_group
+                .add_members(&provider, &alice_signer, std::slice::from_ref(&key_package))
+                .expect("generate fresh Add Commit and Welcome");
+            let commit = commit_out
+                .tls_serialize_detached()
+                .expect("serialize fresh Add Commit");
+            let welcome = welcome_out
+                .tls_serialize_detached()
+                .expect("serialize fresh Add Welcome");
+            alice_group
+                .merge_pending_commit(&provider)
+                .expect("merge fresh Add locally");
+            let post_commit_group_info =
+                post_commit_group_info.expect("ratchet-tree profile exports post-Commit GroupInfo");
+            let group_context_hash: [u8; 32] = Sha256::digest(
+                post_commit_group_info
+                    .group_context()
+                    .tls_serialize_detached()
+                    .expect("serialize fresh Add successor GroupContext"),
+            )
+            .into();
+            let encoded_confirmation_tag = alice_group
+                .confirmation_tag()
+                .tls_serialize_detached()
+                .expect("serialize fresh Add confirmation tag");
+            assert_eq!(
+                encoded_confirmation_tag.first(),
+                Some(&32),
+                "XWing confirmation tag uses canonical one-byte VL length"
+            );
+            let confirmation_tag: [u8; 32] = encoded_confirmation_tag[1..]
+                .try_into()
+                .expect("fresh Add confirmation tag is 32 bytes");
+            let next_coordinate = PublicGroupSnapshotCoordinate::new(
+                *cid.as_bytes(),
+                0,
+                3,
+                group_id,
+                alice_group.epoch().as_u64(),
+                group_context_hash,
+                confirmation_tag,
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let processed = process_commit(
+                &add_prior,
+                &commit,
+                &aad,
+                next_coordinate,
+                u64::try_from(instant(FULFILLED_AT).timestamp()).unwrap(),
+                100,
+            )
+            .expect("production processes fresh Add Commit");
+            assert_eq!(processed.adds().len(), 1);
+            assert_eq!(processed.adds()[0].key_package_ref(), &key_package_ref);
+            verify_recovery_welcome(&welcome, key_package_ref, MAX_WELCOME_WIRE_BYTES)
+                .expect("production binds fresh Welcome to fresh KeyPackageRef");
+
+            FreshAddCryptoFixture {
+                entry,
+                invitee,
+                genesis_group_info,
+                genesis,
+                committed: processed.into_next(),
+                key_package_ref,
+                key_package_wrapper,
+                commit,
+                welcome,
+            }
+        }
+
+        #[test]
+        fn test_commit_aad_encoder_is_byte_exact_with_frozen_corpus() {
+            let manifest = corpus_manifest();
+            let cid = Uuid::parse_str(manifest["identifiers"]["conversationId"].as_str().unwrap())
+                .unwrap();
+            let transition_id =
+                Uuid::parse_str(manifest["identifiers"]["transitionId"].as_str().unwrap()).unwrap();
+            let prior = fixed_corpus_commit_states().add_prior;
+            let expected = validate_public_commit(
+                &corpus_file("commit-public.mls"),
+                MAX_PUBLIC_MESSAGE_WIRE_BYTES,
+            )
+            .expect("frozen Add Commit validates")
+            .aad()
+            .to_vec();
+            assert_eq!(
+                encode_commit_aad(cid.as_bytes(), &transition_id, prior.coordinate()),
+                expected,
+                "dynamic Add generator uses the canonical client Commit-AAD bytes"
+            );
         }
 
         fn validate_exact_corpus_recovery_artifacts() -> [u8; 32] {
@@ -7121,9 +7514,9 @@ mod historical_control_loader {
             signature: Vec<u8>,
         }
 
-        struct AcceptanceInvitee {
-            did: String,
-            device_id: Uuid,
+        pub(super) struct AcceptanceInvitee {
+            pub(super) did: String,
+            pub(super) device_id: Uuid,
             key_id: String,
             signing_key: SigningKey,
             participant_period_id: Uuid,
@@ -7810,11 +8203,12 @@ mod historical_control_loader {
             (entry, invitee, acceptance)
         }
 
-        struct GenuinePolicyRoleGraph {
-            entry: RealCreationEntry,
-            invitee: AcceptanceInvitee,
+        pub(super) struct GenuinePolicyRoleGraph {
+            pub(super) entry: RealCreationEntry,
+            pub(super) invitee: AcceptanceInvitee,
             acceptance: RealAcceptanceEntry,
-            fulfillment: RealLeafRecoveryFulfillmentEntry,
+            pub(super) fulfillment: RealLeafRecoveryFulfillmentEntry,
+            pub(super) committed: ActivePublicState,
         }
 
         struct TerminalFamilyBActors {
@@ -9073,14 +9467,77 @@ mod historical_control_loader {
                     .expect("fixed corpus conversationId"),
             )
             .expect("fixed corpus conversation UUID");
-            let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
+            let transition_id = Uuid::parse_str(
+                corpus_manifest()["identifiers"]["transitionId"]
+                    .as_str()
+                    .expect("fixed Add transitionId"),
+            )
+            .expect("fixed Add transition UUID");
+            commit_genuine_policy_acceptance_fulfillment_at(pool, cid, transition_id).await
+        }
+
+        pub(super) async fn commit_genuine_policy_acceptance_fulfillment_at(
+            pool: &PgPool,
+            cid: Uuid,
+            add_transition_id: Uuid,
+        ) -> GenuinePolicyRoleGraph {
+            let fixed_cid = Uuid::parse_str(
+                corpus_manifest()["identifiers"]["conversationId"]
+                    .as_str()
+                    .expect("fixed corpus conversationId"),
+            )
+            .expect("fixed corpus conversation UUID");
+            let (
+                mut entry,
+                invitee,
+                genesis_group_info,
+                genesis,
+                committed,
+                key_package_ref,
+                key_package_wrapper,
+                commit_bytes,
+                welcome_bytes,
+            ) = if cid == fixed_cid {
+                let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
+                entry.head_next_entry_seq = 2;
+                let states = fixed_corpus_commit_states();
+                let genesis = states.genesis;
+                let committed = states.added;
+                let key_package_ref = validate_exact_corpus_recovery_artifacts();
+                (
+                    entry,
+                    corpus_invitee(),
+                    None,
+                    genesis,
+                    committed,
+                    key_package_ref,
+                    corpus_file("key-package.mls"),
+                    corpus_file("commit-public.mls"),
+                    corpus_file("welcome.mls"),
+                )
+            } else {
+                let fresh = build_fresh_add_crypto_fixture(cid, add_transition_id);
+                (
+                    fresh.entry,
+                    fresh.invitee,
+                    Some(fresh.genesis_group_info),
+                    fresh.genesis,
+                    fresh.committed,
+                    fresh.key_package_ref,
+                    fresh.key_package_wrapper,
+                    fresh.commit,
+                    fresh.welcome,
+                )
+            };
             entry.head_next_entry_seq = 2;
-            let states = fixed_corpus_commit_states();
-            let genesis = states.genesis;
-            assert_eq!(genesis.coordinate().conversation_id(), cid.as_bytes());
-            let creation_transition_id =
-                super::seed_real_creation_graph_with_public_state(pool, &entry, &genesis).await;
-            let invitee = corpus_invitee();
+            let creation_transition_id = if let Some(group_info) = genesis_group_info.as_deref() {
+                seed_real_creation_graph_with_public_state_and_group_info(
+                    pool, &entry, &genesis, group_info,
+                )
+                .await
+            } else {
+                super::seed_real_creation_graph_with_public_state(pool, &entry, &genesis).await
+            };
 
             let policy = genuine_policy_control(
                 &entry,
@@ -9236,7 +9693,6 @@ mod historical_control_loader {
                 .await
                 .expect("genuine Policy Add crosses schema constraints");
 
-            let corpus_key_package_ref = validate_exact_corpus_recovery_artifacts();
             let acceptance = build_real_acceptance_entry_at(
                 &entry,
                 &invitee,
@@ -9246,28 +9702,27 @@ mod historical_control_loader {
                 SIGNED_AT,
                 REQUESTED_AT,
                 EXPIRES_AT,
-                Some((corpus_key_package_ref, corpus_file("key-package.mls"))),
-            );
-            assert_eq!(
-                acceptance.key_package_ref, corpus_key_package_ref,
-                "signed acceptance persists the production-derived corpus KeyPackageRef"
+                Some((key_package_ref, key_package_wrapper)),
             );
             let acceptance_state = rebound_state(&policy_state, 2);
             commit_genuine_acceptance(pool, &entry, &invitee, &acceptance, &acceptance_state).await;
 
-            let committed = states.added;
-            assert_eq!(
-                committed.snapshot(),
-                corpus_file("committed-public-state.bin")
-            );
             assert_eq!(committed.coordinate().state_version(), 3);
-            let fulfillment = build_genuine_add_fulfillment_entry(
+            let fulfillment = build_genuine_add_fulfillment_entry_with_bytes(
                 &entry,
                 &invitee,
                 &acceptance,
                 creation_transition_id,
                 acceptance_state.coordinate(),
                 committed.coordinate(),
+                add_transition_id,
+                4,
+                FULFILLMENT_SIGNED_AT,
+                FULFILLED_AT,
+                commit_bytes,
+                welcome_bytes,
+                0x26,
+                0x32,
             );
             commit_genuine_add_fulfillment(
                 pool,
@@ -9285,6 +9740,7 @@ mod historical_control_loader {
                 invitee,
                 acceptance,
                 fulfillment,
+                committed,
             }
         }
 
@@ -9825,7 +10281,7 @@ mod historical_control_loader {
                 .expect("genuine Add fulfillment crosses deferred mappings");
         }
 
-        async fn device_event_predecessor(
+        pub(super) async fn device_event_predecessor(
             pool: &PgPool,
             did: &str,
             device_id: Uuid,
@@ -10205,10 +10661,10 @@ mod historical_control_loader {
             tx.rollback().await.expect("rollback graph-digest read");
         }
 
-        struct RealLeafRecoveryFulfillmentEntry {
+        pub(super) struct RealLeafRecoveryFulfillmentEntry {
             entry_id: Uuid,
             transition_id: Uuid,
-            welcome_id: Uuid,
+            pub(super) welcome_id: Uuid,
             public_row_json: Vec<u8>,
             raw_wrapper: Vec<u8>,
             canonical_projection: Vec<u8>,
@@ -10269,11 +10725,44 @@ mod historical_control_loader {
             metadata_nonce_byte: u8,
             metadata_ciphertext_byte: u8,
         ) -> RealLeafRecoveryFulfillmentEntry {
+            build_genuine_add_fulfillment_entry_with_bytes(
+                entry,
+                invitee,
+                acceptance,
+                creation_transition_id,
+                prior,
+                next,
+                transition_id,
+                seq,
+                signed_at,
+                received_at,
+                corpus_file(commit_file),
+                corpus_file(welcome_file),
+                metadata_nonce_byte,
+                metadata_ciphertext_byte,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_genuine_add_fulfillment_entry_with_bytes(
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            creation_transition_id: Uuid,
+            prior: &PublicGroupSnapshotCoordinate,
+            next: &PublicGroupSnapshotCoordinate,
+            transition_id: Uuid,
+            seq: u64,
+            signed_at: &str,
+            received_at: &str,
+            commit_bytes: Vec<u8>,
+            opaque_welcome: Vec<u8>,
+            metadata_nonce_byte: u8,
+            metadata_ciphertext_byte: u8,
+        ) -> RealLeafRecoveryFulfillmentEntry {
             let signing_key = entry.signing_key();
             let entry_id = Uuid::new_v4();
             let welcome_id = Uuid::new_v4();
-            let commit_bytes = corpus_file(commit_file);
-            let opaque_welcome = corpus_file(welcome_file);
             let metadata_ciphertext = vec![metadata_ciphertext_byte; 16];
             let request_id = Uuid::from_bytes(acceptance.request_id);
             let body = json!({
@@ -13701,43 +14190,69 @@ mod historical_control_loader {
     // -----------------------------------------------------------------------
     pub(super) mod reset_leave_leg {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        use chrono::{DateTime, Duration, Utc};
+        use chrono::{DateTime, Duration, SecondsFormat, Utc};
         use ed25519_dalek::Signer;
+        use openmls::prelude::{
+            tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize},
+            *,
+        };
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::OpenMlsProvider;
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
         use sqlx::{PgPool, Postgres, Transaction};
         use uuid::Uuid;
 
         use super::super::historical_control_path::{build_real_creation_entry, RealCreationEntry};
+        use super::recovery_leg::{
+            commit_genuine_policy_acceptance_fulfillment_at, coordinate_json,
+            device_event_predecessor, AcceptanceInvitee, GenuinePolicyRoleGraph,
+        };
         use super::seed_real_creation_graph;
-        use crate::chat_protocol::public_state::{encode_public_tree_summary, ActivePublicState};
+        use crate::chat_protocol::public_state::{
+            encode_public_tree_summary, verify_reset_successor_group_info, ActivePublicState,
+            ResetSuccessorGroupInfoExpectations,
+        };
         use crate::chat_protocol::repository::core::{
             hydrate_locked_public_state, load_interval_hydration_rows, load_leaf_hydration_rows,
             load_leave_request_hydration_rows, load_metadata_provenance,
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
             load_welcome_hydration_rows, load_work_terminal_hydration_row,
-            resolve_single_control_request_origin, resolve_single_fulfilled_participant,
-            select_leave_terminal, select_reset_terminal, LeaveTerminalColumns,
-            ResetLeaveHydrationError, ResetTerminalColumns, WorkTerminalLocator,
+            require_terminal_timestamp, resolve_single_control_request_origin,
+            resolve_single_fulfilled_participant, select_leave_terminal, select_reset_terminal,
+            LeaveTerminalColumns, ResetLeaveHydrationError, ResetTerminalColumns,
+            ResetTerminalSelection, WorkTerminalLocator,
+        };
+        use crate::chat_protocol::repository::delivery::{
+            EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
         };
         use crate::chat_protocol::repository::transition::{
             terminalize_leave_request, terminalize_reset_request, LeaveRequestTermination,
-            ResetRequestTermination,
+            ResetRequestTermination, TransitionActorRole,
         };
         use crate::chat_protocol::snapshot::{
-            PublicGroupSnapshotLeaf, PublicGroupSnapshotTreeSummary,
+            PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
+            PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            ConversationKind, ConversationStateHydration, DeviceIdentity,
-            HistoricalRehydrationAuthority, HydrationAuthority, LeaveRequestStatus,
-            ParticipantRemovalEvidence, PrincipalId, ResetRequestStatus, ServerTimestamp,
-            WorkTerminalHydrationRow,
+            apply_conversation_persistence_plan, hydrate_conversation_state,
+            persistence_plan_for_test, plan_reset_activation, ControlEntryContent,
+            ConversationHeadCasBinding, ConversationKind, ConversationStateHydration,
+            DeviceIdentity, EventFanout, ExecutionActor, ExecutionContext,
+            HistoricalRehydrationAuthority, HydrationAuthority, LeafPersistenceColumns,
+            LeaveRequestStatus, MetadataAuthorColumns, ParticipantRemovalEvidence, PrincipalId,
+            ResetActivation, ResetRequestStatus, ServerTimestamp, SpineArtifacts,
+            StateMachineError, WelcomeDispositionInput, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
         };
         use crate::chat_protocol::validation::ed25519_key_id;
+        use crate::chat_protocol::wire::{
+            validate_group_info, GroupInfoValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
+            XWING_CIPHERSUITE,
+        };
         use crate::common;
 
         pub(super) const RESET_ENTRY_KIND: &str = "blue.catbird.chat.defs#resetRequestEntry";
@@ -13820,6 +14335,322 @@ mod historical_control_loader {
             outer_entry_fingerprint: Vec<u8>,
         }
 
+        struct RealResetActivation {
+            entry_id: Uuid,
+            transition_id: Uuid,
+            public_row_json: Vec<u8>,
+            raw_wrapper: Vec<u8>,
+            canonical_projection: Vec<u8>,
+            signing_transcript: Vec<u8>,
+            request_digest: Vec<u8>,
+            signature: Vec<u8>,
+            server_fields_dag_cbor: Vec<u8>,
+            outer_entry_fingerprint: Vec<u8>,
+            group_info: Vec<u8>,
+            successor_public_state: ActivePublicState,
+        }
+
+        fn reset_successor_coordinate_json(
+            cid: [u8; 16],
+            generation: u64,
+            group_id: &[u8; 32],
+            group_context_hash: &[u8; 32],
+            confirmation_tag: &[u8; 32],
+        ) -> Value {
+            json!({
+                "conversationId": Uuid::from_bytes(cid).hyphenated().to_string(),
+                "generation": generation,
+                "stateVersion": 0,
+                "groupId": STANDARD.encode(group_id),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode(group_context_hash),
+                "confirmationTag": STANDARD.encode(confirmation_tag),
+                "lifecycle": "active",
+            })
+        }
+
+        fn reset_retired_coordinate_json(prior: &PublicGroupSnapshotCoordinate) -> Value {
+            json!({
+                "conversationId": Uuid::from_bytes(*prior.conversation_id()).hyphenated().to_string(),
+                "generation": prior.generation(),
+                "stateVersion": prior.state_version() + 1,
+                "groupId": STANDARD.encode(prior.group_id()),
+                "epoch": prior.epoch(),
+                "groupContextHash": STANDARD.encode(prior.group_context_hash()),
+                "confirmationTag": STANDARD.encode(prior.confirmation_tag()),
+                "lifecycle": "superseded",
+            })
+        }
+
+        fn build_real_reset_activation(
+            entry: &RealCreationEntry,
+            reset_request_id: [u8; 16],
+            prior_coordinate: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            participants: Value,
+            received_at: DateTime<Utc>,
+        ) -> RealResetActivation {
+            let now_unix_seconds =
+                u64::try_from(received_at.timestamp()).expect("reset time is positive");
+            let received_at_text = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let signed_at_text =
+                (received_at - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let provider = openmls_libcrux_crypto::Provider::new().expect("reset libcrux provider");
+            let signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                entry.signing_seed.to_vec(),
+                entry.public_key.clone(),
+            );
+            signer
+                .store(provider.storage())
+                .expect("store reset actor signer");
+            let credential = format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let capabilities = Capabilities::new(
+                Some(&[ProtocolVersion::Mls10]),
+                Some(&[XWING_CIPHERSUITE]),
+                Some(&[]),
+                Some(&[]),
+                Some(&[CredentialType::Basic]),
+            );
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(XWING_CIPHERSUITE)
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .capabilities(capabilities)
+                .lifetime(Lifetime::init(
+                    now_unix_seconds - 60,
+                    now_unix_seconds + 3_600,
+                ))
+                .build();
+            let group_id = [0xd2_u8; 32];
+            let group = MlsGroup::new_with_group_id(
+                &provider,
+                &signer,
+                &config,
+                GroupId::from_slice(&group_id),
+                CredentialWithKey {
+                    credential: BasicCredential::new(credential.clone()).into(),
+                    signature_key: entry.public_key.clone().into(),
+                },
+            )
+            .expect("create genuine reset successor group");
+            let group_info = group
+                .export_group_info(provider.crypto(), &signer, true)
+                .expect("export genuine reset GroupInfo")
+                .tls_serialize_detached()
+                .expect("serialize genuine reset GroupInfo");
+            let verifiable = match MlsMessageIn::tls_deserialize_exact(&group_info)
+                .expect("parse exported reset GroupInfo")
+                .extract()
+            {
+                MlsMessageBodyIn::GroupInfo(group_info) => group_info,
+                _ => panic!("reset GroupInfo uses the GroupInfo wire wrapper"),
+            };
+            let ratchet_tree = verifiable
+                .extensions()
+                .ratchet_tree()
+                .expect("reset GroupInfo ratchet tree")
+                .ratchet_tree()
+                .clone();
+            let external_provider =
+                openmls_libcrux_crypto::Provider::new().expect("external reset provider");
+            PublicGroup::from_external(
+                external_provider.crypto(),
+                external_provider.storage(),
+                ratchet_tree,
+                verifiable,
+                ProposalStore::new(),
+            )
+            .expect("OpenMLS imports the exported reset GroupInfo");
+            let validated = validate_group_info(
+                &group_info,
+                GroupInfoValidationPolicy {
+                    expected_basic_credential: &credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds,
+                    max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 1,
+                },
+            )
+            .expect("genuine reset GroupInfo validates");
+            let validated_group_id: [u8; 32] = validated
+                .group_id()
+                .try_into()
+                .expect("reset group id is 32 bytes");
+            let group_context_hash = *validated.group_context_hash();
+            let confirmation_tag = *validated.confirmation_tag();
+            let successor_coordinate = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                prior_coordinate.generation() + 1,
+                0,
+                validated_group_id,
+                0,
+                group_context_hash,
+                confirmation_tag,
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let successor_public_state = verify_reset_successor_group_info(
+                &group_info,
+                prior_coordinate,
+                ResetSuccessorGroupInfoExpectations {
+                    coordinate: successor_coordinate,
+                    expected_basic_credential: &credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds,
+                    max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                    max_members: 1,
+                },
+            )
+            .expect("reset successor binds to the exact signed coordinate");
+
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let metadata_ciphertext = [0xb2_u8; 16];
+            let successor = reset_successor_coordinate_json(
+                entry.cid,
+                successor_coordinate.generation(),
+                &validated_group_id,
+                &group_context_hash,
+                &confirmation_tag,
+            );
+            let body = json!({
+                "$type": SignedMutationKind::ResetActivation.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::ResetActivation.domain().to_vec()
+                ).unwrap(),
+                "resetRequestId": Uuid::from_bytes(reset_request_id).hyphenated().to_string(),
+                "transitionId": transition_id.hyphenated().to_string(),
+                "conversationKind": "group",
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": coordinate_json(prior_coordinate),
+                "retired": reset_retired_coordinate_json(prior_coordinate),
+                "successor": successor,
+                "manifest": {
+                    "participants": participants,
+                    "actorLeaf": {
+                        "userDid": entry.actor_did,
+                        "deviceId": entry.actor_device_id.hyphenated().to_string(),
+                        "leafOrigin": "genesis",
+                    },
+                },
+                "genesisGroupInfo": {
+                    "framing": "mlsMessage",
+                    "contentType": "groupInfo",
+                    "bytes": STANDARD.encode(&group_info),
+                    "sha256": STANDARD.encode(Sha256::digest(&group_info)),
+                },
+                "metadataSnapshot": {
+                    "coordinate": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": successor_coordinate.generation(),
+                        "groupId": STANDARD.encode(validated_group_id),
+                        "epoch": 0,
+                        "groupContextHash": STANDARD.encode(group_context_hash),
+                        "confirmationTag": STANDARD.encode(confirmation_tag),
+                    },
+                    "originTransitionId": transition_id.hyphenated().to_string(),
+                    "metadataVersion": 2,
+                    "nonce": STANDARD.encode([0xb1_u8; 12]),
+                    "ciphertext": STANDARD.encode(metadata_ciphertext),
+                    "ciphertextSha256": STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                    "ciphertextSize": metadata_ciphertext.len(),
+                    "authorProof": {
+                        "authorDid": entry.actor_did,
+                        "authorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                        "authorKeyId": entry.actor_key_id,
+                        "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                        "authGenerationAtOrigin": 1,
+                        "originTransitionId": transition_id.hyphenated().to_string(),
+                        "originSeq": seq,
+                        "roleAtOrigin": "admin",
+                        "deviceStatusAtOrigin": "active",
+                    },
+                },
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": signed_at_text,
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).expect("serialize unsigned reset");
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("unsigned reset activation canonicalizes");
+            let signature = entry
+                .signing_key()
+                .sign(canonical.transcript_bytes())
+                .to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).expect("serialize signed reset");
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed reset activation canonicalizes");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#resetActivationEntry",
+                "entryId": entry_id.hyphenated().to_string(),
+                "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
+                "seq": seq,
+                "signedRequest": wrapper,
+                "receivedAt": received_at_text,
+            }))
+            .expect("serialize reset entry");
+            let decoded = decode_and_verify_control_entry(&public_row_json, &entry.public_key)
+                .expect("genuine reset activation verifies");
+
+            RealResetActivation {
+                entry_id,
+                transition_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields_dag_cbor: decoded
+                    .server_fields_dag_cbor()
+                    .expect("reset server fields"),
+                outer_entry_fingerprint: decoded.outer_control_fingerprint().to_vec(),
+                group_info,
+                successor_public_state,
+            }
+        }
+
+        fn mutate_real_reset_activation(
+            entry: &RealCreationEntry,
+            activation: &RealResetActivation,
+            mutate_body: impl FnOnce(&mut Value),
+        ) -> (Vec<u8>, Vec<u8>) {
+            let mut wrapper: Value =
+                serde_json::from_slice(&activation.raw_wrapper).expect("reset wrapper JSON");
+            mutate_body(&mut wrapper["body"]);
+            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+            let unsigned = serde_json::to_vec(&wrapper).expect("serialize reset mutation");
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("reset mutation remains canonical");
+            wrapper["signature"] = Value::String(
+                STANDARD.encode(
+                    entry
+                        .signing_key()
+                        .sign(canonical.transcript_bytes())
+                        .to_bytes(),
+                ),
+            );
+            let raw_wrapper =
+                serde_json::to_vec(&wrapper).expect("serialize signed reset mutation");
+            decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed reset mutation verifies structurally");
+
+            let mut public_row: Value =
+                serde_json::from_slice(&activation.public_row_json).expect("reset public row JSON");
+            public_row["signedRequest"] = wrapper;
+            let public_row_json =
+                serde_json::to_vec(&public_row).expect("serialize mutated reset row");
+            decode_and_verify_control_entry(&public_row_json, &entry.public_key)
+                .expect("mutated reset remains genuinely signed");
+            (public_row_json, raw_wrapper)
+        }
+
         fn build_real_staling_commit(
             entry: &RealCreationEntry,
             origin_transition_id: Uuid,
@@ -13832,6 +14663,26 @@ mod historical_control_loader {
             origin_transition_id: Uuid,
             entry_seq: u64,
             received_at: &str,
+            prior_state_version: u64,
+            next_state_version: u64,
+        ) -> RealStalingCommit {
+            build_real_commit_with_signed_at(
+                entry,
+                origin_transition_id,
+                entry_seq,
+                received_at,
+                "2030-02-01T00:00:59.000Z",
+                prior_state_version,
+                next_state_version,
+            )
+        }
+
+        fn build_real_commit_with_signed_at(
+            entry: &RealCreationEntry,
+            origin_transition_id: Uuid,
+            entry_seq: u64,
+            received_at: &str,
+            signed_at: &str,
             prior_state_version: u64,
             next_state_version: u64,
         ) -> RealStalingCommit {
@@ -13904,7 +14755,7 @@ mod historical_control_loader {
                     },
                 },
                 "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
-                "signedAt": "2030-02-01T00:00:59.000Z",
+                "signedAt": signed_at,
             });
             let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
             let unsigned = serde_json::to_vec(&wrapper).unwrap();
@@ -14140,6 +14991,29 @@ mod historical_control_loader {
             request_uuid: Uuid,
             received_at: &str,
         ) -> RealControlRequestEntry {
+            build_real_control_request_entry_with_id_at_and_signed_at(
+                entry,
+                kind,
+                entry_kind,
+                seq,
+                request_uuid,
+                received_at,
+                SIGNED_AT,
+                None,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_real_control_request_entry_with_id_at_and_signed_at(
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            seq: u64,
+            request_uuid: Uuid,
+            received_at: &str,
+            signed_at: &str,
+            prior: Option<&PublicGroupSnapshotCoordinate>,
+        ) -> RealControlRequestEntry {
             let signing_key = entry.signing_key();
             let verifying = signing_key.verifying_key().to_bytes();
             // The creation entry signed with this same key, so its device-keys row
@@ -14182,7 +15056,10 @@ mod historical_control_loader {
                     json!(Uuid::from_bytes(entry.cid).hyphenated().to_string()),
                 );
             } else {
-                body.insert("prior".into(), genesis_coordinate_json(entry.cid));
+                body.insert(
+                    "prior".into(),
+                    prior.map_or_else(|| genesis_coordinate_json(entry.cid), coordinate_json),
+                );
             }
             if matches!(kind, SignedMutationKind::ResetRequest) {
                 body.insert("reason".into(), json!("manualRecovery"));
@@ -14193,7 +15070,7 @@ mod historical_control_loader {
                     .hyphenated()
                     .to_string()),
             );
-            body.insert("signedAt".into(), json!(SIGNED_AT));
+            body.insert("signedAt".into(), json!(signed_at));
 
             // Sign the inner mutation over the exact canonical transcript the strict
             // decoder derives (mirrors `build_signed_recovery_request`).
@@ -14248,11 +15125,73 @@ mod historical_control_loader {
             kind: SignedMutationKind,
             entry_kind: &str,
         ) -> RealControlRequestEntry {
+            seed_control_request_at(
+                pool,
+                entry,
+                kind,
+                entry_kind,
+                instant(RECEIVED_AT),
+                SIGNED_AT,
+            )
+            .await
+        }
+
+        async fn seed_control_request_at(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            received_at: DateTime<Utc>,
+            signed_at: &str,
+        ) -> RealControlRequestEntry {
             seed_real_creation_graph(pool, entry).await;
+            let prior = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                0,
+                0,
+                [1_u8; 32],
+                0,
+                [2_u8; 32],
+                [3_u8; 32],
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            append_control_request_at(
+                pool,
+                entry,
+                kind,
+                entry_kind,
+                &prior,
+                2,
+                received_at,
+                signed_at,
+            )
+            .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn append_control_request_at(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            kind: SignedMutationKind,
+            entry_kind: &str,
+            prior: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            received_at: DateTime<Utc>,
+            signed_at: &str,
+        ) -> RealControlRequestEntry {
             let conversation_id = Uuid::from_bytes(entry.cid);
-            let request = build_real_control_request_entry(entry, kind, entry_kind, 2);
+            let received_at_text = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let request = build_real_control_request_entry_with_id_at_and_signed_at(
+                entry,
+                kind,
+                entry_kind,
+                seq,
+                Uuid::new_v4(),
+                &received_at_text,
+                signed_at,
+                Some(prior),
+            );
             let request_uuid = Uuid::from_bytes(request.request_id);
-            let received_at = instant(RECEIVED_AT);
             let expires_at = received_at + Duration::hours(24);
             let payload_sha = Sha256::digest(&request.public_row_json).to_vec();
 
@@ -14267,9 +15206,10 @@ mod historical_control_loader {
                     accepted_payload_sha256,signed_request_bytes,request_digest,signature,
                     server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
                     actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at
-                ) VALUES($1,2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,NULL,NULL,NULL,$14)"#,
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1,NULL,NULL,NULL,$15)"#,
             )
             .bind(conversation_id)
+            .bind(i64::try_from(seq).expect("request seq fits i64"))
             .bind(request.entry_id)
             .bind(entry_kind)
             .bind(&request.public_row_json)
@@ -14295,16 +15235,20 @@ mod historical_control_loader {
                         prior_group_id,prior_epoch,prior_group_context_hash,prior_confirmation_tag,
                         reason,status,signed_request_bytes,signing_transcript_bytes,request_digest,
                         signature,received_at,expires_at
-                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'manualRecovery','pending',$9,$10,$11,$12,$13,$14)"#,
+                    ) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,
+                        'manualRecovery','pending',$12,$13,$14,$15,$16,$17)"#,
                 )
                 .bind(request_uuid)
                 .bind(conversation_id)
                 .bind(&entry.actor_did)
                 .bind(entry.actor_device_id)
                 .bind(&entry.actor_key_id)
-                .bind(vec![1_u8; 32])
-                .bind(vec![2_u8; 32])
-                .bind(vec![3_u8; 32])
+                .bind(i64::try_from(prior.generation()).expect("prior generation fits i64"))
+                .bind(i64::try_from(prior.state_version()).expect("prior state fits i64"))
+                .bind(prior.group_id().to_vec())
+                .bind(i64::try_from(prior.epoch()).expect("prior epoch fits i64"))
+                .bind(prior.group_context_hash().to_vec())
+                .bind(prior.confirmation_tag().to_vec())
                 .bind(&request.raw_wrapper)
                 .bind(&request.signing_transcript)
                 .bind(&request.request_digest)
@@ -14322,16 +15266,20 @@ mod historical_control_loader {
                         prior_group_id,prior_epoch,prior_group_context_hash,prior_confirmation_tag,
                         status,signed_request_bytes,signing_transcript_bytes,request_digest,
                         signature,received_at,expires_at
-                    ) VALUES($1,$2,$3,$4,$5,1,0,0,$6,0,$7,$8,'pending',$9,$10,$11,$12,$13,$14)"#,
+                    ) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,
+                        'pending',$12,$13,$14,$15,$16,$17)"#,
                 )
                 .bind(request_uuid)
                 .bind(conversation_id)
                 .bind(&entry.actor_did)
                 .bind(entry.actor_device_id)
                 .bind(&entry.actor_key_id)
-                .bind(vec![1_u8; 32])
-                .bind(vec![2_u8; 32])
-                .bind(vec![3_u8; 32])
+                .bind(i64::try_from(prior.generation()).expect("prior generation fits i64"))
+                .bind(i64::try_from(prior.state_version()).expect("prior state fits i64"))
+                .bind(prior.group_id().to_vec())
+                .bind(i64::try_from(prior.epoch()).expect("prior epoch fits i64"))
+                .bind(prior.group_context_hash().to_vec())
+                .bind(prior.confirmation_tag().to_vec())
                 .bind(&request.raw_wrapper)
                 .bind(&request.signing_transcript)
                 .bind(&request.request_digest)
@@ -14343,11 +15291,19 @@ mod historical_control_loader {
                 .expect("insert leave request");
             }
 
-            // Advance the head so the request entry (seq 2) is strictly below it.
+            // Advance only the append pointer; a reset/leave request does not
+            // mutate the active public coordinate.
             sqlx::query(
-                "UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1",
+                r#"UPDATE chat.conversations SET next_entry_seq=$2
+                   WHERE conversation_id=$1
+                     AND current_generation=$3 AND current_state_version=$4
+                     AND next_entry_seq=$5"#,
             )
             .bind(conversation_id)
+            .bind(i64::try_from(seq + 1).expect("next request seq fits i64"))
+            .bind(i64::try_from(prior.generation()).expect("prior generation fits i64"))
+            .bind(i64::try_from(prior.state_version()).expect("prior state fits i64"))
+            .bind(i64::try_from(seq).expect("request seq fits i64"))
             .execute(&mut *tx)
             .await
             .expect("advance head");
@@ -14799,6 +15755,14 @@ mod historical_control_loader {
             pool: &PgPool,
             entry: &RealCreationEntry,
         ) -> ConversationStateHydration {
+            load_aggregate_hydration_at(pool, entry, STALE_AT).await
+        }
+
+        async fn load_aggregate_hydration_at(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            locked_at: &str,
+        ) -> ConversationStateHydration {
             let cid = Uuid::from_bytes(entry.cid);
             let next_entry_seq: i64 = sqlx::query_scalar(
                 "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
@@ -14814,7 +15778,7 @@ mod historical_control_loader {
             .expect("historical aggregate authority");
 
             let mut tx = pool.begin().await.expect("begin aggregate load");
-            let guard = hydrate_locked_public_state(&mut tx, cid, instant(STALE_AT))
+            let guard = hydrate_locked_public_state(&mut tx, cid, instant(locked_at))
                 .await
                 .expect("locked public-state rows hydrate");
             let (
@@ -14895,6 +15859,251 @@ mod historical_control_loader {
             .unwrap()
         }
 
+        #[allow(clippy::too_many_arguments)]
+        async fn commit_real_reset_activation(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            welcome_id: Uuid,
+            request: &RealControlRequestEntry,
+            prior_coordinate: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            reset_at: DateTime<Utc>,
+        ) -> RealResetActivation {
+            let cid = Uuid::from_bytes(entry.cid);
+            let reset_at_text = reset_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let prior_rows = load_aggregate_hydration_at(pool, entry, &reset_at_text).await;
+            let prior = hydrate_conversation_state(
+                &HydrationAuthority::new(entry.cid).expect("prior aggregate authority"),
+                prior_rows,
+            )
+            .expect("pending-reset aggregate hydrates");
+            let invitation_transition_id: Uuid = sqlx::query_scalar(
+                r#"SELECT invitation_transition_id FROM chat.participants
+                   WHERE conversation_id=$1 AND user_did=$2 AND current_membership"#,
+            )
+            .bind(cid)
+            .bind(&invitee.did)
+            .fetch_one(pool)
+            .await
+            .expect("reset-retained invitation transition");
+            let mut participant_manifest = vec![
+                json!({
+                    "userDid": entry.actor_did,
+                    "role": "admin",
+                    "status": "active",
+                }),
+                json!({
+                    "userDid": invitee.did,
+                    "role": "member",
+                    "status": "active",
+                    "invitationProvenance": {
+                        "invitedByDid": entry.actor_did,
+                        "invitedByDeviceId": entry.actor_device_id,
+                        "invitationTransitionId": invitation_transition_id,
+                    },
+                }),
+            ];
+            participant_manifest.sort_by(|left, right| {
+                left["userDid"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .cmp(right["userDid"].as_str().unwrap().as_bytes())
+            });
+            let activation = build_real_reset_activation(
+                entry,
+                request.request_id,
+                prior_coordinate,
+                seq,
+                Value::Array(participant_manifest),
+                reset_at,
+            );
+            let historical = HistoricalRehydrationAuthority::new(entry.cid, seq + 1)
+                .expect("reset transition authority");
+            let evidence = historical
+                .hydrate_historical_control_from_durable_bytes(
+                    activation.public_row_json.clone(),
+                    activation.raw_wrapper.clone(),
+                    &entry.public_key,
+                )
+                .expect("genuine reset re-hydrates as signed authority")
+                .into_transition()
+                .expect("reset activation is a coordinate transition");
+            let reset_received =
+                ServerTimestamp::from_canonical_stored(&reset_at_text).expect("reset instant");
+            let planned = plan_reset_activation(
+                &prior,
+                ResetActivation {
+                    actor: creator_device(entry),
+                    reset_request_id: request.request_id,
+                    transition: evidence,
+                    successor_public_state: activation.successor_public_state.clone(),
+                },
+            )
+            .expect("genuine reset activation plans");
+            let plan = persistence_plan_for_test(
+                planned,
+                ConversationHeadCasBinding::for_test_edge(
+                    entry.cid,
+                    *activation.entry_id.as_bytes(),
+                    *prior.coordinate(),
+                    seq,
+                    reset_received,
+                ),
+            );
+
+            let old_leaf_rows: Vec<(String, Uuid, Uuid)> = sqlx::query_as(
+                r#"SELECT user_did,device_id,leaf_period_id FROM chat.member_devices
+                   WHERE conversation_id=$1 AND generation=$2 AND removed_seq IS NULL
+                   ORDER BY convert_to(user_did, 'UTF8'),uuid_send(device_id)"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(prior_coordinate.generation()).unwrap())
+            .fetch_all(pool)
+            .await
+            .expect("old reset leaf periods");
+            let old_leaves: Vec<(DeviceIdentity, Uuid)> = old_leaf_rows
+                .into_iter()
+                .map(|(did, device_id, leaf_period_id)| {
+                    (
+                        DeviceIdentity::new(
+                            PrincipalId::new(did.into_bytes()).unwrap(),
+                            *device_id.as_bytes(),
+                        )
+                        .unwrap(),
+                        leaf_period_id,
+                    )
+                })
+                .collect();
+            let participant_period_ids: Vec<Uuid> = sqlx::query_scalar(
+                r#"SELECT participant_period_id FROM chat.participants
+                   WHERE conversation_id=$1 AND current_membership
+                   ORDER BY convert_to(user_did, 'UTF8')"#,
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await
+            .expect("reset participant periods");
+            let protocol_instance_id: Uuid =
+                sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                    .fetch_one(pool)
+                    .await
+                    .expect("protocol instance");
+            let actor = creator_device(entry);
+            let invitee_device = DeviceIdentity::new(
+                PrincipalId::new(invitee.did.as_bytes().to_vec()).unwrap(),
+                *invitee.device_id.as_bytes(),
+            )
+            .unwrap();
+            let actor_event_predecessor =
+                device_event_predecessor(pool, &entry.actor_did, entry.actor_device_id).await;
+            let invitee_event_predecessor =
+                device_event_predecessor(pool, &invitee.did, invitee.device_id).await;
+            let (tree_summary_bytes, tree_summary_sha256) = encode_public_tree_summary(
+                activation.successor_public_state.binding().tree_summary(),
+            )
+            .expect("reset tree summary canonical")
+            .into_parts();
+            let context = ExecutionContext {
+                protocol_instance_id,
+                applied_at: reset_at,
+                actor: ExecutionActor {
+                    user_did: entry.actor_did.clone(),
+                    device_id: entry.actor_device_id,
+                    key_id: entry.actor_key_id.clone(),
+                    auth_generation: 1,
+                    role: TransitionActorRole::Admin,
+                    device_status: "active".to_owned(),
+                },
+                entry: ControlEntryContent {
+                    entry_id: activation.entry_id,
+                    entry_kind: "blue.catbird.chat.defs#resetActivationEntry".to_owned(),
+                    accepted_payload_bytes: activation.public_row_json.clone(),
+                    accepted_payload_sha256: Sha256::digest(&activation.public_row_json).to_vec(),
+                    signed_request_bytes: activation.raw_wrapper.clone(),
+                    unsigned_projection_bytes: activation.canonical_projection.clone(),
+                    signing_transcript_bytes: activation.signing_transcript.clone(),
+                    request_digest: activation.request_digest.clone(),
+                    signature: activation.signature.clone(),
+                    server_fields_bytes: activation.server_fields_dag_cbor.clone(),
+                    outer_entry_fingerprint: activation.outer_entry_fingerprint.clone(),
+                },
+                spine: SpineArtifacts {
+                    public_snapshot_bytes: activation.successor_public_state.snapshot().to_vec(),
+                    public_snapshot_sha256: activation
+                        .successor_public_state
+                        .snapshot_sha256()
+                        .to_vec(),
+                    tree_summary_bytes,
+                    tree_summary_sha256: tree_summary_sha256.to_vec(),
+                    leaf_count: 1,
+                    genesis_group_info_bytes: activation.group_info.clone(),
+                    genesis_group_info_sha256: Sha256::digest(&activation.group_info).to_vec(),
+                },
+                opened_leaves: vec![LeafPersistenceColumns {
+                    device: creator_device(entry),
+                    leaf_key_id: entry.actor_key_id.clone(),
+                    leaf_auth_generation: 1,
+                }],
+                metadata_author: Some(MetadataAuthorColumns {
+                    author_role: "admin".to_owned(),
+                    author_device_status: "active".to_owned(),
+                    author_public_key: entry.public_key.clone(),
+                    author_key_id: entry.actor_key_id.clone(),
+                    metadata_snapshot_id: Uuid::new_v4(),
+                }),
+                participant_period_ids,
+                leaf_period_ids: vec![Uuid::new_v4()],
+                entry_recipients: old_leaves
+                    .iter()
+                    .map(|(device, _)| (device.clone(), EntryEntitlementKind::IntervalClose))
+                    .collect(),
+                events: vec![EventFanout {
+                    event_id: Uuid::new_v4(),
+                    event_kind: EventKind::ConversationChanged,
+                    payload_bytes: vec![0xd2_u8; 8],
+                    recipients: vec![(
+                        actor,
+                        EventEntitlementKind::Participant,
+                        actor_event_predecessor,
+                    )],
+                    outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+                }],
+                closing_leaf_periods: old_leaves,
+                closing_participant_periods: Vec::new(),
+                reset_request_row: None,
+                recovery_open: None,
+                welcome_expiry: None,
+                welcome_response: None,
+                welcome_dispositions: vec![WelcomeDispositionInput {
+                    welcome_id,
+                    event: EventFanout {
+                        event_id: Uuid::new_v4(),
+                        event_kind: EventKind::WelcomeDisposition,
+                        payload_bytes: vec![0xd3_u8; 8],
+                        recipients: vec![(
+                            invitee_device,
+                            EventEntitlementKind::Welcome,
+                            invitee_event_predecessor,
+                        )],
+                        outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+                    },
+                }],
+            };
+
+            let mut transaction = pool.begin().await.expect("begin genuine reset");
+            let applied = apply_conversation_persistence_plan(&mut transaction, &plan, &context)
+                .await
+                .expect("production executor applies genuine reset");
+            assert_eq!(applied.allocated_seq, seq);
+            transaction
+                .commit()
+                .await
+                .expect("genuine reset crosses all deferred constraints");
+            activation
+        }
+
         /// The pure JOIN-ruling decision covers every fail-closed arm the coherent
         /// gate DB cannot construct (the reciprocal entry<->row mapping triggers
         /// force EXACTLY-1:1): 0-match => missing, >1-match => ambiguous (never
@@ -14959,8 +16168,15 @@ mod historical_control_loader {
             .is_ok());
             assert!(select_reset_terminal(columns("expired", None, Some(expires_at))).is_ok());
             assert!(matches!(
-                select_reset_terminal(columns("consumed", Some(transition_id), Some(terminal_at))),
-                Err(ResetLeaveHydrationError::UnsupportedTerminal)
+                select_reset_terminal(columns(
+                    "consumed",
+                    Some(transition_id),
+                    Some(terminal_at),
+                )),
+                Ok(ResetTerminalSelection::ConsumedTransition {
+                    transition_id: selected_transition_id,
+                    terminal_at: selected_terminal_at,
+                }) if selected_transition_id == transition_id && selected_terminal_at == terminal_at
             ));
 
             for malformed in [
@@ -14981,6 +16197,19 @@ mod historical_control_loader {
             assert!(matches!(
                 select_reset_terminal(columns("future-status", None, None)),
                 Err(ResetLeaveHydrationError::OutOfDomain)
+            ));
+        }
+
+        #[test]
+        fn terminal_transition_time_must_equal_the_durable_terminal_instant() {
+            let terminal_at = instant("2030-02-01T00:01:00.000Z");
+            let exact = ServerTimestamp::from_canonical_stored("2030-02-01T00:01:00.000Z").unwrap();
+            let mismatched =
+                ServerTimestamp::from_canonical_stored("2030-02-01T00:01:00.001Z").unwrap();
+            assert!(require_terminal_timestamp(exact, terminal_at).is_ok());
+            assert!(matches!(
+                require_terminal_timestamp(mismatched, terminal_at),
+                Err(ResetLeaveHydrationError::InvalidTerminal)
             ));
         }
 
@@ -15170,6 +16399,338 @@ mod historical_control_loader {
             );
             let aggregate = load_aggregate_hydration(&pool, &entry).await;
             assert_aggregate_hydrates(&entry, aggregate);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reset_request_leg_hydrates_genuine_consumed_activation() {
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .expect("unsafe TEST_DATABASE_URL for reset-consumption proof");
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to existing gate database without lifecycle operations");
+
+            let request_at = DateTime::<Utc>::from_timestamp_millis(Utc::now().timestamp_millis())
+                .expect("current request instant");
+            let request_signed_at =
+                (request_at - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let reset_at = request_at + Duration::seconds(1);
+            let reset_at_text = reset_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let read_at_text =
+                (reset_at + Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+            let cid = Uuid::new_v4();
+            let GenuinePolicyRoleGraph {
+                entry,
+                invitee,
+                fulfillment,
+                committed,
+                ..
+            } = commit_genuine_policy_acceptance_fulfillment_at(&pool, cid, Uuid::new_v4()).await;
+            let prior_coordinate = *committed.coordinate();
+            let request = append_control_request_at(
+                &pool,
+                &entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+                &prior_coordinate,
+                5,
+                request_at,
+                &request_signed_at,
+            )
+            .await;
+            let activation = commit_real_reset_activation(
+                &pool,
+                &entry,
+                &invitee,
+                fulfillment.welcome_id,
+                &request,
+                &prior_coordinate,
+                6,
+                reset_at,
+            )
+            .await;
+
+            let authority =
+                HistoricalRehydrationAuthority::new(entry.cid, 7).expect("post-reset authority");
+            let mut read = pool.begin().await.expect("begin fresh consumed hydration");
+            let rows = load_reset_request_hydration_rows(&mut read, &authority, cid)
+                .await
+                .expect("consumed reset request hydrates");
+            read.rollback()
+                .await
+                .expect("rollback read-only reset load");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status, ResetRequestStatus::Consumed);
+            let Some(WorkTerminalHydrationRow::Transition(terminal)) = &rows[0].terminal else {
+                panic!("consumed reset must retain its exact activation transition");
+            };
+            assert_eq!(
+                terminal.transition_id(),
+                activation.transition_id.as_bytes()
+            );
+            assert_eq!(
+                terminal.received_at(),
+                ServerTimestamp::from_canonical_stored(&reset_at_text).unwrap()
+            );
+
+            let aggregate = load_aggregate_hydration_at(&pool, &entry, &read_at_text).await;
+            assert_aggregate_hydrates(&entry, aggregate.clone());
+
+            let aggregate_authority =
+                HydrationAuthority::new(entry.cid).expect("negative aggregate authority");
+            let assert_terminal_rejected =
+                |mut rows: ConversationStateHydration,
+                 terminal: crate::chat_protocol::state_machine::TransitionEvidence| {
+                    rows.reset_requests[0].terminal =
+                        Some(WorkTerminalHydrationRow::Transition(terminal));
+                    assert!(matches!(
+                        hydrate_conversation_state(&aggregate_authority, rows),
+                        Err(StateMachineError::InvariantViolation)
+                    ));
+                };
+            let historical = HistoricalRehydrationAuthority::new(entry.cid, 7)
+                .expect("negative transition authority");
+            let hydrate_mutation = |public_row_json: Vec<u8>, raw_wrapper: Vec<u8>| {
+                historical
+                    .hydrate_historical_control_from_durable_bytes(
+                        public_row_json,
+                        raw_wrapper,
+                        &entry.public_key,
+                    )
+                    .expect("genuinely signed negative re-hydrates")
+                    .into_transition()
+                    .expect("negative is a coordinate transition")
+            };
+
+            let (wrong_request_row, wrong_request_wrapper) =
+                mutate_real_reset_activation(&entry, &activation, |body| {
+                    body["resetRequestId"] = json!(Uuid::new_v4().hyphenated().to_string());
+                });
+            assert_terminal_rejected(
+                aggregate.clone(),
+                hydrate_mutation(wrong_request_row, wrong_request_wrapper),
+            );
+
+            let (wrong_prior_row, wrong_prior_wrapper) =
+                mutate_real_reset_activation(&entry, &activation, |body| {
+                    body["prior"]["stateVersion"] = json!(1);
+                    body["retired"]["stateVersion"] = json!(2);
+                });
+            assert_terminal_rejected(
+                aggregate.clone(),
+                hydrate_mutation(wrong_prior_row, wrong_prior_wrapper),
+            );
+
+            let (wrong_retired_row, wrong_retired_wrapper) =
+                mutate_real_reset_activation(&entry, &activation, |body| {
+                    body["retired"]["stateVersion"] = json!(2);
+                });
+            assert_terminal_rejected(
+                aggregate.clone(),
+                hydrate_mutation(wrong_retired_row, wrong_retired_wrapper),
+            );
+
+            let (wrong_successor_row, wrong_successor_wrapper) =
+                mutate_real_reset_activation(&entry, &activation, |body| {
+                    body["successor"]["generation"] = json!(2);
+                });
+            assert_terminal_rejected(
+                aggregate.clone(),
+                hydrate_mutation(wrong_successor_row, wrong_successor_wrapper),
+            );
+
+            let (wrong_kind_row, wrong_kind_wrapper): (Vec<u8>, Vec<u8>) = sqlx::query_as(
+                r#"SELECT accepted_payload_bytes,signed_request_bytes FROM chat.entries
+                   WHERE conversation_id=$1 AND seq=4"#,
+            )
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .expect("genuine prior leaf-recovery transition");
+            assert_terminal_rejected(
+                aggregate.clone(),
+                hydrate_mutation(wrong_kind_row, wrong_kind_wrapper),
+            );
+
+            let durable: (i64, i64, i64, String, String, Uuid) = sqlx::query_as(
+                r#"SELECT c.current_generation,c.current_state_version,c.next_entry_seq,
+                          old.lifecycle,new.lifecycle,t.reset_request_id
+                   FROM chat.conversations c
+                   JOIN chat.generations old
+                     ON old.conversation_id=c.conversation_id AND old.generation=0
+                   JOIN chat.generations new
+                     ON new.conversation_id=c.conversation_id AND new.generation=1
+                   JOIN chat.transitions t
+                     ON t.conversation_id=c.conversation_id AND t.kind='resetActivation'
+                   WHERE c.conversation_id=$1"#,
+            )
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable reset graph");
+            assert_eq!(
+                durable,
+                (
+                    1,
+                    0,
+                    7,
+                    "superseded".to_owned(),
+                    "active".to_owned(),
+                    Uuid::from_bytes(request.request_id),
+                )
+            );
+
+            let durable_states: Vec<(i64, i64, String, String)> = sqlx::query_as(
+                r#"SELECT generation,state_version,lifecycle,state_kind
+                   FROM chat.generation_states
+                   WHERE conversation_id=$1
+                   ORDER BY generation,state_version"#,
+            )
+            .bind(cid)
+            .fetch_all(&pool)
+            .await
+            .expect("read durable reset states");
+            assert_eq!(
+                durable_states,
+                vec![
+                    (0, 0, "active".to_owned(), "creation".to_owned()),
+                    (0, 1, "active".to_owned(), "policy".to_owned()),
+                    (0, 2, "active".to_owned(), "acceptConversation".to_owned(),),
+                    (0, 3, "active".to_owned(), "commit".to_owned()),
+                    (0, 4, "superseded".to_owned(), "resetRetirement".to_owned(),),
+                    (1, 0, "active".to_owned(), "resetSuccessor".to_owned()),
+                ]
+            );
+
+            #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+            struct DurableResetInterval {
+                generation: i64,
+                active: bool,
+                start_seq: i64,
+                terminal_seq: Option<i64>,
+                opening_kind: String,
+                closing_kind: Option<String>,
+            }
+            let durable_intervals: Vec<DurableResetInterval> = sqlx::query_as(
+                r#"SELECT d.generation,d.active,i.start_seq,i.terminal_seq,
+                              i.opening_kind,i.closing_kind
+                       FROM chat.member_devices d
+                       JOIN chat.application_intervals i
+                         ON i.opening_leaf_period_id=d.leaf_period_id
+                       WHERE d.conversation_id=$1
+                       ORDER BY d.generation,i.start_seq"#,
+            )
+            .bind(cid)
+            .fetch_all(&pool)
+            .await
+            .expect("read durable reset intervals");
+            assert_eq!(
+                durable_intervals,
+                vec![
+                    DurableResetInterval {
+                        generation: 0,
+                        active: false,
+                        start_seq: 1,
+                        terminal_seq: Some(6),
+                        opening_kind: "creation".to_owned(),
+                        closing_kind: Some("reset".to_owned()),
+                    },
+                    DurableResetInterval {
+                        generation: 0,
+                        active: false,
+                        start_seq: 4,
+                        terminal_seq: Some(6),
+                        opening_kind: "add".to_owned(),
+                        closing_kind: Some("reset".to_owned()),
+                    },
+                    DurableResetInterval {
+                        generation: 1,
+                        active: true,
+                        start_seq: 6,
+                        terminal_seq: None,
+                        opening_kind: "reset".to_owned(),
+                        closing_kind: None,
+                    },
+                ]
+            );
+
+            let reset_entry_recipient_count: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM chat.entry_recipients
+                   WHERE conversation_id=$1 AND seq=6
+                     AND entitlement_kind='intervalClose'"#,
+            )
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .expect("count reset entry recipients");
+            assert_eq!(reset_entry_recipient_count, 2);
+
+            let reset_delivery_counts: (i64, i64, i64) = sqlx::query_as(
+                r#"SELECT count(DISTINCT e.event_position),
+                          count(DISTINCT (er.event_position,er.user_did,er.device_id)),
+                          count(DISTINCT o.outbox_id)
+                   FROM chat.events e
+                   LEFT JOIN chat.event_recipients er
+                     ON er.event_position=e.event_position
+                   LEFT JOIN chat.outbox o
+                     ON o.event_position=e.event_position
+                   WHERE e.created_at=$1
+                     AND e.event_kind='conversationChanged'
+                     AND e.payload_bytes=$2"#,
+            )
+            .bind(reset_at)
+            .bind(vec![0xd2_u8; 8])
+            .fetch_one(&pool)
+            .await
+            .expect("read durable reset delivery graph");
+            assert_eq!(reset_delivery_counts, (1, 1, 1));
+
+            let welcome_disposition: (String, Option<Uuid>, DateTime<Utc>, String, i64, i64) =
+                sqlx::query_as(
+                    r#"SELECT delivery.status,disposition.terminal_transition_id,
+                              disposition.terminal_at,event.event_kind,
+                              count(DISTINCT (recipient.event_position,recipient.user_did,
+                                              recipient.device_id)),
+                              count(DISTINCT outbox.outbox_id)
+                       FROM chat.welcome_deliveries delivery
+                       JOIN chat.welcome_dispositions disposition USING(welcome_id)
+                       JOIN chat.events event USING(event_position)
+                       JOIN chat.event_recipients recipient USING(event_position)
+                       JOIN chat.outbox outbox USING(event_position)
+                       WHERE delivery.welcome_id=$1
+                       GROUP BY delivery.status,disposition.terminal_transition_id,
+                                disposition.terminal_at,event.event_kind"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read reset Welcome disposition graph");
+            assert_eq!(
+                welcome_disposition,
+                (
+                    "superseded".to_owned(),
+                    Some(activation.transition_id),
+                    reset_at,
+                    "welcomeDisposition".to_owned(),
+                    1,
+                    1,
+                )
+            );
+
+            let welcome_disposition_payload_count: i64 = sqlx::query_scalar(
+                r#"SELECT count(*) FROM chat.events event
+                   JOIN chat.welcome_dispositions disposition USING(event_position)
+                   WHERE disposition.welcome_id=$1 AND event.payload_bytes=$2"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(vec![0xd3_u8; 8])
+            .fetch_one(&pool)
+            .await
+            .expect("count exact reset Welcome disposition payload");
+            assert_eq!(welcome_disposition_payload_count, 1);
         }
 
         /// The pending leave request hydrates the same way through the leave table +
