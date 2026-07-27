@@ -42,6 +42,7 @@ use super::super::{
         WorkTerminalHydrationRow,
     },
     validation::{BareDid, KeyThumbprint},
+    wire::{validate_key_package, KeyPackageValidationPolicy, MAX_KEY_PACKAGE_WIRE_BYTES},
 };
 
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1630,6 +1631,583 @@ fn canonical_transaction_id(value: &str) -> bool {
 
 fn uuid_is_canonical_v4(value: Uuid) -> bool {
     value.get_variant() == uuid::Variant::RFC4122 && value.get_version_num() == 4
+}
+
+// ===========================================================================
+// T4-H2-pre G5 — production recovery-package lock hydration.
+//
+// The available and reserved shapes are intentionally separate entry points:
+// an available package is claimed at the request's trusted/head instant, while
+// a reserved package remains bound to the original recovery request instant.
+// Both acquire the package row under `FOR UPDATE`; the reserved arm also locks
+// its exact reservation row. Constructors remain private and no caller-supplied
+// digest is accepted.
+// ===========================================================================
+
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum RecoveryPackageHydrationError {
+    #[error("clean-chat recovery package is absent")]
+    PackageMissing,
+    #[error("clean-chat recovery package column is out of domain")]
+    OutOfDomain,
+    #[error("clean-chat recovery package does not match its locked recovery work")]
+    ReadSetMismatch,
+    #[error("clean-chat recovery package guard invariant was violated")]
+    GuardInvariant,
+    #[error("clean-chat recovery package provenance failed re-verification: {0}")]
+    Recovery(#[from] RecoveryHydrationError),
+    #[error("clean-chat recovery package database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedAvailableRecoveryPackageRow {
+    key_package_ref: Vec<u8>,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    owner_did: String,
+    owner_device_id: Uuid,
+    owner_key_id: String,
+    owner_auth_generation: i64,
+    owner_signing_public_key: Vec<u8>,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    status: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LockedReservedRecoveryPackageRow {
+    conversation_id: Uuid,
+    recovery_request_id: Uuid,
+    generation: i64,
+    bound_state_version: i64,
+    bound_group_id: Vec<u8>,
+    bound_epoch: i64,
+    bound_group_context_hash: Vec<u8>,
+    bound_confirmation_tag: Vec<u8>,
+    requester_did: String,
+    requester_device_id: Uuid,
+    requester_key_id: String,
+    requester_auth_generation: i64,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    key_package_ref: Vec<u8>,
+    reservation_created_at: DateTime<Utc>,
+    reservation_expires_at: DateTime<Utc>,
+    reservation_status: String,
+    package_owner_did: String,
+    package_owner_device_id: Uuid,
+    package_owner_key_id: String,
+    package_owner_auth_generation: i64,
+    package_owner_signing_public_key: Vec<u8>,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    package_created_at: DateTime<Utc>,
+    package_status: String,
+}
+
+fn whole_millis_nonnegative(value: DateTime<Utc>) -> bool {
+    value.timestamp_millis() >= 0 && value.timestamp_subsec_nanos().is_multiple_of(1_000_000)
+}
+
+fn recovery_package_bytes32(value: Vec<u8>) -> Result<[u8; 32], RecoveryPackageHydrationError> {
+    value
+        .try_into()
+        .map_err(|_| RecoveryPackageHydrationError::OutOfDomain)
+}
+
+fn recovery_package_safe_u64(value: i64) -> Result<u64, RecoveryPackageHydrationError> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value <= MAX_PROTOCOL_INTEGER)
+        .ok_or(RecoveryPackageHydrationError::OutOfDomain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_package_guard_digest(
+    transaction_id: &str,
+    conversation_id: Uuid,
+    request_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+    target_key_id: &str,
+    target_auth_generation: i64,
+    bound_coordinate: &PublicGroupSnapshotCoordinate,
+    key_package_ref: &[u8; 32],
+    wrapper_bytes: &[u8],
+    wrapper_sha256: &[u8; 32],
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    claimed_at: DateTime<Utc>,
+    status: LockedRecoveryPackageStatus,
+    use_kind: LockedRecoveryPackageUse,
+    reservation_created_at: Option<DateTime<Utc>>,
+    reservation_expires_at: Option<DateTime<Utc>>,
+    request_provenance_digest: Option<&[u8; 32]>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-LOCKED-RECOVERY-PACKAGE\0");
+    digest.update((transaction_id.len() as u64).to_be_bytes());
+    digest.update(transaction_id.as_bytes());
+    digest.update(conversation_id.as_bytes());
+    digest.update(request_id.as_bytes());
+    digest.update((target_did.len() as u64).to_be_bytes());
+    digest.update(target_did.as_bytes());
+    digest.update(target_device_id.as_bytes());
+    digest.update((target_key_id.len() as u64).to_be_bytes());
+    digest.update(target_key_id.as_bytes());
+    digest.update(target_auth_generation.to_be_bytes());
+    graph_digest_coordinate(&mut digest, bound_coordinate);
+    digest.update(key_package_ref);
+    digest.update((wrapper_bytes.len() as u64).to_be_bytes());
+    digest.update(wrapper_bytes);
+    digest.update(wrapper_sha256);
+    digest.update(not_before.timestamp_millis().to_be_bytes());
+    digest.update(not_after.timestamp_millis().to_be_bytes());
+    digest.update(claimed_at.timestamp_millis().to_be_bytes());
+    digest.update([match status {
+        LockedRecoveryPackageStatus::Available => 1,
+        LockedRecoveryPackageStatus::Reserved => 2,
+        LockedRecoveryPackageStatus::Consumed => 3,
+        LockedRecoveryPackageStatus::Expired => 4,
+        LockedRecoveryPackageStatus::Revoked => 5,
+    }]);
+    digest.update([match use_kind {
+        LockedRecoveryPackageUse::AvailableSelection => 1,
+        LockedRecoveryPackageUse::ReservedFulfillment => 2,
+    }]);
+    for timestamp in [reservation_created_at, reservation_expires_at] {
+        match timestamp {
+            None => digest.update([0]),
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.timestamp_millis().to_be_bytes());
+            }
+        }
+    }
+    match request_provenance_digest {
+        None => digest.update([0]),
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value);
+        }
+    }
+    digest.finalize().into()
+}
+
+fn recovery_origin_binding(
+    origin: &RecoveryOriginHydrationRow,
+) -> Result<([u8; 32], u64, [u8; 32]), RecoveryPackageHydrationError> {
+    match origin {
+        RecoveryOriginHydrationRow::Acceptance(evidence) => {
+            let authority = evidence
+                .signed_authority()
+                .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+            Ok((
+                *authority.key_id(),
+                authority.auth_generation(),
+                *evidence.outer_entry_fingerprint(),
+            ))
+        }
+        RecoveryOriginHydrationRow::Request(evidence) => {
+            let authority = evidence
+                .signed_authority()
+                .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+            Ok((
+                *authority.key_id(),
+                authority.auth_generation(),
+                *evidence.durable_row_digest(),
+            ))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_locked_recovery_package_artifact(
+    wrapper_bytes: &[u8],
+    expected_key_package_ref: &[u8; 32],
+    target_did: &str,
+    target_device_id: Uuid,
+    target_signing_public_key: &[u8],
+    claimed_at: DateTime<Utc>,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+) -> Result<(), RecoveryPackageHydrationError> {
+    let now_unix_seconds = u64::try_from(claimed_at.timestamp())
+        .map_err(|_| RecoveryPackageHydrationError::OutOfDomain)?;
+    let validated = validate_key_package(
+        wrapper_bytes,
+        KeyPackageValidationPolicy {
+            expected_basic_credential: format!("{target_did}#{target_device_id}").as_bytes(),
+            expected_signature_key: target_signing_public_key,
+            now_unix_seconds,
+            max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+        },
+    )
+    .map_err(|_| RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let validated_not_before = i64::try_from(validated.not_before())
+        .ok()
+        .and_then(|value| value.checked_mul(1_000));
+    let validated_not_after = i64::try_from(validated.not_after())
+        .ok()
+        .and_then(|value| value.checked_mul(1_000));
+    if validated.key_package_ref() != expected_key_package_ref
+        || validated_not_before != Some(not_before.timestamp_millis())
+        || validated_not_after != Some(not_after.timestamp_millis())
+    {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+    Ok(())
+}
+
+/// Lock the deterministic first available KeyPackage for an exact active
+/// device/key generation. The existing conversation head is the serialization
+/// root and supplies the one trusted instant shared by sibling guards.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) async fn hydrate_locked_available_recovery_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &LockedConversationHeadGuard,
+    request_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+    target_key_id: &str,
+    target_auth_generation: i64,
+    bound_coordinate: PublicGroupSnapshotCoordinate,
+) -> Result<LockedRecoveryPackageGuard, RecoveryPackageHydrationError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != head.transaction_id()
+        || head.prior_coordinate() != Some(&bound_coordinate)
+        || !whole_millis_nonnegative(head.locked_at())
+        || !uuid_is_canonical_v4(request_id)
+        || !uuid_is_canonical_v4(target_device_id)
+        || BareDid::parse(target_did).is_err()
+        || KeyThumbprint::parse(target_key_id).is_err()
+        || !(1..=i64::try_from(MAX_PROTOCOL_INTEGER).unwrap()).contains(&target_auth_generation)
+    {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+    let claimed_at = head.locked_at();
+    let row: Option<LockedAvailableRecoveryPackageRow> = sqlx::query_as(
+        r#"
+        SELECT
+            kp.key_package_ref,
+            kp.wrapper_bytes,
+            kp.wrapper_sha256,
+            kp.owner_did,
+            kp.owner_device_id,
+            kp.owner_key_id,
+            kp.owner_auth_generation,
+            dk.signing_public_key AS owner_signing_public_key,
+            kp.not_before,
+            kp.not_after,
+            kp.created_at,
+            kp.status
+        FROM chat.key_packages kp
+        JOIN chat.device_keys dk
+          ON dk.user_did = kp.owner_did
+         AND dk.device_id = kp.owner_device_id
+         AND dk.key_id = kp.owner_key_id
+        WHERE kp.owner_did = $1
+          AND kp.owner_device_id = $2
+          AND kp.owner_key_id = $3
+          AND kp.owner_auth_generation = $4
+          AND kp.status = 'available'
+          AND kp.not_before < $5
+          AND kp.created_at <= $5
+          AND $5 < kp.not_after
+        ORDER BY kp.created_at, kp.key_package_ref
+        LIMIT 1
+        FOR UPDATE OF kp
+        "#,
+    )
+    .bind(target_did)
+    .bind(target_device_id)
+    .bind(target_key_id)
+    .bind(target_auth_generation)
+    .bind(claimed_at)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let row = row.ok_or(RecoveryPackageHydrationError::PackageMissing)?;
+    if row.status != "available"
+        || row.owner_did != target_did
+        || row.owner_device_id != target_device_id
+        || row.owner_key_id != target_key_id
+        || row.owner_auth_generation != target_auth_generation
+        || !whole_millis_nonnegative(row.not_before)
+        || !whole_millis_nonnegative(row.not_after)
+        || !whole_millis_nonnegative(row.created_at)
+        || row.created_at > claimed_at
+    {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+    let key_package_ref = recovery_package_bytes32(row.key_package_ref)?;
+    let wrapper_sha256 = recovery_package_bytes32(row.wrapper_sha256)?;
+    validate_locked_recovery_package_artifact(
+        &row.wrapper_bytes,
+        &key_package_ref,
+        target_did,
+        target_device_id,
+        &row.owner_signing_public_key,
+        claimed_at,
+        row.not_before,
+        row.not_after,
+    )?;
+    let durable_row_digest = recovery_package_guard_digest(
+        &transaction_id,
+        head.conversation_id(),
+        request_id,
+        target_did,
+        target_device_id,
+        target_key_id,
+        target_auth_generation,
+        &bound_coordinate,
+        &key_package_ref,
+        &row.wrapper_bytes,
+        &wrapper_sha256,
+        row.not_before,
+        row.not_after,
+        claimed_at,
+        LockedRecoveryPackageStatus::Available,
+        LockedRecoveryPackageUse::AvailableSelection,
+        None,
+        None,
+        None,
+    );
+    LockedRecoveryPackageGuard::from_locked_row(
+        transaction_id,
+        head.conversation_id(),
+        request_id,
+        target_did.to_owned(),
+        target_device_id,
+        target_key_id.to_owned(),
+        target_auth_generation,
+        bound_coordinate,
+        key_package_ref,
+        row.wrapper_bytes,
+        wrapper_sha256,
+        row.not_before,
+        row.not_after,
+        claimed_at,
+        LockedRecoveryPackageStatus::Available,
+        LockedRecoveryPackageUse::AvailableSelection,
+        None,
+        None,
+        None,
+        durable_row_digest,
+    )
+    .ok_or(RecoveryPackageHydrationError::GuardInvariant)
+}
+
+/// Lock one exact active reservation and its reserved KeyPackage, then match
+/// every durable binding against independently re-verified recovery hydration
+/// under the same conversation-head lock.
+#[allow(dead_code)]
+pub(crate) async fn hydrate_locked_reserved_recovery_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    head: &LockedConversationHeadGuard,
+    request_id: Uuid,
+) -> Result<LockedRecoveryPackageGuard, RecoveryPackageHydrationError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != head.transaction_id() || !uuid_is_canonical_v4(request_id) {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+    let row: Option<LockedReservedRecoveryPackageRow> = sqlx::query_as(
+        r#"
+        SELECT
+            r.conversation_id,
+            r.recovery_request_id,
+            r.generation,
+            r.bound_state_version,
+            r.bound_group_id,
+            r.bound_epoch,
+            r.bound_group_context_hash,
+            r.bound_confirmation_tag,
+            r.requester_did,
+            r.requester_device_id,
+            r.requester_key_id,
+            r.requester_auth_generation,
+            r.recipient_did,
+            r.recipient_device_id,
+            r.key_package_ref,
+            r.created_at AS reservation_created_at,
+            r.expires_at AS reservation_expires_at,
+            r.status AS reservation_status,
+            kp.owner_did AS package_owner_did,
+            kp.owner_device_id AS package_owner_device_id,
+            kp.owner_key_id AS package_owner_key_id,
+            kp.owner_auth_generation AS package_owner_auth_generation,
+            dk.signing_public_key AS package_owner_signing_public_key,
+            kp.wrapper_bytes,
+            kp.wrapper_sha256,
+            kp.not_before,
+            kp.not_after,
+            kp.created_at AS package_created_at,
+            kp.status AS package_status
+        FROM chat.key_package_reservations r
+        JOIN chat.key_packages kp
+          ON kp.key_package_ref = r.key_package_ref
+         AND kp.owner_did = r.recipient_did
+         AND kp.owner_device_id = r.recipient_device_id
+        JOIN chat.device_keys dk
+          ON dk.user_did = kp.owner_did
+         AND dk.device_id = kp.owner_device_id
+         AND dk.key_id = kp.owner_key_id
+        WHERE r.conversation_id = $1
+          AND r.recovery_request_id = $2
+        FOR UPDATE OF r, kp
+        "#,
+    )
+    .bind(head.conversation_id())
+    .bind(request_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let row = row.ok_or(RecoveryPackageHydrationError::PackageMissing)?;
+
+    let generation = recovery_package_safe_u64(row.generation)?;
+    let state_version = recovery_package_safe_u64(row.bound_state_version)?;
+    let epoch = recovery_package_safe_u64(row.bound_epoch)?;
+    let bound_coordinate = PublicGroupSnapshotCoordinate::new(
+        *row.conversation_id.as_bytes(),
+        generation,
+        state_version,
+        recovery_package_bytes32(row.bound_group_id)?,
+        epoch,
+        recovery_package_bytes32(row.bound_group_context_hash)?,
+        recovery_package_bytes32(row.bound_confirmation_tag)?,
+        super::super::snapshot::PublicGroupSnapshotLifecycle::Active,
+    );
+    let key_package_ref = recovery_package_bytes32(row.key_package_ref)?;
+    let wrapper_sha256 = recovery_package_bytes32(row.wrapper_sha256)?;
+    let claimed_at = row.reservation_created_at;
+    validate_locked_recovery_package_artifact(
+        &row.wrapper_bytes,
+        &key_package_ref,
+        &row.requester_did,
+        row.requester_device_id,
+        &row.package_owner_signing_public_key,
+        claimed_at,
+        row.not_before,
+        row.not_after,
+    )?;
+    let target_key_id = KeyThumbprint::parse(&row.requester_key_id)
+        .map_err(|_| RecoveryPackageHydrationError::OutOfDomain)?;
+    let decoded_target_key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(target_key_id.as_str())
+        .map_err(|_| RecoveryPackageHydrationError::OutOfDomain)?
+        .try_into()
+        .map_err(|_| RecoveryPackageHydrationError::OutOfDomain)?;
+    let target_auth_generation = recovery_package_safe_u64(row.requester_auth_generation)?;
+
+    let historical = historical_authority_for_locked_head(head)
+        .map_err(|_| RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let (requests, reservations) =
+        load_recovery_work_hydration_rows(transaction, &historical, head.conversation_id()).await?;
+    let request = requests
+        .iter()
+        .find(|value| value.request_id == *request_id.as_bytes())
+        .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let reservation = reservations
+        .iter()
+        .find(|value| value.request_id == *request_id.as_bytes())
+        .ok_or(RecoveryPackageHydrationError::ReadSetMismatch)?;
+    let (origin_key_id, origin_auth_generation, request_provenance_digest) =
+        recovery_origin_binding(&request.origin)?;
+    let claimed_server = recovery_timestamp(claimed_at)?;
+    let expires_server = recovery_timestamp(row.reservation_expires_at)?;
+    let not_after_server = recovery_timestamp(row.not_after)?;
+
+    if row.conversation_id != head.conversation_id()
+        || row.recovery_request_id != request_id
+        || head.prior_coordinate() != Some(&bound_coordinate)
+        || row.requester_did != row.recipient_did
+        || row.requester_device_id != row.recipient_device_id
+        || row.requester_did != row.package_owner_did
+        || row.requester_device_id != row.package_owner_device_id
+        || row.requester_key_id != row.package_owner_key_id
+        || row.requester_auth_generation != row.package_owner_auth_generation
+        || row.reservation_status != "active"
+        || row.package_status != "reserved"
+        || BareDid::parse(&row.requester_did).is_err()
+        || !uuid_is_canonical_v4(row.requester_device_id)
+        || target_auth_generation == 0
+        || origin_key_id != decoded_target_key_id
+        || origin_auth_generation != target_auth_generation
+        || !whole_millis_nonnegative(row.not_before)
+        || !whole_millis_nonnegative(row.not_after)
+        || !whole_millis_nonnegative(row.package_created_at)
+        || !whole_millis_nonnegative(claimed_at)
+        || !whole_millis_nonnegative(row.reservation_expires_at)
+        || row.package_created_at > claimed_at
+        || request.target.principal().as_bytes() != row.requester_did.as_bytes()
+        || request.target.device_id() != row.requester_device_id.as_bytes()
+        || request.bound_coordinate != bound_coordinate
+        || request.key_package_ref != key_package_ref
+        || request.received_at != claimed_server
+        || request.expires_at != expires_server
+        || request.status != RecoveryRequestStatus::Open
+        || reservation.target != request.target
+        || reservation.bound_coordinate != bound_coordinate
+        || reservation.key_package_ref != key_package_ref
+        || reservation.received_at != claimed_server
+        || reservation.expires_at != expires_server
+        || reservation.package_not_after != not_after_server
+        || reservation.status != ReservationStatus::Active
+    {
+        return Err(RecoveryPackageHydrationError::ReadSetMismatch);
+    }
+
+    let durable_row_digest = recovery_package_guard_digest(
+        &transaction_id,
+        row.conversation_id,
+        request_id,
+        &row.requester_did,
+        row.requester_device_id,
+        &row.requester_key_id,
+        row.requester_auth_generation,
+        &bound_coordinate,
+        &key_package_ref,
+        &row.wrapper_bytes,
+        &wrapper_sha256,
+        row.not_before,
+        row.not_after,
+        claimed_at,
+        LockedRecoveryPackageStatus::Reserved,
+        LockedRecoveryPackageUse::ReservedFulfillment,
+        Some(claimed_at),
+        Some(row.reservation_expires_at),
+        Some(&request_provenance_digest),
+    );
+    LockedRecoveryPackageGuard::from_locked_row(
+        transaction_id,
+        row.conversation_id,
+        request_id,
+        row.requester_did,
+        row.requester_device_id,
+        row.requester_key_id,
+        row.requester_auth_generation,
+        bound_coordinate,
+        key_package_ref,
+        row.wrapper_bytes,
+        wrapper_sha256,
+        row.not_before,
+        row.not_after,
+        claimed_at,
+        LockedRecoveryPackageStatus::Reserved,
+        LockedRecoveryPackageUse::ReservedFulfillment,
+        Some(claimed_at),
+        Some(row.reservation_expires_at),
+        Some(request_provenance_digest),
+        durable_row_digest,
+    )
+    .ok_or(RecoveryPackageHydrationError::GuardInvariant)
 }
 
 // ===========================================================================

@@ -5248,8 +5248,9 @@ mod historical_control_loader {
             ActivePublicState, GenesisGroupInfoExpectations,
         };
         use crate::chat_protocol::repository::core::{
-            active_conversation_graph_digest_for_test, hydrate_locked_conversation_head,
-            hydrate_locked_conversation_state, hydrate_locked_public_state,
+            active_conversation_graph_digest_for_test, hydrate_locked_available_recovery_package,
+            hydrate_locked_conversation_head, hydrate_locked_conversation_state,
+            hydrate_locked_public_state, hydrate_locked_reserved_recovery_package,
             load_interval_hydration_rows, load_leaf_hydration_rows,
             load_leave_request_hydration_rows, load_metadata_provenance,
             load_participant_hydration_rows, load_producer_transition_evidence,
@@ -5257,8 +5258,8 @@ mod historical_control_loader {
             load_welcome_hydration_rows, map_recovery_control_evidence_error,
             recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
             select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
-            FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
-            WelcomeTerminalSelection,
+            FulfilledRecoveryTerminalColumns, RecoveryHydrationError,
+            RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
             EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
@@ -8369,6 +8370,56 @@ mod historical_control_loader {
             replaced_leaf_period_id: Uuid,
         }
 
+        fn build_real_creator_key_package(
+            entry: &RealCreationEntry,
+            evaluated_at: DateTime<Utc>,
+        ) -> ([u8; 32], Vec<u8>) {
+            let provider =
+                openmls_libcrux_crypto::Provider::new().expect("real creator package provider");
+            let signer = SignatureKeyPair::from_raw(
+                XWING_CIPHERSUITE.signature_algorithm(),
+                entry.signing_seed.to_vec(),
+                entry.public_key.clone(),
+            );
+            signer
+                .store(provider.storage())
+                .expect("store real creator package signer");
+            let credential = format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
+            let lifetime = Lifetime::init(
+                u64::try_from(instant(KP_NOT_BEFORE).timestamp()).unwrap(),
+                u64::try_from(instant(KP_NOT_AFTER).timestamp()).unwrap(),
+            );
+            let package = KeyPackage::builder()
+                .key_package_lifetime(lifetime)
+                .leaf_node_capabilities(exact_mls_capabilities())
+                .build(
+                    XWING_CIPHERSUITE,
+                    &provider,
+                    &signer,
+                    CredentialWithKey {
+                        credential: BasicCredential::new(credential.clone()).into(),
+                        signature_key: entry.public_key.clone().into(),
+                    },
+                )
+                .expect("build real creator KeyPackage")
+                .key_package()
+                .clone();
+            let wrapper = MlsMessageOut::from(package)
+                .tls_serialize_detached()
+                .expect("serialize real creator KeyPackage");
+            let validated = validate_key_package(
+                &wrapper,
+                KeyPackageValidationPolicy {
+                    expected_basic_credential: &credential,
+                    expected_signature_key: &entry.public_key,
+                    now_unix_seconds: u64::try_from(evaluated_at.timestamp()).unwrap(),
+                    max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+                },
+            )
+            .expect("production validates real creator KeyPackage");
+            (*validated.key_package_ref(), wrapper)
+        }
+
         /// Seed an OPEN leaf-recovery request + its ACTIVE key-package reservation
         /// on top of a committed genesis graph, coherent under the deferred
         /// `assert_recovery_fulfillment_mapping` constraint. `source` drives only
@@ -8490,6 +8541,398 @@ mod historical_control_loader {
                 creation_transition_id,
                 replaced_leaf_period_id,
             }
+        }
+
+        /// Append-only real-crypto variant of `seed_recovery_pair`, used by the
+        /// production G5 guard tests. It preserves the exact signed request and
+        /// graph provenance while replacing the legacy opaque test wrapper with
+        /// an identity-bound OpenMLS KeyPackage accepted by production validation.
+        async fn seed_real_crypto_recovery_pair(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> RecoverySeed {
+            let creation_transition_id = seed_real_creation_graph(pool, entry).await;
+            let conversation_id = Uuid::from_bytes(entry.cid);
+            let request_uuid = Uuid::new_v4();
+            let request_id = *request_uuid.as_bytes();
+            let (key_package_ref, wrapper_bytes) =
+                build_real_creator_key_package(entry, instant(REQUESTED_AT));
+            let init_key =
+                Sha256::digest([b"g5-real-recovery-init".as_ref(), &request_id].concat()).to_vec();
+            let signed = build_signed_recovery_request(entry, request_id);
+            let replaced_leaf_period_id: Uuid = sqlx::query_scalar(
+                "SELECT leaf_period_id FROM chat.member_devices \
+                 WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+            )
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .fetch_one(pool)
+            .await
+            .expect("creator leaf period");
+
+            let mut tx = pool.begin().await.expect("begin real recovery pair");
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'reserved',$10)"#,
+            )
+            .bind(key_package_ref.to_vec())
+            .bind(&wrapper_bytes)
+            .bind(Sha256::digest(&wrapper_bytes).to_vec())
+            .bind(init_key)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(instant(REQUESTED_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert real reserved KeyPackage");
+            sqlx::query(
+                r#"INSERT INTO chat.key_package_reservations(
+                    recovery_request_id,key_package_ref,conversation_id,generation,requester_did,
+                    requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
+                    recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
+                    bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,0,$7,0,$8,$9,'leafRecovery',$10,'active',$11)"#,
+            )
+            .bind(request_uuid)
+            .bind(key_package_ref.to_vec())
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(instant(EXPIRES_AT))
+            .bind(instant(REQUESTED_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert real reservation");
+            sqlx::query(
+                r#"INSERT INTO chat.leaf_recovery_requests(
+                    recovery_request_id,conversation_id,generation,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,
+                    bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
+                    reservation_request_id,replaced_leaf_period_id,status,signed_request_bytes,
+                    signing_transcript_bytes,request_digest,signature,requested_at,expires_at
+                ) VALUES($1,$2,0,$3,$4,$5,1,'replace','requestLeafRecovery',0,$6,0,$7,$8,$1,$9,
+                    'open',$10,$11,$12,$13,$14,$15)"#,
+            )
+            .bind(request_uuid)
+            .bind(conversation_id)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(vec![1_u8; 32])
+            .bind(vec![2_u8; 32])
+            .bind(vec![3_u8; 32])
+            .bind(replaced_leaf_period_id)
+            .bind(&signed.raw_wrapper)
+            .bind(&signed.signing_transcript)
+            .bind(&signed.request_digest)
+            .bind(&signed.signature)
+            .bind(instant(REQUESTED_AT))
+            .bind(instant(EXPIRES_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert real recovery request");
+            tx.commit().await.expect("commit real recovery pair");
+
+            RecoverySeed {
+                request_id,
+                key_package_ref,
+                raw_wrapper: signed.raw_wrapper,
+                creation_transition_id,
+                replaced_leaf_period_id,
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn available_recovery_package_hydrates_real_crypto_and_holds_package_lock() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let (key_package_ref, wrapper_bytes) =
+                build_real_creator_key_package(&entry, instant(REQUESTED_AT));
+            let init_key =
+                Sha256::digest([b"g5-available-init".as_ref(), cid.as_bytes()].concat()).to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#,
+            )
+            .bind(key_package_ref.to_vec())
+            .bind(&wrapper_bytes)
+            .bind(Sha256::digest(&wrapper_bytes).to_vec())
+            .bind(init_key)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(instant(REQUESTED_AT))
+            .execute(&pool)
+            .await
+            .expect("insert available real KeyPackage");
+
+            let request_id = Uuid::new_v4();
+            let mut tx = pool.begin().await.expect("begin G5 available");
+            let head = hydrate_locked_conversation_head(&mut tx, cid, instant(REQUESTED_AT))
+                .await
+                .expect("lock available conversation head");
+            let coordinate = *head.prior_coordinate().expect("existing coordinate");
+            let guard = hydrate_locked_available_recovery_package(
+                &mut tx,
+                &head,
+                request_id,
+                &entry.actor_did,
+                entry.actor_device_id,
+                &entry.actor_key_id,
+                1,
+                coordinate,
+            )
+            .await
+            .expect("hydrate available recovery package");
+            assert_eq!(guard.key_package_ref(), &key_package_ref);
+            assert_eq!(guard.wrapper_bytes(), wrapper_bytes);
+            assert_eq!(guard.claimed_at(), instant(REQUESTED_AT));
+            assert_ne!(guard.durable_row_digest(), &[0_u8; 32]);
+
+            let contender_pool = pool.clone();
+            let mut contender = tokio::spawn(async move {
+                let mut other = contender_pool.begin().await.expect("begin contender");
+                sqlx::query(
+                    "SELECT key_package_ref FROM chat.key_packages \
+                     WHERE key_package_ref=$1 FOR UPDATE",
+                )
+                .bind(key_package_ref.to_vec())
+                .fetch_one(&mut *other)
+                .await
+                .expect("contender locks package after release");
+                other.rollback().await.expect("rollback contender");
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut contender)
+                    .await
+                    .is_err(),
+                "a direct competing package lock must block while the guard transaction lives"
+            );
+            tx.rollback().await.expect("release available package lock");
+            tokio::time::timeout(std::time::Duration::from_secs(3), contender)
+                .await
+                .expect("contender unblocks")
+                .expect("contender task");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn available_recovery_package_rejects_submillisecond_lifetime_alias() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let (key_package_ref, wrapper_bytes) =
+                build_real_creator_key_package(&entry, instant(REQUESTED_AT));
+            let stored_not_after = instant(KP_NOT_AFTER) + chrono::TimeDelta::microseconds(500);
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#,
+            )
+            .bind(key_package_ref.to_vec())
+            .bind(&wrapper_bytes)
+            .bind(Sha256::digest(&wrapper_bytes).to_vec())
+            .bind(Sha256::digest([b"g5-submillis-init".as_ref(), cid.as_bytes()].concat()).to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(stored_not_after)
+            .bind(instant(REQUESTED_AT))
+            .execute(&pool)
+            .await
+            .expect("schema permits microsecond timestamp for fail-closed read test");
+
+            let mut tx = pool.begin().await.expect("begin submillisecond test");
+            let head = hydrate_locked_conversation_head(&mut tx, cid, instant(REQUESTED_AT))
+                .await
+                .expect("lock conversation head");
+            let coordinate = *head.prior_coordinate().expect("existing coordinate");
+            let result = hydrate_locked_available_recovery_package(
+                &mut tx,
+                &head,
+                Uuid::new_v4(),
+                &entry.actor_did,
+                entry.actor_device_id,
+                &entry.actor_key_id,
+                1,
+                coordinate,
+            )
+            .await;
+            tx.rollback().await.expect("rollback submillisecond test");
+            assert!(
+                matches!(result, Err(RecoveryPackageHydrationError::ReadSetMismatch)),
+                "a +500µs durable timestamp must not alias the KeyPackage's whole-second lifetime"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn available_recovery_package_never_selects_a_future_upload() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            seed_real_creation_graph(&pool, &entry).await;
+            let (key_package_ref, wrapper_bytes) =
+                build_real_creator_key_package(&entry, instant(REQUESTED_AT));
+            let future_created_at = instant(REQUESTED_AT) + chrono::TimeDelta::seconds(1);
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#,
+            )
+            .bind(key_package_ref.to_vec())
+            .bind(&wrapper_bytes)
+            .bind(Sha256::digest(&wrapper_bytes).to_vec())
+            .bind(
+                Sha256::digest([b"g5-future-upload-init".as_ref(), cid.as_bytes()].concat())
+                    .to_vec(),
+            )
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(future_created_at)
+            .execute(&pool)
+            .await
+            .expect("insert package uploaded after the trusted request instant");
+
+            let mut tx = pool.begin().await.expect("begin future-upload test");
+            let head = hydrate_locked_conversation_head(&mut tx, cid, instant(REQUESTED_AT))
+                .await
+                .expect("lock conversation head");
+            let coordinate = *head.prior_coordinate().expect("existing coordinate");
+            let result = hydrate_locked_available_recovery_package(
+                &mut tx,
+                &head,
+                Uuid::new_v4(),
+                &entry.actor_did,
+                entry.actor_device_id,
+                &entry.actor_key_id,
+                1,
+                coordinate,
+            )
+            .await;
+            tx.rollback().await.expect("rollback future-upload test");
+            assert!(
+                matches!(result, Err(RecoveryPackageHydrationError::PackageMissing)),
+                "a package uploaded after the request clock must be causally invisible"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn reserved_recovery_package_reverifies_work_and_holds_both_row_locks() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+            let cid = Uuid::new_v4();
+            let entry = build_real_creation_entry(*cid.as_bytes());
+            let seed = seed_real_crypto_recovery_pair(&pool, &entry).await;
+            let request_id = Uuid::from_bytes(seed.request_id);
+
+            let mut tx = pool.begin().await.expect("begin G5 reserved");
+            let head = hydrate_locked_conversation_head(&mut tx, cid, instant(REQUESTED_AT))
+                .await
+                .expect("lock reserved conversation head");
+            let guard = hydrate_locked_reserved_recovery_package(&mut tx, &head, request_id)
+                .await
+                .expect("hydrate reserved recovery package");
+            assert_eq!(guard.key_package_ref(), &seed.key_package_ref);
+            assert_eq!(guard.request_id(), request_id);
+            assert_eq!(guard.claimed_at(), instant(REQUESTED_AT));
+            assert!(
+                guard.request_provenance_digest().is_some(),
+                "reserved guard carries re-verified request provenance"
+            );
+            assert_ne!(guard.durable_row_digest(), &[0_u8; 32]);
+
+            let reservation_contender_pool = pool.clone();
+            let package_contender_pool = pool.clone();
+            let key_package_ref = seed.key_package_ref;
+            let mut reservation_contender = tokio::spawn(async move {
+                let mut other = reservation_contender_pool
+                    .begin()
+                    .await
+                    .expect("begin reservation contender");
+                sqlx::query(
+                    "SELECT recovery_request_id FROM chat.key_package_reservations \
+                     WHERE recovery_request_id=$1 FOR UPDATE",
+                )
+                .bind(request_id)
+                .fetch_one(&mut *other)
+                .await
+                .expect("contender locks reservation after release");
+                other
+                    .rollback()
+                    .await
+                    .expect("rollback reservation contender");
+            });
+            let mut package_contender = tokio::spawn(async move {
+                let mut other = package_contender_pool
+                    .begin()
+                    .await
+                    .expect("begin package contender");
+                sqlx::query(
+                    "SELECT key_package_ref FROM chat.key_packages \
+                     WHERE key_package_ref=$1 FOR UPDATE",
+                )
+                .bind(key_package_ref.to_vec())
+                .fetch_one(&mut *other)
+                .await
+                .expect("contender locks reserved package after release");
+                other.rollback().await.expect("rollback package contender");
+            });
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    &mut reservation_contender
+                )
+                .await
+                .is_err(),
+                "the exact reservation row must remain locked while the guard transaction lives"
+            );
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    &mut package_contender
+                )
+                .await
+                .is_err(),
+                "the exact reserved package row must remain locked while the guard transaction lives"
+            );
+            tx.rollback().await.expect("release reserved row locks");
+            tokio::time::timeout(std::time::Duration::from_secs(3), reservation_contender)
+                .await
+                .expect("reservation contender unblocks")
+                .expect("reservation contender task");
+            tokio::time::timeout(std::time::Duration::from_secs(3), package_contender)
+                .await
+                .expect("package contender unblocks")
+                .expect("package contender task");
         }
 
         async fn commit_real_acceptance_recovery(
