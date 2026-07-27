@@ -40,6 +40,14 @@ mod chat_protocol {
     // `include!` directly — mirroring `chat_protocol_transition_repository.rs`.
     // The existing 27 state-machine tests do not use these; they are inert here.
     pub mod repository {
+        pub mod core {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/core.rs"
+            ));
+        }
+
         pub mod transition {
             #![allow(dead_code)]
             include!(concat!(
