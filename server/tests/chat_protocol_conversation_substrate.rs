@@ -5004,6 +5004,18 @@ mod historical_control_loader {
         }
 
         fn validate_exact_corpus_recovery_artifacts() -> [u8; 32] {
+            validate_corpus_recovery_artifacts(
+                "key-package.mls",
+                "welcome.mls",
+                "innerKeyPackageRefHex",
+            )
+        }
+
+        fn validate_corpus_recovery_artifacts(
+            key_package_file: &str,
+            welcome_file: &str,
+            manifest_ref_field: &str,
+        ) -> [u8; 32] {
             let manifest = corpus_manifest();
             let bob = &manifest["identity"]["bob"];
             let credential = bob["credentialIdentity"]
@@ -5014,7 +5026,7 @@ mod historical_control_loader {
             let evaluation = manifest["evaluationUnixSeconds"]
                 .as_u64()
                 .expect("corpus evaluation instant");
-            let package = corpus_file("key-package.mls");
+            let package = corpus_file(key_package_file);
             let validated = validate_key_package(
                 &package,
                 KeyPackageValidationPolicy {
@@ -5028,16 +5040,30 @@ mod historical_control_loader {
             let key_package_ref = *validated.key_package_ref();
             assert_eq!(
                 key_package_ref,
-                corpus_hex::<32>(&manifest["chain"]["innerKeyPackageRefHex"]),
+                corpus_hex::<32>(&manifest["chain"][manifest_ref_field]),
                 "production-derived KeyPackageRef remains manifest-bound"
             );
             verify_recovery_welcome(
-                &corpus_file("welcome.mls"),
+                &corpus_file(welcome_file),
                 key_package_ref,
                 MAX_WELCOME_WIRE_BYTES,
             )
             .expect("production Welcome verification binds the same corpus KeyPackageRef");
             key_package_ref
+        }
+
+        #[test]
+        fn rejoin_corpus_package_and_welcome_are_exactly_bound() {
+            let original = validate_exact_corpus_recovery_artifacts();
+            let rejoin = validate_corpus_recovery_artifacts(
+                "rejoin-key-package.mls",
+                "rejoin-welcome.mls",
+                "rejoinInnerKeyPackageRefHex",
+            );
+            assert_ne!(
+                rejoin, original,
+                "post-removal rejoin must consume fresh one-use package material"
+            );
         }
 
         #[derive(Clone)]

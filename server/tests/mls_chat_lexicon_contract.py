@@ -40,7 +40,7 @@ PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
-FROZEN_APPLICATION_MANIFEST_SHA256 = "8ecb98cc3fb1b4e8d69e9b7e3b1f0bc01d6bae8194990223571f1474f16db7c7"
+FROZEN_APPLICATION_MANIFEST_SHA256 = "4ecfa4193eaf0eac1ca50a8a5ed023178469f59f0fa634c645d7c84a4b0fb4fa"
 TASK1_DOC_PATHS = (
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-semantic-repair-brief.md",
     STACK_ROOT / ".superpowers/sdd/mls-chat-task-1-report.md",
@@ -4741,6 +4741,9 @@ def validate_crypto_wire_corpus() -> None:
         "genesis-public-state.bin", "committed-public-state.bin",
         "commit-generic-public.mls", "committed-generic-public-state.bin",
         "commit-remove-public.mls", "committed-remove-public-state.bin",
+        "rejoin-key-package.mls", "rejoin-key-package-inner.tls",
+        "rejoin-key-package-ref.bin", "commit-rejoin-public.mls",
+        "rejoin-welcome.mls", "committed-rejoin-public-state.bin",
         "creation-signed-request.cbor",
     }
     actual_files = {path.name for path in CRYPTO_WIRE_ROOT.iterdir() if path.is_file()}
@@ -4831,6 +4834,9 @@ def validate_crypto_wire_corpus() -> None:
         "commit-public.mls": 1,
         "commit-generic-public.mls": 1,
         "commit-remove-public.mls": 1,
+        "rejoin-key-package.mls": 5,
+        "commit-rejoin-public.mls": 1,
+        "rejoin-welcome.mls": 3,
         "welcome.mls": 3,
         "application-private.mls": 2,
     }
@@ -4844,17 +4850,27 @@ def validate_crypto_wire_corpus() -> None:
     assert payloads["key-package.mls"][4:] == inner
     assert len(payloads["key-package-ref.bin"]) == 32
     assert payloads["key-package.mls"] != inner
+    rejoin_inner = payloads["rejoin-key-package-inner.tls"]
+    assert len(rejoin_inner) >= 4 and rejoin_inner[:4].hex() == "0001004d"
+    assert payloads["rejoin-key-package.mls"][4:] == rejoin_inner
+    assert len(payloads["rejoin-key-package-ref.bin"]) == 32
+    assert payloads["rejoin-key-package-ref.bin"] != payloads["key-package-ref.bin"]
 
     chain = manifest["chain"]
     assert chain["genesisEpoch"] == 0 and chain["committedEpoch"] == 1
     assert chain["genesisStateVersion"] == 0 and chain["committedStateVersion"] == 1
+    assert chain["rejoinEpoch"] == 4 and chain["rejoinStateVersion"] == 4
+    assert chain["rejoinMemberCredentials"] == chain["committedMemberCredentials"]
     for field in (
         "groupIdHex", "genesisGroupContextHashHex", "genesisConfirmationTagHex",
         "committedGroupContextHashHex", "committedConfirmationTagHex",
-        "innerKeyPackageRefHex",
+        "innerKeyPackageRefHex", "rejoinGroupContextHashHex",
+        "rejoinConfirmationTagHex", "rejoinInnerKeyPackageRefHex",
     ):
         assert len(bytes.fromhex(chain[field])) == 32
     assert bytes.fromhex(chain["innerKeyPackageRefHex"]) == payloads["key-package-ref.bin"]
+    assert bytes.fromhex(chain["rejoinInnerKeyPackageRefHex"]) == payloads["rejoin-key-package-ref.bin"]
+    assert chain["rejoinInnerKeyPackageRefHex"] != chain["innerKeyPackageRefHex"]
     assert chain["genesisGroupContextHashHex"] != chain["committedGroupContextHashHex"]
     assert chain["genesisConfirmationTagHex"] != chain["committedConfirmationTagHex"]
 
@@ -4862,7 +4878,7 @@ def validate_crypto_wire_corpus() -> None:
     assert set(public_snapshot_profile) == {
         "schema", "openmlsVersion", "storageVersion", "recordCount", "recordLabels",
         "storageSchemaSuffixHex", "containsSecrets", "genesisRecordKeyHex",
-        "committedRecordKeyHex",
+        "committedRecordKeyHex", "rejoinRecordKeyHex",
     }
     assert public_snapshot_profile == {
         **public_snapshot_profile,
@@ -4875,6 +4891,7 @@ def validate_crypto_wire_corpus() -> None:
         "containsSecrets": False,
     }
     assert public_snapshot_profile["genesisRecordKeyHex"] == public_snapshot_profile["committedRecordKeyHex"]
+    assert public_snapshot_profile["genesisRecordKeyHex"] == public_snapshot_profile["rejoinRecordKeyHex"]
     expected_snapshot_keys = [bytes.fromhex(value) for value in public_snapshot_profile["genesisRecordKeyHex"]]
     assert len(expected_snapshot_keys) == 4 and expected_snapshot_keys == sorted(set(expected_snapshot_keys))
     expected_labels = {b"Tree", b"GroupContext", b"InterimTranscriptHash", b"ConfirmationTag"}
@@ -4925,7 +4942,9 @@ def validate_crypto_wire_corpus() -> None:
         return keys
 
     assert validate_public_snapshot("genesis-public-state.bin") == validate_public_snapshot("committed-public-state.bin")
+    assert validate_public_snapshot("genesis-public-state.bin") == validate_public_snapshot("committed-rejoin-public-state.bin")
     assert payloads["genesis-public-state.bin"] != payloads["committed-public-state.bin"]
+    assert payloads["committed-remove-public-state.bin"] != payloads["committed-rejoin-public-state.bin"]
 
 
 def validate_non_crypto_contract(documents: dict[str, dict[str, Any]], vectors: dict[str, Any]) -> None:
