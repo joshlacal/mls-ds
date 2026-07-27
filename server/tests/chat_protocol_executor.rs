@@ -1183,7 +1183,7 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
             "inconsistent",
         ),
         (PolicyPlanMutation::DuplicateDelta, "inconsistent"),
-        (PolicyPlanMutation::Remove, "unsupported-remove"),
+        (PolicyPlanMutation::Remove, "inconsistent"),
     ] {
         assert_policy_prewrite_rejection(
             &pool,
@@ -1741,10 +1741,6 @@ async fn assert_policy_prewrite_rejection(
     let result = apply_conversation_persistence_plan(&mut transaction, plan, ctx).await;
     match (expected, result) {
         ("inconsistent", Err(ExecutorError::InconsistentPlan(_))) => {}
-        (
-            "unsupported-remove",
-            Err(ExecutorError::UnsupportedEffect("policy participant Remove")),
-        ) => {}
         (_, other) => panic!("unexpected policy rejection for {expected}: {other:?}"),
     }
     let head_after: (i64, i64) = sqlx::query_as(
@@ -7242,7 +7238,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
-        closing_participant_periods: vec![(bob_id.clone(), bob_period)],
+        closing_participant_periods: vec![(bob_id.principal().clone(), bob_period)],
         reset_request_row: None,
         recovery_open: None,
         welcome_expiry: None,
@@ -7446,7 +7442,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
-        closing_participant_periods: vec![(bob_id.clone(), bob_period)],
+        closing_participant_periods: vec![(bob_id.principal().clone(), bob_period)],
         reset_request_row: None,
         recovery_open: None,
         welcome_expiry: None,
@@ -7685,7 +7681,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![(bob_id.clone(), bob_leaf_period)],
-        closing_participant_periods: vec![(bob_id.clone(), bob_participant_period)],
+        closing_participant_periods: vec![(bob_id.principal().clone(), bob_participant_period)],
         reset_request_row: None,
         recovery_open: None,
         // The epoch change supersedes the fulfillment scenario's pending Welcome.
@@ -8628,7 +8624,7 @@ async fn build_bob_leave_fulfillment(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![(bob_id.clone(), bob_leaf_period)],
-        closing_participant_periods: vec![(bob_id.clone(), bob_participant_period)],
+        closing_participant_periods: vec![(bob_id.principal().clone(), bob_participant_period)],
         reset_request_row: None,
         recovery_open: None,
         welcome_expiry: None,
@@ -10223,7 +10219,7 @@ async fn build_carol_zero_leaf_leave(
             outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
         }],
         closing_leaf_periods: vec![],
-        closing_participant_periods: vec![(carol_id.clone(), setup.carol_period)],
+        closing_participant_periods: vec![(carol_id.principal().clone(), setup.carol_period)],
         reset_request_row: None,
         recovery_open: None,
         welcome_expiry: None,

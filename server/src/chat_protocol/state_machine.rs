@@ -13,9 +13,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::relationship_policy::{
-    consume_admission_projection, consume_block_projection, AdmissionOperation, AdmissionRequest,
-    ProjectionOperationScope, PublicTransport, RelationshipAuthority, RelationshipProjection,
-    TrustedRelationshipDecisionInstant,
+    AdmissionOperation, AdmissionRequest, ProjectionOperationScope, PublicTransport,
+    RelationshipAuthority, RelationshipProjection,
 };
 
 use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
@@ -29,7 +28,11 @@ use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
     LockedRevocationTargetStatus, LockedWelcomeGuard,
 };
-use super::repository::relationship::LockedNoPendingAdmissionGuard;
+use super::repository::relationship::{
+    consume_locked_acceptance_projection, consume_locked_creation_projection,
+    consume_locked_pending_add_projection, consume_locked_recovery_projection,
+    LockedNoPendingAdmissionGuard, LockedRelationshipDecisionGuard, RelationshipConsumptionError,
+};
 
 use super::{
     public_state::{
@@ -137,6 +140,15 @@ pub(crate) enum StateMachineError {
     InvalidMetadataAuthority,
     #[error("metadata version would overflow")]
     MetadataVersionOverflow,
+}
+
+fn relationship_consumption_error(error: RelationshipConsumptionError) -> StateMachineError {
+    match error {
+        RelationshipConsumptionError::InvalidWitness => {
+            StateMachineError::InvalidHydrationAuthority
+        }
+        RelationshipConsumptionError::PolicyDenied => StateMachineError::InvalidPolicyAuthority,
+    }
 }
 
 /// One captured trusted server instant represented at canonical millisecond
@@ -1454,7 +1466,7 @@ impl HydrationAuthority {
         relationship: &RelationshipProjection,
         relationship_authority: &RelationshipAuthority<T>,
         quota_guard: LockedInvitationQuotaGuard,
-        relationship_decision: &TrustedRelationshipDecisionInstant,
+        relationship_decision: &LockedRelationshipDecisionGuard,
         trusted_now: &TrustedRequestInstant,
     ) -> Result<CreationDecision, StateMachineError> {
         let group_info_bytes = match entry.mutation().projection() {
@@ -1486,7 +1498,7 @@ impl HydrationAuthority {
             .map(|participant| participant.principal.clone())
             .collect::<Vec<_>>();
         let trusted_at = ServerTimestamp::from_trusted_request_instant(trusted_now)?;
-        let head = match (kind, direct_lookup, head) {
+        let head = match (kind, direct_lookup.as_ref(), head) {
             (ConversationKind::Direct, Some(lookup), maybe_head) => {
                 let [invitee] = invitees.as_slice() else {
                     return Err(StateMachineError::InvalidCreation);
@@ -1588,15 +1600,18 @@ impl HydrationAuthority {
             registration.transaction_id(),
             registration.trusted_read_at(),
         )?;
-        consume_admission_projection(
+        consume_locked_creation_projection(
             relationship,
-            ProjectionOperationScope::Creation,
-            &request,
-            relationship_authority,
             relationship_decision,
+            head,
+            &quota_guard,
+            direct_lookup.as_ref(),
+            registration,
+            &request,
             quota_guard.would_exceed(),
+            relationship_authority,
         )
-        .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
+        .map_err(relationship_consumption_error)?;
         if registration.trusted_read_at()
             != ServerTimestamp::from_trusted_request_instant(trusted_now)?
         {
@@ -1746,7 +1761,7 @@ impl HydrationAuthority {
         relationship: &RelationshipProjection,
         relationship_authority: &RelationshipAuthority<T>,
         quota_guard: LockedInvitationQuotaGuard,
-        relationship_decision: &TrustedRelationshipDecisionInstant,
+        relationship_decision: &LockedRelationshipDecisionGuard,
         trusted_now: &TrustedRequestInstant,
     ) -> Result<PlannedTransition, StateMachineError> {
         self.require_same_locked_conversation(locked)?;
@@ -1800,15 +1815,17 @@ impl HydrationAuthority {
             registration.transaction_id(),
             registration.trusted_read_at(),
         )?;
-        consume_admission_projection(
+        consume_locked_pending_add_projection(
             relationship,
-            ProjectionOperationScope::PendingAdd,
-            &request,
-            relationship_authority,
             relationship_decision,
+            locked,
+            &quota_guard,
+            registration,
+            &request,
             quota_guard.would_exceed(),
+            relationship_authority,
         )
-        .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
+        .map_err(relationship_consumption_error)?;
         if registration.trusted_read_at()
             != ServerTimestamp::from_trusted_request_instant(trusted_now)?
         {
@@ -1934,7 +1951,7 @@ impl HydrationAuthority {
         terminal_packages: Vec<LockedRecoveryPackageGuard>,
         relationship: &RelationshipProjection,
         relationship_authority: &RelationshipAuthority<T>,
-        relationship_decision: &TrustedRelationshipDecisionInstant,
+        relationship_decision: &LockedRelationshipDecisionGuard,
         trusted_now: &TrustedRequestInstant,
     ) -> Result<PlannedTransition, StateMachineError> {
         self.require_same_locked_conversation(locked)?;
@@ -1972,6 +1989,33 @@ impl HydrationAuthority {
                 .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
         let accepting_principal = String::from_utf8(actor.principal().as_bytes().to_vec())
             .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
+        let roster = prior
+            .participants
+            .iter()
+            .map(|participant| {
+                String::from_utf8(participant.principal.as_bytes().to_vec())
+                    .map_err(|_| StateMachineError::InvalidPolicyAuthority)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let relationship_request = AdmissionRequest {
+            inviter,
+            roster,
+            pending_recipients: vec![accepting_principal],
+            operation: if prior.kind == ConversationKind::Direct {
+                AdmissionOperation::Direct
+            } else {
+                AdmissionOperation::Group
+            },
+        };
+        consume_locked_acceptance_projection(
+            relationship,
+            relationship_decision,
+            locked,
+            &registration,
+            &relationship_request,
+            relationship_authority,
+        )
+        .map_err(relationship_consumption_error)?;
         let key_package_ref = *reservation.key_package_ref();
         let package_not_after = reservation.package_not_after();
         let package_cas = reservation.available_package_cas();
@@ -1992,33 +2036,6 @@ impl HydrationAuthority {
                 relationship_evidence_digest,
             },
         )?;
-        let roster = plan
-            .state
-            .participants
-            .iter()
-            .map(|participant| {
-                String::from_utf8(participant.principal.as_bytes().to_vec())
-                    .map_err(|_| StateMachineError::InvalidPolicyAuthority)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        consume_admission_projection(
-            relationship,
-            ProjectionOperationScope::Acceptance,
-            &AdmissionRequest {
-                inviter,
-                roster,
-                pending_recipients: vec![accepting_principal],
-                operation: if prior.kind == ConversationKind::Direct {
-                    AdmissionOperation::Direct
-                } else {
-                    AdmissionOperation::Group
-                },
-            },
-            relationship_authority,
-            relationship_decision,
-            false,
-        )
-        .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
         plan.bind_transition_authority(authority, head, &transaction_id, trusted_read_at)?
             .bind_recovery_package_cas(package_cas)?
             .bind_terminal_package_guards(prior, terminal_packages, &transaction_id)
@@ -2097,7 +2114,7 @@ impl HydrationAuthority {
         terminal_packages: Vec<LockedRecoveryPackageGuard>,
         relationship: &RelationshipProjection,
         relationship_authority: &RelationshipAuthority<T>,
-        relationship_decision: &TrustedRelationshipDecisionInstant,
+        relationship_decision: &LockedRelationshipDecisionGuard,
         trusted_now: &TrustedRequestInstant,
     ) -> Result<PlannedTransition, StateMachineError> {
         self.require_same_locked_conversation(locked)?;
@@ -2186,14 +2203,16 @@ impl HydrationAuthority {
                     .map_err(|_| StateMachineError::InvalidPolicyAuthority)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        consume_block_projection(
+        consume_locked_recovery_projection(
             relationship,
+            relationship_decision,
+            locked,
+            actor_registration,
             ProjectionOperationScope::RecoveryFulfillment,
             &roster,
             relationship_authority,
-            relationship_decision,
         )
-        .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
+        .map_err(relationship_consumption_error)?;
         plan.effects.policy_evidence_digest = Some(relationship.evidence_digest());
         plan.bind_transition_authority(
             authority,
@@ -2714,7 +2733,7 @@ impl HydrationAuthority {
         reservation: LockedRecoveryReservationProjection,
         relationship: &RelationshipProjection,
         relationship_authority: &RelationshipAuthority<T>,
-        relationship_decision: &TrustedRelationshipDecisionInstant,
+        relationship_decision: &LockedRelationshipDecisionGuard,
         trusted_now: &TrustedRequestInstant,
     ) -> Result<PlannedTransition, StateMachineError> {
         self.require_same_locked_conversation(locked)?;
@@ -2743,6 +2762,26 @@ impl HydrationAuthority {
         let transaction_id = registration.transaction_id().to_owned();
         let trusted_read_at = registration.trusted_read_at();
         let authority = evidence.clone();
+        // Opening recovery work cannot change the logical roster; this is the
+        // exact roster the deterministic request planner carries forward.
+        let roster = prior
+            .participants
+            .iter()
+            .map(|participant| {
+                String::from_utf8(participant.principal.as_bytes().to_vec())
+                    .map_err(|_| StateMachineError::InvalidPolicyAuthority)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        consume_locked_recovery_projection(
+            relationship,
+            relationship_decision,
+            locked,
+            &registration,
+            ProjectionOperationScope::RecoveryReservation,
+            &roster,
+            relationship_authority,
+        )
+        .map_err(relationship_consumption_error)?;
         let plan = plan_leaf_recovery_request_inner(
             prior,
             LeafRecoveryRequestCommand {
@@ -2758,23 +2797,6 @@ impl HydrationAuthority {
                 relationship_evidence_digest,
             },
         )?;
-        let roster = plan
-            .state
-            .participants
-            .iter()
-            .map(|participant| {
-                String::from_utf8(participant.principal.as_bytes().to_vec())
-                    .map_err(|_| StateMachineError::InvalidPolicyAuthority)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        consume_block_projection(
-            relationship,
-            ProjectionOperationScope::RecoveryReservation,
-            &roster,
-            relationship_authority,
-            relationship_decision,
-        )
-        .map_err(|_| StateMachineError::InvalidPolicyAuthority)?;
         plan.bind_non_control_request_authority(authority, head, &transaction_id, trusted_read_at)?
             .bind_recovery_package_cas(package_cas)
     }
@@ -15766,12 +15788,12 @@ mod executor {
         /// Empty for edges that close no interval (creation / policy / reset req).
         pub(crate) closing_leaf_periods: Vec<(DeviceIdentity, Uuid)>,
         /// For an edge that TERMINALIZES an existing participant period (a
-        /// `zeroLeafLeave` self-removal of a leafless/pending participant): the
+        /// Policy/leave removal): the
         /// exact active `chat.participants.participant_period_id` to close. The
         /// removed participant is NOT in the successor hydration, so its period id
         /// cannot come from `participant_period_ids`; the facade queries
         /// `chat.participants` for it under lock. Empty for every other edge.
-        pub(crate) closing_participant_periods: Vec<(DeviceIdentity, Uuid)>,
+        pub(crate) closing_participant_periods: Vec<(PrincipalId, Uuid)>,
         /// For a `reset request` edge: the exact `chat.reset_requests` row content
         /// the signed request carries (reason + signed material + expiry). `None`
         /// for every other edge.
@@ -16004,6 +16026,7 @@ mod executor {
         }
 
         let mut add_count = 0usize;
+        let mut removed_principals = BTreeSet::new();
         for change in effects.participant_changes() {
             match (change.before(), change.after()) {
                 (None, Some(after)) => {
@@ -16071,10 +16094,26 @@ mod executor {
                         ));
                     }
                 }
-                (Some(_), None) => {
-                    return Err(ExecutorError::UnsupportedEffect(
-                        "policy participant Remove",
-                    ))
+                (Some(before), None) => {
+                    if signed_authority.is_none() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "policy Remove lacks signed authority",
+                        ));
+                    }
+                    let matching_removes = body_changes
+                        .iter()
+                        .filter(|body| {
+                            matches!(body, ManifestParticipantChange::Remove(principal)
+                                if principal == before.principal())
+                        })
+                        .count();
+                    if matching_removes != 1
+                        || !removed_principals.insert(before.principal().clone())
+                    {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "policy Remove participant delta is not exact",
+                        ));
+                    }
                 }
                 (None, None) => {
                     return Err(ExecutorError::InconsistentPlan(
@@ -16087,6 +16126,60 @@ mod executor {
             return Err(ExecutorError::InconsistentPlan(
                 "policy participant period ids do not match Add deltas",
             ));
+        }
+        if ctx.closing_participant_periods.len() != removed_principals.len()
+            || ctx
+                .closing_participant_periods
+                .iter()
+                .any(|(principal, _)| {
+                    !removed_principals.contains(principal)
+                        || ctx
+                            .closing_participant_periods
+                            .iter()
+                            .filter(|(candidate, _)| candidate == principal)
+                            .count()
+                            != 1
+                })
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "policy closing participant periods do not match Remove deltas",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn terminalize_policy_participants(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+        ctx: &ExecutionContext,
+        transition_id: Uuid,
+        seq_i64: i64,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        for removed in effects.participant_changes().iter().filter_map(|change| {
+            match (change.before(), change.after()) {
+                (Some(before), None) => Some(before),
+                _ => None,
+            }
+        }) {
+            let participant_period_id = ctx
+                .closing_participant_periods
+                .iter()
+                .find(|(principal, _)| principal == removed.principal())
+                .map(|(_, period_id)| *period_id)
+                .ok_or(ExecutorError::MissingContext(
+                    "closing participant period id for policy Remove",
+                ))?;
+            transition::terminalize_participant_period(
+                transaction,
+                &transition::ParticipantTerminalization {
+                    participant_period_id,
+                    removing_transition_id: transition_id,
+                    removing_seq: seq_i64,
+                    removed_at: applied_at,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -18772,7 +18865,7 @@ mod executor {
         let participant_period_id = ctx
             .closing_participant_periods
             .iter()
-            .find(|(device, _)| device.principal() == removed.principal())
+            .find(|(principal, _)| principal == removed.principal())
             .map(|(_, id)| *id)
             .ok_or(ExecutorError::MissingContext(
                 "closing participant period id for the leave requester",
@@ -19501,6 +19594,15 @@ mod executor {
             true,
         )
         .await?;
+        terminalize_policy_participants(
+            transaction,
+            effects,
+            ctx,
+            transition_id,
+            seq_i64,
+            applied_at,
+        )
+        .await?;
 
         // 7. Audience + events.
         let recipients = build_entry_recipients(&ctx.entry_recipients)?;
@@ -19713,7 +19815,7 @@ mod executor {
         let participant_period_id = ctx
             .closing_participant_periods
             .iter()
-            .find(|(device, _)| device.principal() == removed.principal())
+            .find(|(principal, _)| principal == removed.principal())
             .map(|(_, id)| *id)
             .ok_or(ExecutorError::MissingContext(
                 "closing participant period id for the zero-leaf leaver",
@@ -21825,6 +21927,7 @@ mod executor {
                     continue;
                 }
                 (None, Some(after)) => after,
+                (Some(_), None) if allow_role_changes => continue,
                 _ => {
                     return Err(ExecutorError::UnsupportedEffect(
                         "participant change is not an insert or policy role change",

@@ -652,7 +652,7 @@ async fn closing_leaf_periods(
 async fn closing_participant_periods(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
-) -> Result<Vec<(DeviceIdentity, Uuid)>, ExecutionContextHydrationError> {
+) -> Result<Vec<(PrincipalId, Uuid)>, ExecutionContextHydrationError> {
     let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
     let mut periods = Vec::new();
     for change in plan.effects().participant_changes() {
@@ -661,23 +661,20 @@ async fn closing_participant_periods(
         };
         let did = String::from_utf8(before.principal().as_bytes().to_vec())
             .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
-        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+        let period_id: Option<Uuid> = sqlx::query_scalar(
             r#"
-            SELECT p.participant_period_id,d.device_id
-              FROM chat.participants AS p
-              JOIN chat.devices AS d ON d.user_did=p.user_did
-             WHERE p.conversation_id=$1 AND p.user_did=$2 AND p.current_membership
-             ORDER BY (d.status='active') DESC,uuid_send(d.device_id)
-             LIMIT 1
-             FOR SHARE OF p,d
+            SELECT participant_period_id
+              FROM chat.participants
+             WHERE conversation_id=$1 AND user_did=$2 AND current_membership
+             FOR SHARE
             "#,
         )
         .bind(conversation_id)
         .bind(&did)
         .fetch_optional(&mut **transaction)
         .await?;
-        let (period_id, device_id) = row.ok_or(ExecutionContextHydrationError::PeriodMismatch)?;
-        periods.push((device_identity(did, device_id)?, period_id));
+        let period_id = period_id.ok_or(ExecutionContextHydrationError::PeriodMismatch)?;
+        periods.push((before.principal().clone(), period_id));
     }
     periods.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(periods)

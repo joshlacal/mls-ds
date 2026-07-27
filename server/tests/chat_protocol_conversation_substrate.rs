@@ -5545,7 +5545,7 @@ mod historical_control_loader {
             AllocatedProjectionRevisionGuard as PolicyProjectionRevisionGuard, ProjectionClock,
             ProjectionOperationScope, PublicGet, PublicResponse, PublicTransport,
             RelationshipAuthority, RelationshipProjection, TransportError,
-            TrustedRelationshipDecisionInstant, TrustedRelationshipPersistenceInstant,
+            TrustedRelationshipPersistenceInstant,
         };
         use crate::chat_protocol::repository::auth::{
             authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
@@ -5578,6 +5578,7 @@ mod historical_control_loader {
             allocate_projection_revision, load_fallback_relationship_projection,
             persist_relationship_projection, seal_group_creation_fallback_scope,
             seal_group_creation_no_pending_admission, seal_non_add_policy_no_pending_admission,
+            LockedRelationshipDecisionGuard,
         };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
@@ -9417,6 +9418,7 @@ mod historical_control_loader {
             plan: &ConversationPersistencePlan,
             context: &ExecutionContext,
             trusted_at: DateTime<Utc>,
+            expected_audience: &[(String, Uuid)],
         ) {
             let coordinate = plan
                 .successor_coordinate()
@@ -9770,21 +9772,9 @@ mod historical_control_loader {
             .fetch_all(&mut **tx)
             .await
             .expect("project exact Creation entry audience");
-            let expected_entry_recipients = context
-                .entry_recipients
+            let expected_entry_recipients = expected_audience
                 .iter()
-                .map(|(device, kind)| {
-                    (
-                        String::from_utf8(device.principal().as_bytes().to_vec()).unwrap(),
-                        Uuid::from_bytes(*device.device_id()),
-                        match kind {
-                            EntryEntitlementKind::Control => "control",
-                            EntryEntitlementKind::IntervalClose => "intervalClose",
-                            EntryEntitlementKind::ScheduleTerminal => "scheduleTerminal",
-                        }
-                        .to_owned(),
-                    )
-                })
+                .map(|(did, device_id)| (did.clone(), *device_id, "control".to_owned()))
                 .collect::<Vec<_>>();
             assert_eq!(entry_recipients, expected_entry_recipients);
 
@@ -9841,23 +9831,10 @@ mod historical_control_loader {
                 .fetch_all(&mut **tx)
                 .await
                 .expect("project exact Creation event audience");
-                let expected_fanout = event
-                    .recipients
+                let expected_fanout = expected_audience
                     .iter()
-                    .map(|(device, kind, predecessor)| {
-                        (
-                            String::from_utf8(device.principal().as_bytes().to_vec()).unwrap(),
-                            Uuid::from_bytes(*device.device_id()),
-                            match kind {
-                                EventEntitlementKind::Participant => "participant",
-                                EventEntitlementKind::Leaf => "leaf",
-                                EventEntitlementKind::Welcome => "welcome",
-                                EventEntitlementKind::Recovery => "recovery",
-                                EventEntitlementKind::HistoricalSchedule => "historicalSchedule",
-                            }
-                            .to_owned(),
-                            *predecessor,
-                        )
+                    .map(|(did, device_id)| {
+                        (did.clone(), *device_id, "participant".to_owned(), None)
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(actual_fanout, expected_fanout);
@@ -10112,7 +10089,7 @@ mod historical_control_loader {
             registration: &LockedRegistrationProjection,
             relationship: &RelationshipProjection,
             relationship_authority: &RelationshipAuthority<T>,
-            relationship_decision: &TrustedRelationshipDecisionInstant,
+            relationship_decision: &LockedRelationshipDecisionGuard,
             trusted: &TrustedRequestInstant,
             trusted_at: DateTime<Utc>,
             dpop_jkt: &str,
@@ -10236,13 +10213,61 @@ mod historical_control_loader {
                         relationship_decision,
                         trusted,
                     )
-                    .expect_err("production Creation planner must deny an exceeded quota");
+                    .expect_err(
+                        "a relationship decision sealed before quota drift must fail closed",
+                    );
                 assert!(
                     matches!(
                         error,
+                        crate::chat_protocol::state_machine::StateMachineError::InvalidHydrationAuthority
+                    ),
+                    "{dimension} stale-decision reuse returned {error:?}"
+                );
+
+                let fresh_quota = hydrate_locked_invitation_quota(
+                    tx,
+                    &entry.actor_did,
+                    std::slice::from_ref(&invitee.did),
+                    trusted_at,
+                )
+                .await
+                .expect("rehydrate exact over-limit quota for a fresh decision");
+                let fresh_scope =
+                    seal_group_creation_fallback_scope(head, &fresh_quota, registration)
+                        .expect("re-seal over-limit Creation fallback scope");
+                let (fresh_relationship, fresh_decision) =
+                    load_fallback_relationship_projection(tx, fresh_scope, relationship_authority)
+                        .await
+                        .expect("reload over-limit fallback projection")
+                        .expect("fresh over-limit fallback remains present");
+                let fresh_verified =
+                    decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                        .expect("verify freshly sealed over-limit Creation");
+                let fresh_verified = rebind_persisted_control_entry(
+                    fresh_verified,
+                    &entry.raw_wrapper,
+                    &entry.public_key,
+                )
+                .expect("retain freshly sealed over-limit Creation wrapper");
+                let fresh_error = hydration
+                    .plan_creation(
+                        fresh_verified,
+                        registration,
+                        Some(head),
+                        None,
+                        &fresh_relationship,
+                        relationship_authority,
+                        fresh_quota,
+                        &fresh_decision,
+                        trusted,
+                    )
+                    .expect_err("freshly sealed over-limit Creation must hit policy denial");
+                assert!(
+                    matches!(
+                        fresh_error,
                         crate::chat_protocol::state_machine::StateMachineError::InvalidPolicyAuthority
                     ),
-                    "{dimension} denial returned {error:?}"
+                    "{dimension} fresh over-limit decision returned {fresh_error:?}"
                 );
 
                 sqlx::query(&format!("ROLLBACK TO SAVEPOINT {savepoint}"))
@@ -10660,6 +10685,48 @@ mod historical_control_loader {
                 .await
                 .expect("release stale quota transaction");
 
+            let mut foreign_decision_tx = pool.begin().await.expect("begin foreign decision proof");
+            let foreign_business =
+                recheck_business_authority(&mut foreign_decision_tx, &verified_request)
+                    .await
+                    .expect("recheck actor authority for foreign decision");
+            let foreign_head =
+                hydrate_locked_creation_head(&mut foreign_decision_tx, conversation_id, trusted_at)
+                    .await
+                    .expect("lock foreign-decision absent head");
+            let foreign_quota = hydrate_locked_invitation_quota(
+                &mut foreign_decision_tx,
+                &entry.actor_did,
+                std::slice::from_ref(&invitee.did),
+                trusted_at,
+            )
+            .await
+            .expect("lock foreign-decision quota");
+            let foreign_hydration = HydrationAuthority::from_locked_creation_head(&foreign_head)
+                .expect("mint foreign-decision hydration");
+            let foreign_registration = foreign_hydration
+                .locked_registration_from_guard(foreign_business)
+                .expect("seal foreign-decision registration");
+            let foreign_scope = seal_group_creation_fallback_scope(
+                &foreign_head,
+                &foreign_quota,
+                &foreign_registration,
+            )
+            .expect("seal foreign-decision scope");
+            let (foreign_relationship, foreign_relationship_decision) =
+                load_fallback_relationship_projection(
+                    &mut foreign_decision_tx,
+                    foreign_scope,
+                    &authority,
+                )
+                .await
+                .expect("load foreign transaction relationship projection")
+                .expect("fresh fallback is present for foreign transaction");
+            foreign_decision_tx
+                .rollback()
+                .await
+                .expect("release foreign relationship decision transaction");
+
             let mut tx = pool
                 .begin()
                 .await
@@ -10694,6 +10761,40 @@ mod historical_control_loader {
                     .await
                     .expect("load production fallback projection")
                     .expect("fresh fallback is present");
+            let cross_transaction_quota = hydrate_locked_invitation_quota(
+                &mut tx,
+                &entry.actor_did,
+                std::slice::from_ref(&invitee.did),
+                trusted_at,
+            )
+            .await
+            .expect("rehydrate current quota for cross-transaction decision proof");
+            let cross_transaction_entry =
+                decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                    .expect("verify cross-transaction-decision Creation");
+            let cross_transaction_entry = rebind_persisted_control_entry(
+                cross_transaction_entry,
+                &entry.raw_wrapper,
+                &entry.public_key,
+            )
+            .expect("retain cross-transaction-decision wrapper");
+            let cross_transaction_error = hydration
+                .plan_creation(
+                    cross_transaction_entry,
+                    &registration,
+                    Some(&head),
+                    None,
+                    &foreign_relationship,
+                    &authority,
+                    cross_transaction_quota,
+                    &foreign_relationship_decision,
+                    &trusted,
+                )
+                .expect_err("a relationship decision from another transaction must fail closed");
+            assert!(matches!(
+                cross_transaction_error,
+                crate::chat_protocol::state_machine::StateMachineError::InvalidHydrationAuthority
+            ));
             assert_g6_creation_quota_denials(
                 &mut tx,
                 &entry,
@@ -10856,7 +10957,19 @@ mod historical_control_loader {
                 .execute(&mut *tx)
                 .await
                 .expect("force all deferred Creation constraints");
-            assert_exact_g6_creation_persistence(&mut tx, &plan, &context, trusted_at).await;
+            let mut expected_audience = vec![
+                (entry.actor_did.clone(), entry.actor_device_id),
+                (invitee.did.clone(), invitee.device_id),
+            ];
+            expected_audience.sort();
+            assert_exact_g6_creation_persistence(
+                &mut tx,
+                &plan,
+                &context,
+                trusted_at,
+                &expected_audience,
+            )
+            .await;
             let inviter_after_creation: i64 = sqlx::query_scalar(
                 r#"SELECT count(*) FROM chat.participants
                     WHERE current_membership AND status='pending'
@@ -10877,6 +10990,10 @@ mod historical_control_loader {
             .expect("read invited Creation participant count");
             assert_eq!(participants_after_creation, 2);
 
+            sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                .execute(&mut *tx)
+                .await
+                .expect("restore deferred constraints before the atomic Policy write set");
             let calls_before_non_add_policy =
                 CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst);
             let locked_invited =
@@ -10981,16 +11098,197 @@ mod historical_control_loader {
             );
             assert_eq!(non_add_planned.effects().before_counts().participants(), 2);
             assert_eq!(non_add_planned.effects().after_counts().participants(), 1);
-            let post_policy_participants: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM chat.participants WHERE conversation_id=$1",
+            let non_add_plan = non_add_planned
+                .into_persistence_plan()
+                .expect("seal complete non-add Policy persistence plan");
+            let non_add_context = hydrate_execution_context(
+                &mut tx,
+                &non_add_plan,
+                ExecutionContextArtifacts {
+                    accepted_control_entry_bytes: Some(
+                        non_add_policy.entry.accepted_payload_bytes.clone(),
+                    ),
+                    genesis_group_info_bytes: None,
+                    primary_event_payload: Some(b"{\"kind\":\"g6PolicyRemove\"}".to_vec()),
+                    welcome_disposition_event_payloads: Vec::new(),
+                },
+            )
+            .await
+            .expect("hydrate exact production non-add Policy execution context");
+            let non_add_applied =
+                apply_conversation_persistence_plan(&mut tx, &non_add_plan, &non_add_context)
+                    .await
+                    .expect("apply complete non-add Policy persistence plan");
+            assert_eq!(non_add_applied.allocated_seq, 2);
+            assert_eq!(non_add_applied.event_positions.len(), 1);
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tx)
+                .await
+                .expect("force all deferred non-add Policy constraints");
+
+            let policy_head: (i64, i64, i64, String) = sqlx::query_as(
+                "SELECT current_generation,current_state_version,next_entry_seq,lifecycle \
+                   FROM chat.conversations WHERE conversation_id=$1",
             )
             .bind(conversation_id)
             .fetch_one(&mut *tx)
             .await
-            .expect("read rollback-only pre-Policy participant count");
+            .expect("project post-Policy head");
+            assert_eq!(policy_head, (0, 1, 3, "active".to_owned()));
+            let policy_generation: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,count(*) OVER() \
+                   FROM chat.generations WHERE conversation_id=$1 AND generation=0",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project post-Policy generation pointer");
+            assert_eq!(policy_generation, (1, 1));
+            let policy_state_exact: bool = sqlx::query_scalar(
+                "SELECT count(*)=1 AND bool_and(state_kind='policy' AND lifecycle='active' \
+                    AND producing_transition_id=$2 AND created_at=$3) \
+                   FROM chat.generation_states \
+                  WHERE conversation_id=$1 AND generation=0 AND state_version=1",
+            )
+            .bind(conversation_id)
+            .bind(non_add_policy.transition_id)
+            .bind(trusted_at)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project exact Policy generation state");
+            assert!(policy_state_exact);
+            let policy_entry_transition: (i64, i64) = sqlx::query_as(
+                "SELECT \
+                    (SELECT count(*) FROM chat.entries \
+                      WHERE conversation_id=$1 AND seq=2 AND entry_id=$2), \
+                    (SELECT count(*) FROM chat.transitions \
+                      WHERE conversation_id=$1 AND transition_id=$3 \
+                        AND kind='policy' AND entry_seq=2)",
+            )
+            .bind(conversation_id)
+            .bind(non_add_policy.entry.entry_id)
+            .bind(non_add_policy.transition_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project exact Policy entry and transition");
+            assert_eq!(policy_entry_transition, (1, 1));
+
+            let participant_counts: (i64, i64) = sqlx::query_as(
+                "SELECT count(*),count(*) FILTER (WHERE current_membership) \
+                   FROM chat.participants WHERE conversation_id=$1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read durable post-Policy participant counts");
+            assert_eq!(participant_counts, (2, 1));
+            let removed_exact: bool = sqlx::query_scalar(
+                "SELECT count(*)=1 AND bool_and(\
+                    status='pending' AND NOT current_membership \
+                    AND removing_transition_id=$3 AND removing_seq=2 AND removed_at=$4) \
+                   FROM chat.participants \
+                  WHERE conversation_id=$1 AND user_did=$2",
+            )
+            .bind(conversation_id)
+            .bind(&invitee.did)
+            .bind(non_add_policy.transition_id)
+            .bind(trusted_at)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project exact terminalized invitee period");
+            assert!(removed_exact);
+            let post_policy_pending_quota: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.participants \
+                  WHERE current_membership AND status='pending' \
+                    AND created_by_did=$1 AND invited_at >= now() - INTERVAL '24 hours'",
+            )
+            .bind(&entry.actor_did)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("project post-Policy pending quota");
+            assert_eq!(post_policy_pending_quota, 0);
+            let unchanged_crypto_rows: (i64, i64) = sqlx::query_as(
+                "SELECT \
+                    (SELECT count(*) FROM chat.member_devices \
+                      WHERE conversation_id=$1 AND active), \
+                    (SELECT count(*) FROM chat.application_intervals \
+                      WHERE conversation_id=$1 AND removed_at IS NULL)",
+            )
+            .bind(conversation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("prove Policy removed no leaf or interval");
+            assert_eq!(unchanged_crypto_rows, (1, 1));
+
+            let policy_entry_audience: Vec<(String, Uuid, String)> = sqlx::query_as(
+                "SELECT user_did,device_id,entitlement_kind \
+                   FROM chat.entry_recipients WHERE conversation_id=$1 AND seq=2 \
+                  ORDER BY user_did COLLATE \"C\",device_id",
+            )
+            .bind(conversation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("project independent Policy entry audience");
+            let expected_policy_entry_audience = expected_audience
+                .iter()
+                .map(|(did, device)| (did.clone(), *device, "control".to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(policy_entry_audience, expected_policy_entry_audience);
+            assert_eq!(non_add_context.events.len(), 1);
             assert_eq!(
-                post_policy_participants, 2,
-                "planning the non-add Policy performs no persistence itself"
+                non_add_context.events[0].event_kind,
+                EventKind::ConversationChanged
+            );
+            let policy_event_position = non_add_applied.event_positions[0];
+            let policy_event_audience: Vec<(String, Uuid, String, Option<i64>)> = sqlx::query_as(
+                "SELECT user_did,device_id,entitlement_kind,audience_predecessor_position \
+                       FROM chat.event_recipients WHERE event_position=$1 \
+                      ORDER BY user_did COLLATE \"C\",device_id",
+            )
+            .bind(policy_event_position)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("project independent Policy event audience");
+            let expected_policy_event_audience = expected_audience
+                .iter()
+                .map(|(did, device)| {
+                    (
+                        did.clone(),
+                        *device,
+                        "participant".to_owned(),
+                        Some(applied.event_positions[0]),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(policy_event_audience, expected_policy_event_audience);
+            let policy_outbox: Vec<(String, String)> = sqlx::query_as(
+                "SELECT work_kind,status FROM chat.outbox \
+                  WHERE event_position=$1 ORDER BY work_kind",
+            )
+            .bind(policy_event_position)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("project exact Policy stream outbox");
+            assert_eq!(
+                policy_outbox,
+                vec![("stream".to_owned(), "pending".to_owned())]
+            );
+            let exact_event_set: Vec<String> = sqlx::query_scalar(
+                "SELECT event_kind FROM chat.events WHERE event_id=ANY($1) ORDER BY event_position",
+            )
+            .bind(vec![
+                context.events[0].event_id,
+                non_add_context.events[0].event_id,
+            ])
+            .fetch_all(&mut *tx)
+            .await
+            .expect("project exact Creation plus Policy event set");
+            assert_eq!(
+                exact_event_set,
+                vec![
+                    "conversationChanged".to_owned(),
+                    "conversationChanged".to_owned()
+                ]
             );
             assert_eq!(
                 CREATION_RELATIONSHIP_CALLS.load(AtomicOrdering::SeqCst),
@@ -11002,6 +11300,7 @@ mod historical_control_loader {
                 .await
                 .expect("rollback all conversation-scoped Creation writes");
             assert_zero_g6_creation_residue(&pool, conversation_id, &context).await;
+            assert_zero_g6_creation_residue(&pool, conversation_id, &non_add_context).await;
 
             let (wrong_leaf_entry, _wrong_group_info) =
                 rebind_creation_to_a_different_leaf_key(entry, trusted_at);

@@ -17,15 +17,19 @@
 
 use std::collections::BTreeSet;
 
+#[cfg(test)]
+use std::ops::Deref;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
 use uuid::{Uuid, Variant, Version};
 
 use super::super::relationship_policy::{
+    consume_admission_projection, consume_block_projection, consume_traffic_projection,
     fixed_production_relationship_policy_config,
     hydrate_persisted_fallback_relationship_projection,
-    hydrate_persisted_fallback_traffic_projection, AdmissionOperation,
+    hydrate_persisted_fallback_traffic_projection, AdmissionOperation, AdmissionRequest,
     DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy, PersistedDeclarationEvidence,
     PersistedGraphRelationshipEvidence, PersistedRelationshipProjection,
     PersistedTrafficProjection, ProjectionOperationScope, ProjectionScope, PublicTransport,
@@ -70,6 +74,12 @@ pub(crate) enum RelationshipRepositoryError {
     Database(sqlx::Error),
     InvalidProjection,
     InvalidAuthorityConfiguration(RelationshipPolicyConfigError),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RelationshipConsumptionError {
+    InvalidWitness,
+    PolicyDenied,
 }
 
 impl From<sqlx::Error> for RelationshipRepositoryError {
@@ -121,6 +131,50 @@ pub(crate) struct LockedTrafficFallbackScope {
     scope: TrafficGraphScope,
     authenticated_actor_digest: [u8; 32],
     durable_read_set_digest: [u8; 32],
+}
+
+/// The projection and its decision clock may leave the repository together,
+/// but their transaction/read-set binding remains repository-owned. Consumers
+/// must present the current durable guards again; the repository re-seals the
+/// scope and rejects any cross-transaction or stale-read-set pairing before
+/// invoking the pure relationship policy.
+pub(crate) struct LockedRelationshipDecisionGuard {
+    transaction_id: String,
+    operation_scope: ProjectionOperationScope,
+    scope: ProjectionScope,
+    authenticated_actor_digest: [u8; 32],
+    durable_read_set_digest: [u8; 32],
+    decision: TrustedRelationshipDecisionInstant,
+}
+
+/// Traffic analogue of `LockedRelationshipDecisionGuard`.
+pub(crate) struct LockedTrafficDecisionGuard {
+    transaction_id: String,
+    scope: TrafficGraphScope,
+    authenticated_actor_digest: [u8; 32],
+    durable_read_set_digest: [u8; 32],
+    decision: TrustedRelationshipDecisionInstant,
+}
+
+// Existing repository-policy tests intentionally exercise the pure consumer.
+// Deref keeps that test seam available without exposing a raw decision from
+// production state-machine APIs.
+#[cfg(test)]
+impl Deref for LockedRelationshipDecisionGuard {
+    type Target = TrustedRelationshipDecisionInstant;
+
+    fn deref(&self) -> &Self::Target {
+        &self.decision
+    }
+}
+
+#[cfg(test)]
+impl Deref for LockedTrafficDecisionGuard {
+    type Target = TrustedRelationshipDecisionInstant;
+
+    fn deref(&self) -> &Self::Target {
+        &self.decision
+    }
 }
 
 /// Closed authority for the exact branch where a signed Creation or Policy
@@ -197,7 +251,6 @@ impl LockedNoPendingAdmissionGuard {
             && self.inviter_did == quota.inviter_did()
             && registration.actor().principal().as_bytes() == self.inviter_did.as_bytes()
             && quota.new_recipient_dids().is_empty()
-            && quota.recipient_facts().is_empty()
             && self.head_digest == *head.durable_row_digest()
             && self.quota_digest == *quota.durable_row_digest()
             && self.registration_digest == *registration.durable_row_digest()
@@ -582,7 +635,6 @@ pub(crate) fn seal_group_creation_no_pending_admission(
         || head.next_entry_seq() != 1
         || head.transaction_id() != quota.transaction_id()
         || !quota.new_recipient_dids().is_empty()
-        || !quota.recipient_facts().is_empty()
         || head.durable_row_digest() == &[0; 32]
         || quota.durable_row_digest() == &[0; 32]
     {
@@ -636,7 +688,6 @@ pub(crate) fn seal_non_add_policy_no_pending_admission(
     let head = locked.head();
     if head.transaction_id() != quota.transaction_id()
         || !quota.new_recipient_dids().is_empty()
-        || !quota.recipient_facts().is_empty()
         || head.durable_row_digest() == &[0; 32]
         || locked.locked_graph_digest() == &[0; 32]
         || quota.durable_row_digest() == &[0; 32]
@@ -1219,7 +1270,7 @@ pub(crate) async fn persist_traffic_projection(
 pub(crate) async fn observe_locked_relationship_decision(
     transaction: &mut Transaction<'_, Postgres>,
     locked_scope: LockedRelationshipFallbackScope,
-) -> Result<TrustedRelationshipDecisionInstant, RelationshipRepositoryError> {
+) -> Result<LockedRelationshipDecisionGuard, RelationshipRepositoryError> {
     let (
         transaction_id,
         operation_scope,
@@ -1229,34 +1280,49 @@ pub(crate) async fn observe_locked_relationship_decision(
     ) = locked_scope.into_parts();
     require_witness_transaction(transaction, &transaction_id).await?;
     let observed_at = observe_post_lock_time(transaction).await?;
-    TrustedRelationshipDecisionInstant::from_locked_relationship_scope(
+    let decision = TrustedRelationshipDecisionInstant::from_locked_relationship_scope(
+        transaction_id.clone(),
+        operation_scope,
+        scope.clone(),
+        authenticated_actor_digest,
+        durable_read_set_digest,
+        observed_at,
+    )
+    .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    Ok(LockedRelationshipDecisionGuard {
         transaction_id,
         operation_scope,
         scope,
         authenticated_actor_digest,
         durable_read_set_digest,
-        observed_at,
-    )
-    .ok_or(RelationshipRepositoryError::InvalidProjection)
+        decision,
+    })
 }
 
 /// Traffic equivalent of `observe_locked_relationship_decision`.
 pub(crate) async fn observe_locked_traffic_decision(
     transaction: &mut Transaction<'_, Postgres>,
     locked_scope: LockedTrafficFallbackScope,
-) -> Result<TrustedRelationshipDecisionInstant, RelationshipRepositoryError> {
+) -> Result<LockedTrafficDecisionGuard, RelationshipRepositoryError> {
     let (transaction_id, scope, authenticated_actor_digest, durable_read_set_digest) =
         locked_scope.into_parts();
     require_witness_transaction(transaction, &transaction_id).await?;
     let observed_at = observe_post_lock_time(transaction).await?;
-    TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
-        transaction_id,
-        scope,
+    let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
+        transaction_id.clone(),
+        scope.clone(),
         authenticated_actor_digest,
         durable_read_set_digest,
         observed_at,
     )
-    .ok_or(RelationshipRepositoryError::InvalidProjection)
+    .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+    Ok(LockedTrafficDecisionGuard {
+        transaction_id,
+        scope,
+        authenticated_actor_digest,
+        durable_read_set_digest,
+        decision,
+    })
 }
 
 /// Load only fallback evidence for one exact operation and structural scope.
@@ -1268,7 +1334,7 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
     locked_scope: LockedRelationshipFallbackScope,
     authority: &RelationshipAuthority<T>,
 ) -> Result<
-    Option<(RelationshipProjection, TrustedRelationshipDecisionInstant)>,
+    Option<(RelationshipProjection, LockedRelationshipDecisionGuard)>,
     RelationshipRepositoryError,
 > {
     let (
@@ -1304,7 +1370,7 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
         return Ok(None);
     }
     let decision = TrustedRelationshipDecisionInstant::from_locked_relationship_scope(
-        transaction_id,
+        transaction_id.clone(),
         operation_scope,
         scope.clone(),
         authenticated_actor_digest,
@@ -1313,9 +1379,21 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
     )
     .ok_or(RelationshipRepositoryError::InvalidProjection)?;
     let values = relationship_values(snapshot, scope.clone(), declarations, relationships)?;
-    let guard = relationship_load_guard(operation_scope, scope);
-    hydrate_persisted_fallback_relationship_projection(values, guard, authority, &decision)
-        .map(|projection| Some((projection, decision)))
+    let load_guard = relationship_load_guard(operation_scope, scope.clone());
+    hydrate_persisted_fallback_relationship_projection(values, load_guard, authority, &decision)
+        .map(|projection| {
+            Some((
+                projection,
+                LockedRelationshipDecisionGuard {
+                    transaction_id,
+                    operation_scope,
+                    scope,
+                    authenticated_actor_digest,
+                    durable_read_set_digest,
+                    decision,
+                },
+            ))
+        })
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)
 }
 
@@ -1324,10 +1402,7 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     locked_scope: LockedTrafficFallbackScope,
     authority: &RelationshipAuthority<T>,
-) -> Result<
-    Option<(TrafficProjection, TrustedRelationshipDecisionInstant)>,
-    RelationshipRepositoryError,
-> {
+) -> Result<Option<(TrafficProjection, LockedTrafficDecisionGuard)>, RelationshipRepositoryError> {
     let (transaction_id, scope, authenticated_actor_digest, durable_read_set_digest) =
         locked_scope.into_parts();
     require_witness_transaction(transaction, &transaction_id).await?;
@@ -1359,7 +1434,7 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
         return Ok(None);
     }
     let decision = TrustedRelationshipDecisionInstant::from_locked_traffic_scope(
-        transaction_id,
+        transaction_id.clone(),
         scope.clone(),
         authenticated_actor_digest,
         durable_read_set_digest,
@@ -1367,10 +1442,181 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
     )
     .ok_or(RelationshipRepositoryError::InvalidProjection)?;
     let values = traffic_values(snapshot, scope.clone(), relationships)?;
-    let guard = traffic_load_guard(scope);
-    hydrate_persisted_fallback_traffic_projection(values, guard, authority, &decision)
-        .map(|projection| Some((projection, decision)))
+    let load_guard = traffic_load_guard(scope.clone());
+    hydrate_persisted_fallback_traffic_projection(values, load_guard, authority, &decision)
+        .map(|projection| {
+            Some((
+                projection,
+                LockedTrafficDecisionGuard {
+                    transaction_id,
+                    scope,
+                    authenticated_actor_digest,
+                    durable_read_set_digest,
+                    decision,
+                },
+            ))
+        })
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)
+}
+
+fn consume_resealed_relationship_projection<T: PublicTransport>(
+    projection: &RelationshipProjection,
+    decision_guard: &LockedRelationshipDecisionGuard,
+    current_scope: LockedRelationshipFallbackScope,
+    expected_scope: &ProjectionScope,
+    authority: &RelationshipAuthority<T>,
+    quota_would_exceed: bool,
+) -> Result<(), RelationshipConsumptionError> {
+    if decision_guard.transaction_id != current_scope.transaction_id
+        || decision_guard.operation_scope != current_scope.operation_scope
+        || decision_guard.scope != current_scope.scope
+        || decision_guard.authenticated_actor_digest != current_scope.authenticated_actor_digest
+        || decision_guard.durable_read_set_digest != current_scope.durable_read_set_digest
+        || &current_scope.scope != expected_scope
+        || !decision_guard
+            .decision
+            .relationship_scope_matches(current_scope.operation_scope, &current_scope.scope)
+    {
+        return Err(RelationshipConsumptionError::InvalidWitness);
+    }
+    match &current_scope.scope {
+        ProjectionScope::Admission(request) => consume_admission_projection(
+            projection,
+            current_scope.operation_scope,
+            request,
+            authority,
+            &decision_guard.decision,
+            quota_would_exceed,
+        ),
+        ProjectionScope::BlockOnly(scope) => consume_block_projection(
+            projection,
+            current_scope.operation_scope,
+            &scope.members,
+            authority,
+            &decision_guard.decision,
+        ),
+    }
+    .map_err(|_| RelationshipConsumptionError::PolicyDenied)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn consume_locked_creation_projection<T: PublicTransport>(
+    projection: &RelationshipProjection,
+    decision_guard: &LockedRelationshipDecisionGuard,
+    head: &LockedConversationHeadGuard,
+    quota: &LockedInvitationQuotaGuard,
+    direct_lookup: Option<&LockedDirectConversationLookupGuard>,
+    registration: &LockedRegistrationProjection,
+    expected_request: &AdmissionRequest,
+    quota_would_exceed: bool,
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let current_scope = seal_creation_fallback_scope(
+        head,
+        quota,
+        registration,
+        expected_request.operation,
+        direct_lookup,
+    )
+    .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    consume_resealed_relationship_projection(
+        projection,
+        decision_guard,
+        current_scope,
+        &ProjectionScope::Admission(expected_request.clone()),
+        authority,
+        quota_would_exceed,
+    )
+}
+
+pub(crate) fn consume_locked_pending_add_projection<T: PublicTransport>(
+    projection: &RelationshipProjection,
+    decision_guard: &LockedRelationshipDecisionGuard,
+    locked: &LockedConversationStateGuard,
+    quota: &LockedInvitationQuotaGuard,
+    registration: &LockedRegistrationProjection,
+    expected_request: &AdmissionRequest,
+    quota_would_exceed: bool,
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let current_scope = seal_pending_add_fallback_scope(locked, quota, registration)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    consume_resealed_relationship_projection(
+        projection,
+        decision_guard,
+        current_scope,
+        &ProjectionScope::Admission(expected_request.clone()),
+        authority,
+        quota_would_exceed,
+    )
+}
+
+pub(crate) fn consume_locked_acceptance_projection<T: PublicTransport>(
+    projection: &RelationshipProjection,
+    decision_guard: &LockedRelationshipDecisionGuard,
+    locked: &LockedConversationStateGuard,
+    registration: &LockedRegistrationProjection,
+    expected_request: &AdmissionRequest,
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let current_scope = seal_acceptance_fallback_scope(locked, registration)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    consume_resealed_relationship_projection(
+        projection,
+        decision_guard,
+        current_scope,
+        &ProjectionScope::Admission(expected_request.clone()),
+        authority,
+        false,
+    )
+}
+
+pub(crate) fn consume_locked_recovery_projection<T: PublicTransport>(
+    projection: &RelationshipProjection,
+    decision_guard: &LockedRelationshipDecisionGuard,
+    locked: &LockedConversationStateGuard,
+    registration: &LockedRegistrationProjection,
+    operation_scope: ProjectionOperationScope,
+    expected_roster: &[String],
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let current_scope = seal_recovery_fallback_scope(locked, registration, operation_scope)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    consume_resealed_relationship_projection(
+        projection,
+        decision_guard,
+        current_scope,
+        &ProjectionScope::BlockOnly(
+            plan_block_only_graph(expected_roster)
+                .map_err(|_| RelationshipConsumptionError::InvalidWitness)?
+                .scope,
+        ),
+        authority,
+        false,
+    )
+}
+
+pub(crate) fn consume_locked_traffic_projection<T: PublicTransport>(
+    projection: &TrafficProjection,
+    decision_guard: &LockedTrafficDecisionGuard,
+    locked: &LockedConversationStateGuard,
+    registration: &LockedRegistrationProjection,
+    authority: &RelationshipAuthority<T>,
+) -> Result<(), RelationshipConsumptionError> {
+    let current_scope = seal_traffic_fallback_scope(locked, registration)
+        .map_err(|_| RelationshipConsumptionError::InvalidWitness)?;
+    if decision_guard.transaction_id != current_scope.transaction_id
+        || decision_guard.scope != current_scope.scope
+        || decision_guard.authenticated_actor_digest != current_scope.authenticated_actor_digest
+        || decision_guard.durable_read_set_digest != current_scope.durable_read_set_digest
+        || !decision_guard
+            .decision
+            .traffic_scope_matches(&current_scope.scope)
+    {
+        return Err(RelationshipConsumptionError::InvalidWitness);
+    }
+    consume_traffic_projection(projection, authority, &decision_guard.decision)
+        .map_err(|_| RelationshipConsumptionError::PolicyDenied)
 }
 
 async fn require_witness_transaction(
