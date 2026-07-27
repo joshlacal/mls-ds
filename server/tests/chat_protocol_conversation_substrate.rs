@@ -15035,18 +15035,32 @@ mod historical_control_loader {
                             AND request.requester_device_id=$4
                             AND request.requester_key_id=$5
                             AND request.requester_auth_generation=1
+                            AND request.recovery_kind='replace'
+                            AND request.source='requestLeafRecovery'
                             AND request.bound_state_version=3
                             AND request.bound_group_id=$6
                             AND request.bound_epoch=$7
                             AND request.bound_group_context_hash=$8
                             AND request.bound_confirmation_tag=$9
+                            AND request.reservation_request_id=$1
+                            AND request.replaced_leaf_period_id=(
+                                SELECT leaf_period_id FROM chat.member_devices
+                                 WHERE conversation_id=$2 AND generation=0
+                                   AND user_did=$3 AND device_id=$4)
                             AND request.status='superseded'
                             AND request.signed_request_bytes=$10
                             AND request.signing_transcript_bytes=$11
                             AND request.request_digest=$12
                             AND request.signature=$13
                             AND request.requested_at=$14
+                            AND request.expires_at=$14 + interval '5 minutes'
+                            AND request.fulfilling_transition_id IS NULL
                             AND request.terminal_transition_id=$15
+                            AND request.terminal_revocation_id IS NULL
+                            AND request.terminal_signed_request_bytes IS NULL
+                            AND request.terminal_signing_transcript_bytes IS NULL
+                            AND request.terminal_request_digest IS NULL
+                            AND request.terminal_signature IS NULL
                             AND request.terminal_at=$16)
                            FROM chat.leaf_recovery_requests request
                           WHERE request.recovery_request_id=$1)
@@ -15066,8 +15080,13 @@ mod historical_control_loader {
                             AND reservation.bound_epoch=$7
                             AND reservation.bound_group_context_hash=$8
                             AND reservation.bound_confirmation_tag=$9
+                            AND reservation.purpose='leafRecovery'
+                            AND reservation.expires_at=$14 + interval '5 minutes'
                             AND reservation.status='released'
+                            AND reservation.consumed_transition_id IS NULL
                             AND reservation.terminal_transition_id=$15
+                            AND reservation.terminal_revocation_id IS NULL
+                            AND reservation.terminal_request_digest IS NULL
                             AND reservation.terminal_at=$16
                             AND reservation.created_at=$14)
                            FROM chat.key_package_reservations reservation
@@ -15076,15 +15095,18 @@ mod historical_control_loader {
                         (SELECT count(*)=1 AND bool_and(
                             package.wrapper_bytes=$18
                             AND package.wrapper_sha256=digest($18::bytea,'sha256')
+                            AND package.init_key=$20
                             AND package.owner_did=$3
                             AND package.owner_device_id=$4
                             AND package.owner_key_id=$5
                             AND package.owner_auth_generation=1
+                            AND package.not_before=$21
                             AND package.not_after=$19
                             AND package.status='available'
                             AND package.terminal_transition_id IS NULL
                             AND package.terminal_revocation_id IS NULL
-                            AND package.terminal_at IS NULL)
+                            AND package.terminal_at IS NULL
+                            AND package.created_at=$22)
                            FROM chat.key_packages package
                           WHERE package.key_package_ref=$17)"#,
                 )
@@ -15107,6 +15129,18 @@ mod historical_control_loader {
                 .bind(prior_bound_key_package_ref.to_vec())
                 .bind(&prior_bound_key_package_wrapper)
                 .bind(package_not_after)
+                .bind(
+                    Sha256::digest(
+                        [
+                            b"g6-reset-prior-bound-init".as_ref(),
+                            conversation_id.as_bytes(),
+                        ]
+                        .concat(),
+                    )
+                    .to_vec(),
+                )
+                .bind(package_not_before)
+                .bind(trusted_at)
                 .fetch_one(&mut *tx)
                 .await
                 .expect("read exact Reset recovery request/reservation/package release graph");
@@ -15117,7 +15151,8 @@ mod historical_control_loader {
 
                 let successor_leaf_exact: bool = sqlx::query_scalar(
                     r#"SELECT count(*)=1 AND bool_and(
-                            leaf.participant_period_id=participant.participant_period_id
+                            chat.is_uuid_v4(leaf.leaf_period_id)
+                            AND leaf.participant_period_id=participant.participant_period_id
                             AND participant.user_did=$2
                             AND participant.status='active'
                             AND participant.role='admin'
@@ -15138,7 +15173,8 @@ mod historical_control_loader {
                             AND leaf.removed_transition_id IS NULL
                             AND leaf.removed_seq IS NULL
                             AND leaf.removed_at IS NULL
-                            AND leaf.active)
+                            AND leaf.active
+                            AND leaf.created_at=$7)
                        FROM chat.member_devices leaf
                        JOIN chat.participants participant
                          ON participant.participant_period_id=leaf.participant_period_id
@@ -15150,6 +15186,7 @@ mod historical_control_loader {
                 .bind(&entry.public_key)
                 .bind(&entry.actor_key_id)
                 .bind(reset_activation.transition_id)
+                .bind(reset_activation_at)
                 .fetch_one(&mut *tx)
                 .await
                 .expect("read exact Reset successor leaf provenance");
@@ -15431,49 +15468,124 @@ mod historical_control_loader {
                     ],
                     "Reset must create exactly the retirement and successor spines"
                 );
-                let reset_entry_transition_exact: bool = sqlx::query_scalar(
-                    r#"SELECT count(*)=2 AND bool_and(
-                           (entry.seq=5 AND entry.entry_kind='blue.catbird.chat.defs#resetRequestEntry'
-                            AND entry.transition_id IS NULL
+                let expected_reset_request_role =
+                    if delegated_reset_request { "member" } else { "admin" };
+                let reset_request_entry_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=1 AND bool_and(
+                            entry.entry_id=$3
+                            AND entry.seq=5
+                            AND entry.entry_kind='blue.catbird.chat.defs#resetRequestEntry'
+                            AND entry.accepted_payload_bytes=$4
+                            AND entry.accepted_payload_sha256=digest($4::bytea,'sha256')
+                            AND entry.signed_request_bytes=$5
+                            AND entry.request_digest=$6
+                            AND entry.signature=$7
+                            AND entry.server_fields_bytes=$8
+                            AND entry.outer_entry_fingerprint=$9
+                            AND entry.actor_did=$10
+                            AND entry.actor_device_id=$11
+                            AND entry.actor_key_id=$12
+                            AND entry.actor_auth_generation=1
                             AND entry.generation IS NULL
                             AND entry.state_version IS NULL
-                            AND entry.accepted_payload_bytes=$2
-                            AND entry.signed_request_bytes=$3
-                            AND entry.received_at=$6)
-                           OR
-                           (entry.seq=6
-                            AND entry.entry_kind='blue.catbird.chat.defs#resetActivationEntry'
-                            AND transition.kind='resetActivation'
-                            AND transition.transition_id=$4
-                            AND transition.reset_request_id=$5
-                            AND entry.accepted_payload_bytes=$7
-                            AND entry.signed_request_bytes=$8
-                            AND entry.received_at=$9
-                            AND transition.prior_generation=0
-                            AND transition.prior_state_version=3
-                            AND transition.next_generation=1
-                            AND transition.next_state_version=0)
-                       )
-                      FROM chat.entries entry
-                      LEFT JOIN chat.transitions transition
-                        ON transition.transition_id=entry.transition_id
-                     WHERE entry.conversation_id=$1 AND entry.seq IN (5,6)
-                       AND (transition.conversation_id=$1
-                            OR transition.transition_id IS NULL)"#,
+                            AND entry.transition_id IS NULL
+                            AND entry.message_id IS NULL
+                            AND entry.received_at=$13
+                            AND request.reset_request_id=$2
+                            AND request.conversation_id=entry.conversation_id
+                            AND request.requester_did=entry.actor_did
+                            AND request.requester_device_id=entry.actor_device_id
+                            AND request.requester_key_id=entry.actor_key_id
+                            AND request.requester_auth_generation=entry.actor_auth_generation
+                            AND request.signed_request_bytes=entry.signed_request_bytes
+                            AND request.signing_transcript_bytes=$14
+                            AND request.request_digest=entry.request_digest
+                            AND request.signature=entry.signature
+                            AND request.received_at=entry.received_at
+                            AND request.status='consumed'
+                            AND request.terminal_transition_id=$15
+                            AND request.terminal_at=$16
+                            AND participant.status='active'
+                            AND participant.role=$17
+                            AND participant.current_membership
+                            AND device.status='active'
+                            AND device.auth_generation=1
+                            AND key.enrollment_auth_generation=1
+                            AND key.signing_public_key=$18
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat.transitions candidate
+                                 WHERE candidate.conversation_id=entry.conversation_id
+                                   AND candidate.entry_seq=entry.seq
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat.metadata_snapshots candidate
+                                 WHERE candidate.conversation_id=entry.conversation_id
+                                   AND candidate.producing_transition_id=entry.transition_id
+                            ))
+                       FROM chat.entries entry
+                       JOIN chat.reset_requests request
+                         ON request.reset_request_id=$2
+                        AND request.conversation_id=entry.conversation_id
+                       JOIN chat.participants participant
+                         ON participant.conversation_id=entry.conversation_id
+                        AND participant.user_did=entry.actor_did
+                        AND participant.current_membership
+                       JOIN chat.devices device
+                         ON device.user_did=entry.actor_did
+                        AND device.device_id=entry.actor_device_id
+                       JOIN chat.device_keys key
+                         ON key.user_did=entry.actor_did
+                        AND key.device_id=entry.actor_device_id
+                        AND key.key_id=entry.actor_key_id
+                      WHERE entry.conversation_id=$1 AND entry.seq=5"#,
                 )
                 .bind(conversation_id)
+                .bind(Uuid::from_bytes(reset_request.request_id))
+                .bind(reset_request.entry_id)
                 .bind(&reset_request.public_row_json)
                 .bind(&reset_request.raw_wrapper)
-                .bind(reset_activation.transition_id)
-                .bind(Uuid::from_bytes(reset_request.request_id))
+                .bind(&reset_request.request_digest)
+                .bind(&reset_request.signature)
+                .bind(&reset_request.server_fields_dag_cbor)
+                .bind(&reset_request.outer_entry_fingerprint)
+                .bind(&reset_request_signer.actor_did)
+                .bind(reset_request_signer.actor_device_id)
+                .bind(&reset_request_signer.actor_key_id)
                 .bind(reset_request_at)
-                .bind(&reset_activation.public_row_json)
-                .bind(&reset_activation.raw_wrapper)
+                .bind(&reset_request.signing_transcript)
+                .bind(reset_activation.transition_id)
                 .bind(reset_activation_at)
+                .bind(expected_reset_request_role)
+                .bind(&reset_request_signer.public_key)
                 .fetch_one(&mut *tx)
                 .await
-                .expect("read exact signed Reset entries and transition provenance");
-                assert!(reset_entry_transition_exact);
+                .expect("read complete ResetRequest entry/projection/actor provenance");
+                assert!(
+                    reset_request_entry_exact,
+                    "ResetRequest entry must preserve every durable column and exact projection crosslink"
+                );
+                let persisted_reset_request_wrapper: Vec<u8> = sqlx::query_scalar(
+                    "SELECT signed_request_bytes FROM chat.entries \
+                      WHERE conversation_id=$1 AND seq=5 AND entry_id=$2",
+                )
+                .bind(conversation_id)
+                .bind(reset_request.entry_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read persisted ResetRequest wrapper for canonical projection proof");
+                let persisted_reset_request_canonical =
+                    decode_canonical_signed_mutation(&persisted_reset_request_wrapper)
+                        .expect("persisted ResetRequest wrapper remains canonical");
+                assert_eq!(
+                    persisted_reset_request_canonical.canonical_projection(),
+                    reset_request.canonical_projection,
+                    "persisted ResetRequest must re-mint the exact normative unsigned projection"
+                );
+                assert_eq!(
+                    persisted_reset_request_canonical.transcript_bytes(),
+                    reset_request.signing_transcript,
+                    "persisted ResetRequest must re-mint the exact normative signing transcript"
+                );
                 let reset_activation_entry_transition_exact: bool = sqlx::query_scalar(
                     r#"SELECT count(*)=1 AND bool_and(
                             entry.entry_id=$3
@@ -15605,37 +15717,88 @@ mod historical_control_loader {
                 let reset_participants_leaves_intervals_exact: bool = sqlx::query_scalar(
                     r#"SELECT
                         (SELECT count(*)=3
+                            AND count(DISTINCT participant_period_id)=3
+                            AND bool_and(chat.is_uuid_v4(participant_period_id))
                             AND count(*) FILTER (
                                 WHERE user_did=$2 AND status='active' AND role='admin'
+                                  AND role_transition_id=$11 AND role_changed_at=$7
+                                  AND created_by_did=$2 AND created_by_device_id=$10
+                                  AND invitation_transition_id IS NULL
+                                  AND invitation_entry_id IS NULL AND invited_at IS NULL
+                                  AND acceptance_transition_id IS NULL
+                                  AND acceptance_entry_id IS NULL AND accepted_at IS NULL
                                   AND current_membership
-                                  AND removing_transition_id IS NULL)=1
+                                  AND removing_transition_id IS NULL
+                                  AND removing_seq IS NULL AND removed_at IS NULL
+                                  AND created_at=$7)=1
                             AND count(*) FILTER (
                                 WHERE user_did=$3 AND status='active' AND role='member'
+                                  AND role_transition_id=$11 AND role_changed_at=$7
+                                  AND created_by_did=$2 AND created_by_device_id=$10
+                                  AND invitation_transition_id=$11
+                                  AND invitation_entry_id=$28 AND invited_at=$7
                                   AND current_membership
                                   AND acceptance_transition_id=$4
-                                  AND removing_transition_id IS NULL)=1
+                                  AND acceptance_entry_id=$29 AND accepted_at=$7
+                                  AND removing_transition_id IS NULL
+                                  AND removing_seq IS NULL AND removed_at IS NULL
+                                  AND created_at=$7)=1
                             AND count(*) FILTER (
                                 WHERE user_did=$5 AND status='pending' AND role='member'
+                                  AND role_transition_id=$11 AND role_changed_at=$7
+                                  AND created_by_did=$2 AND created_by_device_id=$10
+                                  AND invitation_transition_id=$11
+                                  AND invitation_entry_id=$28 AND invited_at=$7
+                                  AND acceptance_transition_id IS NULL
+                                  AND acceptance_entry_id IS NULL AND accepted_at IS NULL
                                   AND NOT current_membership
                                   AND removing_transition_id=$6
                                   AND removing_seq=2
-                                  AND removed_at=$7)=1
+                                  AND removed_at=$7
+                                  AND created_at=$7)=1
                            FROM chat.participants
                           WHERE conversation_id=$1)
                         AND
-                        (SELECT count(*)=2 AND bool_and(
-                            generation=0
-                            AND NOT active
-                            AND removed_state_version=4
-                            AND removed_transition_id=$8
-                            AND removed_seq=6
-                            AND removed_at=$9)
+                        (SELECT count(*)=2
+                            AND count(DISTINCT leaf_period_id)=2
+                            AND bool_and(chat.is_uuid_v4(leaf_period_id))
+                            AND count(*) FILTER (
+                                WHERE participant_period_id=(
+                                        SELECT participant_period_id FROM chat.participants
+                                         WHERE conversation_id=$1 AND user_did=$2)
+                                  AND generation=0 AND user_did=$2
+                                  AND device_id=$10 AND leaf_index=0
+                                  AND basic_credential=convert_to($2 || '#' || $10::text,'UTF8')
+                                  AND leaf_signature_key=$30 AND leaf_key_id=$31
+                                  AND leaf_auth_generation=1 AND origin='genesis'
+                                  AND join_key_package_ref IS NULL
+                                  AND joined_state_version=0
+                                  AND joined_transition_id=$11 AND joined_seq=1
+                                  AND removed_state_version=4
+                                  AND removed_transition_id=$8 AND removed_seq=6
+                                  AND removed_at=$9 AND NOT active AND created_at=$7)=1
+                            AND count(*) FILTER (
+                                WHERE participant_period_id=(
+                                        SELECT participant_period_id FROM chat.participants
+                                         WHERE conversation_id=$1 AND user_did=$3)
+                                  AND generation=0 AND user_did=$3
+                                  AND device_id=$18 AND leaf_index=1
+                                  AND basic_credential=convert_to($3 || '#' || $18::text,'UTF8')
+                                  AND leaf_signature_key=$32 AND leaf_key_id=$33
+                                  AND leaf_auth_generation=1 AND origin='keyPackage'
+                                  AND join_key_package_ref=$34
+                                  AND joined_state_version=3
+                                  AND joined_transition_id=$19 AND joined_seq=4
+                                  AND removed_state_version=4
+                                  AND removed_transition_id=$8 AND removed_seq=6
+                                  AND removed_at=$9 AND NOT active AND created_at=$7)=1
                            FROM chat.member_devices
                           WHERE conversation_id=$1 AND generation=0)
                         AND
                         (SELECT count(*)=1 AND bool_and(
                             recipient_did=$2
                             AND recipient_device_id=$10
+                            AND membership_interval_id=$11
                             AND start_seq=1
                             AND opening_kind='creation'
                             AND opening_transition_id=$11
@@ -15645,19 +15808,25 @@ mod historical_control_loader {
                             AND opening_epoch=$14
                             AND opening_group_context_hash=$15
                             AND opening_confirmation_tag=$16
+                            AND opening_leaf_period_id=(
+                                SELECT leaf_period_id FROM chat.member_devices
+                                 WHERE conversation_id=$1 AND generation=0
+                                   AND user_did=$2 AND device_id=$10)
                             AND terminal_seq=6
                             AND closing_state_version=4
                             AND closing_transition_id=$8
                             AND closing_outer_entry_fingerprint=$17
                             AND closing_kind='reset'
                             AND closing_leaf_period_id=opening_leaf_period_id
-                            AND removed_at=$9)
+                            AND removed_at=$9
+                            AND created_at=$7)
                            FROM chat.application_intervals
                           WHERE conversation_id=$1 AND generation=0 AND start_seq=1)
                         AND
                         (SELECT count(*)=1 AND bool_and(
                             recipient_did=$3
                             AND recipient_device_id=$18
+                            AND membership_interval_id=$19
                             AND start_seq=4
                             AND opening_kind='add'
                             AND opening_transition_id=$19
@@ -15667,19 +15836,25 @@ mod historical_control_loader {
                             AND opening_epoch=$22
                             AND opening_group_context_hash=$23
                             AND opening_confirmation_tag=$24
+                            AND opening_leaf_period_id=(
+                                SELECT leaf_period_id FROM chat.member_devices
+                                 WHERE conversation_id=$1 AND generation=0
+                                   AND user_did=$3 AND device_id=$18)
                             AND terminal_seq=6
                             AND closing_state_version=4
                             AND closing_transition_id=$8
                             AND closing_outer_entry_fingerprint=$17
                             AND closing_kind='reset'
                             AND closing_leaf_period_id=opening_leaf_period_id
-                            AND removed_at=$9)
+                            AND removed_at=$9
+                            AND created_at=$7)
                            FROM chat.application_intervals
                           WHERE conversation_id=$1 AND generation=0 AND start_seq=4)
                         AND
                         (SELECT count(*)=1 AND bool_and(
                             recipient_did=$2
                             AND recipient_device_id=$10
+                            AND membership_interval_id=$8
                             AND start_seq=6
                             AND opening_kind='reset'
                             AND opening_transition_id=$8
@@ -15689,13 +15864,18 @@ mod historical_control_loader {
                             AND opening_epoch=0
                             AND opening_group_context_hash=$26
                             AND opening_confirmation_tag=$27
+                            AND opening_leaf_period_id=(
+                                SELECT leaf_period_id FROM chat.member_devices
+                                 WHERE conversation_id=$1 AND generation=1
+                                   AND user_did=$2 AND device_id=$10)
                             AND terminal_seq IS NULL
                             AND closing_state_version IS NULL
                             AND closing_transition_id IS NULL
                             AND closing_outer_entry_fingerprint IS NULL
                             AND closing_kind IS NULL
                             AND closing_leaf_period_id IS NULL
-                            AND removed_at IS NULL)
+                            AND removed_at IS NULL
+                            AND created_at=$9)
                            FROM chat.application_intervals
                           WHERE conversation_id=$1 AND generation=1)"#,
                 )
@@ -15744,6 +15924,13 @@ mod historical_control_loader {
                         .confirmation_tag()
                         .to_vec(),
                 )
+                .bind(entry.entry_id)
+                .bind(acceptance.entry_id)
+                .bind(&entry.public_key)
+                .bind(&entry.actor_key_id)
+                .bind(invitee.signing_key.verifying_key().as_bytes().as_slice())
+                .bind(&invitee.key_id)
+                .bind(key_package_ref.to_vec())
                 .fetch_one(&mut *tx)
                 .await
                 .expect("read exact Reset participants/leaves/interval evidence graph");
@@ -15925,42 +16112,119 @@ mod historical_control_loader {
                     reset_events_outbox_exact,
                     "Reset events must have exact fixture recipients, entitlements, predecessors, protocol, and Stream/Pending outbox"
                 );
-                let reset_terminal_topology: (
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                    i64,
-                ) = sqlx::query_as(
-                    r#"SELECT
-                        (SELECT count(*) FROM chat.participants
-                          WHERE conversation_id=$1),
-                        (SELECT count(*) FROM chat.participants
-                          WHERE conversation_id=$1 AND current_membership),
-                        (SELECT count(*) FROM chat.member_devices
-                          WHERE conversation_id=$1),
-                        (SELECT count(*) FROM chat.member_devices
-                          WHERE conversation_id=$1 AND active),
-                        (SELECT count(*) FROM chat.application_intervals
-                          WHERE conversation_id=$1),
-                        (SELECT count(*) FROM chat.application_intervals
-                          WHERE conversation_id=$1 AND terminal_seq IS NULL),
-                        (SELECT count(*) FROM chat.recovery_work_items
-                          WHERE conversation_id=$1),
-                        (SELECT count(*) FROM chat.key_package_reservations
-                          WHERE conversation_id=$1 AND status='reserved')"#,
+                let reset_total_inventory: Vec<(String, i64)> = sqlx::query_as(
+                    r#"SELECT family,total FROM (
+                        SELECT 'application_intervals' family,count(*) total
+                          FROM chat.application_intervals WHERE conversation_id=$1
+                        UNION ALL SELECT 'application_intervals.open',count(*)
+                          FROM chat.application_intervals
+                         WHERE conversation_id=$1 AND terminal_seq IS NULL
+                        UNION ALL SELECT 'application_schedule_terminal_proofs',count(*)
+                          FROM chat.application_schedule_terminal_proofs WHERE conversation_id=$1
+                        UNION ALL SELECT 'conversations',count(*)
+                          FROM chat.conversations WHERE conversation_id=$1
+                        UNION ALL SELECT 'entries',count(*)
+                          FROM chat.entries WHERE conversation_id=$1
+                        UNION ALL SELECT 'entry_recipients',count(*)
+                          FROM chat.entry_recipients WHERE conversation_id=$1
+                        UNION ALL SELECT 'events',count(*)
+                          FROM chat.events
+                         WHERE protocol_instance_id=$2
+                           AND position($3::bytea IN payload_bytes)>0
+                        UNION ALL SELECT 'event_recipients',count(*)
+                          FROM chat.event_recipients recipient
+                          JOIN chat.events event USING(event_position)
+                         WHERE event.protocol_instance_id=$2
+                           AND position($3::bytea IN event.payload_bytes)>0
+                        UNION ALL SELECT 'generations',count(*)
+                          FROM chat.generations WHERE conversation_id=$1
+                        UNION ALL SELECT 'generation_states',count(*)
+                          FROM chat.generation_states WHERE conversation_id=$1
+                        UNION ALL SELECT 'key_package_reservations',count(*)
+                          FROM chat.key_package_reservations WHERE conversation_id=$1
+                        UNION ALL SELECT 'key_packages',count(DISTINCT package.key_package_ref)
+                          FROM chat.key_packages package
+                          JOIN chat.key_package_reservations reservation
+                            ON reservation.key_package_ref=package.key_package_ref
+                         WHERE reservation.conversation_id=$1
+                        UNION ALL SELECT 'leaf_recovery_requests',count(*)
+                          FROM chat.leaf_recovery_requests WHERE conversation_id=$1
+                        UNION ALL SELECT 'leave_requests',count(*)
+                          FROM chat.leave_requests WHERE conversation_id=$1
+                        UNION ALL SELECT 'member_devices',count(*)
+                          FROM chat.member_devices WHERE conversation_id=$1
+                        UNION ALL SELECT 'member_devices.active',count(*)
+                          FROM chat.member_devices WHERE conversation_id=$1 AND active
+                        UNION ALL SELECT 'message_sends',count(*)
+                          FROM chat.message_sends WHERE conversation_id=$1
+                        UNION ALL SELECT 'metadata_snapshots',count(*)
+                          FROM chat.metadata_snapshots WHERE conversation_id=$1
+                        UNION ALL SELECT 'outbox',count(*)
+                          FROM chat.outbox outbox
+                          JOIN chat.events event USING(event_position)
+                         WHERE event.protocol_instance_id=$2
+                           AND position($3::bytea IN event.payload_bytes)>0
+                        UNION ALL SELECT 'participants',count(*)
+                          FROM chat.participants WHERE conversation_id=$1
+                        UNION ALL SELECT 'participants.current',count(*)
+                          FROM chat.participants
+                         WHERE conversation_id=$1 AND current_membership
+                        UNION ALL SELECT 'recovery_work_items',count(*)
+                          FROM chat.recovery_work_items WHERE conversation_id=$1
+                        UNION ALL SELECT 'reset_requests',count(*)
+                          FROM chat.reset_requests WHERE conversation_id=$1
+                        UNION ALL SELECT 'transitions',count(*)
+                          FROM chat.transitions WHERE conversation_id=$1
+                        UNION ALL SELECT 'welcome_bundles',count(*)
+                          FROM chat.welcome_bundles WHERE conversation_id=$1
+                        UNION ALL SELECT 'welcome_deliveries',count(*)
+                          FROM chat.welcome_deliveries delivery
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                         WHERE bundle.conversation_id=$1
+                        UNION ALL SELECT 'welcome_dispositions',count(*)
+                          FROM chat.welcome_dispositions disposition
+                          JOIN chat.welcome_bundles bundle USING(welcome_id)
+                         WHERE bundle.conversation_id=$1
+                    ) inventory ORDER BY family"#,
                 )
                 .bind(conversation_id)
-                .fetch_one(&mut *tx)
+                .bind(protocol_instance_id)
+                .bind(&conversation_marker)
+                .fetch_all(&mut *tx)
                 .await
-                .expect("read exact terminal Reset topology");
+                .expect("read exact all-family terminal Reset inventory");
                 assert_eq!(
-                    reset_terminal_topology,
-                    (3, 2, 3, 1, 3, 1, 0, 0),
-                    "Reset must retain participant history while leaving one successor leaf"
+                    reset_total_inventory,
+                    vec![
+                        ("application_intervals".to_owned(), 3),
+                        ("application_intervals.open".to_owned(), 1),
+                        ("application_schedule_terminal_proofs".to_owned(), 0),
+                        ("conversations".to_owned(), 1),
+                        ("entries".to_owned(), 6),
+                        ("entry_recipients".to_owned(), 14),
+                        ("event_recipients".to_owned(), 16),
+                        ("events".to_owned(), 8),
+                        ("generation_states".to_owned(), 6),
+                        ("generations".to_owned(), 2),
+                        ("key_package_reservations".to_owned(), 2),
+                        ("key_packages".to_owned(), 2),
+                        ("leaf_recovery_requests".to_owned(), 2),
+                        ("leave_requests".to_owned(), 0),
+                        ("member_devices".to_owned(), 3),
+                        ("member_devices.active".to_owned(), 1),
+                        ("message_sends".to_owned(), 0),
+                        ("metadata_snapshots".to_owned(), 3),
+                        ("outbox".to_owned(), 8),
+                        ("participants".to_owned(), 3),
+                        ("participants.current".to_owned(), 2),
+                        ("recovery_work_items".to_owned(), 0),
+                        ("reset_requests".to_owned(), 1),
+                        ("transitions".to_owned(), 5),
+                        ("welcome_bundles".to_owned(), 1),
+                        ("welcome_deliveries".to_owned(), 1),
+                        ("welcome_dispositions".to_owned(), 1),
+                    ],
+                    "Reset terminal inventory must enumerate every CID-scoped durable family with no extra rows"
                 );
                     (reset_request_context, reset_activation_context)
                 })
@@ -15983,14 +16247,17 @@ mod historical_control_loader {
                 assert_zero_g6_creation_residue(&pool, conversation_id, reset_activation_context)
                     .await;
             }
-            let rolled_back_package: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM chat.key_packages WHERE key_package_ref=$1",
+            let rolled_back_packages: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.key_packages WHERE key_package_ref=ANY($1)",
             )
-            .bind(key_package_ref.to_vec())
+            .bind(vec![
+                key_package_ref.to_vec(),
+                prior_bound_key_package_ref.to_vec(),
+            ])
             .fetch_one(&pool)
             .await
-            .expect("read transaction-only package after rollback");
-            assert_eq!(rolled_back_package, 0);
+            .expect("read transaction-only packages after rollback");
+            assert_eq!(rolled_back_packages, 0);
             let rolled_back_unfiltered_events: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM chat.events \
                   WHERE protocol_instance_id=$1 AND position($2::bytea IN payload_bytes)>0",
@@ -24135,9 +24402,11 @@ mod historical_control_loader {
             pub(super) seq: u64,
             pub(super) public_row_json: Vec<u8>,
             pub(super) raw_wrapper: Vec<u8>,
+            pub(super) canonical_projection: Vec<u8>,
             pub(super) signing_transcript: Vec<u8>,
             pub(super) request_digest: Vec<u8>,
             pub(super) signature: Vec<u8>,
+            pub(super) server_fields_dag_cbor: Vec<u8>,
             pub(super) outer_entry_fingerprint: Vec<u8>,
         }
 
@@ -24970,9 +25239,11 @@ mod historical_control_loader {
                 seq,
                 public_row_json,
                 raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
                 request_digest: Sha256::digest(&signing_transcript).to_vec(),
                 signature: signature.to_vec(),
                 signing_transcript,
+                server_fields_dag_cbor: decoded.server_fields_dag_cbor().unwrap(),
                 outer_entry_fingerprint: decoded.outer_control_fingerprint().to_vec(),
             }
         }
