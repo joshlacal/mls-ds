@@ -3514,7 +3514,15 @@ mod historical_control_loader {
         let actor_device_id = entry.actor_device_id;
         let actor_key_id = &entry.actor_key_id;
         let actor_public_key = entry.public_key.clone();
-        let group_info = vec![4_u8; 8];
+        let group_info = if public_state.is_some() {
+            std::fs::read(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/group-info.mls"),
+            )
+            .expect("read genuine frozen genesis GroupInfo")
+        } else {
+            vec![4_u8; 8]
+        };
         let signed_request = entry.raw_wrapper.clone();
         let verified_mutation =
             decode_and_verify_signed_mutation(&signed_request, &actor_public_key)
@@ -4612,7 +4620,7 @@ mod historical_control_loader {
             engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
             Engine,
         };
-        use chrono::{DateTime, Utc};
+        use chrono::{DateTime, SecondsFormat, Utc};
         use ed25519_dalek::{Signer, SigningKey};
         use serde_json::{json, Value};
         use sha2::{Digest, Sha256};
@@ -4624,7 +4632,8 @@ mod historical_control_loader {
         };
         use super::seed_real_creation_graph;
         use crate::chat_protocol::public_state::{
-            encode_public_tree_summary, load_persisted_active_snapshot, ActivePublicState,
+            encode_public_tree_summary, load_persisted_active_snapshot, verify_recovery_welcome,
+            ActivePublicState,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_conversation_head,
@@ -4639,21 +4648,34 @@ mod historical_control_loader {
             FulfilledRecoveryTerminalColumns, RecoveryHydrationError, WelcomeTerminalColumns,
             WelcomeTerminalSelection,
         };
+        use crate::chat_protocol::repository::delivery::{
+            EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+        };
+        use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
             PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
             PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            acceptance_recovery_package_artifact_matches, recovery_fulfillment_terminal_matches,
-            ConversationKind, ConversationStateHydration, DeviceIdentity,
-            HistoricalRehydrationAuthority, LeafRecoveryKind, ParticipantRole, ParticipantStatus,
-            PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource,
-            ReservationStatus, ServerTimestamp, WelcomeStatus, WorkTerminalHydrationRow,
+            acceptance_recovery_package_artifact_matches, apply_conversation_persistence_plan,
+            persistence_plan_for_test, plan_policy, recovery_fulfillment_terminal_matches,
+            ControlEntryContent, ConversationHeadCasBinding, ConversationKind, ConversationState,
+            ConversationStateHydration, DeviceIdentity, EventFanout, ExecutionActor,
+            ExecutionContext, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
+            ParticipantRole, ParticipantStatus, PrincipalId, RecoveryOriginHydrationRow,
+            RecoveryRequestStatus, RecoverySource, ReservationStatus, ServerTimestamp,
+            SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeStatus,
+            WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
-            decode_and_verify_control_entry, decode_canonical_signed_mutation, SignedMutationKind,
+            decode_and_verify_control_entry, decode_canonical_signed_mutation,
+            rebind_persisted_control_entry, SignedMutationKind,
         };
         use crate::chat_protocol::validation::ed25519_key_id;
+        use crate::chat_protocol::wire::{
+            validate_key_package, KeyPackageValidationPolicy, MAX_KEY_PACKAGE_WIRE_BYTES,
+            MAX_WELCOME_WIRE_BYTES,
+        };
         use crate::common;
 
         // Fixed millisecond instants (the state machine's `CanonicalTimestamp`
@@ -4668,14 +4690,230 @@ mod historical_control_loader {
         const SIGNED_AT: &str = "2029-12-31T23:59:59.000Z";
         const FULFILLMENT_SIGNED_AT: &str = "2030-01-01T00:00:59.000Z";
         const FULFILLED_AT: &str = "2030-01-01T00:01:00.000Z";
+        const POLICY_ADD_AT: &str = "2029-12-31T23:59:30.000Z";
+        const ROLE_ADMIN_AT: &str = "2030-01-01T00:02:00.000Z";
+        const ROLE_MEMBER_AT: &str = "2030-01-01T00:03:00.000Z";
+
+        const BOB_SIGNING_SEED: [u8; 32] = [
+            0xa9, 0x6b, 0x42, 0xd3, 0x5f, 0x80, 0xe9, 0x18, 0x4c, 0xef, 0x61, 0x44, 0x4a, 0xbc,
+            0xc2, 0x81, 0xf6, 0x54, 0x13, 0x22, 0x93, 0x40, 0xb8, 0xc0, 0x6f, 0x34, 0xe6, 0xa0,
+            0xba, 0x74, 0xb4, 0x09,
+        ];
 
         #[tokio::test]
         #[ignore = "requires the dedicated gate database"]
         async fn genuine_multi_participant_policy_role_aggregate_seal() {
-            panic!(
-                "missing fixture: policy Add invitation -> acceptance Add recovery -> \
-                 Add fulfillment/Welcome -> executor ChangeRole"
+            let database_url = std::env::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must name the existing gate database");
+            common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
+                .expect("unsafe TEST_DATABASE_URL for genuine role aggregate");
+            let pool = PgPool::connect(&database_url)
+                .await
+                .expect("connect to existing gate database");
+
+            let corpus_key_package_ref = validate_exact_corpus_recovery_artifacts();
+            if let Some(committed) =
+                find_committed_exact_corpus_graph(&pool, corpus_key_package_ref).await
+            {
+                assert_committed_exact_corpus_graph(&pool, &committed).await;
+                return;
+            }
+            let corpus_ref_occupied: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM chat.key_packages WHERE key_package_ref=$1)",
+            )
+            .bind(corpus_key_package_ref.to_vec())
+            .fetch_one(&pool)
+            .await
+            .expect("check exact corpus KeyPackageRef occupancy");
+            assert!(
+                !corpus_ref_occupied,
+                "exact corpus KeyPackageRef already exists without a complete reusable graph; \
+                 the append-only gate requires a fresh database"
             );
+
+            let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
+            let first = execute_genuine_role_change(
+                &pool,
+                &graph,
+                ParticipantRole::Admin,
+                5,
+                ROLE_ADMIN_AT,
+                Some(graph.fulfillment.welcome_id),
+            )
+            .await;
+            assert_eq!(first.coordinate().state_version(), 4);
+            let second = execute_genuine_role_change(
+                &pool,
+                &graph,
+                ParticipantRole::Member,
+                6,
+                ROLE_MEMBER_AT,
+                None,
+            )
+            .await;
+            assert_eq!(second.coordinate().state_version(), 5);
+
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let locked_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("canonical aggregate lock instant");
+            let mut tx = pool.begin().await.expect("begin final aggregate read");
+            let aggregate = hydrate_locked_conversation_state(&mut tx, cid, locked_at)
+                .await
+                .expect("genuine multi-participant aggregate seals");
+            let bob = PrincipalId::new(graph.invitee.did.as_bytes().to_vec()).unwrap();
+            let participant = aggregate
+                .state()
+                .participant(&bob)
+                .expect("Bob remains a participant");
+            assert_eq!(participant.status(), ParticipantStatus::Active);
+            assert_eq!(participant.role(), ParticipantRole::Member);
+            assert_eq!(aggregate.state().participants().len(), 2);
+            assert_eq!(aggregate.state().leaves().len(), 2);
+            assert_eq!(aggregate.state().intervals().len(), 2);
+            let recovery = aggregate
+                .state()
+                .recovery_request(&graph.acceptance.request_id)
+                .expect("acceptance recovery retained");
+            assert_eq!(recovery.status(), RecoveryRequestStatus::Fulfilled);
+            let reservation = aggregate
+                .state()
+                .recovery_reservation(&graph.acceptance.request_id)
+                .expect("acceptance reservation retained");
+            assert_eq!(reservation.status(), ReservationStatus::Consumed);
+            let welcome = aggregate
+                .state()
+                .welcome(graph.fulfillment.welcome_id.as_bytes())
+                .expect("Welcome retained");
+            assert_eq!(welcome.status(), WelcomeStatus::Superseded);
+            let durable_provenance: (i64, i64, i64, i64, i64, String, Option<Uuid>) =
+                sqlx::query_as(
+                    r#"
+                SELECT invitation.entry_seq,
+                       acceptance.entry_seq,
+                       role.entry_seq,
+                       producer.entry_seq,
+                       metadata_producer.entry_seq,
+                       delivery.status,
+                       disposition.terminal_transition_id
+                  FROM chat.participants participant
+                  JOIN chat.transitions invitation
+                    ON invitation.transition_id=participant.invitation_transition_id
+                  JOIN chat.transitions acceptance
+                    ON acceptance.transition_id=participant.acceptance_transition_id
+                  JOIN chat.transitions role
+                    ON role.transition_id=participant.role_transition_id
+                  JOIN chat.generation_states state
+                    ON state.conversation_id=participant.conversation_id
+                   AND state.generation=0 AND state.state_version=5
+                  JOIN chat.transitions producer
+                    ON producer.transition_id=state.producing_transition_id
+                  JOIN chat.metadata_snapshots metadata
+                    ON metadata.conversation_id=participant.conversation_id
+                   AND metadata.generation=0
+                   AND metadata.state_version=3
+                  JOIN chat.transitions metadata_producer
+                    ON metadata_producer.transition_id=metadata.producing_transition_id
+                  JOIN chat.welcome_deliveries delivery
+                    ON delivery.welcome_id=$3
+                  JOIN chat.welcome_dispositions disposition
+                    ON disposition.welcome_id=delivery.welcome_id
+                 WHERE participant.conversation_id=$1
+                   AND participant.user_did=$2
+                   AND participant.current_membership
+                "#,
+                )
+                .bind(cid)
+                .bind(&graph.invitee.did)
+                .bind(graph.fulfillment.welcome_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("durable provenance remains populated");
+            assert_eq!(durable_provenance.0, 2, "Bob invitation producer");
+            assert_eq!(durable_provenance.1, 3, "Bob acceptance producer");
+            assert_eq!(durable_provenance.2, 6, "Bob latest role producer");
+            assert_eq!(durable_provenance.3, 6, "current state producer");
+            assert_eq!(durable_provenance.4, 4, "retained metadata producer");
+            assert_eq!(durable_provenance.5, "superseded");
+            let welcome_terminal = durable_provenance
+                .6
+                .expect("Welcome transition terminal populated");
+            let welcome_terminal_seq: i64 =
+                sqlx::query_scalar("SELECT entry_seq FROM chat.transitions WHERE transition_id=$1")
+                    .bind(welcome_terminal)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("Welcome terminal seq");
+            assert_eq!(welcome_terminal_seq, 5);
+            let recovery_terminal_seqs: (i64, i64) = sqlx::query_as(
+                r#"
+                SELECT request_terminal.entry_seq,reservation_terminal.entry_seq
+                  FROM chat.leaf_recovery_requests request
+                  JOIN chat.transitions request_terminal
+                    ON request_terminal.transition_id=request.fulfilling_transition_id
+                  JOIN chat.key_package_reservations reservation
+                    ON reservation.recovery_request_id=request.recovery_request_id
+                  JOIN chat.transitions reservation_terminal
+                    ON reservation_terminal.transition_id=reservation.consumed_transition_id
+                 WHERE request.recovery_request_id=$1
+                "#,
+            )
+            .bind(Uuid::from_bytes(graph.acceptance.request_id))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("recovery work terminals populated");
+            assert_eq!(recovery_terminal_seqs, (4, 4));
+            let durable_add_artifacts: (i64, i64, String, i64) = sqlx::query_as(
+                r#"
+                SELECT leaf.joined_seq,
+                       interval.start_seq,
+                       package.status,
+                       package_terminal.entry_seq
+                  FROM chat.member_devices leaf
+                  JOIN chat.application_intervals interval
+                    ON interval.opening_leaf_period_id=leaf.leaf_period_id
+                  JOIN chat.key_packages package
+                    ON package.key_package_ref=leaf.join_key_package_ref
+                  JOIN chat.transitions package_terminal
+                    ON package_terminal.transition_id=package.terminal_transition_id
+                 WHERE leaf.conversation_id=$1
+                   AND leaf.user_did=$2
+                   AND leaf.device_id=$3
+                   AND leaf.active
+                   AND interval.terminal_seq IS NULL
+                "#,
+            )
+            .bind(cid)
+            .bind(&graph.invitee.did)
+            .bind(graph.invitee.device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("Bob Add leaf, interval, and package remain exact");
+            assert_eq!(
+                durable_add_artifacts,
+                (4, 4, "consumed".to_owned(), 4),
+                "Add fulfillment opens Bob at seq 4 and consumes the package at seq 4"
+            );
+            assert_eq!(aggregate.state().coordinate().state_version(), 5);
+            assert_eq!(aggregate.head().next_entry_seq(), 7);
+            assert_ne!(aggregate.locked_graph_digest(), &[0; 32]);
+            let first_digest = *aggregate.locked_graph_digest();
+            tx.rollback()
+                .await
+                .expect("rollback read-only final aggregate");
+
+            let fresh_locked_at = locked_at + chrono::Duration::milliseconds(1);
+            let mut fresh = pool.begin().await.expect("begin fresh aggregate read");
+            let reloaded = hydrate_locked_conversation_state(&mut fresh, cid, fresh_locked_at)
+                .await
+                .expect("fresh transaction reseals identical graph");
+            assert_eq!(reloaded.locked_graph_digest(), &first_digest);
+            fresh
+                .rollback()
+                .await
+                .expect("rollback fresh aggregate read");
         }
 
         fn instant(text: &str) -> DateTime<Utc> {
@@ -4689,6 +4927,472 @@ mod historical_control_loader {
             value[6] = 0x40 | (byte & 0x0f);
             value[8] = 0x80 | (byte & 0x3f);
             value
+        }
+
+        fn corpus_file(name: &str) -> Vec<u8> {
+            std::fs::read(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+                    .join(name),
+            )
+            .expect("read frozen crypto-wire artifact")
+        }
+
+        fn corpus_manifest() -> Value {
+            serde_json::from_slice(&corpus_file("manifest.json"))
+                .expect("parse frozen crypto-wire manifest")
+        }
+
+        fn corpus_hex<const N: usize>(value: &Value) -> [u8; N] {
+            hex::decode(value.as_str().expect("corpus hex string"))
+                .expect("valid corpus hex")
+                .try_into()
+                .unwrap_or_else(|_| panic!("expected {N}-byte corpus value"))
+        }
+
+        fn coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Value {
+            json!({
+                "conversationId": Uuid::from_bytes(*coordinate.conversation_id()),
+                "generation": coordinate.generation(),
+                "stateVersion": coordinate.state_version(),
+                "groupId": STANDARD.encode(coordinate.group_id()),
+                "epoch": coordinate.epoch(),
+                "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+                "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+                "lifecycle": "active",
+            })
+        }
+
+        fn rebound_state(template: &ActivePublicState, state_version: u64) -> ActivePublicState {
+            let prior = template.coordinate();
+            ActivePublicState::for_test(
+                template,
+                PublicGroupSnapshotCoordinate::new(
+                    *prior.conversation_id(),
+                    prior.generation(),
+                    state_version,
+                    *prior.group_id(),
+                    prior.epoch(),
+                    *prior.group_context_hash(),
+                    *prior.confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            )
+        }
+
+        fn corpus_invitee() -> AcceptanceInvitee {
+            let manifest = corpus_manifest();
+            let bob = &manifest["identity"]["bob"];
+            let signing_key = SigningKey::from_bytes(&BOB_SIGNING_SEED);
+            let public_key = signing_key.verifying_key().to_bytes();
+            assert_eq!(
+                public_key,
+                corpus_hex::<32>(&bob["signaturePublicKeyHex"]),
+                "Bob fixed seed remains corpus-bound"
+            );
+            AcceptanceInvitee {
+                did: bob["actorDid"].as_str().expect("Bob DID").to_owned(),
+                device_id: Uuid::parse_str(bob["deviceId"].as_str().expect("Bob device"))
+                    .expect("Bob device UUID"),
+                key_id: ed25519_key_id(&public_key)
+                    .expect("Bob key id")
+                    .as_str()
+                    .to_owned(),
+                signing_key,
+                participant_period_id: Uuid::new_v4(),
+            }
+        }
+
+        fn validate_exact_corpus_recovery_artifacts() -> [u8; 32] {
+            let manifest = corpus_manifest();
+            let bob = &manifest["identity"]["bob"];
+            let credential = bob["credentialIdentity"]
+                .as_str()
+                .expect("Bob credential identity")
+                .as_bytes();
+            let signature_key = corpus_hex::<32>(&bob["signaturePublicKeyHex"]);
+            let evaluation = manifest["evaluationUnixSeconds"]
+                .as_u64()
+                .expect("corpus evaluation instant");
+            let package = corpus_file("key-package.mls");
+            let validated = validate_key_package(
+                &package,
+                KeyPackageValidationPolicy {
+                    expected_basic_credential: credential,
+                    expected_signature_key: &signature_key,
+                    now_unix_seconds: evaluation,
+                    max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+                },
+            )
+            .expect("production KeyPackage validation accepts the frozen corpus wrapper");
+            let key_package_ref = *validated.key_package_ref();
+            assert_eq!(
+                key_package_ref,
+                corpus_hex::<32>(&manifest["chain"]["innerKeyPackageRefHex"]),
+                "production-derived KeyPackageRef remains manifest-bound"
+            );
+            verify_recovery_welcome(
+                &corpus_file("welcome.mls"),
+                key_package_ref,
+                MAX_WELCOME_WIRE_BYTES,
+            )
+            .expect("production Welcome verification binds the same corpus KeyPackageRef");
+            key_package_ref
+        }
+
+        #[derive(Clone)]
+        struct GenuineGraphRefs {
+            cid: Uuid,
+            bob_did: String,
+            bob_device_id: Uuid,
+            request_id: Uuid,
+            welcome_id: Uuid,
+        }
+
+        async fn find_committed_exact_corpus_graph(
+            pool: &PgPool,
+            key_package_ref: [u8; 32],
+        ) -> Option<GenuineGraphRefs> {
+            sqlx::query_as::<_, (Uuid, String, Uuid, Uuid, Uuid)>(
+                r#"
+                SELECT conversation.conversation_id,
+                       request.requester_did,
+                       request.requester_device_id,
+                       request.recovery_request_id,
+                       bundle.welcome_id
+                  FROM chat.key_packages package
+                  JOIN chat.key_package_reservations reservation
+                    ON reservation.key_package_ref=package.key_package_ref
+                  JOIN chat.leaf_recovery_requests request
+                    ON request.recovery_request_id=reservation.recovery_request_id
+                  JOIN chat.conversations conversation
+                    ON conversation.conversation_id=request.conversation_id
+                  JOIN chat.welcome_deliveries delivery
+                    ON delivery.recovery_request_id=request.recovery_request_id
+                  JOIN chat.welcome_bundles bundle
+                    ON bundle.welcome_id=delivery.welcome_id
+                 WHERE package.key_package_ref=$1
+                   AND package.status='consumed'
+                   AND reservation.status='consumed'
+                   AND request.status='fulfilled'
+                   AND delivery.status='superseded'
+                   AND conversation.current_generation=0
+                   AND conversation.current_state_version=5
+                   AND conversation.next_entry_seq=7
+                 ORDER BY bundle.created_at
+                 LIMIT 1
+                "#,
+            )
+            .bind(key_package_ref.to_vec())
+            .fetch_optional(pool)
+            .await
+            .expect("look up committed exact-corpus graph")
+            .map(
+                |(cid, bob_did, bob_device_id, request_id, welcome_id)| GenuineGraphRefs {
+                    cid,
+                    bob_did,
+                    bob_device_id,
+                    request_id,
+                    welcome_id,
+                },
+            )
+        }
+
+        async fn assert_committed_exact_corpus_graph(pool: &PgPool, graph: &GenuineGraphRefs) {
+            let locked_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                    .fetch_one(pool)
+                    .await
+                    .expect("canonical exact-corpus lock instant");
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin exact-corpus aggregate read");
+            let aggregate = hydrate_locked_conversation_state(&mut tx, graph.cid, locked_at)
+                .await
+                .expect("committed exact-corpus graph independently re-verifies and seals");
+            let bob = PrincipalId::new(graph.bob_did.as_bytes().to_vec()).unwrap();
+            let participant = aggregate
+                .state()
+                .participant(&bob)
+                .expect("exact-corpus Bob remains active");
+            assert_eq!(
+                (participant.status(), participant.role()),
+                (ParticipantStatus::Active, ParticipantRole::Member)
+            );
+            assert_eq!(aggregate.state().coordinate().state_version(), 5);
+            assert_eq!(aggregate.head().next_entry_seq(), 7);
+            assert_eq!(aggregate.state().participants().len(), 2);
+            assert_eq!(aggregate.state().leaves().len(), 2);
+            assert_eq!(aggregate.state().intervals().len(), 2);
+            assert_eq!(
+                aggregate
+                    .state()
+                    .recovery_request(graph.request_id.as_bytes())
+                    .expect("exact-corpus request")
+                    .status(),
+                RecoveryRequestStatus::Fulfilled
+            );
+            assert_eq!(
+                aggregate
+                    .state()
+                    .recovery_reservation(graph.request_id.as_bytes())
+                    .expect("exact-corpus reservation")
+                    .status(),
+                ReservationStatus::Consumed
+            );
+            assert_eq!(
+                aggregate
+                    .state()
+                    .welcome(graph.welcome_id.as_bytes())
+                    .expect("exact-corpus Welcome")
+                    .status(),
+                WelcomeStatus::Superseded
+            );
+            let durable: (
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                String,
+                Option<i64>,
+                String,
+                Option<i64>,
+            ) = sqlx::query_as(
+                r#"
+                SELECT invitation.entry_seq,
+                       acceptance.entry_seq,
+                       role.entry_seq,
+                       producer.entry_seq,
+                       metadata_producer.entry_seq,
+                       leaf.joined_seq,
+                       interval.start_seq,
+                       package.status,
+                       package_terminal.entry_seq,
+                       delivery.status,
+                       welcome_terminal.entry_seq
+                  FROM chat.participants participant
+                  JOIN chat.transitions invitation
+                    ON invitation.transition_id=participant.invitation_transition_id
+                  JOIN chat.transitions acceptance
+                    ON acceptance.transition_id=participant.acceptance_transition_id
+                  JOIN chat.transitions role
+                    ON role.transition_id=participant.role_transition_id
+                  JOIN chat.generation_states state
+                    ON state.conversation_id=participant.conversation_id
+                   AND state.generation=0 AND state.state_version=5
+                  JOIN chat.transitions producer
+                    ON producer.transition_id=state.producing_transition_id
+                  JOIN chat.metadata_snapshots metadata
+                    ON metadata.conversation_id=participant.conversation_id
+                   AND metadata.generation=0 AND metadata.state_version=3
+                  JOIN chat.transitions metadata_producer
+                    ON metadata_producer.transition_id=metadata.producing_transition_id
+                  JOIN chat.member_devices leaf
+                    ON leaf.conversation_id=participant.conversation_id
+                   AND leaf.user_did=participant.user_did
+                   AND leaf.device_id=$4
+                   AND leaf.active
+                  JOIN chat.application_intervals interval
+                    ON interval.opening_leaf_period_id=leaf.leaf_period_id
+                   AND interval.terminal_seq IS NULL
+                  JOIN chat.key_packages package
+                    ON package.key_package_ref=leaf.join_key_package_ref
+                  LEFT JOIN chat.transitions package_terminal
+                    ON package_terminal.transition_id=package.terminal_transition_id
+                  JOIN chat.welcome_deliveries delivery
+                    ON delivery.welcome_id=$3
+                  JOIN chat.welcome_dispositions disposition
+                    ON disposition.welcome_id=delivery.welcome_id
+                  LEFT JOIN chat.transitions welcome_terminal
+                    ON welcome_terminal.transition_id=disposition.terminal_transition_id
+                 WHERE participant.conversation_id=$1
+                   AND participant.user_did=$2
+                   AND participant.current_membership
+                "#,
+            )
+            .bind(graph.cid)
+            .bind(&graph.bob_did)
+            .bind(graph.welcome_id)
+            .bind(graph.bob_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("exact-corpus durable first-run evidence");
+            assert_eq!(durable.0, 2);
+            assert_eq!(durable.1, 3);
+            assert_eq!(durable.2, 6);
+            assert_eq!(durable.3, 6);
+            assert_eq!(durable.4, 4);
+            assert_eq!((durable.5, durable.6), (4, 4));
+            assert_eq!((durable.7.as_str(), durable.8), ("consumed", Some(4)));
+            assert_eq!((durable.9.as_str(), durable.10), ("superseded", Some(5)));
+            let digest = *aggregate.locked_graph_digest();
+            assert_ne!(digest, [0; 32]);
+            tx.rollback()
+                .await
+                .expect("rollback exact-corpus aggregate read");
+            let mut fresh = pool
+                .begin()
+                .await
+                .expect("begin fresh exact-corpus aggregate read");
+            let reloaded = hydrate_locked_conversation_state(
+                &mut fresh,
+                graph.cid,
+                locked_at + chrono::Duration::milliseconds(1),
+            )
+            .await
+            .expect("fresh exact-corpus transaction reseals");
+            assert_eq!(reloaded.locked_graph_digest(), &digest);
+            fresh
+                .rollback()
+                .await
+                .expect("rollback fresh exact-corpus aggregate read");
+        }
+
+        enum GenuinePolicyChange<'a> {
+            Add(&'a str),
+            ChangeRole(&'a str, ParticipantRole),
+        }
+
+        struct GenuinePolicyControl {
+            transition: TransitionEvidence,
+            entry: ControlEntryContent,
+            transition_id: Uuid,
+            received_at: ServerTimestamp,
+            received_at_db: DateTime<Utc>,
+        }
+
+        fn genuine_policy_control(
+            entry: &RealCreationEntry,
+            prior: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            at: &str,
+            mut changes: Vec<GenuinePolicyChange<'_>>,
+        ) -> GenuinePolicyControl {
+            changes.sort_by(|left, right| {
+                let left = match left {
+                    GenuinePolicyChange::Add(did) | GenuinePolicyChange::ChangeRole(did, _) => {
+                        did.as_bytes()
+                    }
+                };
+                let right = match right {
+                    GenuinePolicyChange::Add(did) | GenuinePolicyChange::ChangeRole(did, _) => {
+                        did.as_bytes()
+                    }
+                };
+                left.cmp(right)
+            });
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let next = PublicGroupSnapshotCoordinate::new(
+                *prior.conversation_id(),
+                prior.generation(),
+                prior.state_version() + 1,
+                *prior.group_id(),
+                prior.epoch(),
+                *prior.group_context_hash(),
+                *prior.confirmation_tag(),
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            let participant_changes: Vec<Value> = changes
+                .into_iter()
+                .map(|change| match change {
+                    GenuinePolicyChange::Add(did) => json!({
+                        "$type": "blue.catbird.chat.defs#addParticipant",
+                        "userDid": did,
+                        "status": "pending",
+                        "role": "member",
+                        "invitationProvenance": {
+                            "invitedByDid": &entry.actor_did,
+                            "invitedByDeviceId": entry.actor_device_id,
+                            "invitationTransitionId": transition_id,
+                        },
+                    }),
+                    GenuinePolicyChange::ChangeRole(did, role) => json!({
+                        "$type": "blue.catbird.chat.defs#changeParticipantRole",
+                        "userDid": did,
+                        "role": match role {
+                            ParticipantRole::Member => "member",
+                            ParticipantRole::Admin => "admin",
+                        },
+                    }),
+                })
+                .collect();
+            let signed_at = (instant(at) - chrono::Duration::milliseconds(500))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let body = json!({
+                "$type": SignedMutationKind::PolicyTransition.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::PolicyTransition.domain().to_vec()
+                ).unwrap(),
+                "transitionId": transition_id,
+                "actorDid": &entry.actor_did,
+                "actorDeviceId": entry.actor_device_id,
+                "keyId": &entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": coordinate_json(prior),
+                "next": coordinate_json(&next),
+                "participantChanges": participant_changes,
+                "idempotencyKey": Uuid::new_v4(),
+                "signedAt": signed_at,
+            });
+            let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let unsigned_canonical =
+                decode_canonical_signed_mutation(&unsigned).expect("policy canonicalizes");
+            let signature = entry
+                .signing_key()
+                .sign(unsigned_canonical.transcript_bytes())
+                .to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical =
+                decode_canonical_signed_mutation(&raw_wrapper).expect("signed policy canonical");
+            let row = json!({
+                "$type": "blue.catbird.chat.defs#policyEntry",
+                "entryId": entry_id,
+                "conversationId": Uuid::from_bytes(entry.cid),
+                "seq": seq,
+                "signedRequest": wrapper,
+                "receivedAt": at,
+            });
+            let accepted_payload = serde_json::to_vec(&row).unwrap();
+            let verified = decode_and_verify_control_entry(&accepted_payload, &entry.public_key)
+                .expect("genuine policy control verifies");
+            let verified =
+                rebind_persisted_control_entry(verified, &raw_wrapper, &entry.public_key)
+                    .expect("policy accepted wrapper rebinds");
+            let outer = *verified.outer_control_fingerprint();
+            let server_fields = verified
+                .server_fields_dag_cbor()
+                .expect("policy server fields");
+            let authority = HydrationAuthority::new(entry.cid).expect("policy authority");
+            let transition = authority
+                .control_transition(verified)
+                .expect("policy transition authority");
+            GenuinePolicyControl {
+                transition,
+                entry: ControlEntryContent {
+                    entry_id,
+                    entry_kind: "blue.catbird.chat.defs#policyEntry".to_owned(),
+                    accepted_payload_bytes: accepted_payload.clone(),
+                    accepted_payload_sha256: Sha256::digest(&accepted_payload).to_vec(),
+                    signed_request_bytes: raw_wrapper,
+                    unsigned_projection_bytes: canonical.canonical_projection().to_vec(),
+                    signing_transcript_bytes: canonical.transcript_bytes().to_vec(),
+                    request_digest: canonical.request_digest().to_vec(),
+                    signature: signature.to_vec(),
+                    server_fields_bytes: server_fields,
+                    outer_entry_fingerprint: outer.to_vec(),
+                },
+                transition_id,
+                received_at: ServerTimestamp::from_canonical_stored(at)
+                    .expect("policy server timestamp"),
+                received_at_db: instant(at),
+            }
         }
 
         fn genesis_coordinate_json(cid: [u8; 16]) -> Value {
@@ -4816,18 +5520,41 @@ mod historical_control_loader {
             invitee: &AcceptanceInvitee,
             creation_transition_id: Uuid,
         ) -> RealAcceptanceEntry {
+            let creation_wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+            let prior = creation_wrapper["body"]["next"].clone();
+            build_real_acceptance_entry_at(
+                entry,
+                invitee,
+                creation_transition_id,
+                prior,
+                2,
+                REQUESTED_AT,
+                None,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_real_acceptance_entry_at(
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            invitation_transition_id: Uuid,
+            prior: Value,
+            seq: u64,
+            received_at: &str,
+            corpus_package: Option<([u8; 32], Vec<u8>)>,
+        ) -> RealAcceptanceEntry {
             let entry_id = Uuid::new_v4();
             let transition_id = Uuid::new_v4();
             let request_id = *Uuid::new_v4().as_bytes();
-            let key_package_ref: [u8; 32] =
-                Sha256::digest([b"acceptance-kp".as_ref(), &request_id].concat()).into();
-            let key_package_wrapper =
-                [b"genuine-acceptance-package".as_ref(), &request_id].concat();
+            let (key_package_ref, key_package_wrapper) = corpus_package.unwrap_or_else(|| {
+                (
+                    Sha256::digest([b"acceptance-kp".as_ref(), &request_id].concat()).into(),
+                    [b"genuine-acceptance-package".as_ref(), &request_id].concat(),
+                )
+            });
             let key_package_sha: [u8; 32] = Sha256::digest(&key_package_wrapper).into();
-            let creation_wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
-            let prior = creation_wrapper["body"]["next"].clone();
             let mut next = prior.clone();
-            next["stateVersion"] = json!(1);
+            next["stateVersion"] = json!(prior["stateVersion"].as_u64().unwrap() + 1);
             let body = json!({
                 "$type": SignedMutationKind::ParticipantAcceptance.type_id(),
                 "signatureDomain": String::from_utf8(
@@ -4844,7 +5571,7 @@ mod historical_control_loader {
                 "next": next.clone(),
                 "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
                 "invitationProvenance": {
-                    "invitationTransitionId": creation_transition_id.hyphenated().to_string(),
+                    "invitationTransitionId": invitation_transition_id.hyphenated().to_string(),
                     "invitedByDid": &entry.actor_did,
                     "invitedByDeviceId": entry.actor_device_id.hyphenated().to_string(),
                 }
@@ -4892,10 +5619,10 @@ mod historical_control_loader {
                 "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
                 "entryId": entry_id.hyphenated().to_string(),
                 "conversationId": Uuid::from_bytes(entry.cid).hyphenated().to_string(),
-                "seq": 2,
+                "seq": seq,
                 "signedRequest": wrapper,
                 "recovery": recovery,
-                "receivedAt": REQUESTED_AT,
+                "receivedAt": received_at,
             });
             let public_row_json = serde_json::to_vec(&row).unwrap();
             let decoded = decode_and_verify_control_entry(
@@ -5376,6 +6103,909 @@ mod historical_control_loader {
             (entry, invitee, acceptance)
         }
 
+        struct GenuinePolicyRoleGraph {
+            entry: RealCreationEntry,
+            invitee: AcceptanceInvitee,
+            acceptance: RealAcceptanceEntry,
+            fulfillment: RealLeafRecoveryFulfillmentEntry,
+        }
+
+        async fn insert_real_generation_state(
+            tx: &mut Transaction<'_, Postgres>,
+            cid: Uuid,
+            state: &ActivePublicState,
+            state_kind: &str,
+            producer: Uuid,
+            at: DateTime<Utc>,
+        ) {
+            let coordinate = state.coordinate();
+            let encoded = encode_public_tree_summary(state.binding().tree_summary())
+                .expect("real tree summary encodes");
+            sqlx::query(
+                r#"INSERT INTO chat.generation_states(
+                    conversation_id,generation,state_version,group_id,epoch,group_context_hash,
+                    confirmation_tag,lifecycle,state_kind,producing_transition_id,
+                    public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,
+                    leaf_count,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,$12,$13,$14,$15)"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(coordinate.generation()).unwrap())
+            .bind(i64::try_from(coordinate.state_version()).unwrap())
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(state_kind)
+            .bind(producer)
+            .bind(state.snapshot())
+            .bind(state.snapshot_sha256().to_vec())
+            .bind(encoded.bytes())
+            .bind(encoded.sha256().to_vec())
+            .bind(i64::try_from(state.binding().tree_summary().leaves().len()).unwrap())
+            .bind(at)
+            .execute(&mut **tx)
+            .await
+            .expect("insert real generation state");
+        }
+
+        async fn commit_genuine_policy_acceptance_fulfillment(
+            pool: &PgPool,
+        ) -> GenuinePolicyRoleGraph {
+            let cid = Uuid::new_v4();
+            let mut entry = build_real_corpus_creation_entry(*cid.as_bytes());
+            entry.head_next_entry_seq = 2;
+            let corpus_genesis = crate::frozen_public_state::restore_genesis();
+            let genesis = ActivePublicState::for_test(
+                &corpus_genesis,
+                PublicGroupSnapshotCoordinate::new(
+                    *cid.as_bytes(),
+                    corpus_genesis.coordinate().generation(),
+                    0,
+                    *corpus_genesis.coordinate().group_id(),
+                    corpus_genesis.coordinate().epoch(),
+                    *corpus_genesis.coordinate().group_context_hash(),
+                    *corpus_genesis.coordinate().confirmation_tag(),
+                    PublicGroupSnapshotLifecycle::Active,
+                ),
+            );
+            let creation_transition_id =
+                super::seed_real_creation_graph_with_public_state(pool, &entry, &genesis).await;
+            let invitee = corpus_invitee();
+
+            let policy = genuine_policy_control(
+                &entry,
+                genesis.coordinate(),
+                2,
+                POLICY_ADD_AT,
+                vec![GenuinePolicyChange::Add(&invitee.did)],
+            );
+            let policy_state = rebound_state(&genesis, 1);
+            let mut tx = pool.begin().await.expect("begin genuine Policy Add");
+            sqlx::query(
+                "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+            )
+            .bind(&invitee.did)
+            .bind(policy.received_at_db)
+            .execute(&mut *tx)
+            .await
+            .expect("insert corpus Bob principal");
+            sqlx::query(
+                r#"INSERT INTO chat.devices(
+                    user_did,device_id,device_name,status,dpop_jkt,auth_generation,
+                    capabilities,created_at,updated_at
+                ) VALUES($1,$2,'corpus-bob','active',$3,1,chat.protocol_capabilities(),$4,$4)
+                ON CONFLICT DO NOTHING"#,
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(policy.received_at_db)
+            .execute(&mut *tx)
+            .await
+            .expect("insert corpus Bob device");
+            sqlx::query(
+                r#"INSERT INTO chat.device_keys(
+                    user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at
+                ) VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING"#,
+            )
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(invitee.signing_key.verifying_key().to_bytes().to_vec())
+            .bind(policy.received_at_db)
+            .execute(&mut *tx)
+            .await
+            .expect("insert corpus Bob key");
+            sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=1,next_entry_seq=3 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=0 AND next_entry_seq=2",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance head through Policy Add");
+            sqlx::query(
+                "UPDATE chat.generations SET current_state_version=1 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=0",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation through Policy Add");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    entry_seq,accepted_at
+                ) VALUES($1,$2,'policy',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,0,0,1,2,$11)"#,
+            )
+            .bind(policy.transition_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&policy.entry.signed_request_bytes)
+            .bind(&policy.entry.unsigned_projection_bytes)
+            .bind(&policy.entry.signing_transcript_bytes)
+            .bind(&policy.entry.request_digest)
+            .bind(&policy.entry.signature)
+            .bind(policy.received_at_db)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Policy Add transition");
+            insert_real_generation_state(
+                &mut tx,
+                cid,
+                &policy_state,
+                "policy",
+                policy.transition_id,
+                policy.received_at_db,
+            )
+            .await;
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,0,1,$14,$15)"#,
+            )
+            .bind(cid)
+            .bind(policy.entry.entry_id)
+            .bind(&policy.entry.entry_kind)
+            .bind(&policy.entry.accepted_payload_bytes)
+            .bind(&policy.entry.accepted_payload_sha256)
+            .bind(&policy.entry.signed_request_bytes)
+            .bind(&policy.entry.request_digest)
+            .bind(&policy.entry.signature)
+            .bind(&policy.entry.server_fields_bytes)
+            .bind(&policy.entry.outer_entry_fingerprint)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(policy.transition_id)
+            .bind(policy.received_at_db)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Policy Add entry");
+            sqlx::query(
+                r#"INSERT INTO chat.participants(
+                    participant_period_id,conversation_id,user_did,status,role,role_transition_id,
+                    role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,
+                    invitation_entry_id,invited_at,current_membership,created_at
+                ) VALUES($1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,true,$5)"#,
+            )
+            .bind(invitee.participant_period_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(policy.transition_id)
+            .bind(policy.received_at_db)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(policy.entry.entry_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert policy-invited Bob");
+            tx.commit()
+                .await
+                .expect("genuine Policy Add crosses schema constraints");
+
+            let corpus_key_package_ref = validate_exact_corpus_recovery_artifacts();
+            let acceptance = build_real_acceptance_entry_at(
+                &entry,
+                &invitee,
+                policy.transition_id,
+                coordinate_json(policy_state.coordinate()),
+                3,
+                REQUESTED_AT,
+                Some((corpus_key_package_ref, corpus_file("key-package.mls"))),
+            );
+            assert_eq!(
+                acceptance.key_package_ref, corpus_key_package_ref,
+                "signed acceptance persists the production-derived corpus KeyPackageRef"
+            );
+            let acceptance_state = rebound_state(&policy_state, 2);
+            commit_genuine_acceptance(pool, &entry, &invitee, &acceptance, &acceptance_state).await;
+
+            let committed =
+                crate::frozen_public_state::restore_add_commit(&acceptance_state, 0).into_next();
+            assert_eq!(committed.coordinate().state_version(), 3);
+            let fulfillment = build_genuine_add_fulfillment_entry(
+                &entry,
+                &invitee,
+                &acceptance,
+                creation_transition_id,
+                acceptance_state.coordinate(),
+                committed.coordinate(),
+            );
+            commit_genuine_add_fulfillment(
+                pool,
+                &entry,
+                &invitee,
+                &acceptance,
+                &fulfillment,
+                creation_transition_id,
+                &committed,
+            )
+            .await;
+
+            GenuinePolicyRoleGraph {
+                entry,
+                invitee,
+                acceptance,
+                fulfillment,
+            }
+        }
+
+        async fn commit_genuine_acceptance(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            state: &ActivePublicState,
+        ) {
+            let cid = Uuid::from_bytes(entry.cid);
+            let at = instant(REQUESTED_AT);
+            let coordinate = state.coordinate();
+            let mut tx = pool.begin().await.expect("begin genuine acceptance");
+            sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=2,next_entry_seq=4 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=1 AND next_entry_seq=3",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance head through acceptance");
+            sqlx::query(
+                "UPDATE chat.generations SET current_state_version=2 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=1",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation through acceptance");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    entry_seq,accepted_at
+                ) VALUES($1,$2,'acceptConversation',$3,$4,$5,1,'member','active',$6,$7,$8,$9,$10,
+                    0,1,0,2,3,$11)"#,
+            )
+            .bind(acceptance.transition_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.unsigned_projection)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine acceptance transition");
+            insert_real_generation_state(
+                &mut tx,
+                cid,
+                state,
+                "acceptConversation",
+                acceptance.transition_id,
+                at,
+            )
+            .await;
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,3,$2,'blue.catbird.chat.defs#participantAcceptanceEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,2,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(acceptance.entry_id)
+            .bind(&acceptance.public_row_json)
+            .bind(Sha256::digest(&acceptance.public_row_json).to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(&acceptance.server_fields)
+            .bind(acceptance.outer_fingerprint.to_vec())
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(acceptance.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine acceptance entry");
+            sqlx::query(
+                "UPDATE chat.participants SET status='active',acceptance_transition_id=$2,\
+                 acceptance_entry_id=$3,accepted_at=$4 \
+                 WHERE participant_period_id=$1 AND status='pending'",
+            )
+            .bind(invitee.participant_period_id)
+            .bind(acceptance.transition_id)
+            .bind(acceptance.entry_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("promote genuine Bob");
+            let init_key = Sha256::digest(
+                [b"genuine-acceptance-init".as_ref(), &acceptance.request_id].concat(),
+            )
+            .to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.key_packages(
+                    key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,
+                    owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,
+                    status,created_at
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'reserved',$10)"#,
+            )
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(&acceptance.key_package_wrapper)
+            .bind(Sha256::digest(&acceptance.key_package_wrapper).to_vec())
+            .bind(init_key)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(instant(KP_NOT_BEFORE))
+            .bind(instant(KP_NOT_AFTER))
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine reserved package");
+            let request_id = Uuid::from_bytes(acceptance.request_id);
+            sqlx::query(
+                r#"INSERT INTO chat.key_package_reservations(
+                    recovery_request_id,key_package_ref,conversation_id,generation,requester_did,
+                    requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
+                    recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
+                    bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,2,$7,$8,$9,$10,
+                    'leafRecovery',$11,'active',$12)"#,
+            )
+            .bind(request_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(instant(EXPIRES_AT))
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine active reservation");
+            sqlx::query(
+                r#"INSERT INTO chat.leaf_recovery_requests(
+                    recovery_request_id,conversation_id,generation,requester_did,requester_device_id,
+                    requester_key_id,requester_auth_generation,recovery_kind,source,bound_state_version,
+                    bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
+                    reservation_request_id,status,signed_request_bytes,signing_transcript_bytes,
+                    request_digest,signature,requested_at,expires_at
+                ) VALUES($1,$2,0,$3,$4,$5,1,'add','acceptConversation',2,$6,$7,$8,$9,$1,
+                    'open',$10,$11,$12,$13,$14,$15)"#,
+            )
+            .bind(request_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(&invitee.key_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(&acceptance.raw_wrapper)
+            .bind(&acceptance.signing_transcript)
+            .bind(&acceptance.request_digest)
+            .bind(&acceptance.signature)
+            .bind(at)
+            .bind(instant(EXPIRES_AT))
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine acceptance recovery");
+            tx.commit()
+                .await
+                .expect("genuine acceptance crosses schema constraints");
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn commit_genuine_add_fulfillment(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            fulfillment: &RealLeafRecoveryFulfillmentEntry,
+            creation_transition_id: Uuid,
+            state: &ActivePublicState,
+        ) {
+            let cid = Uuid::from_bytes(entry.cid);
+            let at = instant(FULFILLED_AT);
+            let coordinate = state.coordinate();
+            let metadata_snapshot_id = Uuid::new_v4();
+            let leaf_period_id = Uuid::new_v4();
+            let bob_leaf = state
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .find(|leaf| {
+                    leaf.basic_credential()
+                        == format!("{}#{}", invitee.did, invitee.device_id).as_bytes()
+                })
+                .expect("committed corpus tree contains Bob");
+            assert_eq!(
+                bob_leaf.signature_key(),
+                invitee.signing_key.verifying_key().as_bytes()
+            );
+            let mut tx = pool.begin().await.expect("begin genuine Add fulfillment");
+            sqlx::query(
+                "UPDATE chat.conversations SET current_state_version=3,next_entry_seq=5 \
+                 WHERE conversation_id=$1 AND current_generation=0 \
+                   AND current_state_version=2 AND next_entry_seq=4",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance head through Add fulfillment");
+            sqlx::query(
+                "UPDATE chat.generations SET current_state_version=3 \
+                 WHERE conversation_id=$1 AND generation=0 AND current_state_version=2",
+            )
+            .bind(cid)
+            .execute(&mut *tx)
+            .await
+            .expect("advance generation through Add fulfillment");
+            sqlx::query(
+                r#"INSERT INTO chat.transitions(
+                    transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
+                    actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,
+                    unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,
+                    prior_generation,prior_state_version,next_generation,next_state_version,
+                    metadata_snapshot_id,entry_seq,accepted_at
+                ) VALUES($1,$2,'leafRecovery',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
+                    0,2,0,3,$11,4,$12)"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(cid)
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.canonical_projection)
+            .bind(&fulfillment.signing_transcript)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(metadata_snapshot_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Add fulfillment transition");
+            insert_real_generation_state(
+                &mut tx,
+                cid,
+                state,
+                "commit",
+                fulfillment.transition_id,
+                at,
+            )
+            .await;
+            let metadata_ciphertext = vec![0x32_u8; 16];
+            sqlx::query(
+                r#"INSERT INTO chat.metadata_snapshots(
+                    metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,
+                    group_context_hash,confirmation_tag,producing_transition_id,
+                    origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,
+                    ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,
+                    author_auth_generation,author_origin_seq,author_role,author_device_status,created_at
+                ) VALUES($1,$2,0,3,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,16,$12,$13,$14,$15,
+                    1,1,'admin','active',$16)"#,
+            )
+            .bind(metadata_snapshot_id)
+            .bind(cid)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(fulfillment.transition_id)
+            .bind(creation_transition_id)
+            .bind(vec![0x26_u8; 12])
+            .bind(&metadata_ciphertext)
+            .bind(Sha256::digest(&metadata_ciphertext).to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(&entry.public_key)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine fulfillment metadata");
+            sqlx::query(
+                r#"INSERT INTO chat.entries(
+                    conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+                    accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+                    server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+                    actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+                    received_at
+                ) VALUES($1,4,$2,'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+                    $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,3,$13,$14)"#,
+            )
+            .bind(cid)
+            .bind(fulfillment.entry_id)
+            .bind(&fulfillment.public_row_json)
+            .bind(Sha256::digest(&fulfillment.public_row_json).to_vec())
+            .bind(&fulfillment.raw_wrapper)
+            .bind(&fulfillment.request_digest)
+            .bind(&fulfillment.signature)
+            .bind(&fulfillment.server_fields_dag_cbor)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .bind(&entry.actor_key_id)
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Add fulfillment entry");
+            sqlx::query(
+                r#"INSERT INTO chat.member_devices(
+                    leaf_period_id,participant_period_id,conversation_id,generation,user_did,
+                    device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,
+                    leaf_auth_generation,origin,join_key_package_ref,joined_state_version,
+                    joined_transition_id,joined_seq,active,created_at
+                ) VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'keyPackage',$10,3,$11,4,true,$12)"#,
+            )
+            .bind(leaf_period_id)
+            .bind(invitee.participant_period_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(i64::from(bob_leaf.leaf_index()))
+            .bind(bob_leaf.basic_credential())
+            .bind(bob_leaf.signature_key())
+            .bind(&invitee.key_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Bob leaf");
+            sqlx::query(
+                r#"INSERT INTO chat.application_intervals(
+                    membership_interval_id,conversation_id,generation,recipient_did,
+                    recipient_device_id,start_seq,opening_kind,opening_transition_id,
+                    opening_outer_entry_fingerprint,opening_state_version,opening_group_id,
+                    opening_epoch,opening_group_context_hash,opening_confirmation_tag,
+                    opening_leaf_period_id,created_at
+                ) VALUES($1,$2,0,$3,$4,4,'add',$1,$5,3,$6,$7,$8,$9,$10,$11)"#,
+            )
+            .bind(fulfillment.transition_id)
+            .bind(cid)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(fulfillment.outer_entry_fingerprint.to_vec())
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(leaf_period_id)
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("open genuine Bob interval");
+            let request_id = Uuid::from_bytes(acceptance.request_id);
+            sqlx::query(
+                "UPDATE chat.leaf_recovery_requests SET status='fulfilled',\
+                 fulfilling_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='open'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await
+            .expect("fulfill genuine Add recovery");
+            sqlx::query(
+                "UPDATE chat.key_package_reservations SET status='consumed',\
+                 consumed_transition_id=$1,terminal_at=$2 \
+                 WHERE recovery_request_id=$3 AND status='active'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(request_id)
+            .execute(&mut *tx)
+            .await
+            .expect("consume genuine Add reservation");
+            sqlx::query(
+                "UPDATE chat.key_packages SET status='consumed',terminal_transition_id=$1,\
+                 terminal_at=$2 WHERE key_package_ref=$3 AND status='reserved'",
+            )
+            .bind(fulfillment.transition_id)
+            .bind(at)
+            .bind(acceptance.key_package_ref.to_vec())
+            .execute(&mut *tx)
+            .await
+            .expect("consume genuine Bob package");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_bundles(
+                    welcome_id,conversation_id,transition_id,entry_seq,generation,state_version,
+                    group_id,epoch,group_context_hash,confirmation_tag,wrapper_bytes,
+                    wrapper_sha256,created_at
+                ) VALUES($1,$2,$3,4,0,3,$4,$5,$6,$7,$8,$9,$10)"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(cid)
+            .bind(fulfillment.transition_id)
+            .bind(coordinate.group_id().to_vec())
+            .bind(i64::try_from(coordinate.epoch()).unwrap())
+            .bind(coordinate.group_context_hash().to_vec())
+            .bind(coordinate.confirmation_tag().to_vec())
+            .bind(&fulfillment.opaque_welcome)
+            .bind(Sha256::digest(&fulfillment.opaque_welcome).to_vec())
+            .bind(at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine Welcome bundle");
+            sqlx::query(
+                r#"INSERT INTO chat.welcome_deliveries(
+                    welcome_id,recipient_did,recipient_device_id,recovery_request_id,
+                    key_package_ref,expires_at,status
+                ) VALUES($1,$2,$3,$4,$5,$6,'pending')"#,
+            )
+            .bind(fulfillment.welcome_id)
+            .bind(&invitee.did)
+            .bind(invitee.device_id)
+            .bind(request_id)
+            .bind(acceptance.key_package_ref.to_vec())
+            .bind(instant(KP_NOT_AFTER))
+            .execute(&mut *tx)
+            .await
+            .expect("insert genuine pending Welcome");
+            tx.commit()
+                .await
+                .expect("genuine Add fulfillment crosses deferred mappings");
+        }
+
+        async fn device_event_predecessor(
+            pool: &PgPool,
+            did: &str,
+            device_id: Uuid,
+        ) -> Option<i64> {
+            sqlx::query_scalar(
+                "SELECT max(event_position) FROM chat.event_recipients \
+                 WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(did)
+            .bind(device_id)
+            .fetch_one(pool)
+            .await
+            .expect("read device event predecessor")
+        }
+
+        async fn execute_genuine_role_change(
+            pool: &PgPool,
+            graph: &GenuinePolicyRoleGraph,
+            role: ParticipantRole,
+            seq: u64,
+            at: &str,
+            superseded_welcome: Option<Uuid>,
+        ) -> ConversationState {
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let locked_at: DateTime<Utc> =
+                sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                    .fetch_one(pool)
+                    .await
+                    .expect("role pre-plan lock instant");
+            let mut read = pool.begin().await.expect("begin role pre-plan hydration");
+            let locked = hydrate_locked_conversation_state(&mut read, cid, locked_at)
+                .await
+                .expect("role pre-plan aggregate hydrates");
+            let prior = locked.state().clone();
+            read.rollback().await.expect("rollback role pre-plan read");
+
+            let control = genuine_policy_control(
+                &graph.entry,
+                prior.coordinate(),
+                seq,
+                at,
+                vec![GenuinePolicyChange::ChangeRole(&graph.invitee.did, role)],
+            );
+            assert_eq!(
+                control
+                    .transition
+                    .signed_authority()
+                    .map(|authority| authority.kind()),
+                Some(SignedMutationKind::PolicyTransition),
+                "planner receives genuine signed policy authority"
+            );
+            let alice = DeviceIdentity::new(
+                PrincipalId::new(graph.entry.actor_did.as_bytes().to_vec()).unwrap(),
+                *graph.entry.actor_device_id.as_bytes(),
+            )
+            .unwrap();
+            let bob = DeviceIdentity::new(
+                PrincipalId::new(graph.invitee.did.as_bytes().to_vec()).unwrap(),
+                *graph.invitee.device_id.as_bytes(),
+            )
+            .unwrap();
+            let planned = plan_policy(
+                &prior,
+                alice.clone(),
+                control.transition,
+                Sha256::digest(control.transition_id.as_bytes()).into(),
+            )
+            .expect("genuine signed ChangeRole plans");
+            let resulting_state = planned.resulting_state().clone();
+
+            // Test-only head packaging supplies no semantic authority: the policy
+            // evidence above came from production canonical decode + Ed25519
+            // verification, and the production executor still performs every
+            // plan-shape validation and durable CAS. The final aggregate reload
+            // independently re-verifies the committed seq-5/seq-6 bytes.
+            let head = ConversationHeadCasBinding::for_test_edge(
+                *cid.as_bytes(),
+                *control.entry.entry_id.as_bytes(),
+                *prior.coordinate(),
+                seq,
+                control.received_at,
+            );
+            let plan = persistence_plan_for_test(planned, head);
+            let protocol_instance_id: Uuid =
+                sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
+                    .fetch_one(pool)
+                    .await
+                    .expect("protocol instance");
+            let successor_public_state = resulting_state.public_state();
+            let tree = encode_public_tree_summary(successor_public_state.binding().tree_summary())
+                .expect("role successor tree encodes");
+
+            let mut audience = vec![
+                (alice.clone(), graph.entry.actor_did.clone()),
+                (bob.clone(), graph.invitee.did.clone()),
+            ];
+            audience.sort_by(|left, right| {
+                (left.1.as_bytes(), left.0.device_id())
+                    .cmp(&(right.1.as_bytes(), right.0.device_id()))
+            });
+            let entry_recipients = audience
+                .iter()
+                .map(|(device, _)| (device.clone(), EntryEntitlementKind::Control))
+                .collect();
+            let changed_targets: Vec<_> = if superseded_welcome.is_some() {
+                vec![(alice.clone(), graph.entry.actor_did.clone())]
+            } else {
+                audience.clone()
+            };
+            let mut changed_recipients = Vec::new();
+            for (device, did) in changed_targets {
+                changed_recipients.push((
+                    device.clone(),
+                    EventEntitlementKind::Participant,
+                    device_event_predecessor(pool, &did, Uuid::from_bytes(*device.device_id()))
+                        .await,
+                ));
+            }
+            let welcome_dispositions = if let Some(welcome_id) = superseded_welcome {
+                vec![WelcomeDispositionInput {
+                    welcome_id,
+                    event: EventFanout {
+                        event_id: Uuid::new_v4(),
+                        event_kind: EventKind::WelcomeDisposition,
+                        payload_bytes: format!("welcome-superseded-{seq}").into_bytes(),
+                        recipients: vec![(
+                            bob.clone(),
+                            EventEntitlementKind::Welcome,
+                            device_event_predecessor(
+                                pool,
+                                &graph.invitee.did,
+                                graph.invitee.device_id,
+                            )
+                            .await,
+                        )],
+                        outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+                    },
+                }]
+            } else {
+                vec![]
+            };
+            let ctx = ExecutionContext {
+                protocol_instance_id,
+                applied_at: control.received_at_db,
+                actor: ExecutionActor {
+                    user_did: graph.entry.actor_did.clone(),
+                    device_id: graph.entry.actor_device_id,
+                    key_id: graph.entry.actor_key_id.clone(),
+                    auth_generation: 1,
+                    role: TransitionActorRole::Admin,
+                    device_status: "active".to_owned(),
+                },
+                entry: control.entry,
+                spine: SpineArtifacts {
+                    public_snapshot_bytes: successor_public_state.snapshot().to_vec(),
+                    public_snapshot_sha256: successor_public_state.snapshot_sha256().to_vec(),
+                    tree_summary_bytes: tree.bytes().to_vec(),
+                    tree_summary_sha256: tree.sha256().to_vec(),
+                    leaf_count: i64::try_from(
+                        successor_public_state
+                            .binding()
+                            .tree_summary()
+                            .leaves()
+                            .len(),
+                    )
+                    .unwrap(),
+                    genesis_group_info_bytes: vec![],
+                    genesis_group_info_sha256: vec![],
+                },
+                opened_leaves: vec![],
+                metadata_author: None,
+                participant_period_ids: vec![],
+                leaf_period_ids: vec![],
+                entry_recipients,
+                events: vec![EventFanout {
+                    event_id: Uuid::new_v4(),
+                    event_kind: EventKind::ConversationChanged,
+                    payload_bytes: format!("role-change-{seq}").into_bytes(),
+                    recipients: changed_recipients,
+                    outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+                }],
+                closing_leaf_periods: vec![],
+                closing_participant_periods: vec![],
+                reset_request_row: None,
+                recovery_open: None,
+                welcome_expiry: None,
+                welcome_response: None,
+                welcome_dispositions,
+            };
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin production ChangeRole executor");
+            let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+                .await
+                .expect("production ChangeRole executor applies");
+            assert_eq!(applied.allocated_seq, seq);
+            tx.commit()
+                .await
+                .expect("production ChangeRole crosses deferred constraints");
+            resulting_state
+        }
+
         async fn load_acceptance_aggregate(
             pool: &PgPool,
             entry: &RealCreationEntry,
@@ -5565,6 +7195,153 @@ mod historical_control_loader {
             server_fields_dag_cbor: Vec<u8>,
             outer_entry_fingerprint: [u8; 32],
             opaque_welcome: Vec<u8>,
+        }
+
+        fn build_genuine_add_fulfillment_entry(
+            entry: &RealCreationEntry,
+            invitee: &AcceptanceInvitee,
+            acceptance: &RealAcceptanceEntry,
+            creation_transition_id: Uuid,
+            prior: &PublicGroupSnapshotCoordinate,
+            next: &PublicGroupSnapshotCoordinate,
+        ) -> RealLeafRecoveryFulfillmentEntry {
+            let signing_key = entry.signing_key();
+            let transition_id = Uuid::new_v4();
+            let entry_id = Uuid::new_v4();
+            let welcome_id = Uuid::new_v4();
+            let commit_bytes = corpus_file("commit-public.mls");
+            let opaque_welcome = corpus_file("welcome.mls");
+            let metadata_ciphertext = vec![0x32_u8; 16];
+            let request_id = Uuid::from_bytes(acceptance.request_id);
+            let body = json!({
+                "$type": SignedMutationKind::LeafRecoveryFulfillment.type_id(),
+                "signatureDomain": String::from_utf8(
+                    SignedMutationKind::LeafRecoveryFulfillment.domain().to_vec()
+                ).unwrap(),
+                "transitionId": transition_id,
+                "actorDid": &entry.actor_did,
+                "actorDeviceId": entry.actor_device_id,
+                "keyId": &entry.actor_key_id,
+                "authGeneration": 1,
+                "prior": coordinate_json(prior),
+                "next": coordinate_json(next),
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode(entry.cid),
+                    "generation": prior.generation(),
+                    "transitionId": STANDARD.encode(transition_id.as_bytes()),
+                    "prior": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": prior.generation(),
+                        "stateVersion": prior.state_version(),
+                        "groupId": STANDARD.encode(prior.group_id()),
+                        "epoch": prior.epoch(),
+                        "groupContextHash": STANDARD.encode(prior.group_context_hash()),
+                        "confirmationTag": STANDARD.encode(prior.confirmation_tag()),
+                        "lifecycle": "active",
+                    },
+                },
+                "manifest": {
+                    "participantChanges": [],
+                    "leafChanges": [{
+                        "$type": "blue.catbird.chat.defs#addLeafByRecovery",
+                        "userDid": &invitee.did,
+                        "deviceId": invitee.device_id,
+                        "recoveryRequestId": request_id,
+                        "keyPackageRef": STANDARD.encode(acceptance.key_package_ref),
+                    }],
+                    "leafRecoveryRequestId": request_id,
+                    "welcomeBundle": {
+                        "welcomeId": welcome_id,
+                        "framing": "mlsMessage",
+                        "contentType": "welcome",
+                        "opaqueWelcome": STANDARD.encode(&opaque_welcome),
+                        "sha256": STANDARD.encode(Sha256::digest(&opaque_welcome)),
+                        "deliveries": [{
+                            "recipientDid": &invitee.did,
+                            "recipientDeviceId": invitee.device_id,
+                            "provenance": {
+                                "recoveryRequestId": request_id,
+                                "keyPackageRef": STANDARD.encode(acceptance.key_package_ref),
+                            },
+                        }],
+                    },
+                },
+                "commit": {
+                    "framing": "mlsMessage",
+                    "contentType": "publicMessageCommit",
+                    "bytes": STANDARD.encode(&commit_bytes),
+                    "sha256": STANDARD.encode(Sha256::digest(&commit_bytes)),
+                },
+                "metadataSnapshot": {
+                    "coordinate": {
+                        "conversationId": STANDARD.encode(entry.cid),
+                        "generation": next.generation(),
+                        "groupId": STANDARD.encode(next.group_id()),
+                        "epoch": next.epoch(),
+                        "groupContextHash": STANDARD.encode(next.group_context_hash()),
+                        "confirmationTag": STANDARD.encode(next.confirmation_tag()),
+                    },
+                    "originTransitionId": creation_transition_id,
+                    "metadataVersion": 1,
+                    "nonce": STANDARD.encode([0x26_u8; 12]),
+                    "ciphertext": STANDARD.encode(&metadata_ciphertext),
+                    "ciphertextSha256": STANDARD.encode(Sha256::digest(&metadata_ciphertext)),
+                    "ciphertextSize": metadata_ciphertext.len(),
+                    "authorProof": {
+                        "authorDid": &entry.actor_did,
+                        "authorDeviceId": entry.actor_device_id,
+                        "authorKeyId": &entry.actor_key_id,
+                        "signaturePublicKey": STANDARD.encode(&entry.public_key),
+                        "authGenerationAtOrigin": 1,
+                        "originTransitionId": creation_transition_id,
+                        "originSeq": 1,
+                        "roleAtOrigin": "admin",
+                        "deviceStatusAtOrigin": "active",
+                    },
+                },
+                "recoveryRequestId": request_id,
+                "idempotencyKey": Uuid::new_v4(),
+                "signedAt": FULFILLMENT_SIGNED_AT,
+            });
+            let mut wrapper = json!({"body": body, "signature": STANDARD.encode([0_u8; 64])});
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let unsigned_canonical =
+                decode_canonical_signed_mutation(&unsigned).expect("Add fulfillment canonical");
+            let signature = signing_key
+                .sign(unsigned_canonical.transcript_bytes())
+                .to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&raw_wrapper)
+                .expect("signed Add fulfillment canonical");
+            let public_row_json = serde_json::to_vec(&json!({
+                "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+                "entryId": entry_id,
+                "conversationId": Uuid::from_bytes(entry.cid),
+                "seq": 4,
+                "signedRequest": wrapper,
+                "receivedAt": FULFILLED_AT,
+            }))
+            .unwrap();
+            let decoded = decode_and_verify_control_entry(&public_row_json, &entry.public_key)
+                .expect("genuine Add fulfillment control verifies");
+            RealLeafRecoveryFulfillmentEntry {
+                entry_id,
+                transition_id,
+                welcome_id,
+                public_row_json,
+                raw_wrapper,
+                canonical_projection: canonical.canonical_projection().to_vec(),
+                signing_transcript: canonical.transcript_bytes().to_vec(),
+                request_digest: canonical.request_digest().to_vec(),
+                signature: canonical.signature().to_vec(),
+                server_fields_dag_cbor: decoded
+                    .server_fields_dag_cbor()
+                    .expect("fulfillment server fields"),
+                outer_entry_fingerprint: *decoded.outer_control_fingerprint(),
+                opaque_welcome,
+            }
         }
 
         fn encoded_fixture_tree_summary(entry: &RealCreationEntry) -> (Vec<u8>, [u8; 32]) {
