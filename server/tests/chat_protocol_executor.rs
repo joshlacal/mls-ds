@@ -52,6 +52,13 @@ mod chat_protocol {
         ));
     }
     pub mod repository {
+        pub mod core {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/core.rs"
+            ));
+        }
         pub mod transition {
             #![allow(dead_code)]
             include!(concat!(
