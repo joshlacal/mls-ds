@@ -1461,6 +1461,57 @@ pub(crate) async fn hydrate_execution_context(
     })
 }
 
+/// Read-only preflight for one conversation's entryless revocation authority.
+///
+/// This deliberately verifies only the authority needed before the batch's
+/// first writer: it locks the durable actor registration/key, re-verifies the
+/// exact retained signed DeviceRevocation wrapper, and binds its entryless
+/// operation ID to the global batch revocation ID. It never derives audiences or
+/// predecessors and never constructs an `ExecutionContext`; full hydration still
+/// occurs immediately before each later apply.
+async fn preflight_device_revocation_execution_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    batch_revocation_id: Uuid,
+) -> Result<(), ExecutionContextHydrationError> {
+    if plan.effects().kind() != PlanKind::DeviceRevocation {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let facts = authority_facts(plan)?;
+    if facts.operation_id != batch_revocation_id {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let head = plan
+        .effects()
+        .head_cas()
+        .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
+    #[cfg(not(test))]
+    {
+        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut **transaction)
+            .await?;
+        if transaction_id != head.transaction_id() {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+    }
+    if server_instant(head.locked_at())? != facts.applied_at {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+
+    let actor = lock_actor(transaction, &facts).await?;
+    if actor.status != "active" {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let (authority, _) =
+        build_execution_authority(plan, &facts, &actor, &ExecutionContextArtifacts::default())?;
+    match authority {
+        ExecutionAuthority::Entryless { operation_id } if operation_id == batch_revocation_id => {
+            Ok(())
+        }
+        _ => Err(ExecutionContextHydrationError::AuthorityMismatch),
+    }
+}
+
 /// Apply a sealed device-revocation batch inside the caller-owned transaction.
 ///
 /// The complete keyed artifact set is validated before the immutable/global
@@ -1513,6 +1564,16 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
                 SequentialDeviceRevocationError::MissingConversationArtifacts(conversation_id),
             );
         }
+    }
+
+    let batch_revocation_id = Uuid::from_bytes(*plan.authority().revocation_id());
+    for conversation in plan.conversations() {
+        preflight_device_revocation_execution_authority(
+            transaction,
+            conversation,
+            batch_revocation_id,
+        )
+        .await?;
     }
 
     apply_device_revocation_batch_prefix(transaction, plan).await?;

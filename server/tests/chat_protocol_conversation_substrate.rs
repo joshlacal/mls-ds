@@ -5250,7 +5250,7 @@ mod historical_control_loader {
         use crate::chat_protocol::repository::execution_context::{
             apply_device_revocation_batch_sequential, hydrate_execution_context,
             ConversationExecutionArtifacts, ExecutionContextArtifacts,
-            SequentialDeviceRevocationError,
+            ExecutionContextHydrationError, SequentialDeviceRevocationError,
         };
         use crate::chat_protocol::repository::transition::TransitionActorRole;
         use crate::chat_protocol::snapshot::{
@@ -6286,6 +6286,178 @@ mod historical_control_loader {
             .await
             .expect("read shared device after rollback");
             assert_eq!(durable_status, ("active".to_owned(), None));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_sequential_revocation_rejects_later_invalid_authority_before_any_write() {
+            let pool = g6_gate_pool("sequential authority preflight proof").await;
+            let first_invitee = unique_acceptance_invitee();
+            let second_invitee = same_device_invitee(&first_invitee, Uuid::new_v4());
+            let first_graph = commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(first_invitee),
+            )
+            .await;
+            let second_graph = commit_genuine_policy_acceptance_fulfillment_at_for_invitee(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(second_invitee),
+            )
+            .await;
+            let first_welcome_id = first_graph.fulfillment.welcome_id;
+            let second_welcome_id = second_graph.fulfillment.welcome_id;
+            let second_cid = Uuid::from_bytes(second_graph.entry.cid);
+            let (_, fixture) = g6_revocation_preflight_fixture_for_graph(&pool, first_graph).await;
+            let accepted =
+                ServerTimestamp::from_unix_millis_for_test(fixture.accepted_at.timestamp_millis())
+                    .expect("canonical shared revocation instant");
+            let mut second_read = pool
+                .begin()
+                .await
+                .expect("begin invalid-authority aggregate read");
+            let second_locked = hydrate_locked_conversation_state(
+                &mut second_read,
+                second_cid,
+                fixture.accepted_at,
+            )
+            .await
+            .expect("hydrate later genuine revocation aggregate");
+            let second_state = second_locked.state().clone();
+            second_read
+                .rollback()
+                .await
+                .expect("rollback invalid-authority aggregate read");
+
+            let invalid_evidence = DeviceRevocationEvidence::for_test(
+                *fixture.evidence.revocation_id(),
+                fixture.evidence.actor().clone(),
+                fixture.evidence.target().clone(),
+                *fixture.evidence.actor_key_id(),
+                fixture.evidence.actor_auth_generation(),
+                fixture.evidence.expected_target_auth_generation(),
+                fixture.evidence.signed_at(),
+                fixture.evidence.accepted_at(),
+                *fixture.evidence.request_digest(),
+                *fixture.evidence.signature(),
+                vec![0xff],
+                fixture.evidence.signing_transcript_bytes().to_vec(),
+            );
+            let second_planned = plan_device_revocation(&second_state, invalid_evidence.clone())
+                .expect("shape-valid later revocation plan retains invalid signed wrapper");
+            let second_plan = device_revocation_plan_for_test(
+                second_planned,
+                ConversationHeadCasBinding::for_test_internal(
+                    *second_cid.as_bytes(),
+                    *second_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                invalid_evidence,
+            );
+            let first_cid = Uuid::from_bytes(
+                *fixture
+                    .conversation_plan
+                    .state()
+                    .coordinate
+                    .conversation_id(),
+            );
+            let (available_ref, binding) = append_g6_available_package(&pool, &fixture).await;
+            let batch = fixture.batch(
+                vec![binding],
+                vec![fixture.conversation_plan.clone(), second_plan],
+            );
+            let artifacts = vec![
+                ConversationExecutionArtifacts::new(
+                    first_cid,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: None,
+                        welcome_disposition_event_payloads: vec![(
+                            first_welcome_id,
+                            b"g6-valid-first-authority".to_vec(),
+                        )],
+                    },
+                ),
+                ConversationExecutionArtifacts::new(
+                    second_cid,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: None,
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: None,
+                        welcome_disposition_event_payloads: vec![(
+                            second_welcome_id,
+                            b"g6-invalid-later-authority".to_vec(),
+                        )],
+                    },
+                ),
+            ];
+            let first_head_before: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(first_cid)
+            .fetch_one(&pool)
+            .await
+            .expect("read first head before invalid batch");
+            let second_head_before: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(second_cid)
+            .fetch_one(&pool)
+            .await
+            .expect("read second head before invalid batch");
+
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin invalid later-authority proof");
+            let error = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
+                .await
+                .expect_err("invalid later authority must reject the complete batch");
+            assert!(matches!(
+                error,
+                SequentialDeviceRevocationError::Hydration(
+                    ExecutionContextHydrationError::AuthorityMismatch
+                )
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, Some(available_ref)).await;
+            let first_head_after: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(first_cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read first head after invalid batch");
+            let second_head_after: (i64, i64) = sqlx::query_as(
+                "SELECT current_state_version,next_entry_seq FROM chat.conversations \
+                 WHERE conversation_id=$1",
+            )
+            .bind(second_cid)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read second head after invalid batch");
+            assert_eq!(first_head_after, first_head_before);
+            assert_eq!(second_head_after, second_head_before);
+            let event_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM chat.welcome_dispositions \
+                 WHERE welcome_id=$1 OR welcome_id=$2",
+            )
+            .bind(first_welcome_id)
+            .bind(second_welcome_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count invalid-batch Welcome events");
+            assert_eq!(event_count, 0, "invalid batch appended a Welcome event");
+            tx.rollback()
+                .await
+                .expect("rollback invalid later-authority proof");
         }
 
         #[tokio::test]
