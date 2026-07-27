@@ -5533,6 +5533,11 @@ mod historical_control_loader {
         use super::super::historical_control_path::{
             build_real_corpus_creation_entry, build_real_creation_entry, RealCreationEntry,
         };
+        use super::reset_leave_leg::{
+            build_real_control_request_entry_with_id_at_and_signed_at, build_real_reset_activation,
+            build_real_reset_activation_with_group_info_at, mutate_real_reset_activation,
+            RealResetActivation, RESET_ENTRY_KIND,
+        };
         use super::{
             seed_real_creation_graph, seed_real_creation_graph_with_public_state_and_group_info,
         };
@@ -11623,9 +11628,9 @@ mod historical_control_loader {
                 .expect("rollback wrong-leaf proof");
         }
 
-        #[tokio::test]
-        #[ignore = "requires the dedicated append-only gate database"]
-        async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
+        async fn run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+            include_reset: bool,
+        ) {
             let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
             let trusted_at: DateTime<Utc> =
                 sqlx::query_scalar("SELECT date_trunc('second', clock_timestamp())")
@@ -11706,6 +11711,56 @@ mod historical_control_loader {
                 welcome,
                 0x56,
                 0x57,
+            );
+            let reset_request_at = trusted_at + chrono::Duration::seconds(1);
+            let reset_request_text = reset_request_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let reset_request_signed_text = (reset_request_at
+                - chrono::Duration::milliseconds(500))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+            let reset_activation_at = trusted_at + chrono::Duration::seconds(2);
+            let reset_activation_text =
+                reset_activation_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+            let reset_request = build_real_control_request_entry_with_id_at_and_signed_at(
+                &entry,
+                SignedMutationKind::ResetRequest,
+                RESET_ENTRY_KIND,
+                5,
+                Uuid::new_v4(),
+                &reset_request_text,
+                &reset_request_signed_text,
+                Some(committed.coordinate()),
+            );
+            let mut reset_participants = vec![
+                json!({
+                    "userDid": entry.actor_did,
+                    "role": "admin",
+                    "status": "active",
+                }),
+                json!({
+                    "userDid": invitee.did,
+                    "role": "member",
+                    "status": "active",
+                    "invitationProvenance": {
+                        "invitedByDid": entry.actor_did,
+                        "invitedByDeviceId": entry.actor_device_id,
+                        "invitationTransitionId": creation_transition_id,
+                    },
+                }),
+            ];
+            reset_participants.sort_by(|left, right| {
+                left["userDid"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .cmp(right["userDid"].as_str().unwrap().as_bytes())
+            });
+            let reset_activation = build_real_reset_activation(
+                &entry,
+                reset_request.request_id,
+                committed.coordinate(),
+                6,
+                Value::Array(reset_participants),
+                reset_activation_at,
             );
             let creation_trusted = TrustedRequestInstant::from_canonical_for_test(
                 CanonicalTimestamp::parse(&trusted_text).expect("Creation time canonical"),
@@ -12017,6 +12072,48 @@ mod historical_control_loader {
             {
                 AuthorizationOutcome::FirstExecution(authority) => authority,
                 AuthorizationOutcome::CompletedReplay(_) => panic!("fresh Fulfillment replayed"),
+            };
+            let reset_request_authority = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.requestReset",
+                    &reset_request_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &actor_jkt,
+                ),
+                decode_canonical_signed_mutation(&reset_request.raw_wrapper)
+                    .expect("ResetRequest canonical for authorization"),
+            )
+            .await
+            .expect("authorize lifecycle ResetRequest")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => panic!("fresh ResetRequest replayed"),
+            };
+            let reset_activation_authority = match authorize_signed_request(
+                &pool,
+                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.activateReset",
+                    &reset_activation_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &actor_jkt,
+                ),
+                decode_canonical_signed_mutation(&reset_activation.raw_wrapper)
+                    .expect("ResetActivation canonical for authorization"),
+            )
+            .await
+            .expect("authorize lifecycle ResetActivation")
+            {
+                AuthorizationOutcome::FirstExecution(authority) => authority,
+                AuthorizationOutcome::CompletedReplay(_) => {
+                    panic!("fresh ResetActivation replayed")
+                }
             };
 
             let mut tx = pool.begin().await.expect("begin atomic recovery lifecycle");
@@ -13849,6 +13946,834 @@ mod historical_control_loader {
                 (0, 0, 0, 0, 0, 0, 3, 2),
                 "lifecycle proof produced no unrelated family effects"
             );
+            let reset_contexts = if include_reset {
+                Some(Box::pin(async {
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("defer constraints for ResetRequest");
+                let locked_fulfillment = hydrate_locked_conversation_state(
+                    &mut tx,
+                    conversation_id,
+                    reset_request_at,
+                )
+                .await
+                .expect("lock exact post-Fulfillment graph for ResetRequest");
+                assert_eq!(
+                    locked_fulfillment.state().coordinate(),
+                    committed.coordinate()
+                );
+                let prior_reset_spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) =
+                    sqlx::query_as(
+                        r#"SELECT public_snapshot_bytes,snapshot_sha256,
+                                  tree_summary_bytes,tree_summary_sha256,leaf_count
+                             FROM chat.generation_states
+                            WHERE conversation_id=$1 AND generation=0
+                              AND state_version=3 AND lifecycle='active'"#,
+                    )
+                    .bind(conversation_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read exact active spine before Reset");
+                let reset_request_hydration =
+                    HydrationAuthority::from_locked_conversation(&locked_fulfillment)
+                        .expect("mint lifecycle ResetRequest authority");
+                let reset_request_business =
+                    recheck_business_authority(&mut tx, &reset_request_authority)
+                        .await
+                        .expect("recheck lifecycle ResetRequest authority");
+                let reset_request_registration = reset_request_hydration
+                    .locked_registration_from_guard(reset_request_business)
+                    .expect("seal lifecycle ResetRequest registration");
+                let reset_request_verified = decode_and_verify_control_entry(
+                    &reset_request.public_row_json,
+                    &entry.public_key,
+                )
+                .expect("verify lifecycle ResetRequest");
+                let reset_request_verified = rebind_persisted_control_entry(
+                    reset_request_verified,
+                    &reset_request.raw_wrapper,
+                    &entry.public_key,
+                )
+                .expect("rebind lifecycle ResetRequest");
+                let reset_request_plan = reset_request_hydration
+                    .plan_reset_request_entry(
+                        &locked_fulfillment,
+                        reset_request_verified,
+                        reset_request_registration,
+                    )
+                    .expect("plan genuine lifecycle ResetRequest")
+                    .into_persistence_plan()
+                    .expect("seal lifecycle ResetRequest plan");
+                let reset_request_context = hydrate_execution_context(
+                    &mut tx,
+                    &reset_request_plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: Some(
+                            reset_request.public_row_json.clone(),
+                        ),
+                        genesis_group_info_bytes: None,
+                        primary_event_payload: Some(
+                            format!("g6-reset-request-{conversation_id}").into_bytes(),
+                        ),
+                        welcome_disposition_event_payloads: Vec::new(),
+                    },
+                )
+                .await
+                .expect("hydrate lifecycle ResetRequest context");
+                apply_conversation_persistence_plan(
+                    &mut tx,
+                    &reset_request_plan,
+                    &reset_request_context,
+                )
+                .await
+                .expect("apply lifecycle ResetRequest");
+                sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("force lifecycle ResetRequest constraints");
+
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("defer constraints for ResetActivation");
+                let locked_reset_request = hydrate_locked_conversation_state(
+                    &mut tx,
+                    conversation_id,
+                    reset_activation_at,
+                )
+                .await
+                .expect("lock exact pending ResetRequest graph");
+                let reset_activation_hydration =
+                    HydrationAuthority::from_locked_conversation(&locked_reset_request)
+                        .expect("mint lifecycle ResetActivation authority");
+                let reset_activation_business =
+                    recheck_business_authority(&mut tx, &reset_activation_authority)
+                        .await
+                        .expect("recheck lifecycle ResetActivation authority");
+                let reset_activation_registration = reset_activation_hydration
+                    .locked_registration_from_guard(reset_activation_business)
+                    .expect("seal lifecycle ResetActivation registration");
+                let mut invalid_group_info = reset_activation.group_info.clone();
+                let invalid_group_info_last = invalid_group_info.len() - 1;
+                invalid_group_info[invalid_group_info_last] ^= 1;
+                let singleton_manifest = |actor: &RealCreationEntry| {
+                    json!([{
+                        "userDid": actor.actor_did,
+                        "role": "admin",
+                        "status": "active",
+                    }])
+                };
+                let credential_entry = RealCreationEntry {
+                    cid: entry.cid,
+                    entry_id: entry.entry_id,
+                    public_row_json: entry.public_row_json.clone(),
+                    raw_wrapper: entry.raw_wrapper.clone(),
+                    public_key: entry.public_key.clone(),
+                    outer_entry_fingerprint: entry.outer_entry_fingerprint,
+                    actor_did: invitee.did.clone(),
+                    actor_device_id: invitee.device_id,
+                    actor_key_id: entry.actor_key_id.clone(),
+                    signing_seed: entry.signing_seed,
+                    head_next_entry_seq: entry.head_next_entry_seq,
+                };
+                let credential_group_info = build_real_reset_activation(
+                    &credential_entry,
+                    reset_request.request_id,
+                    committed.coordinate(),
+                    6,
+                    singleton_manifest(&credential_entry),
+                    reset_activation_at,
+                );
+                let mut signature_entry =
+                    build_real_creation_entry(*Uuid::new_v4().as_bytes());
+                signature_entry.cid = entry.cid;
+                let signature_group_info = build_real_reset_activation(
+                    &signature_entry,
+                    reset_request.request_id,
+                    committed.coordinate(),
+                    6,
+                    singleton_manifest(&signature_entry),
+                    reset_activation_at,
+                );
+                let lifetime_group_info = build_real_reset_activation_with_group_info_at(
+                    &entry,
+                    reset_request.request_id,
+                    committed.coordinate(),
+                    6,
+                    singleton_manifest(&entry),
+                    reset_activation_at,
+                    reset_activation_at - chrono::Duration::hours(2),
+                );
+                let replace_group_info =
+                    |alternate: &RealResetActivation| -> (Vec<u8>, Vec<u8>) {
+                        mutate_real_reset_activation(
+                            &entry,
+                            &reset_activation,
+                            |body| {
+                                let coordinate =
+                                    alternate.successor_public_state.coordinate();
+                                body["successor"] = coordinate_json(coordinate);
+                                body["metadataSnapshot"]["coordinate"] = json!({
+                                    "conversationId": STANDARD.encode(coordinate.conversation_id()),
+                                    "generation": coordinate.generation(),
+                                    "groupId": STANDARD.encode(coordinate.group_id()),
+                                    "epoch": coordinate.epoch(),
+                                    "groupContextHash": STANDARD.encode(
+                                        coordinate.group_context_hash()
+                                    ),
+                                    "confirmationTag": STANDARD.encode(
+                                        coordinate.confirmation_tag()
+                                    ),
+                                });
+                                body["genesisGroupInfo"]["bytes"] =
+                                    json!(STANDARD.encode(&alternate.group_info));
+                                body["genesisGroupInfo"]["sha256"] = json!(STANDARD.encode(
+                                    Sha256::digest(&alternate.group_info)
+                                ));
+                            },
+                        )
+                    };
+                let semantic_candidates = vec![
+                    (
+                        "foreign reset request ID",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["resetRequestId"] =
+                                json!(Uuid::new_v4().hyphenated().to_string());
+                        }),
+                    ),
+                    (
+                        "prior coordinate mismatch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["prior"]["stateVersion"] = json!(2);
+                        }),
+                    ),
+                    (
+                        "retired coordinate mismatch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["retired"]["stateVersion"] = json!(5);
+                        }),
+                    ),
+                    (
+                        "successor generation mismatch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["successor"]["generation"] = json!(2);
+                        }),
+                    ),
+                    (
+                        "reused old group ID",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["successor"]["groupId"] =
+                                json!(STANDARD.encode(committed.coordinate().group_id()));
+                        }),
+                    ),
+                    (
+                        "nonzero successor epoch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["successor"]["epoch"] = json!(1);
+                        }),
+                    ),
+                    (
+                        "nonzero successor stateVersion",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["successor"]["stateVersion"] = json!(1);
+                        }),
+                    ),
+                    (
+                        "GroupInfo bytes/signature mismatch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["genesisGroupInfo"]["bytes"] =
+                                json!(STANDARD.encode(&invalid_group_info));
+                            body["genesisGroupInfo"]["sha256"] =
+                                json!(STANDARD.encode(Sha256::digest(&invalid_group_info)));
+                        }),
+                    ),
+                    (
+                        "GroupInfo declared hash mismatch",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["genesisGroupInfo"]["sha256"] =
+                                json!(STANDARD.encode([0xabu8; 32]));
+                        }),
+                    ),
+                    (
+                        "GroupInfo credential mismatch",
+                        replace_group_info(&credential_group_info),
+                    ),
+                    (
+                        "GroupInfo signature-key mismatch",
+                        replace_group_info(&signature_group_info),
+                    ),
+                    (
+                        "GroupInfo lifetime mismatch",
+                        (
+                            lifetime_group_info.public_row_json.clone(),
+                            lifetime_group_info.raw_wrapper.clone(),
+                        ),
+                    ),
+                    (
+                        "wrong registered actor",
+                        mutate_real_reset_activation(&entry, &reset_activation, |body| {
+                            body["actorDid"] = json!(invitee.did);
+                        }),
+                    ),
+                ];
+                for (label, (candidate_row, candidate_wrapper)) in semantic_candidates {
+                    decode_and_verify_signed_mutation(&candidate_wrapper, &entry.public_key)
+                        .unwrap_or_else(|error| {
+                            panic!("{label} must retain authorized signature: {error}")
+                        });
+                    let before = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    let candidate =
+                        decode_and_verify_control_entry(&candidate_row, &entry.public_key)
+                            .unwrap_or_else(|error| {
+                                panic!("{label} must pass outer control decoding: {error}")
+                            });
+                    let candidate = rebind_persisted_control_entry(
+                        candidate,
+                        &candidate_wrapper,
+                        &entry.public_key,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label} must pass exact persisted-row rebind: {error}")
+                    });
+                    let error = match reset_activation_hydration.plan_reset_activation_entry(
+                            &locked_reset_request,
+                            candidate,
+                            &reset_activation_registration,
+                            Vec::new(),
+                        ) {
+                        Ok(_) => panic!("{label} must fail the production planner"),
+                        Err(error) => error,
+                    };
+                    assert!(
+                        matches!(
+                            error,
+                            crate::chat_protocol::state_machine::StateMachineError::InvalidHydrationAuthority
+                                | crate::chat_protocol::state_machine::StateMachineError::InvalidTransition
+                                | crate::chat_protocol::state_machine::StateMachineError::InvalidPublicState
+                                | crate::chat_protocol::state_machine::StateMachineError::ResetRequestNotFound
+                                | crate::chat_protocol::state_machine::StateMachineError::ResetSuccessorMismatch
+                        ),
+                        "unexpected {label} rejection: {error:?}"
+                    );
+                    let after = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(after, before, "{label} changed durable rows");
+                }
+                let reset_activation_verified = decode_and_verify_control_entry(
+                    &reset_activation.public_row_json,
+                    &entry.public_key,
+                )
+                .expect("verify lifecycle ResetActivation");
+                let reset_activation_verified = rebind_persisted_control_entry(
+                    reset_activation_verified,
+                    &reset_activation.raw_wrapper,
+                    &entry.public_key,
+                )
+                .expect("rebind lifecycle ResetActivation");
+                let reset_activation_plan = reset_activation_hydration
+                    .plan_reset_activation_entry(
+                        &locked_reset_request,
+                        reset_activation_verified,
+                        &reset_activation_registration,
+                        Vec::new(),
+                    )
+                    .expect("plan genuine lifecycle ResetActivation")
+                    .into_persistence_plan()
+                    .expect("seal lifecycle ResetActivation plan");
+
+                let caller_group_info_swap = {
+                    let mut bytes = reset_activation.group_info.clone();
+                    bytes[0] ^= 1;
+                    bytes
+                };
+                let swapped_context_error = hydrate_execution_context(
+                    &mut tx,
+                    &reset_activation_plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: Some(
+                            reset_activation.public_row_json.clone(),
+                        ),
+                        genesis_group_info_bytes: Some(caller_group_info_swap),
+                        primary_event_payload: Some(
+                            format!("g6-reset-activation-{conversation_id}").into_bytes(),
+                        ),
+                        welcome_disposition_event_payloads: vec![(
+                            fulfillment.welcome_id,
+                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
+                        )],
+                    },
+                )
+                .await
+                .expect_err("caller-swapped GroupInfo must fail context hydration");
+                assert!(matches!(
+                    swapped_context_error,
+                    ExecutionContextHydrationError::ArtifactMismatch
+                ));
+
+                let mut second_tx = pool
+                    .begin()
+                    .await
+                    .expect("begin second-transaction Reset context negative");
+                let second_transaction_error = hydrate_execution_context(
+                    &mut second_tx,
+                    &reset_activation_plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: Some(
+                            reset_activation.public_row_json.clone(),
+                        ),
+                        genesis_group_info_bytes: Some(reset_activation.group_info.clone()),
+                        primary_event_payload: Some(
+                            format!("g6-reset-activation-{conversation_id}").into_bytes(),
+                        ),
+                        welcome_disposition_event_payloads: vec![(
+                            fulfillment.welcome_id,
+                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
+                        )],
+                    },
+                )
+                .await
+                .expect_err("second transaction cannot hydrate a sealed Reset plan");
+                assert!(matches!(
+                    second_transaction_error,
+                    ExecutionContextHydrationError::AuthorityMismatch
+                ));
+                second_tx
+                    .rollback()
+                    .await
+                    .expect("rollback second-transaction negative");
+
+                let reset_activation_context = hydrate_execution_context(
+                    &mut tx,
+                    &reset_activation_plan,
+                    ExecutionContextArtifacts {
+                        accepted_control_entry_bytes: Some(
+                            reset_activation.public_row_json.clone(),
+                        ),
+                        genesis_group_info_bytes: Some(reset_activation.group_info.clone()),
+                        primary_event_payload: Some(
+                            format!("g6-reset-activation-{conversation_id}").into_bytes(),
+                        ),
+                        welcome_disposition_event_payloads: vec![(
+                            fulfillment.welcome_id,
+                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
+                        )],
+                    },
+                )
+                .await
+                .expect("hydrate lifecycle ResetActivation context");
+                let malformed_reset_plan = reset_activation_plan
+                    .clone()
+                    .with_welcome_supersession_corrupted_for_test();
+                let before_malformed_reset = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let malformed_reset_error = apply_conversation_persistence_plan(
+                    &mut tx,
+                    &malformed_reset_plan,
+                    &reset_activation_context,
+                )
+                .await
+                .expect_err("malformed Reset plan must fail before its first writer");
+                assert!(matches!(
+                    malformed_reset_error,
+                    ExecutorError::InconsistentPlan(_)
+                ));
+                let head_after_malformed_reset: (i64, i64, i64) = sqlx::query_as(
+                    r#"SELECT current_generation,current_state_version,next_entry_seq
+                         FROM chat.conversations WHERE conversation_id=$1"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read head after malformed Reset rejection");
+                assert_eq!(head_after_malformed_reset, (0, 3, 6));
+                let after_malformed_reset = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                assert_eq!(
+                    after_malformed_reset, before_malformed_reset,
+                    "malformed Reset plan changed durable rows before rejection"
+                );
+
+                apply_conversation_persistence_plan(
+                    &mut tx,
+                    &reset_activation_plan,
+                    &reset_activation_context,
+                )
+                .await
+                .expect("apply lifecycle ResetActivation");
+                sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("force lifecycle ResetActivation constraints");
+
+                let reset_head: (i64, i64, i64) = sqlx::query_as(
+                    r#"SELECT current_generation,current_state_version,next_entry_seq
+                         FROM chat.conversations WHERE conversation_id=$1"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset successor head");
+                assert_eq!(reset_head, (1, 0, 7));
+                let reset_request_terminal: (String, Option<Uuid>, Option<DateTime<Utc>>) =
+                    sqlx::query_as(
+                        r#"SELECT status,terminal_transition_id,terminal_at
+                             FROM chat.reset_requests
+                            WHERE reset_request_id=$1 AND conversation_id=$2"#,
+                    )
+                    .bind(Uuid::from_bytes(reset_request.request_id))
+                    .bind(conversation_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read exact consumed ResetRequest");
+                assert_eq!(
+                    reset_request_terminal,
+                    (
+                        "consumed".to_owned(),
+                        Some(reset_activation.transition_id),
+                        Some(reset_activation_at),
+                    )
+                );
+                #[allow(clippy::type_complexity)]
+                let reset_spines: Vec<(
+                    i64,
+                    i64,
+                    String,
+                    String,
+                    Vec<u8>,
+                    Vec<u8>,
+                    Vec<u8>,
+                    Vec<u8>,
+                    i64,
+                )> = sqlx::query_as(
+                    r#"SELECT generation,state_version,lifecycle,state_kind,
+                              public_snapshot_bytes,snapshot_sha256,
+                              tree_summary_bytes,tree_summary_sha256,leaf_count
+                         FROM chat.generation_states
+                        WHERE conversation_id=$1
+                          AND ((generation=0 AND state_version=4)
+                            OR (generation=1 AND state_version=0))
+                        ORDER BY generation,state_version"#,
+                )
+                .bind(conversation_id)
+                .fetch_all(&mut *tx)
+                .await
+                .expect("read exact Reset two-spine rows");
+                assert_eq!(reset_spines.len(), 2);
+                assert_eq!(
+                    (&reset_spines[0].2, &reset_spines[0].3, reset_spines[0].8),
+                    (&"superseded".to_owned(), &"resetRetirement".to_owned(), 2)
+                );
+                assert_eq!(
+                    (&reset_spines[1].2, &reset_spines[1].3, reset_spines[1].8),
+                    (&"active".to_owned(), &"resetSuccessor".to_owned(), 1)
+                );
+                assert_eq!(
+                    (
+                        reset_spines[0].4.clone(),
+                        reset_spines[0].5.clone(),
+                        reset_spines[0].6.clone(),
+                        reset_spines[0].7.clone(),
+                        reset_spines[0].8,
+                    ),
+                    prior_reset_spine,
+                    "Reset retirement must preserve the exact previously active public spine"
+                );
+                assert_ne!(reset_spines[0].4, reset_spines[1].4);
+                assert_ne!(reset_spines[0].6, reset_spines[1].6);
+                assert_eq!(
+                    Sha256::digest(&reset_spines[0].4).as_slice(),
+                    reset_spines[0].5
+                );
+                assert_eq!(
+                    Sha256::digest(&reset_spines[0].6).as_slice(),
+                    reset_spines[0].7
+                );
+                assert_eq!(
+                    reset_spines[1].4,
+                    reset_activation.successor_public_state.snapshot()
+                );
+                let successor_group_info: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+                    r#"SELECT genesis_group_info_bytes,genesis_group_info_sha256
+                         FROM chat.generations
+                        WHERE conversation_id=$1 AND generation=1"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset successor GroupInfo");
+                assert_eq!(successor_group_info.0, reset_activation.group_info);
+                assert_eq!(
+                    successor_group_info.1,
+                    Sha256::digest(&successor_group_info.0).to_vec()
+                );
+                let durable_reset_states: Vec<(i64, i64, String, String)> = sqlx::query_as(
+                    r#"SELECT generation,state_version,lifecycle,state_kind
+                         FROM chat.generation_states
+                        WHERE conversation_id=$1
+                        ORDER BY generation,state_version"#,
+                )
+                .bind(conversation_id)
+                .fetch_all(&mut *tx)
+                .await
+                .expect("read complete Reset state set");
+                assert_eq!(
+                    durable_reset_states,
+                    vec![
+                        (0, 0, "active".to_owned(), "creation".to_owned()),
+                        (0, 1, "active".to_owned(), "policy".to_owned()),
+                        (
+                            0,
+                            2,
+                            "active".to_owned(),
+                            "acceptConversation".to_owned(),
+                        ),
+                        (0, 3, "active".to_owned(), "commit".to_owned()),
+                        (
+                            0,
+                            4,
+                            "superseded".to_owned(),
+                            "resetRetirement".to_owned(),
+                        ),
+                        (
+                            1,
+                            0,
+                            "active".to_owned(),
+                            "resetSuccessor".to_owned(),
+                        ),
+                    ],
+                    "Reset must create exactly the retirement and successor spines"
+                );
+                let reset_entry_transition_exact: bool = sqlx::query_scalar(
+                    r#"SELECT count(*)=2 AND bool_and(
+                           (entry.seq=5 AND entry.entry_kind='blue.catbird.chat.defs#resetRequestEntry'
+                            AND entry.transition_id IS NULL
+                            AND entry.generation IS NULL
+                            AND entry.state_version IS NULL
+                            AND entry.accepted_payload_bytes=$2
+                            AND entry.signed_request_bytes=$3
+                            AND entry.received_at=$6)
+                           OR
+                           (entry.seq=6
+                            AND entry.entry_kind='blue.catbird.chat.defs#resetActivationEntry'
+                            AND transition.kind='resetActivation'
+                            AND transition.transition_id=$4
+                            AND transition.reset_request_id=$5
+                            AND entry.accepted_payload_bytes=$7
+                            AND entry.signed_request_bytes=$8
+                            AND entry.received_at=$9
+                            AND transition.prior_generation=0
+                            AND transition.prior_state_version=3
+                            AND transition.next_generation=1
+                            AND transition.next_state_version=0)
+                       )
+                      FROM chat.entries entry
+                      LEFT JOIN chat.transitions transition
+                        ON transition.transition_id=entry.transition_id
+                     WHERE entry.conversation_id=$1 AND entry.seq IN (5,6)
+                       AND (transition.conversation_id=$1
+                            OR transition.transition_id IS NULL)"#,
+                )
+                .bind(conversation_id)
+                .bind(&reset_request.public_row_json)
+                .bind(&reset_request.raw_wrapper)
+                .bind(reset_activation.transition_id)
+                .bind(Uuid::from_bytes(reset_request.request_id))
+                .bind(reset_request_at)
+                .bind(&reset_activation.public_row_json)
+                .bind(&reset_activation.raw_wrapper)
+                .bind(reset_activation_at)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact signed Reset entries and transition provenance");
+                assert!(reset_entry_transition_exact);
+
+                #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+                struct DurableResetInterval {
+                    generation: i64,
+                    active: bool,
+                    start_seq: i64,
+                    terminal_seq: Option<i64>,
+                    opening_kind: String,
+                    closing_kind: Option<String>,
+                }
+                let durable_reset_intervals: Vec<DurableResetInterval> = sqlx::query_as(
+                    r#"SELECT device.generation,device.active,interval.start_seq,
+                              interval.terminal_seq,interval.opening_kind,interval.closing_kind
+                         FROM chat.member_devices device
+                         JOIN chat.application_intervals interval
+                           ON interval.opening_leaf_period_id=device.leaf_period_id
+                        WHERE device.conversation_id=$1
+                        ORDER BY device.generation,interval.start_seq"#,
+                )
+                .bind(conversation_id)
+                .fetch_all(&mut *tx)
+                .await
+                .expect("read exact Reset leaf/interval topology");
+                assert_eq!(
+                    durable_reset_intervals,
+                    vec![
+                        DurableResetInterval {
+                            generation: 0,
+                            active: false,
+                            start_seq: 1,
+                            terminal_seq: Some(6),
+                            opening_kind: "creation".to_owned(),
+                            closing_kind: Some("reset".to_owned()),
+                        },
+                        DurableResetInterval {
+                            generation: 0,
+                            active: false,
+                            start_seq: 4,
+                            terminal_seq: Some(6),
+                            opening_kind: "add".to_owned(),
+                            closing_kind: Some("reset".to_owned()),
+                        },
+                        DurableResetInterval {
+                            generation: 1,
+                            active: true,
+                            start_seq: 6,
+                            terminal_seq: None,
+                            opening_kind: "reset".to_owned(),
+                            closing_kind: None,
+                        },
+                    ]
+                );
+                let reset_entry_recipient_count: i64 = sqlx::query_scalar(
+                    r#"SELECT count(*) FROM chat.entry_recipients
+                        WHERE conversation_id=$1 AND seq=6
+                          AND entitlement_kind='intervalClose'"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count exact Reset closed-interval audience");
+                assert_eq!(reset_entry_recipient_count, 2);
+                let reset_delivery_counts: (i64, i64, i64) = sqlx::query_as(
+                    r#"SELECT count(DISTINCT event.event_position),
+                              count(DISTINCT (recipient.event_position,
+                                              recipient.user_did,recipient.device_id)),
+                              count(DISTINCT outbox.outbox_id)
+                         FROM chat.events event
+                         LEFT JOIN chat.event_recipients recipient
+                           ON recipient.event_position=event.event_position
+                         LEFT JOIN chat.outbox outbox
+                           ON outbox.event_position=event.event_position
+                        WHERE event.created_at=$1
+                          AND event.event_kind='conversationChanged'
+                          AND event.payload_bytes=$2"#,
+                )
+                .bind(reset_activation_at)
+                .bind(format!("g6-reset-activation-{conversation_id}").into_bytes())
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset delivery graph");
+                assert_eq!(reset_delivery_counts, (1, 1, 1));
+                let welcome_disposition: (
+                    String,
+                    Option<Uuid>,
+                    DateTime<Utc>,
+                    String,
+                    i64,
+                    i64,
+                ) = sqlx::query_as(
+                    r#"SELECT delivery.status,disposition.terminal_transition_id,
+                              disposition.terminal_at,event.event_kind,
+                              count(DISTINCT (recipient.event_position,recipient.user_did,
+                                              recipient.device_id)),
+                              count(DISTINCT outbox.outbox_id)
+                         FROM chat.welcome_deliveries delivery
+                         JOIN chat.welcome_dispositions disposition USING(welcome_id)
+                         JOIN chat.events event USING(event_position)
+                         JOIN chat.event_recipients recipient USING(event_position)
+                         JOIN chat.outbox outbox USING(event_position)
+                        WHERE delivery.welcome_id=$1
+                        GROUP BY delivery.status,disposition.terminal_transition_id,
+                                 disposition.terminal_at,event.event_kind"#,
+                )
+                .bind(fulfillment.welcome_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact Reset Welcome disposition graph");
+                assert_eq!(
+                    welcome_disposition,
+                    (
+                        "superseded".to_owned(),
+                        Some(reset_activation.transition_id),
+                        reset_activation_at,
+                        "welcomeDisposition".to_owned(),
+                        1,
+                        1,
+                    )
+                );
+                let reset_terminal_topology: (
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                    i64,
+                ) = sqlx::query_as(
+                    r#"SELECT
+                        (SELECT count(*) FROM chat.participants
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.participants
+                          WHERE conversation_id=$1 AND current_membership),
+                        (SELECT count(*) FROM chat.member_devices
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.member_devices
+                          WHERE conversation_id=$1 AND active),
+                        (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.application_intervals
+                          WHERE conversation_id=$1 AND terminal_seq IS NULL),
+                        (SELECT count(*) FROM chat.recovery_work_items
+                          WHERE conversation_id=$1),
+                        (SELECT count(*) FROM chat.key_package_reservations
+                          WHERE conversation_id=$1 AND status='reserved')"#,
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read exact terminal Reset topology");
+                assert_eq!(
+                    reset_terminal_topology,
+                    (3, 2, 3, 1, 3, 1, 0, 0),
+                    "Reset must retain participant history while leaving one successor leaf"
+                );
+                    (reset_request_context, reset_activation_context)
+                })
+                .await)
+            } else {
+                None
+            };
             tx.rollback().await.expect("rollback lifecycle proof");
             for context in [
                 &creation_context,
@@ -13857,6 +14782,12 @@ mod historical_control_loader {
                 &fulfillment_context,
             ] {
                 assert_zero_g6_creation_residue(&pool, conversation_id, context).await;
+            }
+            if let Some((reset_request_context, reset_activation_context)) = &reset_contexts {
+                assert_zero_g6_creation_residue(&pool, conversation_id, reset_request_context)
+                    .await;
+                assert_zero_g6_creation_residue(&pool, conversation_id, reset_activation_context)
+                    .await;
             }
             let rolled_back_package: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM chat.key_packages WHERE key_package_ref=$1",
@@ -13876,6 +14807,18 @@ mod historical_control_loader {
             .await
             .expect("read unfiltered lifecycle events after rollback");
             assert_eq!(rolled_back_unfiltered_events, 0);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
+            run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(false).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_reset_lifecycle_uses_locked_production_planners_and_executor() {
+            run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(true).await;
         }
 
         fn build_fresh_add_crypto_fixture_for_invitee(
@@ -21947,19 +22890,19 @@ mod historical_control_loader {
             outer_entry_fingerprint: Vec<u8>,
         }
 
-        struct RealResetActivation {
-            entry_id: Uuid,
-            transition_id: Uuid,
-            public_row_json: Vec<u8>,
-            raw_wrapper: Vec<u8>,
-            canonical_projection: Vec<u8>,
-            signing_transcript: Vec<u8>,
-            request_digest: Vec<u8>,
-            signature: Vec<u8>,
-            server_fields_dag_cbor: Vec<u8>,
-            outer_entry_fingerprint: Vec<u8>,
-            group_info: Vec<u8>,
-            successor_public_state: ActivePublicState,
+        pub(super) struct RealResetActivation {
+            pub(super) entry_id: Uuid,
+            pub(super) transition_id: Uuid,
+            pub(super) public_row_json: Vec<u8>,
+            pub(super) raw_wrapper: Vec<u8>,
+            pub(super) canonical_projection: Vec<u8>,
+            pub(super) signing_transcript: Vec<u8>,
+            pub(super) request_digest: Vec<u8>,
+            pub(super) signature: Vec<u8>,
+            pub(super) server_fields_dag_cbor: Vec<u8>,
+            pub(super) outer_entry_fingerprint: Vec<u8>,
+            pub(super) group_info: Vec<u8>,
+            pub(super) successor_public_state: ActivePublicState,
         }
 
         fn reset_successor_coordinate_json(
@@ -21994,7 +22937,7 @@ mod historical_control_loader {
             })
         }
 
-        fn build_real_reset_activation(
+        pub(super) fn build_real_reset_activation(
             entry: &RealCreationEntry,
             reset_request_id: [u8; 16],
             prior_coordinate: &PublicGroupSnapshotCoordinate,
@@ -22002,8 +22945,29 @@ mod historical_control_loader {
             participants: Value,
             received_at: DateTime<Utc>,
         ) -> RealResetActivation {
-            let now_unix_seconds =
-                u64::try_from(received_at.timestamp()).expect("reset time is positive");
+            build_real_reset_activation_with_group_info_at(
+                entry,
+                reset_request_id,
+                prior_coordinate,
+                seq,
+                participants,
+                received_at,
+                received_at,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn build_real_reset_activation_with_group_info_at(
+            entry: &RealCreationEntry,
+            reset_request_id: [u8; 16],
+            prior_coordinate: &PublicGroupSnapshotCoordinate,
+            seq: u64,
+            participants: Value,
+            group_info_at: DateTime<Utc>,
+            received_at: DateTime<Utc>,
+        ) -> RealResetActivation {
+            let group_info_unix_seconds =
+                u64::try_from(group_info_at.timestamp()).expect("reset GroupInfo time is positive");
             let received_at_text = received_at.to_rfc3339_opts(SecondsFormat::Millis, true);
             let signed_at_text =
                 (received_at - Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -22030,8 +22994,8 @@ mod historical_control_loader {
                 .use_ratchet_tree_extension(true)
                 .capabilities(capabilities)
                 .lifetime(Lifetime::init(
-                    now_unix_seconds - 60,
-                    now_unix_seconds + 3_600,
+                    group_info_unix_seconds - 60,
+                    group_info_unix_seconds + 3_600,
                 ))
                 .build();
             let group_id = [0xd2_u8; 32];
@@ -22079,7 +23043,7 @@ mod historical_control_loader {
                 GroupInfoValidationPolicy {
                     expected_basic_credential: &credential,
                     expected_signature_key: &entry.public_key,
-                    now_unix_seconds,
+                    now_unix_seconds: group_info_unix_seconds,
                     max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_members: 1,
@@ -22109,7 +23073,7 @@ mod historical_control_loader {
                     coordinate: successor_coordinate,
                     expected_basic_credential: &credential,
                     expected_signature_key: &entry.public_key,
-                    now_unix_seconds,
+                    now_unix_seconds: group_info_unix_seconds,
                     max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                     max_members: 1,
@@ -22228,7 +23192,7 @@ mod historical_control_loader {
             }
         }
 
-        fn mutate_real_reset_activation(
+        pub(super) fn mutate_real_reset_activation(
             entry: &RealCreationEntry,
             activation: &RealResetActivation,
             mutate_body: impl FnOnce(&mut Value),
@@ -22616,7 +23580,7 @@ mod historical_control_loader {
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn build_real_control_request_entry_with_id_at_and_signed_at(
+        pub(super) fn build_real_control_request_entry_with_id_at_and_signed_at(
             entry: &RealCreationEntry,
             kind: SignedMutationKind,
             entry_kind: &str,
@@ -23597,6 +24561,18 @@ mod historical_control_loader {
             .fetch_all(pool)
             .await
             .expect("reset participant periods");
+            let prior_spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
+                r#"SELECT public_snapshot_bytes,snapshot_sha256,
+                          tree_summary_bytes,tree_summary_sha256,leaf_count
+                     FROM chat.generation_states
+                    WHERE conversation_id=$1 AND generation=$2 AND state_version=$3"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(prior_coordinate.generation()).unwrap())
+            .bind(i64::try_from(prior_coordinate.state_version()).unwrap())
+            .fetch_one(pool)
+            .await
+            .expect("capture exact active spine before reset");
             let protocol_instance_id: Uuid =
                 sqlx::query_scalar("SELECT protocol_instance_id FROM chat.protocol_instances")
                     .fetch_one(pool)
@@ -23612,11 +24588,6 @@ mod historical_control_loader {
                 device_event_predecessor(pool, &entry.actor_did, entry.actor_device_id).await;
             let invitee_event_predecessor =
                 device_event_predecessor(pool, &invitee.did, invitee.device_id).await;
-            let (tree_summary_bytes, tree_summary_sha256) = encode_public_tree_summary(
-                activation.successor_public_state.binding().tree_summary(),
-            )
-            .expect("reset tree summary canonical")
-            .into_parts();
             let context = ExecutionContext {
                 protocol_instance_id,
                 applied_at: reset_at,
@@ -23642,14 +24613,11 @@ mod historical_control_loader {
                     outer_entry_fingerprint: activation.outer_entry_fingerprint.clone(),
                 }),
                 spine: SpineArtifacts {
-                    public_snapshot_bytes: activation.successor_public_state.snapshot().to_vec(),
-                    public_snapshot_sha256: activation
-                        .successor_public_state
-                        .snapshot_sha256()
-                        .to_vec(),
-                    tree_summary_bytes,
-                    tree_summary_sha256: tree_summary_sha256.to_vec(),
-                    leaf_count: 1,
+                    public_snapshot_bytes: prior_spine.0.clone(),
+                    public_snapshot_sha256: prior_spine.1.clone(),
+                    tree_summary_bytes: prior_spine.2.clone(),
+                    tree_summary_sha256: prior_spine.3.clone(),
+                    leaf_count: prior_spine.4,
                     genesis_group_info_bytes: activation.group_info.clone(),
                     genesis_group_info_sha256: Sha256::digest(&activation.group_info).to_vec(),
                 },
@@ -23709,6 +24677,22 @@ mod historical_control_loader {
                 .await
                 .expect("production executor applies genuine reset");
             assert_eq!(applied.allocated_seq, seq);
+            let retired_spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
+                r#"SELECT public_snapshot_bytes,snapshot_sha256,
+                          tree_summary_bytes,tree_summary_sha256,leaf_count
+                     FROM chat.generation_states
+                    WHERE conversation_id=$1 AND generation=$2 AND state_version=$3"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(prior_coordinate.generation()).unwrap())
+            .bind(i64::try_from(prior_coordinate.state_version() + 1).unwrap())
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("read reset retirement spine before commit");
+            assert_eq!(
+                retired_spine, prior_spine,
+                "reset retirement must preserve the exact previously active public spine"
+            );
             transaction
                 .commit()
                 .await
@@ -24041,6 +25025,18 @@ mod historical_control_loader {
                 ..
             } = commit_genuine_policy_acceptance_fulfillment_at(&pool, cid, Uuid::new_v4()).await;
             let prior_coordinate = *committed.coordinate();
+            let prior_spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
+                r#"SELECT public_snapshot_bytes,snapshot_sha256,
+                          tree_summary_bytes,tree_summary_sha256,leaf_count
+                     FROM chat.generation_states
+                    WHERE conversation_id=$1 AND generation=$2 AND state_version=$3"#,
+            )
+            .bind(cid)
+            .bind(i64::try_from(prior_coordinate.generation()).unwrap())
+            .bind(i64::try_from(prior_coordinate.state_version()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("capture exact active spine before reset");
             let request = append_control_request_at(
                 &pool,
                 &entry,
@@ -24215,6 +25211,36 @@ mod historical_control_loader {
                     (0, 4, "superseded".to_owned(), "resetRetirement".to_owned(),),
                     (1, 0, "active".to_owned(), "resetSuccessor".to_owned()),
                 ]
+            );
+            let reset_spines: Vec<(i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64)> =
+                sqlx::query_as(
+                    r#"SELECT generation,state_version,public_snapshot_bytes,snapshot_sha256,
+                              tree_summary_bytes,tree_summary_sha256,leaf_count
+                         FROM chat.generation_states
+                        WHERE conversation_id=$1
+                          AND ((generation=0 AND state_version=4)
+                            OR (generation=1 AND state_version=0))
+                        ORDER BY generation,state_version"#,
+                )
+                .bind(cid)
+                .fetch_all(&pool)
+                .await
+                .expect("read reset retirement and successor spines");
+            assert_eq!(reset_spines.len(), 2);
+            assert_eq!(
+                (
+                    reset_spines[0].2.clone(),
+                    reset_spines[0].3.clone(),
+                    reset_spines[0].4.clone(),
+                    reset_spines[0].5.clone(),
+                    reset_spines[0].6,
+                ),
+                prior_spine,
+                "reset retirement must preserve the exact previously active public spine"
+            );
+            assert_ne!(
+                reset_spines[0].2, reset_spines[1].2,
+                "retired and successor public snapshots must be distinct"
             );
 
             #[derive(Debug, PartialEq, Eq, sqlx::FromRow)]

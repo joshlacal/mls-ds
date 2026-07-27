@@ -910,6 +910,61 @@ async fn spine_artifacts(
         (None, None) => {}
         _ => return Err(ExecutionContextHydrationError::ArtifactMismatch),
     }
+    if plan.effects().kind() == PlanKind::ResetActivation {
+        let prior = plan
+            .expected_prior()
+            .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+        let row: Option<GenerationSpineRow> = sqlx::query_as(
+            r#"
+            SELECT public_snapshot_bytes,snapshot_sha256,
+                   tree_summary_bytes,tree_summary_sha256,leaf_count
+              FROM chat.generation_states
+             WHERE conversation_id=$1 AND generation=$2 AND state_version=$3
+               AND group_id=$4 AND epoch=$5
+               AND group_context_hash=$6 AND confirmation_tag=$7
+               AND lifecycle='active'
+             FOR SHARE
+            "#,
+        )
+        .bind(Uuid::from_bytes(*prior.conversation_id()))
+        .bind(
+            i64::try_from(prior.generation())
+                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        )
+        .bind(
+            i64::try_from(prior.state_version())
+                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        )
+        .bind(prior.group_id().to_vec())
+        .bind(
+            i64::try_from(prior.epoch())
+                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        )
+        .bind(prior.group_context_hash().to_vec())
+        .bind(prior.confirmation_tag().to_vec())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let row = row.ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+        if Sha256::digest(&row.public_snapshot_bytes).as_slice() != row.snapshot_sha256
+            || Sha256::digest(&row.tree_summary_bytes).as_slice() != row.tree_summary_sha256
+            || row.leaf_count < 1
+        {
+            return Err(ExecutionContextHydrationError::ArtifactMismatch);
+        }
+        return Ok(SpineArtifacts {
+            public_snapshot_bytes: row.public_snapshot_bytes,
+            public_snapshot_sha256: row.snapshot_sha256,
+            tree_summary_bytes: row.tree_summary_bytes,
+            tree_summary_sha256: row.tree_summary_sha256,
+            leaf_count: row.leaf_count,
+            genesis_group_info_bytes: group_info
+                .expect("Reset GroupInfo presence was verified above")
+                .to_vec(),
+            genesis_group_info_sha256: expected_group_info
+                .expect("Reset successor retains its verified GroupInfo digest")
+                .to_vec(),
+        });
+    }
     Ok(SpineArtifacts {
         public_snapshot_bytes: public_state.snapshot().to_vec(),
         public_snapshot_sha256: public_state.snapshot_sha256().to_vec(),

@@ -2284,7 +2284,6 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
     pub(crate) fn plan_reset_activation_entry(
         &self,
         locked: &LockedConversationStateGuard,
@@ -2467,11 +2466,12 @@ impl HydrationAuthority {
         if entry.conversation_id().as_bytes() != &self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        #[cfg(not(test))]
-        if entry.seq() != self.locked.expected_next_entry_seq
-            || canonical_server_timestamp(entry.received_at())? != self.locked.locked_at
-        {
-            return Err(StateMachineError::InvalidHydrationAuthority);
+        if let Some(locked) = self.locked_binding() {
+            if entry.seq() != locked.expected_next_entry_seq
+                || canonical_server_timestamp(entry.received_at())? != locked.locked_at
+            {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
         }
         let (kind, request_id, body_binding) = match entry.mutation().projection() {
             VerifiedMutationProjection::ResetRequest(value) => (
@@ -2497,14 +2497,15 @@ impl HydrationAuthority {
             ),
             _ => return Err(StateMachineError::InvalidHydrationAuthority),
         };
-        #[cfg(not(test))]
-        if matches!(
-            &body_binding,
-            RequestBodyBinding::ResetRequest { prior }
-                | RequestBodyBinding::LeaveRequest { prior }
-                if Some(prior) != self.locked.expected_prior.as_ref()
-        ) {
-            return Err(StateMachineError::InvalidHydrationAuthority);
+        if let Some(locked) = self.locked_binding() {
+            if matches!(
+                &body_binding,
+                RequestBodyBinding::ResetRequest { prior }
+                    | RequestBodyBinding::LeaveRequest { prior }
+                    if Some(prior) != locked.expected_prior.as_ref()
+            ) {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
         }
         request_evidence_from_verified(
             kind,
@@ -2525,7 +2526,6 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
     pub(crate) fn plan_reset_request_entry(
         &self,
         locked: &LockedConversationStateGuard,
@@ -2549,7 +2549,6 @@ impl HydrationAuthority {
                 reset_request_id: evidence.request_id,
                 received_at: evidence.received_at,
                 evidence,
-                registration,
             },
         )?;
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
@@ -9113,7 +9112,6 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
     fn bind_control_request_authority(
         mut self,
         evidence: RequestEvidence,
@@ -10923,8 +10921,6 @@ pub(crate) struct ResetRequestCommand {
     pub(crate) reset_request_id: [u8; 16],
     pub(crate) received_at: ServerTimestamp,
     pub(crate) evidence: RequestEvidence,
-    #[cfg(not(test))]
-    registration: LockedRegistrationProjection,
 }
 
 fn plan_reset_request_inner(
@@ -10941,10 +10937,6 @@ fn plan_reset_request_inner(
         command.received_at,
     )?;
     require_request_prior(&command.evidence, &prior.coordinate)?;
-    #[cfg(not(test))]
-    if !command.registration.authorizes(&command.evidence) {
-        return Err(StateMachineError::InvalidHydrationAuthority);
-    }
     if !is_uuid_v4(&command.reset_request_id) {
         return Err(StateMachineError::InvalidTransition);
     }
@@ -15502,6 +15494,7 @@ mod executor {
 
     use std::collections::{BTreeSet, HashMap};
 
+    use super::super::public_state::encode_public_tree_summary;
     use super::super::repository::delivery::{
         self as delivery, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
         EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
@@ -16327,6 +16320,251 @@ mod executor {
             && leaf.signature_key == row.signature_key
             && leaf.encryption_key == row.encryption_key
             && leaf.key_package_ref == row.key_package_ref
+    }
+
+    /// Complete logical-shape fence for ResetActivation. This runs before the
+    /// head CAS; applied-row reconciliation remains a second fence.
+    fn preflight_reset_activation(
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        prior: &PublicGroupSnapshotCoordinate,
+        retired: &PublicGroupSnapshotCoordinate,
+        transition_id: Uuid,
+        seq_i64: i64,
+    ) -> Result<Uuid, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let producer = &hydration.producer;
+        if producer.transition_id != *transition_id.as_bytes()
+            || i64::try_from(producer.seq).ok() != Some(seq_i64)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset producer disagrees with allocated transition/sequence",
+            ));
+        }
+        let signed_request_id = match producer.body_binding.as_ref() {
+            Some(super::TransitionBodyBinding::ResetActivation {
+                reset_request_id,
+                prior: bound_prior,
+                retired: bound_retired,
+                successor,
+                ..
+            }) if bound_prior == prior
+                && bound_retired == retired
+                && successor == &hydration.coordinate =>
+            {
+                *reset_request_id
+            }
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset producer coordinates/request binding drift",
+                ))
+            }
+        };
+
+        let mut own_reset = None;
+        let mut staled_resets = BTreeSet::new();
+        for change in effects.reset_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset request delta is not terminal",
+                ));
+            };
+            if !reset_request_identity_is_unchanged(before, after)
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || before.status != ResetRequestStatus::Pending
+                || before.bound_coordinate != *prior
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset request identity/binding/terminal drift",
+                ));
+            }
+            match after.status {
+                ResetRequestStatus::Consumed if after.request_id == signed_request_id => {
+                    if own_reset.replace(after).is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset consumes multiple own requests",
+                        ));
+                    }
+                }
+                ResetRequestStatus::Stale if after.request_id != signed_request_id => {
+                    if !staled_resets.insert(after.request_id) {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "reset repeats a staled reset request",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "reset request delta has an illegal direction",
+                    ))
+                }
+            }
+        }
+        let own_reset = own_reset.ok_or(ExecutorError::InconsistentPlan(
+            "reset consumes no exact signed pending request",
+        ))?;
+
+        let mut staled_leaves = BTreeSet::new();
+        for change in effects.leave_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset leave request delta is not terminal",
+                ));
+            };
+            if !leave_request_identity_is_unchanged(before, after)
+                || before.status != LeaveRequestStatus::Pending
+                || after.status != LeaveRequestStatus::Stale
+                || before.bound_coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || !staled_leaves.insert(after.request_id)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset leave staling is not exact/prior-bound",
+                ));
+            }
+        }
+
+        let mut request_keys = BTreeSet::new();
+        for change in effects.recovery_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset recovery request delta is not terminal",
+                ));
+            };
+            if !recovery_request_identity_is_unchanged(before, after)
+                || before.status != RecoveryRequestStatus::Open
+                || after.status != RecoveryRequestStatus::Superseded
+                || before.bound_coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || !request_keys.insert((after.request_id, after.key_package_ref))
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset recovery supersession is not exact/prior-bound",
+                ));
+            }
+        }
+        let mut reservation_keys = BTreeSet::new();
+        for change in effects.reservation_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset reservation delta is not terminal",
+                ));
+            };
+            if !recovery_reservation_identity_is_unchanged(before, after)
+                || before.status != ReservationStatus::Active
+                || after.status != ReservationStatus::Released
+                || before.bound_coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || !reservation_keys.insert((after.request_id, after.key_package_ref))
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset reservation release is not exact/prior-bound",
+                ));
+            }
+        }
+        let package_keys = effects
+            .package_transitions()
+            .iter()
+            .filter_map(|edge| {
+                (edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available)
+                    .then_some((edge.request_id, edge.key_package_ref))
+            })
+            .collect::<BTreeSet<_>>();
+        verify_recovery_package_bijection(effects)?;
+        if request_keys != reservation_keys
+            || request_keys != package_keys
+            || package_keys.len() != effects.package_transitions().len()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset recovery request/reservation/package families are not bijective",
+            ));
+        }
+
+        let mut welcome_ids = BTreeSet::new();
+        for change in effects.welcome_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset Welcome delta is not terminal",
+                ));
+            };
+            if !welcome_identity_is_unchanged(before, after)
+                || before.status != WelcomeStatus::Pending
+                || after.status != WelcomeStatus::Superseded
+                || before.coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || !welcome_ids.insert(after.welcome_id)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "reset Welcome supersession is not exact/prior-bound",
+                ));
+            }
+        }
+        let disposition_ids = ctx
+            .welcome_dispositions
+            .iter()
+            .map(|input| *input.welcome_id.as_bytes())
+            .collect::<BTreeSet<_>>();
+        if welcome_ids != disposition_ids || disposition_ids.len() != ctx.welcome_dispositions.len()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset Welcome dispositions are not complete/bijective",
+            ));
+        }
+
+        if hydration.leaves.len() != 1
+            || ctx.opened_leaves.len() != 1
+            || ctx.leaf_period_ids.len() != 1
+            || ctx.participant_period_ids.len() != hydration.participants.len()
+            || effects.opened_intervals().len() != 1
+            || ctx.closing_leaf_periods.len() != effects.closed_intervals().len()
+            || usize::try_from(ctx.spine.leaf_count).ok() != Some(ctx.closing_leaf_periods.len())
+            || hydration
+                .public_state
+                .as_ref()
+                .map(|state| state.binding().tree_summary().leaves().len())
+                != Some(1)
+            || ctx.events.len() != 1
+            || ctx.metadata_author.is_none()
+            || ctx.spine.leaf_count < 1
+            || sha2::Sha256::digest(&ctx.spine.public_snapshot_bytes).as_slice()
+                != ctx.spine.public_snapshot_sha256
+            || sha2::Sha256::digest(&ctx.spine.tree_summary_bytes).as_slice()
+                != ctx.spine.tree_summary_sha256
+            || ctx.spine.genesis_group_info_bytes.is_empty()
+            || sha2::Sha256::digest(&ctx.spine.genesis_group_info_bytes).as_slice()
+                != ctx.spine.genesis_group_info_sha256
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset execution context/spine cardinality or digest mismatch",
+            ));
+        }
+        if hydration.leaves[0].device != ctx.opened_leaves[0].device
+            || hydration.leaves[0].device != own_reset.requester
+            || effects.opened_intervals()[0] != own_reset.requester
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset successor is not the singleton activator leaf/interval",
+            ));
+        }
+        let closed_devices = effects
+            .closed_intervals()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let closing_context_devices = ctx
+            .closing_leaf_periods
+            .iter()
+            .map(|(device, _)| device.clone())
+            .collect::<BTreeSet<_>>();
+        if closed_devices != closing_context_devices
+            || closing_context_devices.len() != ctx.closing_leaf_periods.len()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "reset old leaf/interval closure context is incomplete",
+            ));
+        }
+        Ok(Uuid::from_bytes(signed_request_id))
     }
 
     /// Pure, complete effect-family validation for a leaf-recovery fulfillment.
@@ -21355,6 +21593,17 @@ mod executor {
         let retired_generation = checked_i64(retired.generation())?;
         let retired_state_version = checked_i64(retired.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_public_state =
+            hydration
+                .public_state
+                .as_ref()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "reset successor has no verified public state",
+                ))?;
+        let successor_tree = encode_public_tree_summary(
+            successor_public_state.binding().tree_summary(),
+        )
+        .map_err(|_| ExecutorError::InconsistentPlan("reset successor tree is not canonical"))?;
 
         // Reset activation carries no participant change and no OWN recovery edge.
         // Its ONE own request edge is the named reset request it CONSUMES
@@ -21420,18 +21669,6 @@ mod executor {
                 "reset invitation quota CAS",
             ));
         }
-        // Exactly one pending reset request is consumed.
-        let consumed_request = effects
-            .reset_request_changes()
-            .iter()
-            .find_map(|change| match (change.before(), change.after()) {
-                (Some(_), Some(after)) => Some(after),
-                _ => None,
-            })
-            .ok_or(ExecutorError::InconsistentPlan(
-                "reset activation consumes no pending reset request",
-            ))?;
-        let reset_request_id = Uuid::from_bytes(consumed_request.request_id);
         let metadata = effects
             .metadata_change()
             .and_then(StateChange::after)
@@ -21444,6 +21681,8 @@ mod executor {
             .ok_or(ExecutorError::MissingContext(
                 "reset metadata author columns",
             ))?;
+        let reset_request_id =
+            preflight_reset_activation(plan, ctx, prior, retired, transition_id, seq_i64)?;
 
         // 1. Head CAS to the successor pointer (generation+1, stateVersion 0).
         transition::cas_conversation_head(
@@ -21529,11 +21768,18 @@ mod executor {
                 lifecycle: GenerationStateLifecycle::Active,
                 state_kind: GenerationStateKind::ResetSuccessor,
                 producing_transition_id: transition_id,
-                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
-                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
-                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
-                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
-                leaf_count: ctx.spine.leaf_count,
+                public_snapshot_bytes: successor_public_state.snapshot().to_vec(),
+                snapshot_sha256: successor_public_state.snapshot_sha256().to_vec(),
+                tree_summary_bytes: successor_tree.bytes().to_vec(),
+                tree_summary_sha256: successor_tree.sha256().to_vec(),
+                leaf_count: i64::try_from(
+                    successor_public_state
+                        .binding()
+                        .tree_summary()
+                        .leaves()
+                        .len(),
+                )
+                .map_err(|_| ExecutorError::ValueOutOfRange)?,
                 created_at: applied_at,
             },
         )
