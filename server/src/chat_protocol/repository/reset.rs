@@ -8,16 +8,38 @@
 #[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(not(test))]
+use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+#[cfg(not(test))]
+use chrono::SecondsFormat;
 use chrono::{DateTime, Duration, Utc};
+#[cfg(not(test))]
+use jacquard_common::DefaultStr;
+#[cfg(not(test))]
+use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
+#[cfg(not(test))]
+use super::{
+    auth::CompletedIdempotentResponse,
+    execution_context::{
+        hydrate_execution_context, ExecutionContextArtifacts, ExecutionContextHydrationError,
+    },
+    prelude::{
+        lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
+        release_signed_operation_replay, LockedSignedOperationReplayAuthority,
+        OperationCompletionGuard, OperationReservationGuard, PreludeError, PreparedSignedOperation,
+        SignedOperationReplayPostStateProof,
+    },
+};
 use super::{
     auth::RepositoryAuthorityClass,
     core::{
-        hydrate_locked_conversation_state, ConversationHeadHydrationError,
-        ConversationStateHydrationError, LockedConversationStateGuard, LockedRecoveryPackageGuard,
+        hydrate_locked_conversation_state, hydrate_locked_reserved_recovery_package,
+        ConversationHeadHydrationError, ConversationStateHydrationError,
+        LockedConversationStateGuard, LockedRecoveryPackageGuard,
     },
     prelude::{
         CanonicalDeviceIdentity, CanonicalLockScope, PreparedBusinessPrelude,
@@ -35,6 +57,18 @@ use crate::chat_protocol::{
         VerifiedControlEntry, VerifiedMutationProjection, VerifiedSignedMutation,
     },
     validation::{BareDid, KeyThumbprint},
+};
+#[cfg(not(test))]
+use crate::chat_protocol::{
+    model::AuthPrimitiveError,
+    state_machine::{
+        executor::AppliedTransition, ConversationPersistencePlan, ExecutorError, PlanKind,
+    },
+    transcript::{
+        build_verified_control_entry, CanonicalControlEntryProducts, CanonicalControlServerFields,
+        ControlEntryKind,
+    },
+    validation::CanonicalUuidV4,
 };
 
 const MAX_PREPARE_ATTEMPTS: usize = 3;
@@ -150,6 +184,368 @@ pub(crate) fn classify_pending_reset_at(
     }
 }
 
+/// Canonical repository-owned payload for a newly persisted Reset request.
+///
+/// Field order and whitespace are protocol constants so the first response
+/// and every exact replay retain byte-identical event material. UUID's
+/// hyphenated lowercase display contains no JSON metacharacters.
+pub(crate) fn canonical_reset_requested_event_payload(
+    reset_request_id: Uuid,
+    conversation_id: Uuid,
+) -> Vec<u8> {
+    format!(
+        r#"{{"$type":"blue.catbird.chat.defs#resetRequestedEvent","resetRequestId":"{}","conversationId":"{}"}}"#,
+        reset_request_id.hyphenated(),
+        conversation_id.hyphenated(),
+    )
+    .into_bytes()
+}
+
+/// Canonical repository-owned primary event for a successful Reset activation.
+pub(crate) fn canonical_reset_activation_event_payload(conversation_id: Uuid) -> Vec<u8> {
+    format!(
+        r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+        conversation_id.hyphenated(),
+    )
+    .into_bytes()
+}
+
+/// High-level Reset composition failure. Every arm is pre-commit: the caller
+/// retains sole ownership of the outer transaction and must roll it back on an
+/// error.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(crate) enum ResetFacadeError {
+    MissingMutation,
+    UnsupportedMutation,
+    InvalidCanonicalMaterial,
+    Repository(ResetRepositoryError),
+    Prelude(PreludeError),
+    Primitive(AuthPrimitiveError),
+    StateMachine(StateMachineError),
+    ExecutionContext(ExecutionContextHydrationError),
+    Executor(ExecutorError),
+    Database(sqlx::Error),
+}
+
+#[cfg(not(test))]
+impl From<ResetRepositoryError> for ResetFacadeError {
+    fn from(value: ResetRepositoryError) -> Self {
+        Self::Repository(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<ResetCompositionError> for ResetFacadeError {
+    fn from(value: ResetCompositionError) -> Self {
+        match value {
+            ResetCompositionError::Repository(error) => Self::Repository(error),
+            ResetCompositionError::StateMachine(error) => Self::StateMachine(error),
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl From<PreludeError> for ResetFacadeError {
+    fn from(value: PreludeError) -> Self {
+        Self::Prelude(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<AuthPrimitiveError> for ResetFacadeError {
+    fn from(value: AuthPrimitiveError) -> Self {
+        Self::Primitive(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<StateMachineError> for ResetFacadeError {
+    fn from(value: StateMachineError) -> Self {
+        Self::StateMachine(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<ExecutionContextHydrationError> for ResetFacadeError {
+    fn from(value: ExecutionContextHydrationError) -> Self {
+        Self::ExecutionContext(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<ExecutorError> for ResetFacadeError {
+    fn from(value: ExecutorError) -> Self {
+        Self::Executor(value)
+    }
+}
+
+#[cfg(not(test))]
+impl From<sqlx::Error> for ResetFacadeError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Database(value)
+    }
+}
+
+/// Generated-DTO-validated response bytes retained by the sealed Reset graph.
+///
+/// The handler may pass these exact bytes to operation completion but cannot
+/// assemble or alter Reset response fields.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(crate) struct ResetCanonicalResponse {
+    endpoint: ResetOperationEndpoint,
+    bytes: Box<[u8]>,
+    binding_digest: [u8; 32],
+}
+
+#[cfg(not(test))]
+impl ResetCanonicalResponse {
+    pub(crate) fn endpoint(&self) -> ResetOperationEndpoint {
+        self.endpoint
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn status(&self) -> i32 {
+        200
+    }
+
+    pub(crate) fn sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.bytes).into()
+    }
+
+    fn request(
+        entry_json: &[u8],
+        reset_request_id: Uuid,
+        conversation_id: Uuid,
+        requester_did: &str,
+        requester_device_id: Uuid,
+        prior: &PublicGroupSnapshotCoordinate,
+        reason: &str,
+        requested_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self, ResetFacadeError> {
+        let output: chat_dto::request_reset::RequestResetOutput<DefaultStr> =
+            serde_json::from_value(json!({
+                "entry": parse_json(entry_json)?,
+                "resetRequest": {
+                    "resetRequestId": reset_request_id.hyphenated().to_string(),
+                    "conversationId": conversation_id.hyphenated().to_string(),
+                    "requesterDid": requester_did,
+                    "requesterDeviceId": requester_device_id.hyphenated().to_string(),
+                    "prior": coordinate_json(prior)?,
+                    "reason": reason,
+                    "status": "pending",
+                    "requestedAt": canonical_datetime(requested_at),
+                    "expiresAt": canonical_datetime(expires_at),
+                },
+            }))
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        let bytes =
+            serde_json::to_vec(&output).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        Self::new(ResetOperationEndpoint::RequestReset, bytes)
+    }
+
+    fn activation(
+        entry_json: &[u8],
+        retired: &PublicGroupSnapshotCoordinate,
+        successor: &PublicGroupSnapshotCoordinate,
+    ) -> Result<Self, ResetFacadeError> {
+        let output: chat_dto::activate_reset::ActivateResetOutput<DefaultStr> =
+            serde_json::from_value(json!({
+                "entry": parse_json(entry_json)?,
+                "retiredCoordinates": coordinate_json(retired)?,
+                "successorCoordinates": coordinate_json(successor)?,
+            }))
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        let bytes =
+            serde_json::to_vec(&output).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        Self::new(ResetOperationEndpoint::ActivateReset, bytes)
+    }
+
+    fn new(endpoint: ResetOperationEndpoint, bytes: Vec<u8>) -> Result<Self, ResetFacadeError> {
+        if bytes.is_empty() {
+            return Err(ResetFacadeError::InvalidCanonicalMaterial);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-RESET-CANONICAL-RESPONSE\0");
+        digest.update(match endpoint {
+            ResetOperationEndpoint::RequestReset => b"request".as_slice(),
+            ResetOperationEndpoint::ActivateReset => b"activation".as_slice(),
+        });
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(&bytes);
+        Ok(Self {
+            endpoint,
+            bytes: bytes.into_boxed_slice(),
+            binding_digest: digest.finalize().into(),
+        })
+    }
+
+    fn matches(&self, endpoint: ResetOperationEndpoint, bytes: &[u8]) -> bool {
+        if self.endpoint != endpoint || self.bytes.as_ref() != bytes {
+            return false;
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-RESET-CANONICAL-RESPONSE\0");
+        digest.update(match endpoint {
+            ResetOperationEndpoint::RequestReset => b"request".as_slice(),
+            ResetOperationEndpoint::ActivateReset => b"activation".as_slice(),
+        });
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+        self.binding_digest == <[u8; 32]>::from(digest.finalize())
+    }
+}
+
+/// Linear first-execution completion authority returned only after the Reset
+/// executor has applied inside the caller-owned transaction.
+#[cfg(not(test))]
+pub(crate) struct ResetCompletion {
+    authority: VerifiedChatDeviceRequest,
+    scope_authority: ScopeBoundBusinessAuthority,
+    completion: OperationCompletionGuard,
+}
+
+#[cfg(not(test))]
+impl ResetCompletion {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        VerifiedChatDeviceRequest,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+    ) {
+        (self.authority, self.scope_authority, self.completion)
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) struct AppliedResetOperation {
+    applied: AppliedTransition,
+    completion: ResetCompletion,
+    response: ResetCanonicalResponse,
+}
+
+#[cfg(not(test))]
+impl AppliedResetOperation {
+    pub(crate) fn response(&self) -> &ResetCanonicalResponse {
+        &self.response
+    }
+
+    pub(crate) fn event_position(&self) -> Option<i64> {
+        self.applied.event_positions.first().copied()
+    }
+
+    pub(crate) fn into_parts(self) -> (AppliedTransition, ResetCompletion, ResetCanonicalResponse) {
+        (self.applied, self.completion, self.response)
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) enum ResetTransactionOutcome {
+    First(AppliedResetOperation),
+    Replay(CompletedIdempotentResponse),
+}
+
+#[cfg(not(test))]
+struct PreparedResetExecutionGraph {
+    plan: ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+    response: ResetCanonicalResponse,
+}
+
+#[cfg(not(test))]
+impl PreparedResetExecutionGraph {
+    fn new(
+        plan: ConversationPersistencePlan,
+        artifacts: ExecutionContextArtifacts,
+        response: ResetCanonicalResponse,
+    ) -> Result<Self, ResetFacadeError> {
+        let expected = match plan.effects().kind() {
+            PlanKind::ResetRequest => ResetOperationEndpoint::RequestReset,
+            PlanKind::ResetActivation => ResetOperationEndpoint::ActivateReset,
+            _ => return Err(ResetFacadeError::InvalidCanonicalMaterial),
+        };
+        if response.endpoint() != expected
+            || !response.matches(expected, response.as_bytes())
+            || artifacts.accepted_control_entry_bytes.is_none()
+            || artifacts.primary_event_payload.is_none()
+            || !artifacts.welcome_disposition_event_payloads.is_empty()
+            || (expected == ResetOperationEndpoint::RequestReset
+                && artifacts.genesis_group_info_bytes.is_some())
+            || (expected == ResetOperationEndpoint::ActivateReset
+                && artifacts.genesis_group_info_bytes.is_none())
+        {
+            return Err(ResetFacadeError::InvalidCanonicalMaterial);
+        }
+        Ok(Self {
+            plan,
+            artifacts,
+            response,
+        })
+    }
+
+    async fn apply(
+        self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(AppliedTransition, ResetCanonicalResponse), ResetFacadeError> {
+        let Self {
+            plan,
+            artifacts,
+            response,
+        } = self;
+        let prepared = hydrate_execution_context(transaction, &plan, artifacts).await?;
+        let applied =
+            crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(
+                prepared,
+            )
+            .await?;
+        Ok((applied, response))
+    }
+}
+
+#[cfg(not(test))]
+fn parse_json(bytes: &[u8]) -> Result<JsonValue, ResetFacadeError> {
+    serde_json::from_slice(bytes).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)
+}
+
+#[cfg(not(test))]
+fn canonical_datetime(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[cfg(not(test))]
+fn coordinate_json(
+    coordinate: &PublicGroupSnapshotCoordinate,
+) -> Result<JsonValue, ResetFacadeError> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let generation = i64::try_from(coordinate.generation())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    let state_version = i64::try_from(coordinate.state_version())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    let epoch = i64::try_from(coordinate.epoch())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    let lifecycle = match coordinate.lifecycle() {
+        PublicGroupSnapshotLifecycle::Active => "active",
+        PublicGroupSnapshotLifecycle::Superseded => "superseded",
+    };
+    Ok(json!({
+        "conversationId": Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),
+        "generation": generation,
+        "stateVersion": state_version,
+        "groupId": STANDARD.encode(coordinate.group_id()),
+        "epoch": epoch,
+        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+        "lifecycle": lifecycle,
+    }))
+}
+
 #[derive(Debug, FromRow)]
 struct PendingResetRow {
     reset_request_id: Uuid,
@@ -174,6 +570,175 @@ struct PendingResetRow {
     expires_at: DateTime<Utc>,
     terminal_transition_id: Option<Uuid>,
     terminal_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ResetReplayHeadRow {
+    kind: String,
+    lifecycle: String,
+    current_generation: i64,
+    current_state_version: i64,
+    next_entry_seq: i64,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ResetReplayEntryRow {
+    seq: i64,
+    entry_id: Uuid,
+    accepted_payload_bytes: Vec<u8>,
+    accepted_payload_sha256: Vec<u8>,
+    signed_request_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+    server_fields_bytes: Vec<u8>,
+    outer_entry_fingerprint: Vec<u8>,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+    generation: Option<i64>,
+    state_version: Option<i64>,
+    transition_id: Option<Uuid>,
+    received_at: DateTime<Utc>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ResetReplayTransitionRow {
+    transition_id: Uuid,
+    conversation_id: Uuid,
+    kind: String,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+    actor_role: String,
+    actor_device_status: String,
+    signed_request_bytes: Vec<u8>,
+    unsigned_projection_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+    prior_generation: Option<i64>,
+    prior_state_version: Option<i64>,
+    next_generation: Option<i64>,
+    next_state_version: Option<i64>,
+    retired_generation: Option<i64>,
+    retired_state_version: Option<i64>,
+    successor_generation: Option<i64>,
+    successor_state_version: Option<i64>,
+    reset_request_id: Option<Uuid>,
+    entry_seq: i64,
+    accepted_at: DateTime<Utc>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ResetReplayGenerationRow {
+    group_id: Vec<u8>,
+    genesis_group_info_bytes: Vec<u8>,
+    genesis_group_info_sha256: Vec<u8>,
+    activated_seq: i64,
+    activated_at: DateTime<Utc>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ResetReplaySuccessorRow {
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    lifecycle: String,
+    state_kind: String,
+    producing_transition_id: Uuid,
+    created_at: DateTime<Utc>,
+}
+
+/// Reset-owned, private-constructor replay proof. Prelude can inspect the
+/// complete binding but cannot mint one or substitute loose endpoint facts.
+#[cfg(not(test))]
+pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
+    transaction_id: Box<str>,
+    operation_id: Uuid,
+    principal_did: Box<str>,
+    endpoint_nsid: Box<str>,
+    mutation_kind: SignedMutationKind,
+    request_digest: [u8; 32],
+    accepted_request_sha256: [u8; 32],
+    signature: [u8; 64],
+    post_state_digest: [u8; 32],
+    expected_response_status: i32,
+    expected_response_sha256: [u8; 32],
+    seal_digest: [u8; 32],
+}
+
+#[cfg(not(test))]
+impl ResetReplayPostStateProof {
+    pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(in crate::chat_protocol::repository) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub(in crate::chat_protocol::repository) fn principal_did(&self) -> &str {
+        &self.principal_did
+    }
+
+    pub(in crate::chat_protocol::repository) fn endpoint_nsid(&self) -> &str {
+        &self.endpoint_nsid
+    }
+
+    pub(in crate::chat_protocol::repository) fn mutation_kind(&self) -> SignedMutationKind {
+        self.mutation_kind
+    }
+
+    pub(in crate::chat_protocol::repository) fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub(in crate::chat_protocol::repository) fn accepted_request_sha256(&self) -> &[u8; 32] {
+        &self.accepted_request_sha256
+    }
+
+    pub(in crate::chat_protocol::repository) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+
+    pub(in crate::chat_protocol::repository) fn post_state_digest(&self) -> &[u8; 32] {
+        &self.post_state_digest
+    }
+
+    pub(in crate::chat_protocol::repository) fn expected_response_status(&self) -> i32 {
+        self.expected_response_status
+    }
+
+    pub(in crate::chat_protocol::repository) fn expected_response_sha256(&self) -> &[u8; 32] {
+        &self.expected_response_sha256
+    }
+
+    pub(in crate::chat_protocol::repository) fn validates_seal(&self) -> bool {
+        self.post_state_digest != [0; 32]
+            && self.expected_response_sha256 != [0; 32]
+            && self.seal_digest
+                == reset_replay_seal(
+                    &self.transaction_id,
+                    self.operation_id,
+                    &self.principal_did,
+                    &self.endpoint_nsid,
+                    self.mutation_kind,
+                    &self.request_digest,
+                    &self.accepted_request_sha256,
+                    &self.signature,
+                    &self.post_state_digest,
+                    self.expected_response_status,
+                    &self.expected_response_sha256,
+                )
+    }
 }
 
 /// Exact immutable pending Reset row plus its requester device/key bindings.
@@ -320,6 +885,7 @@ pub(crate) struct LockedResetActivationAuthority {
     head_digest: [u8; 32],
     admission_digest: [u8; 32],
     request: LockedPendingResetRequestGuard,
+    terminal_packages: Vec<LockedRecoveryPackageGuard>,
 }
 
 impl LockedResetActivationAuthority {
@@ -331,7 +897,6 @@ impl LockedResetActivationAuthority {
         self,
         mutation: &VerifiedSignedMutation,
         entry: VerifiedControlEntry,
-        terminal_packages: Vec<LockedRecoveryPackageGuard>,
     ) -> Result<
         (
             PlannedTransition,
@@ -364,7 +929,7 @@ impl LockedResetActivationAuthority {
             &self.aggregate,
             self.prelude.scope_authority(),
             entry,
-            terminal_packages,
+            self.terminal_packages,
         )?;
         Ok((plan, self.request, self.prelude))
     }
@@ -635,6 +1200,20 @@ pub(crate) async fn prepare_reset_activation_authority(
     {
         return Err(ResetRepositoryError::PendingResetExpired);
     }
+    let mut terminal_packages = Vec::new();
+    for recovery in prepared.aggregate.state().recovery_requests() {
+        if recovery.status() == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open {
+            terminal_packages.push(
+                hydrate_locked_reserved_recovery_package(
+                    transaction,
+                    prepared.aggregate.head(),
+                    Uuid::from_bytes(*recovery.request_id()),
+                )
+                .await
+                .map_err(|_| ResetRepositoryError::GuardInvariant)?,
+            );
+        }
+    }
     let admission_digest = reset_admission_digest(
         prepared.operation_id,
         &prepared.incoming_request_digest,
@@ -664,6 +1243,7 @@ pub(crate) async fn prepare_reset_activation_authority(
         head_digest: prepared.head_digest,
         admission_digest,
         request,
+        terminal_packages,
     })
 }
 
@@ -770,6 +1350,749 @@ pub(crate) async fn terminalize_locked_reset_request(
         _ => {}
     }
     cas_terminalize(transaction, &guard, guard.authorized_terminal).await
+}
+
+#[cfg(not(test))]
+async fn lock_reset_replay_post_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    locked: &LockedSignedOperationReplayAuthority,
+) -> Result<ResetReplayPostStateProof, ResetFacadeError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let replay = locked.authority();
+    let mutation = replay.mutation();
+    let expected = match mutation.kind() {
+        SignedMutationKind::ResetRequest => ResetPreparationKind::Request,
+        SignedMutationKind::ResetActivation => ResetPreparationKind::Activation,
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    let parsed = parse_reset_authority(mutation, expected)?;
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let head: ResetReplayHeadRow = sqlx::query_as(
+        r#"
+        SELECT kind,lifecycle,current_generation,current_state_version,next_entry_seq
+          FROM chat.conversations
+         WHERE conversation_id=$1
+         FOR UPDATE
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetRepositoryError::ConversationMissing)?;
+    if !matches!(head.kind.as_str(), "direct" | "group")
+        || !matches!(head.lifecycle.as_str(), "active" | "superseded")
+        || head.current_generation < 0
+        || head.current_state_version < 0
+        || head.next_entry_seq < 2
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+
+    let (post_state_digest, response) = match expected {
+        ResetPreparationKind::Request => {
+            lock_reset_request_replay_rows(transaction, mutation, &parsed, &head).await?
+        }
+        ResetPreparationKind::Activation => {
+            lock_reset_activation_replay_rows(transaction, mutation, &parsed, &head).await?
+        }
+    };
+    let raw = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let expected_response_status = response.status();
+    let expected_response_sha256 = response.sha256();
+    let endpoint_nsid = match expected {
+        ResetPreparationKind::Request => "blue.catbird.chat.requestReset",
+        ResetPreparationKind::Activation => "blue.catbird.chat.activateReset",
+    };
+    if replay.endpoint().as_str() != endpoint_nsid
+        || response.endpoint()
+            != match expected {
+                ResetPreparationKind::Request => ResetOperationEndpoint::RequestReset,
+                ResetPreparationKind::Activation => ResetOperationEndpoint::ActivateReset,
+            }
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let accepted_request_sha256: [u8; 32] = Sha256::digest(raw).into();
+    let seal_digest = reset_replay_seal(
+        &transaction_id,
+        parsed.operation_id,
+        replay.subject().as_str(),
+        endpoint_nsid,
+        mutation.kind(),
+        mutation.request_digest(),
+        &accepted_request_sha256,
+        mutation.signature(),
+        &post_state_digest,
+        expected_response_status,
+        &expected_response_sha256,
+    );
+    let proof = ResetReplayPostStateProof {
+        transaction_id: transaction_id.into_boxed_str(),
+        operation_id: parsed.operation_id,
+        principal_did: replay.subject().as_str().to_owned().into_boxed_str(),
+        endpoint_nsid: endpoint_nsid.into(),
+        mutation_kind: mutation.kind(),
+        request_digest: *mutation.request_digest(),
+        accepted_request_sha256,
+        signature: *mutation.signature(),
+        post_state_digest,
+        expected_response_status,
+        expected_response_sha256,
+        seal_digest,
+    };
+    if !proof.validates_seal() {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    Ok(proof)
+}
+
+#[cfg(not(test))]
+async fn lock_reset_request_replay_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    mutation: &VerifiedSignedMutation,
+    parsed: &ParsedResetAuthority,
+    head: &ResetReplayHeadRow,
+) -> Result<([u8; 32], ResetCanonicalResponse), ResetFacadeError> {
+    let row: PendingResetRow = sqlx::query_as(
+        r#"
+        SELECT reset_request_id,conversation_id,requester_did,requester_device_id,
+               requester_key_id,requester_auth_generation,prior_generation,
+               prior_state_version,prior_group_id,prior_epoch,
+               prior_group_context_hash,prior_confirmation_tag,reason,status,
+               signed_request_bytes,signing_transcript_bytes,request_digest,
+               signature,received_at,expires_at,terminal_transition_id,terminal_at
+          FROM chat.reset_requests
+         WHERE reset_request_id=$1
+         FOR UPDATE
+        "#,
+    )
+    .bind(parsed.reset_request_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetRepositoryError::PendingResetNotFound)?;
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let prior = coordinate_from_row(&row)?;
+    let actor_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    if row.reset_request_id != parsed.reset_request_id
+        || row.conversation_id != Uuid::from_bytes(*parsed.prior.conversation_id())
+        || row.requester_did != mutation.actor_did().as_str()
+        || row.requester_device_id != Uuid::from_bytes(*mutation.actor_device_id().as_bytes())
+        || row.requester_key_id != mutation.key_id().as_str()
+        || row.requester_auth_generation != actor_generation
+        || prior != parsed.prior
+        || !matches!(
+            row.status.as_str(),
+            "pending" | "stale" | "consumed" | "expired"
+        )
+        || row.signed_request_bytes != accepted
+        || row.signing_transcript_bytes != mutation.transcript_bytes()
+        || row.request_digest.as_slice() != mutation.request_digest()
+        || row.signature.as_slice() != mutation.signature()
+        || row.expires_at != row.received_at + Duration::hours(24)
+        || !whole_millis(row.received_at)
+        || !whole_millis(row.expires_at)
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let expected_reason = match mutation.projection() {
+        VerifiedMutationProjection::ResetRequest(value) => value.reason(),
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    if row.reason != expected_reason {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let entry = lock_reset_replay_entry(
+        transaction,
+        mutation,
+        row.conversation_id,
+        "blue.catbird.chat.defs#resetRequestEntry",
+        None,
+    )
+    .await?;
+    if entry.generation.is_some()
+        || entry.state_version.is_some()
+        || entry.transition_id.is_some()
+        || entry.received_at != row.received_at
+        || entry.seq >= head.next_entry_seq
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let response = ResetCanonicalResponse::request(
+        &entry.accepted_payload_bytes,
+        row.reset_request_id,
+        row.conversation_id,
+        &row.requester_did,
+        row.requester_device_id,
+        &prior,
+        &row.reason,
+        row.received_at,
+        row.expires_at,
+    )?;
+    let mut digest = reset_replay_post_state_digest("request", head, &entry);
+    digest_uuid(&mut digest, row.reset_request_id);
+    digest_uuid(&mut digest, row.conversation_id);
+    digest_len(&mut digest, row.requester_did.as_bytes());
+    digest_uuid(&mut digest, row.requester_device_id);
+    digest_len(&mut digest, row.requester_key_id.as_bytes());
+    digest.update(row.requester_auth_generation.to_be_bytes());
+    digest_coordinate(&mut digest, &prior);
+    digest_len(&mut digest, row.reason.as_bytes());
+    digest_len(&mut digest, row.status.as_bytes());
+    digest_len(&mut digest, &row.signed_request_bytes);
+    digest_len(&mut digest, &row.signing_transcript_bytes);
+    digest_len(&mut digest, &row.request_digest);
+    digest_len(&mut digest, &row.signature);
+    digest.update(row.received_at.timestamp_millis().to_be_bytes());
+    digest.update(row.expires_at.timestamp_millis().to_be_bytes());
+    digest_optional_uuid(&mut digest, row.terminal_transition_id);
+    digest_optional_time(&mut digest, row.terminal_at);
+    Ok((digest.finalize().into(), response))
+}
+
+#[cfg(not(test))]
+async fn lock_reset_activation_replay_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    mutation: &VerifiedSignedMutation,
+    parsed: &ParsedResetAuthority,
+    head: &ResetReplayHeadRow,
+) -> Result<([u8; 32], ResetCanonicalResponse), ResetFacadeError> {
+    let activation = match mutation.projection() {
+        VerifiedMutationProjection::ResetActivation(value) => value,
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    let retired = parse_coordinate(&activation.retired())?;
+    let successor = parse_coordinate(&activation.successor())?;
+    let transition: ResetReplayTransitionRow = sqlx::query_as(
+        r#"
+        SELECT transition_id,conversation_id,kind,actor_did,actor_device_id,
+               actor_key_id,actor_auth_generation,actor_role,actor_device_status,
+               signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,
+               request_digest,signature,prior_generation,prior_state_version,
+               next_generation,next_state_version,retired_generation,
+               retired_state_version,successor_generation,successor_state_version,
+               reset_request_id,entry_seq,accepted_at
+          FROM chat.transitions
+         WHERE transition_id=$1
+         FOR UPDATE
+        "#,
+    )
+    .bind(parsed.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetRepositoryError::OperationIdAlreadyUsed)?;
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let actor_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    let prior_pair = coordinate_pair(&parsed.prior)?;
+    let retired_pair = coordinate_pair(&retired)?;
+    let successor_pair = coordinate_pair(&successor)?;
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    if transition.transition_id != parsed.operation_id
+        || transition.conversation_id != conversation_id
+        || transition.kind != "resetActivation"
+        || transition.actor_did != mutation.actor_did().as_str()
+        || transition.actor_device_id != Uuid::from_bytes(*mutation.actor_device_id().as_bytes())
+        || transition.actor_key_id != mutation.key_id().as_str()
+        || transition.actor_auth_generation != actor_generation
+        || transition.actor_role != "admin"
+        || transition.actor_device_status != "active"
+        || transition.signed_request_bytes != accepted
+        || transition.unsigned_projection_bytes != mutation.canonical_projection()
+        || transition.signing_transcript_bytes != mutation.transcript_bytes()
+        || transition.request_digest.as_slice() != mutation.request_digest()
+        || transition.signature.as_slice() != mutation.signature()
+        || (transition.prior_generation, transition.prior_state_version)
+            != (Some(prior_pair.0), Some(prior_pair.1))
+        || (
+            transition.retired_generation,
+            transition.retired_state_version,
+        ) != (Some(retired_pair.0), Some(retired_pair.1))
+        || (
+            transition.successor_generation,
+            transition.successor_state_version,
+        ) != (Some(successor_pair.0), Some(successor_pair.1))
+        || (transition.next_generation, transition.next_state_version)
+            != (Some(successor_pair.0), Some(successor_pair.1))
+        || transition.reset_request_id != Some(parsed.reset_request_id)
+        || !whole_millis(transition.accepted_at)
+        || transition.entry_seq < 1
+        || transition.entry_seq >= head.next_entry_seq
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let request: PendingResetRow = sqlx::query_as(
+        r#"
+        SELECT reset_request_id,conversation_id,requester_did,requester_device_id,
+               requester_key_id,requester_auth_generation,prior_generation,
+               prior_state_version,prior_group_id,prior_epoch,
+               prior_group_context_hash,prior_confirmation_tag,reason,status,
+               signed_request_bytes,signing_transcript_bytes,request_digest,
+               signature,received_at,expires_at,terminal_transition_id,terminal_at
+          FROM chat.reset_requests
+         WHERE reset_request_id=$1
+         FOR UPDATE
+        "#,
+    )
+    .bind(parsed.reset_request_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetRepositoryError::PendingResetNotFound)?;
+    if request.conversation_id != conversation_id
+        || coordinate_from_row(&request)? != parsed.prior
+        || request.status != "consumed"
+        || request.terminal_transition_id != Some(parsed.operation_id)
+        || request.terminal_at != Some(transition.accepted_at)
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let entry = lock_reset_replay_entry(
+        transaction,
+        mutation,
+        conversation_id,
+        "blue.catbird.chat.defs#resetActivationEntry",
+        Some(parsed.operation_id),
+    )
+    .await?;
+    if entry.seq != transition.entry_seq
+        || entry.generation != Some(successor_pair.0)
+        || entry.state_version != Some(successor_pair.1)
+        || entry.received_at != transition.accepted_at
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let generation: ResetReplayGenerationRow = sqlx::query_as(
+        r#"
+        SELECT group_id,genesis_group_info_bytes,genesis_group_info_sha256,
+               activated_seq,activated_at
+          FROM chat.generations
+         WHERE conversation_id=$1 AND generation=$2
+         FOR UPDATE
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(successor_pair.0)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let expected_group_info = reset_group_info_bytes(mutation)?;
+    if generation.group_id.as_slice() != successor.group_id()
+        || generation.genesis_group_info_bytes != expected_group_info
+        || generation.genesis_group_info_sha256.as_slice()
+            != Sha256::digest(&generation.genesis_group_info_bytes).as_slice()
+        || generation.activated_seq != transition.entry_seq
+        || generation.activated_at != transition.accepted_at
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let retired_row =
+        lock_reset_generation_state(transaction, &retired, parsed.operation_id).await?;
+    let successor_row =
+        lock_reset_generation_state(transaction, &successor, parsed.operation_id).await?;
+    if retired_row.state_kind != "resetRetirement"
+        || retired_row.lifecycle != "superseded"
+        || successor_row.state_kind != "resetSuccessor"
+        || !matches!(successor_row.lifecycle.as_str(), "active" | "superseded")
+        || retired_row.created_at != transition.accepted_at
+        || successor_row.created_at != transition.accepted_at
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    let response =
+        ResetCanonicalResponse::activation(&entry.accepted_payload_bytes, &retired, &successor)?;
+    let mut digest = reset_replay_post_state_digest("activation", head, &entry);
+    digest_transition(&mut digest, &transition);
+    digest_uuid(&mut digest, request.reset_request_id);
+    digest_len(&mut digest, request.status.as_bytes());
+    digest_optional_uuid(&mut digest, request.terminal_transition_id);
+    digest_optional_time(&mut digest, request.terminal_at);
+    digest_coordinate(&mut digest, &retired);
+    digest_coordinate(&mut digest, &successor);
+    digest_len(&mut digest, &generation.group_id);
+    digest_len(&mut digest, &generation.genesis_group_info_bytes);
+    digest_len(&mut digest, &generation.genesis_group_info_sha256);
+    digest.update(generation.activated_seq.to_be_bytes());
+    digest.update(generation.activated_at.timestamp_millis().to_be_bytes());
+    digest_generation_state(&mut digest, &retired_row);
+    digest_generation_state(&mut digest, &successor_row);
+    Ok((digest.finalize().into(), response))
+}
+
+#[cfg(not(test))]
+async fn lock_reset_replay_entry(
+    transaction: &mut Transaction<'_, Postgres>,
+    mutation: &VerifiedSignedMutation,
+    conversation_id: Uuid,
+    entry_kind: &str,
+    transition_id: Option<Uuid>,
+) -> Result<ResetReplayEntryRow, ResetFacadeError> {
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let rows: Vec<ResetReplayEntryRow> = sqlx::query_as(
+        r#"
+        SELECT seq,entry_id,accepted_payload_bytes,accepted_payload_sha256,
+               signed_request_bytes,request_digest,signature,server_fields_bytes,
+               outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,
+               actor_auth_generation,generation,state_version,transition_id,received_at
+          FROM chat.entries
+         WHERE conversation_id=$1 AND entry_kind=$2
+           AND signed_request_bytes=$3 AND request_digest=$4 AND signature=$5
+           AND transition_id IS NOT DISTINCT FROM $6
+         ORDER BY seq
+         FOR UPDATE
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(entry_kind)
+    .bind(accepted)
+    .bind(mutation.request_digest().as_slice())
+    .bind(mutation.signature().as_slice())
+    .bind(transition_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let [row] = rows.as_slice() else {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    };
+    let actor_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+    if row.entry_id.get_version_num() != 4
+        || row.seq < 1
+        || row.accepted_payload_bytes.is_empty()
+        || row.accepted_payload_sha256.as_slice()
+            != Sha256::digest(&row.accepted_payload_bytes).as_slice()
+        || row.signed_request_bytes != accepted
+        || row.request_digest.as_slice() != mutation.request_digest()
+        || row.signature.as_slice() != mutation.signature()
+        || row.server_fields_bytes.is_empty()
+        || row.outer_entry_fingerprint.len() != 32
+        || row.actor_did != mutation.actor_did().as_str()
+        || row.actor_device_id != Uuid::from_bytes(*mutation.actor_device_id().as_bytes())
+        || row.actor_key_id != mutation.key_id().as_str()
+        || row.actor_auth_generation != actor_generation
+        || row.transition_id != transition_id
+        || !whole_millis(row.received_at)
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    Ok(rows.into_iter().next().expect("single exact Reset entry"))
+}
+
+#[cfg(not(test))]
+async fn lock_reset_generation_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    coordinate: &PublicGroupSnapshotCoordinate,
+    transition_id: Uuid,
+) -> Result<ResetReplaySuccessorRow, ResetFacadeError> {
+    let (generation, state_version) = coordinate_pair(coordinate)?;
+    let row: ResetReplaySuccessorRow = sqlx::query_as(
+        r#"
+        SELECT group_id,epoch,group_context_hash,confirmation_tag,lifecycle,
+               state_kind,producing_transition_id,created_at
+          FROM chat.generation_states
+         WHERE conversation_id=$1 AND generation=$2 AND state_version=$3
+         FOR UPDATE
+        "#,
+    )
+    .bind(Uuid::from_bytes(*coordinate.conversation_id()))
+    .bind(generation)
+    .bind(state_version)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    if row.group_id.as_slice() != coordinate.group_id()
+        || row.epoch
+            != i64::try_from(coordinate.epoch())
+                .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?
+        || row.group_context_hash.as_slice() != coordinate.group_context_hash()
+        || row.confirmation_tag.as_slice() != coordinate.confirmation_tag()
+        || row.producing_transition_id != transition_id
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    Ok(row)
+}
+
+#[cfg(not(test))]
+fn coordinate_pair(
+    coordinate: &PublicGroupSnapshotCoordinate,
+) -> Result<(i64, i64), ResetFacadeError> {
+    Ok((
+        i64::try_from(coordinate.generation())
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?,
+        i64::try_from(coordinate.state_version())
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?,
+    ))
+}
+
+/// Consume one globally arbitrated signed Reset operation. First execution
+/// owns discovery, full scope locking, entry minting, planning, canonical
+/// artifacts/response, and apply. Replay remains byte-opaque until the exact
+/// Reset durable post-state has been locked and validated.
+#[cfg(not(test))]
+pub(crate) async fn execute_prepared_reset(
+    transaction: &mut Transaction<'_, Postgres>,
+    prepared: PreparedSignedOperation,
+) -> Result<ResetTransactionOutcome, ResetFacadeError> {
+    match prepared {
+        PreparedSignedOperation::First {
+            authority,
+            reservation,
+        } => execute_first_reset(transaction, authority, reservation)
+            .await
+            .map(ResetTransactionOutcome::First),
+        PreparedSignedOperation::Replay { authority, replay } => {
+            let locked =
+                lock_signed_operation_replay_authority(transaction, authority, replay).await?;
+            let post_state = lock_reset_replay_post_state(transaction, &locked).await?;
+            let expected_response_sha256 = post_state.expected_response_sha256;
+            let closed_post_state = match post_state.mutation_kind() {
+                SignedMutationKind::ResetRequest => {
+                    SignedOperationReplayPostStateProof::ResetRequest(post_state)
+                }
+                SignedMutationKind::ResetActivation => {
+                    SignedOperationReplayPostStateProof::ResetActivation(post_state)
+                }
+                _ => return Err(ResetFacadeError::UnsupportedMutation),
+            };
+            let response =
+                release_signed_operation_replay(transaction, locked, closed_post_state).await?;
+            if response.response_sha256() != &expected_response_sha256
+                || Sha256::digest(response.response_bytes()).as_slice()
+                    != response.response_sha256()
+            {
+                return Err(ResetFacadeError::InvalidCanonicalMaterial);
+            }
+            Ok(ResetTransactionOutcome::Replay(response))
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn execute_first_reset(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: VerifiedChatDeviceRequest,
+    reservation: OperationReservationGuard,
+) -> Result<AppliedResetOperation, ResetFacadeError> {
+    let mutation = authority
+        .mutation()
+        .ok_or(ResetFacadeError::MissingMutation)?;
+    let expected = match mutation.kind() {
+        SignedMutationKind::ResetRequest => ResetPreparationKind::Request,
+        SignedMutationKind::ResetActivation => ResetPreparationKind::Activation,
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    let parsed = parse_reset_authority(mutation, expected)?;
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let scope =
+        discover_reset_identity_scope(transaction, &authority, mutation, conversation_id).await?;
+    let prelude =
+        prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?;
+    let graph = match expected {
+        ResetPreparationKind::Request => {
+            prepare_reset_request_graph(transaction, &authority, prelude, mutation).await?
+        }
+        ResetPreparationKind::Activation => {
+            prepare_reset_activation_graph(transaction, &authority, prelude, mutation).await?
+        }
+    };
+    let (scope_authority, completion) = graph.1.into_execution_parts();
+    let (applied, response) = graph.0.apply(transaction).await?;
+    Ok(AppliedResetOperation {
+        applied,
+        completion: ResetCompletion {
+            authority,
+            scope_authority,
+            completion,
+        },
+        response,
+    })
+}
+
+#[cfg(not(test))]
+async fn prepare_reset_request_graph(
+    transaction: &mut Transaction<'_, Postgres>,
+    request: &VerifiedChatDeviceRequest,
+    prelude: PreparedBusinessPrelude,
+    mutation: &VerifiedSignedMutation,
+) -> Result<(PreparedResetExecutionGraph, PreparedBusinessPrelude), ResetFacadeError> {
+    let authority = prepare_reset_request_authority(transaction, prelude, mutation).await?;
+    let parsed = parse_reset_authority(mutation, ResetPreparationKind::Request)?;
+    let scope = authority.prelude.scope_authority();
+    let verified_mutation = reverify_scope_mutation(scope, mutation)?;
+    let entry_id = canonical_uuid_v4(Uuid::new_v4())?;
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let seq = authority.aggregate.head().next_entry_seq();
+    let entry = build_verified_control_entry(
+        verified_mutation,
+        request.endpoint(),
+        entry_id,
+        canonical_uuid_v4(conversation_id)?,
+        seq,
+        request.trusted_instant(),
+        CanonicalControlServerFields::empty(ControlEntryKind::ResetRequest)?,
+    )?;
+    let products = CanonicalControlEntryProducts::mint(&entry)?;
+    let trusted_instant = authority.trusted_instant;
+    let expires_at = trusted_instant
+        .checked_add_signed(Duration::hours(24))
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let reason = match entry.mutation().projection() {
+        VerifiedMutationProjection::ResetRequest(value) => value.reason(),
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    let response = ResetCanonicalResponse::request(
+        products.canonical_response_json(),
+        parsed.reset_request_id,
+        conversation_id,
+        entry.mutation().actor_did().as_str(),
+        Uuid::from_bytes(*entry.mutation().actor_device_id().as_bytes()),
+        &parsed.prior,
+        reason,
+        trusted_instant,
+        expires_at,
+    )?;
+    let artifacts = ExecutionContextArtifacts {
+        accepted_control_entry_bytes: Some(products.durable_json().to_vec()),
+        genesis_group_info_bytes: None,
+        primary_event_payload: Some(canonical_reset_requested_event_payload(
+            parsed.reset_request_id,
+            conversation_id,
+        )),
+        welcome_disposition_event_payloads: Vec::new(),
+    };
+    let (planned, prelude) = match authority.disposition() {
+        LockedResetRequestDisposition::Vacant => {
+            authority.plan_vacant_reset_request_entry(mutation, entry)?
+        }
+        LockedResetRequestDisposition::ExpiredReplacement(_) => {
+            // Entry, response, and every executor artifact are sealed before
+            // expiry terminalization performs the replacement's first write.
+            let replacement = expire_pending_reset_for_replacement(transaction, authority).await?;
+            replacement.plan_replacement_reset_request_entry(mutation, entry)?
+        }
+        LockedResetRequestDisposition::Pending(_) => {
+            return Err(ResetRepositoryError::PendingResetAlreadyExists.into());
+        }
+    };
+    let plan = planned.into_persistence_plan()?;
+    Ok((
+        PreparedResetExecutionGraph::new(plan, artifacts, response)?,
+        prelude,
+    ))
+}
+
+#[cfg(not(test))]
+async fn prepare_reset_activation_graph(
+    transaction: &mut Transaction<'_, Postgres>,
+    request: &VerifiedChatDeviceRequest,
+    prelude: PreparedBusinessPrelude,
+    mutation: &VerifiedSignedMutation,
+) -> Result<(PreparedResetExecutionGraph, PreparedBusinessPrelude), ResetFacadeError> {
+    let authority = prepare_reset_activation_authority(transaction, prelude, mutation).await?;
+    let parsed = parse_reset_authority(mutation, ResetPreparationKind::Activation)?;
+    let scope = authority.prelude.scope_authority();
+    let verified_mutation = reverify_scope_mutation(scope, mutation)?;
+    let group_info = reset_group_info_bytes(mutation)?;
+    let entry_id = canonical_uuid_v4(Uuid::new_v4())?;
+    let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let seq = authority.aggregate.head().next_entry_seq();
+    let entry = build_verified_control_entry(
+        verified_mutation,
+        request.endpoint(),
+        entry_id,
+        canonical_uuid_v4(conversation_id)?,
+        seq,
+        request.trusted_instant(),
+        CanonicalControlServerFields::empty(ControlEntryKind::ResetActivation)?,
+    )?;
+    let products = CanonicalControlEntryProducts::mint(&entry)?;
+    let (planned, _pending, prelude) = authority.plan_reset_activation_entry(mutation, entry)?;
+    let plan = planned.into_persistence_plan()?;
+    let retired = plan
+        .retired_coordinate()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let successor = plan
+        .successor_coordinate()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let response =
+        ResetCanonicalResponse::activation(products.canonical_response_json(), retired, successor)?;
+    let artifacts = ExecutionContextArtifacts {
+        accepted_control_entry_bytes: Some(products.durable_json().to_vec()),
+        genesis_group_info_bytes: Some(group_info),
+        primary_event_payload: Some(canonical_reset_activation_event_payload(conversation_id)),
+        welcome_disposition_event_payloads: Vec::new(),
+    };
+    Ok((
+        PreparedResetExecutionGraph::new(plan, artifacts, response)?,
+        prelude,
+    ))
+}
+
+#[cfg(not(test))]
+fn canonical_uuid_v4(value: Uuid) -> Result<CanonicalUuidV4, ResetFacadeError> {
+    CanonicalUuidV4::parse(&value.hyphenated().to_string()).map_err(ResetFacadeError::from)
+}
+
+#[cfg(not(test))]
+fn reset_group_info_bytes(mutation: &VerifiedSignedMutation) -> Result<Vec<u8>, ResetFacadeError> {
+    let object = match mutation.projection() {
+        VerifiedMutationProjection::ResetActivation(value) => value.genesis_group_info(),
+        _ => return Err(ResetFacadeError::UnsupportedMutation),
+    };
+    let bytes = match object.get("bytes") {
+        Some(CanonicalValueRef::Bytes(value)) => value,
+        _ => return Err(ResetFacadeError::InvalidCanonicalMaterial),
+    };
+    let declared: [u8; 32] = match object.get("sha256") {
+        Some(CanonicalValueRef::Bytes(value)) => value
+            .try_into()
+            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?,
+        _ => return Err(ResetFacadeError::InvalidCanonicalMaterial),
+    };
+    if <[u8; 32]>::from(Sha256::digest(bytes)) != declared {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    Ok(bytes.to_vec())
+}
+
+#[cfg(not(test))]
+fn reverify_scope_mutation(
+    scope: &ScopeBoundBusinessAuthority,
+    mutation: &VerifiedSignedMutation,
+) -> Result<VerifiedSignedMutation, ResetFacadeError> {
+    let raw = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let signing_public_key = scope
+        .actor_signing_public_key()
+        .ok_or(ResetFacadeError::InvalidCanonicalMaterial)?;
+    let verified = decode_and_verify_signed_mutation(raw, signing_public_key)?;
+    if verified.kind() != mutation.kind()
+        || verified.type_id() != mutation.type_id()
+        || verified.domain() != mutation.domain()
+        || verified.canonical_projection() != mutation.canonical_projection()
+        || verified.transcript_bytes() != mutation.transcript_bytes()
+        || verified.request_digest() != mutation.request_digest()
+        || verified.signature() != mutation.signature()
+        || verified.accepted_wrapper_bytes() != mutation.accepted_wrapper_bytes()
+        || verified.actor_did() != mutation.actor_did()
+        || verified.actor_device_id() != mutation.actor_device_id()
+        || verified.key_id() != mutation.key_id()
+        || verified.auth_generation() != mutation.auth_generation()
+        || verified.signed_at() != mutation.signed_at()
+    {
+        return Err(ResetFacadeError::InvalidCanonicalMaterial);
+    }
+    Ok(verified)
 }
 
 async fn prepare_reset_read_set(
@@ -2013,6 +3336,139 @@ fn digest_coordinate(digest: &mut Sha256, coordinate: &PublicGroupSnapshotCoordi
         PublicGroupSnapshotLifecycle::Active => 1,
         PublicGroupSnapshotLifecycle::Superseded => 2,
     }]);
+}
+
+#[cfg(not(test))]
+fn reset_replay_post_state_digest(
+    family: &str,
+    head: &ResetReplayHeadRow,
+    entry: &ResetReplayEntryRow,
+) -> Sha256 {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RESET-REPLAY-POST-STATE\0");
+    digest_len(&mut digest, family.as_bytes());
+    digest_len(&mut digest, head.kind.as_bytes());
+    digest_len(&mut digest, head.lifecycle.as_bytes());
+    digest.update(head.current_generation.to_be_bytes());
+    digest.update(head.current_state_version.to_be_bytes());
+    digest.update(head.next_entry_seq.to_be_bytes());
+    digest.update(entry.seq.to_be_bytes());
+    digest_uuid(&mut digest, entry.entry_id);
+    digest_len(&mut digest, &entry.accepted_payload_bytes);
+    digest_len(&mut digest, &entry.accepted_payload_sha256);
+    digest_len(&mut digest, &entry.signed_request_bytes);
+    digest_len(&mut digest, &entry.request_digest);
+    digest_len(&mut digest, &entry.signature);
+    digest_len(&mut digest, &entry.server_fields_bytes);
+    digest_len(&mut digest, &entry.outer_entry_fingerprint);
+    digest_len(&mut digest, entry.actor_did.as_bytes());
+    digest_uuid(&mut digest, entry.actor_device_id);
+    digest_len(&mut digest, entry.actor_key_id.as_bytes());
+    digest.update(entry.actor_auth_generation.to_be_bytes());
+    digest_optional_i64(&mut digest, entry.generation);
+    digest_optional_i64(&mut digest, entry.state_version);
+    digest_optional_uuid(&mut digest, entry.transition_id);
+    digest.update(entry.received_at.timestamp_millis().to_be_bytes());
+    digest
+}
+
+#[cfg(not(test))]
+fn digest_transition(digest: &mut Sha256, row: &ResetReplayTransitionRow) {
+    digest_uuid(digest, row.transition_id);
+    digest_uuid(digest, row.conversation_id);
+    digest_len(digest, row.kind.as_bytes());
+    digest_len(digest, row.actor_did.as_bytes());
+    digest_uuid(digest, row.actor_device_id);
+    digest_len(digest, row.actor_key_id.as_bytes());
+    digest.update(row.actor_auth_generation.to_be_bytes());
+    digest_len(digest, row.actor_role.as_bytes());
+    digest_len(digest, row.actor_device_status.as_bytes());
+    digest_len(digest, &row.signed_request_bytes);
+    digest_len(digest, &row.unsigned_projection_bytes);
+    digest_len(digest, &row.signing_transcript_bytes);
+    digest_len(digest, &row.request_digest);
+    digest_len(digest, &row.signature);
+    digest_optional_i64(digest, row.prior_generation);
+    digest_optional_i64(digest, row.prior_state_version);
+    digest_optional_i64(digest, row.next_generation);
+    digest_optional_i64(digest, row.next_state_version);
+    digest_optional_i64(digest, row.retired_generation);
+    digest_optional_i64(digest, row.retired_state_version);
+    digest_optional_i64(digest, row.successor_generation);
+    digest_optional_i64(digest, row.successor_state_version);
+    digest_optional_uuid(digest, row.reset_request_id);
+    digest.update(row.entry_seq.to_be_bytes());
+    digest.update(row.accepted_at.timestamp_millis().to_be_bytes());
+}
+
+#[cfg(not(test))]
+fn digest_generation_state(digest: &mut Sha256, row: &ResetReplaySuccessorRow) {
+    digest_len(digest, &row.group_id);
+    digest.update(row.epoch.to_be_bytes());
+    digest_len(digest, &row.group_context_hash);
+    digest_len(digest, &row.confirmation_tag);
+    digest_len(digest, row.lifecycle.as_bytes());
+    digest_len(digest, row.state_kind.as_bytes());
+    digest_uuid(digest, row.producing_transition_id);
+    digest.update(row.created_at.timestamp_millis().to_be_bytes());
+}
+
+#[cfg(not(test))]
+#[allow(clippy::too_many_arguments)]
+fn reset_replay_seal(
+    transaction_id: &str,
+    operation_id: Uuid,
+    principal_did: &str,
+    endpoint_nsid: &str,
+    mutation_kind: SignedMutationKind,
+    request_digest: &[u8; 32],
+    accepted_request_sha256: &[u8; 32],
+    signature: &[u8; 64],
+    post_state_digest: &[u8; 32],
+    expected_response_status: i32,
+    expected_response_sha256: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RESET-REPLAY-PROOF\0");
+    digest_len(&mut digest, transaction_id.as_bytes());
+    digest_uuid(&mut digest, operation_id);
+    digest_len(&mut digest, principal_did.as_bytes());
+    digest_len(&mut digest, endpoint_nsid.as_bytes());
+    digest_len(&mut digest, mutation_kind.type_id().as_bytes());
+    digest.update(request_digest);
+    digest.update(accepted_request_sha256);
+    digest.update(signature);
+    digest.update(post_state_digest);
+    digest.update(expected_response_status.to_be_bytes());
+    digest.update(expected_response_sha256);
+    digest.finalize().into()
+}
+
+#[cfg(not(test))]
+fn digest_uuid(digest: &mut Sha256, value: Uuid) {
+    digest.update(value.as_bytes());
+}
+
+#[cfg(not(test))]
+fn digest_optional_uuid(digest: &mut Sha256, value: Option<Uuid>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest_uuid(digest, value);
+        }
+        None => digest.update([0]),
+    }
+}
+
+#[cfg(not(test))]
+fn digest_optional_i64(digest: &mut Sha256, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
 }
 
 fn digest_len(digest: &mut Sha256, value: &[u8]) {

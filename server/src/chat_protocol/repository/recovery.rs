@@ -10,7 +10,9 @@
 // integration slice adds that module edge, the dedicated compile target
 // includes it directly.
 
-use chrono::{DateTime, Duration, Utc};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
@@ -30,13 +32,14 @@ use super::super::{
         HydrationAuthority, PlanAuthority, RecoveryPlanClass, ServerTimestamp, StateMachineError,
     },
     transcript::{
-        decode_and_verify_signed_mutation, CanonicalValueRef, VerifiedMutationProjection,
-        VerifiedSignedMutation,
+        decode_and_verify_control_entry, decode_and_verify_signed_mutation,
+        CanonicalControlEntryProducts, CanonicalValueRef, SignedMutationKind,
+        VerifiedMutationProjection, VerifiedSignedMutation,
     },
     validation::TrustedRequestInstant,
 };
 use super::{
-    auth::RepositoryAuthorityClass,
+    auth::{CompletedIdempotentResponse, RepositoryAuthorityClass, SignedOperationReplayAuthority},
     core::{
         hydrate_locked_available_recovery_package, hydrate_locked_conversation_state,
         hydrate_locked_reserved_recovery_package, ConversationStateHydrationError,
@@ -48,7 +51,8 @@ use super::{
     },
     prelude::{
         canonical_operation_lock_key, CanonicalDeviceIdentity, CanonicalLockScope,
-        OperationCompletionGuard, PreparedBusinessPrelude, RecoveryOperationEndpoint,
+        LockedSignedOperationReplayAuthority, OperationCompletionGuard, OperationReplayGuard,
+        PreludeError, PreparedBusinessPrelude, PreparedSignedOperation, RecoveryOperationEndpoint,
         RecoveryPreludeAggregatePlanBinding, RecoveryPreludeClientExpiryError,
         RecoveryPreludePersistenceMode, RecoveryPreludePlanBinding, RecoveryPreludePlanKind,
         RecoveryPreludePrewriteWitness, ScopeBoundBusinessAuthority,
@@ -61,6 +65,9 @@ use super::{
         self, LeafRecoveryKind, LeafRecoverySource, NewLeafRecoveryRequest, NewReservation,
     },
 };
+
+#[cfg(not(test))]
+use super::prelude::SignedOperationReplayPostStateProof;
 
 const RECOVERY_AUTHORITY_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-REPOSITORY-AUTHORITY\0";
 const RECOVERY_HEAD_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-HEAD\0";
@@ -424,6 +431,7 @@ pub(crate) enum RecoveryRepositoryError {
     StateMachine(StateMachineError),
     ExecutionHydration(ExecutionContextHydrationError),
     Execution(ExecutorError),
+    Prelude(PreludeError),
 }
 
 impl From<sqlx::Error> for RecoveryRepositoryError {
@@ -465,6 +473,12 @@ impl From<ExecutionContextHydrationError> for RecoveryRepositoryError {
 impl From<ExecutorError> for RecoveryRepositoryError {
     fn from(value: ExecutorError) -> Self {
         Self::Execution(value)
+    }
+}
+
+impl From<PreludeError> for RecoveryRepositoryError {
+    fn from(value: PreludeError) -> Self {
+        Self::Prelude(value)
     }
 }
 
@@ -864,6 +878,68 @@ struct RecoveryPackageRow {
     terminal_revocation_id: Option<Uuid>,
     terminal_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(FromRow)]
+struct RecoveryFulfillmentReplayRow {
+    conversation_id: Uuid,
+    transition_kind: String,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+    transition_signed_request_bytes: Vec<u8>,
+    transition_signing_transcript_bytes: Vec<u8>,
+    transition_request_digest: Vec<u8>,
+    transition_signature: Vec<u8>,
+    prior_generation: Option<i64>,
+    prior_state_version: Option<i64>,
+    next_generation: Option<i64>,
+    next_state_version: Option<i64>,
+    entry_seq: i64,
+    accepted_at: DateTime<Utc>,
+    entry_id: Uuid,
+    entry_kind: String,
+    accepted_payload_bytes: Vec<u8>,
+    accepted_payload_sha256: Vec<u8>,
+    entry_signed_request_bytes: Vec<u8>,
+    entry_request_digest: Vec<u8>,
+    entry_signature: Vec<u8>,
+    entry_actor_did: String,
+    entry_actor_device_id: Uuid,
+    entry_actor_key_id: String,
+    entry_actor_auth_generation: i64,
+    entry_generation: Option<i64>,
+    entry_state_version: Option<i64>,
+    entry_transition_id: Option<Uuid>,
+    received_at: DateTime<Utc>,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    state_lifecycle: String,
+    state_kind: String,
+    producing_transition_id: Uuid,
+    state_created_at: DateTime<Utc>,
+    welcome_id: Uuid,
+    welcome_transition_id: Uuid,
+    welcome_entry_seq: i64,
+    welcome_generation: i64,
+    welcome_state_version: i64,
+    welcome_group_id: Vec<u8>,
+    welcome_epoch: i64,
+    welcome_group_context_hash: Vec<u8>,
+    welcome_confirmation_tag: Vec<u8>,
+    welcome_wrapper_bytes: Vec<u8>,
+    welcome_wrapper_sha256: Vec<u8>,
+    welcome_created_at: DateTime<Utc>,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+    delivery_key_package_ref: Vec<u8>,
+    delivery_expires_at: DateTime<Utc>,
+    delivery_status: String,
+    delivery_terminal_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1795,6 +1871,528 @@ pub(crate) enum RecoveryCanonicalMaterial {
     },
 }
 
+const RECOVERY_REPLAY_POST_STATE_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-REPLAY-POST-STATE\0";
+
+/// Non-forgeable Recovery-side proof that a completed retry's exact endpoint
+/// post-state was locked and validated before its response was released.
+///
+/// Construction is private to this module. Prelude may consume the sealed
+/// claim projection, but neither handlers nor sibling repositories can mint
+/// one from caller-supplied fields.
+pub(in crate::chat_protocol::repository) struct RecoveryReplayPostStateProof {
+    transaction_id: Box<str>,
+    operation_id: Uuid,
+    principal_did: Box<str>,
+    endpoint_nsid: &'static str,
+    mutation_kind: SignedMutationKind,
+    request_digest: [u8; 32],
+    accepted_request_sha256: [u8; 32],
+    signature: [u8; 64],
+    expected_status: i32,
+    expected_response_sha256: [u8; 32],
+    durable_graph_digests: Box<[[u8; 32]]>,
+    seal_digest: [u8; 32],
+}
+
+impl RecoveryReplayPostStateProof {
+    fn mint(
+        transaction_id: &str,
+        operation_id: Uuid,
+        endpoint: RecoveryOperationEndpoint,
+        locked: &LockedSignedOperationReplayAuthority,
+        expected_status: i32,
+        expected_response_sha256: [u8; 32],
+        durable_graph_digests: Vec<[u8; 32]>,
+    ) -> Result<Self, RecoveryRepositoryError> {
+        let authority = locked.authority();
+        let mutation = authority.mutation();
+        let accepted = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+        let endpoint_nsid = recovery_endpoint_nsid(endpoint);
+        if transaction_id.is_empty()
+            || operation_id.get_version_num() != 4
+            || authority.endpoint().as_str() != endpoint_nsid
+            || mutation.kind() != recovery_endpoint_mutation_kind(endpoint)
+            || !matches!(expected_status, 200 | 400)
+            || expected_response_sha256 == [0; 32]
+            || durable_graph_digests.is_empty()
+            || durable_graph_digests
+                .iter()
+                .any(|digest| *digest == [0; 32])
+        {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+        }
+        let mut proof = Self {
+            transaction_id: transaction_id.to_owned().into_boxed_str(),
+            operation_id,
+            principal_did: authority.subject().as_str().to_owned().into_boxed_str(),
+            endpoint_nsid,
+            mutation_kind: mutation.kind(),
+            request_digest: *mutation.request_digest(),
+            accepted_request_sha256: Sha256::digest(accepted).into(),
+            signature: *mutation.signature(),
+            expected_status,
+            expected_response_sha256,
+            durable_graph_digests: durable_graph_digests.into_boxed_slice(),
+            seal_digest: [0; 32],
+        };
+        proof.seal_digest = proof.rederive_seal();
+        Ok(proof)
+    }
+
+    fn rederive_seal(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(RECOVERY_REPLAY_POST_STATE_DOMAIN);
+        digest_len(&mut digest, self.transaction_id.as_bytes());
+        digest.update(self.operation_id.as_bytes());
+        digest_len(&mut digest, self.principal_did.as_bytes());
+        digest_len(&mut digest, self.endpoint_nsid.as_bytes());
+        digest_len(&mut digest, self.mutation_kind.type_id().as_bytes());
+        digest.update(self.request_digest);
+        digest.update(self.accepted_request_sha256);
+        digest.update(self.signature);
+        digest.update(self.expected_status.to_be_bytes());
+        digest.update(self.expected_response_sha256);
+        digest.update(
+            u64::try_from(self.durable_graph_digests.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for component in &self.durable_graph_digests {
+            digest.update(component);
+        }
+        digest.finalize().into()
+    }
+
+    pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(in crate::chat_protocol::repository) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub(in crate::chat_protocol::repository) fn principal_did(&self) -> &str {
+        &self.principal_did
+    }
+
+    pub(in crate::chat_protocol::repository) fn endpoint_nsid(&self) -> &str {
+        self.endpoint_nsid
+    }
+
+    pub(in crate::chat_protocol::repository) fn mutation_kind(&self) -> SignedMutationKind {
+        self.mutation_kind
+    }
+
+    pub(in crate::chat_protocol::repository) fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+
+    pub(in crate::chat_protocol::repository) fn accepted_request_sha256(&self) -> &[u8; 32] {
+        &self.accepted_request_sha256
+    }
+
+    pub(in crate::chat_protocol::repository) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+
+    pub(in crate::chat_protocol::repository) fn expected_status(&self) -> i32 {
+        self.expected_status
+    }
+
+    pub(in crate::chat_protocol::repository) fn expected_response_sha256(&self) -> &[u8; 32] {
+        &self.expected_response_sha256
+    }
+
+    pub(in crate::chat_protocol::repository) fn post_state_digest(&self) -> &[u8; 32] {
+        &self.seal_digest
+    }
+
+    pub(in crate::chat_protocol::repository) fn validates_seal(&self) -> bool {
+        self.seal_digest != [0; 32]
+            && !self.durable_graph_digests.is_empty()
+            && self
+                .durable_graph_digests
+                .iter()
+                .all(|digest| *digest != [0; 32])
+            && self.seal_digest == self.rederive_seal()
+    }
+}
+
+fn recovery_endpoint_nsid(endpoint: RecoveryOperationEndpoint) -> &'static str {
+    match endpoint {
+        RecoveryOperationEndpoint::RequestLeafRecovery => "blue.catbird.chat.requestLeafRecovery",
+        RecoveryOperationEndpoint::CancelLeafRecovery => "blue.catbird.chat.cancelLeafRecovery",
+        RecoveryOperationEndpoint::SubmitRecoveryFulfillment => {
+            "blue.catbird.chat.submitTransition"
+        }
+    }
+}
+
+fn recovery_endpoint_mutation_kind(endpoint: RecoveryOperationEndpoint) -> SignedMutationKind {
+    match endpoint {
+        RecoveryOperationEndpoint::RequestLeafRecovery => SignedMutationKind::LeafRecoveryRequest,
+        RecoveryOperationEndpoint::CancelLeafRecovery => {
+            SignedMutationKind::LeafRecoveryCancellation
+        }
+        RecoveryOperationEndpoint::SubmitRecoveryFulfillment => {
+            SignedMutationKind::LeafRecoveryFulfillment
+        }
+    }
+}
+
+/// Complete endpoint response bytes derived inside the sealed Recovery graph.
+///
+/// A handler may serialize no Recovery DTO of its own: request/cancel carry the
+/// full `leafRecoveryView`, while fulfillment carries the successor
+/// coordinate, canonical control entry, and exactly one target-bound
+/// `welcomeView`. Construction remains private and the graph re-derives the
+/// bytes from its locked facts before executor prewrite.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryCanonicalResponse {
+    endpoint: RecoveryOperationEndpoint,
+    bytes: Box<[u8]>,
+    binding_digest: [u8; 32],
+}
+
+impl RecoveryCanonicalResponse {
+    pub(crate) fn endpoint(&self) -> RecoveryOperationEndpoint {
+        self.endpoint
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn new(
+        endpoint: RecoveryOperationEndpoint,
+        bytes: Vec<u8>,
+        plan_fingerprint: [u8; 32],
+    ) -> Result<Self, RecoveryRepositoryError> {
+        if bytes.is_empty() || plan_fingerprint == [0; 32] {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+        }
+        let binding_digest = recovery_response_binding_digest(endpoint, &bytes, plan_fingerprint);
+        Ok(Self {
+            endpoint,
+            bytes: bytes.into_boxed_slice(),
+            binding_digest,
+        })
+    }
+
+    fn matches(
+        &self,
+        endpoint: RecoveryOperationEndpoint,
+        expected_bytes: &[u8],
+        plan_fingerprint: [u8; 32],
+    ) -> bool {
+        self.endpoint == endpoint
+            && self.bytes.as_ref() == expected_bytes
+            && self.binding_digest
+                == recovery_response_binding_digest(endpoint, expected_bytes, plan_fingerprint)
+    }
+}
+
+fn recovery_response_binding_digest(
+    endpoint: RecoveryOperationEndpoint,
+    bytes: &[u8],
+    plan_fingerprint: [u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-CANONICAL-RESPONSE\0");
+    let endpoint = match endpoint {
+        RecoveryOperationEndpoint::RequestLeafRecovery => {
+            b"blue.catbird.chat.requestLeafRecovery".as_slice()
+        }
+        RecoveryOperationEndpoint::CancelLeafRecovery => {
+            b"blue.catbird.chat.cancelLeafRecovery".as_slice()
+        }
+        RecoveryOperationEndpoint::SubmitRecoveryFulfillment => {
+            b"blue.catbird.chat.submitTransition".as_slice()
+        }
+    };
+    digest_len(&mut digest, endpoint);
+    digest.update(plan_fingerprint);
+    digest_len(&mut digest, bytes);
+    digest.finalize().into()
+}
+
+fn response_coordinate(
+    conversation_id: Uuid,
+    generation: i64,
+    state_version: i64,
+    group_id: &[u8],
+    epoch: i64,
+    group_context_hash: &[u8],
+    confirmation_tag: &[u8],
+) -> Result<JsonValue, RecoveryRepositoryError> {
+    if generation < 0
+        || state_version < 0
+        || epoch < 0
+        || group_id.len() != 32
+        || group_context_hash.len() != 32
+        || confirmation_tag.len() != 32
+    {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    Ok(json!({
+        "conversationId": conversation_id.hyphenated().to_string(),
+        "generation": generation,
+        "stateVersion": state_version,
+        "groupId": STANDARD.encode(group_id),
+        "epoch": epoch,
+        "groupContextHash": STANDARD.encode(group_context_hash),
+        "confirmationTag": STANDARD.encode(confirmation_tag),
+        "lifecycle": "active",
+    }))
+}
+
+fn response_coordinate_from_snapshot(
+    coordinate: &super::super::snapshot::PublicGroupSnapshotCoordinate,
+) -> Result<JsonValue, RecoveryRepositoryError> {
+    let generation = i64::try_from(coordinate.generation())
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    let state_version = i64::try_from(coordinate.state_version())
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    let epoch = i64::try_from(coordinate.epoch())
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    if coordinate.lifecycle() != super::super::snapshot::PublicGroupSnapshotLifecycle::Active {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    response_coordinate(
+        Uuid::from_bytes(*coordinate.conversation_id()),
+        generation,
+        state_version,
+        coordinate.group_id(),
+        epoch,
+        coordinate.group_context_hash(),
+        coordinate.confirmation_tag(),
+    )
+}
+
+fn canonical_datetime(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn canonical_recovery_error_bytes(
+    error: RecoveryClientTerminalError,
+) -> Result<Vec<u8>, RecoveryRepositoryError> {
+    let code = match error {
+        RecoveryClientTerminalError::CancellationConflict => "CancellationConflict",
+        RecoveryClientTerminalError::RecoveryNotFound => "LeafRecoveryNotFound",
+        RecoveryClientTerminalError::RecoveryExpired => "LeafRecoveryExpired",
+        RecoveryClientTerminalError::RecoverySuperseded => "LeafRecoverySuperseded",
+    };
+    serde_json::to_vec(&json!({ "error": code, "message": code }))
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
+}
+
+fn recovery_kind_text(kind: &LeafRecoveryKind) -> &'static str {
+    match kind {
+        LeafRecoveryKind::Add => "add",
+        LeafRecoveryKind::Replace { .. } => "replace",
+    }
+}
+
+fn leaf_recovery_response_bytes(
+    witness: &RecoveryPersistenceWitness,
+    request_status: &'static str,
+    reservation_status: &'static str,
+) -> Result<Vec<u8>, RecoveryRepositoryError> {
+    leaf_recovery_response_from_rows(
+        &witness.request,
+        &witness.reservation,
+        &witness.package,
+        request_status,
+        reservation_status,
+    )
+}
+
+fn leaf_recovery_response_from_rows(
+    request: &NewLeafRecoveryRequest,
+    reservation: &NewReservation,
+    package: &RecoveryPackageRow,
+    request_status: &'static str,
+    reservation_status: &'static str,
+) -> Result<Vec<u8>, RecoveryRepositoryError> {
+    if request.recovery_request_id != reservation.recovery_request_id
+        || request.recovery_request_id != request.reservation_request_id
+        || request.conversation_id != reservation.conversation_id
+        || request.generation != reservation.generation
+        || request.requester_did != reservation.requester_did
+        || request.requester_device_id != reservation.requester_device_id
+        || request.requester_key_id != reservation.requester_key_id
+        || request.requester_auth_generation != reservation.requester_auth_generation
+        || request.requester_did != reservation.recipient_did
+        || request.requester_device_id != reservation.recipient_device_id
+        || request.bound_state_version != reservation.bound_state_version
+        || request.bound_group_id != reservation.bound_group_id
+        || request.bound_epoch != reservation.bound_epoch
+        || request.bound_group_context_hash != reservation.bound_group_context_hash
+        || request.bound_confirmation_tag != reservation.bound_confirmation_tag
+        || request.expires_at != reservation.expires_at
+        || reservation.key_package_ref != package.key_package_ref
+        || request.request_digest.len() != 32
+        || request.signature.len() != 64
+        || package.wrapper_bytes.is_empty()
+        || package.wrapper_sha256.len() != 32
+        || package.wrapper_sha256.as_slice()
+            != <[u8; 32]>::from(Sha256::digest(&package.wrapper_bytes))
+    {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
+    let coordinate = response_coordinate(
+        request.conversation_id,
+        request.generation,
+        request.bound_state_version,
+        &request.bound_group_id,
+        request.bound_epoch,
+        &request.bound_group_context_hash,
+        &request.bound_confirmation_tag,
+    )?;
+    serde_json::to_vec(&json!({
+        "recovery": {
+            "recoveryRequestId": request.recovery_request_id.hyphenated().to_string(),
+            "conversationId": request.conversation_id.hyphenated().to_string(),
+            "requesterDid": request.requester_did,
+            "requesterDeviceId": request.requester_device_id.hyphenated().to_string(),
+            "recoveryKind": recovery_kind_text(&request.recovery_kind),
+            "boundCoordinate": coordinate,
+            "reservation": {
+                "recoveryRequestId": reservation.recovery_request_id.hyphenated().to_string(),
+                "conversationId": reservation.conversation_id.hyphenated().to_string(),
+                "boundCoordinate": response_coordinate(
+                    reservation.conversation_id,
+                    reservation.generation,
+                    reservation.bound_state_version,
+                    &reservation.bound_group_id,
+                    reservation.bound_epoch,
+                    &reservation.bound_group_context_hash,
+                    &reservation.bound_confirmation_tag,
+                )?,
+                "requesterDid": reservation.requester_did,
+                "requesterDeviceId": reservation.requester_device_id.hyphenated().to_string(),
+                "requesterKeyId": reservation.requester_key_id,
+                "requesterAuthGeneration": reservation.requester_auth_generation,
+                "keyPackageRef": STANDARD.encode(&reservation.key_package_ref),
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "purpose": "leafRecovery",
+                "status": reservation_status,
+                "expiresAt": canonical_datetime(reservation.expires_at),
+                "keyPackage": {
+                    "framing": "mlsMessage",
+                    "contentType": "keyPackage",
+                    "bytes": STANDARD.encode(&package.wrapper_bytes),
+                    "sha256": STANDARD.encode(&package.wrapper_sha256),
+                    "keyPackageRef": STANDARD.encode(&package.key_package_ref),
+                },
+            },
+            "status": request_status,
+            "requestedAt": canonical_datetime(request.requested_at),
+            "expiresAt": canonical_datetime(request.expires_at),
+        },
+    }))
+    .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
+}
+
+fn fulfillment_response_bytes(
+    plan: &ConversationPersistencePlan,
+    witness: &RecoveryPersistenceWitness,
+    canonical_response_entry_bytes: Option<&[u8]>,
+) -> Result<Vec<u8>, RecoveryRepositoryError> {
+    let entry_bytes = canonical_response_entry_bytes
+        .filter(|bytes| !bytes.is_empty())
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let entry: JsonValue = serde_json::from_slice(entry_bytes)
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    if !entry.is_object() {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    let successor = plan
+        .successor_coordinate()
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let mut pending = plan
+        .effects()
+        .welcome_changes()
+        .iter()
+        .filter_map(|change| {
+            (change.before().is_none())
+                .then(|| change.after())
+                .flatten()
+                .filter(|welcome| {
+                    welcome.status() == super::super::state_machine::WelcomeStatus::Pending
+                })
+        });
+    let welcome = pending
+        .next()
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    if pending.next().is_some()
+        || welcome.coordinate() != successor
+        || welcome.recovery_request_id() != witness.request.recovery_request_id.as_bytes()
+        || welcome.key_package_ref().as_slice() != witness.package.key_package_ref.as_slice()
+        || welcome.recipient().principal().as_bytes() != witness.request.requester_did.as_bytes()
+        || welcome.recipient().device_id() != witness.request.requester_device_id.as_bytes()
+        || welcome.opaque_welcome().is_empty()
+        || welcome.sha256() != &<[u8; 32]>::from(Sha256::digest(welcome.opaque_welcome()))
+    {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
+    let recipient_did = std::str::from_utf8(welcome.recipient().principal().as_bytes())
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    let expires_at = DateTime::<Utc>::from_timestamp_millis(welcome.expires_at().unix_millis())
+        .ok_or(RecoveryRepositoryError::InvalidDurableRow)?;
+    serde_json::to_vec(&json!({
+        "coordinates": response_coordinate_from_snapshot(successor)?,
+        "entry": entry,
+        "welcomes": [{
+            "welcomeId": Uuid::from_bytes(*welcome.welcome_id()).hyphenated().to_string(),
+            "conversationId": Uuid::from_bytes(*successor.conversation_id()).hyphenated().to_string(),
+            "transitionSeq": welcome.transition_seq(),
+            "coordinates": response_coordinate_from_snapshot(successor)?,
+            "status": "pending",
+            "opaqueWelcome": STANDARD.encode(welcome.opaque_welcome()),
+            "sha256": STANDARD.encode(welcome.sha256()),
+            "recipientDid": recipient_did,
+            "recipientDeviceId":
+                Uuid::from_bytes(*welcome.recipient().device_id()).hyphenated().to_string(),
+            "provenance": {
+                "recoveryRequestId": witness.request.recovery_request_id.hyphenated().to_string(),
+                "keyPackageRef": STANDARD.encode(welcome.key_package_ref()),
+            },
+            "expiresAt": canonical_datetime(expires_at),
+        }],
+    }))
+    .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
+}
+
+fn canonical_client_response(
+    plan: &ConversationPersistencePlan,
+    witness: &RecoveryPersistenceWitness,
+    accepted_control_entry_bytes: Option<&[u8]>,
+    canonical_response_entry_bytes: Option<&[u8]>,
+    material: RecoveryCanonicalMaterial,
+) -> Result<Option<RecoveryCanonicalResponse>, RecoveryRepositoryError> {
+    let fingerprint = recovery_plan_fingerprint(plan, accepted_control_entry_bytes)?;
+    let (endpoint, bytes) = match material {
+        RecoveryCanonicalMaterial::Requested { .. } => (
+            RecoveryOperationEndpoint::RequestLeafRecovery,
+            leaf_recovery_response_bytes(witness, "open", "active")?,
+        ),
+        RecoveryCanonicalMaterial::Cancelled { .. } => (
+            RecoveryOperationEndpoint::CancelLeafRecovery,
+            leaf_recovery_response_bytes(witness, "cancelled", "released")?,
+        ),
+        RecoveryCanonicalMaterial::Fulfilled { .. } => (
+            RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+            fulfillment_response_bytes(plan, witness, canonical_response_entry_bytes)?,
+        ),
+        RecoveryCanonicalMaterial::ClientExpired { .. }
+        | RecoveryCanonicalMaterial::SchedulerExpired { .. } => return Ok(None),
+    };
+    RecoveryCanonicalResponse::new(endpoint, bytes, *fingerprint.digest()).map(Some)
+}
+
 #[cfg(not(test))]
 pub(crate) struct PreparedRecoveryMutation {
     graph: PreparedRecoveryExecutionGraph,
@@ -1818,15 +2416,18 @@ enum RecoveryGraphPrewriteOrigin {
 pub(in crate::chat_protocol) struct PreparedRecoveryExecutionGraph {
     plan: ConversationPersistencePlan,
     accepted_control_entry_bytes: Option<Vec<u8>>,
+    canonical_response_entry_bytes: Option<Vec<u8>>,
     persistence_witness: RecoveryPersistenceWitness,
     origin: RecoveryGraphPrewriteOrigin,
     material: RecoveryCanonicalMaterial,
+    response: Option<RecoveryCanonicalResponse>,
 }
 
 impl PreparedRecoveryExecutionGraph {
     fn new_client(
         plan: ConversationPersistencePlan,
         accepted_control_entry_bytes: Option<Vec<u8>>,
+        canonical_response_entry_bytes: Option<Vec<u8>>,
         persistence_witness: RecoveryPersistenceWitness,
         prewrite: RecoveryPreludePrewriteWitness,
         material: RecoveryCanonicalMaterial,
@@ -1839,12 +2440,21 @@ impl PreparedRecoveryExecutionGraph {
         let witness = prewrite
             .seal_recovery_plan(binding)
             .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+        let response = canonical_client_response(
+            &plan,
+            &persistence_witness,
+            accepted_control_entry_bytes.as_deref(),
+            canonical_response_entry_bytes.as_deref(),
+            material,
+        )?;
         Ok(Self {
             plan,
             accepted_control_entry_bytes,
+            canonical_response_entry_bytes,
             persistence_witness,
             origin: RecoveryGraphPrewriteOrigin::Client { witness },
             material,
+            response,
         })
     }
 
@@ -1872,12 +2482,14 @@ impl PreparedRecoveryExecutionGraph {
         Ok(Self {
             plan,
             accepted_control_entry_bytes: None,
+            canonical_response_entry_bytes: None,
             persistence_witness,
             origin: RecoveryGraphPrewriteOrigin::Scheduler {
                 plan_fingerprint,
                 seal_digest,
             },
             material,
+            response: None,
         })
     }
 
@@ -1899,6 +2511,29 @@ impl PreparedRecoveryExecutionGraph {
             .persistence_witness
             .material_matches_plan(&self.plan, self.material)
         {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        let expected_response = canonical_client_response(
+            &self.plan,
+            &self.persistence_witness,
+            self.accepted_control_entry_bytes.as_deref(),
+            self.canonical_response_entry_bytes.as_deref(),
+            self.material,
+        )
+        .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+        let fingerprint =
+            recovery_plan_fingerprint(&self.plan, self.accepted_control_entry_bytes.as_deref())
+                .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+        let response_matches = match (&self.response, expected_response) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => actual.matches(
+                expected.endpoint,
+                expected.as_bytes(),
+                *fingerprint.digest(),
+            ),
+            _ => false,
+        };
+        if !response_matches {
             return Err(ExecutionContextHydrationError::AuthorityMismatch);
         }
         match &self.origin {
@@ -1944,6 +2579,10 @@ impl PreparedRecoveryExecutionGraph {
     fn material(&self) -> RecoveryCanonicalMaterial {
         self.material
     }
+
+    fn take_response(&mut self) -> Option<RecoveryCanonicalResponse> {
+        self.response.take()
+    }
 }
 
 #[cfg(not(test))]
@@ -1958,12 +2597,15 @@ impl PreparedRecoveryMutation {
     ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
         let Self { graph, completion } = self;
         let material = graph.material();
+        let mut graph = graph;
         let prepared = prepare_recovery_execution(transaction, &graph).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
+        let response = graph.take_response();
         Ok(AppliedRecoveryMutation {
             applied,
             completion,
             material,
+            response,
         })
     }
 }
@@ -1973,6 +2615,7 @@ pub(crate) struct AppliedRecoveryMutation {
     pub(crate) applied: AppliedTransition,
     pub(crate) completion: RecoveryCompletion,
     pub(crate) material: RecoveryCanonicalMaterial,
+    pub(crate) response: Option<RecoveryCanonicalResponse>,
 }
 
 #[cfg(not(test))]
@@ -1985,6 +2628,7 @@ fn seal_planned_recovery(
         completion,
         prewrite,
         accepted_control_entry_bytes,
+        canonical_response_entry_bytes,
         persistence_witness,
         kind,
     ) = planned.into_parts();
@@ -2011,6 +2655,7 @@ fn seal_planned_recovery(
         graph: PreparedRecoveryExecutionGraph::new_client(
             transition.into_persistence_plan()?,
             accepted_control_entry_bytes,
+            canonical_response_entry_bytes,
             persistence_witness,
             prewrite,
             material,
@@ -2099,6 +2744,7 @@ pub(crate) fn plan_client_recovery_expiry(
         graph: PreparedRecoveryExecutionGraph::new_client(
             transition.into_persistence_plan()?,
             None,
+            None,
             persistence_witness,
             prewrite,
             material,
@@ -2107,6 +2753,247 @@ pub(crate) fn plan_client_recovery_expiry(
             scope_authority,
             completion,
         },
+    })
+}
+
+/// Handler-safe Recovery transaction result. The repository has already
+/// validated or completed the exact operation; the caller owns only transport
+/// serialization and the outer transaction commit.
+#[cfg(not(test))]
+pub(crate) struct RecoveryTransactionOutcome {
+    status: i32,
+    response_bytes: Box<[u8]>,
+    event_position: Option<i64>,
+    replayed: bool,
+}
+
+#[cfg(not(test))]
+impl RecoveryTransactionOutcome {
+    pub(crate) fn status(&self) -> i32 {
+        self.status
+    }
+
+    pub(crate) fn response_bytes(&self) -> &[u8] {
+        &self.response_bytes
+    }
+
+    pub(crate) fn event_position(&self) -> Option<i64> {
+        self.event_position
+    }
+
+    pub(crate) fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    fn from_replay(completed: CompletedIdempotentResponse) -> Self {
+        Self {
+            status: completed.status(),
+            response_bytes: completed.response_bytes().to_vec().into_boxed_slice(),
+            event_position: completed.event_position(),
+            replayed: true,
+        }
+    }
+}
+
+/// Single consuming facade for request/cancel/Recovery-fulfillment handlers.
+///
+/// It owns scope discovery, exact prelude preparation, domain planning/apply,
+/// canonical success/error material, operation completion, and replay
+/// post-state validation. It deliberately does not commit the caller's outer
+/// transaction.
+#[cfg(not(test))]
+pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    prepared: PreparedSignedOperation,
+    relationship_authority: &RelationshipAuthority<T>,
+) -> Result<RecoveryTransactionOutcome, RecoveryRepositoryError> {
+    let (authority, reservation) = match prepared {
+        PreparedSignedOperation::Replay { authority, replay } => {
+            return Ok(RecoveryTransactionOutcome::from_replay(
+                validate_recovery_operation_replay(transaction, authority, replay).await?,
+            ));
+        }
+        PreparedSignedOperation::First {
+            authority,
+            reservation,
+        } => (authority, reservation),
+    };
+    let trusted = authority.trusted_instant().clone();
+    let mutation = authority
+        .mutation()
+        .ok_or(RecoveryRepositoryError::UnsupportedAuthority)?;
+    match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryRequest(_) => {
+            let prelude =
+                super::prelude::prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let domain = prepare_recovery_request_authority(transaction, prelude, mutation).await?;
+            let input = domain
+                .into_plan_input(transaction, relationship_authority, &trusted)
+                .await?;
+            let applied = plan_recovery_request(input, relationship_authority)?
+                .apply(transaction)
+                .await?;
+            complete_applied_recovery(
+                transaction,
+                &authority,
+                RecoveryOperationEndpoint::RequestLeafRecovery,
+                applied,
+            )
+            .await
+        }
+        VerifiedMutationProjection::LeafRecoveryCancellation(_) => {
+            let prelude =
+                super::prelude::prepare_actor_prelude(transaction, &authority, reservation).await?;
+            match prepare_recovery_cancellation_authority(transaction, prelude, mutation).await? {
+                RecoveryCancellationRead::Execute(domain) => {
+                    let applied = plan_recovery_cancellation(domain.into_plan_input(&trusted)?)?
+                        .apply(transaction)
+                        .await?;
+                    complete_applied_recovery(
+                        transaction,
+                        &authority,
+                        RecoveryOperationEndpoint::CancelLeafRecovery,
+                        applied,
+                    )
+                    .await
+                }
+                RecoveryCancellationRead::DueForExpiry(due) => {
+                    let applied = plan_client_recovery_expiry(due.into_plan_input(&trusted)?)?
+                        .apply(transaction)
+                        .await?;
+                    complete_applied_recovery(
+                        transaction,
+                        &authority,
+                        RecoveryOperationEndpoint::CancelLeafRecovery,
+                        applied,
+                    )
+                    .await
+                }
+                RecoveryCancellationRead::Classified(retained) => {
+                    let (prelude, error) = retained.into_classified_outcome().into_parts();
+                    complete_classified_recovery(transaction, &authority, prelude, error).await
+                }
+            }
+        }
+        VerifiedMutationProjection::LeafRecoveryFulfillment(_) => {
+            let scope =
+                discover_recovery_fulfillment_terminal_scope(transaction, &authority, mutation)
+                    .await?;
+            let prelude = super::prelude::prepare_identity_scope_prelude(
+                transaction,
+                &authority,
+                reservation,
+                scope,
+            )
+            .await?;
+            match prepare_recovery_fulfillment_authority(transaction, prelude, mutation).await? {
+                RecoveryFulfillmentRead::Execute(domain) => {
+                    let input = domain
+                        .into_plan_input(transaction, relationship_authority, &trusted)
+                        .await?;
+                    let applied = plan_recovery_fulfillment(input, relationship_authority)?
+                        .apply(transaction)
+                        .await?;
+                    complete_applied_recovery(
+                        transaction,
+                        &authority,
+                        RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                        applied,
+                    )
+                    .await
+                }
+                RecoveryFulfillmentRead::DueForExpiry(due) => {
+                    let applied = plan_client_recovery_expiry(due.into_plan_input(&trusted)?)?
+                        .apply(transaction)
+                        .await?;
+                    complete_applied_recovery(
+                        transaction,
+                        &authority,
+                        RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                        applied,
+                    )
+                    .await
+                }
+                RecoveryFulfillmentRead::Classified(retained) => {
+                    let (prelude, error) = retained.into_classified_outcome().into_parts();
+                    complete_classified_recovery(transaction, &authority, prelude, error).await
+                }
+            }
+        }
+        _ => Err(RecoveryRepositoryError::UnsupportedAuthority),
+    }
+}
+
+#[cfg(not(test))]
+async fn complete_applied_recovery(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    endpoint: RecoveryOperationEndpoint,
+    applied: AppliedRecoveryMutation,
+) -> Result<RecoveryTransactionOutcome, RecoveryRepositoryError> {
+    let AppliedRecoveryMutation {
+        applied,
+        completion,
+        material,
+        response,
+    } = applied;
+    let (status, response_bytes) = match response {
+        Some(response) if response.endpoint() == endpoint => (200, response.as_bytes().to_vec()),
+        Some(_) => return Err(RecoveryRepositoryError::AuthorityBindingMismatch),
+        None => match material {
+            RecoveryCanonicalMaterial::ClientExpired {
+                post_apply_error, ..
+            } => (400, canonical_recovery_error_bytes(post_apply_error)?),
+            _ => return Err(RecoveryRepositoryError::AuthorityBindingMismatch),
+        },
+    };
+    let [event_position] = applied.event_positions.as_slice() else {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    };
+    let (scope, completion) = completion.into_parts();
+    super::prelude::complete_operation(
+        transaction,
+        authority,
+        scope,
+        completion,
+        status,
+        &response_bytes,
+        Some(*event_position),
+    )
+    .await?;
+    Ok(RecoveryTransactionOutcome {
+        status,
+        response_bytes: response_bytes.into_boxed_slice(),
+        event_position: Some(*event_position),
+        replayed: false,
+    })
+}
+
+#[cfg(not(test))]
+async fn complete_classified_recovery(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    prelude: PreparedBusinessPrelude,
+    error: RecoveryClientTerminalError,
+) -> Result<RecoveryTransactionOutcome, RecoveryRepositoryError> {
+    let status = 400;
+    let response_bytes = canonical_recovery_error_bytes(error)?;
+    let (scope, completion) = prelude.into_execution_parts();
+    super::prelude::complete_operation(
+        transaction,
+        authority,
+        scope,
+        completion,
+        status,
+        &response_bytes,
+        None,
+    )
+    .await?;
+    Ok(RecoveryTransactionOutcome {
+        status,
+        response_bytes: response_bytes.into_boxed_slice(),
+        event_position: None,
+        replayed: false,
     })
 }
 
@@ -3157,14 +4044,16 @@ pub mod production_composition_proof {
         ScopeBoundBusinessAuthority,
         OperationCompletionGuard,
         RecoveryCanonicalMaterial,
+        Option<RecoveryCanonicalResponse>,
     ) {
         let AppliedRecoveryMutation {
             applied,
             completion,
             material,
+            response,
         } = applied;
         let (scope, completion) = completion.into_parts();
-        (applied, scope, completion, material)
+        (applied, scope, completion, material, response)
     }
 
     fn exact_executor_surface_typechecks() {
@@ -3623,6 +4512,616 @@ impl RecoverySchedulerExpiryPlanInput {
             persistence_witness,
         })
     }
+}
+
+enum RecoveryReplayProjection {
+    Request {
+        request_id: Uuid,
+    },
+    Cancellation {
+        operation_id: Uuid,
+        request_id: Uuid,
+    },
+    Fulfillment {
+        transition_id: Uuid,
+        request_id: Uuid,
+    },
+}
+
+impl RecoveryReplayProjection {
+    fn endpoint(&self) -> RecoveryOperationEndpoint {
+        match self {
+            Self::Request { .. } => RecoveryOperationEndpoint::RequestLeafRecovery,
+            Self::Cancellation { .. } => RecoveryOperationEndpoint::CancelLeafRecovery,
+            Self::Fulfillment { .. } => RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+        }
+    }
+
+    fn operation_id(&self) -> Uuid {
+        match self {
+            Self::Request { request_id } => *request_id,
+            Self::Cancellation { operation_id, .. } => *operation_id,
+            Self::Fulfillment { transition_id, .. } => *transition_id,
+        }
+    }
+
+    fn request_id(&self) -> Uuid {
+        match self {
+            Self::Request { request_id }
+            | Self::Cancellation { request_id, .. }
+            | Self::Fulfillment { request_id, .. } => *request_id,
+        }
+    }
+}
+
+/// Locks and validates Recovery's complete durable replay graph before asking
+/// the operation prelude to release any completed response material.
+#[cfg(not(test))]
+pub(crate) async fn validate_recovery_operation_replay(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: SignedOperationReplayAuthority,
+    replay: OperationReplayGuard,
+) -> Result<CompletedIdempotentResponse, RecoveryRepositoryError> {
+    let locked =
+        super::prelude::lock_signed_operation_replay_authority(transaction, authority, replay)
+            .await?;
+    let proof = prepare_recovery_replay_post_state(transaction, &locked).await?;
+    if !proof.validates_seal() {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
+    Ok(super::prelude::release_signed_operation_replay(
+        transaction,
+        locked,
+        SignedOperationReplayPostStateProof::Recovery(proof),
+    )
+    .await?)
+}
+
+#[cfg(not(test))]
+async fn prepare_recovery_replay_post_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    locked: &LockedSignedOperationReplayAuthority,
+) -> Result<RecoveryReplayPostStateProof, RecoveryRepositoryError> {
+    let authority = locked.authority();
+    let mutation = authority.mutation();
+    let projection = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryRequest(value) => {
+            let request_id = Uuid::from_bytes(*value.recovery_request_id().as_bytes());
+            require_idempotency_key(value.body(), request_id)?;
+            RecoveryReplayProjection::Request { request_id }
+        }
+        VerifiedMutationProjection::LeafRecoveryCancellation(value) => {
+            let operation_id = body_uuid(&value.body(), "idempotencyKey")?;
+            if !uuid_v4(operation_id) {
+                return Err(RecoveryRepositoryError::NonCanonicalOperation);
+            }
+            RecoveryReplayProjection::Cancellation {
+                operation_id,
+                request_id: Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+            }
+        }
+        VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
+            let transition_id = Uuid::from_bytes(*value.transition_id().as_bytes());
+            require_idempotency_key_from_mutation(mutation, transition_id)?;
+            RecoveryReplayProjection::Fulfillment {
+                transition_id,
+                request_id: Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+            }
+        }
+        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+    };
+    if authority.endpoint().as_str() != recovery_endpoint_nsid(projection.endpoint()) {
+        return Err(RecoveryRepositoryError::NonCanonicalOperation);
+    }
+    let operation_id = projection.operation_id();
+    let endpoint = projection.endpoint();
+
+    let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
+        .bind(projection.request_id())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
+    if locator.recovery_request_id != projection.request_id() {
+        return Err(RecoveryRepositoryError::ReadSetMismatch);
+    }
+    let head = lock_recovery_replay_head_graph(
+        transaction,
+        locator.conversation_id,
+        authority.subject().as_str(),
+        Uuid::from_bytes(*authority.device_id().as_bytes()),
+    )
+    .await?;
+    let (request, reservation, package) =
+        lock_terminal_rows(transaction, projection.request_id()).await?;
+    if request.conversation_id != locator.conversation_id
+        || request.requester_did != locator.requester_did
+        || request.requester_device_id != locator.requester_device_id
+        || request.requester_key_id != locator.requester_key_id
+        || request.requester_auth_generation != locator.requester_auth_generation
+    {
+        return Err(RecoveryRepositoryError::ReadSetMismatch);
+    }
+    let requester_signing_public_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM chat.device_keys \
+         WHERE user_did=$1 AND device_id=$2 AND key_id=$3 \
+         FOR UPDATE",
+    )
+    .bind(&request.requester_did)
+    .bind(request.requester_device_id)
+    .bind(&request.requester_key_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let classification = validate_replay_locked_triple(
+        &head,
+        &request,
+        &reservation,
+        &package,
+        authority.trusted_instant(),
+        &requester_signing_public_key,
+    )?;
+    validate_terminal_linkage(transaction, &request, &reservation).await?;
+    validate_replay_projection_binding(&projection, authority, &request)?;
+
+    let request_digest = digest_recovery_replay_request(&request);
+    let reservation_digest = digest_recovery_replay_reservation(&reservation);
+    let package_digest = digest_recovery_replay_package(&package);
+    let mut graph_digests = vec![
+        head.head_digest,
+        head.graph_digest,
+        request_digest,
+        reservation_digest,
+        package_digest,
+    ];
+    let (expected_status, expected_response_bytes) = match projection {
+        RecoveryReplayProjection::Request { .. } => {
+            let response = leaf_recovery_response_from_rows(
+                &new_request_from_row(&request)?,
+                &new_reservation_from_row(&reservation)?,
+                &package,
+                "open",
+                "active",
+            )?;
+            (200, response)
+        }
+        RecoveryReplayProjection::Cancellation { .. } => {
+            if cancellation_replay_is_exact(mutation, &request, &reservation)? {
+                let response = leaf_recovery_response_from_rows(
+                    &new_request_from_row(&request)?,
+                    &new_reservation_from_row(&reservation)?,
+                    &package,
+                    "cancelled",
+                    "released",
+                )?;
+                (200, response)
+            } else {
+                let error = match classification {
+                    RecoveryTerminalClassification::RetainedCancelled => {
+                        RecoveryClientTerminalError::CancellationConflict
+                    }
+                    RecoveryTerminalClassification::RetainedFulfilled
+                    | RecoveryTerminalClassification::RetainedExpired
+                    | RecoveryTerminalClassification::RetainedSuperseded => {
+                        RecoveryClientTerminalError::RecoveryNotFound
+                    }
+                    RecoveryTerminalClassification::OpenLive
+                    | RecoveryTerminalClassification::OpenDue => {
+                        return Err(RecoveryRepositoryError::InvalidDurableRow)
+                    }
+                };
+                (400, canonical_recovery_error_bytes(error)?)
+            }
+        }
+        RecoveryReplayProjection::Fulfillment { transition_id, .. } => {
+            if classification == RecoveryTerminalClassification::RetainedFulfilled
+                && request.fulfilling_transition_id == Some(transition_id)
+            {
+                let fulfillment = lock_recovery_fulfillment_replay_graph(
+                    transaction,
+                    transition_id,
+                    &request,
+                    &reservation,
+                    &package,
+                    authority,
+                )
+                .await?;
+                graph_digests.push(fulfillment.graph_digest);
+                (200, fulfillment.response_bytes)
+            } else {
+                let error = match classification {
+                    RecoveryTerminalClassification::RetainedExpired => {
+                        RecoveryClientTerminalError::RecoveryExpired
+                    }
+                    RecoveryTerminalClassification::RetainedSuperseded => {
+                        RecoveryClientTerminalError::RecoverySuperseded
+                    }
+                    RecoveryTerminalClassification::RetainedCancelled
+                    | RecoveryTerminalClassification::RetainedFulfilled => {
+                        RecoveryClientTerminalError::RecoveryNotFound
+                    }
+                    RecoveryTerminalClassification::OpenLive
+                    | RecoveryTerminalClassification::OpenDue => {
+                        return Err(RecoveryRepositoryError::InvalidDurableRow)
+                    }
+                };
+                (400, canonical_recovery_error_bytes(error)?)
+            }
+        }
+    };
+    let transaction_id = live_transaction_id(transaction).await?;
+    RecoveryReplayPostStateProof::mint(
+        &transaction_id,
+        operation_id,
+        endpoint,
+        locked,
+        expected_status,
+        Sha256::digest(&expected_response_bytes).into(),
+        graph_digests,
+    )
+}
+
+fn validate_replay_projection_binding(
+    projection: &RecoveryReplayProjection,
+    authority: &SignedOperationReplayAuthority,
+    request: &RecoveryRequestRow,
+) -> Result<(), RecoveryRepositoryError> {
+    let mutation = authority.mutation();
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
+    let actor_auth_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let exact_request_evidence = request.signed_request_bytes == accepted
+        && request.signing_transcript_bytes == mutation.transcript_bytes()
+        && request.request_digest.as_slice() == mutation.request_digest()
+        && request.signature.as_slice() == mutation.signature();
+    match (projection, mutation.projection()) {
+        (
+            RecoveryReplayProjection::Request { request_id },
+            VerifiedMutationProjection::LeafRecoveryRequest(value),
+        ) => {
+            let coordinate = signed_coordinate(value.prior())?;
+            if request.source != "requestLeafRecovery"
+                || request.recovery_request_id != *request_id
+                || request.recovery_request_id
+                    != Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                || request.requester_did != authority.subject().as_str()
+                || request.requester_device_id != actor_device_id
+                || request.requester_key_id != mutation.key_id().as_str()
+                || request.requester_auth_generation != actor_auth_generation
+                || request.recovery_kind != value.recovery_kind()
+                || request.conversation_id != coordinate.conversation_id
+                || request.generation != coordinate.generation
+                || request.bound_state_version != coordinate.state_version
+                || request.bound_group_id.as_slice() != coordinate.group_id
+                || request.bound_epoch != coordinate.epoch
+                || request.bound_group_context_hash.as_slice() != coordinate.group_context_hash
+                || request.bound_confirmation_tag.as_slice() != coordinate.confirmation_tag
+                || !exact_request_evidence
+            {
+                return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+            }
+        }
+        (
+            RecoveryReplayProjection::Cancellation { request_id, .. },
+            VerifiedMutationProjection::LeafRecoveryCancellation(value),
+        ) => {
+            if request.recovery_request_id != *request_id
+                || request.recovery_request_id
+                    != Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                || request.requester_did != authority.subject().as_str()
+                || request.requester_device_id != actor_device_id
+                || request.requester_key_id != mutation.key_id().as_str()
+                || request.requester_auth_generation != actor_auth_generation
+            {
+                return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+            }
+        }
+        (
+            RecoveryReplayProjection::Fulfillment { request_id, .. },
+            VerifiedMutationProjection::LeafRecoveryFulfillment(value),
+        ) => {
+            let prior = signed_coordinate(value.prior())?;
+            if request.recovery_request_id != *request_id
+                || request.recovery_request_id
+                    != Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                || request.conversation_id != prior.conversation_id
+                || request.generation != prior.generation
+                || request.bound_state_version != prior.state_version
+                || request.bound_group_id.as_slice() != prior.group_id
+                || request.bound_epoch != prior.epoch
+                || request.bound_group_context_hash.as_slice() != prior.group_context_hash
+                || request.bound_confirmation_tag.as_slice() != prior.confirmation_tag
+                || (request.requester_did == authority.subject().as_str()
+                    && request.requester_device_id == actor_device_id)
+            {
+                return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+            }
+        }
+        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+    }
+    Ok(())
+}
+
+fn cancellation_replay_is_exact(
+    mutation: &VerifiedSignedMutation,
+    request: &RecoveryRequestRow,
+    reservation: &RecoveryReservationRow,
+) -> Result<bool, RecoveryRepositoryError> {
+    let cancellation = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryCancellation(value) => value,
+        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+    };
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    Ok(request.status == "cancelled"
+        && Uuid::from_bytes(*cancellation.recovery_request_id().as_bytes())
+            == request.recovery_request_id
+        && request.terminal_signed_request_bytes.as_deref() == Some(accepted)
+        && request.terminal_signing_transcript_bytes.as_deref()
+            == Some(mutation.transcript_bytes())
+        && request.terminal_request_digest.as_deref() == Some(mutation.request_digest().as_slice())
+        && request.terminal_signature.as_deref() == Some(mutation.signature().as_slice())
+        && reservation.terminal_request_digest.as_deref()
+            == Some(mutation.request_digest().as_slice()))
+}
+
+struct LockedRecoveryFulfillmentReplayGraph {
+    response_bytes: Vec<u8>,
+    graph_digest: [u8; 32],
+}
+
+async fn lock_recovery_fulfillment_replay_graph(
+    transaction: &mut Transaction<'_, Postgres>,
+    transition_id: Uuid,
+    request: &RecoveryRequestRow,
+    reservation: &RecoveryReservationRow,
+    package: &RecoveryPackageRow,
+    authority: &SignedOperationReplayAuthority,
+) -> Result<LockedRecoveryFulfillmentReplayGraph, RecoveryRepositoryError> {
+    let rows: Vec<RecoveryFulfillmentReplayRow> = sqlx::query_as(
+        r#"
+        SELECT
+            t.conversation_id,
+            t.kind AS transition_kind,
+            t.actor_did,
+            t.actor_device_id,
+            t.actor_key_id,
+            t.actor_auth_generation,
+            t.signed_request_bytes AS transition_signed_request_bytes,
+            t.signing_transcript_bytes AS transition_signing_transcript_bytes,
+            t.request_digest AS transition_request_digest,
+            t.signature AS transition_signature,
+            t.prior_generation,
+            t.prior_state_version,
+            t.next_generation,
+            t.next_state_version,
+            t.entry_seq,
+            t.accepted_at,
+            e.entry_id,
+            e.entry_kind,
+            e.accepted_payload_bytes,
+            e.accepted_payload_sha256,
+            e.signed_request_bytes AS entry_signed_request_bytes,
+            e.request_digest AS entry_request_digest,
+            e.signature AS entry_signature,
+            e.actor_did AS entry_actor_did,
+            e.actor_device_id AS entry_actor_device_id,
+            e.actor_key_id AS entry_actor_key_id,
+            e.actor_auth_generation AS entry_actor_auth_generation,
+            e.generation AS entry_generation,
+            e.state_version AS entry_state_version,
+            e.transition_id AS entry_transition_id,
+            e.received_at,
+            g.group_id,
+            s.epoch,
+            s.group_context_hash,
+            s.confirmation_tag,
+            s.lifecycle AS state_lifecycle,
+            s.state_kind,
+            s.producing_transition_id,
+            s.created_at AS state_created_at,
+            w.welcome_id,
+            w.transition_id AS welcome_transition_id,
+            w.entry_seq AS welcome_entry_seq,
+            w.generation AS welcome_generation,
+            w.state_version AS welcome_state_version,
+            w.group_id AS welcome_group_id,
+            w.epoch AS welcome_epoch,
+            w.group_context_hash AS welcome_group_context_hash,
+            w.confirmation_tag AS welcome_confirmation_tag,
+            w.wrapper_bytes AS welcome_wrapper_bytes,
+            w.wrapper_sha256 AS welcome_wrapper_sha256,
+            w.created_at AS welcome_created_at,
+            d.recipient_did,
+            d.recipient_device_id,
+            d.recovery_request_id,
+            d.key_package_ref AS delivery_key_package_ref,
+            d.expires_at AS delivery_expires_at,
+            d.status AS delivery_status,
+            d.terminal_at AS delivery_terminal_at
+        FROM chat.transitions t
+        JOIN chat.entries e
+          ON e.conversation_id=t.conversation_id
+         AND e.seq=t.entry_seq
+         AND e.transition_id=t.transition_id
+        JOIN chat.generations g
+          ON g.conversation_id=t.conversation_id
+         AND g.generation=t.next_generation
+        JOIN chat.generation_states s
+          ON s.conversation_id=t.conversation_id
+         AND s.generation=t.next_generation
+         AND s.state_version=t.next_state_version
+         AND s.producing_transition_id=t.transition_id
+        JOIN chat.welcome_bundles w
+          ON w.conversation_id=t.conversation_id
+         AND w.transition_id=t.transition_id
+         AND w.entry_seq=t.entry_seq
+        JOIN chat.welcome_deliveries d
+          ON d.welcome_id=w.welcome_id
+        WHERE t.transition_id=$1
+        FOR UPDATE OF t,e,g,s,w,d
+        "#,
+    )
+    .bind(transition_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let [row] = rows.as_slice() else {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    };
+    let mutation = authority.mutation();
+    let fulfillment = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryFulfillment(value) => value,
+        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+    };
+    let prior = signed_coordinate(fulfillment.prior())?;
+    let next = signed_coordinate(fulfillment.next())?;
+    let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
+    let actor_auth_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let delivery_shape_valid = match row.delivery_status.as_str() {
+        "pending" => row.delivery_terminal_at.is_none(),
+        "expired" => row.delivery_terminal_at == Some(row.delivery_expires_at),
+        "acknowledged" | "rejected" | "superseded" => row
+            .delivery_terminal_at
+            .is_some_and(|at| at < row.delivery_expires_at),
+        _ => false,
+    };
+    if row.conversation_id != request.conversation_id
+        || row.transition_kind != "leafRecovery"
+        || row.actor_did != authority.subject().as_str()
+        || row.actor_device_id != actor_device_id
+        || row.actor_key_id != mutation.key_id().as_str()
+        || row.actor_auth_generation != actor_auth_generation
+        || row.transition_signed_request_bytes != accepted
+        || row.transition_signing_transcript_bytes != mutation.transcript_bytes()
+        || row.transition_request_digest.as_slice() != mutation.request_digest()
+        || row.transition_signature.as_slice() != mutation.signature()
+        || row.prior_generation != Some(prior.generation)
+        || row.prior_state_version != Some(prior.state_version)
+        || row.next_generation != Some(next.generation)
+        || row.next_state_version != Some(next.state_version)
+        || row.entry_seq <= 0
+        || !whole_millis(row.accepted_at)
+        || row.entry_id != transition_id
+        || row.entry_kind != "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry"
+        || row.accepted_payload_bytes.is_empty()
+        || row.accepted_payload_sha256.as_slice()
+            != Sha256::digest(&row.accepted_payload_bytes).as_slice()
+        || row.entry_signed_request_bytes != accepted
+        || row.entry_request_digest.as_slice() != mutation.request_digest()
+        || row.entry_signature.as_slice() != mutation.signature()
+        || row.entry_actor_did != row.actor_did
+        || row.entry_actor_device_id != row.actor_device_id
+        || row.entry_actor_key_id != row.actor_key_id
+        || row.entry_actor_auth_generation != row.actor_auth_generation
+        || row.entry_generation != row.next_generation
+        || row.entry_state_version != row.next_state_version
+        || row.entry_transition_id != Some(transition_id)
+        || row.received_at != row.accepted_at
+        || row.group_id.as_slice() != next.group_id
+        || row.epoch != next.epoch
+        || row.group_context_hash.as_slice() != next.group_context_hash
+        || row.confirmation_tag.as_slice() != next.confirmation_tag
+        || !matches!(row.state_lifecycle.as_str(), "active" | "superseded")
+        || row.state_kind != "commit"
+        || row.producing_transition_id != transition_id
+        || row.state_created_at != row.accepted_at
+        || row.welcome_transition_id != transition_id
+        || row.welcome_entry_seq != row.entry_seq
+        || row.welcome_generation != next.generation
+        || row.welcome_state_version != next.state_version
+        || row.welcome_group_id.as_slice() != next.group_id
+        || row.welcome_epoch != next.epoch
+        || row.welcome_group_context_hash.as_slice() != next.group_context_hash
+        || row.welcome_confirmation_tag.as_slice() != next.confirmation_tag
+        || row.welcome_wrapper_bytes.is_empty()
+        || row.welcome_wrapper_sha256.as_slice()
+            != Sha256::digest(&row.welcome_wrapper_bytes).as_slice()
+        || row.welcome_created_at != row.accepted_at
+        || row.recipient_did != request.requester_did
+        || row.recipient_device_id != request.requester_device_id
+        || row.recovery_request_id != request.recovery_request_id
+        || row.delivery_key_package_ref != reservation.key_package_ref
+        || row.delivery_key_package_ref != package.key_package_ref
+        || row.delivery_expires_at != package.not_after
+        || !delivery_shape_valid
+    {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    let actor_signing_public_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT signing_public_key FROM chat.device_keys \
+         WHERE user_did=$1 AND device_id=$2 AND key_id=$3 \
+         FOR UPDATE",
+    )
+    .bind(authority.subject().as_str())
+    .bind(actor_device_id)
+    .bind(mutation.key_id().as_str())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
+    let canonical_entry = CanonicalControlEntryProducts::mint(
+        &decode_and_verify_control_entry(&row.accepted_payload_bytes, &actor_signing_public_key)
+            .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?,
+    )
+    .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    let entry: JsonValue = serde_json::from_slice(canonical_entry.canonical_response_json())
+        .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    if !entry.is_object() {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    let coordinates = response_coordinate(
+        row.conversation_id,
+        next.generation,
+        next.state_version,
+        &row.group_id,
+        next.epoch,
+        &row.group_context_hash,
+        &row.confirmation_tag,
+    )?;
+    let response_bytes = serde_json::to_vec(&json!({
+        "coordinates": coordinates,
+        "entry": entry,
+        "welcomes": [{
+            "welcomeId": row.welcome_id.hyphenated().to_string(),
+            "conversationId": row.conversation_id.hyphenated().to_string(),
+            "transitionSeq": row.entry_seq,
+            "coordinates": response_coordinate(
+                row.conversation_id,
+                next.generation,
+                next.state_version,
+                &row.group_id,
+                next.epoch,
+                &row.group_context_hash,
+                &row.confirmation_tag,
+            )?,
+            "status": "pending",
+            "opaqueWelcome": STANDARD.encode(&row.welcome_wrapper_bytes),
+            "sha256": STANDARD.encode(&row.welcome_wrapper_sha256),
+            "recipientDid": row.recipient_did,
+            "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
+            "provenance": {
+                "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
+                "keyPackageRef": STANDARD.encode(&row.delivery_key_package_ref),
+            },
+            "expiresAt": canonical_datetime(row.delivery_expires_at),
+        }],
+    }))
+    .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+    let graph_digest = digest_recovery_fulfillment_replay_graph(
+        row,
+        canonical_entry.canonical_response_json(),
+        &response_bytes,
+    );
+    Ok(LockedRecoveryFulfillmentReplayGraph {
+        response_bytes,
+        graph_digest,
+    })
 }
 
 pub(crate) async fn prepare_recovery_request_authority(
@@ -4592,6 +6091,124 @@ async fn lock_head_graph(
     })
 }
 
+async fn lock_recovery_replay_head_graph(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+) -> Result<LockedRecoveryHeadGraph, RecoveryRepositoryError> {
+    let conversation: RecoveryConversationRow = sqlx::query_as(LOCK_RECOVERY_CONVERSATION_SQL)
+        .bind(conversation_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::ConversationMissing)?;
+    let generation: RecoveryGenerationRow = sqlx::query_as(LOCK_RECOVERY_GENERATION_SQL)
+        .bind(conversation_id)
+        .bind(conversation.current_generation)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::ConversationDrift)?;
+    let state: RecoveryGenerationStateRow = sqlx::query_as(LOCK_RECOVERY_GENERATION_STATE_SQL)
+        .bind(conversation_id)
+        .bind(conversation.current_generation)
+        .bind(conversation.current_state_version)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::ConversationDrift)?;
+    let actor_leaf_period_id: Option<Uuid> = sqlx::query_scalar(LOCK_RECOVERY_MEMBER_DEVICE_SQL)
+        .bind(conversation_id)
+        .bind(conversation.current_generation)
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    let graph_identity_valid = generation.conversation_id == conversation_id
+        && generation.generation == conversation.current_generation
+        && state.conversation_id == conversation_id
+        && state.generation == conversation.current_generation
+        && state.state_version == conversation.current_state_version;
+    let row = RecoveryHeadGraphRow {
+        conversation_id: conversation.conversation_id,
+        kind: conversation.kind,
+        lifecycle: conversation.lifecycle,
+        current_generation: conversation.current_generation,
+        current_state_version: conversation.current_state_version,
+        next_entry_seq: conversation.next_entry_seq,
+        direct_did_low: conversation.direct_did_low,
+        direct_did_high: conversation.direct_did_high,
+        created_at: conversation.created_at,
+        close_transition_id: conversation.close_transition_id,
+        close_generation: conversation.close_generation,
+        close_state_version: conversation.close_state_version,
+        close_seq: conversation.close_seq,
+        closed_at: conversation.closed_at,
+        group_id: generation.group_id,
+        generation_lifecycle: generation.generation_lifecycle,
+        genesis_group_info_sha256: generation.genesis_group_info_sha256,
+        generation_state_version: generation.generation_state_version,
+        activated_seq: generation.activated_seq,
+        activated_at: generation.activated_at,
+        superseded_seq: generation.superseded_seq,
+        superseded_at: generation.superseded_at,
+        epoch: state.epoch,
+        group_context_hash: state.group_context_hash,
+        confirmation_tag: state.confirmation_tag,
+        state_lifecycle: state.state_lifecycle,
+        state_kind: state.state_kind,
+        producing_transition_id: state.producing_transition_id,
+        snapshot_sha256: state.snapshot_sha256,
+        tree_summary_sha256: state.tree_summary_sha256,
+        leaf_count: state.leaf_count,
+        state_created_at: state.state_created_at,
+        actor_leaf_period_id,
+    };
+    let lifecycle_shape = match row.lifecycle.as_str() {
+        "active" => {
+            row.close_transition_id.is_none()
+                && row.close_generation.is_none()
+                && row.close_state_version.is_none()
+                && row.close_seq.is_none()
+                && row.closed_at.is_none()
+        }
+        "closed" => {
+            row.close_transition_id.is_some()
+                && row.close_generation.is_some()
+                && row.close_state_version.is_some()
+                && row.close_seq.is_some()
+                && row.closed_at.is_some()
+        }
+        _ => false,
+    };
+    if row.conversation_id != conversation_id
+        || !graph_identity_valid
+        || !lifecycle_shape
+        || !matches!(row.generation_lifecycle.as_str(), "active" | "superseded")
+        || !matches!(row.state_lifecycle.as_str(), "active" | "superseded")
+        || row.current_state_version != row.generation_state_version
+        || !safe_nonnegative(row.current_generation)
+        || !safe_nonnegative(row.current_state_version)
+        || !safe_nonnegative(row.epoch)
+        || row.next_entry_seq <= 0
+        || !whole_millis(row.created_at)
+        || !whole_millis(row.activated_at)
+        || !whole_millis(row.state_created_at)
+    {
+        return Err(RecoveryRepositoryError::ConversationDrift);
+    }
+    Ok(LockedRecoveryHeadGraph {
+        conversation_id,
+        generation: row.current_generation,
+        state_version: row.current_state_version,
+        group_id: bytes32(&row.group_id)?,
+        epoch: row.epoch,
+        group_context_hash: bytes32(&row.group_context_hash)?,
+        confirmation_tag: bytes32(&row.confirmation_tag)?,
+        actor_leaf_period_id: row.actor_leaf_period_id,
+        head_digest: digest_head(&row),
+        graph_digest: digest_graph(&row),
+    })
+}
+
 async fn lock_terminal_rows(
     transaction: &mut Transaction<'_, Postgres>,
     request_id: Uuid,
@@ -4619,6 +6236,220 @@ async fn lock_terminal_rows(
         .await?
         .ok_or(RecoveryRepositoryError::ReadSetMismatch)?;
     Ok((request, reservation, package))
+}
+
+fn validate_replay_locked_triple(
+    head: &LockedRecoveryHeadGraph,
+    request: &RecoveryRequestRow,
+    reservation: &RecoveryReservationRow,
+    package: &RecoveryPackageRow,
+    trusted_instant: DateTime<Utc>,
+    requester_signing_public_key: &[u8],
+) -> Result<RecoveryTerminalClassification, RecoveryRepositoryError> {
+    let status = parse_request_status(&request.status)?;
+    let classification = classify_locked_recovery(status, trusted_instant, request.expires_at);
+    if request.recovery_request_id != reservation.recovery_request_id
+        || request.reservation_request_id != request.recovery_request_id
+        || reservation.conversation_id != request.conversation_id
+        || reservation.generation != request.generation
+        || request.requester_did != reservation.requester_did
+        || request.requester_device_id != reservation.requester_device_id
+        || request.requester_key_id != reservation.requester_key_id
+        || request.requester_auth_generation != reservation.requester_auth_generation
+        || reservation.recipient_did != request.requester_did
+        || reservation.recipient_device_id != request.requester_device_id
+        || reservation.purpose != "leafRecovery"
+        || reservation.bound_state_version != request.bound_state_version
+        || reservation.bound_group_id != request.bound_group_id
+        || reservation.bound_epoch != request.bound_epoch
+        || reservation.bound_group_context_hash != request.bound_group_context_hash
+        || reservation.bound_confirmation_tag != request.bound_confirmation_tag
+        || request.expires_at != reservation.expires_at
+        || reservation.key_package_ref != package.key_package_ref
+        || package.owner_did != request.requester_did
+        || package.owner_device_id != request.requester_device_id
+        || package.owner_key_id != request.requester_key_id
+        || package.owner_auth_generation != request.requester_auth_generation
+        || reservation.expires_at > package.not_after
+        || request.request_digest.as_slice()
+            != Sha256::digest(&request.signing_transcript_bytes).as_slice()
+        || request.signature.len() != 64
+        || request.signed_request_bytes.is_empty()
+        || request.signing_transcript_bytes.is_empty()
+        || request.bound_group_id.len() != 32
+        || request.bound_group_context_hash.len() != 32
+        || request.bound_confirmation_tag.len() != 32
+        || !safe_nonnegative(request.generation)
+        || !safe_nonnegative(request.bound_state_version)
+        || !safe_nonnegative(request.bound_epoch)
+        || !whole_millis(request.requested_at)
+        || !whole_millis(request.expires_at)
+        || !whole_millis(reservation.created_at)
+        || !replay_package_shape_valid(package)
+    {
+        return Err(RecoveryRepositoryError::ReadSetMismatch);
+    }
+    reverify_persisted_request(request, requester_signing_public_key)?;
+
+    let request_terminal_null = request.fulfilling_transition_id.is_none()
+        && request.terminal_transition_id.is_none()
+        && request.terminal_revocation_id.is_none()
+        && request.terminal_signed_request_bytes.is_none()
+        && request.terminal_signing_transcript_bytes.is_none()
+        && request.terminal_request_digest.is_none()
+        && request.terminal_signature.is_none()
+        && request.terminal_at.is_none();
+    let reservation_terminal_null = reservation.consumed_transition_id.is_none()
+        && reservation.terminal_transition_id.is_none()
+        && reservation.terminal_revocation_id.is_none()
+        && reservation.terminal_request_digest.is_none()
+        && reservation.terminal_at.is_none();
+    let shape_valid = match classification {
+        RecoveryTerminalClassification::OpenLive | RecoveryTerminalClassification::OpenDue => {
+            request.status == "open"
+                && reservation.status == "active"
+                && package.status == "reserved"
+                && request_terminal_null
+                && reservation_terminal_null
+                && package.terminal_transition_id.is_none()
+                && package.terminal_revocation_id.is_none()
+                && package.terminal_at.is_none()
+                && request.conversation_id == head.conversation_id
+                && request.generation == head.generation
+                && request.bound_state_version == head.state_version
+                && request.bound_group_id == head.group_id
+                && request.bound_epoch == head.epoch
+                && request.bound_group_context_hash == head.group_context_hash
+                && request.bound_confirmation_tag == head.confirmation_tag
+        }
+        RecoveryTerminalClassification::RetainedFulfilled => {
+            reservation.status == "consumed"
+                && package.status == "consumed"
+                && request.fulfilling_transition_id.is_some()
+                && request.fulfilling_transition_id == reservation.consumed_transition_id
+                && request.fulfilling_transition_id == package.terminal_transition_id
+                && request.terminal_transition_id.is_none()
+                && request.terminal_revocation_id.is_none()
+                && request.terminal_signed_request_bytes.is_none()
+                && request.terminal_signing_transcript_bytes.is_none()
+                && request.terminal_request_digest.is_none()
+                && request.terminal_signature.is_none()
+                && reservation.terminal_transition_id.is_none()
+                && reservation.terminal_revocation_id.is_none()
+                && reservation.terminal_request_digest.is_none()
+                && package.terminal_revocation_id.is_none()
+                && request.terminal_at == reservation.terminal_at
+                && request.terminal_at == package.terminal_at
+        }
+        RecoveryTerminalClassification::RetainedCancelled => {
+            reservation.status == "released"
+                && request.fulfilling_transition_id.is_none()
+                && request.terminal_transition_id.is_none()
+                && request.terminal_revocation_id.is_none()
+                && request.terminal_signed_request_bytes.is_some()
+                && request.terminal_signing_transcript_bytes.is_some()
+                && request.terminal_request_digest.is_some()
+                && request.terminal_signature.is_some()
+                && reservation.consumed_transition_id.is_none()
+                && reservation.terminal_transition_id.is_none()
+                && reservation.terminal_revocation_id.is_none()
+                && request.terminal_request_digest == reservation.terminal_request_digest
+                && request.terminal_at == reservation.terminal_at
+                && replay_package_terminal_not_before(package, request.terminal_at)
+        }
+        RecoveryTerminalClassification::RetainedExpired => {
+            reservation.status == "expired"
+                && request.fulfilling_transition_id.is_none()
+                && request.terminal_transition_id.is_none()
+                && request.terminal_revocation_id.is_none()
+                && request.terminal_signed_request_bytes.is_none()
+                && request.terminal_signing_transcript_bytes.is_none()
+                && request.terminal_request_digest.is_none()
+                && request.terminal_signature.is_none()
+                && reservation.consumed_transition_id.is_none()
+                && reservation.terminal_transition_id.is_none()
+                && reservation.terminal_revocation_id.is_none()
+                && reservation.terminal_request_digest.is_none()
+                && request.terminal_at == Some(request.expires_at)
+                && reservation.terminal_at == Some(request.expires_at)
+                && replay_package_terminal_not_before(package, request.terminal_at)
+        }
+        RecoveryTerminalClassification::RetainedSuperseded => {
+            request.fulfilling_transition_id.is_none()
+                && request.terminal_signed_request_bytes.is_none()
+                && request.terminal_signing_transcript_bytes.is_none()
+                && request.terminal_request_digest.is_none()
+                && request.terminal_signature.is_none()
+                && request.terminal_transition_id.is_some()
+                    != request.terminal_revocation_id.is_some()
+                && reservation.status == "released"
+                && reservation.consumed_transition_id.is_none()
+                && reservation.terminal_transition_id == request.terminal_transition_id
+                && reservation.terminal_revocation_id == request.terminal_revocation_id
+                && reservation.terminal_request_digest.is_none()
+                && reservation.terminal_at == request.terminal_at
+                && replay_package_terminal_not_before(package, request.terminal_at)
+        }
+    };
+    if !shape_valid
+        || request
+            .terminal_at
+            .is_some_and(|at| at < request.requested_at)
+    {
+        return Err(RecoveryRepositoryError::InvalidDurableRow);
+    }
+    if classification == RecoveryTerminalClassification::RetainedCancelled {
+        reverify_retained_cancellation(request, requester_signing_public_key)?;
+    }
+    Ok(classification)
+}
+
+fn replay_package_shape_valid(package: &RecoveryPackageRow) -> bool {
+    package.key_package_ref.len() == 32
+        && !package.wrapper_bytes.is_empty()
+        && package.wrapper_sha256.as_slice() == Sha256::digest(&package.wrapper_bytes).as_slice()
+        && !package.init_key.is_empty()
+        && whole_millis(package.not_before)
+        && whole_millis(package.not_after)
+        && whole_millis(package.created_at)
+        && package.not_before < package.created_at
+        && package.created_at < package.not_after
+        && match package.status.as_str() {
+            "available" | "reserved" => {
+                package.terminal_transition_id.is_none()
+                    && package.terminal_revocation_id.is_none()
+                    && package.terminal_at.is_none()
+            }
+            "consumed" => {
+                package.terminal_transition_id.is_some()
+                    && package.terminal_revocation_id.is_none()
+                    && package.terminal_at.is_some()
+            }
+            "expired" => {
+                package.terminal_transition_id.is_none()
+                    && package.terminal_revocation_id.is_none()
+                    && package.terminal_at == Some(package.not_after)
+            }
+            "revoked" => {
+                package.terminal_transition_id.is_none()
+                    && package.terminal_revocation_id.is_some()
+                    && package
+                        .terminal_at
+                        .is_some_and(|at| at >= package.created_at && at < package.not_after)
+            }
+            _ => false,
+        }
+}
+
+fn replay_package_terminal_not_before(
+    package: &RecoveryPackageRow,
+    retained_terminal_at: Option<DateTime<Utc>>,
+) -> bool {
+    match (retained_terminal_at, package.terminal_at) {
+        (Some(retained), Some(current)) => current >= retained,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 fn validate_locked_triple(
@@ -5484,6 +7315,146 @@ fn digest_graph(row: &RecoveryHeadGraphRow) -> [u8; 32] {
     digest.finalize().into()
 }
 
+fn digest_recovery_replay_request(row: &RecoveryRequestRow) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-REPLAY-REQUEST-ROW\0");
+    digest.update(row.recovery_request_id.as_bytes());
+    digest.update(row.conversation_id.as_bytes());
+    digest.update(row.generation.to_be_bytes());
+    digest_len(&mut digest, row.requester_did.as_bytes());
+    digest.update(row.requester_device_id.as_bytes());
+    digest_len(&mut digest, row.requester_key_id.as_bytes());
+    digest.update(row.requester_auth_generation.to_be_bytes());
+    digest_len(&mut digest, row.recovery_kind.as_bytes());
+    digest_len(&mut digest, row.source.as_bytes());
+    digest.update(row.bound_state_version.to_be_bytes());
+    digest_len(&mut digest, &row.bound_group_id);
+    digest.update(row.bound_epoch.to_be_bytes());
+    digest_len(&mut digest, &row.bound_group_context_hash);
+    digest_len(&mut digest, &row.bound_confirmation_tag);
+    digest.update(row.reservation_request_id.as_bytes());
+    digest_optional_uuid(&mut digest, row.replaced_leaf_period_id);
+    digest_len(&mut digest, row.status.as_bytes());
+    digest_len(&mut digest, &row.signed_request_bytes);
+    digest_len(&mut digest, &row.signing_transcript_bytes);
+    digest_len(&mut digest, &row.request_digest);
+    digest_len(&mut digest, &row.signature);
+    digest.update(row.requested_at.timestamp_millis().to_be_bytes());
+    digest.update(row.expires_at.timestamp_millis().to_be_bytes());
+    digest_optional_uuid(&mut digest, row.fulfilling_transition_id);
+    digest_optional_uuid(&mut digest, row.terminal_transition_id);
+    digest_optional_uuid(&mut digest, row.terminal_revocation_id);
+    digest_optional_bytes(&mut digest, row.terminal_signed_request_bytes.as_deref());
+    digest_optional_bytes(
+        &mut digest,
+        row.terminal_signing_transcript_bytes.as_deref(),
+    );
+    digest_optional_bytes(&mut digest, row.terminal_request_digest.as_deref());
+    digest_optional_bytes(&mut digest, row.terminal_signature.as_deref());
+    digest_optional_time(&mut digest, row.terminal_at);
+    digest.finalize().into()
+}
+
+fn digest_recovery_replay_reservation(row: &RecoveryReservationRow) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-REPLAY-RESERVATION-ROW\0");
+    digest.update(row.recovery_request_id.as_bytes());
+    digest_len(&mut digest, &row.key_package_ref);
+    digest.update(row.conversation_id.as_bytes());
+    digest.update(row.generation.to_be_bytes());
+    digest_len(&mut digest, row.requester_did.as_bytes());
+    digest.update(row.requester_device_id.as_bytes());
+    digest_len(&mut digest, row.requester_key_id.as_bytes());
+    digest.update(row.requester_auth_generation.to_be_bytes());
+    digest_len(&mut digest, row.recipient_did.as_bytes());
+    digest.update(row.recipient_device_id.as_bytes());
+    digest.update(row.bound_state_version.to_be_bytes());
+    digest_len(&mut digest, &row.bound_group_id);
+    digest.update(row.bound_epoch.to_be_bytes());
+    digest_len(&mut digest, &row.bound_group_context_hash);
+    digest_len(&mut digest, &row.bound_confirmation_tag);
+    digest_len(&mut digest, row.purpose.as_bytes());
+    digest.update(row.expires_at.timestamp_millis().to_be_bytes());
+    digest_len(&mut digest, row.status.as_bytes());
+    digest_optional_uuid(&mut digest, row.consumed_transition_id);
+    digest_optional_uuid(&mut digest, row.terminal_transition_id);
+    digest_optional_uuid(&mut digest, row.terminal_revocation_id);
+    digest_optional_bytes(&mut digest, row.terminal_request_digest.as_deref());
+    digest_optional_time(&mut digest, row.terminal_at);
+    digest.update(row.created_at.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
+}
+
+fn digest_recovery_replay_package(row: &RecoveryPackageRow) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-REPLAY-PACKAGE-ROW\0");
+    digest_len(&mut digest, &row.key_package_ref);
+    digest_len(&mut digest, &row.wrapper_bytes);
+    digest_len(&mut digest, &row.wrapper_sha256);
+    digest_len(&mut digest, &row.init_key);
+    digest_len(&mut digest, row.owner_did.as_bytes());
+    digest.update(row.owner_device_id.as_bytes());
+    digest_len(&mut digest, row.owner_key_id.as_bytes());
+    digest.update(row.owner_auth_generation.to_be_bytes());
+    digest.update(row.not_before.timestamp_millis().to_be_bytes());
+    digest.update(row.not_after.timestamp_millis().to_be_bytes());
+    digest_len(&mut digest, row.status.as_bytes());
+    digest_optional_uuid(&mut digest, row.terminal_transition_id);
+    digest_optional_uuid(&mut digest, row.terminal_revocation_id);
+    digest_optional_time(&mut digest, row.terminal_at);
+    digest.update(row.created_at.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
+}
+
+fn digest_recovery_fulfillment_replay_graph(
+    row: &RecoveryFulfillmentReplayRow,
+    canonical_response_entry: &[u8],
+    response_bytes: &[u8],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-FULFILLMENT-REPLAY-GRAPH\0");
+    digest.update(row.conversation_id.as_bytes());
+    digest_len(&mut digest, row.transition_kind.as_bytes());
+    digest_len(&mut digest, row.actor_did.as_bytes());
+    digest.update(row.actor_device_id.as_bytes());
+    digest_len(&mut digest, row.actor_key_id.as_bytes());
+    digest.update(row.actor_auth_generation.to_be_bytes());
+    digest_len(&mut digest, &row.transition_signed_request_bytes);
+    digest_len(&mut digest, &row.transition_signing_transcript_bytes);
+    digest_len(&mut digest, &row.transition_request_digest);
+    digest_len(&mut digest, &row.transition_signature);
+    digest_optional_i64(&mut digest, row.prior_generation);
+    digest_optional_i64(&mut digest, row.prior_state_version);
+    digest_optional_i64(&mut digest, row.next_generation);
+    digest_optional_i64(&mut digest, row.next_state_version);
+    digest.update(row.entry_seq.to_be_bytes());
+    digest.update(row.accepted_at.timestamp_millis().to_be_bytes());
+    digest.update(row.entry_id.as_bytes());
+    digest_len(&mut digest, row.entry_kind.as_bytes());
+    digest_len(&mut digest, &row.accepted_payload_bytes);
+    digest_len(&mut digest, &row.accepted_payload_sha256);
+    digest_len(&mut digest, &row.group_id);
+    digest.update(row.epoch.to_be_bytes());
+    digest_len(&mut digest, &row.group_context_hash);
+    digest_len(&mut digest, &row.confirmation_tag);
+    digest_len(&mut digest, row.state_lifecycle.as_bytes());
+    digest_len(&mut digest, row.state_kind.as_bytes());
+    digest.update(row.producing_transition_id.as_bytes());
+    digest.update(row.welcome_id.as_bytes());
+    digest_len(&mut digest, &row.welcome_wrapper_bytes);
+    digest_len(&mut digest, &row.welcome_wrapper_sha256);
+    digest_len(&mut digest, row.recipient_did.as_bytes());
+    digest.update(row.recipient_device_id.as_bytes());
+    digest.update(row.recovery_request_id.as_bytes());
+    digest_len(&mut digest, &row.delivery_key_package_ref);
+    digest.update(row.delivery_expires_at.timestamp_millis().to_be_bytes());
+    digest_len(&mut digest, row.delivery_status.as_bytes());
+    digest_optional_time(&mut digest, row.delivery_terminal_at);
+    digest_len(&mut digest, canonical_response_entry);
+    digest_len(&mut digest, response_bytes);
+    digest.finalize().into()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn client_authority_digest(
     transaction_id: &str,
@@ -5566,6 +7537,16 @@ fn digest_optional_text(digest: &mut Sha256, value: Option<&str>) {
         Some(value) => {
             digest.update([1]);
             digest_len(digest, value.as_bytes());
+        }
+    }
+}
+
+fn digest_optional_bytes(digest: &mut Sha256, value: Option<&[u8]>) {
+    match value {
+        None => digest.update([0]),
+        Some(value) => {
+            digest.update([1]);
+            digest_len(digest, value);
         }
     }
 }

@@ -8,10 +8,8 @@ use super::production_proof_fixture::{
     SignedRecoveryEnvelope,
 };
 use super::*;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::json;
-use sqlx::{Executor, FromRow};
+use sqlx::Executor;
 use uuid::Uuid;
 
 const RECOVERY_ENDPOINT: &str = "blue.catbird.chat.requestLeafRecovery";
@@ -152,102 +150,6 @@ async fn prepare_request(
         .map_err(|error| format!("load immutable client Recovery fallback: {error:?}"))?;
     plan_recovery_request(input, &proof.relationship_authority)
         .map_err(|error| format!("plan client Recovery request: {error:?}"))
-}
-
-#[derive(FromRow)]
-struct ResponseRow {
-    conversation_id: Uuid,
-    requester_did: String,
-    requester_device_id: Uuid,
-    requester_key_id: String,
-    requester_auth_generation: i64,
-    recovery_kind: String,
-    request_status: String,
-    requested_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    reservation_status: String,
-    key_package_ref: Vec<u8>,
-    wrapper_bytes: Vec<u8>,
-    wrapper_sha256: Vec<u8>,
-}
-
-async fn exact_request_response(
-    transaction: &mut Transaction<'_, Postgres>,
-    proof: &ClientRequestProof,
-) -> Result<Vec<u8>, String> {
-    exact_recovery_view_response(transaction, proof, "open", "active").await
-}
-
-/// Serialize the endpoint's exact `{recovery: leafRecoveryView}` from the
-/// terminal rows, never from a hand-written status surrogate.
-async fn exact_recovery_view_response(
-    transaction: &mut Transaction<'_, Postgres>,
-    proof: &ClientRequestProof,
-    expected_request_status: &str,
-    expected_reservation_status: &str,
-) -> Result<Vec<u8>, String> {
-    let row: ResponseRow = sqlx::query_as(
-        "SELECT request.conversation_id,request.requester_did,request.requester_device_id,\
-                request.requester_key_id,request.requester_auth_generation,request.recovery_kind,\
-                request.status AS request_status,request.requested_at,request.expires_at,\
-                reservation.status AS reservation_status,package.key_package_ref,\
-                package.wrapper_bytes,package.wrapper_sha256 \
-           FROM chat.leaf_recovery_requests request \
-           JOIN chat.key_package_reservations reservation \
-             ON reservation.recovery_request_id=request.recovery_request_id \
-           JOIN chat.key_packages package ON package.key_package_ref=request.key_package_ref \
-          WHERE request.recovery_request_id=$1",
-    )
-    .bind(proof.envelope.operation_id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(|error| format!("read exact client Recovery response: {error}"))?;
-    if row.conversation_id != proof.fixture.conversation_id
-        || row.requester_did != proof.fixture.identity.did
-        || row.requester_device_id != proof.fixture.identity.device_id
-        || row.requester_key_id != proof.fixture.identity.key_id
-        || row.requester_auth_generation != 1
-        || row.recovery_kind != "replace"
-        || row.request_status != expected_request_status
-        || row.reservation_status != expected_reservation_status
-        || row.key_package_ref.as_slice() != proof.fixture.available_key_package_ref
-        || row.wrapper_bytes != proof.fixture.available_key_package_wrapper
-    {
-        return Err(
-            "client Recovery view rows do not exactly match the persisted fixture".to_owned(),
-        );
-    }
-    let prior = coordinate_json(&proof.fixture.prior);
-    serde_json::to_vec(&json!({"recovery": {
-        "recoveryRequestId": proof.envelope.operation_id.hyphenated().to_string(),
-        "conversationId": row.conversation_id.hyphenated().to_string(),
-        "requesterDid": row.requester_did,
-        "requesterDeviceId": row.requester_device_id.hyphenated().to_string(),
-        "recoveryKind": row.recovery_kind,
-        "boundCoordinate": prior,
-        "reservation": {
-            "recoveryRequestId": proof.envelope.operation_id.hyphenated().to_string(),
-            "conversationId": row.conversation_id.hyphenated().to_string(),
-            "boundCoordinate": coordinate_json(&proof.fixture.prior),
-            "requesterDid": proof.fixture.identity.did,
-            "requesterDeviceId": proof.fixture.identity.device_id.hyphenated().to_string(),
-            "requesterKeyId": proof.fixture.identity.key_id,
-            "requesterAuthGeneration": 1,
-            "keyPackageRef": STANDARD.encode(&row.key_package_ref),
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "purpose": "leafRecovery",
-            "status": row.reservation_status,
-            "expiresAt": row.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "keyPackage": {"framing":"mlsMessage","contentType":"keyPackage",
-                "bytes":STANDARD.encode(&row.wrapper_bytes),
-                "sha256":STANDARD.encode(&row.wrapper_sha256),
-                "keyPackageRef":STANDARD.encode(&row.key_package_ref)}
-        },
-        "status": row.request_status,
-        "requestedAt": row.requested_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        "expiresAt": row.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true)
-    }}))
-    .map_err(|error| format!("encode exact client Recovery response: {error}"))
 }
 
 async fn require_exact_completion_response(
@@ -503,8 +405,7 @@ fn require_residue_unchanged(before: &ClientResidue, after: &ClientResidue) -> R
 pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Result<(), String> {
     let proof = new_client_request_proof(pool).await?;
     let operation_id = proof.envelope.operation_id;
-    let before =
-        observe_client_residue(pool, &proof.fixture, operation_id, operation_id).await?;
+    let before = observe_client_residue(pool, &proof.fixture, operation_id, operation_id).await?;
     let mut transaction = pool
         .begin()
         .await
@@ -514,7 +415,7 @@ pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Resul
         .apply(&mut transaction)
         .await
         .map_err(|e| format!("apply client Recovery request: {e:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
+    let (transition, scope, completion, material, response) = client_completion(applied);
     if !matches!(material, RecoveryCanonicalMaterial::Requested { recovery_request_id } if recovery_request_id == proof.envelope.operation_id)
         || transition.event_positions.len() != 1
     {
@@ -528,7 +429,11 @@ pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Resul
         transition.event_positions[0],
     )
     .await?;
-    let response = exact_request_response(&mut transaction, &proof).await?;
+    let response = response
+        .filter(|response| response.endpoint() == RecoveryOperationEndpoint::RequestLeafRecovery)
+        .ok_or_else(|| "request graph returned no canonical endpoint response".to_owned())?
+        .as_bytes()
+        .to_vec();
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &proof.authority,
@@ -550,9 +455,13 @@ pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Resul
     if stored != response {
         return Err("client Recovery completion response was not exact".to_owned());
     }
-    let during =
-        observe_client_residue(&mut *transaction, &proof.fixture, operation_id, operation_id)
-            .await?;
+    let during = observe_client_residue(
+        &mut *transaction,
+        &proof.fixture,
+        operation_id,
+        operation_id,
+    )
+    .await?;
     require_request_delta(&before, &during)?;
     transaction
         .rollback()
@@ -642,7 +551,7 @@ pub(super) async fn run_request_leaf_recovery_completion_rollback_negative(
         .apply(&mut transaction)
         .await
         .map_err(|e| format!("apply before completion mismatch: {e:?}"))?;
-    let (transition, scope, completion, _) = client_completion(applied);
+    let (transition, scope, completion, _, _response) = client_completion(applied);
     let error = crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &wrong_authority,
@@ -682,13 +591,17 @@ async fn commit_open_request(pool: &PgPool) -> Result<ClientRequestProof, String
         .apply(&mut transaction)
         .await
         .map_err(|e| format!("apply durable client Recovery request: {e:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
+    let (transition, scope, completion, material, response) = client_completion(applied);
     if !matches!(material, RecoveryCanonicalMaterial::Requested { recovery_request_id } if recovery_request_id == proof.envelope.operation_id)
         || transition.event_positions.len() != 1
     {
         return Err("durable client Recovery request returned wrong material".to_owned());
     }
-    let response = exact_request_response(&mut transaction, &proof).await?;
+    let response = response
+        .filter(|response| response.endpoint() == RecoveryOperationEndpoint::RequestLeafRecovery)
+        .ok_or_else(|| "durable request graph returned no canonical response".to_owned())?
+        .as_bytes()
+        .to_vec();
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &proof.authority,
@@ -815,7 +728,7 @@ pub(super) async fn run_leaf_recovery_cancellation_happy_path(pool: &PgPool) -> 
     let applied = cancellation(cancellation_authority, &mut transaction, &trusted)
         .await
         .map_err(|e| format!("apply Recovery cancellation: {e:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
+    let (transition, scope, completion, material, response) = client_completion(applied);
     if !matches!(material, RecoveryCanonicalMaterial::Cancelled { recovery_request_id } if recovery_request_id == proof.envelope.operation_id)
         || transition.event_positions.len() != 1
     {
@@ -828,8 +741,11 @@ pub(super) async fn run_leaf_recovery_cancellation_happy_path(pool: &PgPool) -> 
         transition.event_positions[0],
     )
     .await?;
-    let response =
-        exact_recovery_view_response(&mut transaction, &proof, "cancelled", "released").await?;
+    let response = response
+        .filter(|response| response.endpoint() == RecoveryOperationEndpoint::CancelLeafRecovery)
+        .ok_or_else(|| "cancellation graph returned no canonical endpoint response".to_owned())?
+        .as_bytes()
+        .to_vec();
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &authority,
@@ -959,8 +875,9 @@ pub(super) async fn run_leaf_recovery_cancellation_due_for_expiry_ordering(
     )
     .await
     .map_err(|e| format!("apply client Recovery expiry: {e:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
-    if !matches!(material, RecoveryCanonicalMaterial::ClientExpired { recovery_request_id, post_apply_error: RecoveryClientTerminalError::RecoveryNotFound, .. } if recovery_request_id == proof.envelope.operation_id)
+    let (transition, scope, completion, material, response) = client_completion(applied);
+    if response.is_some()
+        || !matches!(material, RecoveryCanonicalMaterial::ClientExpired { recovery_request_id, post_apply_error: RecoveryClientTerminalError::RecoveryNotFound, .. } if recovery_request_id == proof.envelope.operation_id)
         || transition.event_positions.len() != 1
     {
         return Err("client DueForExpiry returned wrong material/event count".to_owned());

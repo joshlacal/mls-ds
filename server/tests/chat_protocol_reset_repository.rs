@@ -411,7 +411,7 @@ use chat_protocol::{
     transcript::{
         build_verified_control_entry, decode_and_verify_signed_mutation,
         decode_canonical_signed_mutation, CanonicalControlEntryProducts,
-        CanonicalControlServerFields, ControlEntryKind, SignedMutationKind,
+        CanonicalControlServerFields, ControlEntryKind, SignedMutationKind, VerifiedControlEntry,
         VerifiedMutationProjection, VerifiedSignedMutation,
     },
     validation::{
@@ -1419,6 +1419,49 @@ fn pending_reset_rejects_each_cryptographic_binding_mutation() {
             "pending Reset accepted cryptographic binding mutation {mutation:?}"
         );
     }
+}
+
+#[test]
+fn reset_request_event_payload_is_repository_owned_and_canonical() {
+    let reset_request_id = Uuid::from_bytes([
+        0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x4a, 0xbc, 0x8d, 0xef, 0x12, 0x34, 0x56, 0x78, 0x9a,
+        0xbc,
+    ]);
+    let conversation_id = Uuid::from_bytes([
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x47, 0x89, 0x8a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56,
+        0x78,
+    ]);
+
+    assert_eq!(
+        reset::canonical_reset_requested_event_payload(reset_request_id, conversation_id),
+        br#"{"$type":"blue.catbird.chat.defs#resetRequestedEvent","resetRequestId":"12345678-1234-4abc-8def-123456789abc","conversationId":"abcdef01-2345-4789-8abc-def012345678"}"#
+    );
+}
+
+#[test]
+fn reset_activation_event_payload_is_repository_owned_and_canonical() {
+    let conversation_id = Uuid::from_bytes([
+        0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x47, 0x89, 0x8a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56,
+        0x78,
+    ]);
+
+    assert_eq!(
+        reset::canonical_reset_activation_event_payload(conversation_id),
+        br#"{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"abcdef01-2345-4789-8abc-def012345678"}"#
+    );
+}
+
+#[test]
+fn reset_activation_authority_owns_terminal_recovery_packages() {
+    fn typecheck(
+        authority: reset::LockedResetActivationAuthority,
+        mutation: &VerifiedSignedMutation,
+        entry: VerifiedControlEntry,
+    ) {
+        let _ = authority.plan_reset_activation_entry(mutation, entry);
+    }
+
+    let _ = typecheck;
 }
 
 #[tokio::test]

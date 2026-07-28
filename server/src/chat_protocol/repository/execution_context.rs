@@ -17,12 +17,13 @@ use sqlx::{Acquire, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::blobs::{BindingKind, BlobPurpose, NewBlobBinding};
 use super::core::LockedG6Prelude;
 use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
 };
 use super::recovery::PreparedRecoveryExecutionGraph;
-use super::transition::{ResetReason, TransitionActorRole};
+use super::transition::{MetadataAvatarBinding, ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
 #[cfg(test)]
 use crate::chat_protocol::state_machine::apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test;
@@ -33,15 +34,16 @@ use crate::chat_protocol::state_machine::{
     prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
     ConversationPersistencePlan, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
     EventChainCursorError, EventFanout, ExecutionActor, ExecutionAuthority, ExecutorError,
-    LeafPersistenceColumns, LeafRecoveryKind, MetadataAuthorColumns, ParticipantRole,
-    PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
-    PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
-    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext, WelcomeStatus,
+    LeafPersistenceColumns, LeafRecoveryKind, MetadataAuthorColumns, MetadataAvatarPersistence,
+    ParticipantRole, PlanAuthority, PlanKind, PreparedConversationExecution,
+    PreparedDeviceRevocationBatchMembers, PrincipalId, RecoveryOpenContext, RecoverySource,
+    ResetRequestRow, ServerTimestamp, SpineArtifacts, WelcomeDispositionInput,
+    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
-    decode_and_verify_control_entry, decode_and_verify_signed_mutation, CanonicalValueRef,
-    SignedMutationKind, VerifiedMutationProjection, VerifiedSignedMutation,
+    canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
+    decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
+    VerifiedMutationProjection, VerifiedSignedMutation,
 };
 
 const STREAM_OUTBOX_COUNT: usize = 1;
@@ -1006,6 +1008,206 @@ async fn metadata_author(
     }))
 }
 
+async fn metadata_avatar(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    applied_at: DateTime<Utc>,
+) -> Result<Option<MetadataAvatarPersistence>, ExecutionContextHydrationError> {
+    if plan.effects().kind() != PlanKind::Metadata {
+        return Ok(None);
+    }
+    let change = plan
+        .effects()
+        .metadata_change()
+        .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+    let (Some(before), Some(after)) = (change.before(), change.after()) else {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    };
+    let Some(signed_avatar) = after.avatar_binding() else {
+        return Ok(None);
+    };
+    let prior = plan
+        .expected_prior()
+        .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+    let conversation_id = Uuid::from_bytes(*prior.conversation_id());
+    let blob_id = Uuid::from_bytes(*signed_avatar.blob_id());
+    let signed_size = i64::try_from(signed_avatar.ciphertext_size())
+        .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
+
+    if before
+        .avatar_binding()
+        .is_some_and(|binding| binding.blob_id() == signed_avatar.blob_id())
+    {
+        let row: Option<(Uuid, Vec<u8>, i64, Uuid, i64, String, Uuid)> = sqlx::query_as(
+            r#"
+            SELECT avatar_blob_id,avatar_ciphertext_sha256,avatar_ciphertext_size,
+                   avatar_binding_origin_transition_id,avatar_binding_metadata_version,
+                   avatar_binding_owner_did,avatar_binding_owner_device_id
+              FROM chat.metadata_snapshots
+             WHERE conversation_id=$1 AND generation=$2 AND state_version=$3
+               AND avatar_blob_id=$4
+             FOR SHARE
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(
+            i64::try_from(prior.generation())
+                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        )
+        .bind(
+            i64::try_from(prior.state_version())
+                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        )
+        .bind(blob_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let (locked_blob_id, hash, size, origin, version, owner_did, owner_device_id) =
+            row.ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+        let binding_exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM chat.blob_bindings
+                 WHERE blob_id=$1 AND binding_kind='metadataAvatar'
+                   AND conversation_id=$2
+                   AND metadata_origin_transition_id=$3
+                   AND metadata_version=$4
+                   AND ciphertext_sha256=$5 AND ciphertext_size=$6
+                   AND purpose='metadata' AND owner_did=$7 AND owner_device_id=$8
+                 FOR SHARE
+            )
+            "#,
+        )
+        .bind(locked_blob_id)
+        .bind(conversation_id)
+        .bind(origin)
+        .bind(version)
+        .bind(&hash)
+        .bind(size)
+        .bind(&owner_did)
+        .bind(owner_device_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !binding_exists
+            || locked_blob_id != blob_id
+            || hash.as_slice() != signed_avatar.ciphertext_sha256()
+            || size != signed_size
+        {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        return Ok(Some(MetadataAvatarPersistence::Reuse {
+            snapshot: MetadataAvatarBinding {
+                avatar_blob_id: locked_blob_id,
+                avatar_ciphertext_sha256: hash,
+                avatar_ciphertext_size: size,
+                avatar_binding_origin_transition_id: origin,
+                avatar_binding_metadata_version: version,
+                avatar_binding_owner_did: owner_did,
+                avatar_binding_owner_device_id: owner_device_id,
+            },
+        }));
+    }
+
+    let row: Option<(
+        String,
+        Uuid,
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT owner_did,owner_device_id,owner_key_id,owner_auth_generation,
+               purpose,media_type,plaintext_size,ciphertext_size,ciphertext_sha256,
+               uploaded_at,unbound_expires_at
+          FROM chat.blobs
+         WHERE blob_id=$1 AND status='completedUnbound'
+         FOR UPDATE
+        "#,
+    )
+    .bind(blob_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let (
+        owner_did,
+        owner_device_id,
+        owner_key_id,
+        owner_auth_generation,
+        purpose,
+        media_type,
+        plaintext_size,
+        ciphertext_size,
+        ciphertext_sha256,
+        uploaded_at,
+        unbound_expires_at,
+    ) = row.ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+    let author_did = device_did(after.author())?;
+    let author_device_id = device_uuid(after.author());
+    if owner_did != author_did
+        || owner_device_id != author_device_id
+        || owner_key_id != URL_SAFE_NO_PAD.encode(after.author_key_id())
+        || u64::try_from(owner_auth_generation).ok()
+            != Some(after.author_auth_generation_at_origin())
+        || purpose != "metadata"
+        || ciphertext_size != signed_size
+        || ciphertext_sha256.as_slice() != signed_avatar.ciphertext_sha256()
+        || uploaded_at > applied_at
+        || applied_at >= unbound_expires_at
+    {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let plaintext_size_u64 =
+        u64::try_from(plaintext_size).map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
+    let aad_bytes = canonical_metadata_avatar_blob_aad(
+        *after.coordinate_conversation_id(),
+        *after.origin_transition_id(),
+        after.metadata_version(),
+        *signed_avatar.blob_id(),
+        &media_type,
+        plaintext_size_u64,
+    );
+    let origin_transition_id = Uuid::from_bytes(*after.origin_transition_id());
+    let metadata_version = i64::try_from(after.metadata_version())
+        .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
+    Ok(Some(MetadataAvatarPersistence::Fresh {
+        snapshot: MetadataAvatarBinding {
+            avatar_blob_id: blob_id,
+            avatar_ciphertext_sha256: ciphertext_sha256.clone(),
+            avatar_ciphertext_size: ciphertext_size,
+            avatar_binding_origin_transition_id: origin_transition_id,
+            avatar_binding_metadata_version: metadata_version,
+            avatar_binding_owner_did: owner_did.clone(),
+            avatar_binding_owner_device_id: owner_device_id,
+        },
+        binding: NewBlobBinding {
+            blob_id,
+            binding_kind: BindingKind::MetadataAvatar,
+            conversation_id,
+            entry_seq: None,
+            message_id: None,
+            metadata_origin_transition_id: Some(origin_transition_id),
+            metadata_version: Some(metadata_version),
+            owner_did,
+            owner_device_id,
+            descriptor_bytes: signed_avatar.canonical_descriptor().to_vec(),
+            descriptor_sha256: signed_avatar.digest().to_vec(),
+            aad_sha256: Sha256::digest(&aad_bytes).to_vec(),
+            aad_bytes,
+            ciphertext_sha256,
+            plaintext_size,
+            ciphertext_size,
+            purpose: BlobPurpose::Metadata,
+            bound_at: applied_at,
+            uploaded_at,
+            unbound_expires_at,
+        },
+    }))
+}
+
 async fn spine_artifacts(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
@@ -1268,6 +1470,63 @@ fn canonical_recovery_primary_event_payload(
                 Uuid::from_bytes(*welcome.welcome_id()),
                 Uuid::from_bytes(*welcome.coordinate().conversation_id()),
             ))
+        }
+        _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
+    }
+}
+
+fn submit_transition_authority_matches_plan(plan: &ConversationPersistencePlan) -> bool {
+    let plan_kind = plan.effects().kind();
+    matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if evidence.signed_authority().is_some_and(|authority| matches!(
+                (authority.kind(), plan_kind),
+                (SignedMutationKind::CommitTransition, PlanKind::Commit)
+                    | (SignedMutationKind::PolicyTransition, PlanKind::Policy)
+                    | (SignedMutationKind::MetadataTransition, PlanKind::Metadata)
+                    | (SignedMutationKind::LeaveCommitFulfillment, PlanKind::Commit)
+            ))
+    )
+}
+
+fn canonical_submit_transition_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    let signed = match plan.effects().authority() {
+        Some(PlanAuthority::Transition(evidence)) => evidence
+            .signed_authority()
+            .ok_or(ExecutionContextHydrationError::MissingAuthority)?,
+        _ => return Err(ExecutionContextHydrationError::MissingAuthority),
+    };
+    if !submit_transition_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    match signed.kind() {
+        SignedMutationKind::CommitTransition
+        | SignedMutationKind::PolicyTransition
+        | SignedMutationKind::MetadataTransition => Ok(format!(
+                r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+                conversation_id.hyphenated(),
+            )
+            .into_bytes()),
+        SignedMutationKind::LeaveCommitFulfillment => {
+            let wrapper: serde_json::Value = serde_json::from_slice(signed.signed_request_bytes())
+                .map_err(|_| ExecutionContextHydrationError::ArtifactMismatch)?;
+            let leave_request_id = wrapper
+                .get("body")
+                .and_then(|body| body.get("leaveRequestId"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .filter(|value| value.get_version_num() == 4)
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(format!(
+                r#"{{"$type":"blue.catbird.chat.defs#leaveRequestEvent","leaveRequestId":"{}","conversationId":"{}","status":"fulfilled"}}"#,
+                leave_request_id.hyphenated(),
+                conversation_id.hyphenated(),
+            )
+            .into_bytes())
         }
         _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
     }
@@ -1629,32 +1888,42 @@ async fn hydrate_execution_context_inner_with_g6(
         // and historical terminal-graph verification disagree.
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
-    let superseded = plan
+    let prior_bound_dispositions = plan
         .effects()
         .welcome_changes()
         .iter()
         .filter_map(|change| match (change.before(), change.after()) {
             (Some(before), Some(after))
                 if before.status() == WelcomeStatus::Pending
-                    && after.status() == WelcomeStatus::Superseded =>
+                    && matches!(
+                        after.status(),
+                        WelcomeStatus::Superseded | WelcomeStatus::Expired
+                    ) =>
             {
-                Some(after)
+                Some((
+                    after,
+                    if after.status() == WelcomeStatus::Expired {
+                        "expired"
+                    } else {
+                        "superseded"
+                    },
+                ))
             }
             _ => None,
         })
         .collect::<Vec<_>>();
-    let disposition_recipients = superseded
+    let disposition_recipients = prior_bound_dispositions
         .iter()
-        .map(|welcome| welcome.recipient().clone())
+        .map(|(welcome, _)| welcome.recipient().clone())
         .collect::<BTreeSet<_>>();
-    if disposition_recipients.len() != superseded.len() {
+    if disposition_recipients.len() != prior_bound_dispositions.len() {
         return Err(ExecutionContextHydrationError::AudienceMismatch);
     }
-    let mut welcome_dispositions = Vec::with_capacity(superseded.len());
-    for welcome in superseded {
+    let mut welcome_dispositions = Vec::with_capacity(prior_bound_dispositions.len());
+    for (welcome, status) in prior_bound_dispositions {
         let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
         let payload =
-            super::delivery::canonical_welcome_disposition_event_payload(welcome_id, "superseded");
+            super::delivery::canonical_welcome_disposition_event_payload(welcome_id, status);
         let recipients = vec![(welcome.recipient().clone(), EventEntitlementKind::Welcome)];
         let event = match g6_prelude {
             Some(prelude) => g6_event(prelude, EventKind::WelcomeDisposition, payload, recipients)?,
@@ -1722,7 +1991,14 @@ async fn hydrate_execution_context_inner_with_g6(
         PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection | PlanKind::WelcomeExpiry => {
             return Err(ExecutionContextHydrationError::ArtifactMismatch);
         }
-        _ if terminal_welcome_changes.is_empty() => None,
+        _ if terminal_welcome_changes.is_empty()
+            || terminal_welcome_changes.iter().all(|welcome| {
+                welcome.status() == WelcomeStatus::Expired
+                    && plan.effects().kind() != PlanKind::WelcomeExpiry
+            }) =>
+        {
+            None
+        }
         _ => return Err(ExecutionContextHydrationError::ArtifactMismatch),
     };
     let (welcome_expiry, welcome_response) = match plan.effects().kind() {
@@ -1820,6 +2096,7 @@ async fn hydrate_execution_context_inner_with_g6(
         participant_period_ids,
         closing_participant_periods,
         metadata_author,
+        metadata_avatar,
         spine,
         recovery_open,
     ) = if g6_prelude.is_some() {
@@ -1828,6 +2105,7 @@ async fn hydrate_execution_context_inner_with_g6(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            None,
             None,
             g6_spine_artifacts(plan)?,
             None,
@@ -1840,6 +2118,7 @@ async fn hydrate_execution_context_inner_with_g6(
             participant_period_ids(transaction, plan).await?,
             closing_participant_periods(transaction, plan).await?,
             metadata_author(transaction, plan, &facts, &actor_row).await?,
+            metadata_avatar(transaction, plan, facts.applied_at).await?,
             spine_artifacts(transaction, plan, &artifacts).await?,
             recovery_open(transaction, plan).await?,
         )
@@ -1860,6 +2139,7 @@ async fn hydrate_execution_context_inner_with_g6(
         spine,
         opened_leaves,
         metadata_author,
+        metadata_avatar,
         participant_period_ids,
         leaf_period_ids,
         entry_recipients,
@@ -2022,6 +2302,46 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
 }
 
 pub(in crate::chat_protocol) async fn apply_prepared_recovery_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+/// Non-Recovery `submitTransition` capsule constructor. The facade supplies
+/// only the exact repository-minted control row; this module derives the
+/// complete primary event and every Welcome-disposition payload from the
+/// sealed plan.
+pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_execution<
+    'borrow,
+    'connection,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if is_recovery_plan(plan) || !submit_transition_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_submit_transition_primary_event_payload(plan)?;
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_submit_transition_execution(
     prepared: PreparedConversationExecution<'_, '_, '_>,
 ) -> Result<AppliedTransition, ExecutorError> {
     crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
@@ -2451,6 +2771,35 @@ pub(crate) async fn prepare_device_revocation_batch_execution<'transaction, 'con
     }
 }
 
+/// G6 facade-only production constructor. Every conversation receives the
+/// canonical empty artifact set required by an entryless device revocation;
+/// neither handlers nor the higher-level repository facade can inject control
+/// bytes, a broad revocation event, or Welcome-disposition payloads.
+pub(crate) async fn prepare_canonical_device_revocation_batch_execution<
+    'transaction,
+    'connection,
+    'plan,
+>(
+    transaction: &'transaction mut Transaction<'connection, Postgres>,
+    plan: &'plan DeviceRevocationBatchPersistencePlan,
+    prelude: LockedG6Prelude,
+) -> Result<
+    PreparedDeviceRevocationBatchExecution<'transaction, 'plan>,
+    SequentialDeviceRevocationError,
+> {
+    let artifact_inputs = plan
+        .conversations()
+        .iter()
+        .map(|conversation| {
+            ConversationExecutionArtifacts::new(
+                Uuid::from_bytes(*conversation.state().coordinate.conversation_id()),
+                ExecutionContextArtifacts::default(),
+            )
+        })
+        .collect();
+    prepare_device_revocation_batch_execution(transaction, plan, prelude, artifact_inputs).await
+}
+
 /// Test compatibility for legacy mutation harnesses. Production does not
 /// compile this separable plan/context execution seam.
 #[cfg(test)]
@@ -2666,6 +3015,6 @@ fn g6_scope_bound_production_pipeline_typecheck() {
     let _ = super::core::LockedG6PreheadScope::seal_fanout;
     let _ = super::core::hydrate_locked_g6_prelude;
     let _ = crate::chat_protocol::state_machine::HydrationAuthority::plan_device_revocation_batch;
-    let _ = prepare_device_revocation_batch_execution;
+    let _ = prepare_canonical_device_revocation_batch_execution;
     let _ = apply_device_revocation_batch_sequential;
 }

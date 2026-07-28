@@ -1666,6 +1666,84 @@ pub(crate) async fn terminalize_welcome_delivery_for_supersession(
     .await
 }
 
+/// Expire a prior-coordinate Welcome as part of a later coordinate-changing
+/// transition. The sealed plan carries every immutable bundle/delivery column,
+/// so this uses the same complete CAS as standalone expiry without accepting a
+/// caller-authored `WelcomeCasBinding`.
+pub(crate) async fn terminalize_prior_bound_welcome_expiry(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &crate::chat_protocol::state_machine::WelcomeWork,
+    terminal_at: DateTime<Utc>,
+    event_position: i64,
+) -> Result<(), DeliveryRepositoryError> {
+    use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
+    use crate::chat_protocol::state_machine::WelcomeStatus;
+
+    if binding.status() != WelcomeStatus::Expired
+        || binding.coordinate().lifecycle() != PublicGroupSnapshotLifecycle::Active
+        || terminal_at.timestamp_millis() != binding.expires_at().unix_millis()
+    {
+        return Err(DeliveryRepositoryError::InvalidTerminalAuthority);
+    }
+    let recipient_did = std::str::from_utf8(binding.recipient().principal().as_bytes())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let generation = i64::try_from(binding.coordinate().generation())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let state_version = i64::try_from(binding.coordinate().state_version())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let epoch = i64::try_from(binding.coordinate().epoch())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let welcome_id = Uuid::from_bytes(*binding.welcome_id());
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.welcome_deliveries AS delivery
+           SET status='expired', terminal_at=$2
+          FROM chat.welcome_bundles AS bundle
+         WHERE delivery.welcome_id=$1 AND delivery.status='pending'
+           AND bundle.welcome_id=delivery.welcome_id
+           AND bundle.conversation_id=$3 AND bundle.entry_seq=$4
+           AND bundle.generation=$5 AND bundle.state_version=$6
+           AND bundle.group_id=$7 AND bundle.epoch=$8
+           AND bundle.group_context_hash=$9 AND bundle.confirmation_tag=$10
+           AND bundle.wrapper_sha256=$11
+           AND delivery.recipient_did=$12 AND delivery.recipient_device_id=$13
+           AND delivery.recovery_request_id=$14 AND delivery.key_package_ref=$15
+           AND delivery.expires_at=$2
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(terminal_at)
+    .bind(Uuid::from_bytes(*binding.coordinate().conversation_id()))
+    .bind(
+        i64::try_from(binding.transition_seq())
+            .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?,
+    )
+    .bind(generation)
+    .bind(state_version)
+    .bind(binding.coordinate().group_id().to_vec())
+    .bind(epoch)
+    .bind(binding.coordinate().group_context_hash().to_vec())
+    .bind(binding.coordinate().confirmation_tag().to_vec())
+    .bind(binding.sha256().to_vec())
+    .bind(recipient_did)
+    .bind(Uuid::from_bytes(*binding.recipient().device_id()))
+    .bind(Uuid::from_bytes(*binding.recovery_request_id()))
+    .bind(binding.key_package_ref().to_vec())
+    .execute(&mut **transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+    insert_welcome_disposition(
+        transaction,
+        welcome_id,
+        &WelcomeDisposition::Expired,
+        terminal_at,
+        event_position,
+    )
+    .await
+}
+
 async fn insert_welcome_disposition(
     transaction: &mut Transaction<'_, Postgres>,
     welcome_id: Uuid,

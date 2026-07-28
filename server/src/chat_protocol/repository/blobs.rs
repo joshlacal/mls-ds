@@ -887,6 +887,37 @@ pub(crate) async fn bind_application_blob(
     Ok(())
 }
 
+/// Bind one repository-locked completed-unbound metadata avatar. The immutable
+/// binding carries the signed descriptor plus the canonical avatar-blob AAD
+/// derived during execution-context hydration. It is deliberately separate
+/// from application attachment binding so neither purpose can inhabit the
+/// other's persistence path.
+pub(crate) async fn bind_metadata_avatar_blob(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &NewBlobBinding,
+) -> Result<(), BlobRepositoryError> {
+    if binding.binding_kind != BindingKind::MetadataAvatar
+        || binding.purpose != BlobPurpose::Metadata
+        || binding.entry_seq.is_some()
+        || binding.message_id.is_some()
+        || binding.metadata_origin_transition_id.is_none()
+        || binding.metadata_version.is_none()
+    {
+        return Err(BlobRepositoryError::PurposeBindingMismatch);
+    }
+    cas_bind_blob(
+        transaction,
+        binding.blob_id,
+        &binding.owner_did,
+        binding.owner_device_id,
+        binding.bound_at,
+    )
+    .await?;
+    insert_blob_binding(transaction, binding).await?;
+    apply_usage_delta(transaction, &binding.owner_did, 0, 0, -1, 0).await?;
+    Ok(())
+}
+
 /// Delete a completed-unbound blob by its signing owner. Usage delta:
 ///   used -= ciphertext_size (deleted leaves the used set),
 ///   reserved += 0, live_unbound -= 1, blob_count -= 1.

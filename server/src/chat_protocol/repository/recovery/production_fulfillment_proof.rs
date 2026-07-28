@@ -13,8 +13,7 @@ use super::production_proof_fixture::{
     FixtureIdentity, SignedRecoveryEnvelope,
 };
 use super::*;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use chrono::{DateTime, SecondsFormat, Utc};
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
@@ -180,96 +179,6 @@ async fn prepare_request(
         .map_err(|error| format!("plan committed Recovery prerequisite request: {error:?}"))
 }
 
-#[derive(FromRow)]
-struct RequestResponseRow {
-    conversation_id: Uuid,
-    requester_did: String,
-    requester_device_id: Uuid,
-    requester_key_id: String,
-    requester_auth_generation: i64,
-    recovery_kind: String,
-    request_status: String,
-    requested_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    reservation_status: String,
-    key_package_ref: Vec<u8>,
-    wrapper_bytes: Vec<u8>,
-    wrapper_sha256: Vec<u8>,
-}
-
-async fn exact_request_response(
-    transaction: &mut Transaction<'_, Postgres>,
-    proof: &FulfillmentProof,
-) -> Result<Vec<u8>, String> {
-    let row: RequestResponseRow = sqlx::query_as(
-        "SELECT request.conversation_id,request.requester_did,request.requester_device_id,\
-                request.requester_key_id,request.requester_auth_generation,request.recovery_kind,\
-                request.status AS request_status,request.requested_at,request.expires_at,\
-                reservation.status AS reservation_status,package.key_package_ref,\
-                package.wrapper_bytes,package.wrapper_sha256 \
-           FROM chat.leaf_recovery_requests request \
-           JOIN chat.key_package_reservations reservation \
-             ON reservation.recovery_request_id=request.recovery_request_id \
-           JOIN chat.key_packages package ON package.key_package_ref=request.key_package_ref \
-          WHERE request.recovery_request_id=$1",
-    )
-    .bind(proof.request.operation_id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(|error| format!("read committed Recovery prerequisite response: {error}"))?;
-    if row.conversation_id != proof.fixture.conversation_id
-        || row.requester_did != proof.fixture.requester.did
-        || row.requester_device_id != proof.fixture.requester.device_id
-        || row.requester_key_id != proof.fixture.requester.key_id
-        || row.requester_auth_generation != 1
-        || row.recovery_kind != "replace"
-        || row.request_status != "open"
-        || row.reservation_status != "active"
-        || row.key_package_ref.as_slice() != proof.fixture.requester_key_package_ref
-        || row.wrapper_bytes != proof.fixture.requester_key_package_wrapper
-        || row.wrapper_sha256.as_slice()
-            != Sha256::digest(&proof.fixture.requester_key_package_wrapper).as_slice()
-    {
-        return Err(
-            "committed Recovery prerequisite rows do not exactly match the two-party fixture"
-                .to_owned(),
-        );
-    }
-    serde_json::to_vec(&json!({"recovery": {
-        "recoveryRequestId": proof.request.operation_id.hyphenated().to_string(),
-        "conversationId": row.conversation_id.hyphenated().to_string(),
-        "requesterDid": row.requester_did,
-        "requesterDeviceId": row.requester_device_id.hyphenated().to_string(),
-        "recoveryKind": row.recovery_kind,
-        "boundCoordinate": coordinate_json(&proof.fixture.prior),
-        "reservation": {
-            "recoveryRequestId": proof.request.operation_id.hyphenated().to_string(),
-            "conversationId": row.conversation_id.hyphenated().to_string(),
-            "boundCoordinate": coordinate_json(&proof.fixture.prior),
-            "requesterDid": proof.fixture.requester.did,
-            "requesterDeviceId": proof.fixture.requester.device_id.hyphenated().to_string(),
-            "requesterKeyId": proof.fixture.requester.key_id,
-            "requesterAuthGeneration": 1,
-            "keyPackageRef": STANDARD.encode(&row.key_package_ref),
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "purpose": "leafRecovery",
-            "status": row.reservation_status,
-            "expiresAt": row.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "keyPackage": {
-                "framing": "mlsMessage",
-                "contentType": "keyPackage",
-                "bytes": STANDARD.encode(&row.wrapper_bytes),
-                "sha256": STANDARD.encode(&row.wrapper_sha256),
-                "keyPackageRef": STANDARD.encode(&row.key_package_ref),
-            }
-        },
-        "status": row.request_status,
-        "requestedAt": row.requested_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        "expiresAt": row.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-    }}))
-    .map_err(|error| format!("encode committed Recovery prerequisite response: {error}"))
-}
-
 async fn commit_request_prerequisite(
     pool: &PgPool,
     proof: &FulfillmentProof,
@@ -302,7 +211,7 @@ async fn commit_request_prerequisite(
         .apply(&mut transaction)
         .await
         .map_err(|error| format!("apply committed Recovery prerequisite: {error:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
+    let (transition, scope, completion, material, response) = client_completion(applied);
     if !matches!(
         material,
         RecoveryCanonicalMaterial::Requested {
@@ -315,7 +224,13 @@ async fn commit_request_prerequisite(
                 .to_owned(),
         );
     }
-    let response = exact_request_response(&mut transaction, proof).await?;
+    let response = response
+        .filter(|response| response.endpoint() == RecoveryOperationEndpoint::RequestLeafRecovery)
+        .ok_or_else(|| {
+            "fulfillment prerequisite graph returned no canonical request response".to_owned()
+        })?
+        .as_bytes()
+        .to_vec();
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &authority,
@@ -734,115 +649,6 @@ async fn prepare_fulfillment(
         .map_err(|error| format!("plan genuine Recovery fulfillment: {error:?}"))
 }
 
-#[derive(FromRow)]
-struct FulfillmentResponseRow {
-    accepted_payload_bytes: Vec<u8>,
-    welcome_id: Uuid,
-    transition_id: Uuid,
-    entry_seq: i64,
-    generation: i64,
-    state_version: i64,
-    group_id: Vec<u8>,
-    epoch: i64,
-    group_context_hash: Vec<u8>,
-    confirmation_tag: Vec<u8>,
-    wrapper_bytes: Vec<u8>,
-    wrapper_sha256: Vec<u8>,
-    recipient_did: String,
-    recipient_device_id: Uuid,
-    recovery_request_id: Uuid,
-    key_package_ref: Vec<u8>,
-    expires_at: DateTime<Utc>,
-    status: String,
-}
-
-async fn exact_fulfillment_response(
-    transaction: &mut Transaction<'_, Postgres>,
-    proof: &FulfillmentProof,
-    applied: &AppliedTransition,
-    welcome_id: Uuid,
-) -> Result<Vec<u8>, String> {
-    let row: FulfillmentResponseRow = sqlx::query_as(
-        "SELECT entry.accepted_payload_bytes,welcome.welcome_id,welcome.transition_id,\
-                welcome.entry_seq,welcome.generation,welcome.state_version,welcome.group_id,\
-                welcome.epoch,welcome.group_context_hash,welcome.confirmation_tag,\
-                welcome.wrapper_bytes,welcome.wrapper_sha256,delivery.recipient_did,\
-                delivery.recipient_device_id,delivery.recovery_request_id,\
-                delivery.key_package_ref,delivery.expires_at,delivery.status \
-           FROM chat.entries entry \
-           JOIN chat.welcome_bundles welcome \
-             ON welcome.conversation_id=entry.conversation_id \
-            AND welcome.transition_id=entry.transition_id \
-            AND welcome.entry_seq=entry.seq \
-           JOIN chat.welcome_deliveries delivery ON delivery.welcome_id=welcome.welcome_id \
-          WHERE entry.conversation_id=$1 AND entry.seq=$2 AND entry.transition_id=$3",
-    )
-    .bind(proof.fixture.conversation_id)
-    .bind(
-        i64::try_from(applied.allocated_seq)
-            .map_err(|_| "Recovery fulfillment response sequence overflows SQL".to_owned())?,
-    )
-    .bind(proof.fulfillment_transition_id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(|error| format!("read exact Recovery fulfillment response: {error}"))?;
-    let next = proof.fixture.next.coordinate();
-    if row.welcome_id != welcome_id
-        || row.transition_id != proof.fulfillment_transition_id
-        || row.entry_seq
-            != i64::try_from(applied.allocated_seq)
-                .map_err(|_| "Recovery fulfillment response sequence overflows SQL".to_owned())?
-        || row.generation
-            != i64::try_from(next.generation())
-                .map_err(|_| "Recovery fulfillment response generation overflows SQL".to_owned())?
-        || row.state_version
-            != i64::try_from(next.state_version()).map_err(|_| {
-                "Recovery fulfillment response state version overflows SQL".to_owned()
-            })?
-        || row.group_id.as_slice() != next.group_id()
-        || row.epoch
-            != i64::try_from(next.epoch())
-                .map_err(|_| "Recovery fulfillment response epoch overflows SQL".to_owned())?
-        || row.group_context_hash.as_slice() != next.group_context_hash()
-        || row.confirmation_tag.as_slice() != next.confirmation_tag()
-        || row.wrapper_bytes != proof.fixture.welcome
-        || row.wrapper_sha256.as_slice() != Sha256::digest(&proof.fixture.welcome).as_slice()
-        || row.recipient_did != proof.fixture.requester.did
-        || row.recipient_device_id != proof.fixture.requester.device_id
-        || row.recovery_request_id != proof.request.operation_id
-        || row.key_package_ref.as_slice() != proof.fixture.requester_key_package_ref
-        || row.status != "pending"
-    {
-        return Err(
-            "persisted Recovery fulfillment response does not exactly match the signed products"
-                .to_owned(),
-        );
-    }
-    let entry: Value = serde_json::from_slice(&row.accepted_payload_bytes)
-        .map_err(|error| format!("decode persisted Recovery fulfillment entry: {error}"))?;
-    serde_json::to_vec(&json!({
-        "coordinates": coordinate_json(next),
-        "entry": entry,
-        "welcomes": [{
-            "welcomeId": row.welcome_id.hyphenated().to_string(),
-            "conversationId": proof.fixture.conversation_id.hyphenated().to_string(),
-            "transitionSeq": applied.allocated_seq,
-            "coordinates": coordinate_json(next),
-            "status": row.status,
-            "opaqueWelcome": STANDARD.encode(&row.wrapper_bytes),
-            "sha256": STANDARD.encode(&row.wrapper_sha256),
-            "recipientDid": row.recipient_did,
-            "recipientDeviceId": row.recipient_device_id.hyphenated().to_string(),
-            "provenance": {
-                "recoveryRequestId": row.recovery_request_id.hyphenated().to_string(),
-                "keyPackageRef": STANDARD.encode(&row.key_package_ref),
-            },
-            "expiresAt": row.expires_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        }],
-    }))
-    .map_err(|error| format!("encode exact Recovery fulfillment response: {error}"))
-}
-
 async fn new_fulfillment_proof(pool: &PgPool) -> Result<FulfillmentProof, String> {
     let dids = fresh_two_party_fallback_dids(pool).await?;
     let requester =
@@ -886,7 +692,7 @@ pub(super) async fn run_leaf_recovery_fulfillment_happy_path(pool: &PgPool) -> R
 
     let trusted = TrustedRequestInstant::capture()
         .map_err(|error| format!("capture Recovery fulfillment instant: {error:?}"))?;
-    let (body, welcome_id) = fulfillment_body(&proof, &trusted);
+    let (body, _welcome_id) = fulfillment_body(&proof, &trusted);
     let envelope = leaf_recovery_fulfillment(&proof.fixture.fulfiller, body)?;
     if envelope.operation_id != proof.fulfillment_transition_id {
         return Err(
@@ -940,7 +746,7 @@ pub(super) async fn run_leaf_recovery_fulfillment_happy_path(pool: &PgPool) -> R
         .apply(&mut transaction)
         .await
         .map_err(|error| format!("apply genuine Recovery fulfillment: {error:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
+    let (transition, scope, completion, material, response) = client_completion(applied);
     if !matches!(
         material,
         RecoveryCanonicalMaterial::Fulfilled {
@@ -952,8 +758,15 @@ pub(super) async fn run_leaf_recovery_fulfillment_happy_path(pool: &PgPool) -> R
     {
         return Err("Recovery fulfillment returned non-fulfillment canonical material".to_owned());
     }
-    let response =
-        exact_fulfillment_response(&mut transaction, &proof, &transition, welcome_id).await?;
+    let response = response
+        .filter(|response| {
+            response.endpoint() == RecoveryOperationEndpoint::SubmitRecoveryFulfillment
+        })
+        .ok_or_else(|| {
+            "fulfillment graph returned no canonical submitTransition response".to_owned()
+        })?
+        .as_bytes()
+        .to_vec();
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
         &authority,
@@ -1176,15 +989,17 @@ pub(super) async fn run_leaf_recovery_fulfillment_due_for_expiry_ordering(
     .apply(&mut transaction)
     .await
     .map_err(|error| format!("apply fulfillment client expiry: {error:?}"))?;
-    let (transition, scope, completion, material) = client_completion(applied);
-    if !matches!(
-        material,
-        RecoveryCanonicalMaterial::ClientExpired {
-            recovery_request_id,
-            post_apply_error: RecoveryClientTerminalError::RecoveryExpired,
-            ..
-        } if recovery_request_id == proof.request.operation_id
-    ) || transition.event_positions.len() != 1
+    let (transition, scope, completion, material, response) = client_completion(applied);
+    if response.is_some()
+        || !matches!(
+            material,
+            RecoveryCanonicalMaterial::ClientExpired {
+                recovery_request_id,
+                post_apply_error: RecoveryClientTerminalError::RecoveryExpired,
+                ..
+            } if recovery_request_id == proof.request.operation_id
+        )
+        || transition.event_positions.len() != 1
     {
         return Err(
             "fulfillment DueForExpiry returned the wrong canonical material/event count".to_owned(),

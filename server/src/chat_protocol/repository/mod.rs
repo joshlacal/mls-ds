@@ -46,6 +46,11 @@ pub(crate) mod relationship;
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) mod reset;
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) mod revocation;
+#[cfg(not(test))]
+pub(crate) mod submit_transition;
 pub(crate) mod transition;
 #[cfg(not(test))]
 #[allow(dead_code)]

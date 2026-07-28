@@ -1102,6 +1102,55 @@ impl Serialize for DagMapRef<'_> {
     }
 }
 
+/// Canonical `#metadataAvatarBlobAad` derived only from signed metadata origin
+/// fields and repository-locked immutable blob columns.
+const METADATA_AVATAR_BLOB_AAD_DOMAIN: &[u8] = b"CATBIRD-CHAT-METADATA-AVATAR-BLOB\0";
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn canonical_metadata_avatar_blob_aad(
+    conversation_id: [u8; 16],
+    origin_transition_id: [u8; 16],
+    original_metadata_version: u64,
+    blob_id: [u8; 16],
+    media_type: &str,
+    plaintext_size: u64,
+) -> Vec<u8> {
+    let fields = BTreeMap::from([
+        ("blobId".to_owned(), DagValue::Bytes(blob_id.to_vec())),
+        (
+            "conversationId".to_owned(),
+            DagValue::Bytes(conversation_id.to_vec()),
+        ),
+        (
+            "mediaType".to_owned(),
+            DagValue::Text(media_type.to_owned()),
+        ),
+        (
+            "originTransitionId".to_owned(),
+            DagValue::Bytes(origin_transition_id.to_vec()),
+        ),
+        (
+            "originalMetadataVersion".to_owned(),
+            DagValue::Integer(original_metadata_version),
+        ),
+        (
+            "plaintextSize".to_owned(),
+            DagValue::Integer(plaintext_size),
+        ),
+        (
+            "protocol".to_owned(),
+            DagValue::Text("blue.catbird.chat.metadata.avatar".to_owned()),
+        ),
+        ("purpose".to_owned(), DagValue::Text("metadata".to_owned())),
+    ]);
+    let canonical = serde_ipld_dagcbor::to_vec(&DagMapRef(&fields))
+        .expect("closed metadata-avatar AAD always encodes");
+    let mut aad = Vec::with_capacity(METADATA_AVATAR_BLOB_AAD_DOMAIN.len() + canonical.len());
+    aad.extend_from_slice(METADATA_AVATAR_BLOB_AAD_DOMAIN);
+    aad.extend_from_slice(&canonical);
+    aad
+}
+
 /// Strictly decoded and canonically projected, but not yet Ed25519-authorized.
 /// It is intentionally non-Clone and cannot be deserialized or forged.
 #[derive(Debug)]

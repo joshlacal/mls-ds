@@ -11,14 +11,18 @@ use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::super::transcript::VerifiedMutationProjection;
 use super::{
     super::{
         dpop::VerifiedChatDeviceRequest,
-        transcript::{SignedMutationKind, VerifiedMutationProjection, VerifiedSignedMutation},
+        transcript::{SignedMutationKind, VerifiedSignedMutation},
         validation::BareDid,
     },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
 };
+#[cfg(not(test))]
+use super::{recovery, reset, revocation, submit_transition, welcome_terminal};
 
 #[derive(Debug, Error)]
 pub(crate) enum PreludeError {
@@ -215,6 +219,63 @@ impl OperationClaimBinding {
         })
     }
 
+    fn from_signed_admission(
+        admission: &auth::SignedOperationAdmission,
+    ) -> Result<Self, PreludeError> {
+        let endpoint = admission.pre_replay().endpoint().as_str();
+        if !endpoint_has_operation_claim(endpoint) {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        let mutation = admission.canonical();
+        let accepted_request_bytes = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        let operation_id = admission.operation_id()?;
+        if operation_id.get_version_num() != 4 {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        Ok(Self {
+            operation_id,
+            principal_did: admission.pre_replay().subject().as_str().to_owned(),
+            endpoint_nsid: endpoint.to_owned(),
+            mutation_kind: mutation.type_id().to_owned(),
+            request_digest: *mutation.request_digest(),
+            accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
+            signature: *mutation.signature(),
+            claimed_at: admission.pre_replay().trusted_instant().datetime(),
+        })
+    }
+
+    fn from_signed_replay_authority(
+        authority: &auth::SignedOperationReplayAuthority,
+    ) -> Result<Self, PreludeError> {
+        let endpoint = authority.endpoint().as_str();
+        if !endpoint_has_operation_claim(endpoint) {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        let mutation = authority.mutation();
+        let accepted_request_bytes = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        let operation_id = authority
+            .repository_receipt()
+            .operation_id()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        if operation_id.get_version_num() != 4 {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        Ok(Self {
+            operation_id,
+            principal_did: authority.subject().as_str().to_owned(),
+            endpoint_nsid: endpoint.to_owned(),
+            mutation_kind: mutation.type_id().to_owned(),
+            request_digest: *mutation.request_digest(),
+            accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
+            signature: *mutation.signature(),
+            claimed_at: authority.trusted_instant(),
+        })
+    }
+
     #[cfg(test)]
     fn for_test(
         operation_id: Uuid,
@@ -323,6 +384,273 @@ pub(crate) struct OperationReservationGuard {
 struct OperationClaimGuard {
     transaction_id: String,
     binding: OperationClaimBinding,
+}
+
+/// Consuming result of global arbitration for an ordinary signed operation.
+/// The replay arm remains byte-opaque; only repository endpoint facades can
+/// lock it and later release exact completion material.
+pub(crate) enum PreparedSignedOperation {
+    First {
+        authority: VerifiedChatDeviceRequest,
+        reservation: OperationReservationGuard,
+    },
+    Replay {
+        authority: auth::SignedOperationReplayAuthority,
+        replay: OperationReplayGuard,
+    },
+}
+
+impl fmt::Debug for PreparedSignedOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::First { .. } => formatter.write_str("PreparedSignedOperation::First(<sealed>)"),
+            Self::Replay { .. } => formatter.write_str("PreparedSignedOperation::Replay(<opaque>)"),
+        }
+    }
+}
+
+impl PreparedSignedOperation {
+    /// Closed-union discriminator for the HTTP compositor. This exposes no
+    /// request bytes or authority: `submitTransition` may use it only to route
+    /// the Recovery fulfillment arm to its stronger repository facade.
+    pub(crate) fn mutation_kind(&self) -> Option<SignedMutationKind> {
+        match self {
+            Self::First { authority, .. } => authority.mutation().map(|value| value.kind()),
+            Self::Replay { authority, .. } => Some(authority.mutation().kind()),
+        }
+    }
+}
+
+/// Pre-head proof that the replay claim and actor authority were both locked
+/// in the caller-owned transaction. It contains no response material.
+pub(in crate::chat_protocol::repository) struct LockedSignedOperationReplayAuthority {
+    transaction_id: String,
+    authority: auth::SignedOperationReplayAuthority,
+    binding: OperationClaimBinding,
+}
+
+impl LockedSignedOperationReplayAuthority {
+    pub(in crate::chat_protocol::repository) fn authority(
+        &self,
+    ) -> &auth::SignedOperationReplayAuthority {
+        &self.authority
+    }
+}
+
+/// Closed repository-only endpoint post-state proof required to release one
+/// replay. Every payload has a private constructor in the endpoint repository;
+/// sibling modules cannot implement an open proof contract or synthesize one
+/// from loose request facts.
+#[cfg(not(test))]
+pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProof {
+    ResetRequest(reset::ResetReplayPostStateProof),
+    ResetActivation(reset::ResetReplayPostStateProof),
+    DeviceRevocation(revocation::DeviceRevocationReplayPostStateProof),
+    WelcomeAcknowledgement(welcome_terminal::WelcomeReplayPostStateProof),
+    WelcomeRejection(welcome_terminal::WelcomeReplayPostStateProof),
+    Recovery(recovery::RecoveryReplayPostStateProof),
+    SubmitTransition(submit_transition::SubmitTransitionReplayPostStateProof),
+}
+
+#[cfg(not(test))]
+impl SignedOperationReplayPostStateProof {
+    fn transaction_id(&self) -> &str {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.transaction_id(),
+            Self::DeviceRevocation(proof) => proof.transaction_id(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.transaction_id()
+            }
+            Self::Recovery(proof) => proof.transaction_id(),
+            Self::SubmitTransition(proof) => proof.transaction_id(),
+        }
+    }
+
+    fn operation_id(&self) -> Uuid {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.operation_id(),
+            Self::DeviceRevocation(proof) => proof.operation_id(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.operation_id()
+            }
+            Self::Recovery(proof) => proof.operation_id(),
+            Self::SubmitTransition(proof) => proof.operation_id(),
+        }
+    }
+
+    fn principal_did(&self) -> &str {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.principal_did(),
+            Self::DeviceRevocation(proof) => proof.principal_did(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.principal_did()
+            }
+            Self::Recovery(proof) => proof.principal_did(),
+            Self::SubmitTransition(proof) => proof.principal_did(),
+        }
+    }
+
+    fn endpoint_nsid(&self) -> &str {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.endpoint_nsid(),
+            Self::DeviceRevocation(proof) => proof.endpoint_nsid(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.endpoint_nsid()
+            }
+            Self::Recovery(proof) => proof.endpoint_nsid(),
+            Self::SubmitTransition(proof) => proof.endpoint_nsid(),
+        }
+    }
+
+    fn mutation_kind(&self) -> SignedMutationKind {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.mutation_kind(),
+            Self::DeviceRevocation(proof) => proof.mutation_kind(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.mutation_kind()
+            }
+            Self::Recovery(proof) => proof.mutation_kind(),
+            Self::SubmitTransition(proof) => proof.mutation_kind(),
+        }
+    }
+
+    fn request_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.request_digest(),
+            Self::DeviceRevocation(proof) => proof.request_digest(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.request_digest()
+            }
+            Self::Recovery(proof) => proof.request_digest(),
+            Self::SubmitTransition(proof) => proof.request_digest(),
+        }
+    }
+
+    fn accepted_request_sha256(&self) -> &[u8; 32] {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => {
+                proof.accepted_request_sha256()
+            }
+            Self::DeviceRevocation(proof) => proof.accepted_request_sha256(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.accepted_request_sha256()
+            }
+            Self::Recovery(proof) => proof.accepted_request_sha256(),
+            Self::SubmitTransition(proof) => proof.accepted_request_sha256(),
+        }
+    }
+
+    fn signature(&self) -> &[u8; 64] {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.signature(),
+            Self::DeviceRevocation(proof) => proof.signature(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.signature()
+            }
+            Self::Recovery(proof) => proof.signature(),
+            Self::SubmitTransition(proof) => proof.signature(),
+        }
+    }
+
+    fn post_state_digest(&self) -> &[u8; 32] {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.post_state_digest(),
+            Self::DeviceRevocation(proof) => proof.post_state_digest(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.post_state_digest()
+            }
+            Self::Recovery(proof) => proof.post_state_digest(),
+            Self::SubmitTransition(proof) => proof.post_state_digest(),
+        }
+    }
+
+    fn expected_status(&self) -> i32 {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => {
+                proof.expected_response_status()
+            }
+            Self::DeviceRevocation(proof) => proof.expected_status(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.expected_status()
+            }
+            Self::Recovery(proof) => proof.expected_status(),
+            Self::SubmitTransition(proof) => proof.expected_status(),
+        }
+    }
+
+    fn expected_response_sha256(&self) -> &[u8; 32] {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => {
+                proof.expected_response_sha256()
+            }
+            Self::DeviceRevocation(proof) => proof.expected_response_sha256(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.expected_response_sha256()
+            }
+            Self::Recovery(proof) => proof.expected_response_sha256(),
+            Self::SubmitTransition(proof) => proof.expected_response_sha256(),
+        }
+    }
+
+    fn validates_seal(&self) -> bool {
+        match self {
+            Self::ResetRequest(proof) | Self::ResetActivation(proof) => proof.validates_seal(),
+            Self::DeviceRevocation(proof) => proof.validates_seal(),
+            Self::WelcomeAcknowledgement(proof) | Self::WelcomeRejection(proof) => {
+                proof.validates_seal()
+            }
+            Self::Recovery(proof) => proof.validates_seal(),
+            Self::SubmitTransition(proof) => proof.validates_seal(),
+        }
+    }
+
+    fn variant_matches_endpoint(&self) -> bool {
+        match self {
+            Self::ResetRequest(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.requestReset"
+                    && proof.mutation_kind() == SignedMutationKind::ResetRequest
+            }
+            Self::ResetActivation(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.activateReset"
+                    && proof.mutation_kind() == SignedMutationKind::ResetActivation
+            }
+            Self::DeviceRevocation(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.revokeDevice"
+                    && proof.mutation_kind() == SignedMutationKind::DeviceRevocation
+            }
+            Self::WelcomeAcknowledgement(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.acknowledgeWelcome"
+                    && proof.mutation_kind() == SignedMutationKind::WelcomeAcknowledgement
+            }
+            Self::WelcomeRejection(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.rejectWelcome"
+                    && proof.mutation_kind() == SignedMutationKind::WelcomeRejection
+            }
+            Self::Recovery(proof) => matches!(
+                (proof.endpoint_nsid(), proof.mutation_kind()),
+                (
+                    "blue.catbird.chat.requestLeafRecovery",
+                    SignedMutationKind::LeafRecoveryRequest,
+                ) | (
+                    "blue.catbird.chat.cancelLeafRecovery",
+                    SignedMutationKind::LeafRecoveryCancellation,
+                ) | (
+                    "blue.catbird.chat.submitTransition",
+                    SignedMutationKind::LeafRecoveryFulfillment,
+                )
+            ),
+            Self::SubmitTransition(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.submitTransition"
+                    && matches!(
+                        proof.mutation_kind(),
+                        SignedMutationKind::CommitTransition
+                            | SignedMutationKind::PolicyTransition
+                            | SignedMutationKind::MetadataTransition
+                            | SignedMutationKind::LeaveCommitFulfillment
+                    )
+            }
+        }
+    }
 }
 
 pub(crate) struct PreparedBusinessPrelude {
@@ -1398,6 +1726,29 @@ impl PreparedBusinessPrelude {
         )
     }
 
+    pub(crate) fn verify_submit_transition_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        let mutation_kind = mutation.kind();
+        if !matches!(
+            mutation_kind,
+            SignedMutationKind::CommitTransition
+                | SignedMutationKind::PolicyTransition
+                | SignedMutationKind::MetadataTransition
+                | SignedMutationKind::LeaveCommitFulfillment
+        ) {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.submitTransition",
+            mutation_kind,
+            operation_id,
+            mutation,
+        )
+    }
+
     fn verify_exact_operation_claim(
         self,
         endpoint_nsid: &str,
@@ -1555,6 +1906,65 @@ pub(crate) async fn arbitrate_operation_only(
     }))
 }
 
+pub(crate) async fn prepare_signed_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedSignedOperation, PreludeError> {
+    let binding = OperationClaimBinding::from_signed_admission(&admission)?;
+    let operation_lock = auth::reserve_canonical_signed_operation(transaction, &admission).await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if operation_lock.transaction_id() != transaction_id
+        || operation_lock.operation_id() != binding.operation_id
+    {
+        return Err(PreludeError::ForeignTransaction);
+    }
+    let existing: Option<OperationClaimRow> = sqlx::query_as(
+        r#"
+        SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
+               request_digest,accepted_request_sha256,signature,claimed_at
+          FROM chat.operation_claims
+         WHERE operation_id=$1
+        "#,
+    )
+    .bind(binding.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(existing) = existing {
+        if !existing.matches(&binding) {
+            return Err(PreludeError::OperationIdConflict);
+        }
+        let binding = OperationClaimBinding {
+            claimed_at: existing.claimed_at,
+            ..binding
+        };
+        let authority = admission.into_replay_authority()?;
+        if !binding.matches_signed_replay_authority(&authority)? {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        return Ok(PreparedSignedOperation::Replay {
+            authority,
+            replay: OperationReplayGuard {
+                operation_lock,
+                binding,
+            },
+        });
+    }
+
+    let authority = admission.into_first_authority()?;
+    if !binding.matches_authority(&authority)? {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    Ok(PreparedSignedOperation::First {
+        authority,
+        reservation: OperationReservationGuard {
+            operation_lock,
+            binding,
+        },
+    })
+}
+
 pub(crate) async fn prepare_enrollment_bootstrap_prelude(
     transaction: &mut Transaction<'_, Postgres>,
     admission: auth::EnrollmentOperationAdmission,
@@ -1622,6 +2032,86 @@ async fn validate_operation_only_replay(
     auth::load_validated_completed_business_replay(transaction, authority)
         .await?
         .ok_or(PreludeError::ClaimIntegrity)
+}
+
+pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: auth::SignedOperationReplayAuthority,
+    replay: OperationReplayGuard,
+) -> Result<LockedSignedOperationReplayAuthority, PreludeError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if replay.operation_lock.transaction_id() != transaction_id
+        || replay.operation_lock.operation_id() != replay.binding.operation_id
+        || !replay.binding.matches_signed_replay_authority(&authority)?
+    {
+        return Err(PreludeError::ForeignTransaction);
+    }
+    auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+    Ok(LockedSignedOperationReplayAuthority {
+        transaction_id,
+        authority,
+        binding: replay.binding,
+    })
+}
+
+#[cfg(not(test))]
+pub(in crate::chat_protocol::repository) async fn release_signed_operation_replay(
+    transaction: &mut Transaction<'_, Postgres>,
+    locked: LockedSignedOperationReplayAuthority,
+    post_state: SignedOperationReplayPostStateProof,
+) -> Result<CompletedIdempotentResponse, PreludeError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let binding = &locked.binding;
+    if locked.transaction_id != transaction_id
+        || post_state.transaction_id() != transaction_id.as_str()
+        || post_state.operation_id() != binding.operation_id
+        || post_state.principal_did() != binding.principal_did.as_str()
+        || post_state.endpoint_nsid() != binding.endpoint_nsid.as_str()
+        || post_state.mutation_kind().type_id() != binding.mutation_kind.as_str()
+        || post_state.request_digest() != &binding.request_digest
+        || post_state.accepted_request_sha256() != &binding.accepted_request_sha256
+        || post_state.signature() != &binding.signature
+        || post_state.post_state_digest() == &[0; 32]
+        || !(200..=599).contains(&post_state.expected_status())
+        || post_state.expected_response_sha256() == &[0; 32]
+        || !post_state.validates_seal()
+        || !post_state.variant_matches_endpoint()
+        || !binding.matches_signed_replay_authority(&locked.authority)?
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    let live_claim: Option<OperationClaimRow> = sqlx::query_as(
+        r#"
+        SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
+               request_digest,accepted_request_sha256,signature,claimed_at
+          FROM chat.operation_claims
+         WHERE operation_id=$1
+        "#,
+    )
+    .bind(binding.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if !live_claim
+        .as_ref()
+        .is_some_and(|claim| claim.matches_exact(binding))
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    let completed = auth::load_signed_operation_replay_completion(transaction, &locked.authority)
+        .await?
+        .ok_or(PreludeError::ClaimIntegrity)?;
+    let response_bytes_sha256 = <[u8; 32]>::from(Sha256::digest(completed.response_bytes()));
+    if completed.status() != post_state.expected_status()
+        || completed.response_sha256() != post_state.expected_response_sha256()
+        || &response_bytes_sha256 != post_state.expected_response_sha256()
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    Ok(completed)
 }
 
 pub(crate) async fn validate_enrollment_operation_replay(
@@ -1720,6 +2210,20 @@ impl OperationClaimBinding {
         authority: &VerifiedChatDeviceRequest,
     ) -> Result<bool, PreludeError> {
         let current = Self::from_authority(authority)?;
+        Ok(self.operation_id == current.operation_id
+            && self.principal_did == current.principal_did
+            && self.endpoint_nsid == current.endpoint_nsid
+            && self.mutation_kind == current.mutation_kind
+            && self.request_digest == current.request_digest
+            && self.accepted_request_sha256 == current.accepted_request_sha256
+            && self.signature == current.signature)
+    }
+
+    fn matches_signed_replay_authority(
+        &self,
+        authority: &auth::SignedOperationReplayAuthority,
+    ) -> Result<bool, PreludeError> {
+        let current = Self::from_signed_replay_authority(authority)?;
         Ok(self.operation_id == current.operation_id
             && self.principal_did == current.principal_did
             && self.endpoint_nsid == current.endpoint_nsid

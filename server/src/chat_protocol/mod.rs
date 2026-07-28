@@ -107,4 +107,11 @@ pub mod production_proof {
         run_reservation_row_drift_negative, run_scheduler_expiry_lifecycle,
         run_terminal_head_cas_rollback_negative,
     };
+
+    /// Execute the real metadata executor's sealed pure preflight against one
+    /// exact fixture and the canonical payload, audience, spine, and avatar
+    /// drift negatives. This is compiled out of every shipping server binary.
+    pub fn run_metadata_executor_semantic_proof() -> Result<(), String> {
+        super::state_machine::executor::run_metadata_semantic_proof()
+    }
 }

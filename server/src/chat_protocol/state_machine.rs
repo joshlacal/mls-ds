@@ -534,7 +534,7 @@ pub(crate) struct MetadataSnapshotBinding {
     nonce: [u8; 12],
     ciphertext: Vec<u8>,
     ciphertext_sha256: [u8; 32],
-    avatar_binding_digest: Option<[u8; 32]>,
+    avatar_binding: Option<MetadataAvatarDescriptorBinding>,
     author_proof: MetadataAuthorProofBinding,
     canonical_snapshot: Vec<u8>,
     digest: [u8; 32],
@@ -569,8 +569,12 @@ impl MetadataSnapshotBinding {
         &self.ciphertext_sha256
     }
 
+    pub(crate) fn avatar_binding(&self) -> Option<&MetadataAvatarDescriptorBinding> {
+        self.avatar_binding.as_ref()
+    }
+
     pub(crate) fn avatar_binding_digest(&self) -> Option<&[u8; 32]> {
-        self.avatar_binding_digest.as_ref()
+        self.avatar_binding.as_ref().map(|binding| &binding.digest)
     }
 
     pub(crate) fn coordinate_conversation_id(&self) -> &[u8; 16] {
@@ -611,6 +615,40 @@ impl MetadataSnapshotBinding {
 
     pub(crate) fn author_origin_seq(&self) -> u64 {
         self.author_proof.origin_seq
+    }
+}
+
+/// Exact signed `#metadataAvatarBinding`. Purpose is closed to `metadata` by
+/// the lexicon projector, so the sealed value carries the three variable
+/// columns plus its canonical descriptor and digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MetadataAvatarDescriptorBinding {
+    blob_id: [u8; 16],
+    ciphertext_sha256: [u8; 32],
+    ciphertext_size: u64,
+    canonical_descriptor: Vec<u8>,
+    digest: [u8; 32],
+}
+
+impl MetadataAvatarDescriptorBinding {
+    pub(crate) fn blob_id(&self) -> &[u8; 16] {
+        &self.blob_id
+    }
+
+    pub(crate) fn ciphertext_sha256(&self) -> &[u8; 32] {
+        &self.ciphertext_sha256
+    }
+
+    pub(crate) fn ciphertext_size(&self) -> u64 {
+        self.ciphertext_size
+    }
+
+    pub(crate) fn canonical_descriptor(&self) -> &[u8] {
+        &self.canonical_descriptor
+    }
+
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.digest
     }
 }
 
@@ -734,7 +772,13 @@ impl TransitionEvidence {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        )
+    ))]
     pub(crate) fn for_test_at(
         seq: u64,
         transition_id: [u8; 16],
@@ -1159,6 +1203,7 @@ pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
     completion: OperationCompletionGuard,
     prewrite: RecoveryPreludePrewriteWitness,
     accepted_control_entry_bytes: Option<Vec<u8>>,
+    canonical_response_entry_bytes: Option<Vec<u8>>,
     persistence_witness: RecoveryPersistenceWitness,
     kind: RecoveryPlannedKind,
 }
@@ -1173,6 +1218,7 @@ impl PlannedRecoveryMutation {
         OperationCompletionGuard,
         RecoveryPreludePrewriteWitness,
         Option<Vec<u8>>,
+        Option<Vec<u8>>,
         RecoveryPersistenceWitness,
         RecoveryPlannedKind,
     ) {
@@ -1182,6 +1228,7 @@ impl PlannedRecoveryMutation {
             self.completion,
             self.prewrite,
             self.accepted_control_entry_bytes,
+            self.canonical_response_entry_bytes,
             self.persistence_witness,
             self.kind,
         )
@@ -3059,6 +3106,7 @@ impl HydrationAuthority {
             completion,
             prewrite,
             accepted_control_entry_bytes: None,
+            canonical_response_entry_bytes: None,
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Request {
                 recovery_request_id: request_id,
@@ -3103,6 +3151,7 @@ impl HydrationAuthority {
             completion,
             prewrite,
             accepted_control_entry_bytes: None,
+            canonical_response_entry_bytes: None,
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Cancellation {
                 recovery_request_id: request_id,
@@ -3138,7 +3187,7 @@ impl HydrationAuthority {
             parts.execution_package.target_key_id(),
             parts.execution_package.target_auth_generation(),
         )?;
-        let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.fulfillLeafRecovery")
+        let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition")
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
         let entry = build_verified_control_entry(
             parts.mutation,
@@ -3160,10 +3209,10 @@ impl HydrationAuthority {
                 .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
         )
         .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
-        let accepted_control_entry_bytes = CanonicalControlEntryProducts::mint(&entry)
-            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
-            .durable_json()
-            .to_vec();
+        let control_products = CanonicalControlEntryProducts::mint(&entry)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let accepted_control_entry_bytes = control_products.durable_json().to_vec();
+        let canonical_response_entry_bytes = control_products.canonical_response_json().to_vec();
         let transition = hydration.plan_recovery_fulfillment_entry(
             &parts.aggregate,
             entry,
@@ -3183,6 +3232,7 @@ impl HydrationAuthority {
             completion,
             prewrite,
             accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            canonical_response_entry_bytes: Some(canonical_response_entry_bytes),
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Fulfillment {
                 recovery_request_id: request_id,
@@ -4220,6 +4270,133 @@ impl HydrationAuthority {
         digest.update(trusted_read_at.unix_millis().to_be_bytes());
         Ok(LockedRegistrationProjection {
             conversation_id: self.expected_conversation_id,
+            actor,
+            key_id,
+            registered_mls_signature_key,
+            auth_generation,
+            status: PersistedRegistrationStatus::Active,
+            trusted_read_at,
+            durable_row_digest: digest.finalize().into(),
+            transaction_id: scope.transaction_id().to_owned(),
+            authority_scope_digest: *scope.scope_digest(),
+        })
+    }
+
+    /// Project the exact actor registration for a global device-revocation
+    /// operation without inventing a conversation hydration authority.
+    ///
+    /// The zero conversation sentinel is deliberate: revocation authorization
+    /// is the only consumer that does not compare `conversation_id`, while the
+    /// ordinary request and transition authorization paths do. The distinct
+    /// digest domain and non-zero scope binding therefore make this projection
+    /// usable for G6 only, including the valid empty-fanout case.
+    pub(crate) fn locked_global_registration_from_scope_authority(
+        scope: &ScopeBoundBusinessAuthority,
+    ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        const GLOBAL_CONVERSATION_SENTINEL: [u8; 16] = [0; 16];
+
+        if scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+            || scope.actor_device_id().get_version_num() != 4
+            || scope.transaction_id().is_empty()
+            || scope.scope_digest() == &[0; 32]
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let did = BareDid::parse(scope.actor_did())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(did.as_str().as_bytes().to_vec())?,
+            *scope.actor_device_id().as_bytes(),
+        )?;
+        let dpop_jkt = scope
+            .actor_dpop_jkt()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let actor_key_id = scope
+            .actor_key_id()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let key = KeyThumbprint::parse(actor_key_id)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let key_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(key.as_str())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let actor_auth_generation = scope
+            .actor_auth_generation()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let auth_generation = u64::try_from(actor_auth_generation)
+            .ok()
+            .filter(|value| *value > 0 && *value <= MAX_PROTOCOL_INTEGER)
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let actor_signing_public_key = scope
+            .actor_signing_public_key()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let exact_signing_public_key = scope
+            .actor_projected_signing_public_key()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_signing_public_key != actor_signing_public_key {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let registered_mls_signature_key: [u8; 32] = exact_signing_public_key
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let trusted_read_at =
+            ServerTimestamp::from_unix_millis(scope.trusted_instant().timestamp_millis())?;
+
+        if scope
+            .principals()
+            .binary_search_by(|principal| principal.as_str().cmp(did.as_str()))
+            .is_err()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let exact_device = scope
+            .devices()
+            .iter()
+            .find(|device| {
+                device.user_did() == did.as_str() && device.device_id() == scope.actor_device_id()
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_device.status() != "active"
+            || exact_device.revoked_at().is_some()
+            || exact_device.dpop_jkt() != dpop_jkt
+            || exact_device.auth_generation() != actor_auth_generation
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let exact_key = scope
+            .keys()
+            .iter()
+            .find(|locked_key| {
+                locked_key.user_did() == did.as_str()
+                    && locked_key.device_id() == scope.actor_device_id()
+                    && locked_key.key_id() == actor_key_id
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_key.revoked_at().is_some()
+            || exact_key.signing_public_key_sha256()
+                != <[u8; 32]>::from(Sha256::digest(registered_mls_signature_key))
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-GLOBAL-REVOCATION-REGISTRATION\0");
+        digest.update(GLOBAL_CONVERSATION_SENTINEL);
+        digest.update((scope.transaction_id().len() as u64).to_be_bytes());
+        digest.update(scope.transaction_id().as_bytes());
+        digest.update((actor.principal().as_bytes().len() as u64).to_be_bytes());
+        digest.update(actor.principal().as_bytes());
+        digest.update(actor.device_id());
+        digest.update((dpop_jkt.len() as u64).to_be_bytes());
+        digest.update(dpop_jkt.as_bytes());
+        digest.update(key_id);
+        digest.update(registered_mls_signature_key);
+        digest.update(auth_generation.to_be_bytes());
+        digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        digest.update(scope.scope_digest());
+        Ok(LockedRegistrationProjection {
+            conversation_id: GLOBAL_CONVERSATION_SENTINEL,
             actor,
             key_id,
             registered_mls_signature_key,
@@ -5744,9 +5921,22 @@ fn parse_metadata_snapshot(
     {
         return Err(StateMachineError::InvalidHydrationAuthority);
     }
-    let avatar_binding_digest = match object.get("avatarBinding") {
+    let avatar_binding = match object.get("avatarBinding") {
         None => None,
-        Some(CanonicalValueRef::Object(value)) => Some(sealed_object_digest(&value)),
+        Some(CanonicalValueRef::Object(value)) => {
+            if closed_text(&value, "purpose")? != "metadata" {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
+            let canonical_descriptor = value.canonical_dag_cbor();
+            let digest = Sha256::digest(&canonical_descriptor).into();
+            Some(MetadataAvatarDescriptorBinding {
+                blob_id: closed_uuid(&value, "blobId")?,
+                ciphertext_sha256: closed_fixed_bytes::<32>(&value, "ciphertextSha256")?,
+                ciphertext_size: closed_integer(&value, "ciphertextSize")?,
+                canonical_descriptor,
+                digest,
+            })
+        }
         _ => return Err(StateMachineError::InvalidHydrationAuthority),
     };
     let canonical_snapshot = object.canonical_dag_cbor();
@@ -5758,7 +5948,7 @@ fn parse_metadata_snapshot(
         nonce,
         ciphertext,
         ciphertext_sha256,
-        avatar_binding_digest,
+        avatar_binding,
         author_proof,
         canonical_snapshot,
         digest,
@@ -10917,8 +11107,12 @@ impl RecoveryPlanEncoder {
         self.bytes(&value.nonce);
         self.bytes(&value.ciphertext);
         self.bytes(&value.ciphertext_sha256);
-        self.option(value.avatar_binding_digest.as_ref(), |encoder, value| {
-            encoder.bytes(value)
+        self.option(value.avatar_binding.as_ref(), |encoder, value| {
+            encoder.bytes(&value.blob_id);
+            encoder.bytes(&value.ciphertext_sha256);
+            encoder.u64(value.ciphertext_size);
+            encoder.bytes(&value.canonical_descriptor);
+            encoder.bytes(&value.digest);
         });
         self.device(&value.author_proof.author);
         self.bytes(&value.author_proof.author_key_id);
@@ -15088,7 +15282,7 @@ impl MetadataSnapshotBinding {
             nonce,
             ciphertext,
             ciphertext_sha256,
-            avatar_binding_digest: None,
+            avatar_binding: None,
             author_proof: MetadataAuthorProofBinding {
                 author,
                 author_key_id,
@@ -17285,7 +17479,7 @@ fn commit_metadata_matches(
         && next_metadata.metadata_version == prior_metadata.metadata_version
         && next_metadata.origin_transition_id == prior_metadata.origin_transition_id
         && next_metadata.author_proof == prior_metadata.author_proof
-        && next_metadata.avatar_binding_digest == prior_metadata.avatar_binding_digest
+        && next_metadata.avatar_binding == prior_metadata.avatar_binding
         && next_metadata.nonce != prior_metadata.nonce
 }
 
@@ -17537,7 +17731,7 @@ fn reset_metadata_matches(
     let reencrypted = next.metadata_version == previous.metadata_version
         && next.origin_transition_id == previous.origin_transition_id
         && next.author_proof == previous.author_proof
-        && next.avatar_binding_digest == previous.avatar_binding_digest;
+        && next.avatar_binding == previous.avatar_binding;
     let fresh_empty = previous
         .metadata_version
         .checked_add(1)
@@ -19059,8 +19253,9 @@ pub(crate) use executor::{
     apply_prepared_device_revocation_prefix, prepare_device_revocation_batch_members,
     AppliedTransition, ControlEntryContent, EventChainCursorError, EventFanout, ExecutionActor,
     ExecutionAuthority, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    PreparedDeviceRevocationBatchMembers, RecoveryOpenContext, ResetRequestRow, SpineArtifacts,
-    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+    MetadataAvatarPersistence, PreparedDeviceRevocationBatchMembers, RecoveryOpenContext,
+    ResetRequestRow, SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext,
+    WelcomeRejectionWork, WelcomeResponseContext,
 };
 #[cfg(test)]
 pub(crate) use executor::{
@@ -19082,6 +19277,9 @@ pub(in crate::chat_protocol) mod executor {
     use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
     use super::super::public_state::encode_public_tree_summary;
+    use super::super::repository::blobs::{
+        self as blobs, BindingKind, BlobPurpose, BlobRepositoryError, NewBlobBinding,
+    };
     use super::super::repository::delivery::{
         self as delivery, AppendEntry, ApplicationIntervalClose, DeliveryRepositoryError,
         EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
@@ -19094,28 +19292,29 @@ pub(in crate::chat_protocol) mod executor {
         ActiveLeafPeriodBinding, ConversationHeadClose, ConversationHeadKind, GenerationStateKind,
         GenerationStateLifecycle, GenerationSupersede, LeafClose, LeafOrigin,
         LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
-        LeaveRequestTermination, NewDeviceRevocation, NewGeneration, NewGenerationState,
-        NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot,
-        NewParticipantPeriod, NewReservation, NewTransition, PackageStatus as RepoPackageStatus,
-        PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation,
-        ParticipantRole as RepoParticipantRole, ParticipantRoleCas,
-        ParticipantStatus as RepoParticipantStatus, RegistrationRevoke, ReservationTermination,
-        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
-        TransitionRepositoryError,
+        LeaveRequestTermination, MetadataAvatarBinding, NewDeviceRevocation, NewGeneration,
+        NewGenerationState, NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest,
+        NewMetadataSnapshot, NewParticipantPeriod, NewReservation, NewTransition,
+        PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
+        ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
+        ParticipantRoleCas, ParticipantStatus as RepoParticipantStatus, RegistrationRevoke,
+        ReservationTermination, ResetRequestTermination, TransitionActorRole,
+        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
     };
+    use super::super::transcript::canonical_metadata_avatar_blob_aad;
     use super::{
         classify_role_producer, coordinate_is_in_lineage, coordinate_only_successor,
-        initial_participant_role, invitation_matches_participant,
-        recovery_package_cas_authority_digest, revocation_package_cas_bijection_valid,
-        validate_transition_evidence, CloseKind, ConversationKind, DeviceIdentity,
-        DeviceRevocationBatchPersistencePlan, LeafHydrationRow, LeafRecord, LeafRecoveryKind,
-        LeaveRequestStatus, ManifestParticipantChange, MetadataSnapshotBinding, PackageStatus,
-        ParticipantHydrationRow, ParticipantRecord, ParticipantRole, ParticipantStatus,
-        PlanAuthority, PlanKind, PrincipalId, PublicGroupSnapshotCoordinate,
-        RecoveryOriginEvidence, RecoveryRequest, RecoveryRequestStatus, RecoveryReservation,
-        RecoverySource, ReservationStatus, ResetRequest, ResetRequestStatus, ServerTimestamp,
-        SignedMutationKind, StateChange, TransitionBodyBinding, TransitionEffects, WelcomeStatus,
-        WelcomeWork, WorkTerminalEvidence,
+        initial_participant_role, invitation_matches_participant, metadata_author_matches_evidence,
+        metadata_coordinate_matches, recovery_package_cas_authority_digest,
+        revocation_package_cas_bijection_valid, validate_transition_evidence, CloseKind,
+        ConversationKind, DeviceIdentity, DeviceRevocationBatchPersistencePlan, LeafHydrationRow,
+        LeafRecord, LeafRecoveryKind, LeaveRequestStatus, ManifestParticipantChange,
+        MetadataSnapshotBinding, PackageStatus, ParticipantHydrationRow, ParticipantRecord,
+        ParticipantRole, ParticipantStatus, PlanAuthority, PlanKind, PrincipalId,
+        PublicGroupSnapshotCoordinate, RecoveryOriginEvidence, RecoveryRequest,
+        RecoveryRequestStatus, RecoveryReservation, RecoverySource, ReservationStatus,
+        ResetRequest, ResetRequestStatus, ServerTimestamp, SignedMutationKind, StateChange,
+        TransitionBodyBinding, TransitionEffects, WelcomeStatus, WelcomeWork, WorkTerminalEvidence,
     };
     use super::{ConversationPersistencePlan, ConversationStateHydration};
     use super::{Engine, URL_SAFE_NO_PAD};
@@ -19133,6 +19332,8 @@ pub(in crate::chat_protocol) mod executor {
         /// A `repository::delivery` writer failed (append/audience/event, or its
         /// typed `CompareAndSetConflict`).
         Delivery(DeliveryRepositoryError),
+        /// A metadata-avatar bind CAS or immutable binding insert failed.
+        Blob(BlobRepositoryError),
         /// The plan carried a non-empty effect family this executor does not yet
         /// persist. Emitted as a HARD error rather than silently dropped, so a
         /// future planner change cannot lose writes. Carries the family name.
@@ -19174,6 +19375,12 @@ pub(in crate::chat_protocol) mod executor {
     impl From<DeliveryRepositoryError> for ExecutorError {
         fn from(error: DeliveryRepositoryError) -> Self {
             Self::Delivery(error)
+        }
+    }
+
+    impl From<BlobRepositoryError> for ExecutorError {
+        fn from(error: BlobRepositoryError) -> Self {
+            Self::Blob(error)
         }
     }
 
@@ -19296,6 +19503,29 @@ pub(in crate::chat_protocol) mod executor {
         pub(crate) author_key_id: String,
         /// Fresh `chat.metadata_snapshots` primary key for this snapshot.
         pub(crate) metadata_snapshot_id: Uuid,
+    }
+
+    /// Repository-sealed persistence authority for a signed metadata avatar.
+    /// A reused avatar carries the immutable historical binding columns read
+    /// under lock. A fresh avatar additionally carries the exact locked
+    /// completed-unbound blob row projected as the single-use binding CAS.
+    #[derive(Clone, Debug)]
+    pub(crate) enum MetadataAvatarPersistence {
+        Reuse {
+            snapshot: MetadataAvatarBinding,
+        },
+        Fresh {
+            snapshot: MetadataAvatarBinding,
+            binding: NewBlobBinding,
+        },
+    }
+
+    impl MetadataAvatarPersistence {
+        pub(crate) fn snapshot(&self) -> &MetadataAvatarBinding {
+            match self {
+                Self::Reuse { snapshot } | Self::Fresh { snapshot, .. } => snapshot,
+            }
+        }
     }
 
     /// One event to append with its frozen audience and outbox work.
@@ -19747,6 +19977,7 @@ pub(in crate::chat_protocol) mod executor {
         pub(crate) spine: SpineArtifacts,
         pub(crate) opened_leaves: Vec<LeafPersistenceColumns>,
         pub(crate) metadata_author: Option<MetadataAuthorColumns>,
+        pub(crate) metadata_avatar: Option<MetadataAvatarPersistence>,
         /// Fresh participant-period ids in the plan's canonical participant order.
         pub(crate) participant_period_ids: Vec<Uuid>,
         /// Fresh leaf-period ids in the plan's opened-leaf order.
@@ -20435,6 +20666,15 @@ pub(in crate::chat_protocol) mod executor {
         producer: &super::TransitionEvidence,
     ) -> bool {
         matches!(terminal, Some(WorkTerminalEvidence::Transition(value)) if value == producer)
+    }
+
+    fn terminal_is_exact_due_expiry(
+        terminal: &Option<WorkTerminalEvidence>,
+        expires_at: ServerTimestamp,
+        applied_at: DateTime<Utc>,
+    ) -> bool {
+        matches!(terminal, Some(WorkTerminalEvidence::Expiry(value)) if *value == expires_at)
+            && server_instant(expires_at).is_ok_and(|expiry| applied_at >= expiry)
     }
 
     fn recovery_request_identity_is_unchanged(
@@ -21553,6 +21793,686 @@ pub(in crate::chat_protocol) mod executor {
         Ok(prior_bound)
     }
 
+    #[derive(Debug)]
+    struct MetadataExecutionBinding<'a> {
+        metadata: &'a MetadataSnapshotBinding,
+        author: &'a MetadataAuthorColumns,
+        avatar: Option<&'a MetadataAvatarPersistence>,
+    }
+
+    /// Re-derive the complete metadata-transition contract from the sealed plan
+    /// and repository-hydrated context before the first writer runs.
+    ///
+    /// A metadata transition is a coordinate-only successor: same generation
+    /// and MLS crypto coordinate, `state_version + 1`, one signed self-origin
+    /// metadata snapshot, and no membership/leaf/interval mutation. It may
+    /// terminalize work bound to the retired coordinate; every such family is
+    /// classified here and reconciled again after its writer runs.
+    fn preflight_metadata_transition<'a>(
+        plan: &'a ConversationPersistencePlan,
+        ctx: &'a ExecutionContext,
+        transition_id: Uuid,
+        seq_i64: i64,
+    ) -> Result<MetadataExecutionBinding<'a>, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "metadata transition needs an expected prior",
+            ))?;
+        let expected_next = coordinate_only_successor(prior).map_err(|_| {
+            ExecutorError::InconsistentPlan("metadata successor is not coordinate-only")
+        })?;
+        if effects.kind() != PlanKind::Metadata
+            || plan.expected_prior.as_ref() != Some(prior)
+            || plan.retired_coordinate.is_some()
+            || plan.successor_coordinate.as_ref() != Some(&expected_next)
+            || hydration.coordinate != expected_next
+            || head.conversation_id() != prior.conversation_id()
+            || head.allocated_entry_id() != Some(transition_id.as_bytes())
+            || head
+                .allocated_seq()
+                .and_then(|value| i64::try_from(value).ok())
+                != Some(seq_i64)
+            || head
+                .expected_next_entry_seq()
+                .checked_add(1)
+                .filter(|value| *value == head.successor_next_entry_seq())
+                .is_none()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata plan/head/coordinate binding drifted",
+            ));
+        }
+
+        let producer = &hydration.producer;
+        let authority = match effects.authority() {
+            Some(PlanAuthority::Transition(authority)) if authority == producer => authority,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata plan lacks its exact transition authority",
+                ))
+            }
+        };
+        let signed = authority
+            .authority
+            .as_ref()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "metadata transition lacks signed authority",
+            ))?;
+        let actor_did = device_did(&signed.actor)?;
+        let actor_key_id = URL_SAFE_NO_PAD.encode(signed.key_id);
+        if signed.kind != SignedMutationKind::MetadataTransition
+            || signed.control_entry_id != Some(*transition_id.as_bytes())
+            || signed.control_conversation_id != Some(*prior.conversation_id())
+            || authority.transition_id != *transition_id.as_bytes()
+            || i64::try_from(authority.seq).ok() != Some(seq_i64)
+            || authority.received_at != head.locked_at()
+            || ctx.applied_at != server_instant(authority.received_at)?
+            || ctx.entry().entry_id != transition_id
+            || ctx.entry().signed_request_bytes != signed.signed_request_bytes
+            || ctx.entry().unsigned_projection_bytes != signed.canonical_projection
+            || ctx.entry().signing_transcript_bytes != signed.transcript_bytes
+            || ctx.entry().request_digest.as_slice() != signed.request_digest
+            || ctx.entry().signature.as_slice() != signed.signature
+            || ctx.entry().outer_entry_fingerprint.as_slice() != authority.outer_entry_fingerprint
+            || ctx.entry().server_fields_bytes != authority.server_fields_dag_cbor
+            || ctx.actor.user_did != actor_did
+            || ctx.actor.device_id != device_uuid(&signed.actor)
+            || ctx.actor.key_id != actor_key_id
+            || u64::try_from(ctx.actor.auth_generation).ok() != Some(signed.auth_generation)
+            || ctx.actor.role != TransitionActorRole::Admin
+            || ctx.actor.device_status != "active"
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata signed/control/actor authority drifted",
+            ));
+        }
+
+        let metadata_change = effects
+            .metadata_change()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "metadata transition has no metadata delta",
+            ))?;
+        let (Some(before), Some(after)) = (metadata_change.before(), metadata_change.after())
+        else {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata transition delta is not a replacement",
+            ));
+        };
+        let signed_metadata = match authority.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Metadata {
+                prior: signed_prior,
+                next: signed_next,
+                metadata,
+            }) if signed_prior == prior && signed_next == &expected_next => metadata,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata transition body binding drifted",
+                ))
+            }
+        };
+        let expected_version = before.metadata_version().checked_add(1);
+        if after != signed_metadata
+            || hydration.metadata.as_ref() != Some(after)
+            || hydration.metadata_producer.as_ref() != Some(authority)
+            || !metadata_coordinate_matches(before, prior)
+            || !metadata_coordinate_matches(after, &expected_next)
+            || expected_version != Some(after.metadata_version())
+            || after.origin_transition_id() != transition_id.as_bytes()
+            || after.author_origin_transition_id() != transition_id.as_bytes()
+            || i64::try_from(after.author_origin_seq()).ok() != Some(seq_i64)
+            || after.nonce() == before.nonce()
+            || after.author() != &signed.actor
+            || !metadata_author_matches_evidence(after, authority)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata snapshot provenance/version/nonce drifted",
+            ));
+        }
+        let author = ctx
+            .metadata_author
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "metadata transition author columns",
+            ))?;
+        if author.author_role != "admin"
+            || author.author_device_status != "active"
+            || author.author_key_id != actor_key_id
+            || author.author_public_key != after.signature_public_key()
+            || u64::try_from(ctx.actor.auth_generation).ok()
+                != Some(after.author_auth_generation_at_origin())
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata author columns disagree with signed provenance",
+            ));
+        }
+        let avatar = match (after.avatar_binding(), ctx.metadata_avatar.as_ref()) {
+            (None, None) => None,
+            (Some(signed_avatar), Some(persistence)) => {
+                let durable = persistence.snapshot();
+                if durable.avatar_blob_id.as_bytes() != signed_avatar.blob_id()
+                    || durable.avatar_ciphertext_sha256.as_slice()
+                        != signed_avatar.ciphertext_sha256()
+                    || u64::try_from(durable.avatar_ciphertext_size).ok()
+                        != Some(signed_avatar.ciphertext_size())
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "metadata avatar durable columns disagree with signed descriptor",
+                    ));
+                }
+                match persistence {
+                    MetadataAvatarPersistence::Reuse { .. } => {
+                        if !before
+                            .avatar_binding()
+                            .is_some_and(|prior| prior == signed_avatar)
+                        {
+                            return Err(ExecutorError::InconsistentPlan(
+                                "metadata avatar reuse lacks an exact signed predecessor",
+                            ));
+                        }
+                    }
+                    MetadataAvatarPersistence::Fresh { binding, .. } => {
+                        if before
+                            .avatar_binding()
+                            .is_some_and(|prior| prior.blob_id() == signed_avatar.blob_id())
+                            || durable.avatar_binding_origin_transition_id != transition_id
+                            || u64::try_from(durable.avatar_binding_metadata_version).ok()
+                                != Some(after.metadata_version())
+                            || durable.avatar_binding_owner_did != actor_did
+                            || durable.avatar_binding_owner_device_id != device_uuid(after.author())
+                            || binding.blob_id.as_bytes() != signed_avatar.blob_id()
+                            || binding.ciphertext_sha256.as_slice()
+                                != signed_avatar.ciphertext_sha256()
+                            || u64::try_from(binding.ciphertext_size).ok()
+                                != Some(signed_avatar.ciphertext_size())
+                            || binding.descriptor_bytes != signed_avatar.canonical_descriptor()
+                            || binding.descriptor_sha256.as_slice() != signed_avatar.digest()
+                            || binding.binding_kind != BindingKind::MetadataAvatar
+                            || binding.conversation_id
+                                != Uuid::from_bytes(*after.coordinate_conversation_id())
+                            || binding.entry_seq.is_some()
+                            || binding.message_id.is_some()
+                            || binding.metadata_origin_transition_id != Some(transition_id)
+                            || binding.metadata_version
+                                != i64::try_from(after.metadata_version()).ok()
+                            || binding.owner_did != actor_did
+                            || binding.owner_device_id != device_uuid(after.author())
+                            || binding.purpose != BlobPurpose::Metadata
+                            || binding.ciphertext_size
+                                != binding.plaintext_size.saturating_add(blobs::AEAD_TAG_BYTES)
+                            || binding.aad_bytes.is_empty()
+                            || sha2::Sha256::digest(&binding.aad_bytes).as_slice()
+                                != binding.aad_sha256
+                            || binding.bound_at != ctx.applied_at
+                            || binding.uploaded_at > binding.bound_at
+                            || binding.bound_at >= binding.unbound_expires_at
+                        {
+                            return Err(ExecutorError::InconsistentPlan(
+                                "metadata fresh avatar lock/binding authority drifted",
+                            ));
+                        }
+                    }
+                }
+                Some(persistence)
+            }
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata avatar signed/context presence drifted",
+                ))
+            }
+        };
+
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("opened_intervals", effects.opened_intervals())?;
+        reject_if_present("closed_intervals", effects.closed_intervals())?;
+        reject_if_present(
+            "terminal_proof_recipients",
+            effects.terminal_proof_recipients(),
+        )?;
+        reject_if_present(
+            "superseded_recovery_requests",
+            effects.superseded_recovery_requests(),
+        )?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.policy_evidence_digest().is_some()
+            || effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "metadata transition carries unrelated authority effects",
+            ));
+        }
+        if !ctx.opened_leaves.is_empty()
+            || !ctx.participant_period_ids.is_empty()
+            || !ctx.leaf_period_ids.is_empty()
+            || !ctx.closing_leaf_periods.is_empty()
+            || !ctx.closing_participant_periods.is_empty()
+            || ctx.reset_request_row.is_some()
+            || ctx.recovery_open.is_some()
+            || ctx.welcome_expiry.is_some()
+            || ctx.welcome_response.is_some()
+            || !ctx.spine.genesis_group_info_bytes.is_empty()
+            || !ctx.spine.genesis_group_info_sha256.is_empty()
+            || sha2::Sha256::digest(&ctx.spine.public_snapshot_bytes).as_slice()
+                != ctx.spine.public_snapshot_sha256
+            || sha2::Sha256::digest(&ctx.spine.tree_summary_bytes).as_slice()
+                != ctx.spine.tree_summary_sha256
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata transition carries unrelated or invalid execution context",
+            ));
+        }
+
+        let mut request_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
+        for change in effects.recovery_request_changes() {
+            let (Some(before_request), Some(after_request)) = (change.before(), change.after())
+            else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata recovery request delta is not terminal",
+                ));
+            };
+            let expired = match after_request.status {
+                RecoveryRequestStatus::Superseded
+                    if terminal_is_exact_transition(&after_request.terminal, producer) =>
+                {
+                    false
+                }
+                RecoveryRequestStatus::Expired
+                    if terminal_is_exact_due_expiry(
+                        &after_request.terminal,
+                        after_request.expires_at,
+                        ctx.applied_at,
+                    ) =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "metadata recovery request has an illegal terminal shape",
+                    ))
+                }
+            };
+            if !recovery_request_identity_is_unchanged(before_request, after_request)
+                || before_request.status != RecoveryRequestStatus::Open
+                || before_request.bound_coordinate != *prior
+                || request_keys
+                    .insert(
+                        (after_request.request_id, after_request.key_package_ref),
+                        expired,
+                    )
+                    .is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata recovery request terminalization drifted",
+                ));
+            }
+        }
+        let mut reservation_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
+        for change in effects.reservation_changes() {
+            let (Some(before_reservation), Some(after_reservation)) =
+                (change.before(), change.after())
+            else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata reservation delta is not terminal",
+                ));
+            };
+            let expired = match after_reservation.status {
+                ReservationStatus::Released
+                    if terminal_is_exact_transition(&after_reservation.terminal, producer) =>
+                {
+                    false
+                }
+                ReservationStatus::Expired
+                    if terminal_is_exact_due_expiry(
+                        &after_reservation.terminal,
+                        after_reservation.expires_at,
+                        ctx.applied_at,
+                    ) =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "metadata reservation has an illegal terminal shape",
+                    ))
+                }
+            };
+            if !recovery_reservation_identity_is_unchanged(before_reservation, after_reservation)
+                || before_reservation.status != ReservationStatus::Active
+                || before_reservation.bound_coordinate != *prior
+                || reservation_keys
+                    .insert(
+                        (
+                            after_reservation.request_id,
+                            after_reservation.key_package_ref,
+                        ),
+                        expired,
+                    )
+                    .is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata reservation terminalization drifted",
+                ));
+            }
+        }
+        let package_keys = effects
+            .package_transitions()
+            .iter()
+            .map(|edge| {
+                (
+                    (edge.request_id, edge.key_package_ref),
+                    (edge.from, edge.to),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        verify_recovery_package_bijection(effects)?;
+        if request_keys != reservation_keys
+            || request_keys.len() != package_keys.len()
+            || package_keys.len() != effects.package_transitions().len()
+            || request_keys.iter().any(|(key, expired)| {
+                !matches!(
+                    package_keys.get(key),
+                    Some((PackageStatus::Reserved, PackageStatus::Available)) if !expired
+                ) && !matches!(
+                    package_keys.get(key),
+                    Some((
+                        PackageStatus::Reserved,
+                        PackageStatus::Available | PackageStatus::Expired
+                    )) if *expired
+                )
+            })
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata recovery request/reservation/package families are not bijective",
+            ));
+        }
+        for binding in effects.recovery_package_cas() {
+            let request = effects
+                .recovery_request_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|request| {
+                    request.request_id == binding.request_id
+                        && request.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "metadata package authority has no exact recovery request",
+                ))?;
+            let reservation = effects
+                .reservation_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|reservation| {
+                    reservation.request_id == binding.request_id
+                        && reservation.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "metadata package authority has no exact reservation",
+                ))?;
+            let (origin_key_id, origin_auth_generation) = match &request.origin {
+                RecoveryOriginEvidence::Acceptance(value) => {
+                    let authority =
+                        value
+                            .authority
+                            .as_ref()
+                            .ok_or(ExecutorError::InconsistentPlan(
+                                "metadata recovery acceptance has no signing authority",
+                            ))?;
+                    (authority.key_id, authority.auth_generation)
+                }
+                RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
+            };
+            let expected_expired = request.status == RecoveryRequestStatus::Expired;
+            if binding.transaction_id != head.transaction_id
+                || binding.conversation_id != *prior.conversation_id()
+                || binding.target != request.target
+                || binding.target != reservation.target
+                || binding.target_key_id != origin_key_id
+                || binding.target_auth_generation != origin_auth_generation
+                || binding.bound_coordinate != *prior
+                || binding.bound_coordinate != request.bound_coordinate
+                || binding.bound_coordinate != reservation.bound_coordinate
+                || binding.package_not_after != reservation.package_not_after
+                || binding.claimed_at != request.received_at
+                || binding.claimed_at != reservation.received_at
+                || binding.expected_status != PackageStatus::Reserved
+                || binding.successor_status
+                    != package_keys
+                        .get(&(binding.request_id, binding.key_package_ref))
+                        .map(|(_, successor)| *successor)
+                        .ok_or(ExecutorError::InconsistentPlan(
+                            "metadata package authority has no semantic edge",
+                        ))?
+                || (!expected_expired && binding.successor_status != PackageStatus::Available)
+                || (binding.successor_status == PackageStatus::Expired
+                    && server_instant(binding.package_not_after)? > ctx.applied_at)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata recovery package CAS authority drift",
+                ));
+            }
+        }
+        for change in effects.reset_request_changes() {
+            let (Some(before_reset), Some(after_reset)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata reset request delta is not terminal",
+                ));
+            };
+            let exact_terminal = match after_reset.status {
+                ResetRequestStatus::Stale => {
+                    terminal_is_exact_transition(&after_reset.terminal, producer)
+                }
+                ResetRequestStatus::Expired => terminal_is_exact_due_expiry(
+                    &after_reset.terminal,
+                    after_reset.expires_at,
+                    ctx.applied_at,
+                ),
+                _ => false,
+            };
+            if !reset_request_identity_is_unchanged(before_reset, after_reset)
+                || before_reset.status != ResetRequestStatus::Pending
+                || before_reset.bound_coordinate != *prior
+                || !exact_terminal
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata reset request staling drifted",
+                ));
+            }
+        }
+        for change in effects.leave_request_changes() {
+            let (Some(before_leave), Some(after_leave)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata leave request delta is not terminal",
+                ));
+            };
+            let exact_terminal = match after_leave.status {
+                LeaveRequestStatus::Stale => {
+                    terminal_is_exact_transition(&after_leave.terminal, producer)
+                }
+                LeaveRequestStatus::Expired => terminal_is_exact_due_expiry(
+                    &after_leave.terminal,
+                    after_leave.expires_at,
+                    ctx.applied_at,
+                ),
+                _ => false,
+            };
+            if !leave_request_identity_is_unchanged(before_leave, after_leave)
+                || before_leave.status != LeaveRequestStatus::Pending
+                || before_leave.bound_coordinate != *prior
+                || !exact_terminal
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata leave request staling drifted",
+                ));
+            }
+        }
+        let mut welcome_ids = BTreeSet::new();
+        for change in effects.welcome_changes() {
+            let (Some(before_welcome), Some(after_welcome)) = (change.before(), change.after())
+            else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata Welcome delta is not terminal",
+                ));
+            };
+            let exact_terminal = match after_welcome.status {
+                WelcomeStatus::Superseded => {
+                    terminal_is_exact_transition(&after_welcome.terminal, producer)
+                }
+                WelcomeStatus::Expired => terminal_is_exact_due_expiry(
+                    &after_welcome.terminal,
+                    after_welcome.expires_at,
+                    ctx.applied_at,
+                ),
+                _ => false,
+            };
+            if !welcome_identity_is_unchanged(before_welcome, after_welcome)
+                || before_welcome.status != WelcomeStatus::Pending
+                || before_welcome.coordinate != *prior
+                || !exact_terminal
+                || !welcome_ids.insert(after_welcome.welcome_id)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata Welcome supersession drifted",
+                ));
+            }
+        }
+        let disposition_ids = ctx
+            .welcome_dispositions
+            .iter()
+            .map(|input| *input.welcome_id.as_bytes())
+            .collect::<BTreeSet<_>>();
+        if welcome_ids != disposition_ids || disposition_ids.len() != ctx.welcome_dispositions.len()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata Welcome dispositions are not complete/bijective",
+            ));
+        }
+
+        let expected_entry_devices = hydration
+            .leaves
+            .iter()
+            .map(|leaf| leaf.device.clone())
+            .collect::<BTreeSet<_>>();
+        let entry_devices = ctx
+            .entry_recipients
+            .iter()
+            .map(|(device, entitlement)| {
+                if *entitlement != EntryEntitlementKind::Control {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "metadata entry recipient has the wrong entitlement",
+                    ));
+                }
+                Ok(device.clone())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if entry_devices != expected_entry_devices
+            || entry_devices.len() != ctx.entry_recipients.len()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata entry audience is not complete/bijective",
+            ));
+        }
+        let mut disposition_devices = BTreeSet::new();
+        for input in &ctx.welcome_dispositions {
+            let welcome = effects
+                .welcome_changes()
+                .iter()
+                .find_map(|change| {
+                    change.after().filter(|after| {
+                        after.welcome_id == *input.welcome_id.as_bytes()
+                            && matches!(
+                                after.status,
+                                WelcomeStatus::Superseded | WelcomeStatus::Expired
+                            )
+                    })
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "metadata Welcome disposition has no exact terminal delta",
+                ))?;
+            let status = if welcome.status == WelcomeStatus::Expired {
+                "expired"
+            } else {
+                "superseded"
+            };
+            let event = &input.event;
+            if !super::is_uuid_v4(event.event_id.as_bytes())
+                || event.event_kind != EventKind::WelcomeDisposition
+                || event.payload_bytes
+                    != delivery::canonical_welcome_disposition_event_payload(
+                        input.welcome_id,
+                        status,
+                    )
+                || event.recipients.len() != 1
+                || event.recipients[0].0 != welcome.recipient
+                || event.recipients[0].1 != EventEntitlementKind::Welcome
+                || event.outbox.len() != 1
+                || !super::is_uuid_v4(event.outbox[0].0.as_bytes())
+                || event.outbox[0].1 != OutboxWorkKind::Stream
+                || !disposition_devices.insert(welcome.recipient.clone())
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "metadata Welcome disposition event has an illegal shape",
+                ));
+            }
+        }
+        let primary = ctx.events.first().ok_or(ExecutorError::MissingContext(
+            "metadata conversationChanged event",
+        ))?;
+        let primary_devices = primary
+            .recipients
+            .iter()
+            .map(|(device, entitlement, _)| {
+                if *entitlement != EventEntitlementKind::Participant {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "metadata primary event has the wrong entitlement",
+                    ));
+                }
+                Ok(device.clone())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let expected_primary = entry_devices
+            .difference(&disposition_devices)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let canonical_primary = format!(
+            r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+            Uuid::from_bytes(*prior.conversation_id()).hyphenated(),
+        )
+        .into_bytes();
+        if ctx.events.len() != 1
+            || !super::is_uuid_v4(primary.event_id.as_bytes())
+            || primary.event_kind != EventKind::ConversationChanged
+            || primary.payload_bytes != canonical_primary
+            || primary_devices != expected_primary
+            || primary_devices.len() != primary.recipients.len()
+            || primary.outbox.len() != 1
+            || !super::is_uuid_v4(primary.outbox[0].0.as_bytes())
+            || primary.outbox[0].1 != OutboxWorkKind::Stream
+            || usize::try_from(ctx.spine.leaf_count).ok() != Some(hydration.leaves.len())
+            || ctx.spine.public_snapshot_bytes.is_empty()
+            || ctx.spine.tree_summary_bytes.is_empty()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "metadata primary event/audience/spine shape drifted",
+            ));
+        }
+
+        Ok(MetadataExecutionBinding {
+            metadata: after,
+            author,
+            avatar,
+        })
+    }
+
     /// Apply one `ConversationPersistencePlan` inside the caller's transaction.
     ///
     /// Transaction-scoped: never begins or commits. Ordered per the E2b-2 design
@@ -21744,7 +22664,21 @@ pub(in crate::chat_protocol) mod executor {
                 )
                 .await
             }
-            PlanKind::Metadata => Err(ExecutorError::UnsupportedEffect("metadata")),
+            PlanKind::Metadata => {
+                apply_metadata_transition(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    transition_id,
+                    seq_i64,
+                    successor_next_entry_seq,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await
+            }
             PlanKind::Commit => {
                 // Three `PlanKind::Commit` shapes, partitioned by their own edges.
                 //
@@ -26154,6 +27088,202 @@ pub(in crate::chat_protocol) mod executor {
         })
     }
 
+    /// Apply a `signedMetadataTransition`: same MLS crypto coordinate,
+    /// `stateVersion+1`, one self-origin/version-advancing encrypted metadata
+    /// snapshot, and no membership/leaf/interval mutation.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_metadata_transition(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        transition_id: Uuid,
+        seq_i64: i64,
+        successor_next_entry_seq: i64,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let hydration = plan.state();
+        let coordinate = &hydration.coordinate;
+        let applied_at = ctx.applied_at;
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "metadata transition needs an expected prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let binding = preflight_metadata_transition(plan, ctx, transition_id, seq_i64)?;
+
+        // 1. Serialize and advance the exact head coordinate + entry counter.
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+
+        // 2. Advance the active generation's state-version pointer.
+        transition::cas_generation_state_version(
+            transaction,
+            &transition::GenerationStateVersionCas {
+                conversation_id,
+                generation,
+                expected_state_version,
+                successor_state_version: state_version,
+            },
+        )
+        .await?;
+
+        // 3. Append the coordinate-only metadata successor state.
+        transition::insert_generation_state_row(
+            transaction,
+            &NewGenerationState {
+                conversation_id,
+                generation,
+                state_version,
+                group_id: coordinate.group_id().to_vec(),
+                epoch,
+                group_context_hash: coordinate.group_context_hash().to_vec(),
+                confirmation_tag: coordinate.confirmation_tag().to_vec(),
+                lifecycle: GenerationStateLifecycle::Active,
+                state_kind: GenerationStateKind::Metadata,
+                producing_transition_id: transition_id,
+                public_snapshot_bytes: ctx.spine.public_snapshot_bytes.clone(),
+                snapshot_sha256: ctx.spine.public_snapshot_sha256.clone(),
+                tree_summary_bytes: ctx.spine.tree_summary_bytes.clone(),
+                tree_summary_sha256: ctx.spine.tree_summary_sha256.clone(),
+                leaf_count: ctx.spine.leaf_count,
+                created_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 4. Persist the canonical control entry at the head-allocated sequence.
+        let append = build_append_entry(
+            ctx,
+            conversation_id,
+            generation,
+            state_version,
+            transition_id,
+        );
+        delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
+
+        // 5. Bind a fresh signed avatar (reuse needs no new blob mutation), then
+        // persist the exact self-origin metadata snapshot.
+        if let Some(MetadataAvatarPersistence::Fresh { binding, .. }) = binding.avatar {
+            blobs::bind_metadata_avatar_blob(transaction, binding).await?;
+        }
+        write_metadata_update_snapshot(
+            transaction,
+            binding.metadata,
+            binding.author,
+            binding.avatar.map(MetadataAvatarPersistence::snapshot),
+            conversation_id,
+            generation,
+            state_version,
+            epoch,
+            coordinate.group_id(),
+            coordinate.group_context_hash(),
+            coordinate.confirmation_tag(),
+            transition_id,
+            seq_i64,
+            applied_at,
+        )
+        .await?;
+
+        // 6. Persist the signed transition and bind it to that snapshot.
+        transition::insert_transition_row(
+            transaction,
+            &NewTransition {
+                transition_id,
+                conversation_id,
+                kind: TransitionKind::Metadata,
+                actor_did: ctx.actor.user_did.clone(),
+                actor_device_id: ctx.actor.device_id,
+                actor_key_id: ctx.actor.key_id.clone(),
+                actor_auth_generation: ctx.actor.auth_generation,
+                actor_role: ctx.actor.role,
+                actor_device_status: ctx.actor.device_status.clone(),
+                signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                unsigned_projection_bytes: ctx.entry().unsigned_projection_bytes.clone(),
+                signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                request_digest: ctx.entry().request_digest.clone(),
+                signature: ctx.entry().signature.clone(),
+                coordinates: TransitionCoordinates {
+                    prior: Some((expected_generation, expected_state_version)),
+                    next: Some((generation, state_version)),
+                    retired: None,
+                    successor: None,
+                },
+                reset_request_id: None,
+                close_transition_id: None,
+                metadata_snapshot_id: Some(binding.author.metadata_snapshot_id),
+                entry_seq: seq_i64,
+                accepted_at: applied_at,
+            },
+        )
+        .await?;
+
+        // 7. Frozen entry audience + canonical server event schedule.
+        let recipients = build_entry_recipients(&ctx.entry_recipients)?;
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+
+        // 8. Terminalize every prior-coordinate work item retired by this
+        // coordinate change, then prove no family was silently skipped.
+        let mut superseded =
+            write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
+                .await?;
+        superseded.welcomes = write_welcome_supersessions(
+            transaction,
+            ctx,
+            effects,
+            WelcomeSupersessionCause::Transition {
+                terminal_transition_id: transition_id,
+            },
+        )
+        .await?;
+        let staled = write_prior_bound_staling(
+            transaction,
+            effects,
+            transition_id,
+            &ctx.entry().request_digest,
+            applied_at,
+        )
+        .await?;
+        superseded.reset_requests = staled.reset_requests;
+        superseded.leave_requests = staled.leave_requests;
+        reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
+
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(seq_i64).unwrap(),
+            entry_id: ctx.entry().entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
     /// Apply a `zeroLeafLeave` edge: an active but LEAFLESS participant (a pending
     /// invitee who never joined) self-removes immediately. `stateVersion+1`, same
     /// generation/epoch (a coordinate-only rebind, NO crypto commit and NO metadata
@@ -28339,6 +29469,64 @@ pub(in crate::chat_protocol) mod executor {
         Ok(())
     }
 
+    /// Persist a self-origin `signedMetadataTransition` snapshot. Unlike an
+    /// epoch re-encryption, this edge advances `metadata_version`, binds the new
+    /// origin to this transition, and records the current admin signer as the
+    /// author. The pure preflight has already proved those facts against the
+    /// signed body, actor, and repository-hydrated author columns.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_metadata_update_snapshot(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        metadata: &MetadataSnapshotBinding,
+        author_cols: &MetadataAuthorColumns,
+        avatar: Option<&MetadataAvatarBinding>,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        epoch: i64,
+        group_id: &[u8],
+        group_context_hash: &[u8],
+        confirmation_tag: &[u8],
+        transition_id: Uuid,
+        seq_i64: i64,
+        applied_at: DateTime<Utc>,
+    ) -> Result<(), ExecutorError> {
+        let ciphertext = metadata.ciphertext().to_vec();
+        let ciphertext_size = checked_i64(ciphertext.len() as u64)?;
+        transition::insert_metadata_snapshot(
+            transaction,
+            &NewMetadataSnapshot {
+                metadata_snapshot_id: author_cols.metadata_snapshot_id,
+                conversation_id,
+                generation,
+                state_version,
+                group_id: group_id.to_vec(),
+                epoch,
+                group_context_hash: group_context_hash.to_vec(),
+                confirmation_tag: confirmation_tag.to_vec(),
+                producing_transition_id: transition_id,
+                origin_transition_id: transition_id,
+                metadata_version: checked_i64(metadata.metadata_version())?,
+                nonce: metadata.nonce().to_vec(),
+                ciphertext_sha256: metadata.ciphertext_sha256().to_vec(),
+                ciphertext,
+                ciphertext_size,
+                avatar: avatar.cloned(),
+                author_did: device_did(metadata.author())?,
+                author_device_id: device_uuid(metadata.author()),
+                author_key_id: author_cols.author_key_id.clone(),
+                author_public_key: metadata.signature_public_key().to_vec(),
+                author_auth_generation: checked_i64(metadata.author_auth_generation_at_origin())?,
+                author_origin_seq: seq_i64,
+                author_role: author_cols.author_role.clone(),
+                author_device_status: author_cols.author_device_status.clone(),
+                created_at: applied_at,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Persist a commit/leafRecovery metadata RE-ENCRYPTION snapshot. Per the DDL
     /// `assert_metadata_snapshot_mapping` `commit/leafRecovery/leaveCommit` arm the
     /// new snapshot's author / origin / metadata_version / ciphertext_size / avatar
@@ -28674,7 +29862,9 @@ pub(in crate::chat_protocol) mod executor {
         // Terminalizing those rows first would force this writer to fall back
         // to a semantic `(ref,status)` edge and discard the guard.
         for edge in effects.package_transitions() {
-            if edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available {
+            if edge.from == PackageStatus::Reserved
+                && matches!(edge.to, PackageStatus::Available | PackageStatus::Expired)
+            {
                 let mut matches = effects.recovery_package_cas().iter().filter(|binding| {
                     binding.request_id == edge.request_id
                         && binding.key_package_ref == edge.key_package_ref
@@ -28713,6 +29903,17 @@ pub(in crate::chat_protocol) mod executor {
                         claimed_at: server_instant(binding.claimed_at)?,
                         locked_row_digest: &binding.locked_row_digest,
                         authority_digest: &binding.authority_digest,
+                        successor_status: match binding.successor_status {
+                            PackageStatus::Available => RepoPackageStatus::Available,
+                            PackageStatus::Expired => RepoPackageStatus::Expired,
+                            _ => {
+                                return Err(ExecutorError::InconsistentPlan(
+                                    "prior-bound package has an illegal terminal successor",
+                                ))
+                            }
+                        },
+                        terminal_at: (binding.successor_status == PackageStatus::Expired)
+                            .then_some(server_instant(binding.package_not_after)?),
                     },
                 )
                 .await?;
@@ -28721,37 +29922,55 @@ pub(in crate::chat_protocol) mod executor {
         }
         for change in effects.recovery_request_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded
-                {
-                    transition::terminalize_leaf_recovery_request(
-                        transaction,
-                        Uuid::from_bytes(*after.request_id()),
-                        &LeafRecoveryTermination::SupersededByTransition {
-                            terminal_transition_id: transition_id,
-                            terminal_at: applied_at,
-                        },
-                    )
-                    .await?;
-                    counts.requests += 1;
+                if before.status() == RecoveryRequestStatus::Open {
+                    let termination = match after.status() {
+                        RecoveryRequestStatus::Superseded => {
+                            Some(LeafRecoveryTermination::SupersededByTransition {
+                                terminal_transition_id: transition_id,
+                                terminal_at: applied_at,
+                            })
+                        }
+                        RecoveryRequestStatus::Expired => Some(LeafRecoveryTermination::Expired {
+                            terminal_at: server_instant(*after.expires_at())?,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(termination) = termination {
+                        transition::terminalize_leaf_recovery_request(
+                            transaction,
+                            Uuid::from_bytes(*after.request_id()),
+                            &termination,
+                        )
+                        .await?;
+                        counts.requests += 1;
+                    }
                 }
             }
         }
         for change in effects.reservation_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released
-                {
-                    transition::terminalize_reservation(
-                        transaction,
-                        Uuid::from_bytes(after.request_id),
-                        &ReservationTermination::ReleasedByTransition {
-                            terminal_transition_id: transition_id,
-                            terminal_at: applied_at,
-                        },
-                    )
-                    .await?;
-                    counts.reservations += 1;
+                if before.status() == ReservationStatus::Active {
+                    let termination = match after.status() {
+                        ReservationStatus::Released => {
+                            Some(ReservationTermination::ReleasedByTransition {
+                                terminal_transition_id: transition_id,
+                                terminal_at: applied_at,
+                            })
+                        }
+                        ReservationStatus::Expired => Some(ReservationTermination::Expired {
+                            terminal_at: server_instant(after.expires_at)?,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(termination) = termination {
+                        transition::terminalize_reservation(
+                            transaction,
+                            Uuid::from_bytes(after.request_id),
+                            &termination,
+                        )
+                        .await?;
+                        counts.reservations += 1;
+                    }
                 }
             }
         }
@@ -28789,38 +30008,52 @@ pub(in crate::chat_protocol) mod executor {
         let mut counts = FamilyCounts::default();
         for change in effects.reset_request_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
-                if before.status() == ResetRequestStatus::Pending
-                    && after.status() == ResetRequestStatus::Stale
-                {
-                    transition::terminalize_reset_request(
-                        transaction,
-                        Uuid::from_bytes(after.request_id),
-                        &ResetRequestTermination::Stale {
+                if before.status() == ResetRequestStatus::Pending {
+                    let termination = match after.status() {
+                        ResetRequestStatus::Stale => Some(ResetRequestTermination::Stale {
                             terminal_transition_id: transition_id,
                             terminal_at: applied_at,
-                        },
-                    )
-                    .await?;
-                    counts.reset_requests += 1;
+                        }),
+                        ResetRequestStatus::Expired => Some(ResetRequestTermination::Expired {
+                            terminal_at: server_instant(after.expires_at)?,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(termination) = termination {
+                        transition::terminalize_reset_request(
+                            transaction,
+                            Uuid::from_bytes(after.request_id),
+                            &termination,
+                        )
+                        .await?;
+                        counts.reset_requests += 1;
+                    }
                 }
             }
         }
         for change in effects.leave_request_changes() {
             if let (Some(before), Some(after)) = (change.before(), change.after()) {
-                if before.status() == LeaveRequestStatus::Pending
-                    && after.status() == LeaveRequestStatus::Stale
-                {
-                    transition::terminalize_leave_request(
-                        transaction,
-                        Uuid::from_bytes(after.request_id),
-                        &LeaveRequestTermination::Stale {
+                if before.status() == LeaveRequestStatus::Pending {
+                    let termination = match after.status() {
+                        LeaveRequestStatus::Stale => Some(LeaveRequestTermination::Stale {
                             terminal_request_digest: staling_request_digest.to_vec(),
                             terminal_transition_id: transition_id,
                             terminal_at: applied_at,
-                        },
-                    )
-                    .await?;
-                    counts.leave_requests += 1;
+                        }),
+                        LeaveRequestStatus::Expired => Some(LeaveRequestTermination::Expired {
+                            terminal_at: server_instant(after.expires_at)?,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(termination) = termination {
+                        transition::terminalize_leave_request(
+                            transaction,
+                            Uuid::from_bytes(after.request_id),
+                            &termination,
+                        )
+                        .await?;
+                        counts.leave_requests += 1;
+                    }
                 }
             }
         }
@@ -28933,7 +30166,10 @@ pub(in crate::chat_protocol) mod executor {
             let after = match (change.before(), change.after()) {
                 (Some(before), Some(after))
                     if before.status() == WelcomeStatus::Pending
-                        && after.status() == WelcomeStatus::Superseded =>
+                        && matches!(
+                            after.status(),
+                            WelcomeStatus::Superseded | WelcomeStatus::Expired
+                        ) =>
                 {
                     after
                 }
@@ -28954,26 +30190,36 @@ pub(in crate::chat_protocol) mod executor {
                 event_cursor.as_deref_mut(),
             )
             .await?;
-            let terminal_disposition = match cause {
-                WelcomeSupersessionCause::Transition {
-                    terminal_transition_id,
-                } => WelcomeDisposition::SupersededByTransition {
-                    terminal_transition_id,
-                },
-                WelcomeSupersessionCause::Revocation {
-                    terminal_revocation_id,
-                } => WelcomeDisposition::SupersededByRevocation {
-                    terminal_revocation_id,
-                },
-            };
-            delivery::terminalize_welcome_delivery_for_supersession(
-                transaction,
-                welcome_id,
-                &terminal_disposition,
-                ctx.applied_at,
-                position,
-            )
-            .await?;
+            if after.status() == WelcomeStatus::Expired {
+                delivery::terminalize_prior_bound_welcome_expiry(
+                    transaction,
+                    after,
+                    server_instant(after.expires_at())?,
+                    position,
+                )
+                .await?;
+            } else {
+                let terminal_disposition = match cause {
+                    WelcomeSupersessionCause::Transition {
+                        terminal_transition_id,
+                    } => WelcomeDisposition::SupersededByTransition {
+                        terminal_transition_id,
+                    },
+                    WelcomeSupersessionCause::Revocation {
+                        terminal_revocation_id,
+                    } => WelcomeDisposition::SupersededByRevocation {
+                        terminal_revocation_id,
+                    },
+                };
+                delivery::terminalize_welcome_delivery_for_supersession(
+                    transaction,
+                    welcome_id,
+                    &terminal_disposition,
+                    ctx.applied_at,
+                    position,
+                )
+                .await?;
+            }
             superseded += 1;
         }
         Ok(superseded)
@@ -29321,5 +30567,937 @@ pub(in crate::chat_protocol) mod executor {
                 ))
             ));
         }
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        )
+    ))]
+    mod metadata_executor_tests {
+        use super::super::{
+            AuthenticatedEntryEvidence, ConversationPersistencePlan, ConversationStateHydration,
+            LeaveRequest, LeaveRequestHydrationRow, MetadataAvatarDescriptorBinding,
+            MetadataCryptoCoordinate, MetadataSnapshotBinding, PackageTransition, PlanAuthority,
+            PublicGroupSnapshotLifecycle, RecoveryOriginHydrationRow, RecoveryPackageCasBinding,
+            RecoveryRequestHydrationRow, RecoveryReservationHydrationRow, RequestEntryKind,
+            RequestEvidence, ResetRequestHydrationRow, StateChange, StateCounts,
+            TransitionBodyBinding, TransitionEffects, WelcomeHydrationRow,
+            WorkTerminalHydrationRow,
+        };
+        use super::*;
+
+        fn uuid(marker: u8) -> [u8; 16] {
+            let mut value = [marker; 16];
+            value[6] = 0x40 | (marker & 0x0f);
+            value[8] = 0x80 | (marker & 0x3f);
+            value
+        }
+
+        fn device(marker: u8) -> DeviceIdentity {
+            DeviceIdentity::new(
+                PrincipalId::new(
+                    format!("did:plc:metadataexecutor{marker:02x}aaaaaa").into_bytes(),
+                )
+                .expect("valid test DID"),
+                uuid(marker),
+            )
+            .expect("valid test device")
+        }
+
+        fn coordinate(
+            conversation_id: [u8; 16],
+            state_version: u64,
+        ) -> PublicGroupSnapshotCoordinate {
+            PublicGroupSnapshotCoordinate::new(
+                conversation_id,
+                1,
+                state_version,
+                [0x31; 32],
+                4,
+                [0x32; 32],
+                [0x33; 32],
+                PublicGroupSnapshotLifecycle::Active,
+            )
+        }
+
+        fn snapshot(
+            coordinate: PublicGroupSnapshotCoordinate,
+            transition_id: [u8; 16],
+            seq: u64,
+            actor: DeviceIdentity,
+            key_id: [u8; 32],
+            public_key: [u8; 32],
+            version: u64,
+            nonce: [u8; 12],
+            avatar_binding: Option<MetadataAvatarDescriptorBinding>,
+        ) -> MetadataSnapshotBinding {
+            let ciphertext = vec![version as u8, 0x51, 0x52];
+            let ciphertext_sha256 = sha2::Sha256::digest(&ciphertext).into();
+            let canonical_snapshot = ciphertext.clone();
+            MetadataSnapshotBinding {
+                coordinate: MetadataCryptoCoordinate {
+                    conversation_id: *coordinate.conversation_id(),
+                    generation: coordinate.generation(),
+                    epoch: coordinate.epoch(),
+                    group_context_hash: *coordinate.group_context_hash(),
+                },
+                origin_transition_id: transition_id,
+                metadata_version: version,
+                nonce,
+                ciphertext,
+                ciphertext_sha256,
+                avatar_binding,
+                author_proof: super::super::MetadataAuthorProofBinding {
+                    author: actor,
+                    author_key_id: key_id,
+                    signature_public_key: public_key,
+                    auth_generation_at_origin: 3,
+                    origin_transition_id: transition_id,
+                    origin_seq: seq,
+                },
+                digest: sha2::Sha256::digest(&canonical_snapshot).into(),
+                canonical_snapshot,
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum AvatarFixture {
+            None,
+            Fresh,
+            Reuse,
+        }
+
+        #[derive(Clone, Copy)]
+        enum DueExpiryFamily {
+            Recovery,
+            Reset,
+            Leave,
+            Welcome,
+        }
+
+        fn request_evidence(
+            kind: RequestEntryKind,
+            request_id: [u8; 16],
+            actor: DeviceIdentity,
+            conversation_id: [u8; 16],
+            received_at: ServerTimestamp,
+            key_id: [u8; 32],
+        ) -> RequestEvidence {
+            RequestEvidence {
+                kind,
+                control_entry_id: Some(uuid(0x70)),
+                conversation_id,
+                control_seq: Some(4),
+                control_outer_entry_fingerprint: Some([0x71; 32]),
+                control_outer_projection: Some(vec![0x72]),
+                control_server_fields_dag_cbor: Some(vec![0x73]),
+                request_id,
+                actor,
+                key_id,
+                auth_generation: 3,
+                request_digest: [0x74; 32],
+                signature: [0x75; 64],
+                signed_request_bytes: vec![0x76],
+                durable_row_digest: [0x77; 32],
+                received_at,
+                authority: None,
+                body_binding: None,
+            }
+        }
+
+        fn avatar_descriptor() -> MetadataAvatarDescriptorBinding {
+            let canonical_descriptor = vec![0xa4, 0x01, 0x02, 0x03];
+            MetadataAvatarDescriptorBinding {
+                blob_id: uuid(0x45),
+                ciphertext_sha256: [0x46; 32],
+                ciphertext_size: 64,
+                digest: sha2::Sha256::digest(&canonical_descriptor).into(),
+                canonical_descriptor,
+            }
+        }
+
+        fn exact_fixture() -> (ConversationPersistencePlan, ExecutionContext) {
+            exact_fixture_with_avatar(AvatarFixture::None)
+        }
+
+        fn exact_fixture_with_avatar(
+            avatar_fixture: AvatarFixture,
+        ) -> (ConversationPersistencePlan, ExecutionContext) {
+            let conversation_id = uuid(0x21);
+            let prior = coordinate(conversation_id, 7);
+            let next = coordinate(conversation_id, 8);
+            let actor = device(0x22);
+            let prior_transition_id = uuid(0x23);
+            let transition_id = uuid(0x24);
+            let key_id = [0x25; 32];
+            let public_key = [0x26; 32];
+            let avatar = (!matches!(avatar_fixture, AvatarFixture::None)).then(avatar_descriptor);
+            let prior_metadata = snapshot(
+                prior,
+                prior_transition_id,
+                5,
+                actor.clone(),
+                key_id,
+                public_key,
+                1,
+                [0x27; 12],
+                matches!(avatar_fixture, AvatarFixture::Reuse)
+                    .then(|| avatar.clone().expect("reuse avatar")),
+            );
+            let next_metadata = snapshot(
+                next,
+                transition_id,
+                6,
+                actor.clone(),
+                key_id,
+                public_key,
+                2,
+                [0x28; 12],
+                avatar.clone(),
+            );
+            let received_at = ServerTimestamp::from_unix_millis(6_000).unwrap();
+            let mut producer = super::super::TransitionEvidence::for_test_at(
+                6,
+                transition_id,
+                [0x29; 32],
+                received_at,
+            )
+            .unwrap();
+            producer.authority = Some(AuthenticatedEntryEvidence {
+                kind: SignedMutationKind::MetadataTransition,
+                type_id: SignedMutationKind::MetadataTransition.type_id(),
+                domain: SignedMutationKind::MetadataTransition.domain().to_vec(),
+                control_entry_id: Some(transition_id),
+                control_conversation_id: Some(conversation_id),
+                actor: actor.clone(),
+                key_id,
+                auth_generation: 3,
+                signed_at: received_at,
+                request_digest: [0x2a; 32],
+                signature: [0x2b; 64],
+                signed_request_bytes: vec![0x2c],
+                canonical_projection: vec![0x2d],
+                transcript_bytes: vec![0x2e],
+            });
+            producer.body_binding = Some(TransitionBodyBinding::Metadata {
+                prior,
+                next,
+                metadata: next_metadata.clone(),
+            });
+            producer.outer_control_projection = vec![0x2f];
+            producer.server_fields_dag_cbor = vec![0x30];
+
+            let mut effects = TransitionEffects::new(PlanKind::Metadata);
+            effects.complete = true;
+            effects.before_counts = StateCounts::default();
+            effects.after_counts = StateCounts::default();
+            effects.metadata_change = Some(StateChange {
+                before: Some(prior_metadata),
+                after: Some(next_metadata.clone()),
+            });
+            effects.authority = Some(PlanAuthority::Transition(producer.clone()));
+            effects.head_cas = Some(super::super::ConversationHeadCasBinding {
+                transaction_id: "metadata-executor-test-tx".to_owned(),
+                conversation_id,
+                expected_prior: Some(prior),
+                expected_next_entry_seq: 6,
+                allocated_entry_id: Some(transition_id),
+                allocated_seq: Some(6),
+                successor_next_entry_seq: 7,
+                locked_at: received_at,
+                locked_head_digest: [0x34; 32],
+            });
+            let plan = ConversationPersistencePlan {
+                expected_prior: Some(prior),
+                retired_coordinate: None,
+                successor_coordinate: Some(next),
+                state: ConversationStateHydration {
+                    kind: ConversationKind::Group,
+                    coordinate: next,
+                    producer: producer.clone(),
+                    public_state: None,
+                    metadata: Some(next_metadata),
+                    metadata_producer: Some(producer),
+                    participants: Vec::new(),
+                    leaves: Vec::new(),
+                    intervals: Vec::new(),
+                    terminal_proofs: Vec::new(),
+                    recovery_requests: Vec::new(),
+                    recovery_reservations: Vec::new(),
+                    reset_requests: Vec::new(),
+                    leave_requests: Vec::new(),
+                    welcomes: Vec::new(),
+                },
+                effects,
+            };
+            let key_id_text = URL_SAFE_NO_PAD.encode(key_id);
+            let actor_did = String::from_utf8(actor.principal().as_bytes().to_vec()).unwrap();
+            let applied_at =
+                DateTime::<Utc>::from_timestamp_millis(received_at.unix_millis()).unwrap();
+            let metadata_avatar = avatar.as_ref().map(|signed_avatar| {
+                let snapshot = MetadataAvatarBinding {
+                    avatar_blob_id: Uuid::from_bytes(*signed_avatar.blob_id()),
+                    avatar_ciphertext_sha256: signed_avatar.ciphertext_sha256().to_vec(),
+                    avatar_ciphertext_size: i64::try_from(signed_avatar.ciphertext_size())
+                        .expect("fixture avatar size"),
+                    avatar_binding_origin_transition_id: Uuid::from_bytes(
+                        if matches!(avatar_fixture, AvatarFixture::Reuse) {
+                            prior_transition_id
+                        } else {
+                            transition_id
+                        },
+                    ),
+                    avatar_binding_metadata_version: if matches!(
+                        avatar_fixture,
+                        AvatarFixture::Reuse
+                    ) {
+                        1
+                    } else {
+                        2
+                    },
+                    avatar_binding_owner_did: actor_did.clone(),
+                    avatar_binding_owner_device_id: Uuid::from_bytes(*actor.device_id()),
+                };
+                if matches!(avatar_fixture, AvatarFixture::Reuse) {
+                    MetadataAvatarPersistence::Reuse { snapshot }
+                } else {
+                    let plaintext_size = 48;
+                    let aad_bytes = canonical_metadata_avatar_blob_aad(
+                        conversation_id,
+                        transition_id,
+                        2,
+                        *signed_avatar.blob_id(),
+                        "image/png",
+                        plaintext_size,
+                    );
+                    MetadataAvatarPersistence::Fresh {
+                        snapshot,
+                        binding: NewBlobBinding {
+                            blob_id: Uuid::from_bytes(*signed_avatar.blob_id()),
+                            binding_kind: BindingKind::MetadataAvatar,
+                            conversation_id: Uuid::from_bytes(conversation_id),
+                            entry_seq: None,
+                            message_id: None,
+                            metadata_origin_transition_id: Some(Uuid::from_bytes(transition_id)),
+                            metadata_version: Some(2),
+                            owner_did: actor_did.clone(),
+                            owner_device_id: Uuid::from_bytes(*actor.device_id()),
+                            descriptor_bytes: signed_avatar.canonical_descriptor().to_vec(),
+                            descriptor_sha256: signed_avatar.digest().to_vec(),
+                            aad_sha256: sha2::Sha256::digest(&aad_bytes).to_vec(),
+                            aad_bytes,
+                            ciphertext_sha256: signed_avatar.ciphertext_sha256().to_vec(),
+                            plaintext_size: i64::try_from(plaintext_size)
+                                .expect("fixture plaintext size"),
+                            ciphertext_size: i64::try_from(signed_avatar.ciphertext_size())
+                                .expect("fixture ciphertext size"),
+                            purpose: BlobPurpose::Metadata,
+                            bound_at: applied_at,
+                            uploaded_at: DateTime::<Utc>::from_timestamp_millis(5_000).unwrap(),
+                            unbound_expires_at: DateTime::<Utc>::from_timestamp_millis(7_000)
+                                .unwrap(),
+                        },
+                    }
+                }
+            });
+            let context = ExecutionContext {
+                protocol_instance_id: Uuid::from_bytes(uuid(0x35)),
+                applied_at,
+                actor: ExecutionActor {
+                    user_did: actor_did,
+                    device_id: Uuid::from_bytes(*actor.device_id()),
+                    key_id: key_id_text.clone(),
+                    auth_generation: 3,
+                    role: TransitionActorRole::Admin,
+                    device_status: "active".to_owned(),
+                },
+                authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
+                    entry_id: Uuid::from_bytes(transition_id),
+                    entry_kind: "blue.catbird.chat.defs#transitionEntry".to_owned(),
+                    accepted_payload_bytes: vec![0x36],
+                    accepted_payload_sha256: vec![0x37; 32],
+                    signed_request_bytes: vec![0x2c],
+                    unsigned_projection_bytes: vec![0x2d],
+                    signing_transcript_bytes: vec![0x2e],
+                    request_digest: vec![0x2a; 32],
+                    signature: vec![0x2b; 64],
+                    server_fields_bytes: vec![0x30],
+                    outer_entry_fingerprint: vec![0x29; 32],
+                }),
+                spine: SpineArtifacts {
+                    public_snapshot_bytes: vec![0x38],
+                    public_snapshot_sha256: sha2::Sha256::digest([0x38]).to_vec(),
+                    tree_summary_bytes: vec![0x39],
+                    tree_summary_sha256: sha2::Sha256::digest([0x39]).to_vec(),
+                    leaf_count: 0,
+                    genesis_group_info_bytes: Vec::new(),
+                    genesis_group_info_sha256: Vec::new(),
+                },
+                opened_leaves: Vec::new(),
+                metadata_author: Some(MetadataAuthorColumns {
+                    author_role: "admin".to_owned(),
+                    author_device_status: "active".to_owned(),
+                    author_public_key: public_key.to_vec(),
+                    author_key_id: key_id_text,
+                    metadata_snapshot_id: Uuid::from_bytes(uuid(0x3a)),
+                }),
+                metadata_avatar,
+                participant_period_ids: Vec::new(),
+                leaf_period_ids: Vec::new(),
+                entry_recipients: Vec::new(),
+                events: vec![EventFanout {
+                    event_id: Uuid::from_bytes(uuid(0x3b)),
+                    event_kind: EventKind::ConversationChanged,
+                    payload_bytes: format!(
+                        r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+                        Uuid::from_bytes(conversation_id).hyphenated(),
+                    )
+                    .into_bytes(),
+                    recipients: Vec::new(),
+                    outbox: vec![(Uuid::from_bytes(uuid(0x3c)), OutboxWorkKind::Stream)],
+                }],
+                closing_leaf_periods: Vec::new(),
+                closing_participant_periods: Vec::new(),
+                reset_request_row: None,
+                recovery_open: None,
+                welcome_expiry: None,
+                welcome_response: None,
+                welcome_dispositions: Vec::new(),
+            };
+            (plan, context)
+        }
+
+        fn exact_due_expiry_fixture(
+            family: DueExpiryFamily,
+        ) -> (ConversationPersistencePlan, ExecutionContext, FamilyCounts) {
+            let (mut plan, mut context) = exact_fixture();
+            let prior = plan.expected_prior.expect("metadata prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("metadata actor authority")
+                .actor
+                .clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            let terminal = Some(WorkTerminalEvidence::Expiry(expires_at));
+            let mut expected = FamilyCounts {
+                requests: 0,
+                reservations: 0,
+                packages: 0,
+                welcomes: 0,
+                reset_requests: 0,
+                leave_requests: 0,
+            };
+
+            match family {
+                DueExpiryFamily::Recovery => {
+                    let request_id = uuid(0x60);
+                    let key_package_ref = [0x61; 32];
+                    let origin_key_id = [0x62; 32];
+                    let origin = request_evidence(
+                        RequestEntryKind::LeafRecoveryRequest,
+                        request_id,
+                        actor.clone(),
+                        *prior.conversation_id(),
+                        received_at,
+                        origin_key_id,
+                    );
+                    let before_request = RecoveryRequest {
+                        request_id,
+                        target: actor.clone(),
+                        kind: LeafRecoveryKind::Add,
+                        source: RecoverySource::Request,
+                        bound_coordinate: prior,
+                        key_package_ref,
+                        received_at,
+                        expires_at,
+                        status: RecoveryRequestStatus::Open,
+                        origin: RecoveryOriginEvidence::Request(origin.clone()),
+                        terminal: None,
+                    };
+                    let mut after_request = before_request.clone();
+                    after_request.status = RecoveryRequestStatus::Expired;
+                    after_request.terminal = terminal.clone();
+                    let before_reservation = RecoveryReservation {
+                        request_id,
+                        target: actor.clone(),
+                        bound_coordinate: prior,
+                        key_package_ref,
+                        received_at,
+                        expires_at,
+                        package_not_after: expires_at,
+                        status: ReservationStatus::Active,
+                        terminal: None,
+                    };
+                    let mut after_reservation = before_reservation.clone();
+                    after_reservation.status = ReservationStatus::Expired;
+                    after_reservation.terminal = terminal;
+                    plan.effects.recovery_request_changes.push(StateChange {
+                        before: Some(before_request),
+                        after: Some(after_request.clone()),
+                    });
+                    plan.effects.reservation_changes.push(StateChange {
+                        before: Some(before_reservation),
+                        after: Some(after_reservation.clone()),
+                    });
+                    plan.effects.package_transitions.push(PackageTransition {
+                        request_id,
+                        key_package_ref,
+                        from: PackageStatus::Reserved,
+                        to: PackageStatus::Expired,
+                    });
+                    let mut package_cas = RecoveryPackageCasBinding {
+                        transaction_id: plan
+                            .effects
+                            .head_cas
+                            .as_ref()
+                            .expect("metadata head")
+                            .transaction_id
+                            .clone(),
+                        conversation_id: *prior.conversation_id(),
+                        request_id,
+                        target: actor,
+                        target_key_id: origin_key_id,
+                        target_auth_generation: 3,
+                        bound_coordinate: prior,
+                        key_package_ref,
+                        key_package_wrapper_sha256: [0x63; 32],
+                        package_not_after: expires_at,
+                        claimed_at: received_at,
+                        expected_status: PackageStatus::Reserved,
+                        successor_status: PackageStatus::Expired,
+                        locked_row_digest: [0x64; 32],
+                        authority_digest: [0; 32],
+                    };
+                    package_cas.authority_digest =
+                        recovery_package_cas_authority_digest(&package_cas);
+                    plan.effects.recovery_package_cas.push(package_cas);
+                    plan.state
+                        .recovery_requests
+                        .push(RecoveryRequestHydrationRow {
+                            request_id: after_request.request_id,
+                            target: after_request.target,
+                            kind: after_request.kind,
+                            source: after_request.source,
+                            bound_coordinate: after_request.bound_coordinate,
+                            key_package_ref: after_request.key_package_ref,
+                            received_at: after_request.received_at,
+                            expires_at: after_request.expires_at,
+                            status: after_request.status,
+                            origin: RecoveryOriginHydrationRow::Request(origin),
+                            terminal: Some(WorkTerminalHydrationRow::Expiry(expires_at)),
+                        });
+                    plan.state
+                        .recovery_reservations
+                        .push(RecoveryReservationHydrationRow {
+                            request_id: after_reservation.request_id,
+                            target: after_reservation.target,
+                            bound_coordinate: after_reservation.bound_coordinate,
+                            key_package_ref: after_reservation.key_package_ref,
+                            received_at: after_reservation.received_at,
+                            expires_at: after_reservation.expires_at,
+                            package_not_after: after_reservation.package_not_after,
+                            status: after_reservation.status,
+                            terminal: Some(WorkTerminalHydrationRow::Expiry(expires_at)),
+                        });
+                    expected.requests = 1;
+                    expected.reservations = 1;
+                    expected.packages = 1;
+                }
+                DueExpiryFamily::Reset => {
+                    let request_id = uuid(0x65);
+                    let origin = request_evidence(
+                        RequestEntryKind::ResetRequest,
+                        request_id,
+                        actor.clone(),
+                        *prior.conversation_id(),
+                        received_at,
+                        [0x66; 32],
+                    );
+                    let before = ResetRequest {
+                        request_id,
+                        requester: actor,
+                        bound_coordinate: prior,
+                        received_at,
+                        expires_at,
+                        status: ResetRequestStatus::Pending,
+                        origin: origin.clone(),
+                        terminal: None,
+                    };
+                    let mut after = before.clone();
+                    after.status = ResetRequestStatus::Expired;
+                    after.terminal = terminal;
+                    plan.effects.reset_request_changes.push(StateChange {
+                        before: Some(before),
+                        after: Some(after.clone()),
+                    });
+                    plan.state.reset_requests.push(ResetRequestHydrationRow {
+                        request_id: after.request_id,
+                        requester: after.requester,
+                        bound_coordinate: after.bound_coordinate,
+                        received_at: after.received_at,
+                        expires_at: after.expires_at,
+                        status: after.status,
+                        origin,
+                        terminal: Some(WorkTerminalHydrationRow::Expiry(expires_at)),
+                    });
+                    expected.reset_requests = 1;
+                }
+                DueExpiryFamily::Leave => {
+                    let request_id = uuid(0x67);
+                    let origin = request_evidence(
+                        RequestEntryKind::LeaveRequest,
+                        request_id,
+                        actor.clone(),
+                        *prior.conversation_id(),
+                        received_at,
+                        [0x68; 32],
+                    );
+                    let before = LeaveRequest {
+                        request_id,
+                        requester: actor,
+                        bound_coordinate: prior,
+                        received_at,
+                        expires_at,
+                        status: LeaveRequestStatus::Pending,
+                        origin: origin.clone(),
+                        terminal: None,
+                        fulfilled_participant: None,
+                    };
+                    let mut after = before.clone();
+                    after.status = LeaveRequestStatus::Expired;
+                    after.terminal = terminal;
+                    plan.effects.leave_request_changes.push(StateChange {
+                        before: Some(before),
+                        after: Some(after.clone()),
+                    });
+                    plan.state.leave_requests.push(LeaveRequestHydrationRow {
+                        request_id: after.request_id,
+                        requester: after.requester,
+                        bound_coordinate: after.bound_coordinate,
+                        received_at: after.received_at,
+                        expires_at: after.expires_at,
+                        status: after.status,
+                        origin,
+                        terminal: Some(WorkTerminalHydrationRow::Expiry(expires_at)),
+                        fulfilled_participant: None,
+                    });
+                    expected.leave_requests = 1;
+                }
+                DueExpiryFamily::Welcome => {
+                    let welcome_id = uuid(0x69);
+                    let key_package_ref = [0x6a; 32];
+                    let opaque_welcome = vec![0x6b, 0x6c];
+                    let before = WelcomeWork {
+                        welcome_id,
+                        recipient: actor.clone(),
+                        transition_seq: 5,
+                        coordinate: prior,
+                        recovery_request_id: uuid(0x6d),
+                        key_package_ref,
+                        sha256: sha2::Sha256::digest(&opaque_welcome).into(),
+                        opaque_welcome,
+                        expires_at,
+                        status: WelcomeStatus::Pending,
+                        terminal: None,
+                    };
+                    let mut after = before.clone();
+                    after.status = WelcomeStatus::Expired;
+                    after.terminal = terminal;
+                    plan.effects.welcome_changes.push(StateChange {
+                        before: Some(before),
+                        after: Some(after.clone()),
+                    });
+                    plan.state.welcomes.push(WelcomeHydrationRow {
+                        welcome_id: after.welcome_id,
+                        recipient: after.recipient.clone(),
+                        transition_seq: after.transition_seq,
+                        coordinate: after.coordinate,
+                        recovery_request_id: after.recovery_request_id,
+                        key_package_ref: after.key_package_ref,
+                        opaque_welcome: after.opaque_welcome,
+                        sha256: after.sha256,
+                        expires_at: after.expires_at,
+                        status: after.status,
+                        terminal: Some(WorkTerminalHydrationRow::Expiry(expires_at)),
+                    });
+                    let event_id = Uuid::from_bytes(uuid(0x6e));
+                    let outbox_id = Uuid::from_bytes(uuid(0x6f));
+                    context.welcome_dispositions.push(WelcomeDispositionInput {
+                        welcome_id: Uuid::from_bytes(welcome_id),
+                        event: EventFanout {
+                            event_id,
+                            event_kind: EventKind::WelcomeDisposition,
+                            payload_bytes: delivery::canonical_welcome_disposition_event_payload(
+                                Uuid::from_bytes(welcome_id),
+                                "expired",
+                            ),
+                            recipients: vec![(actor, EventEntitlementKind::Welcome, None)],
+                            outbox: vec![(outbox_id, OutboxWorkKind::Stream)],
+                        },
+                    });
+                    expected.welcomes = 1;
+                }
+            }
+
+            (plan, context, expected)
+        }
+
+        #[test]
+        fn metadata_preflight_accepts_the_exact_sealed_transition_and_author() {
+            let (plan, context) = exact_fixture();
+
+            let binding =
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                    .expect("exact metadata transition must be executable");
+
+            assert_eq!(binding.metadata.metadata_version(), 2);
+            assert_eq!(
+                binding.author.metadata_snapshot_id,
+                Uuid::from_bytes(uuid(0x3a))
+            );
+        }
+
+        #[test]
+        fn metadata_preflight_accepts_exact_fresh_and_reused_avatars() {
+            for avatar_fixture in [AvatarFixture::Fresh, AvatarFixture::Reuse] {
+                let (plan, context) = exact_fixture_with_avatar(avatar_fixture);
+                let binding =
+                    preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                        .expect("exact avatar persistence must be executable");
+                assert!(binding.avatar.is_some());
+            }
+        }
+
+        #[test]
+        fn metadata_preflight_accepts_every_exact_due_expiry_family() {
+            for family in [
+                DueExpiryFamily::Recovery,
+                DueExpiryFamily::Reset,
+                DueExpiryFamily::Leave,
+                DueExpiryFamily::Welcome,
+            ] {
+                let (plan, context, expected) = exact_due_expiry_fixture(family);
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                    .expect("exact due-expiry family must be executable");
+                reconcile_coordinate_change_families(
+                    plan.effects(),
+                    &FamilyCounts {
+                        requests: 0,
+                        reservations: 0,
+                        packages: 0,
+                        welcomes: 0,
+                        reset_requests: 0,
+                        leave_requests: 0,
+                    },
+                    &expected,
+                )
+                .expect("due-expiry family must reconcile without a silent drop");
+            }
+        }
+
+        #[test]
+        fn metadata_preflight_rejects_author_column_drift() {
+            let (plan, mut context) = exact_fixture();
+            context
+                .metadata_author
+                .as_mut()
+                .expect("metadata author")
+                .author_role = "member".to_owned();
+
+            assert!(matches!(
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                Err(ExecutorError::InconsistentPlan(_))
+            ));
+        }
+
+        #[test]
+        fn metadata_preflight_rejects_noncanonical_primary_event() {
+            let (plan, mut context) = exact_fixture();
+            context.events[0].payload_bytes.push(0);
+
+            assert!(matches!(
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                Err(ExecutorError::InconsistentPlan(_))
+            ));
+        }
+
+        #[test]
+        fn metadata_preflight_rejects_entry_audience_drift() {
+            let (plan, mut context) = exact_fixture();
+            context
+                .entry_recipients
+                .push((device(0x41), EntryEntitlementKind::Control));
+
+            assert!(matches!(
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                Err(ExecutorError::InconsistentPlan(_))
+            ));
+        }
+
+        #[test]
+        fn metadata_preflight_rejects_spine_digest_drift() {
+            let (plan, mut context) = exact_fixture();
+            context.spine.public_snapshot_bytes.push(0);
+
+            assert!(matches!(
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                Err(ExecutorError::InconsistentPlan(_))
+            ));
+        }
+
+        #[test]
+        fn metadata_preflight_rejects_unsigned_avatar_context() {
+            let (plan, mut context) = exact_fixture();
+            context.metadata_avatar = Some(MetadataAvatarPersistence::Reuse {
+                snapshot: MetadataAvatarBinding {
+                    avatar_blob_id: Uuid::from_bytes(uuid(0x42)),
+                    avatar_ciphertext_sha256: vec![0x43; 32],
+                    avatar_ciphertext_size: 64,
+                    avatar_binding_origin_transition_id: Uuid::from_bytes(uuid(0x44)),
+                    avatar_binding_metadata_version: 1,
+                    avatar_binding_owner_did: context.actor.user_did.clone(),
+                    avatar_binding_owner_device_id: context.actor.device_id,
+                },
+            });
+
+            assert!(matches!(
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                Err(ExecutorError::InconsistentPlan(_))
+            ));
+        }
+
+        #[cfg(all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        ))]
+        pub(super) fn run_production_semantic_proof() -> Result<(), String> {
+            let avatar_aad = canonical_metadata_avatar_blob_aad(
+                uuid(0x51),
+                uuid(0x52),
+                7,
+                uuid(0x53),
+                "image/png",
+                48,
+            );
+            if !avatar_aad.starts_with(b"CATBIRD-CHAT-METADATA-AVATAR-BLOB\0") {
+                return Err("metadata avatar AAD omitted its protocol domain".to_owned());
+            }
+            let expected_avatar_aad_sha256 = [
+                0x97, 0x27, 0x75, 0x7f, 0x58, 0x75, 0x13, 0x39, 0x16, 0x32, 0x0d, 0x3c, 0x82, 0xc2,
+                0x72, 0xdf, 0x48, 0x0d, 0x41, 0x95, 0xed, 0x3b, 0x57, 0x97, 0xd6, 0x1a, 0xa6, 0x3e,
+                0xd0, 0x71, 0x73, 0xb8,
+            ];
+            let actual_avatar_aad_sha256 = <[u8; 32]>::from(sha2::Sha256::digest(&avatar_aad));
+            if actual_avatar_aad_sha256 != expected_avatar_aad_sha256 {
+                return Err(format!(
+                    "metadata avatar AAD canonical payload drifted from the fixed vector: {}",
+                    hex::encode(actual_avatar_aad_sha256)
+                ));
+            }
+
+            let (plan, context) = exact_fixture();
+            preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                .map_err(|error| format!("exact metadata preflight failed: {error:?}"))?;
+            for (label, avatar_fixture) in [
+                ("fresh avatar", AvatarFixture::Fresh),
+                ("reused avatar", AvatarFixture::Reuse),
+            ] {
+                let (plan, context) = exact_fixture_with_avatar(avatar_fixture);
+                let binding =
+                    preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                        .map_err(|error| format!("{label} preflight failed: {error:?}"))?;
+                if binding.avatar.is_none() {
+                    return Err(format!("{label} lost its persistence authority"));
+                }
+            }
+            for (label, family) in [
+                (
+                    "Recovery/reservation/package expiry",
+                    DueExpiryFamily::Recovery,
+                ),
+                ("Reset expiry", DueExpiryFamily::Reset),
+                ("Leave expiry", DueExpiryFamily::Leave),
+                ("Welcome expiry", DueExpiryFamily::Welcome),
+            ] {
+                let (plan, context, expected) = exact_due_expiry_fixture(family);
+                preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                    .map_err(|error| format!("{label} preflight failed: {error:?}"))?;
+                reconcile_coordinate_change_families(
+                    plan.effects(),
+                    &FamilyCounts {
+                        requests: 0,
+                        reservations: 0,
+                        packages: 0,
+                        welcomes: 0,
+                        reset_requests: 0,
+                        leave_requests: 0,
+                    },
+                    &expected,
+                )
+                .map_err(|error| format!("{label} reconciliation failed: {error:?}"))?;
+            }
+
+            let reject = |label: &str,
+                          plan: &ConversationPersistencePlan,
+                          context: &ExecutionContext|
+             -> Result<(), String> {
+                match preflight_metadata_transition(plan, context, Uuid::from_bytes(uuid(0x24)), 6)
+                {
+                    Err(ExecutorError::InconsistentPlan(_)) => Ok(()),
+                    Ok(_) => Err(format!("{label} was accepted")),
+                    Err(error) => Err(format!(
+                        "{label} failed with the wrong executor error: {error:?}"
+                    )),
+                }
+            };
+
+            let (plan, mut context) = exact_fixture();
+            context.events[0].payload_bytes.push(0);
+            reject("primary event payload drift", &plan, &context)?;
+
+            let (plan, mut context) = exact_fixture();
+            context
+                .entry_recipients
+                .push((device(0x41), EntryEntitlementKind::Control));
+            reject("entry audience drift", &plan, &context)?;
+
+            let (plan, mut context) = exact_fixture();
+            context.spine.public_snapshot_bytes.push(0);
+            reject("spine digest drift", &plan, &context)?;
+
+            let (plan, mut context) = exact_fixture();
+            context.metadata_avatar = Some(MetadataAvatarPersistence::Reuse {
+                snapshot: MetadataAvatarBinding {
+                    avatar_blob_id: Uuid::from_bytes(uuid(0x42)),
+                    avatar_ciphertext_sha256: vec![0x43; 32],
+                    avatar_ciphertext_size: 64,
+                    avatar_binding_origin_transition_id: Uuid::from_bytes(uuid(0x44)),
+                    avatar_binding_metadata_version: 1,
+                    avatar_binding_owner_did: context.actor.user_did.clone(),
+                    avatar_binding_owner_device_id: context.actor.device_id,
+                },
+            });
+            reject("unsigned avatar context", &plan, &context)?;
+
+            Ok(())
+        }
+    }
+
+    #[cfg(all(
+        feature = "chat-protocol-production-proof",
+        not(feature = "server-bin")
+    ))]
+    pub(in crate::chat_protocol) fn run_metadata_semantic_proof() -> Result<(), String> {
+        metadata_executor_tests::run_production_semantic_proof()
     }
 }

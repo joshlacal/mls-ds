@@ -1618,6 +1618,8 @@ pub(crate) struct ReservedRecoveryPackageReleaseCas<'a> {
     pub(crate) claimed_at: DateTime<Utc>,
     pub(crate) locked_row_digest: &'a [u8],
     pub(crate) authority_digest: &'a [u8],
+    pub(crate) successor_status: PackageStatus,
+    pub(crate) terminal_at: Option<DateTime<Utc>>,
 }
 
 /// Release a reserved package only while the exact locked Open-request /
@@ -1631,13 +1633,21 @@ pub(crate) async fn release_reserved_recovery_package(
     if binding.locked_row_digest == [0; 32] || binding.authority_digest == [0; 32] {
         return Err(TransitionRepositoryError::CompareAndSetConflict);
     }
+    let valid_successor = match (binding.successor_status, binding.terminal_at) {
+        (PackageStatus::Available, None) => true,
+        (PackageStatus::Expired, Some(terminal_at)) => terminal_at == binding.package_not_after,
+        _ => false,
+    };
+    if !valid_successor {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
     let result = sqlx::query(
         r#"
         UPDATE chat.key_packages AS kp
-           SET status = 'available',
+           SET status = $18,
                terminal_transition_id = NULL,
                terminal_revocation_id = NULL,
-               terminal_at = NULL
+               terminal_at = $19
          WHERE txid_current()::text = $1
            AND kp.key_package_ref = $2
            AND kp.wrapper_sha256 = $3
@@ -1715,6 +1725,8 @@ pub(crate) async fn release_reserved_recovery_package(
     .bind(binding.group_context_hash)
     .bind(binding.confirmation_tag)
     .bind(binding.claimed_at)
+    .bind(binding.successor_status.as_str())
+    .bind(binding.terminal_at)
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() != 1 {

@@ -3,10 +3,9 @@
 //! This is the v2 handler tree, isolated from the superseded
 //! `handlers/mls_chat/` namespace. It exposes the certified
 //! `chat_protocol` repository/executor spine over XRPC. All 32 chat routes are
-//! registered up front by [`chat_router`]; slice H1 implements device
-//! lifecycle (enroll, replenish, rebind, getDevices, getOwnDevices) and leaves
-//! every other route — including `revokeDevice`, whose production revocation
-//! glue is a separate slice — on the shared cutover-gated not-implemented stub.
+//! registered up front by [`chat_router`]. Device lifecycle plus the sealed
+//! Reset, G6, Welcome, and Recovery mutation compositors have real routes;
+//! every remaining endpoint stays on the shared cutover-gated stub.
 
 use std::sync::Arc;
 
@@ -28,8 +27,20 @@ mod errors;
 mod get_devices;
 mod get_own_devices;
 mod rebind_device_authentication;
+#[cfg(not(test))]
+mod recovery;
+#[cfg(not(test))]
+mod recovery_scheduler;
 mod replenish_key_packages;
+#[cfg(not(test))]
+mod reset;
+#[cfg(not(test))]
+mod revoke_device;
 mod runtime;
+#[cfg(not(test))]
+mod submit_transition;
+#[cfg(not(test))]
+mod welcome;
 
 use errors::ChatFailure;
 pub use runtime::ChatRuntime;
@@ -64,28 +75,46 @@ where
     router.merge(implemented_routes::<S>())
 }
 
-/// Whether `endpoint` has a real handler in this slice (H1 device lifecycle).
-/// Everything else — including `revokeDevice`, whose production revocation glue
-/// is a later slice — stays on the shared cutover-gated not-implemented stub.
+/// Whether `endpoint` has a real handler in this slice.
 fn is_implemented(endpoint: ChatEndpoint) -> bool {
-    matches!(
+    if matches!(
         endpoint,
         ChatEndpoint::EnrollDevice
             | ChatEndpoint::ReplenishKeyPackages
             | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
-    )
+    ) {
+        return true;
+    }
+    #[cfg(not(test))]
+    {
+        matches!(
+            endpoint,
+            ChatEndpoint::RequestReset
+                | ChatEndpoint::ActivateReset
+                | ChatEndpoint::RevokeDevice
+                | ChatEndpoint::AcknowledgeWelcome
+                | ChatEndpoint::RejectWelcome
+                | ChatEndpoint::RequestLeafRecovery
+                | ChatEndpoint::CancelLeafRecovery
+                | ChatEndpoint::SubmitTransition
+        )
+    }
+    #[cfg(test)]
+    {
+        false
+    }
 }
 
-/// Register the real H1 device-lifecycle handlers.
+/// Register every real clean-chat handler in this slice.
 fn implemented_routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
 {
-    Router::new()
+    let router = Router::new()
         .route(
             &xrpc_path(ChatEndpoint::EnrollDevice),
             post(enroll_device::handle),
@@ -105,7 +134,42 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::RequestReset),
+            post(reset::handle_request),
         )
+        .route(
+            &xrpc_path(ChatEndpoint::ActivateReset),
+            post(reset::handle_activation),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RevokeDevice),
+            post(revoke_device::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::AcknowledgeWelcome),
+            post(welcome::handle_acknowledgement),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RejectWelcome),
+            post(welcome::handle_rejection),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::RequestLeafRecovery),
+            post(recovery::handle_request),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelLeafRecovery),
+            post(recovery::handle_cancellation),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::SubmitTransition),
+            post(submit_transition::handle),
+        );
+    router
 }
 
 fn xrpc_path(endpoint: ChatEndpoint) -> String {

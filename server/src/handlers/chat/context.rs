@@ -35,7 +35,9 @@ use crate::chat_protocol::{
     repository::auth::{
         self, AuthRepositoryError, AuthorizationOutcome, CompletedIdempotentResponse,
         EnrollmentOperationAdmission, RebindOperationAdmission, ReplenishmentOperationAdmission,
+        SignedOperationAdmission,
     },
+    repository::prelude::PreludeError,
     transcript,
     validation::{CanonicalHttpMethod, TrustedRequestInstant, ValidatedChatNsid},
 };
@@ -260,6 +262,39 @@ pub(crate) async fn admit_rebind(
     Ok(into_admission(outcome))
 }
 
+/// Byte-opaque operation-only admission for an ordinary signed procedure.
+/// Global operation arbitration in the caller-owned transaction decides
+/// whether first-execution timestamp authority or completed-replay authority
+/// may be opened.
+pub(crate) async fn admit_signed_operation_only(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<SignedOperationAdmission, ChatFailure> {
+    require_cutover(runtime, endpoint)?;
+    let trust = verifier(runtime, endpoint)?;
+    let dpop_headers = read_dpop_headers(headers, endpoint)?;
+    let nsid = validated_nsid(endpoint)?;
+    let instant = capture_instant(endpoint)?;
+    let pre_replay = dpop::verify_ordinary_request_auth(
+        trust,
+        &dpop_headers.authorization,
+        &dpop_headers.proof,
+        &nsid,
+        &CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?,
+        &instant,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    let signed_bytes = signed_request_bytes(body, endpoint)?;
+    let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes)
+        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    auth::authorize_signed_operation_only(pool, pre_replay, canonical)
+        .await
+        .map_err(|error| auth_repository_failure(endpoint, error))
+}
+
 /// Operation-only enrollment admission. This consumes replay evidence but
 /// cannot surface completed response bytes; the caller-owned operation prelude
 /// must first reserve the global operation and lock the enrollment slot.
@@ -371,6 +406,29 @@ pub(crate) fn json_ok(response_bytes: Vec<u8>) -> Response {
     response
 }
 
+/// Render facade-owned canonical JSON bytes at their exact validated status.
+/// Endpoint facades use this for deterministic success and terminal-error
+/// material; handlers must not deserialize and reserialize those bytes.
+pub(crate) fn canonical_json_response(
+    endpoint: ChatEndpoint,
+    status: i32,
+    response_bytes: Vec<u8>,
+) -> Result<Response, ChatFailure> {
+    let status = u16::try_from(status)
+        .ok()
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .ok_or_else(|| ChatFailure::invariant(endpoint))?;
+    if response_bytes.is_empty() {
+        return Err(ChatFailure::invariant(endpoint));
+    }
+    let mut response = Response::new(axum::body::Body::from(response_bytes));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
+
 /// Render a completed idempotency record verbatim (OQ-3): the stored status and
 /// exact stored response bytes, with the endpoint content-type.
 pub(crate) fn replay_response(completed: &CompletedIdempotentResponse) -> Response {
@@ -420,4 +478,32 @@ pub(crate) fn auth_repository_failure(
         E::Primitive(_) => C::InvalidSignature,
     };
     ChatFailure::protocol(endpoint, code)
+}
+
+/// Map the shared operation-prelude failures without exposing repository
+/// integrity detail. Only the exact endpoint-agnostic semantic failures cross
+/// the wire; every lock/scope/claim invariant remains internal.
+pub(crate) fn operation_prelude_failure(
+    endpoint: ChatEndpoint,
+    error: PreludeError,
+) -> ChatFailure {
+    use ChatProtocolErrorCode as C;
+    use PreludeError as E;
+
+    match error {
+        E::Database(_) => ChatFailure::storage(endpoint),
+        E::Authorization(error) => auth_repository_failure(endpoint, error),
+        E::MissingDevice | E::MissingDeviceKey => {
+            ChatFailure::protocol(endpoint, C::DeviceNotRegistered)
+        }
+        E::OperationIdConflict => ChatFailure::protocol(endpoint, C::IdempotencyConflict),
+        E::ForeignTransaction
+        | E::UnsupportedAuthority
+        | E::NonCanonicalOperation
+        | E::CanonicalScope
+        | E::ScopeDrift
+        | E::MissingPrincipal
+        | E::AuthorityBindingMismatch
+        | E::ClaimIntegrity => ChatFailure::invariant(endpoint),
+    }
 }

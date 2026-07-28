@@ -101,6 +101,12 @@ fn recovery_production_facade_has_no_caller_payload_injection_surface() {
     }
 }
 
+#[test]
+fn metadata_executor_semantics_run_through_the_real_private_preflight() {
+    catbird_server::chat_protocol::production_proof::run_metadata_executor_semantic_proof()
+        .expect("real metadata executor semantic proof");
+}
+
 #[tokio::test]
 #[ignore = "requires the dedicated gate database with one production-valid due Recovery fixture"]
 async fn recovery_scheduler_expiry_runs_through_the_real_production_facade() {

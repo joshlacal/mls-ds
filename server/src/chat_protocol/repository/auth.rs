@@ -15,7 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[cfg(test)]
-use super::super::validation::{ed25519_key_id, BareDid, KeyThumbprint};
+use super::super::validation::ed25519_key_id;
 use super::super::{
     dpop::{self, PreReplayCryptographicVerification, VerifiedChatDeviceRequest},
     model::AuthPrimitiveError,
@@ -24,7 +24,7 @@ use super::super::{
         CanonicalSignedMutation, CanonicalValueRef, SignedMutationKind, VerifiedEnrollmentBody,
         VerifiedMutationProjection, VerifiedSignedMutation,
     },
-    validation::{CanonicalUuidV4, NumericDate},
+    validation::{BareDid, CanonicalUuidV4, KeyThumbprint, NumericDate},
 };
 
 const UNIQUE_VIOLATION: &str = "23505";
@@ -250,6 +250,30 @@ pub(crate) struct RebindOperationAdmission {
     authority: VerifiedChatDeviceRequest,
 }
 
+/// Replay-consumed ordinary signed operation capability. It owns the exact
+/// canonical request and locked signer but deliberately has not applied the
+/// first-execution `signedAt` window: only global operation arbitration may
+/// decide whether that check is required.
+#[must_use]
+pub(crate) struct SignedOperationAdmission {
+    pre_replay: PreReplayCryptographicVerification,
+    canonical: CanonicalSignedMutation,
+    signing_public_key: Vec<u8>,
+    receipt: RepositoryAuthorityReceipt,
+}
+
+/// Signature-verified authority for a completed ordinary signed operation.
+///
+/// This is intentionally distinct from [`VerifiedChatDeviceRequest`]:
+/// completed retries may be older than the first-execution `signedAt` window.
+/// Repository endpoint facades may inspect its immutable request identity only
+/// while retaining an opaque operation replay guard.
+pub(crate) struct SignedOperationReplayAuthority {
+    pre_replay: PreReplayCryptographicVerification,
+    mutation: VerifiedSignedMutation,
+    receipt: RepositoryAuthorityReceipt,
+}
+
 /// Replay-consumed replenishment capability sealed to the current registered
 /// signing authority. Only the operation prelude may open it.
 #[must_use]
@@ -266,6 +290,79 @@ impl EnrollmentOperationAdmission {
 impl RebindOperationAdmission {
     pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
         self.authority
+    }
+}
+
+impl SignedOperationAdmission {
+    pub(super) fn pre_replay(&self) -> &PreReplayCryptographicVerification {
+        &self.pre_replay
+    }
+
+    pub(super) fn canonical(&self) -> &CanonicalSignedMutation {
+        &self.canonical
+    }
+
+    pub(super) fn operation_id(&self) -> Result<Uuid, AuthRepositoryError> {
+        operation_id_from_canonical(&self.canonical)
+    }
+
+    pub(super) fn into_first_authority(
+        self,
+    ) -> Result<VerifiedChatDeviceRequest, AuthRepositoryError> {
+        Ok(dpop::mint_signed_repository_authority(
+            self.pre_replay,
+            self.canonical,
+            &self.signing_public_key,
+            self.receipt,
+        )?)
+    }
+
+    pub(super) fn into_replay_authority(
+        self,
+    ) -> Result<SignedOperationReplayAuthority, AuthRepositoryError> {
+        let mutation = super::super::transcript::verify_signed_mutation(
+            self.canonical,
+            &self.signing_public_key,
+        )?;
+        Ok(SignedOperationReplayAuthority {
+            pre_replay: self.pre_replay,
+            mutation,
+            receipt: self.receipt,
+        })
+    }
+}
+
+impl SignedOperationReplayAuthority {
+    pub(crate) fn subject(&self) -> &BareDid {
+        self.pre_replay.subject()
+    }
+
+    pub(crate) fn device_id(&self) -> &CanonicalUuidV4 {
+        self.pre_replay.device_id()
+    }
+
+    pub(crate) fn dpop_jkt(&self) -> &KeyThumbprint {
+        self.pre_replay.dpop_jkt()
+    }
+
+    pub(crate) fn endpoint(&self) -> &super::super::validation::ValidatedChatNsid {
+        self.pre_replay.endpoint()
+    }
+
+    pub(crate) fn mutation(&self) -> &VerifiedSignedMutation {
+        &self.mutation
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.pre_replay.trusted_instant().datetime()
+    }
+
+    pub(super) fn pre_replay(&self) -> &PreReplayCryptographicVerification {
+        &self.pre_replay
+    }
+
+    pub(super) fn repository_receipt(&self) -> &RepositoryAuthorityReceipt {
+        &self.receipt
     }
 }
 
@@ -720,6 +817,16 @@ struct IdempotencyRow {
     completed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, FromRow)]
+struct IdempotencyBindingRow {
+    request_digest: Vec<u8>,
+    accepted_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    historical_jkt: Option<String>,
+    current_jkt: Option<String>,
+}
+
 struct RequestMaterial {
     operation_id: Uuid,
     accepted_request_bytes: Vec<u8>,
@@ -1058,6 +1165,100 @@ pub(crate) async fn authorize_rebind_operation_only(
     Ok(RebindOperationAdmission { authority })
 }
 
+/// Consumes ordinary DPoP replay evidence and seals the exact signed operation
+/// to either the current active signer or the retained historical signer for
+/// an exact completed self-revocation. It neither arbitrates the operation nor
+/// reads completed response bytes.
+pub(crate) async fn authorize_signed_operation_only(
+    pool: &PgPool,
+    pre_replay: PreReplayCryptographicVerification,
+    canonical: CanonicalSignedMutation,
+) -> Result<SignedOperationAdmission, AuthRepositoryError> {
+    let unsupported_shape = !endpoint_accepts_operation_only_signed_kind(
+        pre_replay.endpoint().as_str(),
+        canonical.kind(),
+    ) || pre_replay.enrollment_body().is_some()
+        || pre_replay.rebind_bootstrap().is_some()
+        || pre_replay.auth_transaction_replay().is_some();
+    let mut transaction = pool.begin().await?;
+    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
+    let decision = async {
+        if unsupported_shape
+            || canonical.actor_did() != pre_replay.subject()
+            || canonical.actor_device_id() != pre_replay.device_id()
+        {
+            return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+        }
+        let material = request_material_for_canonical(&pre_replay, &canonical)?
+            .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+        let generation = i64::try_from(canonical.auth_generation())
+            .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+        let exact_self_revocation = canonical_is_exact_self_target_revocation(&canonical)?;
+        let state = match lock_existing_authority(&mut transaction, &pre_replay).await {
+            Ok(state) => state,
+            Err(AuthRepositoryError::DeviceRevoked) if exact_self_revocation => {
+                if !completed_request_material_matches_without_response(
+                    &mut transaction,
+                    &pre_replay,
+                    &material,
+                )
+                .await?
+                {
+                    return Err(AuthRepositoryError::DeviceRevoked);
+                }
+                let signing_public_key = completed_self_revocation_signing_public_key(
+                    &mut transaction,
+                    &material,
+                    pre_replay.subject().as_str(),
+                    canonical_uuid(pre_replay.device_id()),
+                    pre_replay.dpop_jkt().as_str(),
+                    canonical.key_id().as_str(),
+                    generation,
+                    None,
+                )
+                .await?
+                .ok_or(AuthRepositoryError::CorruptIdempotencyRecord)?;
+                LockedDeviceAuthority {
+                    dpop_jkt: pre_replay.dpop_jkt().as_str().to_owned(),
+                    auth_generation: generation,
+                    key_id: canonical.key_id().as_str().to_owned(),
+                    signing_public_key,
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if canonical.kind() == SignedMutationKind::KeyPackageReplenishment {
+            validate_replenishment_binding(&pre_replay, &canonical, &state)?;
+        }
+        if state.key_id != canonical.key_id().as_str() {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
+        if state.auth_generation != generation {
+            return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
+        }
+        verify_ed25519_strict(
+            &state.signing_public_key,
+            canonical.transcript_bytes(),
+            canonical.signature(),
+        )?;
+        let receipt = RepositoryAuthorityReceipt::existing(
+            replay_ids,
+            Some(material.operation_id),
+            &state,
+            RepositoryAuthorityClass::ExistingDevice,
+        );
+        Ok((receipt, state.signing_public_key))
+    }
+    .await;
+    let (receipt, signing_public_key) = commit_semantic_decision(transaction, decision).await?;
+    Ok(SignedOperationAdmission {
+        pre_replay,
+        canonical,
+        signing_public_key,
+        receipt,
+    })
+}
+
 /// Consumes ordinary replay evidence and seals an exact replenishment request
 /// to the current registered authority without consulting idempotent response
 /// storage. Replay bytes remain inaccessible until the operation prelude has
@@ -1199,6 +1400,28 @@ pub(super) async fn reserve_canonical_operation(
     Ok(CanonicalOperationReservationGuard {
         transaction_id,
         operation_id: material.operation_id,
+    })
+}
+
+pub(super) async fn reserve_canonical_signed_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: &SignedOperationAdmission,
+) -> Result<CanonicalOperationReservationGuard, AuthRepositoryError> {
+    let operation_id = admission.operation_id()?;
+    if admission.receipt.operation_id() != Some(operation_id) {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let lock_key = format!("chat-operation-id:{operation_id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(CanonicalOperationReservationGuard {
+        transaction_id,
+        operation_id,
     })
 }
 
@@ -2342,16 +2565,18 @@ async fn validate_completed_self_revocation_authority(
     let operation_id = receipt
         .operation_id()
         .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let material = request_material_for_authority(authority)?;
+    if material.operation_id != operation_id {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
     validate_completed_self_revocation_material(
         transaction,
-        operation_id,
+        &material,
         authority.subject().as_str(),
         canonical_uuid(authority.device_id()),
         authority.dpop_jkt().as_str(),
         mutation.key_id().as_str(),
         generation,
-        mutation.transcript_bytes(),
-        mutation.signature(),
         receipt.locked_signing_key_sha256(),
     )
     .await
@@ -2360,16 +2585,39 @@ async fn validate_completed_self_revocation_authority(
 #[allow(clippy::too_many_arguments)]
 async fn validate_completed_self_revocation_material(
     transaction: &mut Transaction<'_, Postgres>,
-    operation_id: Uuid,
+    material: &RequestMaterial,
     actor_did: &str,
     actor_device_id: Uuid,
     historical_jkt: &str,
     actor_key_id: &str,
     actor_auth_generation: i64,
-    signing_transcript_bytes: &[u8],
-    signature: &[u8],
     expected_signing_key_sha256: Option<&[u8; 32]>,
 ) -> Result<bool, AuthRepositoryError> {
+    Ok(completed_self_revocation_signing_public_key(
+        transaction,
+        material,
+        actor_did,
+        actor_device_id,
+        historical_jkt,
+        actor_key_id,
+        actor_auth_generation,
+        expected_signing_key_sha256,
+    )
+    .await?
+    .is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn completed_self_revocation_signing_public_key(
+    transaction: &mut Transaction<'_, Postgres>,
+    material: &RequestMaterial,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    historical_jkt: &str,
+    actor_key_id: &str,
+    actor_auth_generation: i64,
+    expected_signing_key_sha256: Option<&[u8; 32]>,
+) -> Result<Option<Vec<u8>>, AuthRepositoryError> {
     let signing_public_key: Option<Vec<u8>> = sqlx::query_scalar(
         r#"
         SELECT actor_key.signing_public_key
@@ -2407,25 +2655,38 @@ async fn validate_completed_self_revocation_material(
            AND terminal.actor_key_id = $5
            AND terminal.actor_auth_generation = $6
            AND target.dpop_jkt = $3
+           AND completed.request_digest = $7
+           AND completed.accepted_request_bytes = $8
+           AND completed.signing_transcript_bytes = $9
+           AND completed.signature = $10
+         FOR UPDATE OF completed,terminal,target,actor_key
         "#,
     )
-    .bind(operation_id)
+    .bind(material.operation_id)
     .bind(actor_did)
     .bind(historical_jkt)
     .bind(actor_device_id)
     .bind(actor_key_id)
     .bind(actor_auth_generation)
+    .bind(material.request_digest.as_slice())
+    .bind(&material.accepted_request_bytes)
+    .bind(&material.signing_transcript_bytes)
+    .bind(material.signature.as_slice())
     .fetch_optional(&mut **transaction)
     .await?;
     let Some(signing_public_key) = signing_public_key else {
-        return Ok(false);
+        return Ok(None);
     };
     let signing_key_sha256: [u8; 32] = Sha256::digest(&signing_public_key).into();
     if expected_signing_key_sha256.is_some_and(|expected| expected != &signing_key_sha256) {
         return Err(AuthRepositoryError::RequestBindingMismatch);
     }
-    verify_ed25519_strict(&signing_public_key, signing_transcript_bytes, signature)?;
-    Ok(true)
+    verify_ed25519_strict(
+        &signing_public_key,
+        &material.signing_transcript_bytes,
+        &material.signature,
+    )?;
+    Ok(Some(signing_public_key))
 }
 
 /// Persists the immutable exact-response replay record inside the same
@@ -2792,15 +3053,13 @@ async fn arbitrate_signed(
             .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
         if !validate_completed_self_revocation_material(
             transaction,
-            material.operation_id,
+            material,
             pre_replay.subject().as_str(),
             canonical_uuid(pre_replay.device_id()),
             pre_replay.dpop_jkt().as_str(),
             canonical.key_id().as_str(),
             i64::try_from(canonical.auth_generation())
                 .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?,
-            canonical.transcript_bytes(),
-            canonical.signature(),
             None,
         )
         .await?
@@ -2823,15 +3082,13 @@ async fn arbitrate_signed(
             };
             if !validate_completed_self_revocation_material(
                 transaction,
-                material.operation_id,
+                material,
                 pre_replay.subject().as_str(),
                 canonical_uuid(pre_replay.device_id()),
                 pre_replay.dpop_jkt().as_str(),
                 canonical.key_id().as_str(),
                 i64::try_from(canonical.auth_generation())
                     .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?,
-                canonical.transcript_bytes(),
-                canonical.signature(),
                 None,
             )
             .await?
@@ -3100,6 +3357,45 @@ fn validate_completed_rebind_business_authority(
     Ok(())
 }
 
+async fn completed_request_material_matches_without_response(
+    transaction: &mut Transaction<'_, Postgres>,
+    pre_replay: &PreReplayCryptographicVerification,
+    material: &RequestMaterial,
+) -> Result<bool, AuthRepositoryError> {
+    let row: Option<IdempotencyBindingRow> = sqlx::query_as(
+        r#"
+        SELECT request_digest,accepted_request_bytes,signing_transcript_bytes,
+               signature,historical_jkt,current_jkt
+          FROM chat.idempotency_records
+         WHERE principal_did=$1 AND endpoint_nsid=$2 AND operation_id=$3
+        "#,
+    )
+    .bind(pre_replay.subject().as_str())
+    .bind(pre_replay.endpoint().as_str())
+    .bind(material.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    if row.request_digest.as_slice() != material.request_digest
+        || row.accepted_request_bytes != material.accepted_request_bytes
+        || row.signing_transcript_bytes != material.signing_transcript_bytes
+        || row.signature.as_deref() != Some(material.signature.as_slice())
+        || !completed_replay_jkt_shape(
+            pre_replay.endpoint().as_str(),
+            pre_replay.dpop_jkt().as_str(),
+            material.historical_jkt.as_deref(),
+            material.current_jkt.as_deref(),
+            row.historical_jkt.as_deref(),
+            row.current_jkt.as_deref(),
+        )
+    {
+        return Err(AuthRepositoryError::IdempotencyConflict);
+    }
+    Ok(true)
+}
+
 async fn completed_replay(
     transaction: &mut Transaction<'_, Postgres>,
     pre_replay: &PreReplayCryptographicVerification,
@@ -3159,6 +3455,88 @@ pub(super) async fn load_validated_completed_business_replay(
         validate_completed_business_authority(transaction, authority).await?;
     }
     Ok(response)
+}
+
+/// Pre-head identity lock for a generic signed operation replay. This performs
+/// no completed-response load. The caller-owned transaction retains the row
+/// locks while its endpoint facade validates the complete durable post-state.
+pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &SignedOperationReplayAuthority,
+) -> Result<(), AuthRepositoryError> {
+    let material = request_material_for_signed_replay(authority)?;
+    validate_signed_operation_replay_identity(transaction, authority, &material).await
+}
+
+async fn validate_signed_operation_replay_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &SignedOperationReplayAuthority,
+    material: &RequestMaterial,
+) -> Result<(), AuthRepositoryError> {
+    let receipt = authority.repository_receipt();
+    let mutation = authority.mutation();
+    let generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    let exact_self_revocation = if mutation.kind() == SignedMutationKind::DeviceRevocation {
+        let accepted = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(AuthRepositoryError::MissingAcceptedRequestBytes)?;
+        let canonical = decode_canonical_signed_mutation(accepted)?;
+        canonical_is_exact_self_target_revocation(&canonical)?
+    } else {
+        false
+    };
+    if exact_self_revocation {
+        if receipt.class() != RepositoryAuthorityClass::ExistingDevice
+            || receipt.locked_jkt() != Some(authority.dpop_jkt().as_str())
+            || receipt.locked_auth_generation() != Some(generation)
+            || receipt.locked_key_id() != Some(mutation.key_id().as_str())
+            || receipt.locked_signing_key_sha256().is_none()
+        {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
+        if validate_completed_self_revocation_material(
+            transaction,
+            material,
+            authority.subject().as_str(),
+            canonical_uuid(authority.device_id()),
+            authority.dpop_jkt().as_str(),
+            mutation.key_id().as_str(),
+            generation,
+            receipt.locked_signing_key_sha256(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        return Err(AuthRepositoryError::CorruptIdempotencyRecord);
+    }
+
+    let state = lock_existing_authority(transaction, authority.pre_replay()).await?;
+    if receipt.class() != RepositoryAuthorityClass::ExistingDevice
+        || state.key_id != mutation.key_id().as_str()
+        || state.auth_generation != generation
+        || !locked_state_matches_receipt(receipt, &state)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    verify_ed25519_strict(
+        &state.signing_public_key,
+        mutation.transcript_bytes(),
+        mutation.signature(),
+    )?;
+    Ok(())
+}
+
+/// Post-domain exact completion load. Identity authority must already be
+/// locked and sealed by the prelude; this function deliberately performs no
+/// principal/device/key query.
+pub(in crate::chat_protocol::repository) async fn load_signed_operation_replay_completion(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &SignedOperationReplayAuthority,
+) -> Result<Option<CompletedIdempotentResponse>, AuthRepositoryError> {
+    let material = request_material_for_signed_replay(authority)?;
+    completed_replay(transaction, authority.pre_replay(), &material).await
 }
 
 fn completed_replay_jkt_matches(
@@ -3527,6 +3905,29 @@ fn request_material_for_authority(
     })
 }
 
+fn request_material_for_signed_replay(
+    authority: &SignedOperationReplayAuthority,
+) -> Result<RequestMaterial, AuthRepositoryError> {
+    let mutation = authority.mutation();
+    let accepted = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(AuthRepositoryError::MissingAcceptedRequestBytes)?;
+    let operation_id = authority
+        .repository_receipt()
+        .operation_id()
+        .ok_or(AuthRepositoryError::InvalidCompletion)?;
+    Ok(RequestMaterial {
+        operation_id,
+        accepted_request_bytes: accepted.to_vec(),
+        signing_transcript_bytes: mutation.transcript_bytes().to_vec(),
+        request_digest: *mutation.request_digest(),
+        signature: *mutation.signature(),
+        historical_jkt: (authority.endpoint().as_str() == "blue.catbird.chat.revokeDevice")
+            .then(|| authority.dpop_jkt().as_str().to_owned()),
+        current_jkt: None,
+    })
+}
+
 fn operation_id_from_canonical(
     canonical: &CanonicalSignedMutation,
 ) -> Result<Uuid, AuthRepositoryError> {
@@ -3663,6 +4064,10 @@ fn endpoint_accepts_signed_mutation(endpoint: &str) -> bool {
         .any(|kind| endpoint_accepts_kind(endpoint, kind))
 }
 
+fn endpoint_accepts_operation_only_signed_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
+    endpoint_has_idempotency_record(endpoint) && endpoint_accepts_kind(endpoint, kind)
+}
+
 fn endpoint_accepts_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
     match endpoint {
         "blue.catbird.chat.replenishKeyPackages" => {
@@ -3678,7 +4083,6 @@ fn endpoint_accepts_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
                 | SignedMutationKind::PolicyTransition
                 | SignedMutationKind::MetadataTransition
                 | SignedMutationKind::LeafRecoveryFulfillment
-                | SignedMutationKind::ZeroLeafLeave
                 | SignedMutationKind::LeaveCommitFulfillment
         ),
         "blue.catbird.chat.acceptConversation" => kind == SignedMutationKind::ParticipantAcceptance,
@@ -3691,7 +4095,10 @@ fn endpoint_accepts_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
             kind == SignedMutationKind::LeafRecoveryCancellation
         }
         "blue.catbird.chat.closeConversation" => kind == SignedMutationKind::ConversationClose,
-        "blue.catbird.chat.requestLeave" => kind == SignedMutationKind::LeaveRequest,
+        "blue.catbird.chat.requestLeave" => matches!(
+            kind,
+            SignedMutationKind::LeaveRequest | SignedMutationKind::ZeroLeafLeave
+        ),
         "blue.catbird.chat.cancelLeave" => kind == SignedMutationKind::LeaveCancellation,
         "blue.catbird.chat.acknowledgeWelcome" => {
             kind == SignedMutationKind::WelcomeAcknowledgement
@@ -3809,6 +4216,86 @@ mod tests {
                 "bootstrap-only endpoint escaped its dedicated authorizer",
             );
         }
+    }
+
+    #[test]
+    fn operation_only_signed_admission_requires_an_exact_durable_operation_shape() {
+        for (endpoint, kind) in [
+            (
+                "blue.catbird.chat.requestReset",
+                SignedMutationKind::ResetRequest,
+            ),
+            (
+                "blue.catbird.chat.activateReset",
+                SignedMutationKind::ResetActivation,
+            ),
+            (
+                "blue.catbird.chat.revokeDevice",
+                SignedMutationKind::DeviceRevocation,
+            ),
+            (
+                "blue.catbird.chat.acknowledgeWelcome",
+                SignedMutationKind::WelcomeAcknowledgement,
+            ),
+            (
+                "blue.catbird.chat.rejectWelcome",
+                SignedMutationKind::WelcomeRejection,
+            ),
+            (
+                "blue.catbird.chat.requestLeafRecovery",
+                SignedMutationKind::LeafRecoveryRequest,
+            ),
+            (
+                "blue.catbird.chat.cancelLeafRecovery",
+                SignedMutationKind::LeafRecoveryCancellation,
+            ),
+            (
+                "blue.catbird.chat.submitTransition",
+                SignedMutationKind::LeafRecoveryFulfillment,
+            ),
+            (
+                "blue.catbird.chat.submitTransition",
+                SignedMutationKind::CommitTransition,
+            ),
+            (
+                "blue.catbird.chat.submitTransition",
+                SignedMutationKind::PolicyTransition,
+            ),
+            (
+                "blue.catbird.chat.submitTransition",
+                SignedMutationKind::MetadataTransition,
+            ),
+            (
+                "blue.catbird.chat.submitTransition",
+                SignedMutationKind::LeaveCommitFulfillment,
+            ),
+            (
+                "blue.catbird.chat.requestLeave",
+                SignedMutationKind::ZeroLeafLeave,
+            ),
+        ] {
+            assert!(
+                endpoint_accepts_operation_only_signed_kind(endpoint, kind),
+                "{endpoint} rejected its exact Task 6 mutation kind",
+            );
+        }
+
+        assert!(!endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.requestReset",
+            SignedMutationKind::ResetActivation,
+        ));
+        assert!(!endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.submitTransition",
+            SignedMutationKind::ZeroLeafLeave,
+        ));
+        assert!(!endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.sendMessage",
+            SignedMutationKind::ApplicationSend,
+        ));
+        assert!(!endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.enrollDevice",
+            SignedMutationKind::DeviceEnrollment,
+        ));
     }
 
     #[test]
