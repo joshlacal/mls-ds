@@ -371,7 +371,8 @@ use chat_protocol::{
         core::hydrate_locked_conversation_state,
         reset::{
             self, LockedPendingResetRequestGuard, LockedResetRequestDisposition,
-            ResetRepositoryError, ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS,
+            ResetCompositionError, ResetRepositoryError,
+            ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS,
         },
     },
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
@@ -674,6 +675,35 @@ async fn insert_pending(
     received: DateTime<Utc>,
     request: VerifiedSignedMutation,
 ) {
+    insert_pending_with_signed_columns(tx, f, id, received, request, None).await;
+}
+
+struct PendingDurableSignedColumns {
+    signed_request_bytes: Vec<u8>,
+    signing_transcript_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+impl PendingDurableSignedColumns {
+    fn exact(request: &VerifiedSignedMutation) -> Self {
+        Self {
+            signed_request_bytes: request.accepted_wrapper_bytes().unwrap().to_vec(),
+            signing_transcript_bytes: request.transcript_bytes().to_vec(),
+            request_digest: request.request_digest().to_vec(),
+            signature: request.signature().to_vec(),
+        }
+    }
+}
+
+async fn insert_pending_with_signed_columns(
+    tx: &mut Transaction<'_, Postgres>,
+    f: &ResetFixture,
+    id: Uuid,
+    received: DateTime<Utc>,
+    request: VerifiedSignedMutation,
+    signed_columns: Option<PendingDurableSignedColumns>,
+) {
     let seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
     )
@@ -699,6 +729,8 @@ async fn insert_pending(
     let accepted_payload = products.durable_json();
     let accepted_payload_sha256 = Sha256::digest(accepted_payload);
     let mutation = entry.mutation();
+    let signed_columns =
+        signed_columns.unwrap_or_else(|| PendingDurableSignedColumns::exact(mutation));
     sqlx::query(
         r#"INSERT INTO chat.entries(
           conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
@@ -713,9 +745,9 @@ async fn insert_pending(
     .bind(kind.type_id())
     .bind(accepted_payload)
     .bind(accepted_payload_sha256.as_slice())
-    .bind(mutation.accepted_wrapper_bytes().unwrap())
-    .bind(mutation.request_digest().as_slice())
-    .bind(mutation.signature().as_slice())
+    .bind(&signed_columns.signed_request_bytes)
+    .bind(&signed_columns.request_digest)
+    .bind(&signed_columns.signature)
     .bind(entry.server_fields_dag_cbor().unwrap())
     .bind(entry.outer_control_fingerprint().as_slice())
     .bind(&f.actor_did)
@@ -748,10 +780,10 @@ async fn insert_pending(
     .bind(f.epoch)
     .bind(&f.group_context_hash)
     .bind(&f.confirmation_tag)
-    .bind(mutation.accepted_wrapper_bytes().unwrap())
-    .bind(mutation.transcript_bytes())
-    .bind(mutation.request_digest().as_slice())
-    .bind(mutation.signature().as_slice())
+    .bind(&signed_columns.signed_request_bytes)
+    .bind(&signed_columns.signing_transcript_bytes)
+    .bind(&signed_columns.request_digest)
+    .bind(&signed_columns.signature)
     .bind(received)
     .execute(&mut **tx)
     .await
@@ -1070,6 +1102,242 @@ async fn pending_reset_guard_binds_every_immutable_column() {
         assert_ne!(original, *mutated.guard_digest(), "{mutation:?}");
         tx.rollback().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn reset_activation_rejects_retained_pending_row_with_foreign_signed_semantics() {
+    let _serial = SERIAL.get_or_init(|| Mutex::new(())).lock().await;
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let f = fixture(&mut tx, false).await;
+    let at = trusted_now(&mut tx).await;
+    let retained_id = Uuid::new_v4();
+    let request = signed_reset(
+        &f,
+        SignedMutationKind::ResetRequest,
+        retained_id,
+        retained_id,
+        &f.prior(),
+        at,
+    );
+    let mut foreign_wrapper: Value =
+        serde_json::from_slice(request.accepted_wrapper_bytes().unwrap()).unwrap();
+    foreign_wrapper["body"]["reason"] = json!("poisonedState");
+    foreign_wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
+    let canonical =
+        decode_canonical_signed_mutation(&serde_json::to_vec(&foreign_wrapper).unwrap()).unwrap();
+    let signature = SigningKey::from_bytes(&ALICE_SIGNING_SEED)
+        .sign(canonical.transcript_bytes())
+        .to_bytes();
+    foreign_wrapper["signature"] = Value::String(STANDARD.encode(signature));
+    let foreign_semantics = decode_and_verify_signed_mutation(
+        &serde_json::to_vec(&foreign_wrapper).unwrap(),
+        &f.signing_public_key,
+    )
+    .unwrap();
+    let expected_foreign_wrapper = foreign_semantics.accepted_wrapper_bytes().unwrap().to_vec();
+    insert_pending(&mut tx, &f, retained_id, at, foreign_semantics).await;
+    let entry_wrapper: Vec<u8> = sqlx::query_scalar(
+        "SELECT signed_request_bytes FROM chat.entries \
+         WHERE conversation_id=$1 AND entry_kind=$2",
+    )
+    .bind(f.conversation_id)
+    .bind(ControlEntryKind::ResetRequest.type_id())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let (row_wrapper, row_reason): (Vec<u8>, String) = sqlx::query_as(
+        "SELECT signed_request_bytes,reason FROM chat.reset_requests \
+         WHERE reset_request_id=$1",
+    )
+    .bind(retained_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(entry_wrapper, expected_foreign_wrapper);
+    assert_eq!(row_wrapper, expected_foreign_wrapper);
+    assert_eq!(row_reason, "manualRecovery");
+    let before = durable_snapshot(&mut tx, f.conversation_id).await;
+    let business = business(&mut tx, &f, at).await;
+    let activation = signed_reset(
+        &f,
+        SignedMutationKind::ResetActivation,
+        retained_id,
+        Uuid::new_v4(),
+        &f.prior(),
+        at,
+    );
+
+    assert_error(
+        reset::prepare_reset_activation_authority(&mut tx, &business, &activation).await,
+        |error| matches!(error, ResetRepositoryError::InvalidResetRow),
+    );
+    assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+            .bind(retained_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(status, "pending");
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn reset_activation_rejects_retained_pending_row_with_corrupt_signature() {
+    let _serial = SERIAL.get_or_init(|| Mutex::new(())).lock().await;
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let f = fixture(&mut tx, false).await;
+    let at = trusted_now(&mut tx).await;
+    let retained_id = Uuid::new_v4();
+    let request = signed_reset(
+        &f,
+        SignedMutationKind::ResetRequest,
+        retained_id,
+        retained_id,
+        &f.prior(),
+        at,
+    );
+    let mut signed_columns = PendingDurableSignedColumns::exact(&request);
+    let expected_transcript = signed_columns.signing_transcript_bytes.clone();
+    let expected_digest = signed_columns.request_digest.clone();
+    signed_columns.signature[0] ^= 1;
+    let mut corrupt_wrapper: Value =
+        serde_json::from_slice(&signed_columns.signed_request_bytes).unwrap();
+    corrupt_wrapper["signature"] = Value::String(STANDARD.encode(&signed_columns.signature));
+    signed_columns.signed_request_bytes = serde_json::to_vec(&corrupt_wrapper).unwrap();
+    let expected_corrupt_wrapper = signed_columns.signed_request_bytes.clone();
+    let expected_corrupt_signature = signed_columns.signature.clone();
+    insert_pending_with_signed_columns(&mut tx, &f, retained_id, at, request, Some(signed_columns))
+        .await;
+    let (entry_wrapper, entry_digest, entry_signature): (Vec<u8>, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT signed_request_bytes,request_digest,signature FROM chat.entries \
+         WHERE conversation_id=$1 AND entry_kind=$2",
+        )
+        .bind(f.conversation_id)
+        .bind(ControlEntryKind::ResetRequest.type_id())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let (row_wrapper, row_transcript, row_digest, row_signature): (
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) = sqlx::query_as(
+        "SELECT signed_request_bytes,signing_transcript_bytes,request_digest,signature \
+         FROM chat.reset_requests \
+         WHERE reset_request_id=$1",
+    )
+    .bind(retained_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(entry_wrapper, expected_corrupt_wrapper);
+    assert_eq!(row_wrapper, expected_corrupt_wrapper);
+    assert_eq!(entry_digest, expected_digest);
+    assert_eq!(row_digest, expected_digest);
+    assert_eq!(row_transcript, expected_transcript);
+    assert_eq!(entry_signature, expected_corrupt_signature);
+    assert_eq!(row_signature, expected_corrupt_signature);
+    let before = durable_snapshot(&mut tx, f.conversation_id).await;
+    let business = business(&mut tx, &f, at).await;
+    let activation = signed_reset(
+        &f,
+        SignedMutationKind::ResetActivation,
+        retained_id,
+        Uuid::new_v4(),
+        &f.prior(),
+        at,
+    );
+
+    assert_error(
+        reset::prepare_reset_activation_authority(&mut tx, &business, &activation).await,
+        |error| matches!(error, ResetRepositoryError::InvalidResetRow),
+    );
+    assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+            .bind(retained_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(status, "pending");
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn sealed_reset_admission_rejects_alternate_wrapper_with_same_transcript() {
+    let _serial = SERIAL.get_or_init(|| Mutex::new(())).lock().await;
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let f = fixture(&mut tx, false).await;
+    let at = trusted_now(&mut tx).await;
+    let id = Uuid::new_v4();
+    let original = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
+    let original_wrapper = original.accepted_wrapper_bytes().unwrap().to_vec();
+    let wrapper_value: Value = serde_json::from_slice(&original_wrapper).unwrap();
+    let alternate_wrapper = serde_json::to_vec_pretty(&wrapper_value).unwrap();
+    assert_ne!(alternate_wrapper, original_wrapper);
+    let alternate_for_admission =
+        decode_and_verify_signed_mutation(&alternate_wrapper, &f.signing_public_key).unwrap();
+    let alternate_for_entry =
+        decode_and_verify_signed_mutation(&alternate_wrapper, &f.signing_public_key).unwrap();
+    assert_eq!(
+        alternate_for_admission.transcript_bytes(),
+        original.transcript_bytes()
+    );
+    assert_eq!(
+        alternate_for_admission.request_digest(),
+        original.request_digest()
+    );
+    assert_eq!(alternate_for_admission.signature(), original.signature());
+    assert_ne!(
+        alternate_for_admission.accepted_wrapper_bytes(),
+        original.accepted_wrapper_bytes()
+    );
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(f.conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let trusted = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&at.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let entry = build_verified_control_entry(
+        alternate_for_entry,
+        &ValidatedChatNsid::parse("blue.catbird.chat.requestReset").unwrap(),
+        CanonicalUuidV4::parse(&Uuid::new_v4().to_string()).unwrap(),
+        CanonicalUuidV4::parse(&f.conversation_id.to_string()).unwrap(),
+        seq.try_into().unwrap(),
+        &trusted,
+        CanonicalControlServerFields::empty(ControlEntryKind::ResetRequest).unwrap(),
+    )
+    .unwrap();
+    let before = durable_snapshot(&mut tx, f.conversation_id).await;
+    let business = business(&mut tx, &f, at).await;
+    let authority = reset::prepare_reset_request_authority(&mut tx, &business, &original)
+        .await
+        .unwrap();
+    assert!(matches!(
+        authority.disposition(),
+        LockedResetRequestDisposition::Vacant
+    ));
+
+    let result =
+        authority.plan_vacant_reset_request_entry(business, &alternate_for_admission, entry);
+    assert!(matches!(
+        result,
+        Err(ResetCompositionError::Repository(
+            ResetRepositoryError::AuthorityBindingMismatch
+        ))
+    ));
+    assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
+    tx.rollback().await.unwrap();
 }
 
 #[tokio::test]
