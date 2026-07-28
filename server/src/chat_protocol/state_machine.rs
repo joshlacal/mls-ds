@@ -2923,6 +2923,24 @@ impl HydrationAuthority {
                 ))
             }
             terminal => {
+                let mutation_kind = mutation.kind();
+                // Brief L223 / L103: a terminal `Rejected` classification
+                // historically reverifies the retained reason independent of
+                // signature. Capture the new request's closed reason BEFORE
+                // `signed_request` consumes `mutation`, so the reason-binding
+                // check below cannot fall back on signature-byte comparison.
+                let new_rejection_reason: Option<String> = match mutation_kind {
+                    SignedMutationKind::WelcomeRejection => match mutation.projection() {
+                        VerifiedMutationProjection::WelcomeRejection(value) => {
+                            match value.body().get("reason") {
+                                Some(CanonicalValueRef::Text(text)) => Some((*text).to_owned()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let accepted_wrapper = mutation
                     .accepted_wrapper_bytes()
                     .ok_or(StateMachineError::InvalidHydrationAuthority)?
@@ -2931,55 +2949,64 @@ impl HydrationAuthority {
                 let request_digest = *mutation.request_digest();
                 let signature = *mutation.signature();
                 let evidence = self.signed_request(envelope, mutation)?;
-                let (transaction_id, locked_at, row, stored_authorization, stored_kind) =
-                    match &terminal {
-                        LockedWelcomeTerminal::Acknowledged {
-                            transaction_id,
-                            locked_at,
-                            row,
-                            authorization,
-                            ..
-                        } => (
-                            transaction_id,
-                            *locked_at,
-                            row,
-                            Some(authorization),
-                            Some(RequestEntryKind::WelcomeAcknowledgement),
-                        ),
-                        LockedWelcomeTerminal::Rejected {
-                            transaction_id,
-                            locked_at,
-                            row,
-                            authorization,
-                            ..
-                        } => (
-                            transaction_id,
-                            *locked_at,
-                            row,
-                            Some(authorization),
-                            Some(RequestEntryKind::WelcomeRejection),
-                        ),
-                        LockedWelcomeTerminal::Expired {
-                            transaction_id,
-                            locked_at,
-                            row,
-                            ..
-                        }
-                        | LockedWelcomeTerminal::SupersededByTransition {
-                            transaction_id,
-                            locked_at,
-                            row,
-                            ..
-                        }
-                        | LockedWelcomeTerminal::SupersededByRevocation {
-                            transaction_id,
-                            locked_at,
-                            row,
-                            ..
-                        } => (transaction_id, *locked_at, row, None, None),
-                        LockedWelcomeTerminal::PendingNotDue(_)
-                        | LockedWelcomeTerminal::PendingDue(_) => unreachable!(),
-                    };
+                let (
+                    transaction_id,
+                    locked_at,
+                    row,
+                    stored_authorization,
+                    stored_kind,
+                    stored_reason,
+                ) = match &terminal {
+                    LockedWelcomeTerminal::Acknowledged {
+                        transaction_id,
+                        locked_at,
+                        row,
+                        authorization,
+                        ..
+                    } => (
+                        transaction_id,
+                        *locked_at,
+                        row,
+                        Some(authorization),
+                        Some(RequestEntryKind::WelcomeAcknowledgement),
+                        None,
+                    ),
+                    LockedWelcomeTerminal::Rejected {
+                        transaction_id,
+                        locked_at,
+                        row,
+                        authorization,
+                        reason,
+                        ..
+                    } => (
+                        transaction_id,
+                        *locked_at,
+                        row,
+                        Some(authorization),
+                        Some(RequestEntryKind::WelcomeRejection),
+                        Some(reason.as_str()),
+                    ),
+                    LockedWelcomeTerminal::Expired {
+                        transaction_id,
+                        locked_at,
+                        row,
+                        ..
+                    }
+                    | LockedWelcomeTerminal::SupersededByTransition {
+                        transaction_id,
+                        locked_at,
+                        row,
+                        ..
+                    }
+                    | LockedWelcomeTerminal::SupersededByRevocation {
+                        transaction_id,
+                        locked_at,
+                        row,
+                        ..
+                    } => (transaction_id, *locked_at, row, None, None, None),
+                    LockedWelcomeTerminal::PendingNotDue(_)
+                    | LockedWelcomeTerminal::PendingDue(_) => unreachable!(),
+                };
                 if !registration.authorizes(&evidence)
                     || registration.transaction_id() != locked.head().transaction_id()
                     || registration.transaction_id() != transaction_id
@@ -3004,6 +3031,22 @@ impl HydrationAuthority {
                             && stored.request_digest() == &request_digest
                             && stored.signature() == &signature
                     });
+                // Minimal reason-binding check (brief L56/L103/L223): a
+                // terminal `Rejected` classification historically reverifies
+                // the retained reason independent of signature. A re-signed
+                // rejection carrying a DIFFERENT valid reason is a changed
+                // authorization, not a terminal replay; the compositor rejects
+                // it before returning a terminal classification rather than
+                // letting the handler/idempotency layer treat it as replay.
+                // The check only fires against a stored Rejection terminal +
+                // a fresh WelcomeRejection request; a stored Acknowledgement
+                // terminal stays a (changed) replay classification regardless.
+                if mutation_kind == SignedMutationKind::WelcomeRejection
+                    && stored_kind == Some(RequestEntryKind::WelcomeRejection)
+                    && stored_reason != new_rejection_reason.as_deref()
+                {
+                    return Err(StateMachineError::InvalidHydrationAuthority);
+                }
                 Ok(WelcomeTerminalPlan::Terminal {
                     classification: terminal,
                     exact_replay,
@@ -12748,6 +12791,64 @@ impl ConversationPersistencePlan {
         self
     }
 
+    /// Per-family CAS drift (brief L227-228). Each helper mutates EXACTLY ONE
+    /// nonsemantic `WelcomeCasBinding` authority family while leaving the
+    /// stored seal untouched, so a recomputed `welcome_cas_seal` over the
+    /// mutated binding disagrees with the retained seal. The executor prewrite
+    /// fence `!binding.verify_seal()` catches the drift BEFORE the head CAS
+    /// verify or event insert. Without that fence, the corrupted binding would
+    /// first surface at the delivery `terminalize_welcome_delivery` SQL
+    /// predicate (rows_affected != 1) AFTER the event/outbox row is appended,
+    /// leaving a stale partial graph. These seams are `#[cfg(test)]`-gated and
+    /// never reach production.
+    pub(crate) fn with_welcome_cas_opaque_digest_drift_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.welcome_cas.as_mut() {
+            binding.opaque_welcome_sha256[0] ^= 0xFF;
+        }
+        self
+    }
+
+    pub(crate) fn with_welcome_cas_expiry_drift_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.welcome_cas.as_mut() {
+            binding.expires_at.0 = binding.expires_at.0.wrapping_add(1);
+        }
+        self
+    }
+
+    pub(crate) fn with_welcome_cas_locked_instant_drift_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.welcome_cas.as_mut() {
+            binding.locked_at.0 = binding.locked_at.0.wrapping_add(1);
+        }
+        self
+    }
+
+    pub(crate) fn with_welcome_cas_locked_row_digest_drift_for_test(mut self) -> Self {
+        if let Some(binding) = self.effects.welcome_cas.as_mut() {
+            binding.locked_row_digest[0] ^= 0xFF;
+        }
+        self
+    }
+
+    /// Duplicate-recovery-work family drift (brief L231): append a SECOND
+    /// `Pending -> Rejected` welcome_change. The executor prewrite fence
+    /// `welcome_changes().len() != 1 -> InconsistentPlan` rejects the plan
+    /// before any disposition or recovery-work row is written; without that
+    /// fence, `apply_welcome_response` would only ever consume the FIRST
+    /// welcome_change and silently drop the second (and its recovery work),
+    /// persisting a partial graph. `#[cfg(test)]`-gated only.
+    pub(crate) fn with_welcome_rejection_duplicate_for_test(mut self) -> Self {
+        if let Some(duplicate) = self
+            .effects
+            .welcome_changes
+            .iter()
+            .find(|change| matches!((change.before(), change.after()), (Some(b), Some(a)) if b.status() == WelcomeStatus::Pending && a.status() == WelcomeStatus::Rejected))
+            .cloned()
+        {
+            self.effects.welcome_changes.push(duplicate);
+        }
+        self
+    }
+
     /// ADR-019 Erratum 01 desync (leave-fulfillment): append a second leave delta
     /// that STALES the very request the plan FULFILLS (same `request_id`), cloning
     /// its Pending predecessor and flipping the successor to `Stale`. `apply_leave_
@@ -18282,14 +18383,20 @@ mod executor {
         let recipient = expired.recipient().clone();
         let welcome_coordinate = expired.coordinate();
         // Consume the CAS binding as load-bearing: it must bind exactly the pending
-        // welcome the delta expires. A planner that disagreed is a hard
-        // `InconsistentPlan`, never a silently-unread witness.
+        // welcome the delta expires, AND the binding's domain-separated seal must
+        // reaffirm every nonsemantic authority family (opaque digest, expiry,
+        // locked instant, and locked-row digest) independent of the welcome_change
+        // delta. A planner that disagreed, or a drifted binding that the
+        // welcome_change delta alone does not surface, is a hard `InconsistentPlan`
+        // raised before the head CAS verify or event insert — never a
+        // silently-stale witness that first fails at the delivery writer.
         if welcome_cas.welcome_id() != expired.welcome_id()
             || welcome_cas.recipient() != &recipient
             || welcome_cas.coordinate() != welcome_coordinate
             || welcome_cas.expires_at() != expired.expires_at()
             || welcome_cas.expected_status() != WelcomeStatus::Pending
             || welcome_cas.successor_status() != WelcomeStatus::Expired
+            || !welcome_cas.verify_seal()
         {
             return Err(ExecutorError::InconsistentPlan(
                 "welcome expiry CAS binding disagrees with the welcome change",
@@ -18834,13 +18941,20 @@ mod executor {
         let welcome_id = Uuid::from_bytes(*responded.welcome_id());
         let recipient = responded.recipient().clone();
         let welcome_coordinate = responded.coordinate();
-        // Load-bearing welcome CAS validation (mirrors the expiry arm).
+        // Load-bearing welcome CAS validation (mirrors the expiry arm). The
+        // binding's domain-separated seal re-affirms every nonsemantic authority
+        // family (opaque digest, expiry, locked instant, locked-row digest)
+        // independent of the welcome_change delta; a drifted binding that the
+        // delta alone does not surface is rejected here, BEFORE the head CAS
+        // verify or event insert, rather than first failing at the delivery
+        // writer after the event/outbox row is already appended.
         if welcome_cas.welcome_id() != responded.welcome_id()
             || welcome_cas.recipient() != &recipient
             || welcome_cas.coordinate() != welcome_coordinate
             || welcome_cas.expires_at() != responded.expires_at()
             || welcome_cas.expected_status() != WelcomeStatus::Pending
             || welcome_cas.successor_status() != successor_status
+            || !welcome_cas.verify_seal()
         {
             return Err(ExecutorError::InconsistentPlan(
                 "welcome response CAS binding disagrees with the welcome change",

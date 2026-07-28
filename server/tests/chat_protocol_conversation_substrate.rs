@@ -5574,6 +5574,7 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::repository::delivery::{
             EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+            WelcomeRejectionReason,
         };
         use crate::chat_protocol::repository::execution_context::{
             apply_device_revocation_batch_sequential, hydrate_execution_context,
@@ -5606,8 +5607,8 @@ mod historical_control_loader {
             ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
             RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
             RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
-            SpineArtifacts, TransitionEvidence, WelcomeExpiryAuthority, WelcomeStatus,
-            WelcomeTerminalPlan, WorkTerminalHydrationRow,
+            SpineArtifacts, StateMachineError, TransitionEvidence, WelcomeExpiryAuthority,
+            WelcomeRejectionWork, WelcomeStatus, WelcomeTerminalPlan, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -12035,6 +12036,8 @@ mod historical_control_loader {
             delegated_reset_request: bool,
             welcome_terminal: Option<G6WelcomeTerminalMode>,
             welcome_terminal_request_negatives: bool,
+            welcome_terminal_executor_negatives: bool,
+            welcome_terminal_second_response_negatives: bool,
         ) {
             assert!(
                 !include_reset || welcome_terminal.is_none(),
@@ -12044,6 +12047,19 @@ mod historical_control_loader {
                 !welcome_terminal_request_negatives
                     || welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged),
                 "the signed-request negative matrix runs against a genuine pending acknowledgement fixture"
+            );
+            assert!(
+                !welcome_terminal_executor_negatives || welcome_terminal.is_some(),
+                "executor prewrite negatives require a Welcome terminal plan"
+            );
+            assert!(
+                !welcome_terminal_second_response_negatives
+                    || matches!(
+                        welcome_terminal,
+                        Some(G6WelcomeTerminalMode::Acknowledged)
+                            | Some(G6WelcomeTerminalMode::Rejected(_))
+                    ),
+                "second-response negatives require an Acknowledgement or Rejection terminal winner"
             );
             let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
             let trusted_at: DateTime<Utc> =
@@ -12173,6 +12189,22 @@ mod historical_control_loader {
                             .as_deref()
                             .expect("replay proof has a signed instant"),
                         G6WelcomeTerminalMode::Rejected("invalidWelcome"),
+                    )
+                });
+            // Finding 2 (brief L223) — changed rejection reason with a valid
+            // re-sign: built only when the stored terminal is a Rejection, so
+            // the post-terminalize replay matrix exercises the compositor's
+            // reason-binding check against the retained reason ("invalidWelcome").
+            let replay_changed_reason_request =
+                matches!(welcome_terminal, Some(G6WelcomeTerminalMode::Rejected(_))).then(|| {
+                    build_g6_signed_welcome_terminal_request(
+                        &invitee,
+                        &fulfillment,
+                        committed.coordinate(),
+                        welcome_terminal_signed_text
+                            .as_deref()
+                            .expect("changed-reason replay proof has a signed instant"),
+                        G6WelcomeTerminalMode::Rejected("noMatchingKeyPackage"),
                     )
                 });
             let welcome_terminal_trusted = welcome_terminal.map(|_| {
@@ -12804,6 +12836,37 @@ mod historical_control_loader {
                             AuthorizationOutcome::FirstExecution(authority) => authority,
                             AuthorizationOutcome::CompletedReplay(_) => {
                                 panic!("fresh changed-kind request replayed")
+                            }
+                        },
+                    )
+                } else {
+                    None
+                };
+            let replay_changed_reason_authority =
+                if let Some(raw) = replay_changed_reason_request.as_ref() {
+                    Some(
+                        match authorize_signed_request(
+                            &pool,
+                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                                Uuid::new_v4(),
+                                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                                "blue.catbird.chat.rejectWelcome",
+                                welcome_terminal_trusted_text
+                                    .as_deref()
+                                    .expect("changed-reason replay proof has a trusted instant"),
+                                &invitee.did,
+                                invitee.device_id,
+                                &invitee.key_id,
+                            ),
+                            decode_canonical_signed_mutation(raw)
+                                .expect("changed-reason rejection canonical"),
+                        )
+                        .await
+                        .expect("authorize changed-reason replay probe")
+                        {
+                            AuthorizationOutcome::FirstExecution(authority) => authority,
+                            AuthorizationOutcome::CompletedReplay(_) => {
+                                panic!("fresh changed-reason request replayed")
                             }
                         },
                     )
@@ -14744,9 +14807,14 @@ mod historical_control_loader {
             ) {
                 let terminal_observed_at =
                     welcome_terminal_observed_at.expect("terminal mode has an observed instant");
-                if welcome_terminal_request_negatives {
+                if welcome_terminal_request_negatives || welcome_terminal_executor_negatives {
                     Box::pin(async {
-                    let cases = &welcome_terminal_request_negative_cases;
+                    let empty_negative_cases: Vec<G6WelcomeTerminalRequestNegative> = Vec::new();
+                    let cases = if welcome_terminal_request_negatives {
+                        &welcome_terminal_request_negative_cases
+                    } else {
+                        &empty_negative_cases
+                    };
                     let baseline = g6_lifecycle_durable_snapshot(
                         &mut tx,
                         conversation_id,
@@ -15019,6 +15087,222 @@ mod historical_control_loader {
                             "rejected disposition payloads leaves 29 families byte-identical"
                         );
                     }
+                    // Finding 4 — acknowledgement carrying rejection work.
+                    // A malformed `welcome_response` context with a
+                    // `welcomeRejected` recovery work entry on an
+                    // Acknowledgement-shaped plan must be rejected by the
+                    // executor prewrite fence BEFORE any disposition/recovery
+                    // row is written. Without that fence, the acknowledgement
+                    // would silently drop the surplus rejection work and
+                    // persist a wrong graph.
+                    if welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged) {
+                        let mut bad_ctx = exec_ctx.clone();
+                        if let Some(response) = bad_ctx.welcome_response.as_mut() {
+                            response.rejection = Some(WelcomeRejectionWork {
+                                recovery_work_id: Uuid::new_v4(),
+                                reason: WelcomeRejectionReason::NoMatchingKeyPackage,
+                            });
+                        }
+                        let result =
+                            apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
+                                .await;
+                        assert!(
+                            matches!(
+                                result,
+                                Err(ExecutorError::InconsistentPlan(
+                                    "welcome acknowledgement must not carry rejection recovery work"
+                                ))
+                            ),
+                            "acknowledgement carrying rejection work must fail executor prewrite: {result:?}"
+                        );
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "acknowledgement carrying rejection work leaves 29 families byte-identical"
+                        );
+                    }
+                    // Finding 5 — rejection missing or duplicating recovery work.
+                    // The `welcome_response` recovery-work family must carry
+                    // exactly one `WelcomeRejectionWork` for a Rejected plan;
+                    // zero or two+ are rejected by the executor prewrite fence
+                    // before any row is written.
+                    if let Some(G6WelcomeTerminalMode::Rejected(_)) = welcome_terminal {
+                        // 5a: missing recovery work (response.rejection = None).
+                        {
+                            let mut bad_ctx = exec_ctx.clone();
+                            if let Some(response) = bad_ctx.welcome_response.as_mut() {
+                                response.rejection = None;
+                            }
+                            let result =
+                                apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
+                                    .await;
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(ExecutorError::MissingContext(
+                                        "welcome rejection recovery work"
+                                    ))
+                                ),
+                                "rejection missing recovery work must fail executor prewrite: {result:?}"
+                            );
+                            let post = g6_lifecycle_durable_snapshot(
+                                &mut tx,
+                                conversation_id,
+                                &key_package_ref,
+                                protocol_instance_id,
+                                &conversation_marker,
+                            )
+                            .await;
+                            assert_eq!(
+                                post, exec_baseline,
+                                "rejection missing recovery work leaves 29 families byte-identical"
+                            );
+                        }
+                        // 5b: duplicating recovery work (a SECOND
+                        // Pending->Rejected welcome_change) is rejected by the
+                        // `welcome_changes().len() != 1` prewrite fence.
+                        {
+                            let duplicate_plan = exec_plan
+                                .clone()
+                                .with_welcome_rejection_duplicate_for_test();
+                            let result = apply_conversation_persistence_plan(
+                                &mut tx,
+                                &duplicate_plan,
+                                &exec_ctx,
+                            )
+                            .await;
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(ExecutorError::InconsistentPlan(
+                                        "welcome response must change exactly one welcome"
+                                    ))
+                                ),
+                                "rejection duplicating recovery work must fail executor prewrite: {result:?}"
+                            );
+                            let post = g6_lifecycle_durable_snapshot(
+                                &mut tx,
+                                conversation_id,
+                                &key_package_ref,
+                                protocol_instance_id,
+                                &conversation_marker,
+                            )
+                            .await;
+                            assert_eq!(
+                                post, exec_baseline,
+                                "rejection duplicating recovery work leaves 29 families byte-identical"
+                            );
+                        }
+                    }
+                    // Finding 1 — foreign transaction. Build the plan in the
+                    // current `tx`, then attempt to hydrate its execution
+                    // context in a SECOND transaction. The trusted transaction
+                    // id embedded in the head CAS must mismatch txid_current()
+                    // of the foreign transaction → AuthorityMismatch, with the
+                    // 29 durable families unchanged (the failed transaction
+                    // rolls back without leaking any partial row).
+                    {
+                        let mut foreign_tx = pool.begin().await.expect("begin foreign tx");
+                        let foreign_result = hydrate_execution_context(
+                            &mut foreign_tx,
+                            &exec_plan,
+                            ExecutionContextArtifacts {
+                                accepted_control_entry_bytes: None,
+                                genesis_group_info_bytes: None,
+                                primary_event_payload: None,
+                                welcome_disposition_event_payloads: Vec::new(),
+                            },
+                        )
+                        .await;
+                        assert!(
+                            matches!(
+                                foreign_result,
+                                Err(ExecutionContextHydrationError::AuthorityMismatch)
+                            ),
+                            "foreign transaction must fail hydrate context: {foreign_result:?}"
+                        );
+                        foreign_tx
+                            .rollback()
+                            .await
+                            .expect("rollback foreign transaction");
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "foreign transaction rejection leaves 29 durable families byte-identical"
+                        );
+                    }
+                    // Finding 3 — per-family nonsemantic CAS drift. For each
+                    // nonsemantic WelcomeCasBinding family (opaque digest,
+                    // expiry, locked instant, locked-row digest), corrupt ONE
+                    // field while leaving the stored seal untouched, so a
+                    // recomputed `welcome_cas_seal` disagrees with the
+                    // retained seal. The executor `!binding.verify_seal()`
+                    // prewrite fence catches the drift before the head CAS
+                    // verify or event insert.
+                    if welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged) {
+                        for (label, corrupt) in [
+                            (
+                                "opaque digest drift",
+                                ConversationPersistencePlan::with_welcome_cas_opaque_digest_drift_for_test
+                                    as fn(ConversationPersistencePlan) -> ConversationPersistencePlan,
+                            ),
+                            (
+                                "expiry drift",
+                                ConversationPersistencePlan::with_welcome_cas_expiry_drift_for_test,
+                            ),
+                            (
+                                "locked instant drift",
+                                ConversationPersistencePlan::with_welcome_cas_locked_instant_drift_for_test,
+                            ),
+                            (
+                                "locked row digest drift",
+                                ConversationPersistencePlan::with_welcome_cas_locked_row_digest_drift_for_test,
+                            ),
+                        ] {
+                            let drifted_plan = corrupt(exec_plan.clone());
+                            let result = apply_conversation_persistence_plan(
+                                &mut tx,
+                                &drifted_plan,
+                                &exec_ctx,
+                            )
+                            .await;
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(ExecutorError::InconsistentPlan(
+                                        "welcome response CAS binding disagrees with the welcome change"
+                                    ))
+                                ),
+                                "{label} must fail executor prewrite seal verify: {result:?}"
+                            );
+                            let post = g6_lifecycle_durable_snapshot(
+                                &mut tx,
+                                conversation_id,
+                                &key_package_ref,
+                                protocol_instance_id,
+                                &conversation_marker,
+                            )
+                            .await;
+                            assert_eq!(
+                                post, exec_baseline,
+                                "{label} leaves 29 durable families byte-identical"
+                            );
+                        }
+                    }
                 }
                 let welcome_business = recheck_business_authority(&mut tx, authority)
                     .await
@@ -15105,6 +15389,59 @@ mod historical_control_loader {
                     Some(*committed.coordinate()),
                     "Welcome terminalization preserves the complete coordinate"
                 );
+
+                // Finding 6 — second response after another terminal winner
+                // (brief L232). Within the same trusted transaction, after a
+                // genuine Acknowledgement winner is durable, a SECOND terminal
+                // response attempt against the same pending Welcome fails: the
+                // delivery `terminalize_welcome_delivery` CAS finds the row is
+                // no longer `pending` and rejects the writer before a second
+                // disposition is stored. The hard "conversation mutations
+                // rollback-only" constraint forbids COMMITTING this transaction
+                // to drive a literally SEPARATE transaction (tx2 would not see
+                // the uncommitted winner), so the same-transaction second apply
+                // is the closed analog: it isolates the durable winner-existence
+                // fence the SQL CAS provides while a SAVEPOINT absorbs the
+                // second attempt's partial event row so the post-winner 29
+                // durable families stay byte-identical. Removing the pending -> acknowledged/rejected CAS predicate (or a
+                // separate-transaction commit) would let the second response
+                // persist a wrong second winner.
+                if welcome_terminal_second_response_negatives {
+                    let post_winner_baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    sqlx::query("SAVEPOINT finding6_second_response")
+                        .execute(&mut *tx)
+                        .await
+                        .expect("open finding6 savepoint");
+                    let second_result =
+                        apply_conversation_persistence_plan(&mut tx, &plan, &context).await;
+                    assert!(
+                        matches!(second_result, Err(ExecutorError::Delivery(_))),
+                        "second terminal response after the existing winner must fail the delivery CAS: {second_result:?}"
+                    );
+                    sqlx::query("ROLLBACK TO SAVEPOINT finding6_second_response")
+                        .execute(&mut *tx)
+                        .await
+                        .expect("rollback to finding6 savepoint");
+                    let post_finding6 = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(
+                        post_finding6, post_winner_baseline,
+                        "second-response-after-winner failure leaves 29 durable families byte-identical"
+                    );
+                }
 
                 let freshly_locked = hydrate_locked_conversation_state(
                     &mut tx,
@@ -15459,6 +15796,90 @@ mod historical_control_loader {
                             "{label} terminal classification must be read-only"
                         );
                     }
+                }
+                // Finding 2 (brief L223) — changed rejection reason with a
+                // valid re-sign is rejected on reason-binding, not on
+                // signature. After a Rejection terminal is durable, a fresh
+                // rejection signed by the same exact device but carrying a
+                // DIFFERENT valid reason must NOT classify as Terminal replay
+                // (exact_replay:false) or plan a second mutation; the
+                // compositor rejects it (InvalidHydrationAuthority), and the
+                // 29 durable families stay byte-identical.
+                if let G6WelcomeTerminalMode::Rejected(stored_reason) = mode {
+                    let baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    let changed_reason_raw = replay_changed_reason_request
+                        .as_ref()
+                        .expect("changed-reason replay proof has bytes");
+                    let changed_reason_authority = replay_changed_reason_authority
+                        .as_ref()
+                        .expect("changed-reason replay proof has authority");
+                    let replay_business =
+                        recheck_business_authority(&mut tx, changed_reason_authority)
+                            .await
+                            .expect("recheck changed-reason business authority");
+                    let replay_locked = hydrate_locked_conversation_state(
+                        &mut tx,
+                        conversation_id,
+                        terminal_observed_at,
+                    )
+                    .await
+                    .expect("lock changed-reason terminal aggregate");
+                    let replay_hydration =
+                        HydrationAuthority::from_locked_conversation(&replay_locked)
+                            .expect("mint changed-reason hydration");
+                    let replay_registration = replay_hydration
+                        .locked_registration_from_guard(replay_business)
+                        .expect("seal changed-reason registration");
+                    let replay_classification =
+                        lock_welcome_terminal(&mut tx, &replay_locked, fulfillment.welcome_id)
+                            .await
+                            .expect("classify changed-reason terminal Welcome");
+                    let replay_mutation = decode_and_verify_signed_mutation(
+                        changed_reason_raw,
+                        invitee.signing_key.verifying_key().as_bytes(),
+                    )
+                    .expect("verify changed-reason signed request");
+                    let compose_result = replay_hydration.compose_welcome_terminal(
+                        &replay_locked,
+                        DurableSignedRequestEnvelope::new(
+                            *conversation_id.as_bytes(),
+                            trusted_request,
+                        )
+                        .expect("bind changed-reason durable envelope"),
+                        replay_mutation,
+                        replay_registration,
+                        replay_classification,
+                    );
+                    assert!(
+                        matches!(
+                            compose_result,
+                            Err(StateMachineError::InvalidHydrationAuthority)
+                        ),
+                        "fresh changed-reason rejection must be rejected on reason-binding, not signature: {compose_result:?}"
+                    );
+                    assert_ne!(
+                        stored_reason, "noMatchingKeyPackage",
+                        "the changed-reason fixture must pick a reason distinct from the stored terminal reason"
+                    );
+                    let after = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(
+                        after, baseline,
+                        "changed-reason rejection must leave 29 durable families byte-identical"
+                    );
                 }
                 Some(context)
             } else {
@@ -17667,7 +18088,7 @@ mod historical_control_loader {
         async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    false, false, None, false,
+                    false, false, None, false, false, false,
                 ),
             )
             .await;
@@ -17679,6 +18100,8 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
+                    false,
                     false,
                 ),
             )
@@ -17692,6 +18115,8 @@ mod historical_control_loader {
                     false,
                     Some(G6WelcomeTerminalMode::Rejected("invalidWelcome")),
                     false,
+                    false,
+                    false,
                 ),
             )
             .await;
@@ -17703,6 +18128,8 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::DueExpiry),
+                    false,
+                    false,
                     false,
                 ),
             )
@@ -17716,6 +18143,8 @@ mod historical_control_loader {
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
                     false,
+                    false,
+                    false,
                 ),
             )
             .await;
@@ -17728,6 +18157,8 @@ mod historical_control_loader {
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
                     true,
+                    true,
+                    false,
                 ),
             )
             .await;
@@ -17739,6 +18170,36 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
+                    true,
+                    true,
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_terminal_executor_prewrite_rejects_malformed_rejection_work() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Rejected("invalidWelcome")),
+                    false,
+                    true,
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_terminal_second_response_after_winner_negatives() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
+                    false,
                     true,
                 ),
             )
@@ -17783,10 +18244,23 @@ mod historical_control_loader {
 
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_executor_prewrite_rejects_malformed_rejection_work() {
+            Box::pin(run_g6_welcome_terminal_executor_prewrite_rejects_malformed_rejection_work())
+                .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_second_response_after_winner_is_rejected() {
+            Box::pin(run_g6_welcome_terminal_second_response_after_winner_negatives()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_reset_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    true, false, None, false,
+                    true, false, None, false, false, false,
                 ),
             )
             .await;
@@ -17797,7 +18271,7 @@ mod historical_control_loader {
         async fn g6_delegated_reset_request_uses_member_requester_and_admin_activator() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    true, true, None, false,
+                    true, true, None, false, false, false,
                 ),
             )
             .await;
