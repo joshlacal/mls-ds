@@ -38,6 +38,7 @@ pub(crate) mod inventory;
 // `#[allow(dead_code)]` until the H1 endpoint handlers (next seal) call in.
 #[allow(dead_code)]
 pub(crate) mod key_packages;
+pub(crate) mod prelude;
 #[cfg(not(test))]
 pub(crate) mod relationship;
 #[cfg(not(test))]

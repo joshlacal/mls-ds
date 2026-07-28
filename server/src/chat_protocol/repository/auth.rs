@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Transaction};
+use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -165,19 +166,37 @@ impl RepositoryAuthorityReceipt {
     }
 }
 
-#[derive(Debug)]
 pub(crate) enum AuthorizationOutcome {
     FirstExecution(VerifiedChatDeviceRequest),
     CompletedReplay(CompletedIdempotentResponse),
 }
 
-#[derive(Debug)]
 pub(crate) struct CompletedIdempotentResponse {
     status: i32,
     response_bytes: Vec<u8>,
     response_sha256: [u8; 32],
     event_position: Option<i64>,
     completed_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for AuthorizationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstExecution(authority) => formatter
+                .debug_tuple("AuthorizationOutcome::FirstExecution")
+                .field(authority)
+                .finish(),
+            Self::CompletedReplay(_) => {
+                formatter.write_str("AuthorizationOutcome::CompletedReplay(<redacted>)")
+            }
+        }
+    }
+}
+
+impl fmt::Debug for CompletedIdempotentResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletedIdempotentResponse(<redacted>)")
+    }
 }
 
 /// Sealed projection of the registration/key rows locked in the caller-owned
@@ -194,6 +213,30 @@ pub(crate) struct BusinessAuthorityGuard {
     stored_key_id: Option<String>,
     stored_signing_public_key: Option<Vec<u8>>,
     trusted_instant: DateTime<Utc>,
+}
+
+/// Opaque proof that this transaction acquired the globally canonical
+/// operation advisory lock before any identity-domain lock. Construction is
+/// confined to `reserve_canonical_operation`.
+pub(super) struct CanonicalOperationReservationGuard {
+    transaction_id: String,
+    operation_id: Uuid,
+}
+
+impl fmt::Debug for CanonicalOperationReservationGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalOperationReservationGuard(<sealed>)")
+    }
+}
+
+impl CanonicalOperationReservationGuard {
+    pub(super) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
 }
 
 /// Closed authority projection for the G6 lock prelude. It can only be minted
@@ -391,6 +434,17 @@ fn g6_business_authority_digest(
 }
 
 impl CompletedIdempotentResponse {
+    #[cfg(test)]
+    pub(super) fn debug_redaction_sentinel_for_test(status: i32, response_bytes: Vec<u8>) -> Self {
+        Self {
+            status,
+            response_sha256: Sha256::digest(&response_bytes).into(),
+            response_bytes,
+            event_position: Some(9_223_372_036_854_775_000),
+            completed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        }
+    }
+
     pub(crate) fn status(&self) -> i32 {
         self.status
     }
@@ -412,10 +466,21 @@ impl CompletedIdempotentResponse {
     }
 }
 
-#[derive(Debug)]
 enum Arbitration<T> {
     First(T),
     Completed(CompletedIdempotentResponse),
+}
+
+impl<T: fmt::Debug> fmt::Debug for Arbitration<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::First(value) => formatter
+                .debug_tuple("Arbitration::First")
+                .field(value)
+                .finish(),
+            Self::Completed(_) => formatter.write_str("Arbitration::Completed(<redacted>)"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -471,10 +536,23 @@ struct RequestMaterial {
     current_jkt: Option<String>,
 }
 
-#[derive(Debug)]
 pub(crate) enum BusinessIdempotencyOutcome {
     FirstExecution(BusinessIdempotencyGuard),
     CompletedReplay(CompletedIdempotentResponse),
+}
+
+impl fmt::Debug for BusinessIdempotencyOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstExecution(guard) => formatter
+                .debug_tuple("BusinessIdempotencyOutcome::FirstExecution")
+                .field(guard)
+                .finish(),
+            Self::CompletedReplay(_) => {
+                formatter.write_str("BusinessIdempotencyOutcome::CompletedReplay(<redacted>)")
+            }
+        }
+    }
 }
 
 /// Non-forgeable claim on one idempotency key in one PostgreSQL transaction.
@@ -490,10 +568,23 @@ pub(crate) struct BusinessIdempotencyGuard {
     signature: [u8; 64],
 }
 
-#[derive(Debug)]
 pub(crate) enum EnrollmentBusinessOutcome {
     FirstExecution(EnrollmentBusinessGuard),
     CompletedReplay(CompletedIdempotentResponse),
+}
+
+impl fmt::Debug for EnrollmentBusinessOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstExecution(guard) => formatter
+                .debug_tuple("EnrollmentBusinessOutcome::FirstExecution")
+                .field(guard)
+                .finish(),
+            Self::CompletedReplay(_) => {
+                formatter.write_str("EnrollmentBusinessOutcome::CompletedReplay(<redacted>)")
+            }
+        }
+    }
 }
 
 /// Transaction-bound enrollment authority. This value is intentionally
@@ -505,10 +596,23 @@ pub(crate) struct EnrollmentBusinessGuard {
     authority: BusinessAuthorityGuard,
 }
 
-#[derive(Debug)]
 pub(crate) enum RebindBusinessOutcome {
     FirstExecution(RebindBusinessGuard),
     CompletedReplay(CompletedIdempotentResponse),
+}
+
+impl fmt::Debug for RebindBusinessOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FirstExecution(guard) => formatter
+                .debug_tuple("RebindBusinessOutcome::FirstExecution")
+                .field(guard)
+                .finish(),
+            Self::CompletedReplay(_) => {
+                formatter.write_str("RebindBusinessOutcome::CompletedReplay(<redacted>)")
+            }
+        }
+    }
 }
 
 /// Transaction-bound rebind authority. This value is intentionally non-Clone
@@ -738,6 +842,360 @@ pub(crate) async fn recheck_business_authority(
     })
 }
 
+pub(super) async fn reserve_canonical_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+) -> Result<CanonicalOperationReservationGuard, AuthRepositoryError> {
+    let material = request_material_for_authority(authority)?;
+    let lock_key = format!("chat-operation-id:{}", material.operation_id);
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **transaction)
+        .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(CanonicalOperationReservationGuard {
+        transaction_id,
+        operation_id: material.operation_id,
+    })
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct LockedCanonicalDeviceProjection {
+    user_did: String,
+    device_id: Uuid,
+    status: String,
+    dpop_jkt: String,
+    auth_generation: i64,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct LockedCanonicalKeyProjection {
+    user_did: String,
+    device_id: Uuid,
+    key_id: String,
+    signing_public_key: Vec<u8>,
+    enrollment_auth_generation: i64,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+pub(super) struct LockedCanonicalAuthorityScope {
+    receipt_id: Uuid,
+    actor: BusinessAuthorityGuard,
+    principals: Vec<String>,
+    devices: Vec<LockedCanonicalDeviceProjection>,
+    keys: Vec<LockedCanonicalKeyProjection>,
+    scope_digest: [u8; 32],
+}
+
+impl LockedCanonicalDeviceProjection {
+    pub(crate) fn user_did(&self) -> &str {
+        &self.user_did
+    }
+
+    pub(crate) fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+
+    pub(crate) fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub(crate) fn dpop_jkt(&self) -> &str {
+        &self.dpop_jkt
+    }
+
+    pub(crate) fn auth_generation(&self) -> i64 {
+        self.auth_generation
+    }
+
+    pub(crate) fn revoked_at(&self) -> Option<DateTime<Utc>> {
+        self.revoked_at
+    }
+}
+
+impl LockedCanonicalKeyProjection {
+    pub(crate) fn user_did(&self) -> &str {
+        &self.user_did
+    }
+
+    pub(crate) fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+
+    pub(crate) fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub(crate) fn signing_public_key_sha256(&self) -> [u8; 32] {
+        Sha256::digest(&self.signing_public_key).into()
+    }
+
+    pub(crate) fn enrollment_auth_generation(&self) -> i64 {
+        self.enrollment_auth_generation
+    }
+
+    pub(crate) fn revoked_at(&self) -> Option<DateTime<Utc>> {
+        self.revoked_at
+    }
+}
+
+impl LockedCanonicalAuthorityScope {
+    pub(super) fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+
+    pub(super) fn transaction_id(&self) -> &str {
+        self.actor.transaction_id()
+    }
+
+    pub(super) fn actor_class(&self) -> RepositoryAuthorityClass {
+        self.actor.class()
+    }
+
+    pub(super) fn actor_did(&self) -> &str {
+        self.actor.subject()
+    }
+
+    pub(super) fn actor_device_id(&self) -> Uuid {
+        self.actor.device_id()
+    }
+
+    pub(super) fn actor_dpop_jkt(&self) -> Option<&str> {
+        self.actor.stored_dpop_jkt()
+    }
+
+    pub(super) fn actor_auth_generation(&self) -> Option<i64> {
+        self.actor.stored_auth_generation()
+    }
+
+    pub(super) fn actor_key_id(&self) -> Option<&str> {
+        self.actor.stored_key_id()
+    }
+
+    pub(super) fn actor_signing_public_key(&self) -> Option<&[u8]> {
+        self.actor.stored_signing_public_key()
+    }
+
+    pub(super) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.actor.trusted_instant()
+    }
+
+    pub(super) fn principals(&self) -> &[String] {
+        &self.principals
+    }
+
+    pub(super) fn devices(&self) -> &[LockedCanonicalDeviceProjection] {
+        &self.devices
+    }
+
+    pub(super) fn keys(&self) -> &[LockedCanonicalKeyProjection] {
+        &self.keys
+    }
+
+    pub(super) fn scope_digest(&self) -> &[u8; 32] {
+        &self.scope_digest
+    }
+}
+
+/// Locks one already-canonical principal/device scope and projects the actor
+/// from those exact rows. Non-actor devices may legitimately have no keys;
+/// the actor must retain the exact active key bound by repository admission.
+pub(super) async fn lock_canonical_business_authority_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    operation: &CanonicalOperationReservationGuard,
+    principals: &[String],
+    devices: &[(String, Uuid)],
+) -> Result<LockedCanonicalAuthorityScope, AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if operation.transaction_id != transaction_id
+        || authority.repository_receipt().operation_id() != Some(operation.operation_id)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let locked_principals: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_did
+          FROM chat.principals
+         WHERE user_did = ANY($1::text[])
+         ORDER BY convert_to(user_did,'UTF8')
+         FOR UPDATE
+        "#,
+    )
+    .bind(principals)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if locked_principals != principals {
+        return Err(AuthRepositoryError::DeviceNotRegistered);
+    }
+
+    let dids = devices
+        .iter()
+        .map(|(did, _)| did.clone())
+        .collect::<Vec<_>>();
+    let device_ids = devices.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+    let locked_devices: Vec<LockedCanonicalDeviceProjection> = sqlx::query_as(
+        r#"
+        WITH requested(user_did,device_id) AS (
+            SELECT * FROM unnest($1::text[],$2::uuid[])
+        )
+        SELECT device.user_did,device.device_id,device.status,device.dpop_jkt,
+               device.auth_generation,device.revoked_at
+          FROM requested
+          JOIN chat.devices device USING (user_did,device_id)
+         ORDER BY convert_to(device.user_did,'UTF8'),uuid_send(device.device_id)
+         FOR UPDATE OF device
+        "#,
+    )
+    .bind(&dids)
+    .bind(&device_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if locked_devices.len() != devices.len()
+        || locked_devices
+            .iter()
+            .zip(devices)
+            .any(|(row, expected)| row.user_did != expected.0 || row.device_id != expected.1)
+    {
+        return Err(AuthRepositoryError::DeviceNotRegistered);
+    }
+
+    let locked_keys: Vec<LockedCanonicalKeyProjection> = sqlx::query_as(
+        r#"
+        WITH requested(user_did,device_id) AS (
+            SELECT * FROM unnest($1::text[],$2::uuid[])
+        )
+        SELECT key.user_did,key.device_id,key.key_id,key.signing_public_key,
+               key.enrollment_auth_generation,key.revoked_at
+          FROM requested
+          JOIN chat.device_keys key USING (user_did,device_id)
+         ORDER BY convert_to(key.user_did,'UTF8'),uuid_send(key.device_id),
+                  convert_to(key.key_id,'UTF8')
+         FOR UPDATE OF key
+        "#,
+    )
+    .bind(&dids)
+    .bind(&device_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let actor_did = authority.subject().as_str();
+    let actor_device_id = canonical_uuid(authority.device_id());
+    let actor = locked_devices
+        .iter()
+        .find(|row| row.user_did == actor_did && row.device_id == actor_device_id)
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let receipt = authority.repository_receipt();
+    if receipt.class() != RepositoryAuthorityClass::ExistingDevice
+        || actor.status != "active"
+        || actor.revoked_at.is_some()
+        || actor.dpop_jkt != authority.dpop_jkt().as_str()
+        || receipt.locked_jkt() != Some(actor.dpop_jkt.as_str())
+        || receipt.locked_auth_generation() != Some(actor.auth_generation)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let mutation = authority
+        .mutation()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let actor_key = locked_keys
+        .iter()
+        .find(|row| {
+            row.user_did == actor_did
+                && row.device_id == actor_device_id
+                && row.key_id == mutation.key_id().as_str()
+        })
+        .ok_or(AuthRepositoryError::DeviceKeyMissing)?;
+    let signing_key_sha256: [u8; 32] = Sha256::digest(&actor_key.signing_public_key).into();
+    let requested_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    if actor_key.revoked_at.is_some()
+        || actor.auth_generation != requested_generation
+        || receipt.locked_key_id() != Some(actor_key.key_id.as_str())
+        || receipt.locked_signing_key_sha256() != Some(&signing_key_sha256)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    verify_ed25519_strict(
+        &actor_key.signing_public_key,
+        mutation.transcript_bytes(),
+        mutation.signature(),
+    )?;
+    let actor = BusinessAuthorityGuard {
+        transaction_id,
+        class: receipt.class(),
+        subject: actor_did.to_owned(),
+        device_id: actor_device_id,
+        stored_dpop_jkt: Some(actor.dpop_jkt.clone()),
+        stored_auth_generation: Some(actor.auth_generation),
+        stored_key_id: Some(actor_key.key_id.clone()),
+        stored_signing_public_key: Some(actor_key.signing_public_key.clone()),
+        trusted_instant: authority.trusted_instant().datetime(),
+    };
+    let scope_digest =
+        canonical_locked_scope_digest(&locked_principals, &locked_devices, &locked_keys);
+    Ok(LockedCanonicalAuthorityScope {
+        receipt_id: Uuid::new_v4(),
+        actor,
+        principals: locked_principals,
+        devices: locked_devices,
+        keys: locked_keys,
+        scope_digest,
+    })
+}
+
+fn canonical_locked_scope_digest(
+    principals: &[String],
+    devices: &[LockedCanonicalDeviceProjection],
+    keys: &[LockedCanonicalKeyProjection],
+) -> [u8; 32] {
+    fn bind_bytes(digest: &mut Sha256, value: &[u8]) {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    fn bind_optional_instant(digest: &mut Sha256, value: Option<DateTime<Utc>>) {
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.timestamp_micros().to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-LOCKED-CANONICAL-AUTHORITY-SCOPE\0");
+    digest.update((principals.len() as u64).to_be_bytes());
+    for principal in principals {
+        bind_bytes(&mut digest, principal.as_bytes());
+    }
+    digest.update((devices.len() as u64).to_be_bytes());
+    for device in devices {
+        bind_bytes(&mut digest, device.user_did.as_bytes());
+        digest.update(device.device_id.as_bytes());
+        bind_bytes(&mut digest, device.status.as_bytes());
+        bind_bytes(&mut digest, device.dpop_jkt.as_bytes());
+        digest.update(device.auth_generation.to_be_bytes());
+        bind_optional_instant(&mut digest, device.revoked_at);
+    }
+    digest.update((keys.len() as u64).to_be_bytes());
+    for key in keys {
+        bind_bytes(&mut digest, key.user_did.as_bytes());
+        digest.update(key.device_id.as_bytes());
+        bind_bytes(&mut digest, key.key_id.as_bytes());
+        digest.update(<[u8; 32]>::from(Sha256::digest(&key.signing_public_key)));
+        digest.update(key.enrollment_auth_generation.to_be_bytes());
+        bind_optional_instant(&mut digest, key.revoked_at);
+    }
+    digest.finalize().into()
+}
+
 /// Repository-slice test seam for operations whose production caller already
 /// completed cryptographic authorization. It derives every authority field
 /// from exact locked rows; callers supply only the identity and trusted T.
@@ -872,12 +1330,27 @@ async fn validate_completed_business_authority(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
 ) -> Result<(), AuthRepositoryError> {
-    let state = lock_device_and_key(
+    if authority.endpoint().as_str() == "blue.catbird.chat.revokeDevice" {
+        if validate_completed_self_revocation_authority(transaction, authority).await? {
+            return Ok(());
+        }
+    }
+    let state = match lock_device_and_key(
         transaction,
         authority.subject().as_str(),
         canonical_uuid(authority.device_id()),
     )
-    .await?;
+    .await
+    {
+        Ok(state) => state,
+        Err(AuthRepositoryError::DeviceRevoked)
+            if authority.endpoint().as_str() == "blue.catbird.chat.revokeDevice"
+                && validate_completed_self_revocation_authority(transaction, authority).await? =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     match authority.repository_receipt().class() {
         RepositoryAuthorityClass::EnrollmentBootstrap => {
             let body = authority
@@ -918,6 +1391,114 @@ async fn validate_completed_business_authority(
             Ok(())
         }
     }
+}
+
+async fn validate_completed_self_revocation_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+) -> Result<bool, AuthRepositoryError> {
+    let receipt = authority.repository_receipt();
+    let mutation = authority
+        .mutation()
+        .filter(|mutation| mutation.kind() == SignedMutationKind::DeviceRevocation)
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    if receipt.class() != RepositoryAuthorityClass::ExistingDevice
+        || receipt.locked_jkt() != Some(authority.dpop_jkt().as_str())
+        || receipt.locked_auth_generation() != Some(generation)
+        || receipt.locked_key_id() != Some(mutation.key_id().as_str())
+        || receipt.locked_signing_key_sha256().is_none()
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let operation_id = receipt
+        .operation_id()
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    validate_completed_self_revocation_material(
+        transaction,
+        operation_id,
+        authority.subject().as_str(),
+        canonical_uuid(authority.device_id()),
+        authority.dpop_jkt().as_str(),
+        mutation.key_id().as_str(),
+        generation,
+        mutation.transcript_bytes(),
+        mutation.signature(),
+        receipt.locked_signing_key_sha256(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn validate_completed_self_revocation_material(
+    transaction: &mut Transaction<'_, Postgres>,
+    operation_id: Uuid,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    historical_jkt: &str,
+    actor_key_id: &str,
+    actor_auth_generation: i64,
+    signing_transcript_bytes: &[u8],
+    signature: &[u8],
+    expected_signing_key_sha256: Option<&[u8; 32]>,
+) -> Result<bool, AuthRepositoryError> {
+    let signing_public_key: Option<Vec<u8>> = sqlx::query_scalar(
+        r#"
+        SELECT actor_key.signing_public_key
+          FROM chat.idempotency_records completed
+          JOIN chat.device_revocations terminal
+            ON terminal.revocation_id = completed.operation_id
+           AND terminal.actor_did = completed.principal_did
+           AND terminal.request_digest = completed.request_digest
+           AND terminal.accepted_request_bytes = completed.accepted_request_bytes
+           AND terminal.signing_transcript_bytes = completed.signing_transcript_bytes
+           AND terminal.signature = completed.signature
+           AND terminal.accepted_at = completed.completed_at
+          JOIN chat.devices target
+            ON target.user_did = terminal.target_did
+           AND target.device_id = terminal.target_device_id
+           AND target.status = 'revoked'
+           AND target.auth_generation = terminal.target_auth_generation
+           AND target.revocation_id = terminal.revocation_id
+           AND target.revoked_at = terminal.accepted_at
+          JOIN chat.device_keys actor_key
+            ON actor_key.user_did = terminal.actor_did
+           AND actor_key.device_id = terminal.actor_device_id
+           AND actor_key.key_id = terminal.actor_key_id
+           AND actor_key.revocation_id = terminal.revocation_id
+           AND actor_key.revoked_at = terminal.accepted_at
+         WHERE completed.operation_id = $1
+           AND completed.endpoint_nsid = 'blue.catbird.chat.revokeDevice'
+           AND completed.principal_did = $2
+           AND completed.historical_jkt = $3
+           AND completed.current_jkt IS NULL
+           AND terminal.actor_did = terminal.target_did
+           AND terminal.actor_device_id = terminal.target_device_id
+           AND terminal.actor_did = $2
+           AND terminal.actor_device_id = $4
+           AND terminal.actor_key_id = $5
+           AND terminal.actor_auth_generation = $6
+           AND target.dpop_jkt = $3
+        "#,
+    )
+    .bind(operation_id)
+    .bind(actor_did)
+    .bind(historical_jkt)
+    .bind(actor_device_id)
+    .bind(actor_key_id)
+    .bind(actor_auth_generation)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(signing_public_key) = signing_public_key else {
+        return Ok(false);
+    };
+    let signing_key_sha256: [u8; 32] = Sha256::digest(&signing_public_key).into();
+    if expected_signing_key_sha256.is_some_and(|expected| expected != &signing_key_sha256) {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    verify_ed25519_strict(&signing_public_key, signing_transcript_bytes, signature)?;
+    Ok(true)
 }
 
 /// Persists the immutable exact-response replay record inside the same
@@ -1276,8 +1857,64 @@ async fn arbitrate_signed(
     } else {
         None
     };
+    let exact_self_revocation = canonical_is_exact_self_target_revocation(canonical)?;
 
-    let state = lock_existing_authority(transaction, pre_replay).await?;
+    if exact_self_revocation && completed.is_some() {
+        let material = material
+            .as_ref()
+            .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+        if !validate_completed_self_revocation_material(
+            transaction,
+            material.operation_id,
+            pre_replay.subject().as_str(),
+            canonical_uuid(pre_replay.device_id()),
+            pre_replay.dpop_jkt().as_str(),
+            canonical.key_id().as_str(),
+            i64::try_from(canonical.auth_generation())
+                .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?,
+            canonical.transcript_bytes(),
+            canonical.signature(),
+            None,
+        )
+        .await?
+        {
+            return Err(AuthRepositoryError::CorruptIdempotencyRecord);
+        }
+        return Ok(Arbitration::Completed(
+            completed.expect("completed response checked above"),
+        ));
+    }
+
+    let state = match lock_existing_authority(transaction, pre_replay).await {
+        Ok(state) => state,
+        Err(AuthRepositoryError::DeviceRevoked) if exact_self_revocation => {
+            let material = material
+                .as_ref()
+                .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+            let Some(response) = completed_replay(transaction, pre_replay, material).await? else {
+                return Err(AuthRepositoryError::DeviceRevoked);
+            };
+            if !validate_completed_self_revocation_material(
+                transaction,
+                material.operation_id,
+                pre_replay.subject().as_str(),
+                canonical_uuid(pre_replay.device_id()),
+                pre_replay.dpop_jkt().as_str(),
+                canonical.key_id().as_str(),
+                i64::try_from(canonical.auth_generation())
+                    .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?,
+                canonical.transcript_bytes(),
+                canonical.signature(),
+                None,
+            )
+            .await?
+            {
+                return Err(AuthRepositoryError::CorruptIdempotencyRecord);
+            }
+            return Ok(Arbitration::Completed(response));
+        }
+        Err(error) => return Err(error),
+    };
     if canonical.kind() == SignedMutationKind::KeyPackageReplenishment {
         validate_replenishment_binding(pre_replay, canonical, &state)?;
     }
@@ -1580,6 +2217,21 @@ async fn completed_replay(
         event_position: row.event_position,
         completed_at: row.completed_at,
     }))
+}
+
+/// Loads exact completed material and validates the current or retained
+/// terminal authority before the response capability crosses the auth module.
+/// No repository sibling can observe response bytes from an unvalidated row.
+pub(super) async fn load_validated_completed_business_replay(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+) -> Result<Option<CompletedIdempotentResponse>, AuthRepositoryError> {
+    let material = request_material_for_authority(authority)?;
+    let response = completed_replay(transaction, authority.pre_replay(), &material).await?;
+    if response.is_some() {
+        validate_completed_business_authority(transaction, authority).await?;
+    }
+    Ok(response)
 }
 
 fn completed_replay_jkt_matches(
@@ -1964,6 +2616,26 @@ fn operation_id_from_canonical(
     Ok(canonical_uuid(&CanonicalUuidV4::parse(text)?))
 }
 
+fn canonical_is_exact_self_target_revocation(
+    canonical: &CanonicalSignedMutation,
+) -> Result<bool, AuthRepositoryError> {
+    if canonical.kind() != SignedMutationKind::DeviceRevocation {
+        return Ok(false);
+    }
+    let raw = canonical
+        .accepted_wrapper_bytes()
+        .ok_or(AuthRepositoryError::MissingAcceptedRequestBytes)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|_| AuthRepositoryError::RequestBindingMismatch)?;
+    let target_device_id = value
+        .get("body")
+        .and_then(|body| body.get("targetDeviceId"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    Ok(canonical_uuid(&CanonicalUuidV4::parse(target_device_id)?)
+        == canonical_uuid(canonical.actor_device_id()))
+}
+
 fn validate_replenishment_binding(
     pre_replay: &PreReplayCryptographicVerification,
     canonical: &CanonicalSignedMutation,
@@ -2167,6 +2839,21 @@ mod tests {
     }
 
     #[test]
+    fn completed_response_debug_never_exposes_replay_material() {
+        let response_bytes = vec![222, 173, 190, 239, 17, 34, 51, 68];
+        let response = CompletedIdempotentResponse::debug_redaction_sentinel_for_test(
+            598,
+            response_bytes.clone(),
+        );
+        let rendered = format!("{response:?}");
+
+        assert_eq!(rendered, "CompletedIdempotentResponse(<redacted>)");
+        assert!(!rendered.contains("598"));
+        assert!(!rendered.contains(&format!("{response_bytes:?}")));
+        assert!(!rendered.contains(&format!("{:?}", response.response_sha256())));
+    }
+
+    #[test]
     fn completion_status_contract_excludes_informational_and_out_of_range_values() {
         assert!(!completion_status_is_valid(199));
         assert!(completion_status_is_valid(200));
@@ -2318,6 +3005,92 @@ mod tests {
     }
 
     #[test]
+    fn canonical_locked_scope_digest_binds_membership_and_mutable_row_state() {
+        let device_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let locked_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let device = |status: &str, generation: i64, revoked_at| LockedCanonicalDeviceProjection {
+            user_did: "did:web:actor.example.com".to_owned(),
+            device_id,
+            status: status.to_owned(),
+            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            auth_generation: generation,
+            revoked_at,
+        };
+        let key =
+            |public_key: u8, enrollment_generation: i64, revoked_at| LockedCanonicalKeyProjection {
+                user_did: "did:web:actor.example.com".to_owned(),
+                device_id,
+                key_id: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA".to_owned(),
+                signing_public_key: vec![public_key; 32],
+                enrollment_auth_generation: enrollment_generation,
+                revoked_at,
+            };
+        let digest = |principals: Vec<String>,
+                      devices: Vec<LockedCanonicalDeviceProjection>,
+                      keys: Vec<LockedCanonicalKeyProjection>| {
+            canonical_locked_scope_digest(&principals, &devices, &keys)
+        };
+        let principals = vec!["did:web:actor.example.com".to_owned()];
+        let baseline = digest(
+            principals.clone(),
+            vec![device("active", 7, None)],
+            vec![key(3, 7, None)],
+        );
+
+        assert_ne!(
+            baseline,
+            digest(
+                vec![
+                    "did:web:actor.example.com".to_owned(),
+                    "did:web:principal-only.example.com".to_owned(),
+                ],
+                vec![device("active", 7, None)],
+                vec![key(3, 7, None)],
+            ),
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                principals.clone(),
+                vec![device("revoked", 7, Some(locked_at))],
+                vec![key(3, 7, None)],
+            ),
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                principals.clone(),
+                vec![device("active", 8, None)],
+                vec![key(3, 7, None)],
+            ),
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                principals.clone(),
+                vec![device("active", 7, None)],
+                vec![key(4, 7, None)],
+            ),
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                principals.clone(),
+                vec![device("active", 7, None)],
+                vec![key(3, 8, None)],
+            ),
+        );
+        assert_ne!(
+            baseline,
+            digest(
+                principals,
+                vec![device("active", 7, None)],
+                vec![key(3, 7, Some(locked_at))],
+            ),
+        );
+    }
+
+    #[test]
     fn operation_id_can_only_be_extracted_from_strict_canonical_wrapper_evidence() {
         let operation_id = "22222222-2222-4222-8222-222222222222";
         let raw = serde_json::to_vec(&json!({
@@ -2340,5 +3113,37 @@ mod tests {
             operation_id_from_canonical(&canonical).unwrap(),
             Uuid::parse_str(operation_id).unwrap(),
         );
+    }
+
+    #[test]
+    fn self_revocation_classifier_requires_the_actor_device_as_exact_target() {
+        let actor_device_id = "3b241101-e2bb-4255-8caf-4136c566a962";
+        let canonical = |target_device_id: &str| {
+            let raw = serde_json::to_vec(&json!({
+                "body": {
+                    "$type": SignedMutationKind::DeviceRevocation.type_id(),
+                    "signatureDomain": String::from_utf8(
+                        SignedMutationKind::DeviceRevocation.domain().to_vec()
+                    ).unwrap(),
+                    "actorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                    "actorDeviceId": actor_device_id,
+                    "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+                    "authGeneration": 1,
+                    "targetDeviceId": target_device_id,
+                    "targetAuthGeneration": 1,
+                    "idempotencyKey": "22222222-2222-4222-8222-222222222222",
+                    "signedAt": "2026-07-22T14:05:09.123Z"
+                },
+                "signature": STANDARD.encode([0_u8; 64]),
+            }))
+            .unwrap();
+            decode_canonical_signed_mutation(&raw).unwrap()
+        };
+
+        assert!(canonical_is_exact_self_target_revocation(&canonical(actor_device_id)).unwrap());
+        assert!(!canonical_is_exact_self_target_revocation(&canonical(
+            "44444444-4444-4444-8444-444444444444"
+        ))
+        .unwrap());
     }
 }
