@@ -8,7 +8,9 @@
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
+use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 use ed25519_dalek::{Signature, VerifyingKey};
+use jacquard_common::DefaultStr;
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     ser::{SerializeMap, SerializeSeq},
@@ -1259,21 +1261,28 @@ pub fn verify_ed25519_strict(
 #[derive(Debug)]
 pub struct VerifiedSignedMutation {
     canonical: CanonicalSignedMutation,
+    historical_public_key: [u8; 32],
 }
 
 pub fn verify_signed_mutation(
     canonical: CanonicalSignedMutation,
     historical_public_key: &[u8],
 ) -> Result<VerifiedSignedMutation, AuthPrimitiveError> {
-    if &ed25519_key_id(historical_public_key)? != canonical.key_id() {
+    let historical_public_key: [u8; 32] = historical_public_key
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("Ed25519 public key length"))?;
+    if &ed25519_key_id(&historical_public_key)? != canonical.key_id() {
         return Err(AuthPrimitiveError::invalid("signed body key ID mismatch"));
     }
     verify_ed25519_strict(
-        historical_public_key,
+        &historical_public_key,
         canonical.transcript_bytes(),
         canonical.signature(),
     )?;
-    Ok(VerifiedSignedMutation { canonical })
+    Ok(VerifiedSignedMutation {
+        canonical,
+        historical_public_key,
+    })
 }
 
 pub fn decode_and_verify_signed_mutation(
@@ -1287,6 +1296,10 @@ pub fn decode_and_verify_signed_mutation(
 }
 
 impl VerifiedSignedMutation {
+    fn historical_public_key(&self) -> &[u8; 32] {
+        &self.historical_public_key
+    }
+
     pub fn kind(&self) -> SignedMutationKind {
         self.canonical.kind()
     }
@@ -2094,6 +2107,7 @@ pub(crate) fn rebind_persisted_application_entry(
         || mutation.key_id() != original.key_id()
         || mutation.auth_generation() != original.auth_generation()
         || mutation.signed_at() != original.signed_at()
+        || mutation.historical_public_key() != original.historical_public_key()
         || mutation.accepted_wrapper_bytes() != Some(raw_signed_wrapper)
     {
         return Err(AuthPrimitiveError::invalid(
@@ -2531,6 +2545,437 @@ pub struct VerifiedControlEntry {
     mutation: VerifiedSignedMutation,
 }
 
+/// The two public encodings of one verified control row. Construction is
+/// intentionally crate-private and the fields are opaque: callers can only
+/// receive products minted from a `VerifiedControlEntry`.
+pub(crate) struct CanonicalControlEntryProducts {
+    durable_json: Vec<u8>,
+    response_entry: chat_dto::ConversationEntry<DefaultStr>,
+    canonical_response_json: Vec<u8>,
+}
+
+/// One private, closed projection is the sole source for both persistence JSON
+/// and the generated response DTO. In particular, this type cannot be
+/// deserialized from caller JSON or assembled from a caller DTO.
+struct CanonicalControlEntryProjection {
+    row: BTreeMap<String, DagValue>,
+}
+
+#[derive(Clone, Copy)]
+enum ControlJsonBytes {
+    BareStandardBase64,
+    DagJson,
+}
+
+impl CanonicalControlEntryProjection {
+    fn from_verified(entry: &VerifiedControlEntry) -> Self {
+        let signed_request = BTreeMap::from([
+            (
+                "body".to_owned(),
+                DagValue::Map(entry.mutation.canonical.body.clone()),
+            ),
+            (
+                "signature".to_owned(),
+                DagValue::Bytes(entry.mutation.signature().to_vec()),
+            ),
+        ]);
+        let mut row = BTreeMap::from([
+            (
+                "$type".to_owned(),
+                DagValue::Text(entry.kind.type_id().to_owned()),
+            ),
+            (
+                "conversationId".to_owned(),
+                DagValue::Uuid(entry.conversation_id.clone()),
+            ),
+            ("entryId".to_owned(), DagValue::Uuid(entry.entry_id.clone())),
+            (
+                "receivedAt".to_owned(),
+                DagValue::Timestamp(entry.received_at.clone()),
+            ),
+            ("seq".to_owned(), DagValue::Integer(entry.seq)),
+            ("signedRequest".to_owned(), DagValue::Map(signed_request)),
+        ]);
+        for (name, value) in &entry.server_fields {
+            row.insert(name.clone(), value.clone());
+        }
+        Self { row }
+    }
+
+    fn json_value(&self, bytes: ControlJsonBytes) -> SchemaValue {
+        dag_value_json(&DagValue::Map(self.row.clone()), bytes)
+    }
+
+    fn generated_dto_json_value(&self) -> Result<SchemaValue, AuthPrimitiveError> {
+        dag_value_generated_json(
+            definition("conversationEntry")?,
+            &DagValue::Map(self.row.clone()),
+        )
+    }
+}
+
+fn dag_value_json(value: &DagValue, bytes: ControlJsonBytes) -> SchemaValue {
+    match value {
+        DagValue::Text(value) => SchemaValue::String(value.clone()),
+        DagValue::Uuid(value) => SchemaValue::String(value.as_str().to_owned()),
+        DagValue::Did(value) => SchemaValue::String(value.as_str().to_owned()),
+        DagValue::Thumbprint(value) => SchemaValue::String(value.as_str().to_owned()),
+        DagValue::Timestamp(value) => SchemaValue::String(value.as_str().to_owned()),
+        DagValue::Bytes(value) => {
+            let encoded = SchemaValue::String(STANDARD.encode(value));
+            match bytes {
+                ControlJsonBytes::BareStandardBase64 => encoded,
+                ControlJsonBytes::DagJson => SchemaValue::Object(serde_json::Map::from_iter([(
+                    "$bytes".to_owned(),
+                    encoded,
+                )])),
+            }
+        }
+        DagValue::Integer(value) => SchemaValue::Number((*value).into()),
+        DagValue::Bool(value) => SchemaValue::Bool(*value),
+        DagValue::Array(values) => SchemaValue::Array(
+            values
+                .iter()
+                .map(|value| dag_value_json(value, bytes))
+                .collect(),
+        ),
+        DagValue::Map(values) => SchemaValue::Object(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), dag_value_json(value, bytes)))
+                .collect(),
+        ),
+    }
+}
+
+fn dag_value_generated_json(
+    schema: &SchemaValue,
+    value: &DagValue,
+) -> Result<SchemaValue, AuthPrimitiveError> {
+    match schema["type"].as_str() {
+        Some("ref") => {
+            let name = schema["ref"]
+                .as_str()
+                .and_then(|value| value.strip_prefix('#'))
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated control entry ref"))?;
+            match name {
+                "operationId" | "deviceId" => {
+                    Ok(dag_value_json(value, ControlJsonBytes::BareStandardBase64))
+                }
+                // These generated aliases are bare `bytes::Bytes`, rather than
+                // fields carrying Jacquard's DAG-JSON serde helper. Feed their
+                // generated DTO deserializer the byte-array representation it
+                // derives while retaining DAG-JSON for the actual response.
+                "artifactHash" | "identifierBytes" => match value {
+                    DagValue::Bytes(value) => Ok(SchemaValue::Array(
+                        value
+                            .iter()
+                            .map(|byte| SchemaValue::Number((*byte).into()))
+                            .collect(),
+                    )),
+                    _ => Err(AuthPrimitiveError::invalid(
+                        "generated control entry byte alias",
+                    )),
+                },
+                _ => dag_value_generated_json(definition(name)?, value),
+            }
+        }
+        Some("union") => {
+            let DagValue::Map(values) = value else {
+                return Err(AuthPrimitiveError::invalid("generated control entry union"));
+            };
+            let type_id = match values.get("$type") {
+                Some(DagValue::Text(value)) => value.as_str(),
+                _ => {
+                    return Err(AuthPrimitiveError::invalid(
+                        "generated control entry union type",
+                    ));
+                }
+            };
+            let name = type_id
+                .strip_prefix(TYPE_PREFIX)
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated control entry namespace"))?;
+            let allowed = schema["refs"].as_array().is_some_and(|refs| {
+                refs.iter()
+                    .any(|reference| reference.as_str() == Some(&format!("#{name}")))
+            });
+            if !allowed {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated control entry union variant",
+                ));
+            }
+            dag_value_generated_json(definition(name)?, value)
+        }
+        Some("object") => {
+            let DagValue::Map(values) = value else {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated control entry object",
+                ));
+            };
+            let properties = schema["properties"].as_object().ok_or_else(|| {
+                AuthPrimitiveError::invalid("generated control entry object schema")
+            })?;
+            let mut output = serde_json::Map::new();
+            for (name, value) in values {
+                if name == "$type" {
+                    output.insert(
+                        name.clone(),
+                        dag_value_json(value, ControlJsonBytes::BareStandardBase64),
+                    );
+                    continue;
+                }
+                let property = properties.get(name).ok_or_else(|| {
+                    AuthPrimitiveError::invalid("generated control entry field schema")
+                })?;
+                output.insert(name.clone(), dag_value_generated_json(property, value)?);
+            }
+            Ok(SchemaValue::Object(output))
+        }
+        Some("bytes") => Ok(dag_value_json(value, ControlJsonBytes::DagJson)),
+        Some("array") => {
+            let DagValue::Array(values) = value else {
+                return Err(AuthPrimitiveError::invalid("generated control entry array"));
+            };
+            let items = schema.get("items").ok_or_else(|| {
+                AuthPrimitiveError::invalid("generated control entry array schema")
+            })?;
+            values
+                .iter()
+                .map(|value| dag_value_generated_json(items, value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(SchemaValue::Array)
+        }
+        Some("string") | Some("integer") | Some("boolean") => {
+            Ok(dag_value_json(value, ControlJsonBytes::BareStandardBase64))
+        }
+        _ => Err(AuthPrimitiveError::invalid(
+            "generated control entry schema",
+        )),
+    }
+}
+
+fn normalize_generated_response_json(
+    schema: &SchemaValue,
+    value: &SchemaValue,
+) -> Result<SchemaValue, AuthPrimitiveError> {
+    match schema["type"].as_str() {
+        Some("ref") => {
+            let name = schema["ref"]
+                .as_str()
+                .and_then(|value| value.strip_prefix('#'))
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response ref"))?;
+            match name {
+                "operationId" | "deviceId" => {
+                    if !value.is_string() {
+                        return Err(AuthPrimitiveError::invalid("generated response identifier"));
+                    }
+                    Ok(value.clone())
+                }
+                "artifactHash" | "identifierBytes" => {
+                    let values = value.as_array().ok_or_else(|| {
+                        AuthPrimitiveError::invalid("generated response byte alias")
+                    })?;
+                    let bytes = values
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_u64()
+                                .and_then(|value| u8::try_from(value).ok())
+                                .ok_or_else(|| {
+                                    AuthPrimitiveError::invalid(
+                                        "generated response byte alias value",
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(SchemaValue::String(STANDARD.encode(bytes)))
+                }
+                _ => normalize_generated_response_json(definition(name)?, value),
+            }
+        }
+        Some("union") => {
+            let values = value
+                .as_object()
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response union"))?;
+            let type_id = values
+                .get("$type")
+                .and_then(SchemaValue::as_str)
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response union type"))?;
+            let name = type_id
+                .strip_prefix(TYPE_PREFIX)
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response namespace"))?;
+            let allowed = schema["refs"].as_array().is_some_and(|refs| {
+                refs.iter()
+                    .any(|reference| reference.as_str() == Some(&format!("#{name}")))
+            });
+            if !allowed {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated response union variant",
+                ));
+            }
+            normalize_generated_response_json(definition(name)?, value)
+        }
+        Some("object") => {
+            let values = value
+                .as_object()
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response object"))?;
+            let properties = schema["properties"]
+                .as_object()
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response object schema"))?;
+            let mut output = serde_json::Map::new();
+            for (name, value) in values {
+                if name == "$type" {
+                    if !value.is_string() {
+                        return Err(AuthPrimitiveError::invalid(
+                            "generated response object type",
+                        ));
+                    }
+                    output.insert(name.clone(), value.clone());
+                    continue;
+                }
+                let property = properties.get(name).ok_or_else(|| {
+                    AuthPrimitiveError::invalid("generated response field schema")
+                })?;
+                output.insert(
+                    name.clone(),
+                    normalize_generated_response_json(property, value)?,
+                );
+            }
+            Ok(SchemaValue::Object(output))
+        }
+        Some("bytes") => {
+            let values = value
+                .as_object()
+                .filter(|values| values.len() == 1)
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response DAG-JSON bytes"))?;
+            let encoded = values
+                .get("$bytes")
+                .and_then(SchemaValue::as_str)
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response DAG-JSON bytes"))?;
+            let decoded = decode_standard_base64(encoded)?;
+            if STANDARD.encode(&decoded) != encoded {
+                return Err(AuthPrimitiveError::invalid(
+                    "generated response noncanonical bytes",
+                ));
+            }
+            Ok(SchemaValue::String(encoded.to_owned()))
+        }
+        Some("array") => {
+            let values = value
+                .as_array()
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response array"))?;
+            let items = schema
+                .get("items")
+                .ok_or_else(|| AuthPrimitiveError::invalid("generated response array schema"))?;
+            values
+                .iter()
+                .map(|value| normalize_generated_response_json(items, value))
+                .collect::<Result<Vec<_>, _>>()
+                .map(SchemaValue::Array)
+        }
+        Some("string") if value.is_string() => Ok(value.clone()),
+        Some("integer") if value.is_u64() || value.is_i64() => Ok(value.clone()),
+        Some("boolean") if value.is_boolean() => Ok(value.clone()),
+        _ => Err(AuthPrimitiveError::invalid("generated response schema")),
+    }
+}
+
+fn verified_control_entries_match(
+    expected: &VerifiedControlEntry,
+    actual: &VerifiedControlEntry,
+) -> bool {
+    let expected_mutation = expected.mutation();
+    let actual_mutation = actual.mutation();
+    let expected_server_fields = serde_ipld_dagcbor::to_vec(&DagMapRef(&expected.server_fields))
+        .expect("verified serverFields encode");
+    let actual_server_fields = serde_ipld_dagcbor::to_vec(&DagMapRef(&actual.server_fields))
+        .expect("verified serverFields encode");
+    expected.kind == actual.kind
+        && expected.entry_id == actual.entry_id
+        && expected.conversation_id == actual.conversation_id
+        && expected.seq == actual.seq
+        && expected.received_at == actual.received_at
+        && expected_server_fields == actual_server_fields
+        && expected.outer_control_projection() == actual.outer_control_projection()
+        && expected.outer_control_fingerprint() == actual.outer_control_fingerprint()
+        && expected_mutation.kind() == actual_mutation.kind()
+        && expected_mutation.type_id() == actual_mutation.type_id()
+        && expected_mutation.domain() == actual_mutation.domain()
+        && expected_mutation.canonical_projection() == actual_mutation.canonical_projection()
+        && expected_mutation.transcript_bytes() == actual_mutation.transcript_bytes()
+        && expected_mutation.request_digest() == actual_mutation.request_digest()
+        && expected_mutation.signature() == actual_mutation.signature()
+        && expected_mutation.historical_public_key() == actual_mutation.historical_public_key()
+        && expected_mutation.actor_did() == actual_mutation.actor_did()
+        && expected_mutation.actor_device_id() == actual_mutation.actor_device_id()
+        && expected_mutation.key_id() == actual_mutation.key_id()
+        && expected_mutation.auth_generation() == actual_mutation.auth_generation()
+        && expected_mutation.signed_at() == actual_mutation.signed_at()
+}
+
+impl CanonicalControlEntryProducts {
+    pub(crate) fn mint(entry: &VerifiedControlEntry) -> Result<Self, AuthPrimitiveError> {
+        let projection = CanonicalControlEntryProjection::from_verified(entry);
+        let durable_json =
+            serde_json::to_vec(&projection.json_value(ControlJsonBytes::BareStandardBase64))
+                .map_err(|_| AuthPrimitiveError::invalid("durable control entry JSON"))?;
+        let reverified =
+            decode_and_verify_control_entry(&durable_json, entry.mutation.historical_public_key())?;
+        if !verified_control_entries_match(entry, &reverified) {
+            return Err(AuthPrimitiveError::invalid(
+                "durable control entry self-verification",
+            ));
+        }
+
+        let generated_dto_json = serde_json::to_vec(&projection.generated_dto_json_value()?)
+            .map_err(|_| AuthPrimitiveError::invalid("generated control entry JSON"))?;
+        let response_entry: chat_dto::ConversationEntry<DefaultStr> =
+            serde_json::from_slice(&generated_dto_json)
+                .map_err(|_| AuthPrimitiveError::invalid("generated control entry decode"))?;
+        let generated_round_trip = serde_json::to_vec(&response_entry)
+            .map_err(|_| AuthPrimitiveError::invalid("generated control entry encode"))?;
+        let round_tripped: chat_dto::ConversationEntry<DefaultStr> =
+            serde_json::from_slice(&generated_round_trip)
+                .map_err(|_| AuthPrimitiveError::invalid("generated control entry round-trip"))?;
+        if round_tripped != response_entry {
+            return Err(AuthPrimitiveError::invalid(
+                "generated control entry semantic round-trip",
+            ));
+        }
+        let canonical_response_json = generated_round_trip;
+        let generated_response_value: SchemaValue =
+            serde_json::from_slice(&canonical_response_json)
+                .map_err(|_| AuthPrimitiveError::invalid("generated response JSON"))?;
+        let normalized_response = normalize_generated_response_json(
+            definition("conversationEntry")?,
+            &generated_response_value,
+        )?;
+        if normalized_response != projection.json_value(ControlJsonBytes::BareStandardBase64) {
+            return Err(AuthPrimitiveError::invalid(
+                "generated response/durable projection mismatch",
+            ));
+        }
+
+        Ok(Self {
+            durable_json,
+            response_entry,
+            canonical_response_json,
+        })
+    }
+
+    pub(crate) fn durable_json(&self) -> &[u8] {
+        &self.durable_json
+    }
+
+    pub(crate) fn response_entry(&self) -> &chat_dto::ConversationEntry<DefaultStr> {
+        &self.response_entry
+    }
+
+    pub(crate) fn canonical_response_json(&self) -> &[u8] {
+        &self.canonical_response_json
+    }
+}
+
 /// Seals an already verified mutation with repository-allocated row identity
 /// and the request's one trusted instant. No raw signed wrapper, signature, or
 /// caller-selected fingerprint enters this path.
@@ -2659,6 +3104,7 @@ pub fn rebind_persisted_control_entry(
         || mutation.key_id() != original.key_id()
         || mutation.auth_generation() != original.auth_generation()
         || mutation.signed_at() != original.signed_at()
+        || mutation.historical_public_key() != original.historical_public_key()
         || mutation.accepted_wrapper_bytes() != Some(raw_signed_wrapper)
     {
         return Err(AuthPrimitiveError::invalid(
