@@ -351,10 +351,11 @@ mod chat_protocol {
             ));
         }
         pub mod recovery {
-            #[derive(Debug)]
-            pub(crate) struct RecoverySqlAuthoritySeal {
-                _private: (),
-            }
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/recovery.rs"
+            ));
         }
         pub mod delivery {
             #![allow(dead_code)]
@@ -398,7 +399,7 @@ use chat_protocol::{
         core::hydrate_locked_conversation_state,
         prelude::{
             arbitrate_operation, prepare_identity_scope_prelude, OperationArbitration,
-            PreparedBusinessPrelude,
+            PreparedBusinessPrelude, ResetOperationClaimMutationForTest,
         },
         reset::{
             self, LockedPendingResetRequestGuard, LockedResetRequestDisposition,
@@ -413,7 +414,10 @@ use chat_protocol::{
         CanonicalControlServerFields, ControlEntryKind, SignedMutationKind,
         VerifiedMutationProjection, VerifiedSignedMutation,
     },
-    validation::{CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant, ValidatedChatNsid},
+    validation::{
+        ed25519_key_id, CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant,
+        ValidatedChatNsid,
+    },
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
@@ -461,6 +465,32 @@ impl ResetFixture {
             self.confirmation_tag.as_slice().try_into().unwrap(),
             PublicGroupSnapshotLifecycle::Active,
         )
+    }
+}
+
+fn pure_reset_fixture() -> ResetFixture {
+    let signing_public_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED)
+        .verifying_key()
+        .to_bytes()
+        .to_vec();
+    ResetFixture {
+        conversation_id: Uuid::parse_str("d0cb7273-b90d-44aa-985d-8a68c13a18bd").unwrap(),
+        actor_did: ALICE_DID.to_owned(),
+        actor_device_id: Uuid::parse_str(ALICE_DEVICE).unwrap(),
+        actor_dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        actor_key_id: ed25519_key_id(&signing_public_key)
+            .unwrap()
+            .as_str()
+            .to_owned(),
+        signing_public_key,
+        auth_generation: 1,
+        conversation_kind: "group".to_owned(),
+        generation: 1,
+        state_version: 1,
+        group_id: vec![1; 32],
+        epoch: 1,
+        group_context_hash: vec![2; 32],
+        confirmation_tag: vec![3; 32],
     }
 }
 
@@ -927,6 +957,152 @@ async fn durable_snapshot(
     .unwrap()
 }
 
+fn rust_raw_literal_end(source: &[u8], start: usize, prefix_len: usize) -> Option<usize> {
+    let mut quote = start + prefix_len;
+    while source.get(quote) == Some(&b'#') {
+        quote += 1;
+    }
+    if source.get(quote) != Some(&b'"') {
+        return None;
+    }
+    let hashes = quote - (start + prefix_len);
+    let mut cursor = quote + 1;
+    while cursor < source.len() {
+        if source[cursor] == b'"'
+            && source.get(cursor + 1..cursor + 1 + hashes) == Some(&source[quote - hashes..quote])
+        {
+            return Some(cursor + 1 + hashes);
+        }
+        cursor += 1;
+    }
+    Some(source.len())
+}
+
+fn rust_quoted_literal_end(source: &[u8], quote: usize, delimiter: u8) -> Option<usize> {
+    let mut cursor = quote + 1;
+    while cursor < source.len() {
+        match source[cursor] {
+            b'\\' => cursor = (cursor + 2).min(source.len()),
+            byte if byte == delimiter => return Some(cursor + 1),
+            b'\n' | b'\r' if delimiter == b'\'' => return None,
+            _ => cursor += 1,
+        }
+    }
+    (delimiter == b'"').then_some(source.len())
+}
+
+fn rust_char_literal_end(source: &str, quote: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let content = quote + 1;
+    if bytes.get(content) == Some(&b'\\') {
+        return rust_quoted_literal_end(bytes, quote, b'\'');
+    }
+    let character = source.get(content..)?.chars().next()?;
+    let closing_quote = content + character.len_utf8();
+    (bytes.get(closing_quote) == Some(&b'\'')).then_some(closing_quote + 1)
+}
+
+fn rust_code_without_comments_and_literals(source: &str) -> String {
+    fn blank(output: &mut [u8], source: &[u8], start: usize, end: usize) {
+        for index in start..end.min(output.len()) {
+            if source[index] != b'\n' && source[index] != b'\r' {
+                output[index] = b' ';
+            }
+        }
+    }
+
+    fn identifier_boundary(source: &[u8], index: usize) -> bool {
+        index == 0 || !(source[index - 1].is_ascii_alphanumeric() || source[index - 1] == b'_')
+    }
+
+    let bytes = source.as_bytes();
+    let mut output = bytes.to_vec();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes.get(cursor..cursor + 2) == Some(b"//") {
+            let end = bytes[cursor + 2..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(bytes.len(), |relative| cursor + 2 + relative);
+            blank(&mut output, bytes, cursor, end);
+            cursor = end;
+            continue;
+        }
+        if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+            let start = cursor;
+            cursor += 2;
+            let mut depth = 1_u32;
+            while cursor < bytes.len() && depth != 0 {
+                if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if bytes.get(cursor..cursor + 2) == Some(b"*/") {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            blank(&mut output, bytes, start, cursor);
+            continue;
+        }
+
+        let boundary = identifier_boundary(bytes, cursor);
+        let raw_end = if boundary && bytes.get(cursor..cursor + 2) == Some(b"br") {
+            rust_raw_literal_end(bytes, cursor, 2)
+        } else if boundary && bytes[cursor] == b'r' {
+            rust_raw_literal_end(bytes, cursor, 1)
+        } else {
+            None
+        };
+        if let Some(end) = raw_end {
+            blank(&mut output, bytes, cursor, end);
+            cursor = end;
+            continue;
+        }
+
+        let quoted = if boundary && bytes.get(cursor..cursor + 2) == Some(b"b\"") {
+            rust_quoted_literal_end(bytes, cursor + 1, b'"').map(|end| (cursor, end))
+        } else if bytes[cursor] == b'"' {
+            rust_quoted_literal_end(bytes, cursor, b'"').map(|end| (cursor, end))
+        } else if boundary && bytes.get(cursor..cursor + 2) == Some(b"b'") {
+            rust_char_literal_end(source, cursor + 1).map(|end| (cursor, end))
+        } else if bytes[cursor] == b'\'' {
+            rust_char_literal_end(source, cursor).map(|end| (cursor, end))
+        } else {
+            None
+        };
+        if let Some((start, end)) = quoted {
+            blank(&mut output, bytes, start, end);
+            cursor = end;
+        } else {
+            cursor += 1;
+        }
+    }
+    String::from_utf8(output).expect("blanking Rust comments and literals preserves UTF-8")
+}
+
+fn rust_lock_helper_identifiers(source: &str) -> std::collections::BTreeSet<String> {
+    let code = rust_code_without_comments_and_literals(source);
+    let bytes = code.as_bytes();
+    let mut helpers = std::collections::BTreeSet::new();
+    let mut cursor = 0;
+    while let Some(relative) = code[cursor..].find("lock_") {
+        let start = cursor + relative;
+        let boundary =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let mut end = start + "lock_".len();
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if boundary && code[end..].trim_start().starts_with('(') {
+            helpers.insert(code[start..end].to_owned());
+        }
+        cursor = end;
+    }
+    helpers
+}
+
 #[test]
 fn reset_source_has_no_raw_business_guard_or_duplicate_identity_lock_path() {
     let source = include_str!("../src/chat_protocol/repository/reset.rs");
@@ -986,6 +1162,50 @@ fn reset_identity_discovery_is_read_only_and_locked_preparation_does_not_relock_
             );
         }
     }
+
+    let allowed = std::collections::BTreeSet::from([
+        "lock_head_nowait".to_owned(),
+        "lock_operation_and_pending_rows".to_owned(),
+    ]);
+    assert_eq!(
+        rust_lock_helper_identifiers(source),
+        allowed,
+        "Reset gained a non-allowlisted lock-helper path"
+    );
+}
+
+#[test]
+fn reset_lock_helper_scanner_ignores_comments_and_rust_string_literals() {
+    let decoys = r####"
+        // lock_head_nowait()
+        /* lock_operation_and_pending_rows()
+           /* lock_nested_decoy() */
+        */
+        const ORDINARY: &str = "lock_head_nowait()";
+        const BYTES: &[u8] = b"lock_operation_and_pending_rows()";
+        const RAW: &str = r#"lock_head_nowait()"#;
+        const RAW_BYTES: &[u8] = br##"lock_operation_and_pending_rows()"##;
+        const CHARACTER: char = 'x';
+        const BYTE_CHARACTER: u8 = b'x';
+    "####;
+    assert!(
+        rust_lock_helper_identifiers(decoys).is_empty(),
+        "comments or Rust literals masqueraded as real lock-helper code"
+    );
+
+    let real_calls = r#"
+        fn proof<'a>(_value: &'a str) {
+            lock_head_nowait();
+            lock_operation_and_pending_rows ();
+        }
+    "#;
+    assert_eq!(
+        rust_lock_helper_identifiers(real_calls),
+        std::collections::BTreeSet::from([
+            "lock_head_nowait".to_owned(),
+            "lock_operation_and_pending_rows".to_owned(),
+        ])
+    );
 }
 
 #[test]
@@ -1105,6 +1325,84 @@ fn reset_operation_claim_verification_binds_every_exact_authority_dimension() {
         .0;
     assert!(uuid_v4.contains("value.get_version_num() == 4"));
     assert!(uuid_v4.contains("value.get_variant() == uuid::Variant::RFC4122"));
+}
+
+#[test]
+fn reset_operation_claim_runtime_rejects_every_mismatched_dimension() {
+    let fixture = pure_reset_fixture();
+    let at = DateTime::parse_from_rfc3339("2026-07-28T12:00:00.000Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let original_id = Uuid::parse_str("992fc634-beb1-49cd-b5c1-f68cc7645424").unwrap();
+    let alternate_id = Uuid::parse_str("86db988a-c878-4df0-874b-70e27284ad97").unwrap();
+    let original = signed_reset(
+        &fixture,
+        SignedMutationKind::ResetRequest,
+        original_id,
+        original_id,
+        &fixture.prior(),
+        at,
+    );
+    let alternate = signed_reset(
+        &fixture,
+        SignedMutationKind::ResetRequest,
+        alternate_id,
+        alternate_id,
+        &fixture.prior(),
+        at,
+    );
+    for mutation in [
+        ResetOperationClaimMutationForTest::OperationId,
+        ResetOperationClaimMutationForTest::Principal,
+        ResetOperationClaimMutationForTest::Transaction,
+        ResetOperationClaimMutationForTest::RequestDigest,
+        ResetOperationClaimMutationForTest::AcceptedWrapperHash,
+        ResetOperationClaimMutationForTest::Signature,
+        ResetOperationClaimMutationForTest::PresentedMutation,
+        ResetOperationClaimMutationForTest::Endpoint,
+        ResetOperationClaimMutationForTest::MutationKind,
+    ] {
+        assert!(
+            chat_protocol::repository::prelude::reset_operation_claim_mutation_rejected_for_test(
+                &original,
+                &alternate,
+                &fixture.actor_dpop_jkt,
+                &fixture.signing_public_key,
+                mutation,
+            ),
+            "real Reset claim verifier accepted mutation {mutation:?}"
+        );
+    }
+}
+
+#[test]
+fn reset_operation_claim_runtime_fixture_seams_are_test_only_and_reset_specific() {
+    let auth_source = include_str!("../src/chat_protocol/repository/auth.rs");
+    let auth_fixture = auth_source
+        .split_once("pub(super) fn reset_locked_scope_for_claim_test(")
+        .unwrap();
+    assert!(auth_fixture.0.ends_with("#[cfg(test)]\n"));
+    let auth_body = auth_fixture
+        .1
+        .split_once("pub(crate) async fn recheck_existing_business_authority_for_test(")
+        .unwrap()
+        .0;
+    assert!(auth_body.contains("SignedMutationKind::ResetRequest"));
+    assert!(auth_body.contains("SignedMutationKind::ResetActivation"));
+
+    let prelude_source = include_str!("../src/chat_protocol/repository/prelude.rs");
+    let prelude_fixture = prelude_source
+        .split_once("pub(crate) fn reset_operation_claim_mutation_rejected_for_test(")
+        .unwrap();
+    assert!(prelude_fixture.0.ends_with("#[cfg(test)]\n"));
+    let prelude_body = prelude_fixture
+        .1
+        .split_once("pub(crate) enum RecoveryOperationEndpoint")
+        .unwrap()
+        .0;
+    assert!(prelude_body.contains(".verify_reset_operation("));
+    assert!(!prelude_body.contains("verify_recovery_operation"));
+    assert!(!prelude_body.contains("verify_welcome_operation"));
 }
 
 #[test]

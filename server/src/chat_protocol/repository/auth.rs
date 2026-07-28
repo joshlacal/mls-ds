@@ -1278,6 +1278,71 @@ fn canonical_locked_scope_digest(
     digest.finalize().into()
 }
 
+/// Reset-only scope fixture for executable claim-verifier negatives. All
+/// authority fields are derived from one already verified Reset mutation.
+#[cfg(test)]
+pub(super) fn reset_locked_scope_for_claim_test(
+    mutation: &VerifiedSignedMutation,
+    dpop_jkt: &str,
+    signing_public_key: &[u8],
+) -> Result<LockedCanonicalAuthorityScope, AuthRepositoryError> {
+    if !matches!(
+        mutation.kind(),
+        SignedMutationKind::ResetRequest | SignedMutationKind::ResetActivation
+    ) || BareDid::parse(mutation.actor_did().as_str()).is_err()
+        || KeyThumbprint::parse(dpop_jkt).is_err()
+        || ed25519_key_id(signing_public_key)
+            .map(|key_id| key_id.as_str() != mutation.key_id().as_str())
+            .unwrap_or(true)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let actor_did = mutation.actor_did().as_str().to_owned();
+    let actor_device_id = Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
+    let auth_generation = i64::try_from(mutation.auth_generation())
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let transaction_id = "reset-claim-verifier-fixture-transaction".to_owned();
+    let trusted_instant = mutation.signed_at().datetime();
+    let devices = vec![LockedCanonicalDeviceProjection {
+        user_did: actor_did.clone(),
+        device_id: actor_device_id,
+        status: "active".to_owned(),
+        dpop_jkt: dpop_jkt.to_owned(),
+        auth_generation,
+        revoked_at: None,
+    }];
+    let keys = vec![LockedCanonicalKeyProjection {
+        user_did: actor_did.clone(),
+        device_id: actor_device_id,
+        key_id: mutation.key_id().as_str().to_owned(),
+        signing_public_key: signing_public_key.to_vec(),
+        enrollment_auth_generation: auth_generation,
+        revoked_at: None,
+    }];
+    let principals = vec![actor_did.clone()];
+    let scope_digest = canonical_locked_scope_digest(&principals, &devices, &keys);
+    Ok(LockedCanonicalAuthorityScope {
+        receipt_id: Uuid::new_v4(),
+        actor: BusinessAuthorityGuard {
+            transaction_id,
+            class: RepositoryAuthorityClass::ExistingDevice,
+            subject: actor_did,
+            device_id: actor_device_id,
+            stored_dpop_jkt: Some(dpop_jkt.to_owned()),
+            stored_auth_generation: Some(auth_generation),
+            stored_key_id: Some(mutation.key_id().as_str().to_owned()),
+            stored_signing_public_key: Some(signing_public_key.to_vec()),
+            trusted_instant,
+        },
+        principals,
+        devices,
+        keys,
+        scope_digest,
+    })
+}
+
 /// Repository-slice test seam for operations whose production caller already
 /// completed cryptographic authorization. It derives every authority field
 /// from exact locked rows; callers supply only the identity and trusted T.

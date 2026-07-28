@@ -308,6 +308,112 @@ impl fmt::Debug for PreparedBusinessPrelude {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResetOperationClaimMutationForTest {
+    OperationId,
+    Principal,
+    Transaction,
+    RequestDigest,
+    AcceptedWrapperHash,
+    Signature,
+    PresentedMutation,
+    Endpoint,
+    MutationKind,
+}
+
+/// Executes the real consuming Reset verifier against one deliberately altered
+/// claim dimension. The fixture remains Reset-specific and derives its sealed
+/// scope and baseline claim entirely from verified mutations.
+#[cfg(test)]
+pub(crate) fn reset_operation_claim_mutation_rejected_for_test(
+    claimed_mutation: &VerifiedSignedMutation,
+    presented_mutation: &VerifiedSignedMutation,
+    dpop_jkt: &str,
+    signing_public_key: &[u8],
+    mutation: ResetOperationClaimMutationForTest,
+) -> bool {
+    let (operation_id, endpoint) = match claimed_mutation.projection() {
+        crate::chat_protocol::transcript::VerifiedMutationProjection::ResetRequest(reset) => (
+            Uuid::from_bytes(*reset.reset_request_id().as_bytes()),
+            ResetOperationEndpoint::RequestReset,
+        ),
+        crate::chat_protocol::transcript::VerifiedMutationProjection::ResetActivation(reset) => (
+            Uuid::from_bytes(*reset.transition_id().as_bytes()),
+            ResetOperationEndpoint::ActivateReset,
+        ),
+        _ => return false,
+    };
+    let accepted_request_bytes = match claimed_mutation.accepted_wrapper_bytes() {
+        Some(bytes) => bytes,
+        None => return false,
+    };
+    let locked = match auth::reset_locked_scope_for_claim_test(
+        claimed_mutation,
+        dpop_jkt,
+        signing_public_key,
+    ) {
+        Ok(locked) => locked,
+        Err(_) => return false,
+    };
+    let transaction_id = locked.transaction_id().to_owned();
+    let mut binding = OperationClaimBinding {
+        operation_id,
+        principal_did: claimed_mutation.actor_did().as_str().to_owned(),
+        endpoint_nsid: endpoint.endpoint_nsid().to_owned(),
+        mutation_kind: claimed_mutation.type_id().to_owned(),
+        request_digest: *claimed_mutation.request_digest(),
+        accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
+        signature: *claimed_mutation.signature(),
+        claimed_at: claimed_mutation.signed_at().datetime(),
+    };
+    let mut operation_transaction_id = transaction_id;
+    let mut presented_operation_id = operation_id;
+    let mut presented_endpoint = endpoint;
+    let presented = if matches!(
+        mutation,
+        ResetOperationClaimMutationForTest::PresentedMutation
+    ) {
+        presented_mutation
+    } else {
+        claimed_mutation
+    };
+    match mutation {
+        ResetOperationClaimMutationForTest::OperationId => presented_operation_id = Uuid::new_v4(),
+        ResetOperationClaimMutationForTest::Principal => binding.principal_did.push('x'),
+        ResetOperationClaimMutationForTest::Transaction => operation_transaction_id.push('x'),
+        ResetOperationClaimMutationForTest::RequestDigest => binding.request_digest[0] ^= 1,
+        ResetOperationClaimMutationForTest::AcceptedWrapperHash => {
+            binding.accepted_request_sha256[0] ^= 1
+        }
+        ResetOperationClaimMutationForTest::Signature => binding.signature[0] ^= 1,
+        ResetOperationClaimMutationForTest::PresentedMutation => {}
+        ResetOperationClaimMutationForTest::Endpoint => {
+            presented_endpoint = match endpoint {
+                ResetOperationEndpoint::RequestReset => ResetOperationEndpoint::ActivateReset,
+                ResetOperationEndpoint::ActivateReset => ResetOperationEndpoint::RequestReset,
+            }
+        }
+        ResetOperationClaimMutationForTest::MutationKind => {
+            binding.mutation_kind = match claimed_mutation.kind() {
+                SignedMutationKind::ResetRequest => SignedMutationKind::ResetActivation.type_id(),
+                SignedMutationKind::ResetActivation => SignedMutationKind::ResetRequest.type_id(),
+                _ => return false,
+            }
+            .to_owned()
+        }
+    }
+    PreparedBusinessPrelude {
+        authority: ScopeBoundBusinessAuthority { locked },
+        operation: OperationClaimGuard {
+            transaction_id: operation_transaction_id,
+            binding,
+        },
+    }
+    .verify_reset_operation(presented_endpoint, presented_operation_id, presented)
+    .is_err()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryOperationEndpoint {
     RequestLeafRecovery,
