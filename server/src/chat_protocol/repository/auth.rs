@@ -282,12 +282,24 @@ pub(crate) struct ReplenishmentOperationAdmission {
 }
 
 impl EnrollmentOperationAdmission {
+    /// Borrow only within the repository prelude while arbitrating the
+    /// canonical operation. Handlers never receive this authority directly.
+    pub(super) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
     pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
         self.authority
     }
 }
 
 impl RebindOperationAdmission {
+    /// Borrow only within the repository prelude while arbitrating the
+    /// canonical operation. Handlers never receive this authority directly.
+    pub(super) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
     pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
         self.authority
     }
@@ -367,6 +379,12 @@ impl SignedOperationReplayAuthority {
 }
 
 impl ReplenishmentOperationAdmission {
+    /// Borrow only within the repository prelude while arbitrating the
+    /// canonical operation. Handlers never receive this authority directly.
+    pub(super) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
     pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
         self.authority
     }
@@ -2794,6 +2812,106 @@ pub(crate) async fn prepare_enrollment_business(
     ))
 }
 
+/// Apply only the enrollment device-registration effects under the dedicated
+/// bootstrap absence scope. Completion remains exclusively owned by the
+/// consuming prelude guard, so no durable receipt can precede these effects.
+pub(super) async fn persist_enrollment_bootstrap_effects(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    scope: &EnrollmentAbsenceLockedBootstrapScope,
+) -> Result<(), AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let mutation = authority
+        .mutation()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let VerifiedMutationProjection::DeviceEnrollment(projection) = mutation.projection() else {
+        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+    };
+    if transaction_id != scope.transaction_id()
+        || authority.endpoint().as_str() != "blue.catbird.chat.enrollDevice"
+        || authority.repository_receipt().class() != RepositoryAuthorityClass::EnrollmentBootstrap
+        || authority.subject().as_str() != scope.subject()
+        || canonical_uuid(authority.device_id()) != scope.device_id()
+        || authority.dpop_jkt().as_str() != scope.new_jkt()
+        || authority.trusted_instant().datetime() != scope.trusted_instant()
+        || mutation.auth_generation() != 0
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let body = projection.body();
+    let device_name = match body.get("deviceName") {
+        Some(CanonicalValueRef::Text(value)) => value,
+        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
+    };
+    let dpop_jkt = match body.get("dpopJkt") {
+        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
+        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
+    };
+    let signing_public_key = match body.get("signaturePublicKey") {
+        Some(CanonicalValueRef::Bytes(value)) => value,
+        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
+    };
+    if dpop_jkt != scope.new_jkt()
+        || mutation.key_id().as_str()
+            != authority
+                .pre_replay()
+                .enrollment()
+                .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?
+                .key_id()
+                .as_str()
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    let trusted_at = scope.trusted_instant();
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did, created_at) VALUES ($1,$2) ON CONFLICT (user_did) DO NOTHING",
+    )
+    .bind(scope.subject())
+    .bind(trusted_at)
+    .execute(&mut **transaction)
+    .await?;
+    let inserted_device = sqlx::query(
+        r#"
+        INSERT INTO chat.devices (
+            user_did, device_id, device_name, status, dpop_jkt,
+            auth_generation, capabilities, created_at, updated_at
+        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5)
+        "#,
+    )
+    .bind(scope.subject())
+    .bind(scope.device_id())
+    .bind(device_name)
+    .bind(dpop_jkt)
+    .bind(trusted_at)
+    .execute(&mut **transaction)
+    .await?;
+    if inserted_device.rows_affected() != 1 {
+        return Err(AuthRepositoryError::DeviceAlreadyRegistered);
+    }
+    let inserted_key = sqlx::query(
+        r#"
+        INSERT INTO chat.device_keys (
+            user_did, device_id, key_id, signing_public_key,
+            enrollment_auth_generation, created_at
+        ) VALUES ($1,$2,$3,$4,1,$5)
+        "#,
+    )
+    .bind(scope.subject())
+    .bind(scope.device_id())
+    .bind(mutation.key_id().as_str())
+    .bind(signing_public_key)
+    .bind(trusted_at)
+    .execute(&mut **transaction)
+    .await?;
+    if inserted_key.rows_affected() != 1 {
+        return Err(AuthRepositoryError::DeviceKeyMissing);
+    }
+    Ok(())
+}
+
 pub(crate) async fn persist_enrollment_and_completion(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
@@ -2928,6 +3046,85 @@ pub(crate) async fn prepare_rebind_business(
         idempotency,
         authority: authority_guard,
     }))
+}
+
+/// Apply only the rebind CAS under the dedicated old-state bootstrap scope.
+/// Completion is intentionally separate and can only occur after the handler
+/// has serialized the locked post-state response.
+pub(super) async fn persist_rebind_bootstrap_effects(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    scope: &RebindOldStateLockedBootstrapScope,
+) -> Result<(), AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let mutation = authority
+        .mutation()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let VerifiedMutationProjection::DeviceAuthenticationRebind(projection) = mutation.projection()
+    else {
+        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+    };
+    let expected_generation = i64::try_from(mutation.auth_generation())
+        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    let signing_key_sha256: [u8; 32] = Sha256::digest(scope.signing_public_key()).into();
+    if transaction_id != scope.transaction_id()
+        || authority.endpoint().as_str() != "blue.catbird.chat.rebindDeviceAuthentication"
+        || authority.repository_receipt().class() != RepositoryAuthorityClass::RebindBootstrap
+        || authority.repository_receipt().locked_jkt() != Some(scope.old_jkt())
+        || authority.repository_receipt().locked_auth_generation()
+            != Some(scope.old_auth_generation())
+        || authority.repository_receipt().locked_key_id() != Some(scope.key_id())
+        || authority.repository_receipt().locked_signing_key_sha256() != Some(&signing_key_sha256)
+        || authority.subject().as_str() != scope.subject()
+        || canonical_uuid(authority.device_id()) != scope.device_id()
+        || authority.dpop_jkt().as_str() != scope.new_jkt()
+        || authority.trusted_instant().datetime() != scope.trusted_instant()
+        || expected_generation != scope.old_auth_generation()
+        || mutation.key_id().as_str() != scope.key_id()
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let new_generation = expected_generation
+        .checked_add(1)
+        .ok_or(AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    let body = projection.body();
+    let current_jkt = match body.get("currentDpopJkt") {
+        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
+        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
+    };
+    let new_jkt = match body.get("newDpopJkt") {
+        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
+        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
+    };
+    if current_jkt != scope.old_jkt() || new_jkt != scope.new_jkt() || current_jkt == new_jkt {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let updated = sqlx::query(
+        r#"
+        UPDATE chat.devices
+           SET dpop_jkt = $4, auth_generation = $5, updated_at = $6
+         WHERE user_did = $1
+           AND device_id = $2
+           AND status = 'active'
+           AND dpop_jkt = $3
+           AND auth_generation = $7
+        "#,
+    )
+    .bind(scope.subject())
+    .bind(scope.device_id())
+    .bind(scope.old_jkt())
+    .bind(scope.new_jkt())
+    .bind(new_generation)
+    .bind(scope.trusted_instant())
+    .bind(scope.old_auth_generation())
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
+    }
+    Ok(())
 }
 
 pub(crate) async fn persist_rebind_and_completion(

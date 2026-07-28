@@ -199,6 +199,80 @@ const DEVICE_GET_ENDPOINTS: &[&str] = &[
 ];
 
 // =============================================================================
+// Task 7 — handler authority composition (no database)
+// =============================================================================
+
+/// The active device writers must keep idempotent response bytes opaque until
+/// their endpoint-specific prelude has re-established terminal authority in the
+/// handler-owned transaction.  This deliberately pins the composition seam:
+/// the retired receipt-only helpers cannot re-enter a production handler.
+#[test]
+fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts() {
+    for (source, admission, replay_validator, prelude, completion) in [
+        (
+            include_str!("../src/handlers/chat/enroll_device.rs"),
+            "admit_enrollment_operation_only",
+            "validate_enrollment_operation_replay",
+            "prepare_enrollment_bootstrap_prelude",
+            "complete_enrollment_bootstrap_operation",
+        ),
+        (
+            include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
+            "admit_rebind_operation_only",
+            "validate_rebind_operation_replay",
+            "prepare_rebind_bootstrap_prelude",
+            "complete_rebind_bootstrap_operation",
+        ),
+        (
+            include_str!("../src/handlers/chat/replenish_key_packages.rs"),
+            "admit_replenishment_operation_only",
+            "validate_replenishment_operation_replay",
+            "prepare_replenishment_prelude",
+            "complete_replenishment_operation",
+        ),
+    ] {
+        assert!(
+            source.contains(admission),
+            "missing operation-only admission: {admission}"
+        );
+        assert!(
+            source.contains("arbitrate_operation_only"),
+            "missing opaque operation arbitration"
+        );
+        assert!(
+            source.contains(replay_validator),
+            "missing endpoint replay validation: {replay_validator}"
+        );
+        assert!(
+            source.contains(prelude),
+            "missing locked prelude: {prelude}"
+        );
+        assert!(
+            source.contains("into_completion_guard"),
+            "completion guard was not consumed"
+        );
+        assert!(
+            source.contains(completion),
+            "missing consuming completion: {completion}"
+        );
+        for legacy in [
+            "arbitrate_business_idempotency",
+            "recheck_business_authority",
+            "record_completed_idempotency",
+            "prepare_enrollment_business",
+            "prepare_rebind_business",
+            "persist_enrollment_and_completion",
+            "persist_rebind_and_completion",
+        ] {
+            assert!(
+                !source.contains(legacy),
+                "legacy receipt helper remains in an active handler: {legacy}"
+            );
+        }
+    }
+}
+
+// =============================================================================
 // Tier 1 — cutover gate, revokeDevice stub, DPoP extraction (no database)
 // =============================================================================
 
@@ -781,16 +855,21 @@ fn jwt_header() -> Value {
 /// A signed-body procedure request authenticated by the enrolled device's own
 /// (unchanged) DPoP key.
 fn signed_request(scenario: &EnrollScenario, nsid: &str, signed_wrapper: &[u8]) -> Request<Body> {
+    signed_request_with_token_jkt(scenario, nsid, signed_wrapper, &scenario.proof_jkt)
+}
+
+/// Test-only variant used by replay-drift coverage to prove the Nest-token JKT
+/// remains bound to the DPoP key before any replay response can be released.
+fn signed_request_with_token_jkt(
+    scenario: &EnrollScenario,
+    nsid: &str,
+    signed_wrapper: &[u8],
+    token_jkt: &str,
+) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
         jwt_header(),
-        ordinary_claims(
-            &scenario.did,
-            scenario.device_id,
-            &scenario.proof_jkt,
-            nsid,
-            now,
-        ),
+        ordinary_claims(&scenario.did, scenario.device_id, token_jkt, nsid, now),
         &nest_signing_key(),
     );
     let proof = dpop_proof(
@@ -1150,4 +1229,187 @@ fn jacquard_created_at(view: &repository::device_directory::DeviceDirectoryView)
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+// =============================================================================
+// Task 7 — failure atomicity and replay-drift gate (dedicated database only)
+// =============================================================================
+
+/// The Task 7 handlers must reject replay when its authenticated device binding,
+/// Nest-token binding, or immutable operation claim no longer matches. Every
+/// branch uses a legal operation sequence; this fixture never hand-edits an
+/// immutable claim or device/key-package state.
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat gate database"]
+async fn task7_replay_rejects_registered_jkt_token_and_claim_mismatch() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+
+    // A successful legal rebind changes the registered JKT and generation. An
+    // old replenishment retry signed by the prior DPoP key cannot release bytes.
+    let scenario = enroll_fresh_device(&pool, 2).await;
+    let idempotency_key = uuid::Uuid::new_v4().to_string();
+    let wrapper = replenishment_wrapper_keyed(&scenario, 1, &idempotency_key);
+    let nsid = "blue.catbird.chat.replenishKeyPackages";
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        signed_request(&scenario, nsid, &wrapper),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "initial replenish failed: {body}");
+    let new_proof = random_p256();
+    let (rebind_status, rebind_body) = send(
+        router_with(pool.clone(), true),
+        rebind_request(&scenario, &new_proof),
+    )
+    .await;
+    assert_eq!(
+        rebind_status,
+        StatusCode::OK,
+        "legal rebind failed: {rebind_body}"
+    );
+    let (status, _) = send(
+        router_with(pool.clone(), true),
+        signed_request(&scenario, nsid, &wrapper),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "drifted JKT must not replay");
+
+    // A fresh scenario isolates the Nest-token `cnf.jkt` mismatch from the
+    // registered-device drift above.
+    let token_scenario = enroll_fresh_device(&pool, 2).await;
+    let token_wrapper = replenishment_wrapper(&token_scenario, 1);
+    let (status, _) = send(
+        router_with(pool.clone(), true),
+        signed_request_with_token_jkt(
+            &token_scenario,
+            nsid,
+            &token_wrapper,
+            "task7-token-jkt-drift",
+        ),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "drifted token JKT must not replay");
+
+    // The immutable claim is exercised honestly: a distinct signed body with
+    // the same operation ID conflicts rather than being admitted as a replay.
+    let claim_scenario = enroll_fresh_device(&pool, 2).await;
+    let claim_key = uuid::Uuid::new_v4().to_string();
+    let first = replenishment_wrapper_keyed(&claim_scenario, 1, &claim_key);
+    let second = replenishment_wrapper_keyed(&claim_scenario, 2, &claim_key);
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        signed_request(&claim_scenario, nsid, &first),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "claim fixture first write failed: {body}"
+    );
+    let (status, _) = send(
+        router_with(pool.clone(), true),
+        signed_request(&claim_scenario, nsid, &second),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "claim mismatch must not replay");
+}
+
+/// SQL fail triggers make the real HTTP handler abort at exact durable
+/// boundaries. Every failed request must leave neither its effect graph nor its
+/// operation completion graph committed. These are deliberately ignored: they
+/// create and remove trigger functions in the dedicated owner-controlled DB.
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat gate database"]
+async fn task7_injected_claim_effect_and_completion_failures_rollback_the_whole_graph() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+
+    for (phase, table, function, trigger) in [
+        (
+            "claim",
+            "chat.operation_claims",
+            "task7_fail_claim_write",
+            "task7_fail_claim_write_trigger",
+        ),
+        (
+            "effects",
+            "chat.key_packages",
+            "task7_fail_effect_write",
+            "task7_fail_effect_write_trigger",
+        ),
+        (
+            "completion",
+            "chat.idempotency_records",
+            "task7_fail_completion_write",
+            "task7_fail_completion_write_trigger",
+        ),
+    ] {
+        let scenario = EnrollScenario::build(1);
+        install_task7_failure_trigger(&pool, table, function, trigger).await;
+        let (status, body) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "{phase} injection unexpectedly succeeded: {body}"
+        );
+        remove_task7_failure_trigger(&pool, table, function, trigger).await;
+
+        for relation in [
+            "chat.principals",
+            "chat.devices",
+            "chat.device_keys",
+            "chat.key_packages",
+            "chat.operation_claims",
+            "chat.idempotency_records",
+        ] {
+            let count = task7_graph_row_count(&pool, relation, &scenario.did).await;
+            assert_eq!(count, 0, "{phase} failure left partial {relation} graph");
+        }
+    }
+}
+
+async fn task7_graph_row_count(pool: &DbPool, relation: &str, did: &str) -> i64 {
+    let statement = match relation {
+        "chat.principals" => "SELECT count(*) FROM chat.principals WHERE user_did = $1",
+        "chat.devices" => "SELECT count(*) FROM chat.devices WHERE user_did = $1",
+        "chat.device_keys" => "SELECT count(*) FROM chat.device_keys WHERE user_did = $1",
+        "chat.key_packages" => "SELECT count(*) FROM chat.key_packages WHERE owner_did = $1",
+        "chat.operation_claims" => {
+            "SELECT count(*) FROM chat.operation_claims WHERE principal_did = $1"
+        }
+        "chat.idempotency_records" => {
+            "SELECT count(*) FROM chat.idempotency_records WHERE principal_did = $1"
+        }
+        _ => panic!("unknown Task 7 graph relation: {relation}"),
+    };
+    sqlx::query_scalar(statement)
+        .bind(did)
+        .fetch_one(pool)
+        .await
+        .expect("count durable graph")
+}
+
+async fn install_task7_failure_trigger(pool: &DbPool, table: &str, function: &str, trigger: &str) {
+    sqlx::query(&format!(
+        "CREATE OR REPLACE FUNCTION chat.{function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'task7 injected failure'; END; $$"
+    ))
+    .execute(pool)
+    .await
+    .expect("create Task 7 fail function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION chat.{function}()"
+    ))
+    .execute(pool)
+    .await
+    .expect("create Task 7 fail trigger");
+}
+
+async fn remove_task7_failure_trigger(pool: &DbPool, table: &str, function: &str, trigger: &str) {
+    sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger} ON {table}"))
+        .execute(pool)
+        .await
+        .expect("drop Task 7 fail trigger");
+    sqlx::query(&format!("DROP FUNCTION IF EXISTS chat.{function}()"))
+        .execute(pool)
+        .await
+        .expect("drop Task 7 fail function");
 }

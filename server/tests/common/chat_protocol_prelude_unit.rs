@@ -1,10 +1,10 @@
 use super::{
-    auth, bootstrap_completion_digest, canonical_operation_lock_key,
+    auth, bootstrap_completion_digest, canonical_operation_lock_key, completion_authority_digest,
     completion_digest_from_prewrite_snapshot, BootstrapCompletionGuard,
     BootstrapCompletionJktShape, CanonicalDeviceIdentity, CanonicalLockScope, OperationArbitration,
     OperationClaimGuard, RecoveryOperationEndpoint, RecoveryPreludeAggregatePlanBinding,
     RecoveryPreludePersistenceMode, RecoveryPreludePlanBinding, RecoveryPreludePlanKind,
-    RecoveryPreludePrewriteWitness, ReplayCandidate,
+    RecoveryPreludePrewriteWitness, ReplayCandidate, RepositoryAuthorityClass,
 };
 use super::{OperationClaimBinding, OperationClaimRow};
 use crate::chat_protocol::{
@@ -809,6 +809,114 @@ fn rebind_completion_guard_rejects_old_jkt_generation_key_and_signature_drift() 
             Some(generation),
             Some(&key_digest),
         ));
+    }
+}
+
+#[test]
+fn replenishment_operation_completion_digest_binds_existing_device_receipt_dimensions() {
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap(),
+        "did:plc:existing-device",
+        "blue.catbird.chat.replenishKeyPackages",
+        "keyPackageReplenishment",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        instant,
+    );
+    let scope_digest = [3u8; 32];
+    let baseline = completion_authority_digest(
+        "existing-device-tx",
+        Uuid::from_u128(12),
+        RepositoryAuthorityClass::ExistingDevice,
+        "did:plc:existing-device",
+        Uuid::from_u128(13),
+        Some("locked-current-jkt"),
+        Some(41),
+        Some("locked-key-id"),
+        Some(&[4u8; 32]),
+        instant,
+        &binding,
+        &scope_digest,
+    );
+    for (jkt, generation, key_id, key_digest, claim, post_state) in [
+        (
+            "drifted-jkt",
+            41,
+            "locked-key-id",
+            [4u8; 32],
+            binding.clone(),
+            scope_digest,
+        ),
+        (
+            "locked-current-jkt",
+            42,
+            "locked-key-id",
+            [4u8; 32],
+            binding.clone(),
+            scope_digest,
+        ),
+        (
+            "locked-current-jkt",
+            41,
+            "drifted-key-id",
+            [4u8; 32],
+            binding.clone(),
+            scope_digest,
+        ),
+        (
+            "locked-current-jkt",
+            41,
+            "locked-key-id",
+            [5u8; 32],
+            binding.clone(),
+            scope_digest,
+        ),
+        (
+            "locked-current-jkt",
+            41,
+            "locked-key-id",
+            [4u8; 32],
+            OperationClaimBinding::for_test(
+                binding.operation_id,
+                &binding.principal_did,
+                &binding.endpoint_nsid,
+                &binding.mutation_kind,
+                binding.request_digest,
+                binding.accepted_request_sha256,
+                [10u8; 64],
+                instant,
+            ),
+            scope_digest,
+        ),
+        (
+            "locked-current-jkt",
+            41,
+            "locked-key-id",
+            [4u8; 32],
+            binding.clone(),
+            [6u8; 32],
+        ),
+    ] {
+        assert_ne!(
+            baseline,
+            completion_authority_digest(
+                "existing-device-tx",
+                Uuid::from_u128(12),
+                RepositoryAuthorityClass::ExistingDevice,
+                "did:plc:existing-device",
+                Uuid::from_u128(13),
+                Some(jkt),
+                Some(generation),
+                Some(key_id),
+                Some(&key_digest),
+                instant,
+                &claim,
+                &post_state,
+            ),
+            "existing-device operation completion must reject receipt/claim/post-state drift"
+        );
     }
 }
 

@@ -47,6 +47,8 @@ pub(crate) enum KeyPackageRepositoryError {
     OwnerKeyMissing,
     #[error("clean-chat key-package owner device is revoked")]
     OwnerRevoked,
+    #[error("clean-chat key-package publication authority belongs to another transaction")]
+    ForeignTransaction,
     #[error("clean-chat key-package database error: {0}")]
     Database(#[from] sqlx::Error),
 }

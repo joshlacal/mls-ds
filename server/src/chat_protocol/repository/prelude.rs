@@ -11,15 +11,17 @@ use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[cfg(test)]
-use super::super::transcript::VerifiedMutationProjection;
 use super::{
     super::{
         dpop::VerifiedChatDeviceRequest,
-        transcript::{SignedMutationKind, VerifiedSignedMutation},
-        validation::BareDid,
+        transcript::{
+            DeviceEnrollmentProjection, KeyPackageReplenishmentProjection, SignedMutationKind,
+            VerifiedMutationProjection, VerifiedSignedMutation,
+        },
+        validation::{basic_credential_identity, BareDid},
     },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
+    key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
 #[cfg(not(test))]
 use super::{recovery, reset, revocation, submit_transition, welcome_terminal};
@@ -688,6 +690,15 @@ pub(crate) struct RebindBootstrapEffectAuthority<'a> {
     scope: &'a auth::RebindOldStateLockedBootstrapScope,
 }
 
+/// Borrowed endpoint capability that keeps a replenishment's verified request
+/// and locked existing-device scope paired while its packages are validated and
+/// written. It deliberately exposes only the one signed-body projection and
+/// repository facts needed by this endpoint.
+pub(crate) struct ReplenishmentKeyPackageAuthority<'a> {
+    authority: &'a VerifiedChatDeviceRequest,
+    scope: &'a ScopeBoundBusinessAuthority,
+}
+
 impl PreparedEnrollmentBootstrapPrelude {
     pub(crate) fn effect_authority(&self) -> EnrollmentBootstrapEffectAuthority<'_> {
         EnrollmentBootstrapEffectAuthority {
@@ -696,28 +707,36 @@ impl PreparedEnrollmentBootstrapPrelude {
         }
     }
 
-    pub(crate) fn into_completion_guard(self) -> BootstrapCompletionGuard {
-        let current = self.scope.new_jkt().to_owned();
+    pub(crate) fn into_completion_guard(self) -> EnrollmentBootstrapCompletion {
+        let PreparedEnrollmentBootstrapPrelude {
+            authority,
+            scope,
+            operation,
+        } = self;
+        let current = scope.new_jkt().to_owned();
         let authority_digest = bootstrap_completion_digest(
-            &self.operation.transaction_id,
-            &self.operation.binding,
-            self.scope.receipt_id(),
-            self.scope.scope_digest(),
-            self.scope.trusted_instant(),
-            self.scope.subject(),
-            self.scope.device_id(),
+            &operation.transaction_id,
+            &operation.binding,
+            scope.receipt_id(),
+            scope.scope_digest(),
+            scope.trusted_instant(),
+            scope.subject(),
+            scope.device_id(),
             &current,
             None,
             None,
             None,
             None,
         );
-        BootstrapCompletionGuard {
-            operation: self.operation,
-            scope_receipt_id: self.scope.receipt_id(),
-            authority_digest,
-            scope_digest: *self.scope.scope_digest(),
-            jkt_shape: BootstrapCompletionJktShape::Enrollment { current },
+        EnrollmentBootstrapCompletion {
+            guard: BootstrapCompletionGuard {
+                operation,
+                scope_receipt_id: scope.receipt_id(),
+                authority_digest,
+                scope_digest: *scope.scope_digest(),
+                jkt_shape: BootstrapCompletionJktShape::Enrollment { current },
+            },
+            authority,
         }
     }
 }
@@ -730,120 +749,145 @@ impl PreparedRebindBootstrapPrelude {
         }
     }
 
-    pub(crate) fn into_completion_guard(self) -> BootstrapCompletionGuard {
-        let historical = self.scope.old_jkt().to_owned();
-        let current = self.scope.new_jkt().to_owned();
-        let key_id = self.scope.key_id().to_owned();
-        let auth_generation = self.scope.old_auth_generation();
-        let signing_key_sha256: [u8; 32] = Sha256::digest(self.scope.signing_public_key()).into();
+    pub(crate) fn into_completion_guard(self) -> RebindBootstrapCompletion {
+        let PreparedRebindBootstrapPrelude {
+            authority,
+            scope,
+            operation,
+        } = self;
+        let historical = scope.old_jkt().to_owned();
+        let current = scope.new_jkt().to_owned();
+        let key_id = scope.key_id().to_owned();
+        let auth_generation = scope.old_auth_generation();
+        let signing_key_sha256: [u8; 32] = Sha256::digest(scope.signing_public_key()).into();
         let authority_digest = bootstrap_completion_digest(
-            &self.operation.transaction_id,
-            &self.operation.binding,
-            self.scope.receipt_id(),
-            self.scope.scope_digest(),
-            self.scope.trusted_instant(),
-            self.scope.subject(),
-            self.scope.device_id(),
+            &operation.transaction_id,
+            &operation.binding,
+            scope.receipt_id(),
+            scope.scope_digest(),
+            scope.trusted_instant(),
+            scope.subject(),
+            scope.device_id(),
             &current,
             Some(&historical),
             Some(&key_id),
             Some(auth_generation),
             Some(&signing_key_sha256),
         );
-        BootstrapCompletionGuard {
-            operation: self.operation,
-            scope_receipt_id: self.scope.receipt_id(),
-            authority_digest,
-            scope_digest: *self.scope.scope_digest(),
-            jkt_shape: BootstrapCompletionJktShape::Rebind {
-                historical,
-                current,
+        RebindBootstrapCompletion {
+            guard: BootstrapCompletionGuard {
+                operation,
+                scope_receipt_id: scope.receipt_id(),
+                authority_digest,
+                scope_digest: *scope.scope_digest(),
+                jkt_shape: BootstrapCompletionJktShape::Rebind {
+                    historical,
+                    current,
+                },
             },
+            authority,
         }
     }
 }
 
 impl PreparedReplenishmentPrelude {
-    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest {
-        &self.authority
-    }
-    pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
-        self.inner.scope_authority()
+    pub(crate) fn key_package_authority(&self) -> ReplenishmentKeyPackageAuthority<'_> {
+        ReplenishmentKeyPackageAuthority {
+            authority: &self.authority,
+            scope: self.inner.scope_authority(),
+        }
     }
 
-    pub(crate) fn into_completion_guard(
-        self,
-    ) -> (BootstrapCompletionGuard, ScopeBoundBusinessAuthority) {
-        let (scope, completion) = self.inner.into_execution_parts();
-        let authority_digest = bootstrap_completion_digest(
-            &completion.operation.transaction_id,
-            &completion.operation.binding,
-            completion.scope_receipt_id,
-            &completion.scope_digest,
-            scope.trusted_instant(),
-            scope.actor_did(),
-            scope.actor_device_id(),
-            scope.actor_dpop_jkt().unwrap_or_default(),
-            None,
-            None,
-            None,
-            None,
-        );
-        (
-            BootstrapCompletionGuard {
-                operation: completion.operation,
-                scope_receipt_id: completion.scope_receipt_id,
-                authority_digest,
-                scope_digest: completion.scope_digest,
-                jkt_shape: BootstrapCompletionJktShape::Replenishment,
-            },
+    pub(crate) fn into_completion_guard(self) -> ReplenishmentCompletion {
+        let PreparedReplenishmentPrelude { inner, authority } = self;
+        let (scope, completion) = inner.into_execution_parts();
+        ReplenishmentCompletion {
+            completion,
             scope,
-        )
+            authority,
+        }
     }
 }
 
 impl EnrollmentBootstrapEffectAuthority<'_> {
-    pub(crate) fn request(&self) -> &VerifiedChatDeviceRequest {
-        self.authority
-    }
-    pub(crate) fn subject(&self) -> &str {
-        self.scope.subject()
+    pub(crate) fn enrollment_projection(
+        &self,
+    ) -> Result<DeviceEnrollmentProjection<'_>, PreludeError> {
+        let mutation = self
+            .authority
+            .mutation()
+            .ok_or(PreludeError::UnsupportedAuthority)?;
+        let VerifiedMutationProjection::DeviceEnrollment(projection) = mutation.projection() else {
+            return Err(PreludeError::ClaimIntegrity);
+        };
+        Ok(projection)
     }
     pub(crate) fn device_id(&self) -> Uuid {
         self.scope.device_id()
     }
     pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
         self.scope.trusted_instant()
+    }
+    pub(crate) fn current_jkt(&self) -> &str {
+        self.authority.dpop_jkt().as_str()
+    }
+    pub(crate) fn basic_credential_identity(&self) -> Vec<u8> {
+        basic_credential_identity(self.authority.subject(), self.authority.device_id())
+    }
+    pub(crate) fn key_id(&self) -> Result<&str, PreludeError> {
+        Ok(self
+            .authority
+            .mutation()
+            .ok_or(PreludeError::UnsupportedAuthority)?
+            .key_id()
+            .as_str())
     }
 }
 
 impl RebindBootstrapEffectAuthority<'_> {
-    pub(crate) fn request(&self) -> &VerifiedChatDeviceRequest {
-        self.authority
-    }
     pub(crate) fn subject(&self) -> &str {
         self.scope.subject()
     }
     pub(crate) fn device_id(&self) -> Uuid {
         self.scope.device_id()
     }
-    pub(crate) fn old_jkt(&self) -> &str {
-        self.scope.old_jkt()
+}
+
+impl ReplenishmentKeyPackageAuthority<'_> {
+    pub(crate) fn replenishment_projection(
+        &self,
+    ) -> Result<KeyPackageReplenishmentProjection<'_>, PreludeError> {
+        let mutation = self
+            .authority
+            .mutation()
+            .ok_or(PreludeError::UnsupportedAuthority)?;
+        let VerifiedMutationProjection::KeyPackageReplenishment(projection) = mutation.projection()
+        else {
+            return Err(PreludeError::ClaimIntegrity);
+        };
+        Ok(projection)
     }
-    pub(crate) fn new_jkt(&self) -> &str {
-        self.scope.new_jkt()
+
+    pub(crate) fn subject(&self) -> &str {
+        self.scope.actor_did()
     }
-    pub(crate) fn old_auth_generation(&self) -> i64 {
-        self.scope.old_auth_generation()
+
+    pub(crate) fn device_id(&self) -> Uuid {
+        self.scope.actor_device_id()
     }
-    pub(crate) fn key_id(&self) -> &str {
-        self.scope.key_id()
+
+    pub(crate) fn signing_public_key(&self) -> Result<&[u8], PreludeError> {
+        self.scope
+            .actor_signing_public_key()
+            .ok_or(PreludeError::MissingDeviceKey)
     }
-    pub(crate) fn signing_public_key(&self) -> &[u8] {
-        self.scope.signing_public_key()
-    }
+
     pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
         self.scope.trusted_instant()
+    }
+
+    pub(crate) fn basic_credential_identity(&self) -> Vec<u8> {
+        basic_credential_identity(self.authority.subject(), self.authority.device_id())
     }
 }
 
@@ -1197,9 +1241,9 @@ impl fmt::Debug for RecoveryPreludePrewriteWitness {
     }
 }
 
-/// Single-use opaque completion capability for enrollment, rebind, and
-/// replenishment bootstrap operations. The domain-separated digest binds
-/// the exact operation claim, locked scope receipt, and JKT shape.
+/// Single-use opaque completion capability for enrollment and rebind bootstrap
+/// operations. The domain-separated digest binds the exact operation claim,
+/// locked scope receipt, and JKT shape.
 #[must_use]
 pub(crate) struct BootstrapCompletionGuard {
     operation: OperationClaimGuard,
@@ -1207,6 +1251,33 @@ pub(crate) struct BootstrapCompletionGuard {
     authority_digest: [u8; 32],
     scope_digest: [u8; 32],
     jkt_shape: BootstrapCompletionJktShape,
+}
+
+/// Endpoint-owned completion authority for enrollment. Keeping the verified
+/// request inside this consuming wrapper makes it impossible for a handler to
+/// pair a valid completion guard with a caller-selected request.
+#[must_use]
+pub(crate) struct EnrollmentBootstrapCompletion {
+    guard: BootstrapCompletionGuard,
+    authority: VerifiedChatDeviceRequest,
+}
+
+/// Endpoint-owned completion authority for rebind. The old-state JKT shape is
+/// sealed in `guard`; the verified request cannot escape separately.
+#[must_use]
+pub(crate) struct RebindBootstrapCompletion {
+    guard: BootstrapCompletionGuard,
+    authority: VerifiedChatDeviceRequest,
+}
+
+/// Endpoint-owned completion authority for replenishment. It preserves the
+/// `OperationCompletionGuard` produced from the locked existing-device scope;
+/// replenishment must never reinterpret that guard as a bootstrap digest.
+#[must_use]
+pub(crate) struct ReplenishmentCompletion {
+    completion: OperationCompletionGuard,
+    scope: ScopeBoundBusinessAuthority,
+    authority: VerifiedChatDeviceRequest,
 }
 
 #[cfg(test)]
@@ -1249,7 +1320,6 @@ impl BootstrapCompletionGuard {
                 historical,
                 current,
             } => historical_jkt == Some(historical.as_str()) && current == current_jkt,
-            BootstrapCompletionJktShape::Replenishment => historical_jkt.is_none(),
         };
         shape_matches
             && bootstrap_completion_digest(
@@ -1273,7 +1343,6 @@ impl BootstrapCompletionGuard {
 pub(crate) enum BootstrapCompletionJktShape {
     Enrollment { current: String },
     Rebind { historical: String, current: String },
-    Replenishment,
 }
 
 impl ScopeBoundBusinessAuthority {
@@ -1906,6 +1975,33 @@ pub(crate) async fn arbitrate_operation_only(
     }))
 }
 
+/// Endpoint-specific admission wrapper for enrollment. The raw verified
+/// authority remains internal to repository composition.
+pub(crate) async fn arbitrate_enrollment_operation_only(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: &auth::EnrollmentOperationAdmission,
+) -> Result<OperationOnlyArbitration, PreludeError> {
+    arbitrate_operation_only(transaction, admission.authority()).await
+}
+
+/// Endpoint-specific admission wrapper for rebind. The raw verified authority
+/// remains internal to repository composition.
+pub(crate) async fn arbitrate_rebind_operation_only(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: &auth::RebindOperationAdmission,
+) -> Result<OperationOnlyArbitration, PreludeError> {
+    arbitrate_operation_only(transaction, admission.authority()).await
+}
+
+/// Endpoint-specific admission wrapper for replenishment. The raw verified
+/// authority remains internal to repository composition.
+pub(crate) async fn arbitrate_replenishment_operation_only(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: &auth::ReplenishmentOperationAdmission,
+) -> Result<OperationOnlyArbitration, PreludeError> {
+    arbitrate_operation_only(transaction, admission.authority()).await
+}
+
 pub(crate) async fn prepare_signed_operation(
     transaction: &mut Transaction<'_, Postgres>,
     admission: auth::SignedOperationAdmission,
@@ -2013,6 +2109,108 @@ pub(crate) async fn prepare_replenishment_prelude(
     let authority = admission.into_authority();
     let inner = prepare_actor_prelude(transaction, &authority, reservation).await?;
     Ok(PreparedReplenishmentPrelude { inner, authority })
+}
+
+/// Persist only enrollment's device-registration effects through the borrowed
+/// absence-scope authority. Receipt completion is deliberately a separate,
+/// later consuming step.
+pub(crate) async fn persist_enrollment_bootstrap_effects(
+    transaction: &mut Transaction<'_, Postgres>,
+    effect: &EnrollmentBootstrapEffectAuthority<'_>,
+) -> Result<(), PreludeError> {
+    auth::persist_enrollment_bootstrap_effects(transaction, effect.authority, effect.scope)
+        .await
+        .map_err(PreludeError::Authorization)
+}
+
+/// Persist only rebind's exact old-state CAS through the borrowed old-state
+/// authority. Receipt completion is deliberately a separate, later consuming
+/// step.
+pub(crate) async fn persist_rebind_bootstrap_effects(
+    transaction: &mut Transaction<'_, Postgres>,
+    effect: &RebindBootstrapEffectAuthority<'_>,
+) -> Result<(), PreludeError> {
+    auth::persist_rebind_bootstrap_effects(transaction, effect.authority, effect.scope)
+        .await
+        .map_err(PreludeError::Authorization)
+}
+
+/// Publish enrollment packages through the same absence-scope capability that
+/// authorized the preceding device/key effects. The handler supplies only
+/// already-validated package columns; owner identity, generation, and time are
+/// derived from the sealed endpoint authority here.
+pub(crate) async fn publish_enrollment_key_packages(
+    transaction: &mut Transaction<'_, Postgres>,
+    effect: &EnrollmentBootstrapEffectAuthority<'_>,
+    packages: &[NewKeyPackage<'_>],
+) -> Result<u64, key_packages::KeyPackageRepositoryError> {
+    ensure_effect_transaction(transaction, effect.scope.transaction_id()).await?;
+    let key_id = effect
+        .authority
+        .mutation()
+        .ok_or(key_packages::KeyPackageRepositoryError::OwnerKeyMissing)?
+        .key_id()
+        .as_str();
+    let owner = KeyPackageOwner {
+        user_did: effect.scope.subject(),
+        device_id: effect.scope.device_id(),
+        key_id,
+        auth_generation: 1,
+    };
+    key_packages::publish_key_packages(
+        transaction,
+        &owner,
+        packages,
+        effect.scope.trusted_instant(),
+    )
+    .await
+}
+
+/// Publish replenishment packages through the still-borrowed existing-device
+/// scope. This keeps the owner JKT/key/generation receipt binding alive until
+/// the generic writer has consumed the exact locked owner coordinates.
+pub(crate) async fn publish_replenishment_key_packages(
+    transaction: &mut Transaction<'_, Postgres>,
+    effect: &ReplenishmentKeyPackageAuthority<'_>,
+    packages: &[NewKeyPackage<'_>],
+) -> Result<u64, key_packages::KeyPackageRepositoryError> {
+    ensure_effect_transaction(transaction, effect.scope.transaction_id()).await?;
+    let owner = KeyPackageOwner {
+        user_did: effect.scope.actor_did(),
+        device_id: effect.scope.actor_device_id(),
+        key_id: effect
+            .scope
+            .actor_key_id()
+            .ok_or(key_packages::KeyPackageRepositoryError::OwnerKeyMissing)?,
+        auth_generation: effect
+            .scope
+            .actor_auth_generation()
+            .ok_or(key_packages::KeyPackageRepositoryError::OwnerKeyMissing)?,
+    };
+    key_packages::publish_key_packages(
+        transaction,
+        &owner,
+        packages,
+        effect.scope.trusted_instant(),
+    )
+    .await
+}
+
+/// Package effects are borrowed from a prepared prelude, not from `Transaction`
+/// itself. Re-establish the live SQL transaction identity before deriving the
+/// owner or reaching the generic writer, so that capability cannot be carried
+/// into a second transaction and committed apart from its operation claim.
+async fn ensure_effect_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    expected_transaction_id: &str,
+) -> Result<(), key_packages::KeyPackageRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != expected_transaction_id {
+        return Err(key_packages::KeyPackageRepositoryError::ForeignTransaction);
+    }
+    Ok(())
 }
 
 async fn validate_operation_only_replay(
@@ -2373,20 +2571,20 @@ pub(crate) async fn complete_operation(
 
 pub(crate) async fn complete_enrollment_bootstrap_operation(
     transaction: &mut Transaction<'_, Postgres>,
-    guard: BootstrapCompletionGuard,
-    authority: &VerifiedChatDeviceRequest,
+    completion: EnrollmentBootstrapCompletion,
     completed_status: i32,
     response_bytes: &[u8],
     event_position: Option<i64>,
 ) -> Result<(), PreludeError> {
-    validate_bootstrap_completion(transaction, &guard, authority).await?;
+    let EnrollmentBootstrapCompletion { guard, authority } = completion;
+    validate_bootstrap_completion(transaction, &guard, &authority).await?;
     let current = match &guard.jkt_shape {
         BootstrapCompletionJktShape::Enrollment { current } => current.clone(),
         _ => return Err(PreludeError::ClaimIntegrity),
     };
     insert_operation_completion(
         transaction,
-        authority,
+        &authority,
         guard.operation.binding,
         completed_status,
         response_bytes,
@@ -2399,13 +2597,13 @@ pub(crate) async fn complete_enrollment_bootstrap_operation(
 
 pub(crate) async fn complete_rebind_bootstrap_operation(
     transaction: &mut Transaction<'_, Postgres>,
-    guard: BootstrapCompletionGuard,
-    authority: &VerifiedChatDeviceRequest,
+    completion: RebindBootstrapCompletion,
     completed_status: i32,
     response_bytes: &[u8],
     event_position: Option<i64>,
 ) -> Result<(), PreludeError> {
-    validate_bootstrap_completion(transaction, &guard, authority).await?;
+    let RebindBootstrapCompletion { guard, authority } = completion;
+    validate_bootstrap_completion(transaction, &guard, &authority).await?;
     let (historical, current) = match &guard.jkt_shape {
         BootstrapCompletionJktShape::Rebind {
             historical,
@@ -2415,7 +2613,7 @@ pub(crate) async fn complete_rebind_bootstrap_operation(
     };
     insert_operation_completion(
         transaction,
-        authority,
+        &authority,
         guard.operation.binding,
         completed_status,
         response_bytes,
@@ -2428,26 +2626,19 @@ pub(crate) async fn complete_rebind_bootstrap_operation(
 
 pub(crate) async fn complete_replenishment_operation(
     transaction: &mut Transaction<'_, Postgres>,
-    guard: BootstrapCompletionGuard,
-    scope: ScopeBoundBusinessAuthority,
-    authority: &VerifiedChatDeviceRequest,
+    completion: ReplenishmentCompletion,
     completed_status: i32,
     response_bytes: &[u8],
     event_position: Option<i64>,
 ) -> Result<(), PreludeError> {
-    validate_bootstrap_completion(transaction, &guard, authority).await?;
-    if !matches!(guard.jkt_shape, BootstrapCompletionJktShape::Replenishment) {
-        return Err(PreludeError::ClaimIntegrity);
-    }
-    let completion = OperationCompletionGuard {
-        operation: guard.operation,
-        scope_receipt_id: guard.scope_receipt_id,
-        authority_digest: guard.authority_digest,
-        scope_digest: guard.scope_digest,
-    };
+    let ReplenishmentCompletion {
+        completion,
+        scope,
+        authority,
+    } = completion;
     complete_operation(
         transaction,
-        authority,
+        &authority,
         scope,
         completion,
         completed_status,
@@ -2477,7 +2668,6 @@ async fn validate_bootstrap_completion(
             historical,
             current,
         } => (Some(historical.as_str()), Some(current.as_str())),
-        BootstrapCompletionJktShape::Replenishment => (None, None),
     };
     let subject = authority.subject().as_str();
     let device_id = Uuid::from_bytes(*authority.device_id().as_bytes());

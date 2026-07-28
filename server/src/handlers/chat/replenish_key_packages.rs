@@ -20,15 +20,13 @@ use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 use jacquard_common::DefaultStr;
 
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
-use crate::chat_protocol::repository::auth::{self, BusinessIdempotencyOutcome};
 use crate::chat_protocol::repository::device_directory::read_device_view;
-use crate::chat_protocol::repository::key_packages::{self, KeyPackageOwner, NewKeyPackage};
-use crate::chat_protocol::transcript::VerifiedMutationProjection;
-use crate::chat_protocol::validation::basic_credential_identity;
+use crate::chat_protocol::repository::key_packages::NewKeyPackage;
+use crate::chat_protocol::repository::prelude::{self, OperationOnlyArbitration};
 use crate::chat_protocol::wire::{self, KeyPackageValidationPolicy};
 use crate::storage::DbPool;
 
-use super::context::{self, Admission};
+use super::context;
 use super::device_views::{
     device_view_from_directory, directory_failure, extract_key_packages, key_package_failure,
     RawKeyPackage,
@@ -57,88 +55,76 @@ async fn replenish(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let authority = match context::admit_signed(pool, runtime, ENDPOINT, headers, body).await? {
-        Admission::Replay(response) => return Ok(response),
-        Admission::Execute(authority) => authority,
-    };
-
-    // Key packages come from the certified canonical projection (correct bytes
-    // encoding), not the generated DTO.
-    let mutation = authority
-        .mutation()
-        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let VerifiedMutationProjection::KeyPackageReplenishment(projection) = mutation.projection()
-    else {
-        return Err(ChatFailure::invariant(ENDPOINT));
-    };
-    let (raw_packages, _body_signature_key) = extract_key_packages(&projection.body(), ENDPOINT)?;
-
-    let subject = authority.subject().as_str().to_owned();
-    let device_uuid = uuid::Uuid::parse_str(authority.device_id().as_str())
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let expected_credential = basic_credential_identity(authority.subject(), authority.device_id());
-    let now_unix = u64::try_from(authority.trusted_instant().datetime().timestamp())
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let trusted_at = authority.trusted_instant().datetime();
+    let admission =
+        context::admit_replenishment_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
 
     let mut transaction = pool
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    let reservation =
+        match prelude::arbitrate_replenishment_operation_only(&mut transaction, &admission)
+            .await
+            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
+        {
+            OperationOnlyArbitration::Replay(replay) => {
+                let response = prelude::validate_replenishment_operation_replay(
+                    &mut transaction,
+                    admission,
+                    replay,
+                )
+                .await
+                .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                return Ok(context::replay_response(&response));
+            }
+            OperationOnlyArbitration::First(reservation) => reservation,
+        };
 
-    let idempotency = match auth::arbitrate_business_idempotency(&mut transaction, &authority)
+    let prepared = prelude::prepare_replenishment_prelude(&mut transaction, admission, reservation)
         .await
-        .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?
-    {
-        BusinessIdempotencyOutcome::CompletedReplay(response) => {
-            return Ok(context::replay_response(&response));
-        }
-        BusinessIdempotencyOutcome::FirstExecution(guard) => guard,
+        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+
+    let (subject, device_id) = {
+        let effect = prepared.key_package_authority();
+        let projection = effect
+            .replenishment_projection()
+            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        let (raw_packages, _body_signature_key) =
+            extract_key_packages(&projection.body(), ENDPOINT)?;
+        let expected_credential = effect.basic_credential_identity();
+        let now_unix = u64::try_from(effect.trusted_instant().timestamp())
+            .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+        let validated = validate_key_packages(
+            &raw_packages,
+            &expected_credential,
+            effect
+                .signing_public_key()
+                .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?,
+            now_unix,
+        )?;
+        let packages: Vec<NewKeyPackage<'_>> = raw_packages
+            .iter()
+            .zip(validated.iter())
+            .map(|(raw, valid)| NewKeyPackage {
+                key_package_ref: &raw.key_package_ref,
+                wrapper_bytes: &raw.wrapper,
+                init_key: valid.init_key(),
+                not_before_unix: valid.not_before(),
+                not_after_unix: valid.not_after(),
+            })
+            .collect();
+        prelude::publish_replenishment_key_packages(&mut transaction, &effect, &packages)
+            .await
+            .map_err(|error| key_package_failure(ENDPOINT, error))?;
+        (effect.subject().to_owned(), effect.device_id())
     };
-
-    let authority_guard = auth::recheck_business_authority(&mut transaction, &authority)
-        .await
-        .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
-
-    // Continuity: publish against the device's registered signing key + key id.
-    let signing_key = authority_guard
-        .stored_signing_public_key()
-        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
-        .to_vec();
-    let key_id = authority_guard
-        .stored_key_id()
-        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
-        .to_owned();
-    let auth_generation = authority_guard
-        .stored_auth_generation()
-        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-
-    let validated =
-        validate_key_packages(&raw_packages, &expected_credential, &signing_key, now_unix)?;
-    let packages: Vec<NewKeyPackage<'_>> = raw_packages
-        .iter()
-        .zip(validated.iter())
-        .map(|(raw, valid)| NewKeyPackage {
-            key_package_ref: &raw.key_package_ref,
-            wrapper_bytes: &raw.wrapper,
-            init_key: valid.init_key(),
-            not_before_unix: valid.not_before(),
-            not_after_unix: valid.not_after(),
-        })
-        .collect();
-
-    let owner = KeyPackageOwner {
-        user_did: &subject,
-        device_id: device_uuid,
-        key_id: &key_id,
-        auth_generation,
-    };
-    key_packages::publish_key_packages(&mut transaction, &owner, &packages, trusted_at)
-        .await
-        .map_err(|error| key_package_failure(ENDPOINT, error))?;
 
     // Single count source: the post-publish device view.
-    let view = read_device_view(&mut transaction, &subject, device_uuid)
+    let view = read_device_view(&mut transaction, &subject, device_id)
         .await
         .map_err(|error| directory_failure(ENDPOINT, error))?
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
@@ -149,16 +135,15 @@ async fn replenish(
     let response_bytes =
         serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
 
-    auth::record_completed_idempotency(
+    prelude::complete_replenishment_operation(
         &mut transaction,
-        &authority,
-        &idempotency,
+        prepared.into_completion_guard(),
         200,
         &response_bytes,
         None,
     )
     .await
-    .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
+    .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
 
     transaction
         .commit()

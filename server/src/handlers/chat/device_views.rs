@@ -175,6 +175,7 @@ pub(super) fn key_package_failure(
         E::LiveLimitExceeded => C::KeyPackageInventoryLimitReached,
         E::OwnerRevoked => C::DeviceRevoked,
         E::OwnerKeyMissing => C::DeviceNotRegistered,
+        E::ForeignTransaction => return ChatFailure::invariant(endpoint),
     };
     ChatFailure::protocol(endpoint, code)
 }

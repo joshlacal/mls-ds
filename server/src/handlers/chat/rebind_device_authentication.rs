@@ -1,12 +1,11 @@
 //! `blue.catbird.chat.rebindDeviceAuthentication` — rebind-bootstrap DPoP rotation.
 //!
-//! Reads the device view BEFORE persisting the rebind (a rebind rotates only the
-//! DPoP binding + auth generation, never the key packages, so pre == post on
-//! counts / key id / createdAt) and returns a `deviceView` that overrides exactly
-//! the three fields the mutation changes: `dpopJkt` becomes the new proven
-//! thumbprint, `authGeneration` increments by one, and `updatedAt` is the trusted
-//! request instant. A live-DB conformance test asserts the post-rebind
-//! `read_device_view` matches the returned view on counts + key id + createdAt.
+//! Applies the rebind under its locked old-state authority, then reads the
+//! post-CAS device view. A rebind rotates only the DPoP binding + auth generation,
+//! never key packages, so the returned view has unchanged counts / key id /
+//! createdAt and the newly persisted thumbprint, generation, and update time. A
+//! live-DB conformance test asserts the post-rebind `read_device_view` matches
+//! the returned view on counts + key id + createdAt.
 
 use std::sync::Arc;
 
@@ -18,16 +17,14 @@ use axum::{
 };
 
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::deps::smol_str::SmolStr;
 use jacquard_common::DefaultStr;
 
 use crate::chat_protocol::error::ChatEndpoint;
-use crate::chat_protocol::repository::auth::{self, RebindBusinessOutcome};
 use crate::chat_protocol::repository::device_directory::read_device_view;
-use crate::sqlx_jacquard::chrono_to_datetime;
+use crate::chat_protocol::repository::prelude::{self, OperationOnlyArbitration};
 use crate::storage::DbPool;
 
-use super::context::{self, Admission};
+use super::context;
 use super::device_views::{device_view_from_directory, directory_failure};
 use super::errors::ChatFailure;
 use super::runtime::ChatRuntime;
@@ -52,65 +49,68 @@ async fn rebind(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let authority = match context::admit_rebind(pool, runtime, ENDPOINT, headers, body).await? {
-        Admission::Replay(response) => return Ok(response),
-        Admission::Execute(authority) => authority,
-    };
-
-    let subject = authority.subject().as_str().to_owned();
-    let device_uuid = uuid::Uuid::parse_str(authority.device_id().as_str())
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let trusted_at = authority.trusted_instant().datetime();
+    let admission =
+        context::admit_rebind_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
 
     let mut transaction = pool
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-
-    let guard = match auth::prepare_rebind_business(&mut transaction, &authority)
+    let reservation = match prelude::arbitrate_rebind_operation_only(&mut transaction, &admission)
         .await
-        .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?
+        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
     {
-        RebindBusinessOutcome::CompletedReplay(response) => {
+        OperationOnlyArbitration::Replay(replay) => {
+            let response =
+                prelude::validate_rebind_operation_replay(&mut transaction, admission, replay)
+                    .await
+                    .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
             return Ok(context::replay_response(&response));
         }
-        RebindBusinessOutcome::FirstExecution(guard) => guard,
+        OperationOnlyArbitration::First(reservation) => reservation,
     };
 
-    // Pre-persist read: counts / key id / createdAt / signing key / status are all
-    // unchanged by the rebind, so this is the post-state for every field except
-    // the three the rebind rotates below.
-    let view = read_device_view(&mut transaction, &subject, device_uuid)
+    let prepared =
+        prelude::prepare_rebind_bootstrap_prelude(&mut transaction, admission, reservation)
+            .await
+            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+    let (subject, device_id) = {
+        let effect = prepared.effect_authority();
+        let subject = effect.subject().to_owned();
+        let device_id = effect.device_id();
+        prelude::persist_rebind_bootstrap_effects(&mut transaction, &effect)
+            .await
+            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        (subject, device_id)
+    };
+
+    // The exact old-state scope remains locked through the CAS and this one
+    // post-write projection, so the output is the durable terminal state.
+    let view = read_device_view(&mut transaction, &subject, device_id)
         .await
         .map_err(|error| directory_failure(ENDPOINT, error))?
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-
-    let mut device = device_view_from_directory(&view);
-    device.dpop_jkt = SmolStr::from(authority.dpop_jkt().as_str());
-    device.auth_generation = view
-        .auth_generation
-        .checked_add(1)
-        .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    device.updated_at = chrono_to_datetime(trusted_at);
-
     let output =
         chat_dto::rebind_device_authentication::RebindDeviceAuthenticationOutput::<DefaultStr> {
-            device,
+            device: device_view_from_directory(&view),
             extra_data: None,
         };
     let response_bytes =
         serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
 
-    auth::persist_rebind_and_completion(
+    prelude::complete_rebind_bootstrap_operation(
         &mut transaction,
-        &authority,
-        guard,
+        prepared.into_completion_guard(),
         200,
         &response_bytes,
         None,
     )
     .await
-    .map_err(|error| context::auth_repository_failure(ENDPOINT, error))?;
+    .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
 
     transaction
         .commit()
