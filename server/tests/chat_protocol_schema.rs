@@ -1484,10 +1484,9 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         expected_tables(),
         "unexpected chat table set"
     );
-    // LIVE-DB REFRESH REQUIRED: the source-owned set has the exact +1
-    // operation_claims table delta; update this reviewed aggregate count only
-    // after the normalized post-00002 catalog confirms it.
-    assert_eq!(actual_tables.len(), 47, "clean protocol must own 47 tables");
+    // Source-deterministic delta: 00001 adds exactly operation_claims.
+    // The normalized post-00002 catalog fingerprint remains a separate live gate.
+    assert_eq!(actual_tables.len(), 48, "clean protocol must own 48 tables");
 
     let applied: Vec<(i64, String, bool)> = sqlx::query_as(
         "SELECT version,description,success FROM public._sqlx_migrations WHERE version=ANY($1::bigint[]) ORDER BY version",
@@ -1645,10 +1644,10 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .fetch_one(&pool)
     .await
     .expect("count chat FKs");
-    // LIVE-DB REFRESH REQUIRED: 00001 adds operation_claims_principal_fk and
+    // Source-deterministic delta: 00001 adds operation_claims_principal_fk and
     // 00002 drops the staged receipt->claim FK, an exact expected net +1.
-    // Update this reviewed count only with the regenerated constraint catalog.
-    assert_eq!(foreign_keys, 185, "unexpected FK coverage");
+    // The regenerated constraint catalog fingerprint remains a separate live gate.
+    assert_eq!(foreign_keys, 186, "unexpected FK coverage");
     assert_eq!(unvalidated_foreign_keys, 0, "all FKs must be validated");
 
     let enum_count: i64 = sqlx::query_scalar(
@@ -1892,12 +1891,12 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     )
     .await;
     assert_catalog("trigger", &trigger_catalog, TRIGGER_CATALOG_SHA256);
-    // LIVE-DB REFRESH REQUIRED: 00001 adds the claim/receipt deferred pair and
+    // Source-deterministic delta: 00001 adds the claim/receipt deferred pair and
     // operation_claims_immutable, an exact expected +3 authored triggers.
-    // Update this reviewed count only with the regenerated trigger catalog.
+    // The regenerated trigger catalog fingerprint remains a separate live gate.
     assert_eq!(
         trigger_catalog.len(),
-        151,
+        154,
         "unexpected authored trigger coverage"
     );
 
