@@ -22,12 +22,6 @@
 mod common;
 
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -38,9 +32,6 @@ mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/repository/mod.rs"]
-mod repository;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[allow(dead_code)]
@@ -50,6 +41,9 @@ mod validation;
 mod chat_protocol {
     pub mod validation {
         pub use crate::validation::*;
+    }
+    pub mod model {
+        pub(crate) use crate::model::*;
     }
     pub mod transcript {
         pub use crate::transcript::*;
@@ -67,9 +61,9 @@ mod chat_protocol {
             "/src/chat_protocol/public_state.rs"
         ));
     }
-    pub mod dpop {
-        pub use crate::dpop::*;
-    }
+    #[allow(dead_code)]
+    #[path = "../../src/chat_protocol/dpop.rs"]
+    pub mod dpop;
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
     }
@@ -82,14 +76,44 @@ mod chat_protocol {
             pub(crate) struct ExecutionContextHydrationProof;
             pub(crate) struct RevocationBatchHydrationProof;
         }
-        pub mod auth {
-            pub use crate::repository::auth::*;
-        }
-        pub mod prelude {
-            pub use crate::repository::prelude::*;
-        }
+        #[allow(dead_code)]
+        #[path = "../../../src/chat_protocol/repository/auth.rs"]
+        pub mod auth;
+        #[allow(dead_code)]
+        #[path = "../../../src/chat_protocol/repository/prelude.rs"]
+        pub mod prelude;
         pub mod recovery {
-            pub use crate::repository::recovery::*;
+            /// The raw executor harness never mints a production Recovery
+            /// witness. This opaque test-topology stand-in exists only because
+            /// the generic executor accepts `Option<&RecoveryPersistenceWitness>`;
+            /// every raw test passes `None`.
+            pub(crate) struct RecoveryPersistenceWitness {
+                _private: (),
+            }
+
+            /// Opaque authority required by exact Recovery SQL writers. Raw
+            /// executor tests never construct one because they exercise the
+            /// explicit status-CAS compatibility path.
+            #[derive(Debug)]
+            pub(crate) struct RecoverySqlAuthoritySeal {
+                _private: (),
+            }
+
+            impl RecoveryPersistenceWitness {
+                pub(crate) async fn apply_open(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("raw executor tests cannot mint a Recovery witness")
+                }
+
+                pub(crate) async fn apply_terminal(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("raw executor tests cannot mint a Recovery witness")
+                }
+            }
         }
         pub mod relationship {
             #![allow(dead_code)]
@@ -4997,6 +5021,37 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
     let fixture = commit_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let req = commit_replace_recovery_request(&pool, &fixture, 0x71).await;
+    let baseline_statuses: (String, String, String) = sqlx::query_as(
+        r#"SELECT request.status,reservation.status,package.status
+           FROM chat.leaf_recovery_requests request
+           JOIN chat.key_package_reservations reservation
+             ON reservation.recovery_request_id=request.recovery_request_id
+           JOIN chat.key_packages package
+             ON package.key_package_ref=reservation.key_package_ref
+           WHERE request.recovery_request_id=$1"#,
+    )
+    .bind(req.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("baseline Recovery terminal triple");
+    assert_eq!(
+        baseline_statuses,
+        (
+            "open".to_owned(),
+            "active".to_owned(),
+            "reserved".to_owned()
+        )
+    );
+    let baseline_counts: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+             (SELECT count(*) FROM chat.events),
+             (SELECT count(*) FROM chat.outbox)"#,
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("baseline append/event/outbox counts");
 
     // Cancel the open request: received AFTER the request, a DISTINCT digest.
     let cancel_received = ServerTimestamp::from_unix_millis_for_test(
@@ -5093,6 +5148,89 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
         welcome_dispositions: vec![],
     };
 
+    // Preparing and then abandoning the plan is write-free. This is the
+    // raw-executor topology's cancellation-between-prepare-and-apply proof.
+    let abandoned_statuses: (String, String, String) = sqlx::query_as(
+        r#"SELECT request.status,reservation.status,package.status
+           FROM chat.leaf_recovery_requests request
+           JOIN chat.key_package_reservations reservation
+             ON reservation.recovery_request_id=request.recovery_request_id
+           JOIN chat.key_packages package
+             ON package.key_package_ref=reservation.key_package_ref
+           WHERE request.recovery_request_id=$1"#,
+    )
+    .bind(req.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("abandoned-plan Recovery terminal triple");
+    let abandoned_counts: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+             (SELECT count(*) FROM chat.events),
+             (SELECT count(*) FROM chat.outbox)"#,
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("abandoned-plan append/event/outbox counts");
+    assert_eq!(abandoned_statuses, baseline_statuses);
+    assert_eq!(abandoned_counts, baseline_counts);
+
+    // Force a late event uniqueness failure after the raw executor has already
+    // terminalized request + reservation + package. Rolling back the caller-owned
+    // transaction must remove every earlier business write and all event/outbox
+    // residue.
+    let existing_event_id: Uuid =
+        sqlx::query_scalar("SELECT event_id FROM chat.events ORDER BY event_position LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("existing event id for late-write conflict");
+    let mut rollback_ctx = ctx.clone();
+    rollback_ctx.events[0].event_id = existing_event_id;
+    let mut rollback_tx = pool
+        .begin()
+        .await
+        .expect("begin partial-write rollback probe");
+    let late_failure = apply_conversation_persistence_plan_unscoped_for_test(
+        &mut rollback_tx,
+        &plan,
+        &rollback_ctx,
+    )
+    .await;
+    assert!(
+        matches!(late_failure, Err(ExecutorError::Delivery(_))),
+        "duplicate event id must fail after the Recovery terminal writes, got {late_failure:?}"
+    );
+    rollback_tx
+        .rollback()
+        .await
+        .expect("rollback partial Recovery execution");
+    let rolled_back_statuses: (String, String, String) = sqlx::query_as(
+        r#"SELECT request.status,reservation.status,package.status
+           FROM chat.leaf_recovery_requests request
+           JOIN chat.key_package_reservations reservation
+             ON reservation.recovery_request_id=request.recovery_request_id
+           JOIN chat.key_packages package
+             ON package.key_package_ref=reservation.key_package_ref
+           WHERE request.recovery_request_id=$1"#,
+    )
+    .bind(req.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rolled-back Recovery terminal triple");
+    let rolled_back_counts: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+             (SELECT count(*) FROM chat.events),
+             (SELECT count(*) FROM chat.outbox)"#,
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rolled-back append/event/outbox counts");
+    assert_eq!(rolled_back_statuses, baseline_statuses);
+    assert_eq!(rolled_back_counts, baseline_counts);
+
     let mut tx = pool.begin().await.expect("begin cancellation");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
@@ -5134,6 +5272,16 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
             .await
             .expect("package");
     assert_eq!((pkg_status.as_str(), terminal_at), ("available", None));
+    let committed_counts: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+             (SELECT count(*) FROM chat.events),
+             (SELECT count(*) FROM chat.outbox)"#,
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("committed append/event/outbox counts");
 
     // Replay the cancellation -> the request is no longer 'open', the terminalize
     // CAS conflicts, whole transaction rolls back with zero residue.
@@ -5152,6 +5300,38 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
             .await
             .expect("package after replay");
     assert_eq!(pkg_after, "available");
+    let replay_statuses: (String, String, String) = sqlx::query_as(
+        r#"SELECT request.status,reservation.status,package.status
+           FROM chat.leaf_recovery_requests request
+           JOIN chat.key_package_reservations reservation
+             ON reservation.recovery_request_id=request.recovery_request_id
+           JOIN chat.key_packages package
+             ON package.key_package_ref=reservation.key_package_ref
+           WHERE request.recovery_request_id=$1"#,
+    )
+    .bind(req.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replayed Recovery terminal triple");
+    let replay_counts: (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+             (SELECT count(*) FROM chat.entries WHERE conversation_id=$1),
+             (SELECT count(*) FROM chat.events),
+             (SELECT count(*) FROM chat.outbox)"#,
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replayed append/event/outbox counts");
+    assert_eq!(
+        replay_statuses,
+        (
+            "cancelled".to_owned(),
+            "released".to_owned(),
+            "available".to_owned()
+        )
+    );
+    assert_eq!(replay_counts, committed_counts);
     let _ = req.package_not_after;
 }
 

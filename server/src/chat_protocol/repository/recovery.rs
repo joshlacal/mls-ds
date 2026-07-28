@@ -52,8 +52,8 @@ use super::{
         ScopeBoundBusinessAuthority,
     },
     relationship::{
-        allocate_projection_revision, observe_locked_relationship_decision,
-        seal_recovery_fallback_scope, LockedRelationshipDecisionGuard, RelationshipRepositoryError,
+        load_fallback_relationship_projection, seal_recovery_fallback_scope,
+        LockedRelationshipDecisionGuard, RelationshipRepositoryError,
     },
     transition::{
         self, LeafRecoveryKind, LeafRecoverySource, NewLeafRecoveryRequest, NewReservation,
@@ -63,13 +63,15 @@ use super::{
 const RECOVERY_AUTHORITY_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-REPOSITORY-AUTHORITY\0";
 const RECOVERY_HEAD_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-HEAD\0";
 const RECOVERY_GRAPH_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-GRAPH\0";
+const RECOVERY_AGGREGATE_CROSS_BINDING_DOMAIN: &[u8] =
+    b"CATBIRD-CHAT-RECOVERY-AGGREGATE-CROSS-BINDING\0";
 
 /// Linear capability proving that Recovery repository code completed its
 /// ordered locked read-set before constructing a Recovery SQL binding.
 ///
 /// The field and mint are private to this module. `transition` may name and
 /// require the type, but no other crate module can manufacture a value.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RecoverySqlAuthoritySeal {
     _private: (),
 }
@@ -77,6 +79,134 @@ pub(crate) struct RecoverySqlAuthoritySeal {
 impl RecoverySqlAuthoritySeal {
     fn mint() -> Self {
         Self { _private: () }
+    }
+}
+
+/// Seals the generic aggregate read and Recovery's custom ordered head/graph
+/// read into one transaction-local authority. The two digest families use
+/// different domains and are therefore bound side-by-side after exact
+/// coordinate equality; they are never incorrectly compared as equal.
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol) struct RecoveryAggregateCrossBinding {
+    transaction_id: Box<str>,
+    trusted_instant: DateTime<Utc>,
+    conversation_id: Uuid,
+    generation: i64,
+    state_version: i64,
+    group_id: [u8; 32],
+    epoch: i64,
+    group_context_hash: [u8; 32],
+    confirmation_tag: [u8; 32],
+    aggregate_head_digest: [u8; 32],
+    aggregate_graph_digest: [u8; 32],
+    aggregate_snapshot_digest: Option<[u8; 32]>,
+    recovery_head_digest: [u8; 32],
+    recovery_graph_digest: [u8; 32],
+    seal_digest: [u8; 32],
+}
+
+impl RecoveryAggregateCrossBinding {
+    fn seal(
+        transaction_id: &str,
+        trusted_instant: DateTime<Utc>,
+        aggregate: &LockedConversationStateGuard,
+        recovery: &LockedRecoveryHeadGraph,
+    ) -> Result<Self, RecoveryRepositoryError> {
+        let coordinate = aggregate
+            .head()
+            .prior_coordinate()
+            .ok_or(RecoveryRepositoryError::ReadSetMismatch)?;
+        let generation = i64::try_from(coordinate.generation())
+            .map_err(|_| RecoveryRepositoryError::ReadSetMismatch)?;
+        let state_version = i64::try_from(coordinate.state_version())
+            .map_err(|_| RecoveryRepositoryError::ReadSetMismatch)?;
+        let epoch = i64::try_from(coordinate.epoch())
+            .map_err(|_| RecoveryRepositoryError::ReadSetMismatch)?;
+        let conversation_id = Uuid::from_bytes(*coordinate.conversation_id());
+        if aggregate.head().transaction_id() != transaction_id
+            || aggregate.head().locked_at() != trusted_instant
+            || conversation_id != recovery.conversation_id
+            || generation != recovery.generation
+            || state_version != recovery.state_version
+            || coordinate.group_id() != &recovery.group_id
+            || epoch != recovery.epoch
+            || coordinate.group_context_hash() != &recovery.group_context_hash
+            || coordinate.confirmation_tag() != &recovery.confirmation_tag
+        {
+            return Err(RecoveryRepositoryError::ReadSetMismatch);
+        }
+        let mut binding = Self {
+            transaction_id: transaction_id.to_owned().into_boxed_str(),
+            trusted_instant,
+            conversation_id,
+            generation,
+            state_version,
+            group_id: *coordinate.group_id(),
+            epoch,
+            group_context_hash: *coordinate.group_context_hash(),
+            confirmation_tag: *coordinate.confirmation_tag(),
+            aggregate_head_digest: *aggregate.head().durable_row_digest(),
+            aggregate_graph_digest: *aggregate.locked_graph_digest(),
+            aggregate_snapshot_digest: aggregate.locked_snapshot_digest().copied(),
+            recovery_head_digest: recovery.head_digest,
+            recovery_graph_digest: recovery.graph_digest,
+            seal_digest: [0; 32],
+        };
+        binding.seal_digest = binding.rederive_digest();
+        Ok(binding)
+    }
+
+    fn rederive_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(RECOVERY_AGGREGATE_CROSS_BINDING_DOMAIN);
+        digest_len(&mut digest, self.transaction_id.as_bytes());
+        digest.update(self.trusted_instant.timestamp_millis().to_be_bytes());
+        digest.update(self.conversation_id.as_bytes());
+        digest.update(self.generation.to_be_bytes());
+        digest.update(self.state_version.to_be_bytes());
+        digest.update(self.group_id);
+        digest.update(self.epoch.to_be_bytes());
+        digest.update(self.group_context_hash);
+        digest.update(self.confirmation_tag);
+        digest.update(self.aggregate_head_digest);
+        digest.update(self.aggregate_graph_digest);
+        match self.aggregate_snapshot_digest {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value);
+            }
+            None => digest.update([0]),
+        }
+        digest.update(self.recovery_head_digest);
+        digest.update(self.recovery_graph_digest);
+        digest.finalize().into()
+    }
+
+    fn validates(
+        &self,
+        aggregate: &LockedConversationStateGuard,
+        recovery: &LockedRecoveryHeadGraph,
+    ) -> bool {
+        Self::seal(
+            &self.transaction_id,
+            self.trusted_instant,
+            aggregate,
+            recovery,
+        )
+        .is_ok_and(|expected| expected == *self && self.seal_digest == self.rederive_digest())
+    }
+
+    fn validates_reloaded_recovery_head(&self, recovery: &LockedRecoveryHeadGraph) -> bool {
+        self.seal_digest == self.rederive_digest()
+            && self.conversation_id == recovery.conversation_id
+            && self.generation == recovery.generation
+            && self.state_version == recovery.state_version
+            && self.group_id == recovery.group_id
+            && self.epoch == recovery.epoch
+            && self.group_context_hash == recovery.group_context_hash
+            && self.confirmation_tag == recovery.confirmation_tag
+            && self.recovery_head_digest == recovery.head_digest
+            && self.recovery_graph_digest == recovery.graph_digest
     }
 }
 
@@ -91,9 +221,12 @@ pub(crate) enum RecoveryLockStage {
     RecoveryRequest,
     Reservation,
     KeyPackage,
+    RelationshipSnapshot,
+    RelationshipEvidence,
+    RelationshipDecision,
 }
 
-pub(crate) const CANONICAL_RECOVERY_LOCK_ORDER: [RecoveryLockStage; 9] = [
+pub(crate) const CANONICAL_RECOVERY_LOCK_ORDER: [RecoveryLockStage; 12] = [
     RecoveryLockStage::GlobalOperation,
     RecoveryLockStage::Principals,
     RecoveryLockStage::Devices,
@@ -103,6 +236,9 @@ pub(crate) const CANONICAL_RECOVERY_LOCK_ORDER: [RecoveryLockStage; 9] = [
     RecoveryLockStage::RecoveryRequest,
     RecoveryLockStage::Reservation,
     RecoveryLockStage::KeyPackage,
+    RecoveryLockStage::RelationshipSnapshot,
+    RecoveryLockStage::RelationshipEvidence,
+    RecoveryLockStage::RelationshipDecision,
 ];
 
 pub(crate) const LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL: &str =
@@ -693,7 +829,7 @@ struct RecoveryTerminalLocatorRow {
     requester_auth_generation: i64,
 }
 
-#[derive(FromRow)]
+#[derive(Debug, Eq, FromRow, PartialEq)]
 struct RecoveryPackageRow {
     key_package_ref: Vec<u8>,
     wrapper_bytes: Vec<u8>,
@@ -710,6 +846,328 @@ struct RecoveryPackageRow {
     terminal_revocation_id: Option<Uuid>,
     terminal_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RecoveryPersistenceMode {
+    Open,
+    Cancelled {
+        terminal_signed_request_bytes: Box<[u8]>,
+        terminal_signing_transcript_bytes: Box<[u8]>,
+        terminal_request_digest: [u8; 32],
+        terminal_signature: [u8; 64],
+        terminal_at: DateTime<Utc>,
+    },
+    Fulfilled {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    Expired {
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+/// Exact, owned Task-4 row witness consumed only by the prepared Recovery
+/// executor. It retains the complete insertion-shaped request and reservation,
+/// the complete locked package row, and the aggregate/custom-head cross seal.
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol) struct RecoveryPersistenceWitness {
+    sql_authority: RecoverySqlAuthoritySeal,
+    transaction_id: Box<str>,
+    trusted_instant: DateTime<Utc>,
+    graph_actor_did: Box<str>,
+    graph_actor_device_id: Uuid,
+    aggregate_cross_binding: RecoveryAggregateCrossBinding,
+    request: NewLeafRecoveryRequest,
+    reservation: NewReservation,
+    package: RecoveryPackageRow,
+    mode: RecoveryPersistenceMode,
+}
+
+impl RecoveryPersistenceWitness {
+    fn new(
+        context: RecoveryAuthorityContext,
+        request: NewLeafRecoveryRequest,
+        reservation: NewReservation,
+        package: RecoveryPackageRow,
+        mode: RecoveryPersistenceMode,
+    ) -> (
+        Self,
+        LockedConversationStateGuard,
+        VerifiedSignedMutation,
+        PreparedBusinessPrelude,
+        Vec<LockedRecoveryPackageGuard>,
+    ) {
+        let RecoveryAuthorityContext {
+            sql_authority,
+            prelude,
+            transaction_id,
+            trusted_instant,
+            actor_did,
+            actor_device_id,
+            aggregate,
+            aggregate_cross_binding,
+            verified_mutation,
+            head: _,
+            evidence: _,
+            authority_digest: _,
+            terminal_packages,
+            actor_key_id: _,
+            actor_auth_generation: _,
+        } = context;
+        (
+            Self {
+                sql_authority,
+                transaction_id,
+                trusted_instant,
+                graph_actor_did: actor_did,
+                graph_actor_device_id: actor_device_id,
+                aggregate_cross_binding,
+                request,
+                reservation,
+                package,
+                mode,
+            },
+            aggregate,
+            verified_mutation,
+            prelude,
+            terminal_packages,
+        )
+    }
+
+    fn package_cas(&self) -> transition::RecoveryKeyPackageRowCas<'_> {
+        transition::RecoveryKeyPackageRowCas::new(
+            &self.sql_authority,
+            &self.package.key_package_ref,
+            &self.package.wrapper_bytes,
+            &self.package.wrapper_sha256,
+            &self.package.init_key,
+            &self.package.owner_did,
+            self.package.owner_device_id,
+            &self.package.owner_key_id,
+            self.package.owner_auth_generation,
+            self.package.not_before,
+            self.package.not_after,
+            self.package.created_at,
+        )
+    }
+
+    fn matches_plan(&self, plan: &ConversationPersistencePlan) -> bool {
+        let Some(head) = plan.effects().head_cas() else {
+            return false;
+        };
+        let binding = &self.aggregate_cross_binding;
+        let coordinate_matches = head.transaction_id() == self.transaction_id.as_ref()
+            && head.locked_at().unix_millis() == self.trusted_instant.timestamp_millis()
+            && head.locked_head_digest() == &binding.aggregate_head_digest
+            && head.expected_prior().is_some_and(|coordinate| {
+                coordinate.conversation_id() == binding.conversation_id.as_bytes()
+                    && i64::try_from(coordinate.generation()).ok() == Some(binding.generation)
+                    && i64::try_from(coordinate.state_version()).ok() == Some(binding.state_version)
+                    && coordinate.group_id() == &binding.group_id
+                    && i64::try_from(coordinate.epoch()).ok() == Some(binding.epoch)
+                    && coordinate.group_context_hash() == &binding.group_context_hash
+                    && coordinate.confirmation_tag() == &binding.confirmation_tag
+            })
+            && binding.seal_digest == binding.rederive_digest();
+        let request_id = self.request.recovery_request_id;
+        let package_ref = self.package.key_package_ref.as_slice();
+        let semantic_edge = plan.effects().package_transitions().iter().any(|edge| {
+            edge.request_id() == request_id.as_bytes()
+                && edge.key_package_ref().as_slice() == package_ref
+        });
+        let mode_matches = match (&self.mode, plan.effects().kind()) {
+            (
+                RecoveryPersistenceMode::Open,
+                super::super::state_machine::PlanKind::RecoveryRequest,
+            )
+            | (
+                RecoveryPersistenceMode::Cancelled { .. },
+                super::super::state_machine::PlanKind::RecoveryCancellation,
+            )
+            | (
+                RecoveryPersistenceMode::Expired { .. },
+                super::super::state_machine::PlanKind::RecoveryExpiry,
+            ) => true,
+            (
+                RecoveryPersistenceMode::Fulfilled { transition_id, .. },
+                super::super::state_machine::PlanKind::Commit,
+            ) => {
+                matches!(
+                    plan.effects().authority(),
+                    Some(super::super::state_machine::PlanAuthority::Transition(evidence))
+                        if evidence.transition_id() == transition_id.as_bytes()
+                            && evidence
+                                .signed_authority()
+                                .is_some_and(|authority| {
+                                    authority.kind()
+                                        == super::super::transcript::SignedMutationKind::LeafRecoveryFulfillment
+                                })
+                )
+            }
+            _ => false,
+        };
+        coordinate_matches && semantic_edge && mode_matches
+    }
+
+    pub(in crate::chat_protocol) async fn validate_prewrite(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        plan: &ConversationPersistencePlan,
+    ) -> Result<(), ExecutionContextHydrationError> {
+        let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut **transaction)
+            .await?;
+        if live_transaction_id != self.transaction_id.as_ref() || !self.matches_plan(plan) {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        let reloaded_head = lock_head_graph(
+            transaction,
+            self.request.conversation_id,
+            &self.graph_actor_did,
+            self.graph_actor_device_id,
+        )
+        .await
+        .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+        if !self
+            .aggregate_cross_binding
+            .validates_reloaded_recovery_head(&reloaded_head)
+        {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        let package: RecoveryPackageRow = sqlx::query_as(LOCK_RECOVERY_PACKAGE_SQL)
+            .bind(&self.package.key_package_ref)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+        if package != self.package {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        match self.mode {
+            RecoveryPersistenceMode::Open => {
+                let occupied: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM chat.leaf_recovery_requests WHERE recovery_request_id=$1) \
+                     OR EXISTS(SELECT 1 FROM chat.key_package_reservations WHERE recovery_request_id=$1)",
+                )
+                .bind(self.request.recovery_request_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+                if occupied
+                    || self.package.status != "available"
+                    || self.package.terminal_transition_id.is_some()
+                    || self.package.terminal_revocation_id.is_some()
+                    || self.package.terminal_at.is_some()
+                {
+                    return Err(ExecutionContextHydrationError::AuthorityMismatch);
+                }
+            }
+            _ => {
+                let request: RecoveryRequestRow = sqlx::query_as(LOCK_RECOVERY_REQUEST_SQL)
+                    .bind(self.request.recovery_request_id)
+                    .fetch_optional(&mut **transaction)
+                    .await?
+                    .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+                let reservation: RecoveryReservationRow =
+                    sqlx::query_as(LOCK_RECOVERY_RESERVATION_SQL)
+                        .bind(self.request.recovery_request_id)
+                        .fetch_optional(&mut **transaction)
+                        .await?
+                        .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+                if new_request_from_row(&request).ok().as_ref() != Some(&self.request)
+                    || new_reservation_from_row(&reservation).ok().as_ref()
+                        != Some(&self.reservation)
+                    || request.status != "open"
+                    || reservation.status != "active"
+                    || self.package.status != "reserved"
+                    || request.fulfilling_transition_id.is_some()
+                    || request.terminal_transition_id.is_some()
+                    || request.terminal_revocation_id.is_some()
+                    || request.terminal_at.is_some()
+                    || reservation.consumed_transition_id.is_some()
+                    || reservation.terminal_transition_id.is_some()
+                    || reservation.terminal_revocation_id.is_some()
+                    || reservation.terminal_at.is_some()
+                    || self.package.terminal_transition_id.is_some()
+                    || self.package.terminal_revocation_id.is_some()
+                    || self.package.terminal_at.is_some()
+                {
+                    return Err(ExecutionContextHydrationError::AuthorityMismatch);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::chat_protocol) async fn apply_open(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), ExecutorError> {
+        if !matches!(self.mode, RecoveryPersistenceMode::Open) {
+            return Err(ExecutorError::InconsistentPlan(
+                "Recovery open executor received a terminal witness",
+            ));
+        }
+        let package = transition::AvailableRecoveryPackageReservationCas::new(
+            &self.sql_authority,
+            &self.transaction_id,
+            self.package_cas(),
+        );
+        transition::reserve_available_recovery_package(transaction, &package).await?;
+        transition::insert_leaf_recovery_request(transaction, &self.request).await?;
+        transition::insert_reservation(transaction, &self.reservation).await?;
+        Ok(())
+    }
+
+    pub(in crate::chat_protocol) async fn apply_terminal(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), ExecutorError> {
+        let termination = match &self.mode {
+            RecoveryPersistenceMode::Cancelled {
+                terminal_signed_request_bytes,
+                terminal_signing_transcript_bytes,
+                terminal_request_digest,
+                terminal_signature,
+                terminal_at,
+            } => transition::RecoveryTerminalTripleTermination::Cancelled {
+                authority: &self.sql_authority,
+                terminal_signed_request_bytes,
+                terminal_signing_transcript_bytes,
+                terminal_request_digest,
+                terminal_signature,
+                terminal_at: *terminal_at,
+            },
+            RecoveryPersistenceMode::Fulfilled {
+                transition_id,
+                terminal_at,
+            } => transition::RecoveryTerminalTripleTermination::Fulfilled {
+                authority: &self.sql_authority,
+                transition_id: *transition_id,
+                terminal_at: *terminal_at,
+            },
+            RecoveryPersistenceMode::Expired { terminal_at } => {
+                transition::RecoveryTerminalTripleTermination::Expired {
+                    authority: &self.sql_authority,
+                    terminal_at: *terminal_at,
+                }
+            }
+            RecoveryPersistenceMode::Open => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "Recovery terminal executor received an open witness",
+                ))
+            }
+        };
+        let binding = transition::RecoveryTerminalTripleCas::new(
+            &self.sql_authority,
+            &self.transaction_id,
+            &self.request,
+            &self.reservation,
+            self.package_cas(),
+            termination,
+        );
+        transition::terminalize_recovery_triple(transaction, &binding).await?;
+        Ok(())
+    }
 }
 
 struct RecoveryEvidence {
@@ -729,6 +1187,7 @@ struct RecoveryAuthorityContext {
     actor_key_id: Box<str>,
     actor_auth_generation: i64,
     aggregate: LockedConversationStateGuard,
+    aggregate_cross_binding: RecoveryAggregateCrossBinding,
     verified_mutation: VerifiedSignedMutation,
     head: LockedRecoveryHeadGraph,
     evidence: RecoveryEvidence,
@@ -773,7 +1232,10 @@ pub(crate) struct RecoveryClientExpiryAuthority {
     prelude: PreparedBusinessPrelude,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
+    graph_actor_did: Box<str>,
+    graph_actor_device_id: Uuid,
     aggregate: LockedConversationStateGuard,
+    aggregate_cross_binding: RecoveryAggregateCrossBinding,
     execution_package: LockedRecoveryPackageGuard,
     head: LockedRecoveryHeadGraph,
     request: NewLeafRecoveryRequest,
@@ -787,7 +1249,10 @@ pub(crate) struct RecoverySchedulerExpiryAuthority {
     sql_authority: RecoverySqlAuthoritySeal,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
+    graph_actor_did: Box<str>,
+    graph_actor_device_id: Uuid,
     aggregate: LockedConversationStateGuard,
+    aggregate_cross_binding: RecoveryAggregateCrossBinding,
     execution_package: LockedRecoveryPackageGuard,
     head: LockedRecoveryHeadGraph,
     request: NewLeafRecoveryRequest,
@@ -800,6 +1265,7 @@ pub(crate) struct RecoverySchedulerExpiryAuthority {
 pub(crate) struct RecoveryClientExpiryPlanInput {
     authority: RecoveryClientExpiryAuthority,
     trusted_request_instant: TrustedRequestInstant,
+    post_apply_error: RecoveryClientTerminalError,
 }
 
 #[must_use]
@@ -816,6 +1282,8 @@ pub(in crate::chat_protocol) struct RecoveryClientExpiryPlannerParts {
     pub(in crate::chat_protocol) request_id: Uuid,
     pub(in crate::chat_protocol) locked_read_set_digest: [u8; 32],
     pub(in crate::chat_protocol) trusted_request_instant: TrustedRequestInstant,
+    pub(in crate::chat_protocol) post_apply_error: RecoveryClientTerminalError,
+    pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
 pub(in crate::chat_protocol) struct RecoverySchedulerExpiryPlannerParts {
@@ -825,32 +1293,104 @@ pub(in crate::chat_protocol) struct RecoverySchedulerExpiryPlannerParts {
     pub(in crate::chat_protocol) terminal_at: DateTime<Utc>,
     pub(in crate::chat_protocol) request_id: Uuid,
     pub(in crate::chat_protocol) locked_read_set_digest: [u8; 32],
+    pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
 #[must_use]
-pub(crate) struct RecoveryRetainedTerminal {
-    classification: RecoveryTerminalClassification,
-    prelude: Option<PreparedBusinessPrelude>,
+pub(crate) struct RecoveryCancellationDueForExpiry {
+    authority: RecoveryClientExpiryAuthority,
 }
 
-pub(crate) enum RecoveryTerminalRead<T> {
-    Authority(T),
-    DueForExpiry(RecoveryClientExpiryAuthority),
-    Retained(RecoveryRetainedTerminal),
+#[must_use]
+pub(crate) struct RecoveryFulfillmentDueForExpiry {
+    authority: RecoveryClientExpiryAuthority,
+}
+
+#[must_use]
+pub(crate) struct RecoveryCancellationRetained {
+    prelude: PreparedBusinessPrelude,
+    error: RecoveryClientTerminalError,
+}
+
+#[must_use]
+pub(crate) struct RecoveryFulfillmentRetained {
+    prelude: PreparedBusinessPrelude,
+    error: RecoveryClientTerminalError,
+}
+
+#[must_use]
+pub(crate) struct RecoveryClassifiedTerminalOutcome {
+    prelude: PreparedBusinessPrelude,
+    error: RecoveryClientTerminalError,
+}
+
+pub(crate) enum RecoveryCancellationRead {
+    Execute(RecoveryCancellationAuthority),
+    DueForExpiry(RecoveryCancellationDueForExpiry),
+    Classified(RecoveryCancellationRetained),
+}
+
+pub(crate) enum RecoveryFulfillmentRead {
+    Execute(RecoveryFulfillmentAuthority),
+    DueForExpiry(RecoveryFulfillmentDueForExpiry),
+    Classified(RecoveryFulfillmentRetained),
+}
+
+#[must_use]
+pub(crate) struct RecoverySchedulerRetainedTerminal {
+    _classification: RecoveryTerminalClassification,
 }
 
 pub(crate) enum RecoverySchedulerExpiryRead {
     Authority(RecoverySchedulerExpiryAuthority),
-    Retained(RecoveryRetainedTerminal),
+    Retained(RecoverySchedulerRetainedTerminal),
 }
 
-impl RecoveryRetainedTerminal {
-    pub(crate) fn classification(&self) -> RecoveryTerminalClassification {
-        self.classification
+impl RecoveryCancellationDueForExpiry {
+    pub(crate) fn into_plan_input(
+        self,
+        trusted_request_instant: &TrustedRequestInstant,
+    ) -> Result<RecoveryClientExpiryPlanInput, RecoveryRepositoryError> {
+        self.authority.into_plan_input_with_error(
+            trusted_request_instant,
+            RecoveryClientTerminalError::RecoveryNotFound,
+        )
     }
+}
 
-    pub(crate) fn into_prelude(self) -> Option<PreparedBusinessPrelude> {
-        self.prelude
+impl RecoveryFulfillmentDueForExpiry {
+    pub(crate) fn into_plan_input(
+        self,
+        trusted_request_instant: &TrustedRequestInstant,
+    ) -> Result<RecoveryClientExpiryPlanInput, RecoveryRepositoryError> {
+        self.authority.into_plan_input_with_error(
+            trusted_request_instant,
+            RecoveryClientTerminalError::RecoveryExpired,
+        )
+    }
+}
+
+impl RecoveryCancellationRetained {
+    pub(crate) fn into_classified_outcome(self) -> RecoveryClassifiedTerminalOutcome {
+        RecoveryClassifiedTerminalOutcome {
+            prelude: self.prelude,
+            error: self.error,
+        }
+    }
+}
+
+impl RecoveryFulfillmentRetained {
+    pub(crate) fn into_classified_outcome(self) -> RecoveryClassifiedTerminalOutcome {
+        RecoveryClassifiedTerminalOutcome {
+            prelude: self.prelude,
+            error: self.error,
+        }
+    }
+}
+
+impl RecoveryClassifiedTerminalOutcome {
+    pub(crate) fn into_parts(self) -> (PreparedBusinessPrelude, RecoveryClientTerminalError) {
+        (self.prelude, self.error)
     }
 }
 
@@ -901,6 +1441,7 @@ pub(in crate::chat_protocol) struct RecoveryRequestPlannerParts {
     pub(in crate::chat_protocol) relationship: RelationshipProjection,
     pub(in crate::chat_protocol) relationship_decision: LockedRelationshipDecisionGuard,
     pub(in crate::chat_protocol) trusted_request_instant: TrustedRequestInstant,
+    pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
 pub(in crate::chat_protocol) struct RecoveryCancellationPlannerParts {
@@ -909,6 +1450,7 @@ pub(in crate::chat_protocol) struct RecoveryCancellationPlannerParts {
     pub(in crate::chat_protocol) prelude: PreparedBusinessPrelude,
     pub(in crate::chat_protocol) execution_package: LockedRecoveryPackageGuard,
     pub(in crate::chat_protocol) trusted_request_instant: TrustedRequestInstant,
+    pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
 pub(in crate::chat_protocol) struct RecoveryFulfillmentPlannerParts {
@@ -921,6 +1463,7 @@ pub(in crate::chat_protocol) struct RecoveryFulfillmentPlannerParts {
     pub(in crate::chat_protocol) relationship_decision: LockedRelationshipDecisionGuard,
     pub(in crate::chat_protocol) transition_id: Uuid,
     pub(in crate::chat_protocol) trusted_request_instant: TrustedRequestInstant,
+    pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
 #[cfg(not(test))]
@@ -949,7 +1492,12 @@ pub(crate) enum RecoveryCanonicalMaterial {
         recovery_request_id: Uuid,
         transition_id: Uuid,
     },
-    Expired {
+    ClientExpired {
+        recovery_request_id: Uuid,
+        terminal_at: DateTime<Utc>,
+        post_apply_error: RecoveryClientTerminalError,
+    },
+    SchedulerExpired {
         recovery_request_id: Uuid,
         terminal_at: DateTime<Utc>,
     },
@@ -957,10 +1505,49 @@ pub(crate) enum RecoveryCanonicalMaterial {
 
 #[cfg(not(test))]
 pub(crate) struct PreparedRecoveryMutation {
-    plan: ConversationPersistencePlan,
+    graph: PreparedRecoveryExecutionGraph,
     completion: RecoveryCompletion,
-    accepted_control_entry_bytes: Option<Vec<u8>>,
     material: RecoveryCanonicalMaterial,
+}
+
+/// Private, single-owner graph carrying every serialized product retained by a
+/// planned Recovery mutation. The execution facade borrows this graph as one
+/// value; no caller can pair a plan with another mutation's accepted control
+/// entry.
+pub(in crate::chat_protocol) struct PreparedRecoveryExecutionGraph {
+    plan: ConversationPersistencePlan,
+    accepted_control_entry_bytes: Option<Vec<u8>>,
+    persistence_witness: RecoveryPersistenceWitness,
+}
+
+impl PreparedRecoveryExecutionGraph {
+    fn new(
+        plan: ConversationPersistencePlan,
+        accepted_control_entry_bytes: Option<Vec<u8>>,
+        persistence_witness: RecoveryPersistenceWitness,
+    ) -> Self {
+        Self {
+            plan,
+            accepted_control_entry_bytes,
+            persistence_witness,
+        }
+    }
+
+    pub(in crate::chat_protocol::repository) fn plan(&self) -> &ConversationPersistencePlan {
+        &self.plan
+    }
+
+    pub(in crate::chat_protocol::repository) fn accepted_control_entry_bytes(
+        &self,
+    ) -> Option<Vec<u8>> {
+        self.accepted_control_entry_bytes.clone()
+    }
+
+    pub(in crate::chat_protocol::repository) fn persistence_witness(
+        &self,
+    ) -> &RecoveryPersistenceWitness {
+        &self.persistence_witness
+    }
 }
 
 #[cfg(not(test))]
@@ -974,13 +1561,11 @@ impl PreparedRecoveryMutation {
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
         let Self {
-            plan,
+            graph,
             completion,
-            accepted_control_entry_bytes,
             material,
         } = self;
-        let prepared =
-            prepare_recovery_execution(transaction, &plan, accepted_control_entry_bytes).await?;
+        let prepared = prepare_recovery_execution(transaction, &graph).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedRecoveryMutation {
             applied,
@@ -1001,8 +1586,14 @@ pub(crate) struct AppliedRecoveryMutation {
 fn seal_planned_recovery(
     planned: PlannedRecoveryMutation,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
-    let (transition, scope_authority, completion, accepted_control_entry_bytes, kind) =
-        planned.into_parts();
+    let (
+        transition,
+        scope_authority,
+        completion,
+        accepted_control_entry_bytes,
+        persistence_witness,
+        kind,
+    ) = planned.into_parts();
     let material = match kind {
         RecoveryPlannedKind::Request {
             recovery_request_id,
@@ -1023,24 +1614,42 @@ fn seal_planned_recovery(
         },
     };
     Ok(PreparedRecoveryMutation {
-        plan: transition.into_persistence_plan()?,
+        graph: PreparedRecoveryExecutionGraph::new(
+            transition.into_persistence_plan()?,
+            accepted_control_entry_bytes,
+            persistence_witness,
+        ),
         completion: RecoveryCompletion {
             scope_authority,
             completion,
         },
-        accepted_control_entry_bytes,
         material,
     })
 }
 
 #[cfg(not(test))]
-fn expiry_material(
+fn client_expiry_material(
+    recovery_request_id: Uuid,
+    terminal_at: ServerTimestamp,
+    post_apply_error: RecoveryClientTerminalError,
+) -> Result<RecoveryCanonicalMaterial, RecoveryRepositoryError> {
+    let terminal_at = DateTime::<Utc>::from_timestamp_millis(terminal_at.unix_millis())
+        .ok_or(RecoveryRepositoryError::InvalidDurableRow)?;
+    Ok(RecoveryCanonicalMaterial::ClientExpired {
+        recovery_request_id,
+        terminal_at,
+        post_apply_error,
+    })
+}
+
+#[cfg(not(test))]
+fn scheduler_expiry_material(
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
 ) -> Result<RecoveryCanonicalMaterial, RecoveryRepositoryError> {
     let terminal_at = DateTime::<Utc>::from_timestamp_millis(terminal_at.unix_millis())
         .ok_or(RecoveryRepositoryError::InvalidDurableRow)?;
-    Ok(RecoveryCanonicalMaterial::Expired {
+    Ok(RecoveryCanonicalMaterial::SchedulerExpired {
         recovery_request_id,
         terminal_at,
     })
@@ -1080,21 +1689,32 @@ pub(crate) fn plan_client_recovery_expiry(
     input: RecoveryClientExpiryPlanInput,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
     let planned = HydrationAuthority::plan_client_recovery_expiry_input(input)?;
-    let (transition, scope_authority, completion, request_id, terminal_at) = planned.into_parts();
+    let (
+        transition,
+        scope_authority,
+        completion,
+        request_id,
+        terminal_at,
+        persistence_witness,
+        post_apply_error,
+    ) = planned.into_parts();
     Ok(PreparedRecoveryMutation {
-        plan: transition.into_persistence_plan()?,
+        graph: PreparedRecoveryExecutionGraph::new(
+            transition.into_persistence_plan()?,
+            None,
+            persistence_witness,
+        ),
         completion: RecoveryCompletion {
             scope_authority,
             completion,
         },
-        accepted_control_entry_bytes: None,
-        material: expiry_material(request_id, terminal_at)?,
+        material: client_expiry_material(request_id, terminal_at, post_apply_error)?,
     })
 }
 
 #[cfg(not(test))]
 pub(crate) struct PreparedSchedulerRecoveryExpiry {
-    plan: ConversationPersistencePlan,
+    graph: PreparedRecoveryExecutionGraph,
     material: RecoveryCanonicalMaterial,
 }
 
@@ -1108,7 +1728,7 @@ impl PreparedSchedulerRecoveryExpiry {
         self,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
-        let prepared = prepare_recovery_execution(transaction, &self.plan, None).await?;
+        let prepared = prepare_recovery_execution(transaction, &self.graph).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedSchedulerRecoveryExpiry {
             applied,
@@ -1129,25 +1749,15 @@ pub(crate) fn plan_scheduler_recovery_expiry(
 ) -> Result<PreparedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
     let planned: PlannedSchedulerRecoveryExpiry =
         HydrationAuthority::plan_scheduler_recovery_expiry_input(input)?;
-    let (transition, request_id, terminal_at) = planned.into_parts();
+    let (transition, request_id, terminal_at, persistence_witness) = planned.into_parts();
     Ok(PreparedSchedulerRecoveryExpiry {
-        plan: transition.into_persistence_plan()?,
-        material: expiry_material(request_id, terminal_at)?,
+        graph: PreparedRecoveryExecutionGraph::new(
+            transition.into_persistence_plan()?,
+            None,
+            persistence_witness,
+        ),
+        material: scheduler_expiry_material(request_id, terminal_at)?,
     })
-}
-
-impl<T> RecoveryTerminalRead<T> {
-    pub(crate) fn map_authority<U>(self, adapt: impl FnOnce(T) -> U) -> RecoveryTerminalRead<U> {
-        match self {
-            RecoveryTerminalRead::Authority(authority) => {
-                RecoveryTerminalRead::Authority(adapt(authority))
-            }
-            RecoveryTerminalRead::DueForExpiry(authority) => {
-                RecoveryTerminalRead::DueForExpiry(authority)
-            }
-            RecoveryTerminalRead::Retained(terminal) => RecoveryTerminalRead::Retained(terminal),
-        }
-    }
 }
 
 impl RecoveryRequestAuthority {
@@ -1165,23 +1775,18 @@ impl RecoveryRequestAuthority {
         let hydration = HydrationAuthority::from_locked_conversation(&self.context.aggregate)?;
         let registration = hydration
             .locked_registration_from_scope_authority(self.context.prelude.scope_authority())?;
-        let roster = recovery_roster(&self.context.aggregate)?;
-        let allocation = allocate_projection_revision(transaction).await?;
-        let relationship = relationship_authority
-            .collect_block_projection(
-                allocation,
-                ProjectionOperationScope::RecoveryReservation,
-                roster,
-            )
-            .await
-            .map_err(|_| RecoveryRepositoryError::RelationshipUnavailable)?;
         let decision_scope = seal_recovery_fallback_scope(
             &self.context.aggregate,
             &registration,
             ProjectionOperationScope::RecoveryReservation,
         )?;
-        let relationship_decision =
-            observe_locked_relationship_decision(transaction, decision_scope).await?;
+        let (relationship, relationship_decision) = load_fallback_relationship_projection(
+            transaction,
+            decision_scope,
+            relationship_authority,
+        )
+        .await?
+        .ok_or(RecoveryRepositoryError::RelationshipUnavailable)?;
         Ok(RecoveryRequestPlanInput {
             context: self.context,
             request: self.request,
@@ -1241,22 +1846,31 @@ impl RecoveryRequestPlanInput {
     pub(in crate::chat_protocol) fn into_planner_parts(self) -> RecoveryRequestPlannerParts {
         let Self {
             context,
-            request: _,
-            reservation: _,
-            package: _,
+            request,
+            reservation,
+            package,
             execution_package,
             relationship,
             relationship_decision,
             trusted_request_instant,
         } = self;
+        let (persistence_witness, aggregate, mutation, prelude, _terminal_packages) =
+            RecoveryPersistenceWitness::new(
+                context,
+                request,
+                reservation,
+                package,
+                RecoveryPersistenceMode::Open,
+            );
         RecoveryRequestPlannerParts {
-            aggregate: context.aggregate,
-            mutation: context.verified_mutation,
-            prelude: context.prelude,
+            aggregate,
+            mutation,
+            prelude,
             execution_package,
             relationship,
             relationship_decision,
             trusted_request_instant,
+            persistence_witness,
         }
     }
 }
@@ -1299,23 +1913,18 @@ impl RecoveryFulfillmentAuthority {
         let hydration = HydrationAuthority::from_locked_conversation(&self.context.aggregate)?;
         let registration = hydration
             .locked_registration_from_scope_authority(self.context.prelude.scope_authority())?;
-        let roster = recovery_roster(&self.context.aggregate)?;
-        let allocation = allocate_projection_revision(transaction).await?;
-        let relationship = relationship_authority
-            .collect_block_projection(
-                allocation,
-                ProjectionOperationScope::RecoveryFulfillment,
-                roster,
-            )
-            .await
-            .map_err(|_| RecoveryRepositoryError::RelationshipUnavailable)?;
         let decision_scope = seal_recovery_fallback_scope(
             &self.context.aggregate,
             &registration,
             ProjectionOperationScope::RecoveryFulfillment,
         )?;
-        let relationship_decision =
-            observe_locked_relationship_decision(transaction, decision_scope).await?;
+        let (relationship, relationship_decision) = load_fallback_relationship_projection(
+            transaction,
+            decision_scope,
+            relationship_authority,
+        )
+        .await?
+        .ok_or(RecoveryRepositoryError::RelationshipUnavailable)?;
         Ok(RecoveryFulfillmentPlanInput {
             context: self.context,
             request: self.request,
@@ -1361,18 +1970,28 @@ impl RecoveryCancellationPlanInput {
     pub(in crate::chat_protocol) fn into_planner_parts(self) -> RecoveryCancellationPlannerParts {
         let Self {
             context,
-            request: _,
-            reservation: _,
-            package: _,
+            request,
+            reservation,
+            package,
             execution_package,
             trusted_request_instant,
         } = self;
+        let mode = RecoveryPersistenceMode::Cancelled {
+            terminal_signed_request_bytes: context.evidence.signed_request_bytes.clone(),
+            terminal_signing_transcript_bytes: context.evidence.signing_transcript_bytes.clone(),
+            terminal_request_digest: context.evidence.request_digest,
+            terminal_signature: context.evidence.signature,
+            terminal_at: context.trusted_instant,
+        };
+        let (persistence_witness, aggregate, mutation, prelude, _terminal_packages) =
+            RecoveryPersistenceWitness::new(context, request, reservation, package, mode);
         RecoveryCancellationPlannerParts {
-            aggregate: context.aggregate,
-            mutation: context.verified_mutation,
-            prelude: context.prelude,
+            aggregate,
+            mutation,
+            prelude,
             execution_package,
             trusted_request_instant,
+            persistence_witness,
         }
     }
 }
@@ -1408,25 +2027,32 @@ impl RecoveryFulfillmentPlanInput {
     pub(in crate::chat_protocol) fn into_planner_parts(self) -> RecoveryFulfillmentPlannerParts {
         let Self {
             context,
-            request: _,
-            reservation: _,
-            package: _,
+            request,
+            reservation,
+            package,
             execution_package,
             relationship,
             relationship_decision,
             transition_id,
             trusted_request_instant,
         } = self;
+        let mode = RecoveryPersistenceMode::Fulfilled {
+            transition_id,
+            terminal_at: context.trusted_instant,
+        };
+        let (persistence_witness, aggregate, mutation, prelude, terminal_packages) =
+            RecoveryPersistenceWitness::new(context, request, reservation, package, mode);
         RecoveryFulfillmentPlannerParts {
-            aggregate: context.aggregate,
-            mutation: context.verified_mutation,
-            prelude: context.prelude,
+            aggregate,
+            mutation,
+            prelude,
             execution_package,
-            terminal_packages: context.terminal_packages,
+            terminal_packages,
             relationship,
             relationship_decision,
             transition_id,
             trusted_request_instant,
+            persistence_witness,
         }
     }
 }
@@ -1438,9 +2064,10 @@ impl RecoverySchedulerExpiryAuthority {
 }
 
 impl RecoveryClientExpiryAuthority {
-    pub(crate) fn into_plan_input(
+    fn into_plan_input_with_error(
         self,
         trusted_request_instant: &TrustedRequestInstant,
+        post_apply_error: RecoveryClientTerminalError,
     ) -> Result<RecoveryClientExpiryPlanInput, RecoveryRepositoryError> {
         if trusted_request_instant.datetime() != self.trusted_instant {
             return Err(RecoveryRepositoryError::TrustedInstantMismatch);
@@ -1448,6 +2075,7 @@ impl RecoveryClientExpiryAuthority {
         Ok(RecoveryClientExpiryPlanInput {
             authority: self,
             trusted_request_instant: trusted_request_instant.clone(),
+            post_apply_error,
         })
     }
 }
@@ -1458,6 +2086,9 @@ impl RecoveryClientExpiryPlanInput {
     ) -> Result<RecoveryClientExpiryPlannerParts, RecoveryRepositoryError> {
         let authority = self.authority;
         if authority.trusted_instant < authority.request.expires_at
+            || !authority
+                .aggregate_cross_binding
+                .validates(&authority.aggregate, &authority.head)
             || authority.authority_digest
                 != expiry_authority_digest(
                     &authority.transaction_id,
@@ -1470,15 +2101,47 @@ impl RecoveryClientExpiryPlanInput {
         {
             return Err(RecoveryRepositoryError::ReadSetMismatch);
         }
+        let RecoveryClientExpiryAuthority {
+            sql_authority,
+            prelude,
+            transaction_id,
+            trusted_instant,
+            graph_actor_did,
+            graph_actor_device_id,
+            aggregate,
+            aggregate_cross_binding,
+            execution_package,
+            head: _,
+            request,
+            reservation,
+            package,
+            authority_digest,
+        } = authority;
+        let terminal_at = request.expires_at;
+        let request_id = request.recovery_request_id;
+        let persistence_witness = RecoveryPersistenceWitness {
+            sql_authority,
+            transaction_id,
+            trusted_instant,
+            graph_actor_did,
+            graph_actor_device_id,
+            aggregate_cross_binding,
+            request,
+            reservation,
+            package,
+            mode: RecoveryPersistenceMode::Expired { terminal_at },
+        };
         Ok(RecoveryClientExpiryPlannerParts {
-            aggregate: authority.aggregate,
-            execution_package: authority.execution_package,
-            prelude: authority.prelude,
-            observed_at: authority.trusted_instant,
-            terminal_at: authority.request.expires_at,
-            request_id: authority.request.recovery_request_id,
-            locked_read_set_digest: authority.authority_digest,
+            aggregate,
+            execution_package,
+            prelude,
+            observed_at: trusted_instant,
+            terminal_at,
+            request_id,
+            locked_read_set_digest: authority_digest,
             trusted_request_instant: self.trusted_request_instant,
+            post_apply_error: self.post_apply_error,
+            persistence_witness,
         })
     }
 }
@@ -1489,6 +2152,9 @@ impl RecoverySchedulerExpiryPlanInput {
     ) -> Result<RecoverySchedulerExpiryPlannerParts, RecoveryRepositoryError> {
         let authority = self.authority;
         if authority.trusted_instant < authority.request.expires_at
+            || !authority
+                .aggregate_cross_binding
+                .validates(&authority.aggregate, &authority.head)
             || authority.authority_digest
                 != expiry_authority_digest(
                     &authority.transaction_id,
@@ -1501,13 +2167,43 @@ impl RecoverySchedulerExpiryPlanInput {
         {
             return Err(RecoveryRepositoryError::ReadSetMismatch);
         }
+        let RecoverySchedulerExpiryAuthority {
+            sql_authority,
+            transaction_id,
+            trusted_instant,
+            graph_actor_did,
+            graph_actor_device_id,
+            aggregate,
+            aggregate_cross_binding,
+            execution_package,
+            head: _,
+            request,
+            reservation,
+            package,
+            authority_digest,
+        } = authority;
+        let terminal_at = request.expires_at;
+        let request_id = request.recovery_request_id;
+        let persistence_witness = RecoveryPersistenceWitness {
+            sql_authority,
+            transaction_id,
+            trusted_instant,
+            graph_actor_did,
+            graph_actor_device_id,
+            aggregate_cross_binding,
+            request,
+            reservation,
+            package,
+            mode: RecoveryPersistenceMode::Expired { terminal_at },
+        };
         Ok(RecoverySchedulerExpiryPlannerParts {
-            aggregate: authority.aggregate,
-            execution_package: authority.execution_package,
-            observed_at: authority.trusted_instant,
-            terminal_at: authority.request.expires_at,
-            request_id: authority.request.recovery_request_id,
-            locked_read_set_digest: authority.authority_digest,
+            aggregate,
+            execution_package,
+            observed_at: trusted_instant,
+            terminal_at,
+            request_id,
+            locked_read_set_digest: authority_digest,
+            persistence_witness,
         })
     }
 }
@@ -1645,6 +2341,8 @@ pub(crate) async fn prepare_recovery_request_authority(
         &head,
         &evidence,
     );
+    let aggregate_cross_binding =
+        RecoveryAggregateCrossBinding::seal(&transaction_id, trusted_instant, &aggregate, &head)?;
     Ok(RecoveryRequestAuthority {
         context: RecoveryAuthorityContext {
             sql_authority: RecoverySqlAuthoritySeal::mint(),
@@ -1656,6 +2354,7 @@ pub(crate) async fn prepare_recovery_request_authority(
             actor_key_id: actor_key_id.into_boxed_str(),
             actor_auth_generation,
             aggregate,
+            aggregate_cross_binding,
             verified_mutation,
             head,
             evidence,
@@ -1673,7 +2372,7 @@ pub(crate) async fn prepare_recovery_cancellation_authority(
     transaction: &mut Transaction<'_, Postgres>,
     prelude: PreparedBusinessPrelude,
     mutation: &VerifiedSignedMutation,
-) -> Result<RecoveryTerminalRead<RecoveryCancellationAuthority>, RecoveryRepositoryError> {
+) -> Result<RecoveryCancellationRead, RecoveryRepositoryError> {
     let (request_id, operation_id) = match mutation.projection() {
         VerifiedMutationProjection::LeafRecoveryCancellation(value) => {
             let operation_id = body_uuid(&value.body(), "idempotencyKey")?;
@@ -1709,15 +2408,30 @@ pub(crate) async fn prepare_recovery_cancellation_authority(
         return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
     }
     match context.classification {
-        RecoveryTerminalClassification::OpenLive => Ok(RecoveryTerminalRead::Authority(
+        RecoveryTerminalClassification::OpenLive => Ok(RecoveryCancellationRead::Execute(
             context.into_cancellation_authority()?,
         )),
-        RecoveryTerminalClassification::OpenDue => Ok(RecoveryTerminalRead::DueForExpiry(
-            context.into_expiry_authority()?,
+        RecoveryTerminalClassification::OpenDue => Ok(RecoveryCancellationRead::DueForExpiry(
+            RecoveryCancellationDueForExpiry {
+                authority: context.into_expiry_authority()?,
+            },
         )),
-        retained => Ok(RecoveryTerminalRead::Retained(
-            context.into_retained_terminal(retained),
-        )),
+        retained => {
+            let RecoveryClientTerminalDisposition::Retained(error) =
+                classify_client_terminal_disposition(
+                    RecoveryClientTerminalAction::Cancel,
+                    retained,
+                )
+            else {
+                return Err(RecoveryRepositoryError::InvalidDurableRow);
+            };
+            Ok(RecoveryCancellationRead::Classified(
+                RecoveryCancellationRetained {
+                    prelude: context.into_retained_prelude(),
+                    error,
+                },
+            ))
+        }
     }
 }
 
@@ -1725,7 +2439,7 @@ pub(crate) async fn prepare_recovery_fulfillment_authority(
     transaction: &mut Transaction<'_, Postgres>,
     prelude: PreparedBusinessPrelude,
     mutation: &VerifiedSignedMutation,
-) -> Result<RecoveryTerminalRead<RecoveryFulfillmentAuthority>, RecoveryRepositoryError> {
+) -> Result<RecoveryFulfillmentRead, RecoveryRepositoryError> {
     let (request_id, transition_id, coordinate) = match mutation.projection() {
         VerifiedMutationProjection::LeafRecoveryFulfillment(value) => (
             Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
@@ -1753,12 +2467,14 @@ pub(crate) async fn prepare_recovery_fulfillment_authority(
     match context.classification {
         RecoveryTerminalClassification::OpenLive => {
             require_coordinate(&context.context.head, &coordinate)?;
-            Ok(RecoveryTerminalRead::Authority(
+            Ok(RecoveryFulfillmentRead::Execute(
                 context.into_fulfillment_authority(transition_id)?,
             ))
         }
-        RecoveryTerminalClassification::OpenDue => Ok(RecoveryTerminalRead::DueForExpiry(
-            context.into_expiry_authority()?,
+        RecoveryTerminalClassification::OpenDue => Ok(RecoveryFulfillmentRead::DueForExpiry(
+            RecoveryFulfillmentDueForExpiry {
+                authority: context.into_expiry_authority()?,
+            },
         )),
         RecoveryTerminalClassification::RetainedFulfilled
             if context.fulfilling_transition_id == Some(transition_id) =>
@@ -1769,9 +2485,22 @@ pub(crate) async fn prepare_recovery_fulfillment_authority(
             // without a completed receipt is an invariant failure.
             Err(RecoveryRepositoryError::InvalidDurableRow)
         }
-        retained => Ok(RecoveryTerminalRead::Retained(
-            context.into_retained_terminal(retained),
-        )),
+        retained => {
+            let RecoveryClientTerminalDisposition::Retained(error) =
+                classify_client_terminal_disposition(
+                    RecoveryClientTerminalAction::Fulfill,
+                    retained,
+                )
+            else {
+                return Err(RecoveryRepositoryError::InvalidDurableRow);
+            };
+            Ok(RecoveryFulfillmentRead::Classified(
+                RecoveryFulfillmentRetained {
+                    prelude: context.into_retained_prelude(),
+                    error,
+                },
+            ))
+        }
     }
 }
 
@@ -1993,12 +2722,21 @@ pub(crate) async fn prepare_recovery_expiry_authority(
                 &reservation,
                 &package,
             );
+            let aggregate_cross_binding = RecoveryAggregateCrossBinding::seal(
+                &transaction_id,
+                trusted_instant,
+                &aggregate,
+                &head,
+            )?;
             Ok(RecoverySchedulerExpiryRead::Authority(
                 RecoverySchedulerExpiryAuthority {
                     sql_authority: RecoverySqlAuthoritySeal::mint(),
                     transaction_id: transaction_id.into_boxed_str(),
                     trusted_instant,
+                    graph_actor_did: locator.requester_did.into_boxed_str(),
+                    graph_actor_device_id: locator.requester_device_id,
                     aggregate,
+                    aggregate_cross_binding,
                     execution_package,
                     head,
                     request,
@@ -2010,9 +2748,8 @@ pub(crate) async fn prepare_recovery_expiry_authority(
         }
         RecoveryTerminalClassification::OpenLive => Err(RecoveryRepositoryError::ExpiryNotDue),
         retained => Ok(RecoverySchedulerExpiryRead::Retained(
-            RecoveryRetainedTerminal {
-                classification: retained,
-                prelude: None,
+            RecoverySchedulerRetainedTerminal {
+                _classification: retained,
             },
         )),
     }
@@ -2078,7 +2815,10 @@ impl PreparedTerminalContext {
             prelude: self.context.prelude,
             transaction_id: self.context.transaction_id,
             trusted_instant: self.context.trusted_instant,
+            graph_actor_did: self.context.actor_did,
+            graph_actor_device_id: self.context.actor_device_id,
             aggregate: self.context.aggregate,
+            aggregate_cross_binding: self.context.aggregate_cross_binding,
             execution_package: self
                 .execution_package
                 .ok_or(RecoveryRepositoryError::ReadSetMismatch)?,
@@ -2090,14 +2830,8 @@ impl PreparedTerminalContext {
         })
     }
 
-    fn into_retained_terminal(
-        self,
-        classification: RecoveryTerminalClassification,
-    ) -> RecoveryRetainedTerminal {
-        RecoveryRetainedTerminal {
-            classification,
-            prelude: Some(self.context.prelude),
-        }
+    fn into_retained_prelude(self) -> PreparedBusinessPrelude {
+        self.context.prelude
     }
 }
 
@@ -2181,6 +2915,8 @@ async fn prepare_client_terminal_context(
         &head,
         &evidence,
     );
+    let aggregate_cross_binding =
+        RecoveryAggregateCrossBinding::seal(&transaction_id, trusted_instant, &aggregate, &head)?;
     Ok(PreparedTerminalContext {
         context: RecoveryAuthorityContext {
             sql_authority: RecoverySqlAuthoritySeal::mint(),
@@ -2192,6 +2928,7 @@ async fn prepare_client_terminal_context(
             actor_key_id: actor_key_id.into_boxed_str(),
             actor_auth_generation,
             aggregate,
+            aggregate_cross_binding,
             verified_mutation,
             head,
             evidence,
@@ -2244,6 +2981,71 @@ async fn reverify_scoped_request(
     }
     reverify_persisted_request(request, &signing_public_key)?;
     Ok(signing_public_key)
+}
+
+#[cfg(test)]
+mod aggregate_cross_binding_tests {
+    use super::*;
+
+    fn fixture() -> RecoveryAggregateCrossBinding {
+        let mut binding = RecoveryAggregateCrossBinding {
+            transaction_id: "101".into(),
+            trusted_instant: DateTime::<Utc>::from_timestamp_millis(1_900_000_000_000).unwrap(),
+            conversation_id: Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
+            generation: 7,
+            state_version: 11,
+            group_id: [0x10; 32],
+            epoch: 13,
+            group_context_hash: [0x20; 32],
+            confirmation_tag: [0x30; 32],
+            aggregate_head_digest: [0x40; 32],
+            aggregate_graph_digest: [0x50; 32],
+            aggregate_snapshot_digest: Some([0x60; 32]),
+            recovery_head_digest: [0x70; 32],
+            recovery_graph_digest: [0x80; 32],
+            seal_digest: [0; 32],
+        };
+        binding.seal_digest = binding.rederive_digest();
+        binding
+    }
+
+    #[test]
+    fn cross_binding_digest_changes_for_every_sealed_authority_dimension() {
+        let baseline = fixture();
+        let expected = baseline.rederive_digest();
+        assert_eq!(baseline.seal_digest, expected);
+
+        macro_rules! rejects_drift {
+            ($field:ident, $value:expr) => {{
+                let mut drifted = fixture();
+                drifted.$field = $value;
+                assert_ne!(
+                    drifted.rederive_digest(),
+                    expected,
+                    "digest did not bind {}",
+                    stringify!($field)
+                );
+            }};
+        }
+
+        rejects_drift!(transaction_id, "102".into());
+        rejects_drift!(
+            trusted_instant,
+            DateTime::<Utc>::from_timestamp_millis(1_900_000_000_001).unwrap()
+        );
+        rejects_drift!(conversation_id, Uuid::new_v4());
+        rejects_drift!(generation, 8);
+        rejects_drift!(state_version, 12);
+        rejects_drift!(group_id, [0x11; 32]);
+        rejects_drift!(epoch, 14);
+        rejects_drift!(group_context_hash, [0x21; 32]);
+        rejects_drift!(confirmation_tag, [0x31; 32]);
+        rejects_drift!(aggregate_head_digest, [0x41; 32]);
+        rejects_drift!(aggregate_graph_digest, [0x51; 32]);
+        rejects_drift!(aggregate_snapshot_digest, None);
+        rejects_drift!(recovery_head_digest, [0x71; 32]);
+        rejects_drift!(recovery_graph_digest, [0x81; 32]);
+    }
 }
 
 async fn lock_head_graph(
@@ -2534,6 +3336,19 @@ fn require_persisted_idempotency_key(
     }
 }
 
+pub(crate) fn expired_recovery_package_shape_valid(
+    status: &str,
+    not_after: DateTime<Utc>,
+    terminal_at: Option<DateTime<Utc>>,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+) -> bool {
+    status == "expired"
+        && terminal_transition_id.is_none()
+        && terminal_revocation_id.is_none()
+        && terminal_at == Some(not_after)
+}
+
 fn validate_terminal_shapes(
     classification: RecoveryTerminalClassification,
     request: &RecoveryRequestRow,
@@ -2623,9 +3438,14 @@ fn validate_terminal_shapes(
                 && request.terminal_at == Some(request.expires_at)
                 && reservation.terminal_at == Some(request.expires_at)
                 && ((package.status == "available" && package_terminal_null)
-                    || (package.status == "expired"
-                        && package.not_after == request.expires_at
-                        && package.terminal_at == Some(package.not_after)))
+                    || (package.not_after == request.expires_at
+                        && expired_recovery_package_shape_valid(
+                            &package.status,
+                            package.not_after,
+                            package.terminal_at,
+                            package.terminal_transition_id,
+                            package.terminal_revocation_id,
+                        )))
         }
         RecoveryTerminalClassification::RetainedSuperseded => {
             validate_superseded_terminal_shapes(request, reservation, package)
@@ -2845,6 +3665,9 @@ async fn validate_client_context(
 ) -> Result<(), RecoveryRepositoryError> {
     let transaction_id = live_transaction_id(transaction).await?;
     if transaction_id != &*context.transaction_id
+        || !context
+            .aggregate_cross_binding
+            .validates(&context.aggregate, &context.head)
         || context.authority_digest
             != client_authority_digest(
                 &context.transaction_id,

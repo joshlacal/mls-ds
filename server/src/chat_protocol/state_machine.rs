@@ -32,8 +32,9 @@ use super::repository::core::{
 use super::repository::prelude::{OperationCompletionGuard, ScopeBoundBusinessAuthority};
 #[cfg(not(test))]
 use super::repository::recovery::{
-    RecoveryCancellationPlanInput, RecoveryClientExpiryPlanInput, RecoveryFulfillmentPlanInput,
-    RecoveryRequestPlanInput, RecoverySchedulerExpiryPlanInput,
+    RecoveryCancellationPlanInput, RecoveryClientExpiryPlanInput, RecoveryClientTerminalError,
+    RecoveryFulfillmentPlanInput, RecoveryPersistenceWitness, RecoveryRequestPlanInput,
+    RecoverySchedulerExpiryPlanInput,
 };
 use super::repository::relationship::{
     consume_locked_acceptance_projection, consume_locked_creation_projection,
@@ -1155,6 +1156,7 @@ pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
     scope_authority: ScopeBoundBusinessAuthority,
     completion: OperationCompletionGuard,
     accepted_control_entry_bytes: Option<Vec<u8>>,
+    persistence_witness: RecoveryPersistenceWitness,
     kind: RecoveryPlannedKind,
 }
 
@@ -1167,6 +1169,7 @@ impl PlannedRecoveryMutation {
         ScopeBoundBusinessAuthority,
         OperationCompletionGuard,
         Option<Vec<u8>>,
+        RecoveryPersistenceWitness,
         RecoveryPlannedKind,
     ) {
         (
@@ -1174,6 +1177,7 @@ impl PlannedRecoveryMutation {
             self.scope_authority,
             self.completion,
             self.accepted_control_entry_bytes,
+            self.persistence_witness,
             self.kind,
         )
     }
@@ -1186,6 +1190,8 @@ pub(in crate::chat_protocol) struct PlannedClientRecoveryExpiry {
     completion: OperationCompletionGuard,
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
+    persistence_witness: RecoveryPersistenceWitness,
+    post_apply_error: RecoveryClientTerminalError,
 }
 
 #[cfg(not(test))]
@@ -1198,6 +1204,8 @@ impl PlannedClientRecoveryExpiry {
         OperationCompletionGuard,
         Uuid,
         ServerTimestamp,
+        RecoveryPersistenceWitness,
+        RecoveryClientTerminalError,
     ) {
         (
             self.transition,
@@ -1205,6 +1213,8 @@ impl PlannedClientRecoveryExpiry {
             self.completion,
             self.recovery_request_id,
             self.terminal_at,
+            self.persistence_witness,
+            self.post_apply_error,
         )
     }
 }
@@ -1214,12 +1224,25 @@ pub(in crate::chat_protocol) struct PlannedSchedulerRecoveryExpiry {
     transition: PlannedTransition,
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
+    persistence_witness: RecoveryPersistenceWitness,
 }
 
 #[cfg(not(test))]
 impl PlannedSchedulerRecoveryExpiry {
-    pub(in crate::chat_protocol) fn into_parts(self) -> (PlannedTransition, Uuid, ServerTimestamp) {
-        (self.transition, self.recovery_request_id, self.terminal_at)
+    pub(in crate::chat_protocol) fn into_parts(
+        self,
+    ) -> (
+        PlannedTransition,
+        Uuid,
+        ServerTimestamp,
+        RecoveryPersistenceWitness,
+    ) {
+        (
+            self.transition,
+            self.recovery_request_id,
+            self.terminal_at,
+            self.persistence_witness,
+        )
     }
 }
 
@@ -3027,6 +3050,7 @@ impl HydrationAuthority {
             scope_authority,
             completion,
             accepted_control_entry_bytes: None,
+            persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Request {
                 recovery_request_id: request_id,
             },
@@ -3069,6 +3093,7 @@ impl HydrationAuthority {
             scope_authority,
             completion,
             accepted_control_entry_bytes: None,
+            persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Cancellation {
                 recovery_request_id: request_id,
             },
@@ -3147,6 +3172,7 @@ impl HydrationAuthority {
             scope_authority,
             completion,
             accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Fulfillment {
                 recovery_request_id: request_id,
                 transition_id: parts.transition_id,
@@ -3189,6 +3215,8 @@ impl HydrationAuthority {
             completion,
             recovery_request_id: parts.request_id,
             terminal_at,
+            persistence_witness: parts.persistence_witness,
+            post_apply_error: parts.post_apply_error,
         })
     }
 
@@ -3217,6 +3245,7 @@ impl HydrationAuthority {
             transition,
             recovery_request_id: parts.request_id,
             terminal_at: ServerTimestamp::from_unix_millis(parts.terminal_at.timestamp_millis())?,
+            persistence_witness: parts.persistence_witness,
         })
     }
 
@@ -17562,6 +17591,8 @@ pub(in crate::chat_protocol) mod executor {
         plan: &'plan ConversationPersistencePlan,
         context: ExecutionContext,
         expected_transaction_id: Box<str>,
+        recovery_witness:
+            Option<&'plan crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness>,
         _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
         #[cfg(test)]
         drop_safety_probe: Option<DropSafetyProbe>,
@@ -17581,6 +17612,7 @@ pub(in crate::chat_protocol) mod executor {
                 plan,
                 context,
                 expected_transaction_id,
+                recovery_witness: None,
                 _proof: proof,
                 #[cfg(test)]
                 drop_safety_probe: None,
@@ -17592,6 +17624,14 @@ pub(in crate::chat_protocol) mod executor {
         #[cfg(test)]
         pub(crate) fn with_drop_safety_probe_for_test(mut self, probe: DropSafetyProbe) -> Self {
             self.drop_safety_probe = Some(probe);
+            self
+        }
+
+        pub(in crate::chat_protocol) fn with_recovery_witness(
+            mut self,
+            witness: &'plan crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        ) -> Self {
+            self.recovery_witness = Some(witness);
             self
         }
     }
@@ -19252,6 +19292,9 @@ pub(in crate::chat_protocol) mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &ConversationPersistencePlan,
         ctx: &ExecutionContext,
+        recovery_witness: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         require_execution_authority(effects.kind(), &ctx.authority)?;
@@ -19287,6 +19330,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
+                    recovery_witness,
                 )
                 .await;
             }
@@ -19299,6 +19343,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
+                    recovery_witness,
                 )
                 .await;
             }
@@ -19311,6 +19356,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
+                    recovery_witness,
                 )
                 .await;
             }
@@ -19495,6 +19541,7 @@ pub(in crate::chat_protocol) mod executor {
                         generation,
                         state_version,
                         epoch,
+                        recovery_witness,
                     )
                     .await
                 } else {
@@ -19637,6 +19684,7 @@ pub(in crate::chat_protocol) mod executor {
             plan,
             context,
             expected_transaction_id,
+            recovery_witness,
             _proof,
             #[cfg(test)]
             drop_safety_probe,
@@ -19654,7 +19702,13 @@ pub(in crate::chat_protocol) mod executor {
                 if live_transaction_id == expected_transaction_id.as_ref()
                     && plan_transaction_bindings_match(plan, expected_transaction_id.as_ref()) =>
             {
-                apply_conversation_persistence_plan_inner(&mut savepoint, plan, &context).await
+                apply_conversation_persistence_plan_inner(
+                    &mut savepoint,
+                    plan,
+                    &context,
+                    recovery_witness,
+                )
+                .await
             }
             Ok(_) => Err(ExecutorError::TransactionBindingMismatch),
             Err(error) => Err(ExecutorError::TransactionIdentity(error)),
@@ -19690,7 +19744,7 @@ pub(in crate::chat_protocol) mod executor {
         plan: &ConversationPersistencePlan,
         context: &ExecutionContext,
     ) -> Result<AppliedTransition, ExecutorError> {
-        apply_conversation_persistence_plan_inner(transaction, plan, context).await
+        apply_conversation_persistence_plan_inner(transaction, plan, context, None).await
     }
 
     /// Apply an entry-less `leafRecoveryRequest` internal op. The coordinate and
@@ -19707,6 +19761,9 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
+        recovery_witness: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         let applied_at = ctx.applied_at;
@@ -19784,7 +19841,14 @@ pub(in crate::chat_protocol) mod executor {
             PackageStatus::Reserved,
         )?;
 
-        // 1. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
+        // 1. The repository-owned exact package/request/reservation witness is
+        //    the first durable mutation for production Recovery. The test-only
+        //    raw executor seam retains its legacy reconstruction path.
+        if let Some(witness) = recovery_witness {
+            witness.apply_open(transaction).await?;
+        }
+
+        // 2. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
         //    (successor == expected on every column). A drifted head is a typed
         //    conflict; a matched head is a no-op update that pins the read.
         transition::cas_conversation_head(
@@ -19802,8 +19866,9 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
 
-        // 2. The atomic recovery open (request + reservation + package reserve).
-        write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
+        if recovery_witness.is_none() {
+            write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
+        }
 
         // 3. No control entry (internal op) -> no entry recipients; only events.
         let event_positions = write_events(transaction, ctx).await?;
@@ -21434,6 +21499,9 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
+        recovery_witness: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         let applied_at = ctx.applied_at;
@@ -21523,7 +21591,14 @@ pub(in crate::chat_protocol) mod executor {
         // reservation records, per the cancelled-status mapping cross-check.
         let terminal_request_digest = ctx.entry().request_digest.clone();
 
-        // 1. Head CAS VERIFY (coordinate + seq counter unchanged).
+        // 1. Production consumes the Task-4 full-row triple as the first
+        //    durable mutation. The enclosing executor savepoint rolls it back
+        //    if the later head/event/completion composition fails.
+        if let Some(witness) = recovery_witness {
+            witness.apply_terminal(transaction).await?;
+        }
+
+        // 2. Head CAS VERIFY (coordinate + seq counter unchanged).
         transition::cas_conversation_head(
             transaction,
             &transition::ConversationHeadCas {
@@ -21539,39 +21614,37 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
 
-        // 2. Terminalize the request as cancelled with its signed provenance.
-        transition::terminalize_leaf_recovery_request(
-            transaction,
-            recovery_request_id,
-            &LeafRecoveryTermination::Cancelled {
-                terminal_signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
-                terminal_signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
-                terminal_request_digest: terminal_request_digest.clone(),
-                terminal_signature: ctx.entry().signature.clone(),
-                terminal_at: applied_at,
-            },
-        )
-        .await?;
-
-        // 3. Release the reservation by the same signed cancellation request digest.
-        transition::terminalize_reservation(
-            transaction,
-            recovery_request_id,
-            &ReservationTermination::ReleasedByRequestDigest {
-                terminal_request_digest,
-                terminal_at: applied_at,
-            },
-        )
-        .await?;
-
-        // 4. Re-activate the reserved package back to the available pool.
-        transition::cas_key_package_status(
-            transaction,
-            &key_package_ref,
-            RepoPackageStatus::Reserved,
-            &PackageSuccessor::Reactivate,
-        )
-        .await?;
+        if recovery_witness.is_none() {
+            // Test-only raw-executor compatibility path.
+            transition::terminalize_leaf_recovery_request(
+                transaction,
+                recovery_request_id,
+                &LeafRecoveryTermination::Cancelled {
+                    terminal_signed_request_bytes: ctx.entry().signed_request_bytes.clone(),
+                    terminal_signing_transcript_bytes: ctx.entry().signing_transcript_bytes.clone(),
+                    terminal_request_digest: terminal_request_digest.clone(),
+                    terminal_signature: ctx.entry().signature.clone(),
+                    terminal_at: applied_at,
+                },
+            )
+            .await?;
+            transition::terminalize_reservation(
+                transaction,
+                recovery_request_id,
+                &ReservationTermination::ReleasedByRequestDigest {
+                    terminal_request_digest,
+                    terminal_at: applied_at,
+                },
+            )
+            .await?;
+            transition::cas_key_package_status(
+                transaction,
+                &key_package_ref,
+                RepoPackageStatus::Reserved,
+                &PackageSuccessor::Reactivate,
+            )
+            .await?;
+        }
 
         // 5. No control entry (internal op); only events.
         let event_positions = write_events(transaction, ctx).await?;
@@ -21596,6 +21669,9 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
+        recovery_witness: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         let head = effects
@@ -21721,7 +21797,11 @@ pub(in crate::chat_protocol) mod executor {
         if ctx.events.len() != 1
             || ctx.events[0].event_kind != EventKind::LeafRecovery
             || ctx.events[0].payload_bytes
-                != delivery::canonical_leaf_recovery_event_payload(operation_id, "expired")
+                != delivery::canonical_leaf_recovery_event_payload(
+                    operation_id,
+                    conversation_id,
+                    delivery::LeafRecoveryEventStatus::Expired,
+                )
             || ctx.events[0].outbox.len() != 1
             || ctx.events[0].outbox[0].1 != OutboxWorkKind::Stream
         {
@@ -21730,6 +21810,9 @@ pub(in crate::chat_protocol) mod executor {
             ));
         }
 
+        if let Some(witness) = recovery_witness {
+            witness.apply_terminal(transaction).await?;
+        }
         transition::cas_conversation_head(
             transaction,
             &transition::ConversationHeadCas {
@@ -21744,30 +21827,32 @@ pub(in crate::chat_protocol) mod executor {
             },
         )
         .await?;
-        transition::terminalize_leaf_recovery_request(
-            transaction,
-            operation_id,
-            &LeafRecoveryTermination::Expired { terminal_at },
-        )
-        .await?;
-        transition::terminalize_reservation(
-            transaction,
-            operation_id,
-            &ReservationTermination::Expired { terminal_at },
-        )
-        .await?;
-        let successor = match package_edge.to() {
-            PackageStatus::Available => PackageSuccessor::Reactivate,
-            PackageStatus::Expired => PackageSuccessor::Expire { terminal_at },
-            _ => unreachable!("expiry package successor checked above"),
-        };
-        transition::cas_key_package_status(
-            transaction,
-            expired.key_package_ref(),
-            RepoPackageStatus::Reserved,
-            &successor,
-        )
-        .await?;
+        if recovery_witness.is_none() {
+            transition::terminalize_leaf_recovery_request(
+                transaction,
+                operation_id,
+                &LeafRecoveryTermination::Expired { terminal_at },
+            )
+            .await?;
+            transition::terminalize_reservation(
+                transaction,
+                operation_id,
+                &ReservationTermination::Expired { terminal_at },
+            )
+            .await?;
+            let successor = match package_edge.to() {
+                PackageStatus::Available => PackageSuccessor::Reactivate,
+                PackageStatus::Expired => PackageSuccessor::Expire { terminal_at },
+                _ => unreachable!("expiry package successor checked above"),
+            };
+            transition::cas_key_package_status(
+                transaction,
+                expired.key_package_ref(),
+                RepoPackageStatus::Reserved,
+                &successor,
+            )
+            .await?;
+        }
         let event_positions = write_events(transaction, ctx).await?;
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
@@ -21806,6 +21891,9 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         epoch: i64,
+        recovery_witness: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         let hydration = plan.state();
@@ -22232,35 +22320,42 @@ pub(in crate::chat_protocol) mod executor {
             ));
         }
 
-        // 9. Terminalize: request fulfilled, reservation consumed, package consumed.
-        transition::terminalize_leaf_recovery_request(
-            transaction,
-            recovery_request_id,
-            &LeafRecoveryTermination::Fulfilled {
-                fulfilling_transition_id: transition_id,
-                terminal_at: applied_at,
-            },
-        )
-        .await?;
-        transition::terminalize_reservation(
-            transaction,
-            recovery_request_id,
-            &ReservationTermination::Consumed {
-                consumed_transition_id: transition_id,
-                terminal_at: applied_at,
-            },
-        )
-        .await?;
-        transition::cas_key_package_status(
-            transaction,
-            &reserved_ref,
-            RepoPackageStatus::Reserved,
-            &PackageSuccessor::Consume {
-                terminal_transition_id: transition_id,
-                terminal_at: applied_at,
-            },
-        )
-        .await?;
+        // 9. Terminalize the exact full-row triple. This remains after the
+        //    transition insert because the fulfilled rows reference it, while
+        //    the prewrite reread already rejected all triple drift before the
+        //    savepoint's first mutation.
+        if let Some(witness) = recovery_witness {
+            witness.apply_terminal(transaction).await?;
+        } else {
+            transition::terminalize_leaf_recovery_request(
+                transaction,
+                recovery_request_id,
+                &LeafRecoveryTermination::Fulfilled {
+                    fulfilling_transition_id: transition_id,
+                    terminal_at: applied_at,
+                },
+            )
+            .await?;
+            transition::terminalize_reservation(
+                transaction,
+                recovery_request_id,
+                &ReservationTermination::Consumed {
+                    consumed_transition_id: transition_id,
+                    terminal_at: applied_at,
+                },
+            )
+            .await?;
+            transition::cas_key_package_status(
+                transaction,
+                &reserved_ref,
+                RepoPackageStatus::Reserved,
+                &PackageSuccessor::Consume {
+                    terminal_transition_id: transition_id,
+                    terminal_at: applied_at,
+                },
+            )
+            .await?;
+        }
 
         // 10. Welcome bundle + delivery (expires_at == consumed package not_after).
         let welcome_id = Uuid::from_bytes(*welcome.welcome_id());

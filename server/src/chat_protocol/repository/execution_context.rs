@@ -21,6 +21,7 @@ use super::core::LockedG6Prelude;
 use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
 };
+use super::recovery::PreparedRecoveryExecutionGraph;
 use super::transition::{ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
 #[cfg(test)]
@@ -1193,7 +1194,8 @@ fn canonical_recovery_primary_event_payload(
                 .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
             Ok(super::delivery::canonical_leaf_recovery_event_payload(
                 Uuid::from_bytes(*request.request_id()),
-                "open",
+                Uuid::from_bytes(*request.bound_coordinate().conversation_id()),
+                super::delivery::LeafRecoveryEventStatus::Open,
             ))
         }
         PlanKind::RecoveryCancellation => {
@@ -1215,7 +1217,8 @@ fn canonical_recovery_primary_event_payload(
                 .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
             Ok(super::delivery::canonical_leaf_recovery_event_payload(
                 Uuid::from_bytes(*request.request_id()),
-                "cancelled",
+                Uuid::from_bytes(*request.bound_coordinate().conversation_id()),
+                super::delivery::LeafRecoveryEventStatus::Cancelled,
             ))
         }
         PlanKind::RecoveryExpiry => {
@@ -1237,7 +1240,8 @@ fn canonical_recovery_primary_event_payload(
                 .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
             Ok(super::delivery::canonical_leaf_recovery_event_payload(
                 Uuid::from_bytes(*request.request_id()),
-                "expired",
+                Uuid::from_bytes(*request.bound_coordinate().conversation_id()),
+                super::delivery::LeafRecoveryEventStatus::Expired,
             ))
         }
         PlanKind::Commit
@@ -1262,6 +1266,7 @@ fn canonical_recovery_primary_event_payload(
                 .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
             Ok(super::delivery::canonical_welcome_available_event_payload(
                 Uuid::from_bytes(*welcome.welcome_id()),
+                Uuid::from_bytes(*welcome.coordinate().conversation_id()),
             ))
         }
         _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
@@ -1955,12 +1960,12 @@ pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'pl
 /// facade and is required only for fulfillment.
 pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'connection, 'plan>(
     transaction: &'borrow mut Transaction<'connection, Postgres>,
-    plan: &'plan ConversationPersistencePlan,
-    accepted_control_entry_bytes: Option<Vec<u8>>,
+    graph: &'plan PreparedRecoveryExecutionGraph,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
 > {
+    let plan = graph.plan();
     let valid = matches!(
         plan.effects().kind(),
         PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation | PlanKind::RecoveryExpiry
@@ -1976,18 +1981,23 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
     if !valid {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
+    graph
+        .persistence_witness()
+        .validate_prewrite(transaction, plan)
+        .await?;
     let primary_event_payload = canonical_recovery_primary_event_payload(plan)?;
     hydrate_execution_context(
         transaction,
         plan,
         ExecutionContextArtifacts {
-            accepted_control_entry_bytes,
+            accepted_control_entry_bytes: graph.accepted_control_entry_bytes(),
             genesis_group_info_bytes: None,
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
         },
     )
     .await
+    .map(|prepared| prepared.with_recovery_witness(graph.persistence_witness()))
 }
 
 pub(in crate::chat_protocol) async fn apply_prepared_recovery_execution(

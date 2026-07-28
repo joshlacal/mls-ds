@@ -5644,8 +5644,8 @@ mod historical_control_loader {
     // row) whose `prior` coordinate binds the fresh conversation id. The loader
     // pairs the two tables 1:1, re-mints the request ORIGIN through the signed-path
     // loader seam, and byte-equals the direct in-memory re-mint. The terminal
-    // (`fulfilled`/`consumed`) and real `acceptConversation` arms are exercised
-    // below; malformed terminal families remain fail-closed.
+    // Every retained terminal family and the real `acceptConversation` arm are
+    // exercised below; malformed terminal shapes remain fail-closed.
     // -----------------------------------------------------------------------
     pub(crate) mod recovery_leg {
         use std::collections::BTreeSet;
@@ -5677,9 +5677,10 @@ mod historical_control_loader {
             build_real_corpus_creation_entry, build_real_creation_entry, RealCreationEntry,
         };
         use super::reset_leave_leg::{
+            build_real_commit, build_real_commit_with_signed_at,
             build_real_control_request_entry_with_id_at_and_signed_at, build_real_reset_activation,
-            build_real_reset_activation_with_lifetime_for_test, mutate_real_reset_activation,
-            RealResetActivation, RESET_ENTRY_KIND,
+            build_real_reset_activation_with_lifetime_for_test, insert_real_commit,
+            mutate_real_reset_activation, RealResetActivation, RESET_ENTRY_KIND,
         };
         use super::{
             seed_real_creation_graph, seed_real_creation_graph_with_public_state_and_group_info,
@@ -5711,11 +5712,13 @@ mod historical_control_loader {
             load_welcome_hydration_rows, lock_welcome_terminal,
             locked_revocation_packages_match_fanout_for_test, map_recovery_control_evidence_error,
             recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
-            select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
-            FulfilledRecoveryTerminalColumns, InvitationQuotaHydrationError,
-            LockedConversationHeadGuard, LockedG6Prelude, LockedRecoveryPackageStatus,
-            LockedRevocationPackageGuard, RecoveryHydrationError, RecoveryPackageHydrationError,
-            WelcomeTerminalColumns, WelcomeTerminalSelection,
+            select_recovery_request_terminal, select_single_acceptance_origin,
+            select_welcome_terminal, ControlEvidenceLoadError, FulfilledRecoveryTerminalColumns,
+            InvitationQuotaHydrationError, LockedConversationHeadGuard, LockedG6Prelude,
+            LockedRecoveryPackageStatus, LockedRevocationPackageGuard, RecoveryHydrationError,
+            RecoveryPackageHydrationError, RecoveryRequestTerminalColumns,
+            RecoveryRequestTerminalSelection, RecoveryReservationTerminal, WelcomeTerminalColumns,
+            WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
             append_event, canonical_welcome_disposition_event_payload, enqueue_outbox,
@@ -5738,7 +5741,10 @@ mod historical_control_loader {
             seal_non_add_policy_no_pending_admission, seal_recovery_fallback_scope,
             LockedRelationshipDecisionGuard,
         };
-        use crate::chat_protocol::repository::transition::TransitionActorRole;
+        use crate::chat_protocol::repository::transition::{
+            cas_registration_revoke, insert_device_revocation, NewDeviceRevocation,
+            RegistrationRevoke, TransitionActorRole,
+        };
         use crate::chat_protocol::snapshot::{
             PublicGroupSnapshotCoordinate, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
             PublicGroupSnapshotTreeSummary,
@@ -21469,6 +21475,81 @@ mod historical_control_loader {
             }
         }
 
+        fn build_signed_recovery_cancellation(
+            entry: &RealCreationEntry,
+            request_id: [u8; 16],
+        ) -> SignedRecoveryRequest {
+            let signing_key = entry.signing_key();
+            let kind = SignedMutationKind::LeafRecoveryCancellation;
+            let body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "idempotencyKey": Uuid::new_v4().hyphenated().to_string(),
+                "signedAt": FULFILLMENT_SIGNED_AT,
+                "recoveryRequestId": Uuid::from_bytes(request_id).hyphenated().to_string(),
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("recovery cancellation canonicalizes");
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            decode_and_verify_signed_mutation(&raw_wrapper, &entry.public_key)
+                .expect("recovery cancellation verifies");
+            SignedRecoveryRequest {
+                raw_wrapper,
+                request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                signature: signature.to_vec(),
+                signing_transcript,
+            }
+        }
+
+        fn build_signed_recovery_revocation(
+            entry: &RealCreationEntry,
+            target_device_id: Uuid,
+        ) -> (Uuid, SignedRecoveryRequest) {
+            let revocation_id = Uuid::new_v4();
+            let signing_key = entry.signing_key();
+            let kind = SignedMutationKind::DeviceRevocation;
+            let body = json!({
+                "$type": kind.type_id(),
+                "signatureDomain": String::from_utf8(kind.domain().to_vec()).unwrap(),
+                "actorDid": entry.actor_did,
+                "actorDeviceId": entry.actor_device_id.hyphenated().to_string(),
+                "keyId": entry.actor_key_id,
+                "authGeneration": 1,
+                "targetDeviceId": target_device_id.hyphenated().to_string(),
+                "targetAuthGeneration": 1,
+                "idempotencyKey": revocation_id.hyphenated().to_string(),
+                "signedAt": FULFILLMENT_SIGNED_AT,
+            });
+            let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
+            let unsigned = serde_json::to_vec(&wrapper).unwrap();
+            let canonical = decode_canonical_signed_mutation(&unsigned)
+                .expect("Recovery revocation canonicalizes");
+            let signing_transcript = canonical.transcript_bytes().to_vec();
+            let signature = signing_key.sign(&signing_transcript).to_bytes();
+            wrapper["signature"] = Value::String(STANDARD.encode(signature));
+            let raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
+            decode_and_verify_signed_mutation(&raw_wrapper, &entry.public_key)
+                .expect("Recovery revocation verifies");
+            (
+                revocation_id,
+                SignedRecoveryRequest {
+                    raw_wrapper,
+                    request_digest: Sha256::digest(&signing_transcript).to_vec(),
+                    signature: signature.to_vec(),
+                    signing_transcript,
+                },
+            )
+        }
+
         struct RecoverySeed {
             request_id: [u8; 16],
             key_package_ref: [u8; 32],
@@ -21557,6 +21638,130 @@ mod historical_control_loader {
             source: &str,
         ) -> RecoverySeed {
             let creation_transition_id = seed_real_creation_graph(pool, entry).await;
+            insert_recovery_pair_on_existing_graph(
+                pool,
+                entry,
+                source,
+                creation_transition_id,
+                KP_NOT_AFTER,
+                None,
+                SIGNED_AT,
+                REQUESTED_AT,
+                EXPIRES_AT,
+            )
+            .await
+        }
+
+        async fn seed_additional_recovery_pair(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            source: &str,
+        ) -> RecoverySeed {
+            let creation_transition_id: Uuid = sqlx::query_scalar(
+                "SELECT producing_transition_id FROM chat.generation_states \
+                 WHERE conversation_id=$1 AND generation=0 AND state_version=0",
+            )
+            .bind(Uuid::from_bytes(entry.cid))
+            .fetch_one(pool)
+            .await
+            .expect("existing creation transition");
+            insert_recovery_pair_on_existing_graph(
+                pool,
+                entry,
+                source,
+                creation_transition_id,
+                KP_NOT_AFTER,
+                None,
+                SIGNED_AT,
+                REQUESTED_AT,
+                EXPIRES_AT,
+            )
+            .await
+        }
+
+        async fn seed_recovery_pair_expiring_with_package(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> RecoverySeed {
+            let creation_transition_id = seed_real_creation_graph(pool, entry).await;
+            insert_recovery_pair_on_existing_graph(
+                pool,
+                entry,
+                "requestLeafRecovery",
+                creation_transition_id,
+                EXPIRES_AT,
+                None,
+                SIGNED_AT,
+                REQUESTED_AT,
+                EXPIRES_AT,
+            )
+            .await
+        }
+
+        async fn seed_current_coordinate_recovery_pair(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+        ) -> RecoverySeed {
+            let cid = Uuid::from_bytes(entry.cid);
+            let (
+                generation,
+                state_version,
+                group_id,
+                epoch,
+                group_context_hash,
+                confirmation_tag,
+                producer,
+            ): (i64, i64, Vec<u8>, i64, Vec<u8>, Vec<u8>, Uuid) = sqlx::query_as(
+                r#"SELECT c.current_generation,c.current_state_version,
+                          state.group_id,state.epoch,state.group_context_hash,
+                          state.confirmation_tag,state.producing_transition_id
+                   FROM chat.conversations c
+                   JOIN chat.generation_states state
+                     ON state.conversation_id=c.conversation_id
+                    AND state.generation=c.current_generation
+                    AND state.state_version=c.current_state_version
+                   WHERE c.conversation_id=$1 AND c.lifecycle='active'
+                     AND state.lifecycle='active'"#,
+            )
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("load current coordinate for unrelated Recovery");
+            let coordinate = PublicGroupSnapshotCoordinate::new(
+                entry.cid,
+                u64::try_from(generation).unwrap(),
+                u64::try_from(state_version).unwrap(),
+                group_id.try_into().unwrap(),
+                u64::try_from(epoch).unwrap(),
+                group_context_hash.try_into().unwrap(),
+                confirmation_tag.try_into().unwrap(),
+                PublicGroupSnapshotLifecycle::Active,
+            );
+            insert_recovery_pair_on_existing_graph(
+                pool,
+                entry,
+                "requestLeafRecovery",
+                producer,
+                KP_NOT_AFTER,
+                Some(&coordinate),
+                "2026-07-27T04:06:10.500Z",
+                "2026-07-27T04:06:11.000Z",
+                "2026-07-27T04:11:11.000Z",
+            )
+            .await
+        }
+
+        async fn insert_recovery_pair_on_existing_graph(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            source: &str,
+            creation_transition_id: Uuid,
+            package_not_after: &str,
+            prior: Option<&PublicGroupSnapshotCoordinate>,
+            signed_at: &str,
+            requested_at: &str,
+            expires_at: &str,
+        ) -> RecoverySeed {
             let conversation_id = Uuid::from_bytes(entry.cid);
             // The gate DB is shared and never reset (rows are immutable), so every
             // recovery identifier is fresh per run (derived from a fresh request id)
@@ -21568,7 +21773,20 @@ mod historical_control_loader {
             let init_key =
                 Sha256::digest([b"recovery-init".as_ref(), &request_id].concat()).to_vec();
             let wrapper_bytes = vec![0x79_u8; 32];
-            let signed = build_signed_recovery_request(entry, request_id);
+            let signed = prior.map_or_else(
+                || build_signed_recovery_request(entry, request_id),
+                |coordinate| {
+                    build_signed_recovery_request_at(entry, request_id, coordinate, signed_at)
+                },
+            );
+            let generation = prior.map_or(0, |coordinate| coordinate.generation());
+            let state_version = prior.map_or(0, |coordinate| coordinate.state_version());
+            let group_id = prior.map_or([1_u8; 32], |coordinate| *coordinate.group_id());
+            let epoch = prior.map_or(0, |coordinate| coordinate.epoch());
+            let group_context_hash =
+                prior.map_or([2_u8; 32], |coordinate| *coordinate.group_context_hash());
+            let confirmation_tag =
+                prior.map_or([3_u8; 32], |coordinate| *coordinate.confirmation_tag());
 
             // The creator's live leaf period, to bind the `replace` request.
             let replaced_leaf_period_id: Uuid = sqlx::query_scalar(
@@ -21598,8 +21816,8 @@ mod historical_control_loader {
             .bind(entry.actor_device_id)
             .bind(&entry.actor_key_id)
             .bind(instant(KP_NOT_BEFORE))
-            .bind(instant(KP_NOT_AFTER))
-            .bind(instant(REQUESTED_AT))
+            .bind(instant(package_not_after))
+            .bind(instant(requested_at))
             .execute(&mut *tx)
             .await
             .expect("insert key package");
@@ -21609,19 +21827,23 @@ mod historical_control_loader {
                     requester_device_id,requester_key_id,requester_auth_generation,recipient_did,
                     recipient_device_id,bound_state_version,bound_group_id,bound_epoch,
                     bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,created_at
-                ) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,0,$7,0,$8,$9,'leafRecovery',$10,'active',$11)"#,
+                ) VALUES($1,$2,$3,$4,$5,$6,$7,1,$5,$6,$8,$9,$10,$11,$12,
+                    'leafRecovery',$13,'active',$14)"#,
             )
             .bind(request_uuid)
             .bind(&key_package_ref)
             .bind(conversation_id)
+            .bind(i64::try_from(generation).unwrap())
             .bind(&entry.actor_did)
             .bind(entry.actor_device_id)
             .bind(&entry.actor_key_id)
-            .bind(vec![1_u8; 32])
-            .bind(vec![2_u8; 32])
-            .bind(vec![3_u8; 32])
-            .bind(instant(EXPIRES_AT))
-            .bind(instant(REQUESTED_AT))
+            .bind(i64::try_from(state_version).unwrap())
+            .bind(group_id.to_vec())
+            .bind(i64::try_from(epoch).unwrap())
+            .bind(group_context_hash.to_vec())
+            .bind(confirmation_tag.to_vec())
+            .bind(instant(expires_at))
+            .bind(instant(requested_at))
             .execute(&mut *tx)
             .await
             .expect("insert reservation");
@@ -21632,24 +21854,28 @@ mod historical_control_loader {
                     bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,
                     reservation_request_id,replaced_leaf_period_id,status,signed_request_bytes,
                     signing_transcript_bytes,request_digest,signature,requested_at,expires_at
-                ) VALUES($1,$2,0,$3,$4,$5,1,'replace',$6,0,$7,0,$8,$9,$1,$10,'open',$11,$12,$13,$14,$15,$16)"#,
+                ) VALUES($1,$2,$3,$4,$5,$6,1,'replace',$7,$8,$9,$10,$11,$12,$1,$13,
+                    'open',$14,$15,$16,$17,$18,$19)"#,
             )
             .bind(request_uuid)
             .bind(conversation_id)
+            .bind(i64::try_from(generation).unwrap())
             .bind(&entry.actor_did)
             .bind(entry.actor_device_id)
             .bind(&entry.actor_key_id)
             .bind(source)
-            .bind(vec![1_u8; 32])
-            .bind(vec![2_u8; 32])
-            .bind(vec![3_u8; 32])
+            .bind(i64::try_from(state_version).unwrap())
+            .bind(group_id.to_vec())
+            .bind(i64::try_from(epoch).unwrap())
+            .bind(group_context_hash.to_vec())
+            .bind(confirmation_tag.to_vec())
             .bind(replaced_leaf_period_id)
             .bind(&signed.raw_wrapper)
             .bind(&signed.signing_transcript)
             .bind(&signed.request_digest)
             .bind(&signed.signature)
-            .bind(instant(REQUESTED_AT))
-            .bind(instant(EXPIRES_AT))
+            .bind(instant(requested_at))
+            .bind(instant(expires_at))
             .execute(&mut *tx)
             .await
             .expect("insert leaf recovery request");
@@ -27824,6 +28050,192 @@ mod historical_control_loader {
         }
 
         #[test]
+        fn recovery_retained_terminal_selector_is_closed_over_all_cause_columns() {
+            let requested_at = instant("2030-01-01T00:00:00.000Z");
+            let terminal_at = instant("2030-01-01T00:01:00.000Z");
+            let expires_at = instant("2030-01-01T00:05:00.000Z");
+            let package_not_after = instant("2030-01-02T00:00:00.000Z");
+            let transition_id = Uuid::new_v4();
+            let revocation_id = Uuid::new_v4();
+            let digest = [0x41; 32];
+            let no_terminal = RecoveryReservationTerminal::None;
+            let cancellation_terminal = RecoveryReservationTerminal::Released {
+                transition_id: None,
+                revocation_id: None,
+                request_digest: Some(digest),
+                terminal_at,
+            };
+            let expiry_terminal = RecoveryReservationTerminal::Expiry {
+                terminal_at: expires_at,
+            };
+            let transition_terminal = RecoveryReservationTerminal::Released {
+                transition_id: Some(transition_id),
+                revocation_id: None,
+                request_digest: None,
+                terminal_at,
+            };
+            let revocation_terminal = RecoveryReservationTerminal::Released {
+                transition_id: None,
+                revocation_id: Some(revocation_id),
+                request_digest: None,
+                terminal_at,
+            };
+
+            let open = RecoveryRequestTerminalColumns {
+                status: "open",
+                fulfilling_transition_id: None,
+                terminal_transition_id: None,
+                terminal_revocation_id: None,
+                request_has_any_signed_terminal: false,
+                request_has_complete_signed_terminal: false,
+                terminal_request_digest: None,
+                terminal_at: None,
+                requested_at,
+                expires_at,
+                request_reservation_binding_matches: true,
+                reservation_status: ReservationStatus::Active,
+                reservation_terminal: &no_terminal,
+                package_status: "reserved",
+                package_terminal_transition_id: None,
+                package_terminal_revocation_id: None,
+                package_terminal_at: None,
+                package_not_after,
+            };
+            assert_eq!(
+                select_recovery_request_terminal(open).unwrap(),
+                RecoveryRequestTerminalSelection::Open
+            );
+
+            let cancelled = RecoveryRequestTerminalColumns {
+                status: "cancelled",
+                request_has_any_signed_terminal: true,
+                request_has_complete_signed_terminal: true,
+                terminal_request_digest: Some(&digest),
+                terminal_at: Some(terminal_at),
+                reservation_status: ReservationStatus::Released,
+                reservation_terminal: &cancellation_terminal,
+                package_status: "available",
+                ..open
+            };
+            assert_eq!(
+                select_recovery_request_terminal(cancelled).unwrap(),
+                RecoveryRequestTerminalSelection::Cancelled {
+                    terminal_at,
+                    terminal_request_digest: digest,
+                }
+            );
+
+            let expired_available = RecoveryRequestTerminalColumns {
+                status: "expired",
+                terminal_at: Some(expires_at),
+                reservation_status: ReservationStatus::Expired,
+                reservation_terminal: &expiry_terminal,
+                package_status: "available",
+                ..open
+            };
+            assert_eq!(
+                select_recovery_request_terminal(expired_available).unwrap(),
+                RecoveryRequestTerminalSelection::Expired {
+                    terminal_at: expires_at,
+                }
+            );
+            let expired_package = RecoveryRequestTerminalColumns {
+                package_status: "expired",
+                package_terminal_at: Some(expires_at),
+                package_not_after: expires_at,
+                ..expired_available
+            };
+            assert_eq!(
+                select_recovery_request_terminal(expired_package).unwrap(),
+                RecoveryRequestTerminalSelection::Expired {
+                    terminal_at: expires_at,
+                }
+            );
+
+            let transition_superseded = RecoveryRequestTerminalColumns {
+                status: "superseded",
+                terminal_transition_id: Some(transition_id),
+                terminal_at: Some(terminal_at),
+                reservation_status: ReservationStatus::Released,
+                reservation_terminal: &transition_terminal,
+                package_status: "available",
+                ..open
+            };
+            assert_eq!(
+                select_recovery_request_terminal(transition_superseded).unwrap(),
+                RecoveryRequestTerminalSelection::SupersededByTransition {
+                    transition_id,
+                    terminal_at,
+                }
+            );
+            let revocation_superseded = RecoveryRequestTerminalColumns {
+                terminal_transition_id: None,
+                terminal_revocation_id: Some(revocation_id),
+                reservation_terminal: &revocation_terminal,
+                package_status: "revoked",
+                package_terminal_revocation_id: Some(revocation_id),
+                package_terminal_at: Some(terminal_at),
+                ..transition_superseded
+            };
+            assert_eq!(
+                select_recovery_request_terminal(revocation_superseded).unwrap(),
+                RecoveryRequestTerminalSelection::SupersededByRevocation {
+                    revocation_id,
+                    terminal_at,
+                }
+            );
+
+            let malformed = [
+                RecoveryRequestTerminalColumns {
+                    request_has_complete_signed_terminal: false,
+                    ..cancelled
+                },
+                RecoveryRequestTerminalColumns {
+                    terminal_request_digest: Some(&[0x42; 32]),
+                    ..cancelled
+                },
+                RecoveryRequestTerminalColumns {
+                    package_terminal_transition_id: Some(Uuid::new_v4()),
+                    ..cancelled
+                },
+                RecoveryRequestTerminalColumns {
+                    terminal_at: Some(terminal_at),
+                    ..expired_available
+                },
+                RecoveryRequestTerminalColumns {
+                    package_terminal_transition_id: Some(Uuid::new_v4()),
+                    ..expired_package
+                },
+                RecoveryRequestTerminalColumns {
+                    package_terminal_revocation_id: Some(Uuid::new_v4()),
+                    ..expired_package
+                },
+                RecoveryRequestTerminalColumns {
+                    terminal_revocation_id: Some(Uuid::new_v4()),
+                    ..transition_superseded
+                },
+                RecoveryRequestTerminalColumns {
+                    package_terminal_at: Some(terminal_at),
+                    ..transition_superseded
+                },
+                RecoveryRequestTerminalColumns {
+                    package_terminal_revocation_id: Some(Uuid::new_v4()),
+                    ..revocation_superseded
+                },
+                RecoveryRequestTerminalColumns {
+                    request_reservation_binding_matches: false,
+                    ..revocation_superseded
+                },
+            ];
+            for columns in malformed {
+                assert!(matches!(
+                    select_recovery_request_terminal(columns),
+                    Err(RecoveryHydrationError::TerminalMismatch)
+                ));
+            }
+        }
+
+        #[test]
         fn acceptance_origin_locator_requires_exactly_one_candidate() {
             let exact = Uuid::new_v4();
             assert_eq!(select_single_acceptance_origin(vec![exact]).unwrap(), exact);
@@ -27917,6 +28329,486 @@ mod historical_control_loader {
             assert_eq!(reservation.bound_coordinate, request.bound_coordinate);
             assert_eq!(reservation.received_at, request.received_at);
             assert_eq!(reservation.expires_at, request.expires_at);
+        }
+
+        async fn commit_cancelled_recovery_fixture(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+        ) {
+            let cancellation = build_signed_recovery_cancellation(entry, seed.request_id);
+            let request_id = Uuid::from_bytes(seed.request_id);
+            let terminal_at = instant(FULFILLED_AT);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin cancelled Recovery fixture");
+            sqlx::query(
+                r#"UPDATE chat.leaf_recovery_requests
+                   SET status='cancelled',terminal_signed_request_bytes=$2,
+                       terminal_signing_transcript_bytes=$3,terminal_request_digest=$4,
+                       terminal_signature=$5,terminal_at=$6
+                   WHERE recovery_request_id=$1 AND status='open'"#,
+            )
+            .bind(request_id)
+            .bind(&cancellation.raw_wrapper)
+            .bind(&cancellation.signing_transcript)
+            .bind(&cancellation.request_digest)
+            .bind(&cancellation.signature)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("terminalize cancelled request");
+            sqlx::query(
+                r#"UPDATE chat.key_package_reservations
+                   SET status='released',terminal_request_digest=$2,terminal_at=$3
+                   WHERE recovery_request_id=$1 AND status='active'"#,
+            )
+            .bind(request_id)
+            .bind(&cancellation.request_digest)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("release cancelled reservation");
+            sqlx::query(
+                r#"UPDATE chat.key_packages SET status='available'
+                   WHERE key_package_ref=$1 AND status='reserved'
+                     AND terminal_transition_id IS NULL
+                     AND terminal_revocation_id IS NULL AND terminal_at IS NULL"#,
+            )
+            .bind(seed.key_package_ref.to_vec())
+            .execute(&mut *tx)
+            .await
+            .expect("reactivate cancelled package");
+            tx.commit()
+                .await
+                .expect("cancelled Recovery fixture crosses deferred constraints");
+        }
+
+        async fn commit_expired_recovery_fixture(
+            pool: &PgPool,
+            seed: &RecoverySeed,
+            package_expires: bool,
+        ) {
+            let request_id = Uuid::from_bytes(seed.request_id);
+            let terminal_at = instant(EXPIRES_AT);
+            let mut tx = pool.begin().await.expect("begin expired Recovery fixture");
+            sqlx::query(
+                r#"UPDATE chat.leaf_recovery_requests
+                   SET status='expired',terminal_at=$2
+                   WHERE recovery_request_id=$1 AND status='open'"#,
+            )
+            .bind(request_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("expire request");
+            sqlx::query(
+                r#"UPDATE chat.key_package_reservations
+                   SET status='expired',terminal_at=$2
+                   WHERE recovery_request_id=$1 AND status='active'"#,
+            )
+            .bind(request_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("expire reservation");
+            if package_expires {
+                sqlx::query(
+                    r#"UPDATE chat.key_packages SET status='expired',terminal_at=$2
+                       WHERE key_package_ref=$1 AND status='reserved'
+                         AND not_after=$2 AND terminal_transition_id IS NULL
+                         AND terminal_revocation_id IS NULL AND terminal_at IS NULL"#,
+                )
+                .bind(seed.key_package_ref.to_vec())
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("expire package at its exact lifetime");
+            } else {
+                sqlx::query(
+                    r#"UPDATE chat.key_packages SET status='available'
+                       WHERE key_package_ref=$1 AND status='reserved'
+                         AND not_after>$2 AND terminal_transition_id IS NULL
+                         AND terminal_revocation_id IS NULL AND terminal_at IS NULL"#,
+                )
+                .bind(seed.key_package_ref.to_vec())
+                .bind(terminal_at)
+                .execute(&mut *tx)
+                .await
+                .expect("release still-live package");
+            }
+            tx.commit()
+                .await
+                .expect("expired Recovery fixture crosses deferred constraints");
+        }
+
+        async fn commit_transition_superseded_recovery_fixture(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+        ) -> Uuid {
+            let terminal_at = instant(FULFILLED_AT);
+            let transition = build_real_commit_with_signed_at(
+                entry,
+                seed.creation_transition_id,
+                2,
+                FULFILLED_AT,
+                FULFILLMENT_SIGNED_AT,
+                0,
+                1,
+            );
+            let request_id = Uuid::from_bytes(seed.request_id);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin transition-superseded Recovery fixture");
+            insert_real_commit(
+                &mut tx,
+                entry,
+                &transition,
+                seed.creation_transition_id,
+                2,
+                terminal_at,
+                0,
+                1,
+            )
+            .await;
+            sqlx::query(
+                r#"UPDATE chat.leaf_recovery_requests
+                   SET status='superseded',terminal_transition_id=$2,terminal_at=$3
+                   WHERE recovery_request_id=$1 AND status='open'"#,
+            )
+            .bind(request_id)
+            .bind(transition.transition_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("supersede request by exact transition");
+            sqlx::query(
+                r#"UPDATE chat.key_package_reservations
+                   SET status='released',terminal_transition_id=$2,terminal_at=$3
+                   WHERE recovery_request_id=$1 AND status='active'"#,
+            )
+            .bind(request_id)
+            .bind(transition.transition_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("release reservation by exact transition");
+            sqlx::query(
+                r#"UPDATE chat.key_packages SET status='available'
+                   WHERE key_package_ref=$1 AND status='reserved'
+                     AND terminal_transition_id IS NULL
+                     AND terminal_revocation_id IS NULL AND terminal_at IS NULL"#,
+            )
+            .bind(seed.key_package_ref.to_vec())
+            .execute(&mut *tx)
+            .await
+            .expect("release package superseded by transition");
+            tx.commit()
+                .await
+                .expect("transition-superseded Recovery crosses deferred constraints");
+            transition.transition_id
+        }
+
+        async fn commit_revocation_superseded_recovery_fixture(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            seed: &RecoverySeed,
+            target_did: &str,
+            target_device_id: Uuid,
+        ) -> Uuid {
+            let terminal_at = instant(FULFILLED_AT);
+            let signed_at = instant(FULFILLMENT_SIGNED_AT);
+            let (revocation_id, revocation) =
+                build_signed_recovery_revocation(entry, target_device_id);
+            let request_id = Uuid::from_bytes(seed.request_id);
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin revocation-superseded Recovery fixture");
+            insert_device_revocation(
+                &mut tx,
+                &NewDeviceRevocation {
+                    revocation_id,
+                    actor_did: entry.actor_did.clone(),
+                    actor_device_id: entry.actor_device_id,
+                    actor_key_id: entry.actor_key_id.clone(),
+                    actor_auth_generation: 1,
+                    target_did: target_did.to_owned(),
+                    target_device_id,
+                    target_auth_generation: 1,
+                    accepted_request_bytes: revocation.raw_wrapper.clone(),
+                    signing_transcript_bytes: revocation.signing_transcript.clone(),
+                    request_digest: revocation.request_digest.clone(),
+                    signature: revocation.signature.clone(),
+                    signed_at,
+                    accepted_at: terminal_at,
+                },
+            )
+            .await
+            .expect("insert Recovery revocation cause");
+            cas_registration_revoke(
+                &mut tx,
+                &RegistrationRevoke {
+                    target_did: target_did.to_owned(),
+                    target_device_id,
+                    expected_auth_generation: 1,
+                    revocation_id,
+                    revoked_at: terminal_at,
+                },
+            )
+            .await
+            .expect("revoke Recovery target registration");
+            sqlx::query(
+                r#"UPDATE chat.leaf_recovery_requests
+                   SET status='superseded',terminal_revocation_id=$2,terminal_at=$3
+                   WHERE recovery_request_id=$1 AND status='open'"#,
+            )
+            .bind(request_id)
+            .bind(revocation_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("supersede request by exact revocation");
+            sqlx::query(
+                r#"UPDATE chat.key_package_reservations
+                   SET status='released',terminal_revocation_id=$2,terminal_at=$3
+                   WHERE recovery_request_id=$1 AND status='active'"#,
+            )
+            .bind(request_id)
+            .bind(revocation_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("release reservation by exact revocation");
+            sqlx::query(
+                r#"UPDATE chat.key_packages
+                   SET status='revoked',terminal_revocation_id=$2,terminal_at=$3
+                   WHERE key_package_ref=$1 AND status='reserved'
+                     AND terminal_transition_id IS NULL
+                     AND terminal_revocation_id IS NULL AND terminal_at IS NULL"#,
+            )
+            .bind(seed.key_package_ref.to_vec())
+            .bind(revocation_id)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("revoke exact reserved package");
+            let historical_jkt: String = sqlx::query_scalar(
+                "SELECT dpop_jkt FROM chat.devices WHERE user_did=$1 AND device_id=$2",
+            )
+            .bind(&entry.actor_did)
+            .bind(entry.actor_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("load revocation actor historical JKT");
+            let response_bytes = b"recovery-revocation-terminal-fixture".to_vec();
+            sqlx::query(
+                r#"INSERT INTO chat.idempotency_records(
+                    principal_did,endpoint_nsid,operation_id,request_digest,
+                    accepted_request_bytes,signing_transcript_bytes,signature,
+                    completed_status,response_bytes,response_sha256,event_position,
+                    historical_jkt,current_jkt,completed_at
+                ) VALUES($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,
+                    $7,$8,NULL,$9,NULL,$10)"#,
+            )
+            .bind(&entry.actor_did)
+            .bind(revocation_id)
+            .bind(&revocation.request_digest)
+            .bind(&revocation.raw_wrapper)
+            .bind(&revocation.signing_transcript)
+            .bind(&revocation.signature)
+            .bind(&response_bytes)
+            .bind(Sha256::digest(&response_bytes).to_vec())
+            .bind(historical_jkt)
+            .bind(terminal_at)
+            .execute(&mut *tx)
+            .await
+            .expect("complete exact revokeDevice receipt");
+            tx.commit()
+                .await
+                .expect("revocation-superseded Recovery crosses deferred constraints");
+            revocation_id
+        }
+
+        async fn assert_terminal_family_coexists_with_unrelated_open(
+            pool: &PgPool,
+            entry: &RealCreationEntry,
+            terminal_request_id: [u8; 16],
+            expected: RecoveryRequestStatus,
+        ) {
+            let current_state_version: i64 = sqlx::query_scalar(
+                "SELECT current_state_version FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(Uuid::from_bytes(entry.cid))
+            .fetch_one(pool)
+            .await
+            .expect("read retained-family current state");
+            let unrelated = if current_state_version == 0 {
+                seed_additional_recovery_pair(pool, entry, "requestLeafRecovery").await
+            } else {
+                seed_current_coordinate_recovery_pair(pool, entry).await
+            };
+            let next_entry_seq: i64 = sqlx::query_scalar(
+                "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id=$1",
+            )
+            .bind(Uuid::from_bytes(entry.cid))
+            .fetch_one(pool)
+            .await
+            .expect("read retained-family append head");
+            let authority = HistoricalRehydrationAuthority::new(
+                entry.cid,
+                u64::try_from(next_entry_seq).unwrap(),
+            )
+            .unwrap();
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin retained-family aggregate read");
+            let (requests, reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &authority, Uuid::from_bytes(entry.cid))
+                    .await
+                    .expect("retained family and unrelated open hydrate together");
+            tx.rollback().await.expect("rollback read");
+            assert_eq!(requests.len(), 2);
+            assert_eq!(reservations.len(), 2);
+            assert!(requests.iter().any(|request| {
+                request.request_id == terminal_request_id
+                    && request.status == expected
+                    && request.terminal.is_some()
+            }));
+            assert!(requests.iter().any(|request| {
+                request.request_id == unrelated.request_id
+                    && request.status == RecoveryRequestStatus::Open
+                    && request.terminal.is_none()
+            }));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_cancelled_released_available_hydrates_with_unrelated_open_work() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let entry = build_real_creation_entry(*Uuid::new_v4().as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            commit_cancelled_recovery_fixture(&pool, &entry, &seed).await;
+            assert_terminal_family_coexists_with_unrelated_open(
+                &pool,
+                &entry,
+                seed.request_id,
+                RecoveryRequestStatus::Cancelled,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_expired_expired_available_hydrates_with_unrelated_open_work() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let entry = build_real_creation_entry(*Uuid::new_v4().as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            commit_expired_recovery_fixture(&pool, &seed, false).await;
+            assert_terminal_family_coexists_with_unrelated_open(
+                &pool,
+                &entry,
+                seed.request_id,
+                RecoveryRequestStatus::Expired,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_expired_expired_expired_at_package_lifetime_hydrates() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let entry = build_real_creation_entry(*Uuid::new_v4().as_bytes());
+            let seed = seed_recovery_pair_expiring_with_package(&pool, &entry).await;
+            commit_expired_recovery_fixture(&pool, &seed, true).await;
+            assert_terminal_family_coexists_with_unrelated_open(
+                &pool,
+                &entry,
+                seed.request_id,
+                RecoveryRequestStatus::Expired,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_superseded_by_transition_released_available_hydrates() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let entry = build_real_creation_entry(*Uuid::new_v4().as_bytes());
+            let seed = seed_recovery_pair(&pool, &entry, "requestLeafRecovery").await;
+            let _transition_id =
+                commit_transition_superseded_recovery_fixture(&pool, &entry, &seed).await;
+            assert_terminal_family_coexists_with_unrelated_open(
+                &pool,
+                &entry,
+                seed.request_id,
+                RecoveryRequestStatus::Superseded,
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated gate database"]
+        async fn recovery_superseded_by_revocation_released_revoked_hydrates() {
+            let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+            let (entry, invitee, acceptance) = commit_real_acceptance_recovery(&pool).await;
+            let unrelated = seed_current_coordinate_recovery_pair(&pool, &entry).await;
+            let seed = RecoverySeed {
+                request_id: acceptance.request_id,
+                key_package_ref: acceptance.key_package_ref,
+                raw_wrapper: acceptance.raw_wrapper.clone(),
+                creation_transition_id: acceptance.transition_id,
+                replaced_leaf_period_id: invitee.participant_period_id,
+            };
+            let revocation_id = commit_revocation_superseded_recovery_fixture(
+                &pool,
+                &entry,
+                &seed,
+                &invitee.did,
+                invitee.device_id,
+            )
+            .await;
+            let authority = HistoricalRehydrationAuthority::new(entry.cid, 3).unwrap();
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin revocation-superseded Recovery load");
+            let (requests, reservations) =
+                load_recovery_work_hydration_rows(&mut tx, &authority, Uuid::from_bytes(entry.cid))
+                    .await
+                    .expect("revocation-superseded Recovery hydrates");
+            tx.rollback().await.expect("rollback retained read");
+
+            assert_eq!(requests.len(), 2);
+            assert_eq!(reservations.len(), 2);
+            let retained = requests
+                .iter()
+                .find(|request| request.request_id == seed.request_id)
+                .expect("revocation-retained Recovery remains present");
+            assert_eq!(retained.status, RecoveryRequestStatus::Superseded);
+            let Some(WorkTerminalHydrationRow::DeviceRevocation(evidence)) =
+                retained.terminal.as_ref()
+            else {
+                panic!("revocation supersession retains revocation evidence");
+            };
+            assert_eq!(evidence.revocation_id(), revocation_id.as_bytes());
+            assert_eq!(
+                evidence.target(),
+                &DeviceIdentity::new(
+                    PrincipalId::new(invitee.did.clone().into_bytes()).unwrap(),
+                    *invitee.device_id.as_bytes(),
+                )
+                .unwrap()
+            );
+            assert!(requests.iter().any(|request| {
+                request.request_id == unrelated.request_id
+                    && request.status == RecoveryRequestStatus::Open
+                    && request.terminal.is_none()
+            }));
         }
 
         #[tokio::test]
@@ -28322,11 +29214,10 @@ mod historical_control_loader {
             ));
         }
 
-        // Fulfilled/consumed terminal reconstruction is live-exercised above by a
-        // fully coherent graph crossing every deferred fulfillment/Welcome
-        // mapping. The remaining cancelled/released, expired, and
-        // superseded/released status families stay fail-closed behind
-        // `UnsupportedTerminal` until their separately owned signed fixtures land.
+        // Retained Recovery terminal reconstruction is live-exercised above for
+        // fulfilled, cancelled, both expiry package outcomes, and both exact
+        // supersession causes. The pure selector corpus separately rejects mixed
+        // causes, surplus columns, and time/digest/binding drift.
     }
 
     // -----------------------------------------------------------------------
@@ -28496,9 +29387,9 @@ mod historical_control_loader {
             pub(super) outer_entry_fingerprint: Vec<u8>,
         }
 
-        struct RealStalingCommit {
+        pub(super) struct RealStalingCommit {
             entry_id: Uuid,
-            transition_id: Uuid,
+            pub(super) transition_id: Uuid,
             public_row_json: Vec<u8>,
             raw_wrapper: Vec<u8>,
             canonical_projection: Vec<u8>,
@@ -28886,7 +29777,7 @@ mod historical_control_loader {
             build_real_commit(entry, origin_transition_id, 3, STALE_AT, 0, 1)
         }
 
-        fn build_real_commit(
+        pub(super) fn build_real_commit(
             entry: &RealCreationEntry,
             origin_transition_id: Uuid,
             entry_seq: u64,
@@ -28905,7 +29796,7 @@ mod historical_control_loader {
             )
         }
 
-        fn build_real_commit_with_signed_at(
+        pub(super) fn build_real_commit_with_signed_at(
             entry: &RealCreationEntry,
             origin_transition_id: Uuid,
             entry_seq: u64,
@@ -29551,7 +30442,7 @@ mod historical_control_loader {
         }
 
         #[allow(clippy::too_many_arguments)]
-        async fn insert_real_commit(
+        pub(super) async fn insert_real_commit(
             transaction: &mut Transaction<'_, Postgres>,
             entry: &RealCreationEntry,
             transition: &RealStalingCommit,

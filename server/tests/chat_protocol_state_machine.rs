@@ -87,6 +87,26 @@ mod chat_protocol {
         pub mod recovery {
             #[derive(Debug)]
             pub(crate) struct RecoverySqlAuthoritySeal;
+
+            pub(crate) struct RecoveryPersistenceWitness {
+                _private: (),
+            }
+
+            impl RecoveryPersistenceWitness {
+                pub(crate) async fn apply_open(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("state-machine tests cannot mint a Recovery witness")
+                }
+
+                pub(crate) async fn apply_terminal(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("state-machine tests cannot mint a Recovery witness")
+                }
+            }
         }
 
         pub mod execution_context {

@@ -1331,23 +1331,53 @@ pub(crate) fn canonical_welcome_disposition_event_payload(
 }
 
 /// Canonical server-owned payload announcing a newly available Welcome.
-pub(crate) fn canonical_welcome_available_event_payload(welcome_id: Uuid) -> Vec<u8> {
+pub(crate) fn canonical_welcome_available_event_payload(
+    welcome_id: Uuid,
+    conversation_id: Uuid,
+) -> Vec<u8> {
     format!(
-        r#"{{"$type":"blue.catbird.chat.defs#welcomeAvailableEvent","welcomeId":"{}"}}"#,
-        welcome_id.hyphenated()
+        r#"{{"$type":"blue.catbird.chat.defs#welcomeAvailableEvent","welcomeId":"{}","conversationId":"{}"}}"#,
+        welcome_id.hyphenated(),
+        conversation_id.hyphenated(),
     )
     .into_bytes()
 }
 
+/// Closed Recovery status vocabulary from
+/// `blue.catbird.chat.defs#leafRecoveryStatus`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeafRecoveryEventStatus {
+    Open,
+    Fulfilled,
+    Cancelled,
+    Expired,
+    Superseded,
+}
+
+impl LeafRecoveryEventStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Fulfilled => "fulfilled",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
 /// Canonical server-owned payload for Recovery lifecycle events. `status` is
-/// selected by the sealed state-machine edge, never by a route caller.
+/// a closed lexicon value selected by the sealed state-machine edge.
 pub(crate) fn canonical_leaf_recovery_event_payload(
     recovery_request_id: Uuid,
-    status: &str,
+    conversation_id: Uuid,
+    status: LeafRecoveryEventStatus,
 ) -> Vec<u8> {
     format!(
-        r#"{{"$type":"blue.catbird.chat.defs#leafRecoveryEvent","recoveryRequestId":"{}","status":"{status}"}}"#,
-        recovery_request_id.hyphenated()
+        r#"{{"$type":"blue.catbird.chat.defs#leafRecoveryEvent","recoveryRequestId":"{}","conversationId":"{}","status":"{}"}}"#,
+        recovery_request_id.hyphenated(),
+        conversation_id.hyphenated(),
+        status.as_str(),
     )
     .into_bytes()
 }

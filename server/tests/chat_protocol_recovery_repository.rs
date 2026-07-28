@@ -116,10 +116,14 @@ mod chat_protocol {
     }
 }
 
+use chat_protocol::repository::delivery::{
+    canonical_leaf_recovery_event_payload, canonical_welcome_available_event_payload,
+    LeafRecoveryEventStatus,
+};
 use chat_protocol::repository::recovery::{
     cancellation_actor_matches_requester, classify_client_terminal_disposition,
-    classify_locked_recovery, persisted_recovery_origin, requester_key_liveness_matches,
-    requester_row_liveness_matches, RecoveryClientTerminalAction,
+    classify_locked_recovery, expired_recovery_package_shape_valid, persisted_recovery_origin,
+    requester_key_liveness_matches, requester_row_liveness_matches, RecoveryClientTerminalAction,
     RecoveryClientTerminalDisposition, RecoveryClientTerminalError, RecoveryLockStage,
     RecoveryPersistedOrigin, RecoveryRowStatus, RecoveryTerminalClassification,
     CANONICAL_RECOVERY_LOCK_ORDER, LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL,
@@ -129,9 +133,103 @@ use chat_protocol::repository::recovery::{
     LOCK_RECOVERY_REQUEST_SQL, LOCK_RECOVERY_RESERVATION_SQL, RECOVERY_TERMINAL_LOCATOR_SQL,
 };
 use chrono::{Duration, TimeZone, Utc};
+use uuid::Uuid;
 
 fn compact(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn recovery_primary_event_payloads_are_exact_closed_lexicon_bytes() {
+    let conversation_id = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+    let recovery_request_id = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    let welcome_id = Uuid::parse_str("99999999-8888-4777-8666-555555555555").unwrap();
+
+    for (status, wire_status) in [
+        (LeafRecoveryEventStatus::Open, "open"),
+        (LeafRecoveryEventStatus::Cancelled, "cancelled"),
+        (LeafRecoveryEventStatus::Expired, "expired"),
+    ] {
+        assert_eq!(
+            canonical_leaf_recovery_event_payload(recovery_request_id, conversation_id, status,),
+            format!(
+                concat!(
+                    r#"{{"$type":"blue.catbird.chat.defs#leafRecoveryEvent","#,
+                    r#""recoveryRequestId":"{recovery_request_id}","#,
+                    r#""conversationId":"{conversation_id}","#,
+                    r#""status":"{wire_status}"}}"#
+                ),
+                recovery_request_id = recovery_request_id,
+                conversation_id = conversation_id,
+                wire_status = wire_status,
+            )
+            .into_bytes()
+        );
+    }
+
+    assert_eq!(
+        canonical_welcome_available_event_payload(welcome_id, conversation_id),
+        format!(
+            concat!(
+                r#"{{"$type":"blue.catbird.chat.defs#welcomeAvailableEvent","#,
+                r#""welcomeId":"{welcome_id}","#,
+                r#""conversationId":"{conversation_id}"}}"#
+            ),
+            welcome_id = welcome_id,
+            conversation_id = conversation_id,
+        )
+        .into_bytes()
+    );
+}
+
+#[test]
+fn recovery_business_lock_scope_never_performs_live_relationship_transport() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(
+        !source.contains(".collect_block_projection("),
+        "live relationship transport must be completed and persisted before business locks"
+    );
+    assert!(
+        !source.contains("allocate_projection_revision(transaction)"),
+        "Recovery business preparation must not allocate transport work after locks"
+    );
+    assert!(
+        !source.contains("observe_locked_relationship_decision(transaction"),
+        "the decision must be minted while loading the exact persisted fallback"
+    );
+    assert_eq!(
+        source
+            .matches("load_fallback_relationship_projection(")
+            .count(),
+        2,
+        "request and fulfillment must each load their scope-specific frozen fallback"
+    );
+}
+
+#[test]
+fn retained_expired_package_rejects_surplus_terminal_provenance() {
+    let terminal_at = Utc.timestamp_millis_opt(1_900_000_000_000).unwrap();
+    assert!(expired_recovery_package_shape_valid(
+        "expired",
+        terminal_at,
+        Some(terminal_at),
+        None,
+        None,
+    ));
+    assert!(!expired_recovery_package_shape_valid(
+        "expired",
+        terminal_at,
+        Some(terminal_at),
+        Some(Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap()),
+        None,
+    ));
+    assert!(!expired_recovery_package_shape_valid(
+        "expired",
+        terminal_at,
+        Some(terminal_at),
+        None,
+        Some(Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap()),
+    ));
 }
 
 #[test]
@@ -205,6 +303,9 @@ fn canonical_lock_order_keeps_identity_prefix_before_graph_and_recovery_rows() {
             RecoveryLockStage::RecoveryRequest,
             RecoveryLockStage::Reservation,
             RecoveryLockStage::KeyPackage,
+            RecoveryLockStage::RelationshipSnapshot,
+            RecoveryLockStage::RelationshipEvidence,
+            RecoveryLockStage::RelationshipDecision,
         ]
     );
 }
@@ -498,9 +599,9 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
             "{authority} must not gain a loose-value constructor"
         );
     }
-    assert!(!source.contains("reserve_available_recovery_package("));
-    assert!(!source.contains("RecoveryTerminalTripleCas::new("));
-    assert!(!source.contains("RecoveryKeyPackageRowCas::new("));
+    assert!(source.contains("struct RecoveryPersistenceWitness"));
+    assert!(source.contains("RecoveryTerminalTripleCas::new("));
+    assert!(source.contains("RecoveryKeyPackageRowCas::new("));
     assert!(source.contains("struct RecoverySqlAuthoritySeal"));
     assert!(!source.contains("impl Clone for RecoverySqlAuthoritySeal"));
 }
@@ -508,10 +609,13 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
 #[test]
 fn client_terminal_outcomes_never_drop_the_consumed_prelude() {
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
-    assert!(source.contains("struct RecoveryRetainedTerminal"));
+    assert!(source.contains("struct RecoveryCancellationRetained"));
+    assert!(source.contains("struct RecoveryFulfillmentRetained"));
+    assert!(source.contains("struct RecoveryClassifiedTerminalOutcome"));
     assert!(source.contains("prelude: PreparedBusinessPrelude"));
-    assert!(source.contains("prelude: Option<PreparedBusinessPrelude>"));
-    assert!(source.contains("pub(crate) fn into_prelude(self)"));
+    assert!(!source.contains("prelude: Option<PreparedBusinessPrelude>"));
+    assert!(!source.contains("struct RecoveryRetainedTerminal"));
+    assert!(!source.contains("enum RecoveryTerminalRead<T>"));
 }
 
 #[test]
@@ -523,7 +627,7 @@ fn retained_rows_are_reverified_instead_of_status_only_rehydrated() {
 }
 
 #[test]
-fn legacy_recovery_sql_bindings_remain_sealed_but_are_unreachable_from_preparation() {
+fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness() {
     let transition = include_str!("../src/chat_protocol/repository/transition.rs");
     assert!(transition.contains("use super::recovery::RecoverySqlAuthoritySeal;"));
     assert!(
@@ -533,10 +637,80 @@ fn legacy_recovery_sql_bindings_remain_sealed_but_are_unreachable_from_preparati
             >= 6
     );
     let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
-    assert!(!recovery.contains("RecoveryKeyPackageRowCas::new("));
-    assert!(!recovery.contains("RecoveryTerminalTripleCas::new("));
-    assert!(!recovery.contains("reserve_available_recovery_package("));
-    assert!(!recovery.contains("terminalize_recovery_triple("));
+    assert!(recovery.contains("RecoveryKeyPackageRowCas::new("));
+    assert!(recovery.contains("RecoveryTerminalTripleCas::new("));
+    assert!(recovery.contains("reserve_available_recovery_package("));
+    assert!(recovery.contains("terminalize_recovery_triple("));
+}
+
+#[test]
+fn recovery_prewrite_reloads_custom_head_and_every_exact_row_before_hydration() {
+    let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let witness = recovery
+        .split_once("pub(in crate::chat_protocol) async fn validate_prewrite(")
+        .and_then(|(_, tail)| {
+            tail.split_once("\n    pub(in crate::chat_protocol) async fn apply_open")
+        })
+        .map(|(body, _)| body)
+        .expect("Recovery witness prewrite validator");
+    let transaction = witness.find("SELECT txid_current()::text").unwrap();
+    let custom_head = witness.find("lock_head_graph(").unwrap();
+    let cross_binding = witness.find("validates_reloaded_recovery_head").unwrap();
+    let package = witness.find("LOCK_RECOVERY_PACKAGE_SQL").unwrap();
+    let request = witness.find("LOCK_RECOVERY_REQUEST_SQL").unwrap();
+    let reservation = witness.find("LOCK_RECOVERY_RESERVATION_SQL").unwrap();
+    assert!(
+        transaction < custom_head
+            && custom_head < cross_binding
+            && cross_binding < package
+            && package < request
+            && request < reservation,
+        "transaction, aggregate/custom-head, package, request, and reservation drift fences \
+         must run in deterministic prewrite order"
+    );
+    assert!(witness.contains("package != self.package"));
+    assert!(witness.contains("new_request_from_row(&request).ok().as_ref()"));
+    assert!(witness.contains("new_reservation_from_row(&reservation).ok().as_ref()"));
+
+    let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+    let facade = execution
+        .split_once("pub(in crate::chat_protocol) async fn prepare_recovery_execution")
+        .and_then(|(_, tail)| {
+            tail.split_once(
+                "\npub(in crate::chat_protocol) async fn apply_prepared_recovery_execution",
+            )
+        })
+        .map(|(body, _)| body)
+        .expect("Recovery execution facade");
+    assert!(
+        facade.find(".validate_prewrite(").unwrap()
+            < facade.find("hydrate_execution_context(").unwrap(),
+        "all Recovery-specific drift fences must reject before generic hydration can write"
+    );
+}
+
+#[test]
+fn client_due_for_expiry_types_freeze_action_specific_post_apply_errors() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let cancellation = source
+        .split_once("impl RecoveryCancellationDueForExpiry")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("cancellation DueForExpiry adapter");
+    assert!(cancellation.contains("RecoveryClientTerminalError::RecoveryNotFound"));
+    assert!(!cancellation.contains("post_apply_error:"));
+
+    let fulfillment = source
+        .split_once("impl RecoveryFulfillmentDueForExpiry")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("fulfillment DueForExpiry adapter");
+    assert!(fulfillment.contains("RecoveryClientTerminalError::RecoveryExpired"));
+    assert!(!fulfillment.contains("post_apply_error:"));
+
+    assert!(source.contains("RecoveryCanonicalMaterial::ClientExpired"));
+    assert!(source.contains("post_apply_error: RecoveryClientTerminalError"));
+    assert!(source.contains("RecoveryCanonicalMaterial::SchedulerExpired"));
 }
 
 #[test]
@@ -592,22 +766,29 @@ fn client_terminal_disposition_matrix_matches_frozen_brief() {
 #[test]
 fn client_preparation_performs_no_package_reservation_or_terminal_write() {
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
-    assert!(
-        !source.contains("reserve_available_recovery_package("),
-        "preparation must not call the package reservation writer"
-    );
-    assert!(
-        !source.contains("AvailableRecoveryPackageReservationCas"),
-        "preparation must not construct reservation CAS bindings"
-    );
-    assert!(
-        !source.contains("RecoveryTerminalTripleTermination::Cancelled"),
-        "client terminal Cancelled write must move to the executor"
-    );
-    assert!(
-        !source.contains("RecoveryTerminalTripleTermination::Fulfilled"),
-        "client terminal Fulfilled write must move to the executor"
-    );
+    for function in [
+        "prepare_recovery_request_authority(",
+        "prepare_recovery_cancellation_authority(",
+        "prepare_recovery_fulfillment_authority(",
+    ] {
+        let body = source
+            .split_once(function)
+            .map(|(_, tail)| {
+                tail.split_once("\npub(crate) async fn")
+                    .map_or(tail, |v| v.0)
+            })
+            .expect("client preparation function");
+        for forbidden in [
+            "reserve_available_recovery_package(",
+            "terminalize_recovery_triple(",
+            "RecoveryTerminalTripleTermination::",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{function} must not perform executor write {forbidden}"
+            );
+        }
+    }
     assert!(
         !source.contains("fn reserve_available_package"),
         "the reserve method must be removed"
@@ -781,10 +962,22 @@ fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
         .and_then(|(_, tail)| tail.split_once(") -> Result<"))
         .map(|(signature, _)| signature)
         .expect("recovery execution facade signature");
-    assert!(facade.contains("accepted_control_entry_bytes: Option<Vec<u8>>"));
+    assert!(facade.contains("graph: &'plan PreparedRecoveryExecutionGraph"));
+    assert!(!facade.contains("accepted_control_entry_bytes"));
     assert!(!facade.contains("ExecutionContextArtifacts"));
     assert!(!facade.contains("primary_event_payload"));
     assert!(!facade.contains("welcome_disposition_event_payloads"));
+
+    let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let graph = recovery
+        .split_once("struct PreparedRecoveryExecutionGraph")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("private prepared Recovery graph");
+    assert!(graph.contains("plan: ConversationPersistencePlan"));
+    assert!(graph.contains("accepted_control_entry_bytes: Option<Vec<u8>>"));
+    assert!(!graph.contains("pub(crate)"));
+    assert!(!graph.contains("pub(in "));
 }
 
 #[test]
@@ -795,7 +988,7 @@ fn prepared_scheduler_expiry_has_no_client_completion_guard() {
         .and_then(|(_, tail)| tail.split_once("\n}"))
         .map(|(body, _)| body)
         .expect("prepared scheduler expiry");
-    assert!(scheduler.contains("plan: ConversationPersistencePlan"));
+    assert!(scheduler.contains("graph: PreparedRecoveryExecutionGraph"));
     assert!(!scheduler.contains("PreparedBusinessPrelude"));
     assert!(!scheduler.contains("OperationCompletionGuard"));
     assert!(

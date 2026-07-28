@@ -998,7 +998,7 @@ pub(crate) async fn terminalize_leave_request(
 
 /// Recovery kind, carrying the replaced leaf period for the `replace` arm
 /// (`leaf_recovery_requests_kind_shape_check`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LeafRecoveryKind {
     Add,
     Replace { replaced_leaf_period_id: Uuid },
@@ -1042,7 +1042,7 @@ impl LeafRecoverySource {
 /// `reservation_request_id` must equal `recovery_request_id` (DB CHECK), and the
 /// paired `chat.key_package_reservations` row must be inserted in the same
 /// transaction (both directions are `DEFERRABLE INITIALLY DEFERRED`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewLeafRecoveryRequest {
     pub(crate) recovery_request_id: Uuid,
     pub(crate) conversation_id: Uuid,
@@ -1287,7 +1287,7 @@ pub(crate) async fn terminalize_leaf_recovery_request(
 /// always `'leafRecovery'` (written verbatim). The requester and recipient are
 /// the same device (`key_package_reservations_request_recipient_check`); the
 /// caller supplies both explicitly rather than the layer deriving one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NewReservation {
     pub(crate) recovery_request_id: Uuid,
     pub(crate) key_package_ref: Vec<u8>,
