@@ -29,6 +29,7 @@ use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
     LockedRevocationTargetStatus,
 };
+use super::repository::prelude::ScopeBoundBusinessAuthority;
 use super::repository::relationship::{
     consume_locked_acceptance_projection, consume_locked_creation_projection,
     consume_locked_pending_add_projection, consume_locked_recovery_projection,
@@ -3259,42 +3260,28 @@ impl HydrationAuthority {
     #[cfg(not(test))]
     pub(crate) fn plan_device_revocation_batch(
         mutation: VerifiedSignedMutation,
-        actor_guard: BusinessAuthorityGuard,
+        actor_registration: LockedRegistrationProjection,
         target_guard: LockedRevocationTargetGuard,
         fanout_guard: LockedRevocationFanoutGuard,
         mut live_package_guards: Vec<LockedRevocationPackageGuard>,
         mut locked_conversations: Vec<LockedConversationStateGuard>,
     ) -> Result<DeviceRevocationBatchPersistencePlan, StateMachineError> {
-        let transaction_id = actor_guard.transaction_id();
-        let locked_at = actor_guard.trusted_instant();
-        if actor_guard.class() != RepositoryAuthorityClass::ExistingDevice
-            || transaction_id != target_guard.transaction_id()
+        let transaction_id = actor_registration.transaction_id();
+        let accepted_at = actor_registration.trusted_read_at();
+        let locked_at = target_guard.locked_at();
+        if transaction_id != target_guard.transaction_id()
             || transaction_id != fanout_guard.transaction_id()
             || locked_at != target_guard.locked_at()
             || locked_at != fanout_guard.locked_at()
+            || ServerTimestamp::from_unix_millis(locked_at.timestamp_millis())? != accepted_at
             || target_guard.status() != LockedRevocationTargetStatus::Active
             || target_guard.durable_row_digest() == &[0; 32]
             || fanout_guard.durable_manifest_digest() == &[0; 32]
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        let accepted_at = ServerTimestamp::from_unix_millis(locked_at.timestamp_millis())?;
         let evidence = Self::device_revocation_at(mutation, accepted_at)?;
-        let actor_key_id: [u8; 32] = actor_guard
-            .stored_key_id()
-            .and_then(|value| KeyThumbprint::parse(value).ok())
-            .and_then(|value| URL_SAFE_NO_PAD.decode(value.as_str()).ok())
-            .and_then(|value| value.try_into().ok())
-            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
-        let actor_auth_generation = actor_guard
-            .stored_auth_generation()
-            .and_then(|value| u64::try_from(value).ok())
-            .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
-            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
-        if actor_guard.subject().as_bytes() != evidence.actor.principal().as_bytes()
-            || actor_guard.device_id().as_bytes() != evidence.actor.device_id()
-            || actor_key_id != evidence.actor_key_id
-            || actor_auth_generation != evidence.actor_auth_generation
+        if !actor_registration.authorizes_revocation(&evidence)
             || target_guard.target_did().as_bytes() != evidence.target.principal().as_bytes()
             || target_guard.target_device_id().as_bytes() != evidence.target.device_id()
             || target_guard.target_auth_generation() != evidence.expected_target_auth_generation
@@ -3503,6 +3490,7 @@ impl HydrationAuthority {
             authority: evidence,
             target_cas,
             revoked_packages,
+            authority_scope_digest: *actor_registration.authority_scope_digest(),
             fanout_manifest_digest: *fanout_guard.durable_manifest_digest(),
             conversations,
         })
@@ -3689,6 +3677,7 @@ impl HydrationAuthority {
             trusted_read_at: ServerTimestamp::from_trusted_request_instant(trusted_read_at)?,
             durable_row_digest: row.durable_row_digest,
             transaction_id: String::new(),
+            authority_scope_digest: [0; 32],
         })
     }
 
@@ -3750,6 +3739,118 @@ impl HydrationAuthority {
             trusted_read_at,
             durable_row_digest: digest.finalize().into(),
             transaction_id: guard.transaction_id().to_owned(),
+            authority_scope_digest: [0; 32],
+        })
+    }
+
+    pub(crate) fn locked_registration_from_scope_authority(
+        &self,
+        scope: &ScopeBoundBusinessAuthority,
+    ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        if scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+            || scope.actor_device_id().get_version_num() != 4
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let did = BareDid::parse(scope.actor_did())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(did.as_str().as_bytes().to_vec())?,
+            *scope.actor_device_id().as_bytes(),
+        )?;
+        let dpop_jkt = scope
+            .actor_dpop_jkt()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let actor_key_id = scope
+            .actor_key_id()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let key = KeyThumbprint::parse(actor_key_id)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let key_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(key.as_str())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let actor_auth_generation = scope
+            .actor_auth_generation()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let auth_generation = u64::try_from(actor_auth_generation)
+            .ok()
+            .filter(|value| *value > 0 && *value <= MAX_PROTOCOL_INTEGER)
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let actor_signing_public_key = scope
+            .actor_signing_public_key()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let exact_signing_public_key = scope
+            .actor_projected_signing_public_key()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_signing_public_key != actor_signing_public_key {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let registered_mls_signature_key: [u8; 32] = exact_signing_public_key
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let trusted_read_at =
+            ServerTimestamp::from_unix_millis(scope.trusted_instant().timestamp_millis())?;
+
+        if scope
+            .principals()
+            .binary_search_by(|principal| principal.as_str().cmp(did.as_str()))
+            .is_err()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let exact_device = scope
+            .devices()
+            .iter()
+            .find(|device| {
+                device.user_did() == did.as_str() && device.device_id() == scope.actor_device_id()
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_device.status() != "active"
+            || exact_device.revoked_at().is_some()
+            || exact_device.dpop_jkt() != dpop_jkt
+            || exact_device.auth_generation() != actor_auth_generation
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let exact_key = scope
+            .keys()
+            .iter()
+            .find(|locked_key| {
+                locked_key.user_did() == did.as_str()
+                    && locked_key.device_id() == scope.actor_device_id()
+                    && locked_key.key_id() == actor_key_id
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if exact_key.revoked_at().is_some()
+            || exact_key.signing_public_key_sha256()
+                != <[u8; 32]>::from(Sha256::digest(registered_mls_signature_key))
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
+        digest.update(self.expected_conversation_id);
+        digest.update((actor.principal().as_bytes().len() as u64).to_be_bytes());
+        digest.update(actor.principal().as_bytes());
+        digest.update(actor.device_id());
+        digest.update(key_id);
+        digest.update(registered_mls_signature_key);
+        digest.update(auth_generation.to_be_bytes());
+        digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        Ok(LockedRegistrationProjection {
+            conversation_id: self.expected_conversation_id,
+            actor,
+            key_id,
+            registered_mls_signature_key,
+            auth_generation,
+            status: PersistedRegistrationStatus::Active,
+            trusted_read_at,
+            durable_row_digest: digest.finalize().into(),
+            transaction_id: scope.transaction_id().to_owned(),
+            authority_scope_digest: *scope.scope_digest(),
         })
     }
 
@@ -5799,6 +5900,7 @@ pub(crate) struct LockedRegistrationProjection {
     trusted_read_at: ServerTimestamp,
     durable_row_digest: [u8; 32],
     transaction_id: String,
+    authority_scope_digest: [u8; 32],
 }
 
 impl LockedRegistrationProjection {
@@ -5832,6 +5934,7 @@ impl LockedRegistrationProjection {
             && self.auth_generation == evidence.actor_auth_generation
             && self.trusted_read_at == evidence.accepted_at
             && self.durable_row_digest != [0; 32]
+            && self.authority_scope_digest != [0; 32]
     }
 
     pub(crate) fn actor(&self) -> &DeviceIdentity {
@@ -5870,6 +5973,10 @@ impl LockedRegistrationProjection {
         &self.durable_row_digest
     }
 
+    pub(crate) fn authority_scope_digest(&self) -> &[u8; 32] {
+        &self.authority_scope_digest
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(evidence: &RequestEvidence) -> Self {
         Self {
@@ -5882,6 +5989,7 @@ impl LockedRegistrationProjection {
             trusted_read_at: evidence.received_at,
             durable_row_digest: [0x7a; 32],
             transaction_id: String::new(),
+            authority_scope_digest: [0x7b; 32],
         }
     }
 
@@ -9254,6 +9362,7 @@ pub(crate) struct DeviceRevocationBatchPersistencePlan {
     authority: DeviceRevocationEvidence,
     target_cas: RevocationTargetCasBinding,
     revoked_packages: Vec<RevocationPackageCasBinding>,
+    authority_scope_digest: [u8; 32],
     fanout_manifest_digest: [u8; 32],
     conversations: Vec<ConversationPersistencePlan>,
 }
@@ -9267,6 +9376,9 @@ impl DeviceRevocationBatchPersistencePlan {
     }
     pub(crate) fn revoked_packages(&self) -> &[RevocationPackageCasBinding] {
         &self.revoked_packages
+    }
+    pub(crate) fn authority_scope_digest(&self) -> &[u8; 32] {
+        &self.authority_scope_digest
     }
     pub(crate) fn fanout_manifest_digest(&self) -> &[u8; 32] {
         &self.fanout_manifest_digest
@@ -9306,6 +9418,7 @@ impl DeviceRevocationBatchPersistencePlan {
             authority,
             target_cas,
             revoked_packages,
+            authority_scope_digest: [1u8; 32],
             fanout_manifest_digest: [1u8; 32],
             conversations,
         }

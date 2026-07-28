@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::{
     super::{
-        dpop::VerifiedChatDeviceRequest, transcript::VerifiedSignedMutation, validation::BareDid,
+        dpop::VerifiedChatDeviceRequest,
+        transcript::{SignedMutationKind, VerifiedSignedMutation},
+        validation::BareDid,
     },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
 };
@@ -300,6 +302,12 @@ pub(crate) struct PreparedBusinessPrelude {
     operation: OperationClaimGuard,
 }
 
+impl fmt::Debug for PreparedBusinessPrelude {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedBusinessPrelude(<sealed>)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryOperationEndpoint {
     RequestLeafRecovery,
@@ -321,6 +329,50 @@ impl RecoveryOperationEndpoint {
             Self::RequestLeafRecovery => "blue.catbird.chat.defs#leafRecoveryRequestBody",
             Self::CancelLeafRecovery => "blue.catbird.chat.defs#leafRecoveryCancellationBody",
             Self::SubmitRecoveryFulfillment => "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResetOperationEndpoint {
+    RequestReset,
+    ActivateReset,
+}
+
+impl ResetOperationEndpoint {
+    fn endpoint_nsid(self) -> &'static str {
+        match self {
+            Self::RequestReset => "blue.catbird.chat.requestReset",
+            Self::ActivateReset => "blue.catbird.chat.activateReset",
+        }
+    }
+
+    fn mutation_kind(self) -> SignedMutationKind {
+        match self {
+            Self::RequestReset => SignedMutationKind::ResetRequest,
+            Self::ActivateReset => SignedMutationKind::ResetActivation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WelcomeOperationEndpoint {
+    AcknowledgeWelcome,
+    RejectWelcome,
+}
+
+impl WelcomeOperationEndpoint {
+    fn endpoint_nsid(self) -> &'static str {
+        match self {
+            Self::AcknowledgeWelcome => "blue.catbird.chat.acknowledgeWelcome",
+            Self::RejectWelcome => "blue.catbird.chat.rejectWelcome",
+        }
+    }
+
+    fn mutation_kind(self) -> SignedMutationKind {
+        match self {
+            Self::AcknowledgeWelcome => SignedMutationKind::WelcomeAcknowledgement,
+            Self::RejectWelcome => SignedMutationKind::WelcomeRejection,
         }
     }
 }
@@ -376,6 +428,21 @@ impl ScopeBoundBusinessAuthority {
         self.locked.actor_signing_public_key()
     }
 
+    pub(crate) fn actor_projected_signing_public_key(&self) -> Option<&[u8]> {
+        self.locked.actor_projected_signing_public_key()
+    }
+
+    pub(crate) fn signing_public_key_for(
+        &self,
+        did: &str,
+        device_id: Uuid,
+        key_id: &str,
+        enrollment_auth_generation: i64,
+    ) -> Option<&[u8]> {
+        self.locked
+            .signing_public_key_for(did, device_id, key_id, enrollment_auth_generation)
+    }
+
     pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
         self.locked.trusted_instant()
     }
@@ -420,6 +487,76 @@ impl PreparedBusinessPrelude {
             || binding.principal_did != mutation.actor_did().as_str()
             || binding.endpoint_nsid != endpoint.endpoint_nsid()
             || binding.mutation_kind != endpoint.mutation_kind()
+            || binding.mutation_kind != mutation.type_id()
+            || binding.request_digest != *mutation.request_digest()
+            || binding.accepted_request_sha256
+                != <[u8; 32]>::from(Sha256::digest(accepted_request_bytes))
+            || binding.signature != *mutation.signature()
+        {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn verify_reset_operation(
+        self,
+        endpoint: ResetOperationEndpoint,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            endpoint.endpoint_nsid(),
+            endpoint.mutation_kind(),
+            operation_id,
+            mutation,
+        )
+    }
+
+    pub(crate) fn verify_device_revocation_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.revokeDevice",
+            SignedMutationKind::DeviceRevocation,
+            operation_id,
+            mutation,
+        )
+    }
+
+    pub(crate) fn verify_welcome_operation(
+        self,
+        endpoint: WelcomeOperationEndpoint,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            endpoint.endpoint_nsid(),
+            endpoint.mutation_kind(),
+            operation_id,
+            mutation,
+        )
+    }
+
+    fn verify_exact_operation_claim(
+        self,
+        endpoint_nsid: &str,
+        mutation_kind: SignedMutationKind,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        let accepted_request_bytes = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        let binding = &self.operation.binding;
+        if operation_id.get_version_num() != 4
+            || self.operation.transaction_id != self.authority.transaction_id()
+            || binding.operation_id != operation_id
+            || binding.principal_did != mutation.actor_did().as_str()
+            || binding.endpoint_nsid != endpoint_nsid
+            || binding.mutation_kind != mutation_kind.type_id()
+            || mutation.kind() != mutation_kind
             || binding.mutation_kind != mutation.type_id()
             || binding.request_digest != *mutation.request_digest()
             || binding.accepted_request_sha256

@@ -183,6 +183,287 @@ fn recovery_claim_verifier_is_consuming_and_binds_every_exact_dimension() {
 }
 
 #[test]
+fn reset_revocation_and_welcome_claim_verifiers_are_consuming_and_exact() {
+    let source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    let transcript_source = include_str!("../../src/chat_protocol/transcript.rs");
+    for function_name in [
+        "verify_reset_operation",
+        "verify_device_revocation_operation",
+        "verify_welcome_operation",
+    ] {
+        let function = source
+            .split_once(&format!("pub(crate) fn {function_name}("))
+            .unwrap_or_else(|| panic!("missing {function_name}"))
+            .1
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("unterminated {function_name}"))
+            .0;
+        assert!(
+            function.contains("self,"),
+            "{function_name} must consume the prepared prelude"
+        );
+        assert!(
+            function.contains("verify_exact_operation_claim"),
+            "{function_name} must use the closed exact-claim verifier"
+        );
+    }
+
+    for exact_mapping in [
+        (
+            "RequestReset",
+            "blue.catbird.chat.requestReset",
+            "SignedMutationKind::ResetRequest",
+            "\"resetRequestBody\"",
+        ),
+        (
+            "ActivateReset",
+            "blue.catbird.chat.activateReset",
+            "SignedMutationKind::ResetActivation",
+            "\"resetActivationBody\"",
+        ),
+        (
+            "DeviceRevocation",
+            "blue.catbird.chat.revokeDevice",
+            "SignedMutationKind::DeviceRevocation",
+            "\"deviceRevocationBody\"",
+        ),
+        (
+            "AcknowledgeWelcome",
+            "blue.catbird.chat.acknowledgeWelcome",
+            "SignedMutationKind::WelcomeAcknowledgement",
+            "\"welcomeAcknowledgementBody\"",
+        ),
+        (
+            "RejectWelcome",
+            "blue.catbird.chat.rejectWelcome",
+            "SignedMutationKind::WelcomeRejection",
+            "\"welcomeRejectionBody\"",
+        ),
+    ] {
+        for value in [exact_mapping.0, exact_mapping.1, exact_mapping.2] {
+            assert!(
+                source.contains(value),
+                "missing exact operation mapping fact: {value}"
+            );
+        }
+        assert!(
+            transcript_source.contains(exact_mapping.3),
+            "missing canonical mutation body: {}",
+            exact_mapping.3
+        );
+    }
+
+    let exact = source
+        .split_once("fn verify_exact_operation_claim(")
+        .expect("missing closed exact operation-claim verifier")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated exact operation-claim verifier")
+        .0;
+    for fact in [
+        "operation_id.get_version_num() != 4",
+        "operation.transaction_id",
+        "authority.transaction_id()",
+        "binding.operation_id",
+        "binding.principal_did",
+        "mutation.actor_did()",
+        "binding.endpoint_nsid",
+        "binding.mutation_kind",
+        "mutation.type_id()",
+        "binding.request_digest",
+        "mutation.request_digest()",
+        "binding.accepted_request_sha256",
+        "Sha256::digest(accepted_request_bytes)",
+        "binding.signature",
+        "mutation.signature()",
+    ] {
+        assert!(exact.contains(fact), "missing exact claim fact: {fact}");
+    }
+}
+
+#[test]
+fn scope_registration_adapter_borrows_without_raw_guard_escape() {
+    let source = include_str!("../../src/chat_protocol/state_machine.rs");
+    let adapter = source
+        .split_once("pub(crate) fn locked_registration_from_scope_authority(")
+        .expect("missing scope-derived registration adapter")
+        .1
+        .split_once("\n    pub(crate) fn locked_recovery_reservation(")
+        .expect("unterminated scope-derived registration adapter")
+        .0;
+
+    assert!(adapter.contains("scope: &ScopeBoundBusinessAuthority"));
+    assert!(!source.contains(
+        "#[cfg(not(test))]\nuse super::repository::prelude::ScopeBoundBusinessAuthority"
+    ));
+    assert!(!source
+        .contains("#[cfg(not(test))]\n    pub(crate) fn locked_registration_from_scope_authority"));
+    assert!(!adapter.contains("BusinessAuthorityGuard"));
+    assert!(!adapter.contains("locked_registration_from_guard"));
+    for fact in [
+        "scope.actor_class()",
+        "scope.actor_did()",
+        "scope.actor_device_id()",
+        "actor_dpop_jkt()",
+        "actor_auth_generation()",
+        "actor_key_id()",
+        "actor_signing_public_key()",
+        "trusted_instant()",
+        ".principals()",
+        ".devices()",
+        ".keys()",
+        "scope.transaction_id()",
+    ] {
+        assert!(
+            adapter.contains(fact),
+            "scope adapter omitted locked projection fact: {fact}"
+        );
+    }
+}
+
+#[test]
+fn scope_registration_adapter_preserves_scope_digest_across_auth_rebind() {
+    let source = include_str!("../../src/chat_protocol/state_machine.rs");
+    let adapter = source
+        .split_once("pub(crate) fn locked_registration_from_scope_authority(")
+        .expect("missing scope-derived registration adapter")
+        .1
+        .split_once("\n    pub(crate) fn locked_recovery_reservation(")
+        .expect("unterminated scope-derived registration adapter")
+        .0;
+    assert!(adapter.contains("actor_projected_signing_public_key()"));
+    assert!(adapter.contains("authority_scope_digest: *scope.scope_digest()"));
+    assert!(!adapter.contains("locked_key.enrollment_auth_generation() == actor_auth_generation"));
+
+    let registration = source
+        .split_once("pub(crate) struct LockedRegistrationProjection {")
+        .expect("missing locked registration projection")
+        .1
+        .split_once("\n}")
+        .expect("unterminated locked registration projection")
+        .0;
+    assert!(registration.contains("authority_scope_digest: [u8; 32]"));
+    assert!(source.contains("pub(crate) fn authority_scope_digest(&self) -> &[u8; 32]"));
+
+    let plan = source
+        .split_once("pub(crate) struct DeviceRevocationBatchPersistencePlan {")
+        .expect("missing device-revocation batch plan")
+        .1
+        .split_once("\n}")
+        .expect("unterminated device-revocation batch plan")
+        .0;
+    assert!(plan.contains("authority_scope_digest: [u8; 32]"));
+    let constructor = source
+        .split_once("Ok(DeviceRevocationBatchPersistencePlan {")
+        .expect("missing production device-revocation plan constructor")
+        .1
+        .split_once("\n        })")
+        .expect("unterminated production device-revocation plan constructor")
+        .0;
+    assert!(constructor
+        .contains("authority_scope_digest: *actor_registration.authority_scope_digest()"));
+}
+
+#[test]
+fn scope_registration_adapter_rejects_post_rebind_key_material_drift() {
+    let source = include_str!("../../src/chat_protocol/state_machine.rs");
+    let adapter = source
+        .split_once("pub(crate) fn locked_registration_from_scope_authority(")
+        .expect("missing scope-derived registration adapter")
+        .1
+        .split_once("\n    pub(crate) fn locked_recovery_reservation(")
+        .expect("unterminated scope-derived registration adapter")
+        .0;
+    assert!(adapter.contains("exact_signing_public_key != actor_signing_public_key"));
+    assert!(adapter.contains("exact_key.signing_public_key_sha256()"));
+    assert!(adapter.contains("Sha256::digest(registered_mls_signature_key)"));
+    assert!(adapter.contains("exact_device.auth_generation() != actor_auth_generation"));
+    assert!(adapter.contains("exact_key.revoked_at().is_some()"));
+}
+
+#[test]
+fn revocation_batch_consumes_scope_derived_registration_not_raw_authority() {
+    let source = include_str!("../../src/chat_protocol/state_machine.rs");
+    let planner = source
+        .split_once("pub(crate) fn plan_device_revocation_batch(")
+        .expect("missing device-revocation batch planner")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated device-revocation batch planner")
+        .0;
+    assert!(planner.contains("actor_registration: LockedRegistrationProjection"));
+    assert!(planner.contains("actor_registration.authorizes_revocation(&evidence)"));
+    assert!(planner.contains("actor_registration.transaction_id()"));
+    assert!(planner.contains("actor_registration.trusted_read_at()"));
+    assert!(!planner.contains("BusinessAuthorityGuard"));
+    assert!(!planner.contains("stored_key_id"));
+    assert!(!planner.contains("stored_auth_generation"));
+}
+
+#[test]
+fn scope_signing_key_lookup_is_exact_and_has_no_broad_raw_key_escape() {
+    let prelude_source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    let lookup = prelude_source
+        .split_once("pub(crate) fn signing_public_key_for(")
+        .expect("missing exact scope signing-key lookup")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated exact scope signing-key lookup")
+        .0;
+    assert!(lookup.contains("self.locked"));
+    assert!(lookup.contains(".signing_public_key_for("));
+    assert!(!lookup.contains(".keys()"));
+    assert!(!lookup.contains("key.signing_public_key()"));
+
+    let auth_source = include_str!("../../src/chat_protocol/repository/auth.rs");
+    let key_projection = auth_source
+        .split_once("impl LockedCanonicalKeyProjection {")
+        .expect("missing locked canonical key projection")
+        .1
+        .split_once("\n}")
+        .expect("unterminated locked canonical key projection")
+        .0;
+    let opaque_scope = auth_source
+        .split_once("impl LockedCanonicalAuthorityScope {")
+        .expect("missing locked canonical authority scope")
+        .1;
+    let opaque_lookup = opaque_scope
+        .split_once("pub(super) fn signing_public_key_for(")
+        .expect("missing opaque-scope exact signing-key lookup")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated opaque-scope exact signing-key lookup")
+        .0;
+    for dimension in [
+        "key.user_did() == did",
+        "key.device_id() == device_id",
+        "key.key_id() == key_id",
+        "key.enrollment_auth_generation() == enrollment_auth_generation",
+        "key.signing_public_key()",
+    ] {
+        assert!(
+            opaque_lookup.contains(dimension),
+            "opaque signing-key lookup omitted exact tuple dimension: {dimension}"
+        );
+    }
+
+    assert!(key_projection.contains("fn signing_public_key(&self) -> &[u8]"));
+    assert!(!key_projection.contains("pub(super) fn signing_public_key(&self) -> &[u8]"));
+    assert!(!key_projection.contains("pub(crate) fn signing_public_key(&self) -> &[u8]"));
+    let actor_lookup = opaque_scope
+        .split_once("pub(super) fn actor_projected_signing_public_key(")
+        .expect("missing actor-restricted projected signing-key lookup")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated actor-restricted projected signing-key lookup")
+        .0;
+    assert!(!actor_lookup.contains("enrollment_auth_generation"));
+    assert!(actor_lookup.contains("key.user_did() == self.actor.subject()"));
+    assert!(actor_lookup.contains("key.device_id() == self.actor.device_id()"));
+    assert!(actor_lookup.contains("key.key_id() == actor_key_id"));
+}
+
+#[test]
 fn completed_replay_bytes_cross_auth_only_after_post_state_validation() {
     let auth_source = include_str!("../../src/chat_protocol/repository/auth.rs");
     assert!(!auth_source.contains("pub(super) async fn load_completed_business_replay"));

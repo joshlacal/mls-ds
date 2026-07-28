@@ -929,6 +929,10 @@ impl LockedCanonicalKeyProjection {
         &self.key_id
     }
 
+    fn signing_public_key(&self) -> &[u8] {
+        &self.signing_public_key
+    }
+
     pub(crate) fn signing_public_key_sha256(&self) -> [u8; 32] {
         Sha256::digest(&self.signing_public_key).into()
     }
@@ -993,6 +997,38 @@ impl LockedCanonicalAuthorityScope {
 
     pub(super) fn keys(&self) -> &[LockedCanonicalKeyProjection] {
         &self.keys
+    }
+
+    pub(super) fn signing_public_key_for(
+        &self,
+        did: &str,
+        device_id: Uuid,
+        key_id: &str,
+        enrollment_auth_generation: i64,
+    ) -> Option<&[u8]> {
+        self.keys
+            .iter()
+            .find(|key| {
+                key.user_did() == did
+                    && key.device_id() == device_id
+                    && key.key_id() == key_id
+                    && key.enrollment_auth_generation() == enrollment_auth_generation
+            })
+            .map(|key| key.signing_public_key())
+    }
+
+    pub(super) fn actor_projected_signing_public_key(&self) -> Option<&[u8]> {
+        let actor_key_id = self.actor.stored_key_id()?;
+        let mut matches = self.keys.iter().filter(|key| {
+            key.user_did() == self.actor.subject()
+                && key.device_id() == self.actor.device_id()
+                && key.key_id() == actor_key_id
+        });
+        let key = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(key.signing_public_key())
     }
 
     pub(super) fn scope_digest(&self) -> &[u8; 32] {
