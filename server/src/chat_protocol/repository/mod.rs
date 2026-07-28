@@ -47,6 +47,9 @@ pub(crate) mod relationship;
 #[allow(dead_code)]
 pub(crate) mod reset;
 pub(crate) mod transition;
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) mod welcome_terminal;
 // `welcome` (Slice 4b) is the welcome-expiry worker claim + recovery-inbox read
 // surface. Like `delivery`/`inventory` it is unconditionally compiled so both
 // the production build and the `#[path]`-including integration harness resolve

@@ -110,6 +110,13 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/execution_context.rs"
             ));
         }
+        pub mod welcome_terminal {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome_terminal.rs"
+            ));
+        }
         pub mod relationship {
             #![allow(dead_code)]
             include!(concat!(
@@ -124,6 +131,107 @@ mod chat_protocol {
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/state_machine.rs"
         ));
+    }
+}
+
+mod welcome_terminal_facade_contract {
+    use super::chat_protocol::repository::welcome_terminal::{
+        classify_welcome_terminal, WelcomeEndpoint, WelcomeTerminalClass, WelcomeTerminalDecision,
+    };
+
+    #[test]
+    fn endpoint_by_seven_way_terminal_matrix_is_exhaustive() {
+        use WelcomeEndpoint::{Acknowledge, Reject};
+        use WelcomeTerminalClass::{
+            Acknowledged, Expired, PendingDue, PendingNotDue, Rejected, SupersededByRevocation,
+            SupersededByTransition,
+        };
+        use WelcomeTerminalDecision::{
+            AcknowledgementConflict, ExactAcknowledgementReplay, ExactRejectionReplay,
+            PrepareAcknowledgement, PrepareExpiry, PrepareRejection, RejectionConflict,
+            SupersededByRevocation as RevocationOutcome,
+            SupersededByTransition as TransitionOutcome, WelcomeExpired,
+        };
+
+        let cases = [
+            (Acknowledge, PendingNotDue, false, PrepareAcknowledgement),
+            (Reject, PendingNotDue, false, PrepareRejection),
+            (Acknowledge, PendingDue, false, PrepareExpiry),
+            (Reject, PendingDue, false, PrepareExpiry),
+            (Acknowledge, Acknowledged, true, ExactAcknowledgementReplay),
+            (Reject, Acknowledged, false, AcknowledgementConflict),
+            (Acknowledge, Rejected, false, RejectionConflict),
+            (Reject, Rejected, true, ExactRejectionReplay),
+            (Acknowledge, Expired, false, WelcomeExpired),
+            (Reject, Expired, false, WelcomeExpired),
+            (
+                Acknowledge,
+                SupersededByTransition,
+                false,
+                TransitionOutcome,
+            ),
+            (Reject, SupersededByTransition, false, TransitionOutcome),
+            (
+                Acknowledge,
+                SupersededByRevocation,
+                false,
+                RevocationOutcome,
+            ),
+            (Reject, SupersededByRevocation, false, RevocationOutcome),
+        ];
+        assert_eq!(cases.len(), 2 * 7);
+        for (endpoint, classification, exact_replay, expected) in cases {
+            assert_eq!(
+                classify_welcome_terminal(endpoint, classification, exact_replay),
+                expected
+            );
+        }
+
+        assert_eq!(
+            classify_welcome_terminal(Acknowledge, Acknowledged, false),
+            AcknowledgementConflict
+        );
+        assert_eq!(
+            classify_welcome_terminal(Reject, Rejected, false),
+            RejectionConflict
+        );
+    }
+
+    #[test]
+    fn facade_consumes_exact_claim_and_scope_without_post_head_identity_lock() {
+        let source = include_str!("../src/chat_protocol/repository/welcome_terminal.rs");
+        let prepare = source
+            .split_once("pub(crate) async fn prepare_welcome_terminal(")
+            .expect("missing Welcome terminal facade")
+            .1
+            .split_once("\nstruct ParsedWelcomeRequest")
+            .expect("unterminated Welcome terminal facade")
+            .0;
+        let claim = prepare
+            .find("verify_welcome_operation(")
+            .expect("missing exact Welcome operation claim");
+        let aggregate = prepare
+            .find("hydrate_locked_conversation_state(")
+            .expect("missing aggregate lock");
+        let delivery = prepare
+            .find("lock_welcome_terminal(")
+            .expect("missing exact Welcome delivery lock");
+        assert!(claim < aggregate && aggregate < delivery);
+        assert!(prepare.contains("locked_registration_from_scope_authority("));
+        assert!(prepare.contains("prelude.scope_authority()"));
+        assert!(prepare.contains("prelude.into_execution_parts()"));
+        assert!(prepare.contains("prepare_welcome_terminal_execution"));
+        for forbidden in [
+            "lock_device_and_key",
+            "recheck_business_authority",
+            "locked_registration_from_guard",
+            "FOR UPDATE",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "Welcome facade uses forbidden authority seam: {forbidden}"
+            );
+        }
     }
 }
 

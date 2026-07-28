@@ -1813,6 +1813,32 @@ pub(crate) async fn hydrate_execution_context<'borrow, 'connection, 'plan>(
     ))
 }
 
+/// Welcome-only production capsule constructor. It accepts no caller-supplied
+/// artifacts: every response/expiry event and recipient is derived from the
+/// sealed plan under the already-held transaction locks.
+pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'plan>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if !matches!(
+        plan.effects().kind(),
+        PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection | PlanKind::WelcomeExpiry
+    ) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    hydrate_execution_context(transaction, plan, ExecutionContextArtifacts::default()).await
+}
+
+pub(crate) async fn apply_prepared_welcome_terminal_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
 /// cfg(test) mutation harnesses retain raw contexts so they can corrupt one
 /// family at a time. Production builds do not compile this separable seam.
 #[cfg(test)]
