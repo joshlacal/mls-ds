@@ -50,3 +50,44 @@ fn generic_executor_fixture_bridge_is_explicitly_test_gated() {
         );
     }
 }
+
+#[test]
+fn shipping_bootstrap_admission_cannot_bypass_operation_arbitration() {
+    let auth = include_str!("../src/chat_protocol/repository/auth.rs");
+    let context = include_str!("../src/handlers/chat/context.rs");
+
+    for retired_auth_declaration in [
+        "pub(crate) async fn authorize_enrollment_request",
+        "pub(crate) async fn authorize_rebind_request",
+        "async fn arbitrate_enrollment",
+        "async fn arbitrate_rebind",
+    ] {
+        assert!(
+            !auth.contains(retired_auth_declaration),
+            "shipping bootstrap admission still bypasses operation arbitration: {retired_auth_declaration}"
+        );
+    }
+    for retired_context_declaration in [
+        "pub(crate) enum Admission",
+        "pub(crate) async fn admit_signed(",
+        "pub(crate) async fn admit_enrollment(",
+        "pub(crate) async fn admit_rebind(",
+        "fn into_admission(",
+    ] {
+        assert!(
+            !context.contains(retired_context_declaration),
+            "shipping handler context retains a response-first admission seam: {retired_context_declaration}"
+        );
+    }
+
+    for proof_only_symbol in [
+        "#[cfg(any(test, feature = \"chat-protocol-production-proof\"))]\npub(crate) enum AuthorizationOutcome",
+        "#[cfg(any(test, feature = \"chat-protocol-production-proof\"))]\npub(crate) async fn authorize_signed_request",
+        "#[cfg(any(test, feature = \"chat-protocol-production-proof\"))]\nasync fn arbitrate_signed",
+    ] {
+        assert!(
+            auth.contains(proof_only_symbol),
+            "direct completed-response admission is not confined to tests/proof builds: {proof_only_symbol}"
+        );
+    }
+}

@@ -1420,9 +1420,33 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         1,
         FIRST_T,
     );
+    let conflicting_new_jkt =
+        URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+    let conflicting_raw = rebind_body(
+        &fixture,
+        operation_id,
+        &fixture.dpop_jkt,
+        &conflicting_new_jkt,
+        1,
+        FIRST_T,
+    );
     let admission = authorize_rebind_operation_only(
         &pool,
         rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
+    )
+    .await
+    .unwrap();
+    // Both exact old-state requests are admitted before either one changes the
+    // row. Their immutable bodies differ under one operation ID, so arbitration
+    // (not post-CAS admission) must reject the second request.
+    let conflicting_admission = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(
+            &conflicting_raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            FIRST_T,
+        ),
     )
     .await
     .unwrap();
@@ -1433,6 +1457,14 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         .await
         .unwrap();
     transaction.commit().await.unwrap();
+
+    let mut conflict_transaction = pool.begin().await.unwrap();
+    let conflict =
+        prelude::arbitrate_rebind_operation_only(&mut conflict_transaction, &conflicting_admission)
+            .await
+            .unwrap_err();
+    assert!(matches!(conflict, PreludeError::OperationIdConflict));
+    conflict_transaction.rollback().await.unwrap();
 
     let device: (String, i64) = sqlx::query_as(
         "SELECT dpop_jkt, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
@@ -1514,7 +1546,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
     };
     assert!(matches!(
         conflict,
-        AuthRepositoryError::AuthenticationGenerationMismatch
+        AuthRepositoryError::RequestBindingMismatch
     ));
 }
 

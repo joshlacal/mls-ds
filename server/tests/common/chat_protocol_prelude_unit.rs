@@ -508,7 +508,7 @@ fn signed_self_revocation_replay_validates_terminal_authority_before_release_and
         .split_once("async fn arbitrate_signed")
         .unwrap()
         .1
-        .split_once("async fn arbitrate_enrollment")
+        .split_once("fn validate_completed_enrollment_authority")
         .unwrap()
         .0;
 

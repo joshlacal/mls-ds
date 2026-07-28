@@ -20,9 +20,9 @@ use super::super::{
     dpop::{self, PreReplayCryptographicVerification, VerifiedChatDeviceRequest},
     model::AuthPrimitiveError,
     transcript::{
-        decode_canonical_signed_mutation, verify_ed25519_strict, CanonicalRebindBootstrap,
-        CanonicalSignedMutation, CanonicalValueRef, SignedMutationKind, VerifiedEnrollmentBody,
-        VerifiedMutationProjection, VerifiedSignedMutation,
+        decode_canonical_signed_mutation, verify_ed25519_strict, CanonicalSignedMutation,
+        CanonicalValueRef, SignedMutationKind, VerifiedEnrollmentBody, VerifiedMutationProjection,
+        VerifiedSignedMutation,
     },
     validation::{BareDid, CanonicalUuidV4, KeyThumbprint, NumericDate},
 };
@@ -231,6 +231,7 @@ pub(crate) fn reset_existing_device_receipt_for_test(
     })
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 pub(crate) enum AuthorizationOutcome {
     FirstExecution(VerifiedChatDeviceRequest),
     CompletedReplay(CompletedIdempotentResponse),
@@ -398,6 +399,7 @@ pub(crate) struct CompletedIdempotentResponse {
     completed_at: DateTime<Utc>,
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 impl fmt::Debug for AuthorizationOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -775,11 +777,13 @@ impl CompletedIdempotentResponse {
     }
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 enum Arbitration<T> {
     First(T),
     Completed(CompletedIdempotentResponse),
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 impl<T: fmt::Debug> fmt::Debug for Arbitration<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -793,6 +797,7 @@ impl<T: fmt::Debug> fmt::Debug for Arbitration<T> {
 }
 
 #[derive(Debug)]
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 struct FirstSignedExecution {
     receipt: RepositoryAuthorityReceipt,
     signing_public_key: Vec<u8>,
@@ -922,7 +927,7 @@ struct ReplayInsertRow {
 pub(crate) async fn authorize_unsigned_request(
     pool: &PgPool,
     pre_replay: PreReplayCryptographicVerification,
-) -> Result<AuthorizationOutcome, AuthRepositoryError> {
+) -> Result<VerifiedChatDeviceRequest, AuthRepositoryError> {
     let unsupported_shape = endpoint_accepts_signed_mutation(pre_replay.endpoint().as_str())
         || pre_replay.enrollment_body().is_some()
         || pre_replay.rebind_bootstrap().is_some();
@@ -943,11 +948,12 @@ pub(crate) async fn authorize_unsigned_request(
         }
     };
     let receipt = commit_semantic_decision(transaction, decision).await?;
-    Ok(AuthorizationOutcome::FirstExecution(
-        dpop::mint_unsigned_repository_authority(pre_replay, receipt),
+    Ok(dpop::mint_unsigned_repository_authority(
+        pre_replay, receipt,
     ))
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 pub(crate) async fn authorize_signed_request(
     pool: &PgPool,
     pre_replay: PreReplayCryptographicVerification,
@@ -973,63 +979,6 @@ pub(crate) async fn authorize_signed_request(
             let authority = dpop::mint_signed_repository_authority(
                 pre_replay,
                 canonical,
-                &first.signing_public_key,
-                first.receipt,
-            )?;
-            Ok(AuthorizationOutcome::FirstExecution(authority))
-        }
-    }
-}
-
-pub(crate) async fn authorize_enrollment_request(
-    pool: &PgPool,
-    pre_replay: PreReplayCryptographicVerification,
-) -> Result<AuthorizationOutcome, AuthRepositoryError> {
-    let unsupported_shape = pre_replay.endpoint().as_str() != "blue.catbird.chat.enrollDevice"
-        || pre_replay.enrollment_body().is_none()
-        || pre_replay.rebind_bootstrap().is_some()
-        || pre_replay.auth_transaction_replay().is_none();
-
-    let mut transaction = pool.begin().await?;
-    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
-    let decision = if unsupported_shape {
-        Err(AuthRepositoryError::UnsupportedAuthorizationShape)
-    } else {
-        arbitrate_enrollment(&mut transaction, &pre_replay, replay_ids).await
-    };
-    let decision = commit_semantic_decision(transaction, decision).await?;
-    match decision {
-        Arbitration::Completed(response) => Ok(AuthorizationOutcome::CompletedReplay(response)),
-        Arbitration::First(receipt) => {
-            let authority = dpop::mint_enrollment_repository_authority(pre_replay, receipt)?;
-            Ok(AuthorizationOutcome::FirstExecution(authority))
-        }
-    }
-}
-
-pub(crate) async fn authorize_rebind_request(
-    pool: &PgPool,
-    pre_replay: PreReplayCryptographicVerification,
-) -> Result<AuthorizationOutcome, AuthRepositoryError> {
-    let unsupported_shape = pre_replay.endpoint().as_str()
-        != "blue.catbird.chat.rebindDeviceAuthentication"
-        || pre_replay.rebind_bootstrap().is_none()
-        || pre_replay.enrollment_body().is_some()
-        || pre_replay.auth_transaction_replay().is_some();
-
-    let mut transaction = pool.begin().await?;
-    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
-    let decision = if unsupported_shape {
-        Err(AuthRepositoryError::UnsupportedAuthorizationShape)
-    } else {
-        arbitrate_rebind(&mut transaction, &pre_replay, replay_ids).await
-    };
-    let decision = commit_semantic_decision(transaction, decision).await?;
-    match decision {
-        Arbitration::Completed(response) => Ok(AuthorizationOutcome::CompletedReplay(response)),
-        Arbitration::First(first) => {
-            let authority = dpop::mint_rebind_repository_authority(
-                pre_replay,
                 &first.signing_public_key,
                 first.receipt,
             )?;
@@ -2913,6 +2862,7 @@ pub(super) async fn persist_rebind_bootstrap_effects(
     Ok(())
 }
 
+#[cfg(any(test, feature = "chat-protocol-production-proof"))]
 async fn arbitrate_signed(
     transaction: &mut Transaction<'_, Postgres>,
     pre_replay: &PreReplayCryptographicVerification,
@@ -3016,122 +2966,6 @@ async fn arbitrate_signed(
     }))
 }
 
-async fn arbitrate_enrollment(
-    transaction: &mut Transaction<'_, Postgres>,
-    pre_replay: &PreReplayCryptographicVerification,
-    replay_ids: ReplayAuditIds,
-) -> Result<Arbitration<RepositoryAuthorityReceipt>, AuthRepositoryError> {
-    let body = pre_replay
-        .enrollment_body()
-        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let material = RequestMaterial {
-        operation_id: canonical_uuid(body.idempotency_key()),
-        accepted_request_bytes: body.accepted_wrapper_bytes().to_vec(),
-        signing_transcript_bytes: body.mutation().transcript_bytes().to_vec(),
-        request_digest: *body.request_digest(),
-        signature: *body.signature(),
-        historical_jkt: None,
-        current_jkt: Some(body.dpop_jkt().as_str().to_owned()),
-    };
-    if let Some(response) = completed_replay(transaction, pre_replay, &material).await? {
-        let state = lock_device_and_key(
-            transaction,
-            pre_replay.subject().as_str(),
-            canonical_uuid(pre_replay.device_id()),
-        )
-        .await?;
-        validate_completed_enrollment_authority(pre_replay, body, &state)?;
-        return Ok(Arbitration::Completed(response));
-    }
-
-    lock_identity_slot(
-        transaction,
-        pre_replay.subject().as_str(),
-        canonical_uuid(pre_replay.device_id()),
-    )
-    .await?;
-    let existing: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM chat.devices WHERE user_did = $1 AND device_id = $2 FOR UPDATE",
-    )
-    .bind(pre_replay.subject().as_str())
-    .bind(canonical_uuid(pre_replay.device_id()))
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if existing.is_some() {
-        return Err(AuthRepositoryError::DeviceAlreadyRegistered);
-    }
-    Ok(Arbitration::First(RepositoryAuthorityReceipt::enrollment(
-        replay_ids,
-        material.operation_id,
-    )))
-}
-
-async fn arbitrate_rebind(
-    transaction: &mut Transaction<'_, Postgres>,
-    pre_replay: &PreReplayCryptographicVerification,
-    replay_ids: ReplayAuditIds,
-) -> Result<Arbitration<FirstSignedExecution>, AuthRepositoryError> {
-    let bootstrap = pre_replay
-        .rebind_bootstrap()
-        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let decoded_bootstrap = decode_canonical_signed_mutation(bootstrap.accepted_wrapper_bytes())?;
-    if decoded_bootstrap.kind() != SignedMutationKind::DeviceAuthenticationRebind
-        || decoded_bootstrap.request_digest() != bootstrap.request_digest()
-        || decoded_bootstrap.signature() != bootstrap.signature()
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let material = RequestMaterial {
-        operation_id: canonical_uuid(bootstrap.idempotency_key()),
-        accepted_request_bytes: bootstrap.accepted_wrapper_bytes().to_vec(),
-        signing_transcript_bytes: decoded_bootstrap.transcript_bytes().to_vec(),
-        request_digest: *bootstrap.request_digest(),
-        signature: *bootstrap.signature(),
-        historical_jkt: Some(bootstrap.current_dpop_jkt().as_str().to_owned()),
-        current_jkt: Some(bootstrap.new_dpop_jkt().as_str().to_owned()),
-    };
-    if let Some(response) = completed_replay(transaction, pre_replay, &material).await? {
-        let state = lock_device_and_key(
-            transaction,
-            pre_replay.subject().as_str(),
-            canonical_uuid(pre_replay.device_id()),
-        )
-        .await?;
-        validate_completed_rebind_authority(pre_replay, bootstrap, &state)?;
-        return Ok(Arbitration::Completed(response));
-    }
-
-    let state = lock_device_and_key(
-        transaction,
-        pre_replay.subject().as_str(),
-        canonical_uuid(pre_replay.device_id()),
-    )
-    .await?;
-    if state.dpop_jkt != bootstrap.current_dpop_jkt().as_str()
-        || pre_replay.dpop_jkt() != bootstrap.new_dpop_jkt()
-    {
-        return Err(AuthRepositoryError::DpopBindingMismatch);
-    }
-    let expected_generation = i64::try_from(bootstrap.expected_auth_generation())
-        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
-    if state.auth_generation != expected_generation {
-        return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
-    }
-    if state.key_id != bootstrap.key_id().as_str() {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let receipt = RepositoryAuthorityReceipt::existing(
-        replay_ids,
-        Some(material.operation_id),
-        &state,
-        RepositoryAuthorityClass::RebindBootstrap,
-    );
-    Ok(Arbitration::First(FirstSignedExecution {
-        receipt,
-        signing_public_key: state.signing_public_key,
-    }))
-}
-
 fn validate_completed_enrollment_authority(
     pre_replay: &PreReplayCryptographicVerification,
     body: &VerifiedEnrollmentBody,
@@ -3168,31 +3002,6 @@ fn validate_completed_enrollment_authority(
         body.mutation().transcript_bytes(),
         body.signature(),
     )?;
-    Ok(())
-}
-
-fn validate_completed_rebind_authority(
-    pre_replay: &PreReplayCryptographicVerification,
-    bootstrap: &CanonicalRebindBootstrap,
-    state: &LockedDeviceAuthority,
-) -> Result<(), AuthRepositoryError> {
-    if state.dpop_jkt != bootstrap.new_dpop_jkt().as_str()
-        || state.dpop_jkt != pre_replay.dpop_jkt().as_str()
-    {
-        return Err(AuthRepositoryError::DpopBindingMismatch);
-    }
-    let expected_generation = i64::try_from(bootstrap.expected_auth_generation())
-        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
-    let completed_generation = expected_generation
-        .checked_add(1)
-        .ok_or(AuthRepositoryError::AuthenticationGenerationMismatch)?;
-    if state.auth_generation != completed_generation {
-        return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
-    }
-    if state.key_id != bootstrap.key_id().as_str() {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    pre_replay.verify_rebind_stored_signing_key(&state.signing_public_key)?;
     Ok(())
 }
 

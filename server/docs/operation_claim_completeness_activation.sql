@@ -1,19 +1,20 @@
 -- NOT A MIGRATION. Freeze and review this template as a new forward migration.
 --
 -- DO NOT ACTIVATE merely because the database tests are green. Before freezing
--- this file, all three remaining receipt-only handlers:
+-- this file, all three formerly receipt-only handlers:
 --
 --   blue.catbird.chat.enrollDevice
 --   blue.catbird.chat.rebindDeviceAuthentication
 --   blue.catbird.chat.replenishKeyPackages
 --
--- must use the shared operation prelude, and these staged repository bypasses:
+-- must use the shared operation prelude. The formerly receipt-only handlers
+-- previously relied on these staged repository bypasses:
 --
 --   arbitrate_business_idempotency
 --   recheck_business_authority
 --   record_completed_idempotency
 --
--- must be removed or made unreachable outside the shared prelude. Until then,
+-- They must remain removed or unreachable outside the shared prelude. Until then,
 -- operation-claim completeness is staged, not globally enforced.
 --
 -- The activation deliberately preserves existing receipt-only rows as bounded,

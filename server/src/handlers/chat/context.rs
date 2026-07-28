@@ -1,8 +1,3 @@
-// The admission helpers below are the shared spine consumed by the H1 endpoint
-// handlers (next seal); they are intentionally present in the scaffolding seal
-// ahead of their first caller.
-#![allow(dead_code)]
-
 //! Shared authentication and admission spine for every clean-chat handler.
 //!
 //! Handlers never re-implement DPoP/replay crypto. They call one `admit_*`
@@ -10,12 +5,13 @@
 //!   1. evaluates the global cutover gate (OQ-2),
 //!   2. captures one trusted instant `T`,
 //!   3. dispatches to the correct `dpop::verify_*_request_auth` by NSID,
-//!   4. for signed classes, extracts the exact `signedRequest` bytes (preserved
+//!   4. extracts the exact `signedRequest` bytes where the endpoint uses one
+//!      (preserved
 //!      verbatim via `RawValue` so the idempotency wrapper-byte contract holds)
 //!      and decodes the canonical mutation, and
-//!   5. calls the matching `repository::auth::authorize_*`, returning either a
-//!      first-execution authority or a verbatim completed-replay response
-//!      (OQ-3).
+//!   5. returns an opaque operation-only admission. Endpoint composition locks
+//!      the operation and validates durable post-state before replay bytes can
+//!      escape (OQ-3).
 //!
 //! Every failure is mapped to a [`ChatFailure`] at the exact call site that
 //! produced it, so DPoP failures surface as `InvalidDPoP`, malformed request
@@ -33,9 +29,8 @@ use crate::chat_protocol::{
     dpop::{self, TrustedNestVerifier, VerifiedChatDeviceRequest},
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::auth::{
-        self, AuthRepositoryError, AuthorizationOutcome, CompletedIdempotentResponse,
-        EnrollmentOperationAdmission, RebindOperationAdmission, ReplenishmentOperationAdmission,
-        SignedOperationAdmission,
+        self, AuthRepositoryError, CompletedIdempotentResponse, EnrollmentOperationAdmission,
+        RebindOperationAdmission, ReplenishmentOperationAdmission, SignedOperationAdmission,
     },
     repository::prelude::PreludeError,
     transcript,
@@ -45,14 +40,6 @@ use crate::storage::DbPool;
 
 use super::errors::ChatFailure;
 use super::runtime::ChatRuntime;
-
-/// Outcome of admitting a signed or bootstrap request: either a first-execution
-/// authority to drive the business mutation, or a ready-to-return verbatim
-/// replay of a previously completed identical request.
-pub(crate) enum Admission {
-    Execute(Box<VerifiedChatDeviceRequest>),
-    Replay(Response),
-}
 
 /// Reject the request unless the global cutover flag is enabled for the
 /// clean-chat protocol.
@@ -156,110 +143,9 @@ pub(crate) async fn admit_unsigned(
         &instant,
     )
     .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    match auth::authorize_unsigned_request(pool, pre_replay)
+    auth::authorize_unsigned_request(pool, pre_replay)
         .await
-        .map_err(|error| auth_repository_failure(endpoint, error))?
-    {
-        AuthorizationOutcome::FirstExecution(authority) => Ok(authority),
-        // Unsigned endpoints declare no idempotency record; a completed replay
-        // is a repository invariant break, not a wire outcome.
-        AuthorizationOutcome::CompletedReplay(_) => Err(ChatFailure::invariant(endpoint)),
-    }
-}
-
-/// Admit an ordinary signed procedure carrying a `{signedRequest}` body.
-pub(crate) async fn admit_signed(
-    pool: &DbPool,
-    runtime: &ChatRuntime,
-    endpoint: ChatEndpoint,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<Admission, ChatFailure> {
-    require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let nsid = validated_nsid(endpoint)?;
-    let instant = capture_instant(endpoint)?;
-    let pre_replay = dpop::verify_ordinary_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        &nsid,
-        &CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-
-    let signed_bytes = signed_request_bytes(body, endpoint)?;
-    let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes)
-        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-
-    let outcome = auth::authorize_signed_request(pool, pre_replay, canonical)
-        .await
-        .map_err(|error| auth_repository_failure(endpoint, error))?;
-    Ok(into_admission(outcome))
-}
-
-/// Admit an enrollment-bootstrap request (`enrollDevice`).
-pub(crate) async fn admit_enrollment(
-    pool: &DbPool,
-    runtime: &ChatRuntime,
-    endpoint: ChatEndpoint,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<Admission, ChatFailure> {
-    require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let instant = capture_instant(endpoint)?;
-
-    let signed_bytes = signed_request_bytes(body, endpoint)?;
-    let enrollment_body = transcript::decode_and_verify_enrollment_body(&signed_bytes)
-        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let pre_replay = dpop::verify_enrollment_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        enrollment_body,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-
-    let outcome = auth::authorize_enrollment_request(pool, pre_replay)
-        .await
-        .map_err(|error| auth_repository_failure(endpoint, error))?;
-    Ok(into_admission(outcome))
-}
-
-/// Admit a rebind-bootstrap request (`rebindDeviceAuthentication`).
-pub(crate) async fn admit_rebind(
-    pool: &DbPool,
-    runtime: &ChatRuntime,
-    endpoint: ChatEndpoint,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<Admission, ChatFailure> {
-    require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let instant = capture_instant(endpoint)?;
-
-    let signed_bytes = signed_request_bytes(body, endpoint)?;
-    let bootstrap = transcript::decode_rebind_bootstrap(&signed_bytes)
-        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let pre_replay = dpop::verify_rebind_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        bootstrap,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-
-    let outcome = auth::authorize_rebind_request(pool, pre_replay)
-        .await
-        .map_err(|error| auth_repository_failure(endpoint, error))?;
-    Ok(into_admission(outcome))
+        .map_err(|error| auth_repository_failure(endpoint, error))
 }
 
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
@@ -384,15 +270,6 @@ pub(crate) async fn admit_replenishment_operation_only(
     auth::authorize_replenishment_operation_only(pool, pre_replay, canonical)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
-}
-
-fn into_admission(outcome: AuthorizationOutcome) -> Admission {
-    match outcome {
-        AuthorizationOutcome::FirstExecution(authority) => Admission::Execute(Box::new(authority)),
-        AuthorizationOutcome::CompletedReplay(response) => {
-            Admission::Replay(replay_response(&response))
-        }
-    }
 }
 
 /// A fresh `200 OK` JSON response carrying the exact serialized output bytes.
