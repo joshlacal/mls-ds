@@ -39,6 +39,8 @@ pub(crate) mod inventory;
 #[allow(dead_code)]
 pub(crate) mod key_packages;
 pub(crate) mod prelude;
+#[allow(dead_code)]
+pub(crate) mod recovery;
 #[cfg(not(test))]
 pub(crate) mod relationship;
 #[cfg(not(test))]

@@ -28,6 +28,8 @@ use chrono::{DateTime, Utc};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use super::recovery::RecoverySqlAuthoritySeal;
+
 /// Failures the state-family row writers can surface to the composing executor.
 #[derive(Debug)]
 pub(crate) enum TransitionRepositoryError {
@@ -1731,6 +1733,7 @@ pub(crate) async fn release_reserved_recovery_package(
 /// repository must consume its own lock witness before calling this constructor.
 #[derive(Debug)]
 pub(crate) struct RecoveryKeyPackageRowCas<'a> {
+    _authority: &'a RecoverySqlAuthoritySeal,
     key_package_ref: &'a [u8],
     wrapper_bytes: &'a [u8],
     wrapper_sha256: &'a [u8],
@@ -1747,6 +1750,7 @@ pub(crate) struct RecoveryKeyPackageRowCas<'a> {
 impl<'a> RecoveryKeyPackageRowCas<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        authority: &'a RecoverySqlAuthoritySeal,
         key_package_ref: &'a [u8],
         wrapper_bytes: &'a [u8],
         wrapper_sha256: &'a [u8],
@@ -1760,6 +1764,7 @@ impl<'a> RecoveryKeyPackageRowCas<'a> {
         created_at: DateTime<Utc>,
     ) -> Self {
         Self {
+            _authority: authority,
             key_package_ref,
             wrapper_bytes,
             wrapper_sha256,
@@ -1781,13 +1786,19 @@ impl<'a> RecoveryKeyPackageRowCas<'a> {
 /// not by itself prove that a repository lock witness was consumed.
 #[derive(Debug)]
 pub(crate) struct AvailableRecoveryPackageReservationCas<'a> {
+    _authority: &'a RecoverySqlAuthoritySeal,
     transaction_id: &'a str,
     package: RecoveryKeyPackageRowCas<'a>,
 }
 
 impl<'a> AvailableRecoveryPackageReservationCas<'a> {
-    pub(crate) fn new(transaction_id: &'a str, package: RecoveryKeyPackageRowCas<'a>) -> Self {
+    pub(crate) fn new(
+        authority: &'a RecoverySqlAuthoritySeal,
+        transaction_id: &'a str,
+        package: RecoveryKeyPackageRowCas<'a>,
+    ) -> Self {
         Self {
+            _authority: authority,
             transaction_id,
             package,
         }
@@ -1853,10 +1864,12 @@ pub(crate) async fn reserve_available_recovery_package(
 #[derive(Debug)]
 pub(crate) enum RecoveryTerminalTripleTermination<'a> {
     Fulfilled {
+        authority: &'a RecoverySqlAuthoritySeal,
         transition_id: Uuid,
         terminal_at: DateTime<Utc>,
     },
     Cancelled {
+        authority: &'a RecoverySqlAuthoritySeal,
         terminal_signed_request_bytes: &'a [u8],
         terminal_signing_transcript_bytes: &'a [u8],
         terminal_request_digest: &'a [u8],
@@ -1864,6 +1877,7 @@ pub(crate) enum RecoveryTerminalTripleTermination<'a> {
         terminal_at: DateTime<Utc>,
     },
     Expired {
+        authority: &'a RecoverySqlAuthoritySeal,
         terminal_at: DateTime<Utc>,
     },
 }
@@ -1892,6 +1906,7 @@ impl RecoveryTerminalTripleTermination<'_> {
             Self::Fulfilled {
                 transition_id,
                 terminal_at,
+                ..
             } => (
                 "fulfilled",
                 Some(*transition_id),
@@ -1907,6 +1922,7 @@ impl RecoveryTerminalTripleTermination<'_> {
                 terminal_request_digest,
                 terminal_signature,
                 terminal_at,
+                ..
             } => (
                 "cancelled",
                 None,
@@ -1916,7 +1932,7 @@ impl RecoveryTerminalTripleTermination<'_> {
                 Some(*terminal_signature),
                 *terminal_at,
             ),
-            Self::Expired { terminal_at } => {
+            Self::Expired { terminal_at, .. } => {
                 ("expired", None, None, None, None, None, *terminal_at)
             }
         }
@@ -1934,6 +1950,7 @@ impl RecoveryTerminalTripleTermination<'_> {
 /// consumed its private lock witness.
 #[derive(Debug)]
 pub(crate) struct RecoveryTerminalTripleCas<'a> {
+    _authority: &'a RecoverySqlAuthoritySeal,
     transaction_id: &'a str,
     request: &'a NewLeafRecoveryRequest,
     reservation: &'a NewReservation,
@@ -1943,6 +1960,7 @@ pub(crate) struct RecoveryTerminalTripleCas<'a> {
 
 impl<'a> RecoveryTerminalTripleCas<'a> {
     pub(crate) fn new(
+        authority: &'a RecoverySqlAuthoritySeal,
         transaction_id: &'a str,
         request: &'a NewLeafRecoveryRequest,
         reservation: &'a NewReservation,
@@ -1950,6 +1968,7 @@ impl<'a> RecoveryTerminalTripleCas<'a> {
         termination: RecoveryTerminalTripleTermination<'a>,
     ) -> Self {
         Self {
+            _authority: authority,
             transaction_id,
             request,
             reservation,

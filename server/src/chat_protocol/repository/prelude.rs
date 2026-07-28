@@ -12,7 +12,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    super::{dpop::VerifiedChatDeviceRequest, validation::BareDid},
+    super::{
+        dpop::VerifiedChatDeviceRequest, transcript::VerifiedSignedMutation, validation::BareDid,
+    },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
 };
 
@@ -298,6 +300,31 @@ pub(crate) struct PreparedBusinessPrelude {
     operation: OperationClaimGuard,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryOperationEndpoint {
+    RequestLeafRecovery,
+    CancelLeafRecovery,
+    SubmitRecoveryFulfillment,
+}
+
+impl RecoveryOperationEndpoint {
+    fn endpoint_nsid(self) -> &'static str {
+        match self {
+            Self::RequestLeafRecovery => "blue.catbird.chat.requestLeafRecovery",
+            Self::CancelLeafRecovery => "blue.catbird.chat.cancelLeafRecovery",
+            Self::SubmitRecoveryFulfillment => "blue.catbird.chat.submitTransition",
+        }
+    }
+
+    fn mutation_kind(self) -> &'static str {
+        match self {
+            Self::RequestLeafRecovery => "blue.catbird.chat.defs#leafRecoveryRequestBody",
+            Self::CancelLeafRecovery => "blue.catbird.chat.defs#leafRecoveryCancellationBody",
+            Self::SubmitRecoveryFulfillment => "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+        }
+    }
+}
+
 /// Single-use proof that the exact canonical principal/device/key projection
 /// was locked after request admission. It deliberately exposes neither the raw
 /// business guard nor a dereference/escape hatch to it.
@@ -373,6 +400,35 @@ impl ScopeBoundBusinessAuthority {
 impl PreparedBusinessPrelude {
     pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
         &self.authority
+    }
+
+    /// Consume and return the prelude only when its private operation claim is
+    /// the exact Recovery operation represented by `mutation`.
+    pub(crate) fn verify_recovery_operation(
+        self,
+        endpoint: RecoveryOperationEndpoint,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        let accepted_request_bytes = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        let binding = &self.operation.binding;
+        if operation_id.get_version_num() != 4
+            || self.operation.transaction_id != self.authority.transaction_id()
+            || binding.operation_id != operation_id
+            || binding.principal_did != mutation.actor_did().as_str()
+            || binding.endpoint_nsid != endpoint.endpoint_nsid()
+            || binding.mutation_kind != endpoint.mutation_kind()
+            || binding.mutation_kind != mutation.type_id()
+            || binding.request_digest != *mutation.request_digest()
+            || binding.accepted_request_sha256
+                != <[u8; 32]>::from(Sha256::digest(accepted_request_bytes))
+            || binding.signature != *mutation.signature()
+        {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        Ok(self)
     }
 
     pub(crate) fn into_execution_parts(

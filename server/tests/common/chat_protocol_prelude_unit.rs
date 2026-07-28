@@ -158,6 +158,31 @@ fn prepared_scope_authority_has_no_raw_business_guard_escape() {
 }
 
 #[test]
+fn recovery_claim_verifier_is_consuming_and_binds_every_exact_dimension() {
+    let source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    let function = source
+        .split_once("pub(crate) fn verify_recovery_operation(")
+        .expect("missing recovery claim verifier")
+        .1
+        .split_once("\n    }\n")
+        .expect("unterminated recovery claim verifier")
+        .0;
+    assert!(function.contains("self,"));
+    for fact in [
+        "operation_id",
+        "principal_did",
+        "endpoint_nsid",
+        "mutation_kind",
+        "request_digest",
+        "accepted_request_sha256",
+        "signature",
+        "transaction_id",
+    ] {
+        assert!(function.contains(fact), "missing exact claim fact: {fact}");
+    }
+}
+
+#[test]
 fn completed_replay_bytes_cross_auth_only_after_post_state_validation() {
     let auth_source = include_str!("../../src/chat_protocol/repository/auth.rs");
     assert!(!auth_source.contains("pub(super) async fn load_completed_business_replay"));

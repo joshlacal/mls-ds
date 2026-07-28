@@ -1,5 +1,18 @@
 #![allow(dead_code)]
 
+mod recovery {
+    #[derive(Debug)]
+    pub(crate) struct RecoverySqlAuthoritySeal {
+        _private: (),
+    }
+
+    impl RecoverySqlAuthoritySeal {
+        pub(crate) fn for_test() -> Self {
+            Self { _private: () }
+        }
+    }
+}
+
 mod transition {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -157,9 +170,11 @@ fn terminal_triple_cross_binds_the_three_complete_rows() {
 
 #[test]
 fn terminal_arms_share_exact_transition_evidence_and_time_rules() {
+    let authority = recovery::RecoverySqlAuthoritySeal::for_test();
     let terminal_at = Utc.timestamp_opt(1_900_000_000, 0).unwrap();
     assert_eq!(
         RecoveryTerminalTripleTermination::Fulfilled {
+            authority: &authority,
             transition_id: Uuid::from_u128(1),
             terminal_at,
         }
@@ -168,6 +183,7 @@ fn terminal_arms_share_exact_transition_evidence_and_time_rules() {
     );
     assert_eq!(
         RecoveryTerminalTripleTermination::Cancelled {
+            authority: &authority,
             terminal_signed_request_bytes: b"signed",
             terminal_signing_transcript_bytes: b"transcript",
             terminal_request_digest: &[3; 32],
@@ -178,7 +194,11 @@ fn terminal_arms_share_exact_transition_evidence_and_time_rules() {
         ("cancelled", "released", "available")
     );
     assert_eq!(
-        RecoveryTerminalTripleTermination::Expired { terminal_at }.sql_projection(),
+        RecoveryTerminalTripleTermination::Expired {
+            authority: &authority,
+            terminal_at
+        }
+        .sql_projection(),
         ("expired", "expired", "availableOrExpired")
     );
     let sql = compact(RECOVERY_TERMINAL_TRIPLE_SQL);
