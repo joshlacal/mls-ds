@@ -19,10 +19,10 @@
 //! coherent transition+entry+state graph. Building that graph is the composing
 //! executor's job (task E2b) and is verified there, not by these unit writers.
 //!
-//! The production repository module is gated `#[cfg(not(test))]` (see
-//! `src/chat_protocol/repository/mod.rs`), so — mirroring the sibling repository
-//! harnesses — this test `include!`s it directly. The module is self-contained
-//! (only `chrono`/`sqlx`/`uuid`), so no other production module is included.
+//! The repository `delivery` module consumes sealed `WelcomeCasBinding` authority
+//! from `state_machine`, so this harness mirrors the production-shaped nested
+//! `chat_protocol` module graph used by the executor integration tests. That graph
+//! gives the directly included repository sources their real protocol context.
 //!
 //! Run against the dedicated clean-chat database:
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
@@ -32,23 +32,95 @@
 
 mod common;
 
-mod repository {
-    pub(crate) mod transition {
+// `delivery` now consumes the sealed `WelcomeCasBinding` from the state machine.
+// Mirror the executor harness's real nested module graph instead of compiling a
+// second, context-free copy of the repository source.
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/dpop.rs"]
+mod dpop;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/model.rs"]
+mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/repository/mod.rs"]
+mod repository;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/transcript.rs"]
+mod transcript;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/validation.rs"]
+mod validation;
+
+mod chat_protocol {
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
+        #![allow(dead_code)]
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/transition.rs"
+            "/src/chat_protocol/public_state.rs"
         ));
     }
-
-    // The migration-2 state-family row writers (task E2b-1) live in
-    // `repository/delivery.rs` alongside the E1 append-log primitives. Like the
-    // `transition` module above, it is production-gated `#[cfg(not(test))]`, so
-    // this test `include!`s it directly. Both modules are self-contained (only
-    // `chrono`/`sha2`/`sqlx`/`uuid`), so no other production module is included.
-    pub(crate) mod delivery {
+    pub mod dpop {
+        pub use crate::dpop::*;
+    }
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
+    pub mod repository {
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
+        pub mod core {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/core.rs"
+            ));
+        }
+        pub mod transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
+        #![allow(dead_code)]
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
+            "/src/chat_protocol/state_machine.rs"
         ));
     }
 }
@@ -79,11 +151,10 @@ use repository::transition::{
 use repository::delivery::{
     close_application_interval, insert_application_interval, insert_recovery_work_item,
     insert_schedule_terminal_proof, insert_welcome_bundle, insert_welcome_delivery,
-    terminalize_recovery_work_item, terminalize_welcome_delivery, ApplicationIntervalClose,
-    DeliveryRepositoryError, IntervalCloseKind, IntervalOpeningKind, NewApplicationInterval,
-    NewRecoveryWorkItem, NewScheduleTerminalProof, NewWelcomeBundle, NewWelcomeDelivery,
-    RecoveryWorkSourceKind, RecoveryWorkTermination, WelcomeClientAuthorization,
-    WelcomeDisposition, WelcomeRejectionReason,
+    terminalize_recovery_work_item, terminalize_welcome_delivery_for_supersession,
+    ApplicationIntervalClose, DeliveryRepositoryError, IntervalCloseKind, IntervalOpeningKind,
+    NewApplicationInterval, NewRecoveryWorkItem, NewScheduleTerminalProof, NewWelcomeBundle,
+    NewWelcomeDelivery, RecoveryWorkSourceKind, RecoveryWorkTermination, WelcomeDisposition,
 };
 
 // ---------------------------------------------------------------------------
@@ -2060,7 +2131,7 @@ async fn seed_welcome_delivery_prereqs(
 }
 
 #[tokio::test]
-async fn welcome_delivery_insert_and_disposition_terminal_race() {
+async fn welcome_delivery_insert_and_primary_key_constraint_are_faithful() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
@@ -2096,98 +2167,6 @@ async fn welcome_delivery_insert_and_disposition_terminal_race() {
     assert_eq!(req_back, recovery_request_id);
     assert_eq!(terminal_at, None);
 
-    // Terminal race, first winner: acknowledged with a client authorization block.
-    // terminal_at < expires_at (required for a non-expired terminal status).
-    let terminal_at = now + Duration::minutes(1);
-    let ack_transcript = vec![0x61_u8; 24];
-    let authorization = WelcomeClientAuthorization {
-        signed_request_bytes: vec![0x62_u8; 32],
-        signing_transcript_bytes: ack_transcript.clone(),
-        request_digest: Sha256::digest(&ack_transcript).to_vec(),
-        signature: vec![0x63_u8; 64],
-    };
-    terminalize_welcome_delivery(
-        &mut tx,
-        welcome_id,
-        &WelcomeDisposition::Acknowledged {
-            authorization: authorization.clone(),
-        },
-        terminal_at,
-        1,
-    )
-    .await
-    .expect("acknowledge pending welcome delivery");
-
-    // The delivery flipped to acknowledged and the single disposition row carries
-    // the winner kind, the signed authorization bytes (byte-equality), and the
-    // event position; rejection_reason stays NULL for an acknowledgement.
-    let (delivery_status, delivery_terminal): (String, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT status,terminal_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
-    )
-    .bind(welcome_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(delivery_status, "acknowledged");
-    assert!(delivery_terminal.is_some());
-
-    #[allow(clippy::type_complexity)]
-    let (winner, signed, digest, signature, reason, event_position): (
-        String,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<String>,
-        i64,
-    ) = sqlx::query_as(
-        "SELECT winner_kind,signed_request_bytes,request_digest,signature,rejection_reason,event_position \
-           FROM chat.welcome_dispositions WHERE welcome_id=$1",
-    )
-    .bind(welcome_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(winner, "acknowledged");
-    assert_eq!(signed, Some(authorization.signed_request_bytes.clone()));
-    assert_eq!(digest, Some(Sha256::digest(&ack_transcript).to_vec()));
-    assert_eq!(signature, Some(authorization.signature.clone()));
-    assert_eq!(reason, None);
-    assert_eq!(event_position, 1);
-
-    // Second winner loses the race: the delivery is no longer pending, so the CAS
-    // misses and NO second disposition is written.
-    delivery_conflict(
-        terminalize_welcome_delivery(
-            &mut tx,
-            welcome_id,
-            &WelcomeDisposition::Rejected {
-                authorization,
-                reason: WelcomeRejectionReason::InvalidWelcome,
-            },
-            terminal_at,
-            2,
-        )
-        .await,
-    );
-    let disposition_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.welcome_dispositions WHERE welcome_id=$1")
-            .bind(welcome_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    assert_eq!(disposition_count, 1, "the loser must not add a disposition");
-
-    // CAS-drift: terminalizing a welcome_id with no pending delivery -> conflict.
-    delivery_conflict(
-        terminalize_welcome_delivery(
-            &mut tx,
-            Uuid::new_v4(),
-            &WelcomeDisposition::Expired,
-            terminal_at,
-            3,
-        )
-        .await,
-    );
     tx.rollback().await.unwrap();
 
     // DB constraint cross-check: one delivery per welcome_id — a second delivery
@@ -2239,7 +2218,7 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
     )
     .await
     .expect("insert transition-superseded welcome");
-    terminalize_welcome_delivery(
+    terminalize_welcome_delivery_for_supersession(
         &mut transition_tx,
         welcome_id,
         &WelcomeDisposition::SupersededByTransition {
@@ -2281,7 +2260,7 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
     .await
     .expect("insert revocation-superseded welcome");
     let terminal_revocation_id = Uuid::new_v4();
-    terminalize_welcome_delivery(
+    terminalize_welcome_delivery_for_supersession(
         &mut revocation_tx,
         welcome_id,
         &WelcomeDisposition::SupersededByRevocation {
