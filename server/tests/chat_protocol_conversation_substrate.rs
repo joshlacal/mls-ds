@@ -5518,6 +5518,7 @@ mod historical_control_loader {
         };
         use chrono::{DateTime, SecondsFormat, Utc};
         use ed25519_dalek::{Signer, SigningKey};
+        use futures::FutureExt;
         use openmls::prelude::{
             tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, CredentialType,
             CredentialWithKey, GroupId, KeyPackage, Lifetime, MlsGroup, MlsGroupCreateConfig,
@@ -5577,13 +5578,13 @@ mod historical_control_loader {
             WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
-            append_event, enqueue_outbox, insert_event_recipients, EntryEntitlementKind,
-            EventEntitlementKind, EventKind, EventRecipient, NewEvent, OutboxWorkKind,
-            WelcomeRejectionReason,
+            append_event, canonical_welcome_disposition_event_payload, enqueue_outbox,
+            insert_event_recipients, EntryEntitlementKind, EventEntitlementKind, EventKind,
+            EventRecipient, NewEvent, OutboxWorkKind, WelcomeRejectionReason,
         };
         use crate::chat_protocol::repository::execution_context::{
             apply_device_revocation_batch_sequential,
-            apply_device_revocation_batch_unscoped_for_test,
+            apply_device_revocation_batch_unscoped_for_test, hydrate_execution_context,
             hydrate_execution_context_unscoped_for_test, prepare_device_revocation_batch_execution,
             prepare_device_revocation_batch_execution_from_contexts_for_test,
             ConversationExecutionArtifacts, DeviceRevocationCancellationPoint,
@@ -5603,7 +5604,7 @@ mod historical_control_loader {
             PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            acceptance_recovery_package_artifact_matches,
+            acceptance_recovery_package_artifact_matches, apply_conversation_persistence_plan,
             apply_conversation_persistence_plan_unscoped_for_test,
             apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test,
             device_revocation_plan_for_test, persistence_plan_for_test, plan_device_revocation,
@@ -5611,14 +5612,15 @@ mod historical_control_loader {
             ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
             ConversationPersistencePlan, ConversationState, ConversationStateHydration,
             CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
-            DeviceRevocationEvidence, DurableSignedRequestEnvelope, ExecutionActor,
-            ExecutionAuthority, ExecutionContext, ExecutorError, HistoricalRehydrationAuthority,
-            HydrationAuthority, LeafRecoveryKind, LeaveRequestStatus, LockedRegistrationProjection,
-            ParticipantRole, ParticipantStatus, PlanAuthority, PrincipalId,
-            RecoveryOriginHydrationRow, RecoveryRequestStatus, RecoverySource, ReservationStatus,
-            RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
-            SpineArtifacts, StateMachineError, TransitionEvidence, WelcomeExpiryAuthority,
-            WelcomeRejectionWork, WelcomeStatus, WelcomeTerminalPlan, WorkTerminalHydrationRow,
+            DeviceRevocationEvidence, DropSafetyProbe, DropSafetyProbeMode,
+            DurableSignedRequestEnvelope, ExecutionActor, ExecutionAuthority, ExecutionContext,
+            ExecutorError, HistoricalRehydrationAuthority, HydrationAuthority, LeafRecoveryKind,
+            LeaveRequestStatus, LockedRegistrationProjection, ParticipantRole, ParticipantStatus,
+            PlanAuthority, PrincipalId, RecoveryOriginHydrationRow, RecoveryRequestStatus,
+            RecoverySource, ReservationStatus, RevocationPackageCasBinding,
+            RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, StateMachineError,
+            TransitionEvidence, WelcomeExpiryAuthority, WelcomeRejectionWork, WelcomeStatus,
+            WelcomeTerminalPlan, WorkTerminalHydrationRow,
         };
         use crate::chat_protocol::transcript::{
             decode_and_verify_control_entry, decode_and_verify_signed_mutation,
@@ -7310,6 +7312,207 @@ mod historical_control_loader {
                 genesis_group_info_bytes: None,
                 primary_event_payload: None,
                 welcome_disposition_event_payloads: Vec::new(),
+            }
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct PreparedExpiryAtomicSnapshot {
+            head: (i64, i64, i64, String),
+            delivery: (String, Option<DateTime<Utc>>),
+            disposition_count: i64,
+            recovery_work_count: i64,
+            event_count: i64,
+            event_recipient_count: i64,
+            outbox_count: i64,
+        }
+
+        async fn prepared_expiry_atomic_snapshot(
+            transaction: &mut Transaction<'_, Postgres>,
+            conversation_id: Uuid,
+            welcome_id: Uuid,
+        ) -> PreparedExpiryAtomicSnapshot {
+            let payload = canonical_welcome_disposition_event_payload(welcome_id, "expired");
+            PreparedExpiryAtomicSnapshot {
+                head: sqlx::query_as(
+                    "SELECT current_generation,current_state_version,next_entry_seq,lifecycle \
+                       FROM chat.conversations WHERE conversation_id=$1",
+                )
+                .bind(conversation_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("read prepared-expiry conversation head"),
+                delivery: sqlx::query_as(
+                    "SELECT status,terminal_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
+                )
+                .bind(welcome_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("read prepared-expiry Welcome delivery"),
+                disposition_count: sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.welcome_dispositions WHERE welcome_id=$1",
+                )
+                .bind(welcome_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("count prepared-expiry dispositions"),
+                recovery_work_count: sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.recovery_work_items \
+                     WHERE conversation_id=$1 AND source_id=$2",
+                )
+                .bind(conversation_id)
+                .bind(welcome_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("count prepared-expiry recovery work"),
+                event_count: sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.events WHERE payload_bytes=$1",
+                )
+                .bind(&payload)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("count prepared-expiry events"),
+                event_recipient_count: sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.event_recipients recipient \
+                       JOIN chat.events event USING(event_position) \
+                      WHERE event.payload_bytes=$1",
+                )
+                .bind(&payload)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("count prepared-expiry event recipients"),
+                outbox_count: sqlx::query_scalar(
+                    "SELECT count(*) FROM chat.outbox outbox \
+                       JOIN chat.events event USING(event_position) \
+                      WHERE event.payload_bytes=$1",
+                )
+                .bind(payload)
+                .fetch_one(&mut **transaction)
+                .await
+                .expect("count prepared-expiry outbox rows"),
+            }
+        }
+
+        fn assert_prepared_expiry_probe_panic(payload: Box<dyn std::any::Any + Send>) {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(
+                message,
+                Some("prepared-executor drop-safety probe"),
+                "only the deterministic post-write probe may unwind this gate"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_prepared_executor_cancel_and_panic_drop_savepoint_before_outer_reuse() {
+            let pool = g6_gate_pool("prepared executor cancellation and panic atomicity").await;
+            let graph = commit_genuine_policy_acceptance_fulfillment_at(
+                &pool,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+            )
+            .await;
+            let conversation_id = Uuid::from_bytes(graph.entry.cid);
+            let welcome_id = graph.fulfillment.welcome_id;
+
+            for mode in [DropSafetyProbeMode::Pending, DropSafetyProbeMode::Panic] {
+                let (mut transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
+                let before =
+                    prepared_expiry_atomic_snapshot(&mut transaction, conversation_id, welcome_id)
+                        .await;
+                assert_eq!(before.delivery.0, "pending");
+                assert_eq!(before.disposition_count, 0);
+                assert_eq!(before.recovery_work_count, 0);
+                assert_eq!(before.event_count, 0);
+                assert_eq!(before.event_recipient_count, 0);
+                assert_eq!(before.outbox_count, 0);
+
+                let prepared = hydrate_execution_context(
+                    &mut transaction,
+                    &plan,
+                    g6_welcome_expiry_artifacts(),
+                )
+                .await
+                .expect("normal production hydration mints the prepared expiry capsule");
+                let (probe, mut reached) = DropSafetyProbe::new(mode);
+                let prepared = prepared.with_drop_safety_probe_for_test(probe);
+
+                match mode {
+                    DropSafetyProbeMode::Pending => {
+                        let mut execution = Box::pin(apply_conversation_persistence_plan(prepared));
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            tokio::select! {
+                                result = &mut execution => {
+                                    panic!(
+                                        "prepared executor returned before cancellation probe: \
+                                         {result:?}"
+                                    )
+                                }
+                                signal = &mut reached => {
+                                    signal.expect("cancellation probe signals after real writes");
+                                }
+                            }
+                        })
+                        .await
+                        .expect("prepared executor reaches cancellation probe");
+                        drop(execution);
+                    }
+                    DropSafetyProbeMode::Panic => {
+                        let unwind = std::panic::AssertUnwindSafe(
+                            apply_conversation_persistence_plan(prepared),
+                        )
+                        .catch_unwind()
+                        .await
+                        .expect_err("panic probe must unwind the prepared executor");
+                        assert_prepared_expiry_probe_panic(unwind);
+                        tokio::time::timeout(std::time::Duration::from_secs(5), &mut reached)
+                            .await
+                            .expect("panic probe signal is observable")
+                            .expect("panic probe signals after real writes");
+                    }
+                }
+
+                // This must be the first database operation after the apply
+                // future is dropped/unwound. SQLx flushes its queued
+                // ROLLBACK TO SAVEPOINT and waits for ReadyForQuery before
+                // sending this SELECT on the same outer transaction.
+                sqlx::query_scalar::<_, i32>("SELECT 1")
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .expect("drain queued prepared-executor savepoint rollback");
+                sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                    .execute(&mut *transaction)
+                    .await
+                    .expect("rolled-back prepared executor leaves no deferred violation");
+                let after =
+                    prepared_expiry_atomic_snapshot(&mut transaction, conversation_id, welcome_id)
+                        .await;
+                assert_eq!(
+                    after, before,
+                    "drop/unwind must erase the entire prepared expiry write set"
+                );
+                transaction
+                    .rollback()
+                    .await
+                    .expect("rollback prepared-executor outer transaction");
+
+                let mut durable = pool
+                    .begin()
+                    .await
+                    .expect("begin durable prepared-executor baseline read");
+                let durable_after =
+                    prepared_expiry_atomic_snapshot(&mut durable, conversation_id, welcome_id)
+                        .await;
+                assert_eq!(
+                    durable_after, before,
+                    "drop/unwind must expose no durable prepared-executor residue"
+                );
+                durable
+                    .rollback()
+                    .await
+                    .expect("rollback durable prepared-executor baseline read");
             }
         }
 

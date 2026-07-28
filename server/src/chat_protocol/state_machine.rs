@@ -15982,7 +15982,8 @@ pub(crate) use executor::{
 #[cfg(test)]
 pub(crate) use executor::{
     apply_conversation_persistence_plan_unscoped_for_test,
-    apply_device_revocation_batch_unscoped_for_test, ExecutionContext,
+    apply_device_revocation_batch_unscoped_for_test, DropSafetyProbe, DropSafetyProbeMode,
+    ExecutionContext,
 };
 pub(crate) use executor::{
     batch_transaction_bindings_match, plan_transaction_bindings_match,
@@ -16674,6 +16675,8 @@ pub(in crate::chat_protocol) mod executor {
         context: ExecutionContext,
         expected_transaction_id: Box<str>,
         _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
+        #[cfg(test)]
+        drop_safety_probe: Option<DropSafetyProbe>,
     }
 
     impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connection, 'plan> {
@@ -16691,6 +16694,52 @@ pub(in crate::chat_protocol) mod executor {
                 context,
                 expected_transaction_id,
                 _proof: proof,
+                #[cfg(test)]
+                drop_safety_probe: None,
+            }
+        }
+
+        /// Attach a deterministic test-only suspension/unwind point without
+        /// changing any plan, authority, context, or transaction binding.
+        #[cfg(test)]
+        pub(crate) fn with_drop_safety_probe_for_test(mut self, probe: DropSafetyProbe) -> Self {
+            self.drop_safety_probe = Some(probe);
+            self
+        }
+    }
+
+    /// Test-only behavior at the prepared executor's post-write,
+    /// pre-savepoint-release boundary.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum DropSafetyProbeMode {
+        Pending,
+        Panic,
+    }
+
+    /// Per-capsule drop-safety probe. It is neither global nor cloneable and is
+    /// attachable only after repository hydration has minted the production
+    /// capsule, so it cannot weaken any authority or artifact check.
+    #[cfg(test)]
+    pub(crate) struct DropSafetyProbe {
+        mode: DropSafetyProbeMode,
+        reached: tokio::sync::oneshot::Sender<()>,
+    }
+
+    #[cfg(test)]
+    impl DropSafetyProbe {
+        pub(crate) fn new(mode: DropSafetyProbeMode) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (reached, receiver) = tokio::sync::oneshot::channel();
+            (Self { mode, reached }, receiver)
+        }
+
+        async fn reach(self) {
+            let _ = self.reached.send(());
+            match self.mode {
+                DropSafetyProbeMode::Pending => std::future::pending::<()>().await,
+                DropSafetyProbeMode::Panic => {
+                    panic!("prepared-executor drop-safety probe")
+                }
             }
         }
     }
@@ -18672,9 +18721,12 @@ pub(in crate::chat_protocol) mod executor {
     /// Apply one repository-prepared plan inside a nested SQL savepoint.
     ///
     /// Every returned body error explicitly rolls the savepoint back before the
-    /// caller regains the outer transaction. A release failure, cancellation,
-    /// or panic may rely on SQLx's queued savepoint rollback; such callers must
-    /// abandon or explicitly roll back the outer transaction before reuse.
+    /// caller regains the outer transaction. Cancellation or panic drops SQLx's
+    /// live nested `Transaction`, which queues `ROLLBACK TO SAVEPOINT` on this
+    /// same PostgreSQL connection. The caller may reuse the outer transaction
+    /// only after a same-connection round trip succeeds and therefore drains
+    /// that queued rollback. Transaction-identity or savepoint infrastructure
+    /// errors still require the outer transaction to be abandoned.
     pub(crate) async fn apply_conversation_persistence_plan(
         prepared: PreparedConversationExecution<'_, '_, '_>,
     ) -> Result<AppliedTransition, ExecutorError> {
@@ -18684,6 +18736,8 @@ pub(in crate::chat_protocol) mod executor {
             context,
             expected_transaction_id,
             _proof,
+            #[cfg(test)]
+            drop_safety_probe,
         } = prepared;
         let mut savepoint = transaction
             .begin()
@@ -18705,6 +18759,10 @@ pub(in crate::chat_protocol) mod executor {
         };
         match operation {
             Ok(applied) => {
+                #[cfg(test)]
+                if let Some(probe) = drop_safety_probe {
+                    probe.reach().await;
+                }
                 savepoint
                     .commit()
                     .await
