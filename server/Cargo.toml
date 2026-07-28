@@ -120,7 +120,23 @@ lazy_static = "1.4"
 tempfile = "3"
 tower-util = { package = "tower", version = "0.5", features = ["util"] }
 
+[[bin]]
+name = "catbird-server"
+path = "src/main.rs"
+required-features = ["server-bin"]
+
+[[bin]]
+name = "deadletter_recover"
+path = "src/bin/deadletter_recover.rs"
+required-features = ["server-bin"]
+
+[[test]]
+name = "chat_protocol_production_cfg"
+path = "tests/chat_protocol_production_cfg.rs"
+required-features = ["chat-protocol-production-proof"]
 
 [features]
-default = ["namespace-bluecatbird"]
+default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []
+server-bin = []
+chat-protocol-production-proof = []

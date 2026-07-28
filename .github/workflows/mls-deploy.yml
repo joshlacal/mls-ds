@@ -37,7 +37,7 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
     env:
-      # This all-features workspace links many large Rust test binaries. Keep
+      # This shipping-feature workspace links many large Rust test binaries. Keep
       # CI artifacts compact; debug information is not part of the test gate
       # and previously exhausted the hosted runner before tests could start.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -66,7 +66,7 @@ jobs:
         run: |
           # mls-ds does not use the preinstalled mobile, .NET, or Haskell
           # SDKs. Removing them from this ephemeral runner prevents the
-          # all-features Rust link from failing with ENOSPC.
+          # shipping-feature Rust link from failing with ENOSPC.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           df -h /
 
@@ -96,7 +96,7 @@ jobs:
           # code were being cleaned up; that work landed in chore/ci-cleanup.
           # Don't drop back to --lib --bins without a concrete reason; it
           # hides real lint regressions in the test suite.
-          cargo clippy --all-targets --all-features -- -D warnings
+          cargo clippy --all-targets --features namespace-bluecatbird,server-bin -- -D warnings
 
       - name: Install cargo-audit
         working-directory: ./server
@@ -116,6 +116,7 @@ jobs:
       - name: Deployment policy lint
         run: |
           ./server/scripts/check_deploy_policy.sh
+          ./server/scripts/check_chat_production_proof_policy.sh
 
       - name: Cargo audit
         # Cargo.lock lives at the workspace root, not in ./server. Run from
@@ -206,7 +207,7 @@ jobs:
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           RUST_LOG: debug
         run: |
-          cargo test --all-features
+          cargo test --features namespace-bluecatbird,server-bin
 
       - name: Run integration tests
         working-directory: ./server
