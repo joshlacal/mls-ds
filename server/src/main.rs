@@ -909,9 +909,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Clean-cutover chat runtime. Pre-cutover this needs no Nest configuration;
-    // once CHAT_CUTOVER_ENABLED is set the verifier config becomes mandatory and
-    // its absence fails startup loudly rather than silently 500-ing requests.
+    // Clean-cutover chat runtime. The fixed relationship authority is mandatory
+    // in every mode and construction failure aborts startup. Pre-cutover this
+    // needs no Nest configuration; once CHAT_CUTOVER_ENABLED is set the verifier
+    // config becomes mandatory and its absence fails startup loudly rather than
+    // silently 500-ing requests.
     let chat_runtime = Arc::new(
         catbird_server::handlers::chat::ChatRuntime::from_env().unwrap_or_else(|error| {
             tracing::error!("clean-chat runtime configuration rejected: {error}");

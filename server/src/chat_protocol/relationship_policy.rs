@@ -3067,6 +3067,12 @@ pub struct RelationshipAuthority<T: PublicTransport> {
     source_identity: [u8; 32],
 }
 
+/// The sole production relationship authority shape. Keeping the transport
+/// concrete here prevents runtime or handler code from substituting origins,
+/// DNS behavior, redirects, proxies, credentials, or an arbitrary HTTP client.
+pub(crate) type ProductionRelationshipAuthority =
+    RelationshipAuthority<ReqwestPinnedTransport<SystemDnsResolver>>;
+
 #[cfg(test)]
 pub type HttpRelationshipSource<T> = RelationshipAuthority<T>;
 
@@ -3305,7 +3311,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 }
 
 #[cfg(not(test))]
-impl RelationshipAuthority<ReqwestPinnedTransport<SystemDnsResolver>> {
+impl ProductionRelationshipAuthority {
     pub(crate) fn from_startup_guard(guard: RelationshipAuthorityStartupGuard) -> Self {
         let (config, transport) = guard.into_parts();
         Self::from_parts(config, transport, HARDENED_SOURCE_PROFILE_V1)

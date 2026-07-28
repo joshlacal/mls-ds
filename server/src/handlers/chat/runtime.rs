@@ -8,22 +8,36 @@
 //! cutover is enabled the verifier configuration is mandatory and its absence
 //! is a hard startup error.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use p256::ecdsa::VerifyingKey;
 
+#[cfg(not(test))]
+use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{
     dpop::TrustedNestVerifier,
+    relationship_policy::ProductionRelationshipAuthority,
     validation::{CanonicalUuidV4, TrustedExternalBase},
 };
 
 /// Shared, immutable clean-chat runtime, stored in `AppState` and extracted by
 /// every chat handler as `State<Arc<ChatRuntime>>`.
-#[derive(Debug)]
 pub struct ChatRuntime {
     cutover_enabled: bool,
     nest_verifier: Option<TrustedNestVerifier>,
+    relationship_authority: Arc<ProductionRelationshipAuthority>,
+}
+
+impl fmt::Debug for ChatRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatRuntime")
+            .field("cutover_enabled", &self.cutover_enabled)
+            .field("nest_verifier_configured", &self.nest_verifier.is_some())
+            .field("relationship_authority", &"fixed-production-authority")
+            .finish()
+    }
 }
 
 impl ChatRuntime {
@@ -39,9 +53,14 @@ impl ChatRuntime {
     ///
     /// Returns `Err` when cutover is enabled without a fully configured
     /// verifier, or when any verifier field is malformed.
+    #[cfg(not(test))]
     pub fn from_env() -> Result<Self, String> {
         let cutover_enabled = env_flag("CHAT_CUTOVER_ENABLED");
         let nest_verifier = build_verifier_from_env()?;
+        let relationship_authority = Arc::new(ProductionRelationshipAuthority::from_startup_guard(
+            load_fixed_relationship_authority_startup_guard()
+                .map_err(|error| format!("fixed relationship authority rejected: {error:?}"))?,
+        ));
         if cutover_enabled && nest_verifier.is_none() {
             return Err(
                 "CHAT_CUTOVER_ENABLED is set but the clean-chat Nest verifier is not configured \
@@ -53,6 +72,7 @@ impl ChatRuntime {
         Ok(Self {
             cutover_enabled,
             nest_verifier,
+            relationship_authority,
         })
     }
 
@@ -66,15 +86,8 @@ impl ChatRuntime {
         self.nest_verifier.as_ref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test(
-        cutover_enabled: bool,
-        nest_verifier: Option<TrustedNestVerifier>,
-    ) -> Self {
-        Self {
-            cutover_enabled,
-            nest_verifier,
-        }
+    pub(crate) fn relationship_authority(&self) -> &Arc<ProductionRelationshipAuthority> {
+        &self.relationship_authority
     }
 }
 
