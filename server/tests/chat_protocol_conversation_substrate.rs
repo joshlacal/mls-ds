@@ -37,8 +37,26 @@ mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/repository/mod.rs"]
-mod repository;
+mod repository {
+    pub mod auth {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/auth.rs"
+        ));
+    }
+    pub mod prelude {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/prelude.rs"
+        ));
+    }
+    pub mod inventory {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/inventory.rs"
+        ));
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -80,7 +98,11 @@ mod chat_protocol {
             pub use crate::repository::prelude::*;
         }
         pub mod recovery {
-            pub use crate::repository::recovery::*;
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/recovery.rs"
+            ));
         }
         pub mod core {
             #![allow(dead_code)]

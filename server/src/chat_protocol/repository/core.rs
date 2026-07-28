@@ -30,7 +30,8 @@ use super::super::{
     state_machine::{
         acceptance_recovery_package_artifact_matches, classify_acceptance, classify_invitation,
         classify_role_producer, hydrate_conversation_state, metadata_binding_of_transition,
-        recovery_fulfillment_terminal_matches, CloseKind, ConversationKind, ConversationState,
+        recovery_cancellation_terminal_matches, recovery_fulfillment_terminal_matches,
+        recovery_supersession_terminal_matches, CloseKind, ConversationKind, ConversationState,
         ConversationStateHydration, DeviceIdentity, HistoricalRehydrationAuthority,
         HydrationAuthority, IntervalEndHydrationRow, IntervalHydrationRow, LeafHydrationRow,
         LeafRecoveryKind, LeaveRequestHydrationRow, LeaveRequestStatus, MetadataSnapshotBinding,
@@ -6005,6 +6006,15 @@ enum RecoveryReservationTerminal {
         transition_id: Uuid,
         terminal_at: DateTime<Utc>,
     },
+    Expiry {
+        terminal_at: DateTime<Utc>,
+    },
+    Released {
+        transition_id: Option<Uuid>,
+        revocation_id: Option<Uuid>,
+        request_digest: Option<[u8; 32]>,
+        terminal_at: DateTime<Utc>,
+    },
 }
 
 /// A reservation paired to its request during recovery-work hydration; carries
@@ -6266,8 +6276,54 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     },
                 )
             }
-            "active" | "consumed" => return Err(RecoveryHydrationError::TerminalMismatch),
-            "expired" | "released" => return Err(RecoveryHydrationError::UnsupportedTerminal),
+            "expired"
+                if consumed_transition_id.is_none()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && terminal_request_digest.is_none()
+                    && terminal_at == Some(expires_at) =>
+            {
+                (
+                    ReservationStatus::Expired,
+                    RecoveryReservationTerminal::Expiry {
+                        terminal_at: expires_at,
+                    },
+                )
+            }
+            "released"
+                if consumed_transition_id.is_none()
+                    && terminal_at.is_some()
+                    && [
+                        terminal_transition_id.is_some(),
+                        terminal_revocation_id.is_some(),
+                        terminal_request_digest.is_some(),
+                    ]
+                    .into_iter()
+                    .filter(|present| *present)
+                    .count()
+                        == 1 =>
+            {
+                let request_digest = terminal_request_digest
+                    .as_deref()
+                    .map(|value| {
+                        value
+                            .try_into()
+                            .map_err(|_| RecoveryHydrationError::OutOfDomain)
+                    })
+                    .transpose()?;
+                (
+                    ReservationStatus::Released,
+                    RecoveryReservationTerminal::Released {
+                        transition_id: terminal_transition_id,
+                        revocation_id: terminal_revocation_id,
+                        request_digest,
+                        terminal_at: terminal_at.unwrap(),
+                    },
+                )
+            }
+            "active" | "consumed" | "expired" | "released" => {
+                return Err(RecoveryHydrationError::TerminalMismatch)
+            }
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
         let row = RecoveryReservationHydrationRow {
@@ -6431,6 +6487,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
             || terminal_signing_transcript_bytes.is_some()
             || terminal_request_digest.is_some()
             || terminal_signature.is_some();
+        let requester_generation = recovery_u64(requester_auth_generation)?;
         let (status, terminal) = match status.as_str() {
             "open"
                 if fulfilling_transition_id.is_none()
@@ -6458,7 +6515,9 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                             Some(*reservation_transition_id),
                             Some(*reservation_terminal_at),
                         ),
-                        RecoveryReservationTerminal::None => (None, None),
+                        RecoveryReservationTerminal::None
+                        | RecoveryReservationTerminal::Expiry { .. }
+                        | RecoveryReservationTerminal::Released { .. } => (None, None),
                     };
                 let (transition_id, terminal_at) =
                     select_fulfilled_recovery_terminal(FulfilledRecoveryTerminalColumns {
@@ -6510,9 +6569,214 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                 }
                 (RecoveryRequestStatus::Fulfilled, Some(terminal))
             }
+            "cancelled"
+                if fulfilling_transition_id.is_none()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && terminal_at
+                        .is_some_and(|value| value >= requested_at && value < expires_at)
+                    && request_reservation_binding_matches
+                    && reservation_status == ReservationStatus::Released
+                    && package_status == "available"
+                    && package_terminal_transition_id.is_none()
+                    && package_terminal_revocation_id.is_none()
+                    && package_terminal_at.is_none() =>
+            {
+                let raw = terminal_signed_request_bytes
+                    .as_deref()
+                    .ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                let transcript = terminal_signing_transcript_bytes
+                    .as_deref()
+                    .ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                let digest: [u8; 32] = terminal_request_digest
+                    .as_deref()
+                    .and_then(|value| value.try_into().ok())
+                    .ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                let signature: [u8; 64] = terminal_signature
+                    .as_deref()
+                    .and_then(|value| value.try_into().ok())
+                    .ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                let terminal_at = terminal_at.ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                if !matches!(
+                    &reservation_terminal,
+                    RecoveryReservationTerminal::Released {
+                        transition_id: None,
+                        revocation_id: None,
+                        request_digest: Some(reservation_digest),
+                        terminal_at: reservation_terminal_at,
+                    } if reservation_digest == &digest
+                        && *reservation_terminal_at == terminal_at
+                ) {
+                    return Err(RecoveryHydrationError::TerminalMismatch);
+                }
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Request {
+                        kind: RequestEntryKind::LeafRecoveryCancellation,
+                        source: WorkTerminalRequestSource::Signed {
+                            received_at: terminal_at,
+                            signed_request_bytes: raw,
+                            signing_transcript_bytes: transcript,
+                            request_digest: digest,
+                            signature,
+                            signing_public_key: &signing_public_key,
+                        },
+                    },
+                )
+                .await
+                .map_err(|_| RecoveryHydrationError::InvalidTerminal)?;
+                let WorkTerminalHydrationRow::Request(ref evidence) = terminal else {
+                    return Err(RecoveryHydrationError::InvalidTerminal);
+                };
+                if !recovery_cancellation_terminal_matches(
+                    evidence,
+                    &request_id,
+                    &target,
+                    &conversation_bytes,
+                    recovery_timestamp(terminal_at)?,
+                ) {
+                    return Err(RecoveryHydrationError::InvalidTerminal);
+                }
+                (RecoveryRequestStatus::Cancelled, Some(terminal))
+            }
+            "expired"
+                if fulfilling_transition_id.is_none()
+                    && terminal_transition_id.is_none()
+                    && terminal_revocation_id.is_none()
+                    && !request_has_signed_terminal
+                    && terminal_at == Some(expires_at)
+                    && request_reservation_binding_matches
+                    && reservation_status == ReservationStatus::Expired
+                    && matches!(
+                        &reservation_terminal,
+                        RecoveryReservationTerminal::Expiry {
+                            terminal_at: reservation_terminal_at,
+                        } if *reservation_terminal_at == expires_at
+                    ) =>
+            {
+                let package_not_after = reservation.row.package_not_after;
+                let expires_at_timestamp = recovery_timestamp(expires_at)?;
+                let package_shape_valid = if expires_at_timestamp == package_not_after {
+                    package_status == "expired"
+                        && package_terminal_transition_id.is_none()
+                        && package_terminal_revocation_id.is_none()
+                        && package_terminal_at == Some(expires_at)
+                } else {
+                    expires_at_timestamp < package_not_after
+                        && package_status == "available"
+                        && package_terminal_transition_id.is_none()
+                        && package_terminal_revocation_id.is_none()
+                        && package_terminal_at.is_none()
+                };
+                if !package_shape_valid {
+                    return Err(RecoveryHydrationError::TerminalMismatch);
+                }
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::Expiry {
+                        terminal_at: expires_at,
+                    },
+                )
+                .await
+                .map_err(|_| RecoveryHydrationError::InvalidTerminal)?;
+                (RecoveryRequestStatus::Expired, Some(terminal))
+            }
+            "superseded"
+                if fulfilling_transition_id.is_none()
+                    && !request_has_signed_terminal
+                    && terminal_at
+                        .is_some_and(|value| value >= requested_at && value < expires_at)
+                    && request_reservation_binding_matches
+                    && reservation_status == ReservationStatus::Released
+                    && [
+                        terminal_transition_id.is_some(),
+                        terminal_revocation_id.is_some(),
+                    ]
+                    .into_iter()
+                    .filter(|present| *present)
+                    .count()
+                        == 1 =>
+            {
+                let terminal_at = terminal_at.ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                if !matches!(
+                    &reservation_terminal,
+                    RecoveryReservationTerminal::Released {
+                        transition_id: reservation_transition,
+                        revocation_id: reservation_revocation,
+                        request_digest: None,
+                        terminal_at: reservation_terminal_at,
+                    } if *reservation_transition == terminal_transition_id
+                        && *reservation_revocation == terminal_revocation_id
+                        && *reservation_terminal_at == terminal_at
+                ) {
+                    return Err(RecoveryHydrationError::TerminalMismatch);
+                }
+                let terminal = if let Some(transition_id) = terminal_transition_id {
+                    if package_status != "available"
+                        || package_terminal_transition_id.is_some()
+                        || package_terminal_revocation_id.is_some()
+                        || package_terminal_at.is_some()
+                    {
+                        return Err(RecoveryHydrationError::TerminalMismatch);
+                    }
+                    let terminal = load_work_terminal_hydration_row(
+                        transaction,
+                        authority,
+                        conversation_id,
+                        WorkTerminalLocator::Transition { transition_id },
+                    )
+                    .await
+                    .map_err(|_| RecoveryHydrationError::InvalidTerminal)?;
+                    let WorkTerminalHydrationRow::Transition(ref evidence) = terminal else {
+                        return Err(RecoveryHydrationError::InvalidTerminal);
+                    };
+                    if !recovery_supersession_terminal_matches(
+                        evidence,
+                        &bound_coordinate,
+                        recovery_timestamp(terminal_at)?,
+                    ) {
+                        return Err(RecoveryHydrationError::InvalidTerminal);
+                    }
+                    terminal
+                } else {
+                    let revocation_id =
+                        terminal_revocation_id.ok_or(RecoveryHydrationError::TerminalMismatch)?;
+                    if package_status != "revoked"
+                        || package_terminal_transition_id.is_some()
+                        || package_terminal_revocation_id != Some(revocation_id)
+                        || package_terminal_at != Some(terminal_at)
+                    {
+                        return Err(RecoveryHydrationError::TerminalMismatch);
+                    }
+                    let terminal = load_work_terminal_hydration_row(
+                        transaction,
+                        authority,
+                        conversation_id,
+                        WorkTerminalLocator::DeviceRevocation { revocation_id },
+                    )
+                    .await
+                    .map_err(|_| RecoveryHydrationError::InvalidTerminal)?;
+                    let WorkTerminalHydrationRow::DeviceRevocation(ref evidence) = terminal else {
+                        return Err(RecoveryHydrationError::InvalidTerminal);
+                    };
+                    if evidence.revocation_id() != revocation_id.as_bytes()
+                        || evidence.target() != &target
+                        || evidence.expected_target_auth_generation() != requester_generation
+                        || evidence.accepted_at() != recovery_timestamp(terminal_at)?
+                    {
+                        return Err(RecoveryHydrationError::InvalidTerminal);
+                    }
+                    terminal
+                };
+                (RecoveryRequestStatus::Superseded, Some(terminal))
+            }
             "open" => return Err(RecoveryHydrationError::TerminalMismatch),
             "cancelled" | "expired" | "superseded" => {
-                return Err(RecoveryHydrationError::UnsupportedTerminal)
+                return Err(RecoveryHydrationError::TerminalMismatch)
             }
             _ => return Err(RecoveryHydrationError::OutOfDomain),
         };
@@ -6600,7 +6864,6 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     .ok()
                     .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
                     .ok_or(RecoveryHydrationError::OutOfDomain)?;
-                let requester_auth_generation = recovery_u64(requester_auth_generation)?;
                 if !recovery_acceptance_authority_matches_durable(
                     &evidence,
                     transition_id.as_bytes(),
@@ -6608,7 +6871,7 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     &conversation_bytes,
                     &target,
                     &requester_key_bytes,
-                    requester_auth_generation,
+                    requester_generation,
                     &signed_request_bytes,
                     &signing_transcript_bytes,
                     &request_digest,

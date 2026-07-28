@@ -301,6 +301,22 @@ fn authority_facts(
             server_fields_bytes: Vec::new(),
             outer_entry_fingerprint: evidence.durable_row_digest().to_vec(),
         }),
+        PlanAuthority::RecoveryExpiry(evidence) => Ok(AuthorityFacts {
+            actor: evidence.requester().clone(),
+            expected_key_id: None,
+            expected_auth_generation: None,
+            signed_kind: None,
+            operation_id: Uuid::from_bytes(*evidence.request_id()),
+            applied_at: server_instant(evidence.terminal_at())?,
+            signed_request_bytes: Vec::new(),
+            unsigned_projection_bytes: Vec::new(),
+            signing_transcript_bytes: Vec::new(),
+            request_digest: Vec::new(),
+            signature: Vec::new(),
+            outer_control_projection_bytes: Vec::new(),
+            server_fields_bytes: Vec::new(),
+            outer_entry_fingerprint: evidence.locked_read_set_digest().to_vec(),
+        }),
         PlanAuthority::WelcomeExpiry(evidence) => Ok(AuthorityFacts {
             actor: evidence.recipient().clone(),
             expected_key_id: None,
@@ -636,7 +652,7 @@ fn build_execution_authority(
         };
         if matches!(
             plan.effects().kind(),
-            PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation
+            PlanKind::WelcomeExpiry | PlanKind::RecoveryExpiry | PlanKind::DeviceRevocation
         ) {
             return Ok((
                 ExecutionAuthority::Entryless {
@@ -1133,6 +1149,9 @@ fn primary_event_kind(plan: &ConversationPersistencePlan) -> Option<EventKind> {
         | PlanKind::WelcomeAcknowledgement
         | PlanKind::WelcomeRejection
         | PlanKind::WelcomeExpiry => None,
+        PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation | PlanKind::RecoveryExpiry => {
+            Some(EventKind::LeafRecovery)
+        }
         PlanKind::Close => Some(EventKind::ConversationClosed),
         PlanKind::ResetRequest => Some(EventKind::ResetRequested),
         PlanKind::LeaveRequest | PlanKind::LeaveCancellation => Some(EventKind::LeaveRequest),
@@ -1150,6 +1169,102 @@ fn primary_event_kind(plan: &ConversationPersistencePlan) -> Option<EventKind> {
             _ => Some(EventKind::ConversationChanged),
         },
         _ => Some(EventKind::ConversationChanged),
+    }
+}
+
+fn canonical_recovery_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    match plan.effects().kind() {
+        PlanKind::RecoveryRequest => {
+            let request = plan
+                .effects()
+                .recovery_request_changes()
+                .iter()
+                .find_map(|change| match (change.before(), change.after()) {
+                    (None, Some(after))
+                        if after.status()
+                            == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open =>
+                    {
+                        Some(after)
+                    }
+                    _ => None,
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(super::delivery::canonical_leaf_recovery_event_payload(
+                Uuid::from_bytes(*request.request_id()),
+                "open",
+            ))
+        }
+        PlanKind::RecoveryCancellation => {
+            let request = plan
+                .effects()
+                .recovery_request_changes()
+                .iter()
+                .find_map(|change| match (change.before(), change.after()) {
+                    (Some(before), Some(after))
+                        if before.status()
+                            == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open
+                            && after.status()
+                                == crate::chat_protocol::state_machine::RecoveryRequestStatus::Cancelled =>
+                    {
+                        Some(after)
+                    }
+                    _ => None,
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(super::delivery::canonical_leaf_recovery_event_payload(
+                Uuid::from_bytes(*request.request_id()),
+                "cancelled",
+            ))
+        }
+        PlanKind::RecoveryExpiry => {
+            let request = plan
+                .effects()
+                .recovery_request_changes()
+                .iter()
+                .find_map(|change| match (change.before(), change.after()) {
+                    (Some(before), Some(after))
+                        if before.status()
+                            == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open
+                            && after.status()
+                                == crate::chat_protocol::state_machine::RecoveryRequestStatus::Expired =>
+                    {
+                        Some(after)
+                    }
+                    _ => None,
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(super::delivery::canonical_leaf_recovery_event_payload(
+                Uuid::from_bytes(*request.request_id()),
+                "expired",
+            ))
+        }
+        PlanKind::Commit
+            if matches!(
+                plan.effects().authority(),
+                Some(PlanAuthority::Transition(evidence))
+                    if evidence
+                        .signed_authority()
+                        .is_some_and(|authority| {
+                            authority.kind() == SignedMutationKind::LeafRecoveryFulfillment
+                        })
+            ) =>
+        {
+            let welcome = plan
+                .effects()
+                .welcome_changes()
+                .iter()
+                .find_map(|change| match (change.before(), change.after()) {
+                    (None, Some(after)) if after.status() == WelcomeStatus::Pending => Some(after),
+                    _ => None,
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(super::delivery::canonical_welcome_available_event_payload(
+                Uuid::from_bytes(*welcome.welcome_id()),
+            ))
+        }
+        _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
     }
 }
 
@@ -1403,8 +1518,10 @@ async fn hydrate_execution_context_inner_with_g6(
     if transaction_id != head.transaction_id() {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
-    if plan.effects().kind() != PlanKind::WelcomeExpiry
-        && server_instant(head.locked_at())? != facts.applied_at
+    if !matches!(
+        plan.effects().kind(),
+        PlanKind::WelcomeExpiry | PlanKind::RecoveryExpiry
+    ) && server_instant(head.locked_at())? != facts.applied_at
     {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
@@ -1447,7 +1564,7 @@ async fn hydrate_execution_context_inner_with_g6(
     if actor_row.status != "active"
         && !matches!(
             plan.effects().kind(),
-            PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation
+            PlanKind::WelcomeExpiry | PlanKind::RecoveryExpiry | PlanKind::DeviceRevocation
         )
     {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
@@ -1830,6 +1947,54 @@ pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'pl
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
     hydrate_execution_context(transaction, plan, ExecutionContextArtifacts::default()).await
+}
+
+/// Recovery-only production capsule constructor. Route callers cannot supply
+/// event or disposition payloads: those are derived from the sealed plan. The
+/// optional accepted control row is itself minted by the Recovery composition
+/// facade and is required only for fulfillment.
+pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'connection, 'plan>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Option<Vec<u8>>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    let valid = matches!(
+        plan.effects().kind(),
+        PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation | PlanKind::RecoveryExpiry
+    ) || matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if evidence
+                .signed_authority()
+                .is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::LeafRecoveryFulfillment
+                })
+    );
+    if !valid {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_recovery_primary_event_payload(plan)?;
+    hydrate_execution_context(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes,
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol) async fn apply_prepared_recovery_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
 }
 
 pub(crate) async fn apply_prepared_welcome_terminal_execution(

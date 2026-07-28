@@ -1330,6 +1330,28 @@ pub(crate) fn canonical_welcome_disposition_event_payload(
     .into_bytes()
 }
 
+/// Canonical server-owned payload announcing a newly available Welcome.
+pub(crate) fn canonical_welcome_available_event_payload(welcome_id: Uuid) -> Vec<u8> {
+    format!(
+        r#"{{"$type":"blue.catbird.chat.defs#welcomeAvailableEvent","welcomeId":"{}"}}"#,
+        welcome_id.hyphenated()
+    )
+    .into_bytes()
+}
+
+/// Canonical server-owned payload for Recovery lifecycle events. `status` is
+/// selected by the sealed state-machine edge, never by a route caller.
+pub(crate) fn canonical_leaf_recovery_event_payload(
+    recovery_request_id: Uuid,
+    status: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{"$type":"blue.catbird.chat.defs#leafRecoveryEvent","recoveryRequestId":"{}","status":"{status}"}}"#,
+        recovery_request_id.hyphenated()
+    )
+    .into_bytes()
+}
+
 #[derive(sqlx::FromRow)]
 struct PendingWelcomeTerminalPreflightRow {
     welcome_id: Uuid,

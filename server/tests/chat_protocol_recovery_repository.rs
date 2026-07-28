@@ -10,6 +10,8 @@
 mod dpop;
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
@@ -32,22 +34,89 @@ mod repository {
             "/src/chat_protocol/repository/prelude.rs"
         ));
     }
-    pub mod transition {
+}
+
+mod chat_protocol {
+    pub mod dpop {
+        pub use crate::dpop::*;
+    }
+    pub mod model {
+        pub use crate::model::*;
+    }
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/transition.rs"
+            "/src/chat_protocol/public_state.rs"
         ));
     }
-    pub mod recovery {
+    pub mod repository {
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
+        pub mod prelude {
+            pub use crate::repository::prelude::*;
+        }
+        pub mod core {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/core.rs"
+            ));
+        }
+        pub mod relationship {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
+        pub mod transition {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/transition.rs"
+            ));
+        }
+        pub mod delivery {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+        pub mod execution_context {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/execution_context.rs"
+            ));
+        }
+        pub mod recovery {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/recovery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/recovery.rs"
+            "/src/chat_protocol/state_machine.rs"
         ));
     }
 }
 
-use chrono::{Duration, TimeZone, Utc};
-use repository::recovery::{
+use chat_protocol::repository::recovery::{
     cancellation_actor_matches_requester, classify_client_terminal_disposition,
     classify_locked_recovery, persisted_recovery_origin, requester_key_liveness_matches,
     requester_row_liveness_matches, RecoveryClientTerminalAction,
@@ -59,6 +128,7 @@ use repository::recovery::{
     LOCK_RECOVERY_GENERATION_STATE_SQL, LOCK_RECOVERY_MEMBER_DEVICE_SQL, LOCK_RECOVERY_PACKAGE_SQL,
     LOCK_RECOVERY_REQUEST_SQL, LOCK_RECOVERY_RESERVATION_SQL, RECOVERY_TERMINAL_LOCATOR_SQL,
 };
+use chrono::{Duration, TimeZone, Utc};
 
 fn compact(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -403,10 +473,13 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
         "RecoveryRequestAuthority",
         "RecoveryCancellationAuthority",
         "RecoveryFulfillmentAuthority",
-        "RecoveryExpiryAuthority",
+        "RecoveryClientExpiryAuthority",
+        "RecoverySchedulerExpiryAuthority",
         "RecoveryRequestPlanInput",
         "RecoveryCancellationPlanInput",
         "RecoveryFulfillmentPlanInput",
+        "RecoveryClientExpiryPlanInput",
+        "RecoverySchedulerExpiryPlanInput",
     ] {
         let declaration = format!("pub(crate) struct {authority}");
         let declaration_start = source.find(&declaration).expect("missing authority");
@@ -426,10 +499,8 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
         );
     }
     assert!(!source.contains("reserve_available_recovery_package("));
-    assert!(source.contains("RecoveryTerminalTripleCas::new("));
-    assert!(!source.contains("RecoveryTerminalTripleTermination::Cancelled"));
-    assert!(!source.contains("RecoveryTerminalTripleTermination::Fulfilled"));
-    assert!(source.contains("RecoveryTerminalTripleTermination::Expired"));
+    assert!(!source.contains("RecoveryTerminalTripleCas::new("));
+    assert!(!source.contains("RecoveryKeyPackageRowCas::new("));
     assert!(source.contains("struct RecoverySqlAuthoritySeal"));
     assert!(!source.contains("impl Clone for RecoverySqlAuthoritySeal"));
 }
@@ -452,7 +523,7 @@ fn retained_rows_are_reverified_instead_of_status_only_rehydrated() {
 }
 
 #[test]
-fn recovery_sql_bindings_require_the_private_repository_seal_everywhere() {
+fn legacy_recovery_sql_bindings_remain_sealed_but_are_unreachable_from_preparation() {
     let transition = include_str!("../src/chat_protocol/repository/transition.rs");
     assert!(transition.contains("use super::recovery::RecoverySqlAuthoritySeal;"));
     assert!(
@@ -462,8 +533,10 @@ fn recovery_sql_bindings_require_the_private_repository_seal_everywhere() {
             >= 6
     );
     let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
-    assert!(recovery.contains("RecoveryKeyPackageRowCas::new(\n        authority,"));
-    assert!(recovery.contains("RecoveryTerminalTripleCas::new(\n            &self.sql_authority,"));
+    assert!(!recovery.contains("RecoveryKeyPackageRowCas::new("));
+    assert!(!recovery.contains("RecoveryTerminalTripleCas::new("));
+    assert!(!recovery.contains("reserve_available_recovery_package("));
+    assert!(!recovery.contains("terminalize_recovery_triple("));
 }
 
 #[test]
@@ -548,6 +621,8 @@ fn plan_inputs_are_opaque_linear_and_retain_the_prelude() {
         "RecoveryRequestPlanInput",
         "RecoveryCancellationPlanInput",
         "RecoveryFulfillmentPlanInput",
+        "RecoveryClientExpiryPlanInput",
+        "RecoverySchedulerExpiryPlanInput",
     ] {
         assert!(
             source.contains(&format!("pub(crate) struct {plan}")),
@@ -558,24 +633,25 @@ fn plan_inputs_are_opaque_linear_and_retain_the_prelude() {
             "{plan} must remain linear"
         );
         assert!(
-            source.contains(&format!("into_plan_input(self) -> {plan}")),
-            "{plan} must have an adapter from the corresponding authority"
-        );
-        assert!(
             source.contains(&format!("impl {plan}")),
             "{plan} must have an impl block"
+        );
+        let body = source
+            .split_once(&format!("impl {plan} {{"))
+            .map(|(_, tail)| tail.split_once("\n}").map_or(tail, |(body, _)| body))
+            .expect("plan input impl");
+        assert!(
+            body.contains("into_planner_parts(") && body.contains("self"),
+            "{plan} must expose only a consuming planner adapter"
         );
     }
     assert_eq!(
         source.matches("validate_same_transaction(").count(),
         3,
-        "each plan input must have validate_same_transaction"
+        "each client-authored mutation input must retain its tx validator"
     );
-    assert_eq!(
-        source.matches("into_plan_input(self)").count(),
-        3,
-        "each authority must have an into_plan_input adapter"
-    );
+    assert!(source.contains("prelude: PreparedBusinessPrelude"));
+    assert!(source.contains("trusted_request_instant: TrustedRequestInstant"));
 }
 
 #[test]
@@ -612,10 +688,13 @@ fn fulfillment_scope_discovery_is_read_only_and_includes_actor_plus_requester() 
 #[test]
 fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
-    assert!(source.contains("prelude: None"));
     assert!(
-        source.contains("RecoveryExpiryAuthority"),
-        "RecoveryExpiryAuthority must exist"
+        source.contains("pub(crate) struct RecoverySchedulerExpiryAuthority"),
+        "scheduler-only expiry authority must exist"
+    );
+    assert!(
+        source.contains("pub(crate) struct RecoveryClientExpiryAuthority"),
+        "client expiry authority must remain a distinct type"
     );
     let function = source
         .split_once("pub(crate) async fn prepare_recovery_expiry_authority(")
@@ -637,59 +716,95 @@ fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
             "scheduler expiry must not verify a recovery operation claim"
         );
     }
+    let scheduler = source
+        .split_once("pub(crate) struct RecoverySchedulerExpiryAuthority")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map(|(body, _)| body)
+        .expect("scheduler authority");
     assert!(
-        source.contains("fn terminalize("),
-        "terminalize must exist for scheduler/expiry writes"
+        !scheduler.contains("PreparedBusinessPrelude")
+            && !scheduler.contains("OperationCompletionGuard"),
+        "scheduler expiry must not acquire client completion authority"
     );
     assert!(
-        source.matches("prelude: None").count() >= 2,
-        "the scheduler prepare must set prelude=None (authority + retained arms)"
+        !source.contains("fn terminalize("),
+        "repository authority preparation must expose no direct terminal writer"
     );
 }
 
 #[test]
-fn recovery_plan_inputs_expose_only_consuming_executor_capsules() {
-    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
-    for plan in [
-        "RecoveryRequestPlanInput",
-        "RecoveryCancellationPlanInput",
-        "RecoveryFulfillmentPlanInput",
+fn recovery_planners_consume_exact_inputs_and_the_facade_mints_payloads() {
+    let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
+    for (planner, input) in [
+        ("plan_recovery_request_input", "RecoveryRequestPlanInput"),
+        (
+            "plan_recovery_cancellation_input",
+            "RecoveryCancellationPlanInput",
+        ),
+        (
+            "plan_recovery_fulfillment_input",
+            "RecoveryFulfillmentPlanInput",
+        ),
+        (
+            "plan_client_recovery_expiry_input",
+            "RecoveryClientExpiryPlanInput",
+        ),
+        (
+            "plan_scheduler_recovery_expiry_input",
+            "RecoverySchedulerExpiryPlanInput",
+        ),
     ] {
-        let body = source
-            .split_once(&format!("impl {plan} {{"))
-            .map(|(_, tail)| tail.split_once("\n}").map_or(tail, |(body, _)| body))
-            .expect("plan impl");
-        assert!(body.contains("into_executor_capsule(self)"));
-        assert!(!body.contains("&self) -> RecoveryExecutorCapsule"));
+        let body = state_machine
+            .split_once(&format!("fn {planner}"))
+            .map(|(_, tail)| tail.split_once("\n    ///").map_or(tail, |(body, _)| body))
+            .expect("recovery planner");
+        assert!(
+            body.contains(&format!("input: {input}")),
+            "{planner} must consume the exact sealed input"
+        );
+        for forbidden in [
+            "VerifiedChatDeviceRequest",
+            "PreparedBusinessPrelude",
+            "ExecutionContextArtifacts",
+            "primary_event_payload",
+            "welcome_disposition_event_payloads",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{planner} accepts forbidden caller authority/artifact {forbidden}"
+            );
+        }
     }
-    assert!(source.contains("struct RecoveryExecutorCapsule"));
-    for field in [
-        "request: NewLeafRecoveryRequest",
-        "reservation: NewReservation",
-        "package: RecoveryPackageRow",
-    ] {
-        assert!(source.contains(field), "capsule must retain sealed {field}");
-    }
-    assert!(source.contains("pub(crate) fn into_executor_parts("));
-    assert!(source.contains("self.request,"));
-    assert!(source.contains("self.reservation,"));
-    assert!(source.contains("self.package,"));
-    assert!(source.contains("struct RecoverySchedulerExpiryCapsule"));
-    assert!(source.contains("prelude: Option<PreparedBusinessPrelude>"));
+    let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+    let facade = execution
+        .split_once("pub(in crate::chat_protocol) async fn prepare_recovery_execution")
+        .and_then(|(_, tail)| tail.split_once(") -> Result<"))
+        .map(|(signature, _)| signature)
+        .expect("recovery execution facade signature");
+    assert!(facade.contains("accepted_control_entry_bytes: Option<Vec<u8>>"));
+    assert!(!facade.contains("ExecutionContextArtifacts"));
+    assert!(!facade.contains("primary_event_payload"));
+    assert!(!facade.contains("welcome_disposition_event_payloads"));
 }
 
 #[test]
-fn recovery_executor_capsule_keeps_scheduler_without_client_authority() {
+fn prepared_scheduler_expiry_has_no_client_completion_guard() {
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
     let scheduler = source
-        .split_once("struct RecoverySchedulerExpiryCapsule")
-        .and_then(|(_, tail)| tail.split_once("impl RecoverySchedulerExpiryCapsule"))
+        .split_once("pub(crate) struct PreparedSchedulerRecoveryExpiry")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
         .map(|(body, _)| body)
-        .expect("scheduler capsule");
-    assert!(scheduler.contains("authority: RecoveryExpiryAuthority"));
+        .expect("prepared scheduler expiry");
+    assert!(scheduler.contains("plan: ConversationPersistencePlan"));
     assert!(!scheduler.contains("PreparedBusinessPrelude"));
-    assert!(source.contains("fn terminal_cas(&self) -> RecoveryTerminalTripleCas"));
-    assert!(source.contains("debug_assert!(self.prelude.is_none()"));
+    assert!(!scheduler.contains("OperationCompletionGuard"));
+    assert!(
+        source.contains("pub(crate) struct RecoveryCompletion"),
+        "client recovery mutations retain a consuming completion guard"
+    );
+    assert!(!source.contains("RecoveryExecutorCapsule"));
+    assert!(!source.contains("RecoverySchedulerExpiryCapsule"));
+    assert!(!source.contains("into_executor_parts"));
 }
 
 #[test]

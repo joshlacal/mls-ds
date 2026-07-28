@@ -15,8 +15,28 @@ mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/repository/mod.rs"]
-mod repository;
+mod repository {
+    pub mod auth {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/auth.rs"
+        ));
+    }
+
+    pub mod prelude {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/prelude.rs"
+        ));
+    }
+
+    pub mod inventory {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/inventory.rs"
+        ));
+    }
+}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -64,6 +84,11 @@ mod chat_protocol {
     // `include!` directly — mirroring `chat_protocol_transition_repository.rs`.
     // The existing 27 state-machine tests do not use these; they are inert here.
     pub mod repository {
+        pub mod recovery {
+            #[derive(Debug)]
+            pub(crate) struct RecoverySqlAuthoritySeal;
+        }
+
         pub mod execution_context {
             pub(crate) struct ExecutionContextHydrationProof;
             pub(crate) struct RevocationBatchHydrationProof;
@@ -75,10 +100,6 @@ mod chat_protocol {
 
         pub mod prelude {
             pub use crate::repository::prelude::*;
-        }
-
-        pub mod recovery {
-            pub use crate::repository::recovery::*;
         }
 
         pub mod relationship {
@@ -146,7 +167,7 @@ use chat_protocol::{
     state_machine::{
         acceptance_recovery_package_artifact_matches, hydrate_conversation_state as hydrate_graph,
         plan_accept_conversation, plan_close, plan_commit, plan_creation,
-        plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment,
+        plan_leaf_recovery_cancellation, plan_leaf_recovery_expiry, plan_leaf_recovery_fulfillment,
         plan_leaf_recovery_request, plan_leave_cancellation, plan_leave_fulfillment,
         plan_leave_request, plan_reset_activation, plan_reset_request, plan_zero_leaf_leave,
         AcceptConversation, CloseConversation, CommitCommand, ConversationKind,
@@ -157,9 +178,10 @@ use chat_protocol::{
         LeaveFulfillment, LeaveFulfillmentTestMutation, LeaveRequestCommand, LeaveRequestStatus,
         LockedRegistrationProjection, OpeningKind, PackageStatus, ParticipantHydrationRow,
         ParticipantRole, ParticipantStatus, PersistedRegistrationRow, PersistedRegistrationStatus,
-        PersistedSignedRequestRow, PrincipalId, RecoveryRequestStatus, RecoverySource,
-        RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation, ResetRequestCommand,
-        ResetRequestStatus, ServerTimestamp, StateMachineError, TransitionEvidence, ZeroLeafLeave,
+        PersistedSignedRequestRow, PrincipalId, RecoveryExpiryPlanAuthority, RecoveryRequestStatus,
+        RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation,
+        ResetRequestCommand, ResetRequestStatus, ServerTimestamp, StateMachineError,
+        TransitionEvidence, ZeroLeafLeave,
     },
     transcript::{
         decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
@@ -2053,6 +2075,118 @@ fn leafed_leave_consent_accepts_an_active_registered_same_did_sibling_without_a_
     let request = requested.leave_request(&uuid_v4_bytes(0x96)).unwrap();
     assert_eq!(request.status(), LeaveRequestStatus::Pending);
     assert_eq!(request.requester(), &sibling);
+}
+
+fn open_recovery_for_expiry(
+    package_lifetime_millis: i64,
+) -> (
+    chat_protocol::state_machine::ConversationState,
+    DeviceIdentity,
+    [u8; 16],
+    ServerTimestamp,
+) {
+    let manifest = corpus_manifest();
+    let prior = group_creation();
+    let requester = alice(&manifest);
+    let request_id = uuid_v4_bytes((package_lifetime_millis / 100_000) as u8 + 0xa0);
+    let received_at = fixture_received_at(2);
+    let package_not_after = ServerTimestamp::from_unix_millis_for_test(
+        received_at.unix_millis() + package_lifetime_millis,
+    )
+    .unwrap();
+    let opened = plan_leaf_recovery_request(
+        &prior,
+        LeafRecoveryRequestCommand {
+            actor: requester.clone(),
+            recovery_request_id: request_id,
+            kind: LeafRecoveryKind::Replace,
+            key_package_ref: [0xa5; 32],
+            received_at,
+            package_not_after,
+            evidence: request_evidence(
+                RequestEntryKind::LeafRecoveryRequest,
+                2,
+                request_id,
+                requester.clone(),
+                *prior.coordinate().conversation_id(),
+                received_at,
+                0xa6,
+            ),
+        },
+    )
+    .expect("valid open recovery")
+    .into_state();
+    let terminal_at = *opened
+        .recovery_request(&request_id)
+        .expect("open request")
+        .expires_at();
+    (opened, requester, request_id, terminal_at)
+}
+
+#[test]
+fn recovery_expiry_releases_a_still_live_package() {
+    let (prior, requester, request_id, terminal_at) = open_recovery_for_expiry(600_000);
+    let authority = RecoveryExpiryPlanAuthority::for_test(
+        request_id,
+        requester,
+        terminal_at,
+        terminal_at,
+        [0xc1; 32],
+    );
+    let planned = plan_leaf_recovery_expiry(&prior, authority).expect("due expiry");
+    assert_eq!(
+        planned
+            .resulting_state()
+            .recovery_request(&request_id)
+            .unwrap()
+            .status(),
+        RecoveryRequestStatus::Expired
+    );
+    assert_eq!(
+        planned
+            .resulting_state()
+            .recovery_reservation(&request_id)
+            .unwrap()
+            .status(),
+        ReservationStatus::Expired
+    );
+    let package = planned.effects().package_transitions().first().unwrap();
+    assert_eq!(package.from(), PackageStatus::Reserved);
+    assert_eq!(package.to(), PackageStatus::Available);
+}
+
+#[test]
+fn recovery_expiry_expires_a_package_at_its_exact_lifetime_boundary() {
+    let (prior, requester, request_id, terminal_at) = open_recovery_for_expiry(100_000);
+    let authority = RecoveryExpiryPlanAuthority::for_test(
+        request_id,
+        requester,
+        terminal_at,
+        terminal_at,
+        [0xc2; 32],
+    );
+    let planned = plan_leaf_recovery_expiry(&prior, authority).expect("boundary expiry");
+    let package = planned.effects().package_transitions().first().unwrap();
+    assert_eq!(package.from(), PackageStatus::Reserved);
+    assert_eq!(package.to(), PackageStatus::Expired);
+}
+
+#[test]
+fn recovery_expiry_rejects_observation_before_the_terminal_instant() {
+    let (prior, requester, request_id, terminal_at) = open_recovery_for_expiry(600_000);
+    let observed_at =
+        ServerTimestamp::from_unix_millis_for_test(terminal_at.unix_millis() - 1).unwrap();
+    let authority = RecoveryExpiryPlanAuthority::for_test(
+        request_id,
+        requester,
+        terminal_at,
+        observed_at,
+        [0xc3; 32],
+    );
+    assert_eq!(
+        plan_leaf_recovery_expiry(&prior, authority),
+        Err(StateMachineError::InvalidHydrationAuthority)
+    );
 }
 
 #[test]

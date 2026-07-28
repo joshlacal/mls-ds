@@ -29,15 +29,18 @@ use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
     LockedRevocationTargetStatus,
 };
-use super::repository::prelude::ScopeBoundBusinessAuthority;
+use super::repository::prelude::{OperationCompletionGuard, ScopeBoundBusinessAuthority};
+#[cfg(not(test))]
+use super::repository::recovery::{
+    RecoveryCancellationPlanInput, RecoveryClientExpiryPlanInput, RecoveryFulfillmentPlanInput,
+    RecoveryRequestPlanInput, RecoverySchedulerExpiryPlanInput,
+};
 use super::repository::relationship::{
     consume_locked_acceptance_projection, consume_locked_creation_projection,
     consume_locked_pending_add_projection, consume_locked_recovery_projection,
     LockedNoPendingAdmissionGuard, LockedRelationshipDecisionGuard, RelationshipConsumptionError,
 };
 
-#[cfg(test)]
-use super::validation::CanonicalUuidV4;
 use super::{
     public_state::{
         process_commit, rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
@@ -47,12 +50,15 @@ use super::{
     },
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, MAX_PROTOCOL_INTEGER},
     transcript::{
-        decode_and_verify_control_entry, decode_and_verify_signed_mutation,
-        rebind_persisted_control_entry, CanonicalValueRef, SignedMutationKind,
-        VerifiedControlEntry, VerifiedMutationProjection, VerifiedSignedMutation,
+        build_verified_control_entry, decode_and_verify_control_entry,
+        decode_and_verify_signed_mutation, rebind_persisted_control_entry,
+        CanonicalControlEntryProducts, CanonicalControlServerFields, CanonicalValueRef,
+        ControlEntryKind, SignedMutationKind, VerifiedControlEntry, VerifiedMutationProjection,
+        VerifiedSignedMutation,
     },
     validation::{
-        ed25519_key_id, BareDid, CanonicalTimestamp, KeyThumbprint, TrustedRequestInstant,
+        ed25519_key_id, BareDid, CanonicalTimestamp, CanonicalUuidV4, KeyThumbprint,
+        TrustedRequestInstant, ValidatedChatNsid,
     },
     wire::{
         trusted_unix_millis_to_seconds, validate_key_package, KeyPackageValidationPolicy,
@@ -1123,6 +1129,98 @@ pub(crate) struct HydrationAuthority {
     locked: LockedHydrationBinding,
     #[cfg(test)]
     locked: Option<LockedHydrationBinding>,
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol) enum RecoveryPlannedKind {
+    Request {
+        recovery_request_id: Uuid,
+    },
+    Cancellation {
+        recovery_request_id: Uuid,
+    },
+    Fulfillment {
+        recovery_request_id: Uuid,
+        transition_id: Uuid,
+    },
+}
+
+/// Sealed output of a planner that consumed exactly one opaque Recovery input.
+/// The executor facade receives only the persistence plan and the canonical
+/// control row minted here; the route never supplies event payload bytes.
+#[cfg(not(test))]
+pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
+    transition: PlannedTransition,
+    scope_authority: ScopeBoundBusinessAuthority,
+    completion: OperationCompletionGuard,
+    accepted_control_entry_bytes: Option<Vec<u8>>,
+    kind: RecoveryPlannedKind,
+}
+
+#[cfg(not(test))]
+impl PlannedRecoveryMutation {
+    pub(in crate::chat_protocol) fn into_parts(
+        self,
+    ) -> (
+        PlannedTransition,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+        Option<Vec<u8>>,
+        RecoveryPlannedKind,
+    ) {
+        (
+            self.transition,
+            self.scope_authority,
+            self.completion,
+            self.accepted_control_entry_bytes,
+            self.kind,
+        )
+    }
+}
+
+#[cfg(not(test))]
+pub(in crate::chat_protocol) struct PlannedClientRecoveryExpiry {
+    transition: PlannedTransition,
+    scope_authority: ScopeBoundBusinessAuthority,
+    completion: OperationCompletionGuard,
+    recovery_request_id: Uuid,
+    terminal_at: ServerTimestamp,
+}
+
+#[cfg(not(test))]
+impl PlannedClientRecoveryExpiry {
+    pub(in crate::chat_protocol) fn into_parts(
+        self,
+    ) -> (
+        PlannedTransition,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+        Uuid,
+        ServerTimestamp,
+    ) {
+        (
+            self.transition,
+            self.scope_authority,
+            self.completion,
+            self.recovery_request_id,
+            self.terminal_at,
+        )
+    }
+}
+
+#[cfg(not(test))]
+pub(in crate::chat_protocol) struct PlannedSchedulerRecoveryExpiry {
+    transition: PlannedTransition,
+    recovery_request_id: Uuid,
+    terminal_at: ServerTimestamp,
+}
+
+#[cfg(not(test))]
+impl PlannedSchedulerRecoveryExpiry {
+    pub(in crate::chat_protocol) fn into_parts(self) -> (PlannedTransition, Uuid, ServerTimestamp) {
+        (self.transition, self.recovery_request_id, self.terminal_at)
+    }
 }
 
 struct LockedHydrationBinding {
@@ -2883,6 +2981,245 @@ impl HydrationAuthority {
             .bind_recovery_package_cas(package_cas)
     }
 
+    /// Consume the exact request repository input and produce one fully bound
+    /// transition. No handler identity, prelude, durable row, or payload enters
+    /// this planner as a separate argument.
+    #[cfg(not(test))]
+    pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
+        input: RecoveryRequestPlanInput,
+        relationship_authority: &RelationshipAuthority<T>,
+    ) -> Result<PlannedRecoveryMutation, StateMachineError> {
+        let parts = input.into_planner_parts();
+        let request_id = match parts.mutation.projection() {
+            VerifiedMutationProjection::LeafRecoveryRequest(value) => {
+                Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+            }
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if parts.prelude.scope_authority().trusted_instant()
+            != parts.trusted_request_instant.datetime()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let hydration = HydrationAuthority::from_locked_conversation(&parts.aggregate)?;
+        let registration =
+            hydration.locked_registration_from_scope_authority(parts.prelude.scope_authority())?;
+        let reservation =
+            hydration.locked_recovery_reservation(parts.execution_package, &registration)?;
+        let envelope = DurableSignedRequestEnvelope::new(
+            *parts.aggregate.head().conversation_id().as_bytes(),
+            &parts.trusted_request_instant,
+        )?;
+        let transition = hydration.plan_leaf_recovery_request_entry(
+            &parts.aggregate,
+            envelope,
+            parts.mutation,
+            registration,
+            reservation,
+            &parts.relationship,
+            relationship_authority,
+            &parts.relationship_decision,
+            &parts.trusted_request_instant,
+        )?;
+        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        Ok(PlannedRecoveryMutation {
+            transition,
+            scope_authority,
+            completion,
+            accepted_control_entry_bytes: None,
+            kind: RecoveryPlannedKind::Request {
+                recovery_request_id: request_id,
+            },
+        })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn plan_recovery_cancellation_input(
+        input: RecoveryCancellationPlanInput,
+    ) -> Result<PlannedRecoveryMutation, StateMachineError> {
+        let parts = input.into_planner_parts();
+        let request_id = match parts.mutation.projection() {
+            VerifiedMutationProjection::LeafRecoveryCancellation(value) => {
+                Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+            }
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if parts.prelude.scope_authority().trusted_instant()
+            != parts.trusted_request_instant.datetime()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let hydration = HydrationAuthority::from_locked_conversation(&parts.aggregate)?;
+        let registration =
+            hydration.locked_registration_from_scope_authority(parts.prelude.scope_authority())?;
+        let envelope = DurableSignedRequestEnvelope::new(
+            *parts.aggregate.head().conversation_id().as_bytes(),
+            &parts.trusted_request_instant,
+        )?;
+        let transition = hydration.plan_leaf_recovery_cancellation_entry(
+            &parts.aggregate,
+            envelope,
+            parts.mutation,
+            registration,
+            parts.execution_package,
+        )?;
+        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        Ok(PlannedRecoveryMutation {
+            transition,
+            scope_authority,
+            completion,
+            accepted_control_entry_bytes: None,
+            kind: RecoveryPlannedKind::Cancellation {
+                recovery_request_id: request_id,
+            },
+        })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
+        input: RecoveryFulfillmentPlanInput,
+        relationship_authority: &RelationshipAuthority<T>,
+    ) -> Result<PlannedRecoveryMutation, StateMachineError> {
+        let parts = input.into_planner_parts();
+        let request_id = match parts.mutation.projection() {
+            VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
+                Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+            }
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if parts.prelude.scope_authority().trusted_instant()
+            != parts.trusted_request_instant.datetime()
+            || parts.transition_id.get_version_num() != 4
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let hydration = HydrationAuthority::from_locked_conversation(&parts.aggregate)?;
+        let actor_registration =
+            hydration.locked_registration_from_scope_authority(parts.prelude.scope_authority())?;
+        let target_registration = hydration.locked_registration_for_scoped_device(
+            parts.prelude.scope_authority(),
+            parts.execution_package.target_did(),
+            parts.execution_package.target_device_id(),
+            parts.execution_package.target_key_id(),
+            parts.execution_package.target_auth_generation(),
+        )?;
+        let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.fulfillLeafRecovery")
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let entry = build_verified_control_entry(
+            parts.mutation,
+            &endpoint,
+            CanonicalUuidV4::parse(&parts.transition_id.hyphenated().to_string())
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+            CanonicalUuidV4::parse(
+                &parts
+                    .aggregate
+                    .head()
+                    .conversation_id()
+                    .hyphenated()
+                    .to_string(),
+            )
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+            parts.aggregate.head().next_entry_seq(),
+            &parts.trusted_request_instant,
+            CanonicalControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment)
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?,
+        )
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let accepted_control_entry_bytes = CanonicalControlEntryProducts::mint(&entry)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .durable_json()
+            .to_vec();
+        let transition = hydration.plan_recovery_fulfillment_entry(
+            &parts.aggregate,
+            entry,
+            &actor_registration,
+            &target_registration,
+            parts.execution_package,
+            parts.terminal_packages,
+            &parts.relationship,
+            relationship_authority,
+            &parts.relationship_decision,
+            &parts.trusted_request_instant,
+        )?;
+        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        Ok(PlannedRecoveryMutation {
+            transition,
+            scope_authority,
+            completion,
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            kind: RecoveryPlannedKind::Fulfillment {
+                recovery_request_id: request_id,
+                transition_id: parts.transition_id,
+            },
+        })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn plan_client_recovery_expiry_input(
+        input: RecoveryClientExpiryPlanInput,
+    ) -> Result<PlannedClientRecoveryExpiry, StateMachineError> {
+        let parts = input
+            .into_planner_parts()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if parts.prelude.scope_authority().trusted_instant()
+            != parts.trusted_request_instant.datetime()
+            || parts.observed_at != parts.trusted_request_instant.datetime()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        HydrationAuthority::from_locked_conversation(&parts.aggregate)?;
+        let authority = recovery_expiry_plan_authority(
+            &parts.execution_package,
+            parts.request_id,
+            parts.terminal_at,
+            parts.observed_at,
+            parts.locked_read_set_digest,
+        )?;
+        let transition = plan_leaf_recovery_expiry_inner(parts.aggregate.state(), &authority)?
+            .bind_recovery_expiry_authority(
+                authority,
+                parts.aggregate.head(),
+                parts.execution_package,
+            )?;
+        let terminal_at = ServerTimestamp::from_unix_millis(parts.terminal_at.timestamp_millis())?;
+        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        Ok(PlannedClientRecoveryExpiry {
+            transition,
+            scope_authority,
+            completion,
+            recovery_request_id: parts.request_id,
+            terminal_at,
+        })
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn plan_scheduler_recovery_expiry_input(
+        input: RecoverySchedulerExpiryPlanInput,
+    ) -> Result<PlannedSchedulerRecoveryExpiry, StateMachineError> {
+        let parts = input
+            .into_planner_parts()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        HydrationAuthority::from_locked_conversation(&parts.aggregate)?;
+        let authority = recovery_expiry_plan_authority(
+            &parts.execution_package,
+            parts.request_id,
+            parts.terminal_at,
+            parts.observed_at,
+            parts.locked_read_set_digest,
+        )?;
+        let transition = plan_leaf_recovery_expiry_inner(parts.aggregate.state(), &authority)?
+            .bind_recovery_expiry_authority(
+                authority,
+                parts.aggregate.head(),
+                parts.execution_package,
+            )?;
+        Ok(PlannedSchedulerRecoveryExpiry {
+            transition,
+            recovery_request_id: parts.request_id,
+            terminal_at: ServerTimestamp::from_unix_millis(parts.terminal_at.timestamp_millis())?,
+        })
+    }
+
     /// Authenticate and exact-bind one signed Welcome endpoint request before
     /// acting on the repository's closed pending/terminal classification.
     pub(crate) fn compose_welcome_terminal(
@@ -3844,6 +4181,109 @@ impl HydrationAuthority {
             conversation_id: self.expected_conversation_id,
             actor,
             key_id,
+            registered_mls_signature_key,
+            auth_generation,
+            status: PersistedRegistrationStatus::Active,
+            trusted_read_at,
+            durable_row_digest: digest.finalize().into(),
+            transaction_id: scope.transaction_id().to_owned(),
+            authority_scope_digest: *scope.scope_digest(),
+        })
+    }
+
+    /// Project an exact non-actor device registration solely from the locked
+    /// business scope. Recovery fulfillment uses this for the original request
+    /// target; no handler-selected key material crosses the planner boundary.
+    #[cfg(not(test))]
+    fn locked_registration_for_scoped_device(
+        &self,
+        scope: &ScopeBoundBusinessAuthority,
+        did: &str,
+        device_id: Uuid,
+        key_id: &str,
+        auth_generation: i64,
+    ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        if scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+            || device_id.get_version_num() != 4
+            || auth_generation <= 0
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let did = BareDid::parse(did).map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        if scope
+            .principals()
+            .binary_search_by(|principal| principal.as_str().cmp(did.as_str()))
+            .is_err()
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let device = scope
+            .devices()
+            .iter()
+            .find(|candidate| {
+                candidate.user_did() == did.as_str() && candidate.device_id() == device_id
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if device.status() != "active"
+            || device.revoked_at().is_some()
+            || device.auth_generation() != auth_generation
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let key = scope
+            .keys()
+            .iter()
+            .find(|candidate| {
+                candidate.user_did() == did.as_str()
+                    && candidate.device_id() == device_id
+                    && candidate.key_id() == key_id
+                    && candidate.enrollment_auth_generation() == auth_generation
+            })
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let signing_public_key = scope
+            .signing_public_key_for(did.as_str(), device_id, key_id, auth_generation)
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if key.revoked_at().is_some()
+            || signing_public_key.len() != 32
+            || key.signing_public_key_sha256()
+                != <[u8; 32]>::from(Sha256::digest(signing_public_key))
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let key = KeyThumbprint::parse(key_id)
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let decoded_key_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(key.as_str())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let registered_mls_signature_key: [u8; 32] = signing_public_key
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let auth_generation = u64::try_from(auth_generation)
+            .ok()
+            .filter(|value| *value > 0 && *value <= MAX_PROTOCOL_INTEGER)
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(did.as_str().as_bytes().to_vec())?,
+            *device_id.as_bytes(),
+        )?;
+        let trusted_read_at =
+            ServerTimestamp::from_unix_millis(scope.trusted_instant().timestamp_millis())?;
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
+        digest.update(self.expected_conversation_id);
+        digest.update((actor.principal().as_bytes().len() as u64).to_be_bytes());
+        digest.update(actor.principal().as_bytes());
+        digest.update(actor.device_id());
+        digest.update(decoded_key_id);
+        digest.update(registered_mls_signature_key);
+        digest.update(auth_generation.to_be_bytes());
+        digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        Ok(LockedRegistrationProjection {
+            conversation_id: self.expected_conversation_id,
+            actor,
+            key_id: decoded_key_id,
             registered_mls_signature_key,
             auth_generation,
             status: PersistedRegistrationStatus::Active,
@@ -8171,6 +8611,7 @@ pub(crate) enum PlanKind {
     Commit,
     RecoveryRequest,
     RecoveryCancellation,
+    RecoveryExpiry,
     DeviceRevocation,
     ResetRequest,
     ResetActivation,
@@ -8577,6 +9018,54 @@ fn welcome_status_code(status: WelcomeStatus) -> u8 {
     }
 }
 
+/// Repository-issued authority for a due Recovery expiry. The terminal instant
+/// is fixed by the open request; `observed_at` proves the transaction observed
+/// it no earlier than that instant, and the read-set digest binds the locked
+/// request/reservation/package triple.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryExpiryPlanAuthority {
+    request_id: [u8; 16],
+    requester: DeviceIdentity,
+    terminal_at: ServerTimestamp,
+    observed_at: ServerTimestamp,
+    locked_read_set_digest: [u8; 32],
+}
+
+impl RecoveryExpiryPlanAuthority {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        request_id: [u8; 16],
+        requester: DeviceIdentity,
+        terminal_at: ServerTimestamp,
+        observed_at: ServerTimestamp,
+        locked_read_set_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            request_id,
+            requester,
+            terminal_at,
+            observed_at,
+            locked_read_set_digest,
+        }
+    }
+
+    pub(crate) fn request_id(&self) -> &[u8; 16] {
+        &self.request_id
+    }
+    pub(crate) fn requester(&self) -> &DeviceIdentity {
+        &self.requester
+    }
+    pub(crate) fn terminal_at(&self) -> ServerTimestamp {
+        self.terminal_at
+    }
+    pub(crate) fn observed_at(&self) -> ServerTimestamp {
+        self.observed_at
+    }
+    pub(crate) fn locked_read_set_digest(&self) -> &[u8; 32] {
+        &self.locked_read_set_digest
+    }
+}
+
 /// Repository-issued authority for an unsigned expiry worker decision. The
 /// work row itself fixes the terminal instant; `observed_at` only proves the
 /// worker ran no earlier than that instant under the conversation lock.
@@ -8774,6 +9263,7 @@ pub(crate) enum PlanAuthority {
     Transition(TransitionEvidence),
     Request(RequestEvidence),
     DeviceRevocation(DeviceRevocationEvidence),
+    RecoveryExpiry(RecoveryExpiryPlanAuthority),
     WelcomeExpiry(WelcomeExpiryAuthority),
 }
 
@@ -9727,6 +10217,99 @@ impl PlannedTransition {
             locked_head_digest: *head.durable_row_digest(),
         });
         Ok(self)
+    }
+
+    #[cfg(not(test))]
+    fn bind_recovery_expiry_authority(
+        mut self,
+        evidence: RecoveryExpiryPlanAuthority,
+        head: &LockedConversationHeadGuard,
+        package: LockedRecoveryPackageGuard,
+    ) -> Result<Self, StateMachineError> {
+        let locked_at = ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?;
+        let prior = self
+            .expected_prior
+            .as_ref()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let (request, expired_request) = self
+            .effects
+            .recovery_request_changes
+            .iter()
+            .find_map(
+                |change| match (change.before.as_ref(), change.after.as_ref()) {
+                    (Some(before), Some(after))
+                        if before.request_id == *evidence.request_id()
+                            && before.status == RecoveryRequestStatus::Open
+                            && after.status == RecoveryRequestStatus::Expired =>
+                    {
+                        Some((before, after))
+                    }
+                    _ => None,
+                },
+            )
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let (reservation, expired_reservation) = self
+            .effects
+            .reservation_changes
+            .iter()
+            .find_map(
+                |change| match (change.before.as_ref(), change.after.as_ref()) {
+                    (Some(before), Some(after))
+                        if before.request_id == *evidence.request_id()
+                            && before.status == ReservationStatus::Active
+                            && after.status == ReservationStatus::Expired =>
+                    {
+                        Some((before, after))
+                    }
+                    _ => None,
+                },
+            )
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let edge = self
+            .effects
+            .package_transitions
+            .iter()
+            .find(|edge| edge.request_id == *evidence.request_id())
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if head.conversation_id().as_bytes() != prior.conversation_id()
+            || head.prior_coordinate() != Some(prior)
+            || locked_at != evidence.observed_at
+            || evidence.observed_at < evidence.terminal_at
+            || evidence.locked_read_set_digest == [0; 32]
+            || request.target != evidence.requester
+            || request.expires_at != evidence.terminal_at
+            || expired_request.target != request.target
+            || expired_request.expires_at != request.expires_at
+            || reservation.target != request.target
+            || reservation.key_package_ref != request.key_package_ref
+            || reservation.expires_at != request.expires_at
+            || expired_reservation.target != reservation.target
+            || expired_reservation.expires_at != reservation.expires_at
+            || edge.from != PackageStatus::Reserved
+            || !matches!(edge.to, PackageStatus::Available | PackageStatus::Expired)
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let package_cas = reserved_package_cas_for_request(
+            package,
+            request,
+            reservation,
+            head.transaction_id(),
+            edge.to,
+        )?;
+        self.effects.authority = Some(PlanAuthority::RecoveryExpiry(evidence));
+        self.effects.head_cas = Some(ConversationHeadCasBinding {
+            transaction_id: head.transaction_id().to_owned(),
+            conversation_id: *head.conversation_id().as_bytes(),
+            expected_prior: self.expected_prior,
+            expected_next_entry_seq: head.next_entry_seq(),
+            allocated_entry_id: None,
+            allocated_seq: None,
+            successor_next_entry_seq: head.next_entry_seq(),
+            locked_at,
+            locked_head_digest: *head.durable_row_digest(),
+        });
+        self.bind_recovery_package_cas(package_cas)
     }
 
     fn bind_welcome_cas(mut self, binding: WelcomeCasBinding) -> Result<Self, StateMachineError> {
@@ -10711,6 +11294,96 @@ fn plan_leaf_recovery_cancellation_inner(
             &state,
         ),
         state,
+    })
+}
+
+fn plan_leaf_recovery_expiry_inner(
+    prior: &ConversationState,
+    authority: &RecoveryExpiryPlanAuthority,
+) -> Result<PlannedTransition, StateMachineError> {
+    ensure_active(prior)?;
+    if !is_uuid_v4(authority.request_id())
+        || authority.observed_at < authority.terminal_at
+        || authority.locked_read_set_digest == [0; 32]
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let request = prior
+        .recovery_request(authority.request_id())
+        .filter(|request| request.status == RecoveryRequestStatus::Open)
+        .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+    let reservation = prior
+        .recovery_reservation(authority.request_id())
+        .filter(|reservation| reservation.status == ReservationStatus::Active)
+        .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+    if request.target != authority.requester
+        || request.expires_at != authority.terminal_at
+        || reservation.target != request.target
+        || reservation.bound_coordinate != request.bound_coordinate
+        || reservation.key_package_ref != request.key_package_ref
+        || reservation.expires_at != request.expires_at
+        || authority.terminal_at > reservation.package_not_after
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let terminal = WorkTerminalEvidence::Expiry(authority.terminal_at);
+    let mut state = prior.clone();
+    let request = state
+        .recovery_requests
+        .iter_mut()
+        .find(|request| request.request_id == *authority.request_id())
+        .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+    request.status = RecoveryRequestStatus::Expired;
+    request.terminal = Some(terminal.clone());
+    let reservation = state
+        .recovery_reservations
+        .iter_mut()
+        .find(|reservation| reservation.request_id == *authority.request_id())
+        .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+    reservation.status = ReservationStatus::Expired;
+    reservation.terminal = Some(terminal);
+    validate_state(&state)?;
+    Ok(PlannedTransition {
+        expected_prior: Some(prior.coordinate),
+        retired_coordinate: None,
+        successor_coordinate: Some(prior.coordinate),
+        effects: complete_effects(
+            TransitionEffects::new(PlanKind::RecoveryExpiry),
+            Some(prior),
+            &state,
+        ),
+        state,
+    })
+}
+
+#[cfg(not(test))]
+fn recovery_expiry_plan_authority(
+    package: &LockedRecoveryPackageGuard,
+    request_id: Uuid,
+    terminal_at: chrono::DateTime<chrono::Utc>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+    locked_read_set_digest: [u8; 32],
+) -> Result<RecoveryExpiryPlanAuthority, StateMachineError> {
+    let did = BareDid::parse(package.target_did())
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+    let requester = DeviceIdentity::new(
+        PrincipalId::new(did.as_str().as_bytes().to_vec())?,
+        *package.target_device_id().as_bytes(),
+    )?;
+    if package.request_id() != request_id
+        || package.conversation_id().as_bytes() != package.bound_coordinate().conversation_id()
+        || package.status() != LockedRecoveryPackageStatus::Reserved
+        || package.use_kind() != LockedRecoveryPackageUse::ReservedFulfillment
+        || locked_read_set_digest == [0; 32]
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    Ok(RecoveryExpiryPlanAuthority {
+        request_id: *request_id.as_bytes(),
+        requester,
+        terminal_at: ServerTimestamp::from_unix_millis(terminal_at.timestamp_millis())?,
+        observed_at: ServerTimestamp::from_unix_millis(observed_at.timestamp_millis())?,
+        locked_read_set_digest,
     })
 }
 
@@ -13253,6 +13926,14 @@ pub(crate) fn plan_leaf_recovery_cancellation(
 }
 
 #[cfg(test)]
+pub(crate) fn plan_leaf_recovery_expiry(
+    prior: &ConversationState,
+    authority: RecoveryExpiryPlanAuthority,
+) -> Result<PlannedTransition, StateMachineError> {
+    plan_leaf_recovery_expiry_inner(prior, &authority)
+}
+
+#[cfg(test)]
 pub(crate) fn plan_device_revocation(
     prior: &ConversationState,
     evidence: DeviceRevocationEvidence,
@@ -15233,6 +15914,42 @@ pub(crate) fn recovery_fulfillment_terminal_matches(
         )
 }
 
+/// Read-time drift fence for a durable signed Recovery cancellation.  The
+/// cancellation is entry-less, belongs to the same requester device as the
+/// open work, binds the exact request identifier, and is retained at the exact
+/// database terminal timestamp.
+#[allow(dead_code)]
+pub(crate) fn recovery_cancellation_terminal_matches(
+    evidence: &RequestEvidence,
+    request_id: &[u8; 16],
+    target: &DeviceIdentity,
+    conversation_id: &[u8; 16],
+    terminal_at: ServerTimestamp,
+) -> bool {
+    evidence.kind() == RequestEntryKind::LeafRecoveryCancellation
+        && evidence.request_id() == request_id
+        && evidence.actor() == target
+        && evidence.conversation_id() == conversation_id
+        && evidence.received_at() == terminal_at
+        && matches!(
+            evidence.body_binding.as_ref(),
+            Some(RequestBodyBinding::LeafRecoveryCancellation)
+        )
+}
+
+/// Read-time drift fence for a transition which made Recovery work stale.
+/// The transition must consume the exact bound coordinate and its certified
+/// receipt time must equal the retained terminal time.
+#[allow(dead_code)]
+pub(crate) fn recovery_supersession_terminal_matches(
+    evidence: &TransitionEvidence,
+    bound_coordinate: &PublicGroupSnapshotCoordinate,
+    terminal_at: ServerTimestamp,
+) -> bool {
+    evidence.received_at() == terminal_at
+        && transition_consumes_coordinate(evidence, bound_coordinate)
+}
+
 fn recovery_fulfillment_binding_matches(
     evidence: &TransitionEvidence,
     request_id: &[u8; 16],
@@ -16084,9 +16801,6 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // `super::repository::*` paths resolve there as well. See the E2b-3 report.
 // ===========================================================================
 
-pub(crate) use super::repository::recovery::{
-    RecoveryExecutorCapsule, RecoveryExecutorOperation, RecoverySchedulerExpiryCapsule,
-};
 pub(crate) use executor::{
     apply_conversation_persistence_plan, apply_prepared_device_revocation_members,
     apply_prepared_device_revocation_prefix, prepare_device_revocation_batch_members,
@@ -17032,11 +17746,11 @@ pub(in crate::chat_protocol) mod executor {
     ) -> Result<Uuid, ExecutorError> {
         match (kind, authority) {
             (
-                PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation,
+                PlanKind::WelcomeExpiry | PlanKind::RecoveryExpiry | PlanKind::DeviceRevocation,
                 ExecutionAuthority::Entryless { operation_id },
             ) => Ok(*operation_id),
             (
-                PlanKind::WelcomeExpiry | PlanKind::DeviceRevocation,
+                PlanKind::WelcomeExpiry | PlanKind::RecoveryExpiry | PlanKind::DeviceRevocation,
                 ExecutionAuthority::ControlEntry(_),
             ) => Err(ExecutorError::MissingContext(
                 "entryless operation authority",
@@ -18588,6 +19302,18 @@ pub(in crate::chat_protocol) mod executor {
                 )
                 .await;
             }
+            PlanKind::RecoveryExpiry => {
+                return apply_leaf_recovery_expiry(
+                    transaction,
+                    plan,
+                    ctx,
+                    conversation_id,
+                    generation,
+                    state_version,
+                    epoch,
+                )
+                .await;
+            }
             // `welcomeExpiry` is ALSO entry-less (server-observed pending-only CAS,
             // `bind_welcome_expiry_authority`: `allocated_seq == None`, coordinate +
             // seq counter UNCHANGED) — dispatch it here before the `allocated_seq`
@@ -18789,7 +19515,9 @@ pub(in crate::chat_protocol) mod executor {
             }
             // Entry-less internal ops are dispatched (and returned) above, before
             // the entry-bearing `allocated_seq` extraction.
-            PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation => {
+            PlanKind::RecoveryRequest
+            | PlanKind::RecoveryCancellation
+            | PlanKind::RecoveryExpiry => {
                 unreachable!("entry-less recovery ops are dispatched before this match")
             }
             // Entry-less; dispatched (and returned) above.
@@ -20851,6 +21579,199 @@ pub(in crate::chat_protocol) mod executor {
         Ok(AppliedTransition {
             allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
             entry_id: ctx.entry().entry_id,
+            event_positions,
+            successor_coordinate: plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Apply one due Recovery expiry as an entryless exact triple transition.
+    /// The executor is the sole business writer: request, reservation, package,
+    /// canonical event, and head verification share this savepoint.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_leaf_recovery_expiry(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        _epoch: i64,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+        let authority = match effects.authority() {
+            Some(PlanAuthority::RecoveryExpiry(authority)) => authority,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "leaf recovery expiry lacks authority",
+                ))
+            }
+        };
+        let operation_id = match &ctx.authority {
+            ExecutionAuthority::Entryless { operation_id } => *operation_id,
+            ExecutionAuthority::ControlEntry(_) => {
+                return Err(ExecutorError::MissingContext(
+                    "entryless leaf recovery expiry authority",
+                ))
+            }
+        };
+        let terminal_at = server_instant(authority.terminal_at())?;
+        if operation_id.as_bytes() != authority.request_id()
+            || authority.observed_at() < authority.terminal_at()
+            || authority.locked_read_set_digest() == &[0; 32]
+            || head.allocated_entry_id().is_some()
+            || head.allocated_seq().is_some()
+            || head.successor_next_entry_seq() != head.expected_next_entry_seq()
+            || head.locked_at() != authority.observed_at()
+            || ctx.applied_at != terminal_at
+            || generation != expected_generation
+            || state_version != expected_state_version
+            || successor_next_entry_seq != expected_next_entry_seq
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry authority/head drifted",
+            ));
+        }
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("welcome_changes", effects.welcome_changes())?;
+        reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
+        if effects.metadata_change().is_some()
+            || effects.revocation_target_cas().is_some()
+            || effects.welcome_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+            || effects.recovery_request_changes().len() != 1
+            || effects.reservation_changes().len() != 1
+            || effects.package_transitions().len() != 1
+            || !ctx.entry_recipients.is_empty()
+            || !ctx.opened_leaves.is_empty()
+            || ctx.metadata_author.is_some()
+            || !ctx.participant_period_ids.is_empty()
+            || !ctx.leaf_period_ids.is_empty()
+            || !ctx.closing_leaf_periods.is_empty()
+            || !ctx.closing_participant_periods.is_empty()
+            || ctx.reset_request_row.is_some()
+            || ctx.recovery_open.is_some()
+            || ctx.welcome_expiry.is_some()
+            || ctx.welcome_response.is_some()
+            || !ctx.welcome_dispositions.is_empty()
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry carries unrelated effects/context",
+            ));
+        }
+        let expired = effects
+            .recovery_request_changes()
+            .iter()
+            .find_map(|change| match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == RecoveryRequestStatus::Open
+                        && after.status() == RecoveryRequestStatus::Expired
+                        && after.request_id() == authority.request_id()
+                        && after.target() == authority.requester()
+                        && *after.expires_at() == authority.terminal_at() =>
+                {
+                    Some(after)
+                }
+                _ => None,
+            })
+            .ok_or(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry lacks exact request edge",
+            ))?;
+        let package_edge =
+            effects
+                .package_transitions()
+                .first()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "leaf recovery expiry lacks package edge",
+                ))?;
+        if package_edge.request_id() != authority.request_id()
+            || package_edge.key_package_ref() != expired.key_package_ref()
+            || package_edge.from() != PackageStatus::Reserved
+            || !matches!(
+                package_edge.to(),
+                PackageStatus::Available | PackageStatus::Expired
+            )
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry package edge is invalid",
+            ));
+        }
+        verify_recovery_package_consistency(
+            effects,
+            expired.key_package_ref(),
+            PackageStatus::Reserved,
+            package_edge.to(),
+        )?;
+        if ctx.events.len() != 1
+            || ctx.events[0].event_kind != EventKind::LeafRecovery
+            || ctx.events[0].payload_bytes
+                != delivery::canonical_leaf_recovery_event_payload(operation_id, "expired")
+            || ctx.events[0].outbox.len() != 1
+            || ctx.events[0].outbox[0].1 != OutboxWorkKind::Stream
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "leaf recovery expiry event is not canonical",
+            ));
+        }
+
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id,
+                expected_generation,
+                expected_state_version,
+                expected_next_entry_seq,
+                successor_generation: generation,
+                successor_state_version: state_version,
+                successor_next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+        transition::terminalize_leaf_recovery_request(
+            transaction,
+            operation_id,
+            &LeafRecoveryTermination::Expired { terminal_at },
+        )
+        .await?;
+        transition::terminalize_reservation(
+            transaction,
+            operation_id,
+            &ReservationTermination::Expired { terminal_at },
+        )
+        .await?;
+        let successor = match package_edge.to() {
+            PackageStatus::Available => PackageSuccessor::Reactivate,
+            PackageStatus::Expired => PackageSuccessor::Expire { terminal_at },
+            _ => unreachable!("expiry package successor checked above"),
+        };
+        transition::cas_key_package_status(
+            transaction,
+            expired.key_package_ref(),
+            RepoPackageStatus::Reserved,
+            &successor,
+        )
+        .await?;
+        let event_positions = write_events(transaction, ctx).await?;
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
+            entry_id: operation_id,
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
