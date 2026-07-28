@@ -57,6 +57,16 @@ pub const MIN_KEY_PACKAGE_REMAINING_SECONDS: u64 = 10 * 60;
 /// allowed clock skew.
 pub const MAX_KEY_PACKAGE_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60 + 60 * 60;
 
+/// Convert one sealed trusted server timestamp from canonical milliseconds to
+/// the Unix-second instant used for MLS lifetime validation.
+///
+/// This is deliberately total over `i64`: pre-epoch values are rejected, and
+/// nonnegative subsecond values are floored rather than rounded.
+#[doc(hidden)]
+pub fn trusted_unix_millis_to_seconds(unix_millis: i64) -> Option<u64> {
+    u64::try_from(unix_millis.div_euclid(1_000)).ok()
+}
+
 const BASIC_CREDENTIAL_TYPE: u16 = 1;
 
 // Local wire mirrors are intentionally made only of TLS primitives. They let

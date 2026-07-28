@@ -22,6 +22,29 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserialize, VLBytes};
 
+// Compile the production wire module in this integration-test crate so its
+// crate-private trusted-time seam is exercised directly. The two XWing
+// helpers are inert support for compiling unrelated wire validators; this
+// test calls only the production timestamp conversion below.
+const MIN_BASIC_CREDENTIAL_BYTES: usize = 12 + 1 + 36;
+const MAX_BASIC_CREDENTIAL_BYTES: usize = (8 + 253) + 1 + 36;
+
+fn xwing_public_key_is_valid(_bytes: &[u8]) -> bool {
+    false
+}
+
+fn xwing_kem_output_is_valid(_bytes: &[u8]) -> bool {
+    false
+}
+
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/snapshot.rs"]
+mod snapshot;
+
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/wire.rs"]
+mod source_wire;
+
 const TEST_ALICE_CREDENTIAL: &[u8] = b"did:web:a.co#00000000-0000-4000-8000-000000000001";
 const TEST_BOB_CREDENTIAL: &[u8] = b"did:web:b.co#00000000-0000-4000-8000-000000000002";
 
@@ -2654,6 +2677,98 @@ fn group_info_rejects_openmls_default_creator_capabilities() {
     assert!(
         validate_group_info(&fixture.bytes, standalone_group_info_policy(&fixture)).is_err(),
         "OpenMLS defaults advertise four suites and must not pass the closed profile"
+    );
+}
+
+#[test]
+fn group_info_uses_repository_signed_time_floor_instead_of_os_time() {
+    const LIFETIME_NOT_BEFORE: u64 = 100;
+    const LIFETIME_NOT_AFTER: u64 = 750;
+    const REPOSITORY_SIGNED_TIME_MILLIS: i64 = 150_999;
+
+    assert_eq!(
+        source_wire::trusted_unix_millis_to_seconds(-1),
+        None,
+        "pre-epoch sealed instants are outside the protocol time domain"
+    );
+    assert_eq!(
+        source_wire::trusted_unix_millis_to_seconds(999),
+        Some(0),
+        "the production seam is total and floors nonnegative subseconds"
+    );
+
+    let fixture = genesis_group_info_fixture(
+        Some(exact_capabilities()),
+        Some(Lifetime::init(LIFETIME_NOT_BEFORE, LIFETIME_NOT_AFTER)),
+    );
+    let os_time = frozen_now();
+    assert!(
+        os_time > LIFETIME_NOT_AFTER,
+        "fixture must make operating-system time diverge from sealed repository time"
+    );
+    let wall_clock_group_info = match MlsMessageIn::tls_deserialize_exact(&fixture.bytes)
+        .expect("parse historical GroupInfo")
+        .extract()
+    {
+        MlsMessageBodyIn::GroupInfo(group_info) => group_info,
+        _ => panic!("exported GroupInfo must use the GroupInfo wrapper"),
+    };
+    let wall_clock_tree = wall_clock_group_info
+        .extensions()
+        .ratchet_tree()
+        .expect("fixture carries ratchet tree")
+        .ratchet_tree()
+        .clone();
+    let wall_clock_provider =
+        openmls_libcrux_crypto::Provider::new().expect("wall-clock import provider");
+    assert!(
+        PublicGroup::from_external(
+            wall_clock_provider.crypto(),
+            wall_clock_provider.storage(),
+            wall_clock_tree,
+            wall_clock_group_info,
+            ProposalStore::new(),
+        )
+        .is_err(),
+        "the same signed leaf must fail if the operating-system clock is consulted"
+    );
+
+    let repository_time_seconds =
+        source_wire::trusted_unix_millis_to_seconds(REPOSITORY_SIGNED_TIME_MILLIS)
+            .expect("sealed repository time is nonnegative");
+    assert_eq!(
+        repository_time_seconds, 150,
+        "production conversion floors the sealed millisecond instant"
+    );
+
+    let validated = validate_group_info(
+        &fixture.bytes,
+        GroupInfoValidationPolicy {
+            expected_basic_credential: b"did:plc:alice#genesis",
+            expected_signature_key: &fixture.signature_key,
+            now_unix_seconds: repository_time_seconds,
+            max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_ratchet_tree_bytes: 786_432,
+            max_members: 1,
+        },
+    )
+    .expect("repository-signed trusted instant is authoritative despite divergent OS time");
+    assert_eq!(validated.public_group().members().count(), 1);
+
+    assert!(
+        validate_group_info(
+            &fixture.bytes,
+            GroupInfoValidationPolicy {
+                expected_basic_credential: b"did:plc:alice#genesis",
+                expected_signature_key: &fixture.signature_key,
+                now_unix_seconds: repository_time_seconds + 1,
+                max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_ratchet_tree_bytes: 786_432,
+                max_members: 1,
+            },
+        )
+        .is_err(),
+        "rounding 150.999s to 151 would leave only 599s and must fail"
     );
 }
 
