@@ -40,6 +40,9 @@ pub(crate) mod inventory;
 pub(crate) mod key_packages;
 #[cfg(not(test))]
 pub(crate) mod relationship;
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) mod reset;
 pub(crate) mod transition;
 // `welcome` (Slice 4b) is the welcome-expiry worker claim + recovery-inbox read
 // surface. Like `delivery`/`inventory` it is unconditionally compiled so both
