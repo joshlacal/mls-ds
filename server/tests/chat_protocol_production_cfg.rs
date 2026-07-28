@@ -261,15 +261,6 @@ async fn recovery_client_cancellation_due_for_expiry_orders_expiry_before_client
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated owner-controlled gate database and a fresh exact singleton Recovery fallback"]
-async fn recovery_client_expiry_due_for_expiry_orders_expiry_before_client_error() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
-    catbird_server::chat_protocol::production_proof::run_client_recovery_expiry_due_for_expiry_ordering(&pool)
-        .await
-        .expect("Recovery client expiry DueForExpiry ordering");
-}
-
-#[tokio::test]
 #[ignore = "requires the dedicated owner-controlled gate database and fresh exact two-party Recovery fallbacks"]
 async fn recovery_client_fulfillment_runs_through_real_auth_prelude_apply_and_completion() {
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;

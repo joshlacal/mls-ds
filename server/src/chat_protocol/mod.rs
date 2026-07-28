@@ -93,8 +93,8 @@ pub mod wire;
 #[doc(hidden)]
 pub mod production_proof {
     pub use super::repository::recovery::production_composition_proof::{
-        run_aggregate_graph_drift_negative, run_client_recovery_expiry_due_for_expiry_ordering,
-        run_foreign_transaction_negative, run_leaf_recovery_cancellation_due_for_expiry_ordering,
+        run_aggregate_graph_drift_negative, run_foreign_transaction_negative,
+        run_leaf_recovery_cancellation_due_for_expiry_ordering,
         run_leaf_recovery_cancellation_happy_path,
         run_leaf_recovery_fulfillment_due_for_expiry_ordering,
         run_leaf_recovery_fulfillment_happy_path, run_package_row_drift_negative,

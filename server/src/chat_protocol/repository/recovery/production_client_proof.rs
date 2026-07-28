@@ -422,6 +422,37 @@ fn require_terminal_delta(
     }
 }
 
+fn require_request_delta(before: &ClientResidue, after: &ClientResidue) -> Result<(), String> {
+    let expected = ClientResidue {
+        target_request: before.target_request + 1,
+        target_reservation: before.target_reservation + 1,
+        target_request_status: Some("open".to_owned()),
+        target_reservation_status: Some("active".to_owned()),
+        completion: before.completion + 1,
+        operation_claim: before.operation_claim + 1,
+        event: before.event + 1,
+        outbox: before.outbox + 1,
+        package_status: "reserved".to_owned(),
+        actor_dpop_jkt: before.actor_dpop_jkt.clone(),
+    };
+    if after == &expected
+        && before.target_request == 0
+        && before.target_reservation == 0
+        && before.target_request_status.is_none()
+        && before.target_reservation_status.is_none()
+        && before.completion == 0
+        && before.operation_claim == 0
+        && before.package_status == "available"
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "client Recovery request did not have the exact scoped delta \
+             before={before:?} after={after:?} expected={expected:?}"
+        ))
+    }
+}
+
 async fn require_exact_event_outbox(
     transaction: &mut Transaction<'_, Postgres>,
     fixture: &DurableRecoveryFixture,
@@ -471,6 +502,9 @@ fn require_residue_unchanged(before: &ClientResidue, after: &ClientResidue) -> R
 #[doc(hidden)]
 pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Result<(), String> {
     let proof = new_client_request_proof(pool).await?;
+    let operation_id = proof.envelope.operation_id;
+    let before =
+        observe_client_residue(pool, &proof.fixture, operation_id, operation_id).await?;
     let mut transaction = pool
         .begin()
         .await
@@ -488,6 +522,12 @@ pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Resul
             "client Recovery apply returned non-request material or wrong event count".to_owned(),
         );
     }
+    require_exact_event_outbox(
+        &mut transaction,
+        &proof.fixture,
+        transition.event_positions[0],
+    )
+    .await?;
     let response = exact_request_response(&mut transaction, &proof).await?;
     crate::chat_protocol::repository::prelude::complete_operation(
         &mut transaction,
@@ -510,10 +550,16 @@ pub(super) async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Resul
     if stored != response {
         return Err("client Recovery completion response was not exact".to_owned());
     }
+    let during =
+        observe_client_residue(&mut *transaction, &proof.fixture, operation_id, operation_id)
+            .await?;
+    require_request_delta(&before, &during)?;
     transaction
         .rollback()
         .await
-        .map_err(|e| format!("rollback client Recovery happy proof: {e}"))
+        .map_err(|e| format!("rollback client Recovery happy proof: {e}"))?;
+    let after = observe_client_residue(pool, &proof.fixture, operation_id, operation_id).await?;
+    require_residue_unchanged(&before, &after)
 }
 
 async fn run_prewrite_drift(pool: &PgPool, scope: bool) -> Result<(), String> {
@@ -961,11 +1007,4 @@ pub(super) async fn run_leaf_recovery_cancellation_due_for_expiry_ordering(
         )
         .await?,
     )
-}
-
-#[doc(hidden)]
-pub(super) async fn run_client_recovery_expiry_due_for_expiry_ordering(
-    pool: &PgPool,
-) -> Result<(), String> {
-    run_leaf_recovery_cancellation_due_for_expiry_ordering(pool).await
 }

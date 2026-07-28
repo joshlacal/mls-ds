@@ -2173,6 +2173,7 @@ pub mod production_composition_proof {
     use super::*;
     use crate::chat_protocol::state_machine::executor::{DropSafetyProbe, DropSafetyProbeMode};
     use futures::FutureExt as _;
+    use serde_json::Value;
     use sqlx::PgPool;
     use std::panic::AssertUnwindSafe;
 
@@ -2225,13 +2226,6 @@ pub mod production_composition_proof {
         pool: &PgPool,
     ) -> Result<(), String> {
         production_client_proof::run_leaf_recovery_cancellation_due_for_expiry_ordering(pool).await
-    }
-
-    #[doc(hidden)]
-    pub async fn run_client_recovery_expiry_due_for_expiry_ordering(
-        pool: &PgPool,
-    ) -> Result<(), String> {
-        production_client_proof::run_client_recovery_expiry_due_for_expiry_ordering(pool).await
     }
 
     #[doc(hidden)]
@@ -2306,41 +2300,104 @@ pub mod production_composition_proof {
         Ok((request_id, prepared))
     }
 
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(Debug, Eq, FromRow, PartialEq)]
     struct RecoveryResidue {
-        request_status: String,
-        reservation_status: String,
-        package_status: String,
+        request_row: Value,
+        reservation_row: Value,
+        package_row: Value,
+        conversation_row: Value,
         protocol_instance_id: Uuid,
-        event_count: i64,
-        outbox_count: i64,
-        request_completion_count: i64,
+        generations: Value,
+        generation_states: Value,
+        metadata_snapshots: Value,
+        transitions: Value,
+        entries: Value,
+        events: Value,
+        event_recipients: Value,
+        outbox: Value,
+        request_completions: Value,
+    }
+
+    impl RecoveryResidue {
+        fn row_count(value: &Value, family: &str) -> Result<usize, String> {
+            value
+                .as_array()
+                .map(Vec::len)
+                .ok_or_else(|| format!("Recovery residue {family} is not a JSON array"))
+        }
+
+        fn event_count(&self) -> Result<usize, String> {
+            Self::row_count(&self.events, "events")
+        }
+
+        fn outbox_count(&self) -> Result<usize, String> {
+            Self::row_count(&self.outbox, "outbox")
+        }
     }
 
     async fn residue_counts(
         transaction: &mut Transaction<'_, Postgres>,
         request_id: Uuid,
     ) -> Result<RecoveryResidue, String> {
-        let (
-            request_status,
-            reservation_status,
-            package_status,
-            protocol_instance_id,
-            event_count,
-            outbox_count,
-            request_completion_count,
-        ): (String, String, String, Uuid, i64, i64, i64) = sqlx::query_as(
-            "SELECT request.status,reservation.status,package.status,\
+        sqlx::query_as(
+            "SELECT to_jsonb(request) AS request_row,\
+                    to_jsonb(reservation) AS reservation_row,\
+                    to_jsonb(package) AS package_row,\
+                    to_jsonb(conversation) AS conversation_row,\
                     conversation.protocol_instance_id,\
-                    (SELECT count(*) FROM chat.events event\
-                      WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
-                    (SELECT count(*) FROM chat.outbox outbox\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(generation)\
+                                             ORDER BY generation.generation)\
+                      FROM chat.generations generation\
+                     WHERE generation.conversation_id=request.conversation_id),\
+                             '[]'::jsonb) AS generations,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(state)\
+                                             ORDER BY state.generation,state.state_version)\
+                      FROM chat.generation_states state\
+                     WHERE state.conversation_id=request.conversation_id),\
+                             '[]'::jsonb) AS generation_states,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(metadata)\
+                                             ORDER BY metadata.metadata_snapshot_id)\
+                      FROM chat.metadata_snapshots metadata\
+                     WHERE metadata.conversation_id=request.conversation_id),\
+                             '[]'::jsonb) AS metadata_snapshots,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(transition)\
+                                             ORDER BY transition.entry_seq,transition.transition_id)\
+                      FROM chat.transitions transition\
+                     WHERE transition.conversation_id=request.conversation_id),\
+                             '[]'::jsonb) AS transitions,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(entry)\
+                                             ORDER BY entry.seq,entry.entry_id)\
+                      FROM chat.entries entry\
+                     WHERE entry.conversation_id=request.conversation_id),\
+                             '[]'::jsonb) AS entries,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(event)\
+                                             ORDER BY event.event_position)\
+                      FROM chat.events event\
+                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                             '[]'::jsonb) AS events,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(recipient)\
+                                             ORDER BY recipient.event_position,\
+                                                      recipient.user_did,\
+                                                      recipient.device_id)\
+                      FROM chat.event_recipients recipient\
                       JOIN chat.events event USING(event_position)\
-                      WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
-                    (SELECT count(*) FROM chat.idempotency_records completion\
+                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                             '[]'::jsonb) AS event_recipients,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(work)\
+                                             ORDER BY work.event_position,work.outbox_id)\
+                      FROM chat.outbox work\
+                      JOIN chat.events event USING(event_position)\
+                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                             '[]'::jsonb) AS outbox,\
+                    COALESCE((SELECT jsonb_agg(to_jsonb(completion)\
+                                             ORDER BY completion.principal_did,\
+                                                      completion.endpoint_nsid,\
+                                                      completion.operation_id)\
+                      FROM chat.idempotency_records completion\
                       WHERE completion.principal_did=request.requester_did\
                         AND completion.endpoint_nsid='blue.catbird.chat.requestLeafRecovery'\
-                        AND completion.operation_id=request.recovery_request_id)\
+                        AND completion.operation_id=request.recovery_request_id),\
+                             '[]'::jsonb) AS request_completions\
              FROM chat.leaf_recovery_requests request\
              JOIN chat.key_package_reservations reservation\
                ON reservation.recovery_request_id=request.recovery_request_id\
@@ -2353,16 +2410,7 @@ pub mod production_composition_proof {
         .bind(request_id)
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|error| format!("read Recovery proof residue: {error}"))?;
-        Ok(RecoveryResidue {
-            request_status,
-            reservation_status,
-            package_status,
-            protocol_instance_id,
-            event_count,
-            outbox_count,
-            request_completion_count,
-        })
+        .map_err(|error| format!("read complete Recovery proof residue: {error}"))
     }
 
     fn require_prewrite_authority_mismatch(error: RecoveryRepositoryError) -> Result<(), String> {
@@ -2541,8 +2589,10 @@ pub mod production_composition_proof {
             .await
             .map_err(|error| format!("begin exact-row drift proof: {error}"))?;
         let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
-        let before = residue_counts(&mut transaction, request_id).await?;
         corrupt_exact_recovery_row(&mut transaction, request_id, drift).await?;
+        // The corruption is the test precondition. Snapshot it after
+        // injection so equality proves the executor added no further write.
+        let before = residue_counts(&mut transaction, request_id).await?;
         let error = match prepared.apply(&mut transaction).await {
             Ok(_) => return Err("exact Recovery row drift reached executor writes".to_owned()),
             Err(error) => error,
@@ -2816,6 +2866,120 @@ pub mod production_composition_proof {
         run_exact_row_drift(pool, ExactRecoveryDrift::Package).await
     }
 
+    #[derive(Debug)]
+    struct SchedulerTerminalExpectation {
+        terminal_at: DateTime<Utc>,
+        package_not_after: DateTime<Utc>,
+        package_status: &'static str,
+    }
+
+    async fn scheduler_terminal_expectation(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+        prepared: &PreparedSchedulerRecoveryExpiry,
+    ) -> Result<SchedulerTerminalExpectation, String> {
+        let terminal_at = match prepared.material() {
+            RecoveryCanonicalMaterial::SchedulerExpired {
+                recovery_request_id,
+                terminal_at,
+            } if recovery_request_id == request_id => terminal_at,
+            material => {
+                return Err(format!(
+                    "scheduler preparation returned wrong canonical material: {material:?}"
+                ))
+            }
+        };
+        let (request_expires_at, package_not_after): (DateTime<Utc>, DateTime<Utc>) =
+            sqlx::query_as(
+                "SELECT request.expires_at,package.not_after\
+                   FROM chat.leaf_recovery_requests request\
+                   JOIN chat.key_packages package\
+                     ON package.key_package_ref=request.key_package_ref\
+                  WHERE request.recovery_request_id=$1",
+            )
+            .bind(request_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|error| format!("read scheduler terminal expectation: {error}"))?;
+        if request_expires_at != terminal_at || package_not_after < terminal_at {
+            return Err(format!(
+                "scheduler plan terminal binding disagrees with durable lifetime: \
+                 material={terminal_at} request={request_expires_at} package={package_not_after}"
+            ));
+        }
+        Ok(SchedulerTerminalExpectation {
+            terminal_at,
+            package_not_after,
+            package_status: if package_not_after == terminal_at {
+                "expired"
+            } else {
+                "available"
+            },
+        })
+    }
+
+    async fn require_exact_scheduler_terminal(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+        expected: &SchedulerTerminalExpectation,
+    ) -> Result<(), String> {
+        let (request, reservation, package) = lock_terminal_rows(transaction, request_id)
+            .await
+            .map_err(|error| format!("reload exact scheduler terminal rows: {error:?}"))?;
+        let request_exact = request.status == "expired"
+            && request.expires_at == expected.terminal_at
+            && request.fulfilling_transition_id.is_none()
+            && request.terminal_transition_id.is_none()
+            && request.terminal_revocation_id.is_none()
+            && request.terminal_signed_request_bytes.is_none()
+            && request.terminal_signing_transcript_bytes.is_none()
+            && request.terminal_request_digest.is_none()
+            && request.terminal_signature.is_none()
+            && request.terminal_at == Some(expected.terminal_at);
+        let reservation_exact = reservation.status == "expired"
+            && reservation.expires_at == expected.terminal_at
+            && reservation.consumed_transition_id.is_none()
+            && reservation.terminal_transition_id.is_none()
+            && reservation.terminal_revocation_id.is_none()
+            && reservation.terminal_request_digest.is_none()
+            && reservation.terminal_at == Some(expected.terminal_at);
+        let package_exact = package.not_after == expected.package_not_after
+            && package.status == expected.package_status
+            && package.terminal_transition_id.is_none()
+            && package.terminal_revocation_id.is_none()
+            && match expected.package_status {
+                "expired" => package.terminal_at == Some(expected.package_not_after),
+                "available" => package.terminal_at.is_none(),
+                _ => false,
+            };
+        if request_exact && reservation_exact && package_exact {
+            Ok(())
+        } else {
+            Err(format!(
+                "scheduler terminal rows violate exact expected branch \
+                 expected={expected:?} request_status={} request_terminal_at={:?} \
+                 reservation_status={} reservation_terminal_at={:?} \
+                 package_status={} package_not_after={} package_terminal_at={:?} \
+                 request_transition={:?}/{:?} reservation_transition={:?}/{:?}/{:?} \
+                 package_transition={:?}/{:?}",
+                request.status,
+                request.terminal_at,
+                reservation.status,
+                reservation.terminal_at,
+                package.status,
+                package.not_after,
+                package.terminal_at,
+                request.terminal_transition_id,
+                request.terminal_revocation_id,
+                reservation.consumed_transition_id,
+                reservation.terminal_transition_id,
+                reservation.terminal_revocation_id,
+                package.terminal_transition_id,
+                package.terminal_revocation_id,
+            ))
+        }
+    }
+
     /// Executes the real scheduler lifecycle through its opaque authority,
     /// planner, private graph, witness prewrite, prepared executor, exact
     /// terminal triple, event/outbox, and scheduler-only material. The outer
@@ -2828,7 +2992,11 @@ pub mod production_composition_proof {
             .await
             .map_err(|error| format!("begin scheduler production proof: {error}"))?;
         let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let expected =
+            scheduler_terminal_expectation(&mut transaction, request_id, &prepared).await?;
         let before = residue_counts(&mut transaction, request_id).await?;
+        let before_event_count = before.event_count()?;
+        let before_outbox_count = before.outbox_count()?;
         let applied = prepared
             .apply(&mut transaction)
             .await
@@ -2837,20 +3005,13 @@ pub mod production_composition_proof {
             applied.material,
             RecoveryCanonicalMaterial::SchedulerExpired {
                 recovery_request_id,
-                ..
-            } if recovery_request_id == request_id
+                terminal_at,
+            } if recovery_request_id == request_id && terminal_at == expected.terminal_at
         ) {
             return Err("scheduler proof returned client/completion material".to_owned());
         }
         let after = residue_counts(&mut transaction, request_id).await?;
-        if after.request_status != "expired"
-            || after.reservation_status != "expired"
-            || !matches!(after.package_status.as_str(), "available" | "expired")
-        {
-            return Err(format!(
-                "scheduler proof did not terminalize exact triple: {after:?}"
-            ));
-        }
+        require_exact_scheduler_terminal(&mut transaction, request_id, &expected).await?;
         if applied.applied.event_positions.len() != 1 {
             return Err(format!(
                 "scheduler proof emitted {} event positions, expected exactly one",
@@ -2871,9 +3032,9 @@ pub mod production_composition_proof {
         if event_kind != "leafRecovery"
             || protocol_instance_id != before.protocol_instance_id
             || outbox_rows != 1
-            || after.event_count != before.event_count + 1
-            || after.outbox_count != before.outbox_count + 1
-            || after.request_completion_count != before.request_completion_count
+            || after.event_count()? != before_event_count + 1
+            || after.outbox_count()? != before_outbox_count + 1
+            || after.request_completions != before.request_completions
         {
             return Err(format!(
                 "scheduler proof event/outbox/completion delta mismatch: \
@@ -2894,12 +3055,14 @@ pub mod production_composition_proof {
             .await
             .map_err(|error| format!("begin Recovery drift proof: {error}"))?;
         let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
-        let before = residue_counts(&mut transaction, request_id).await?;
         if snapshot {
             corrupt_public_snapshot(&mut transaction, request_id).await?;
         } else {
             corrupt_aggregate_graph(&mut transaction, request_id).await?;
         }
+        // The privileged corruption is the test precondition. Snapshot it
+        // after injection so equality proves the executor added no write.
+        let before = residue_counts(&mut transaction, request_id).await?;
         let error = match prepared.apply(&mut transaction).await {
             Ok(_) => return Err("durable aggregate drift reached executor writes".to_owned()),
             Err(error) => error,
