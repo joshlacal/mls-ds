@@ -44,6 +44,16 @@ migrations:
    - Keeps receipt-to-claim completeness staged while handlers move to the
      shared operation prelude.
 
+3. **20260728000003_defer_operation_claim_principal_fk.sql**
+   - Changes only `operation_claims_principal_fk` to `DEFERRABLE INITIALLY
+     DEFERRED`, allowing enrollment to claim an operation before creating a new
+     principal in the same atomic transaction.
+   - Locks the claim table and fails closed unless the installed constraint is
+     the exact validated, immediate FK created by `00001`; a postflight proves
+     the exact validated deferred replacement.
+   - The normalized live constraint-catalog fingerprint remains pending a
+     reviewed fresh-database refresh.
+
 The final completeness cutover is not yet a migration. Its reviewed readiness
 body lives at
 [`../docs/operation_claim_completeness_activation.sql`](../docs/operation_claim_completeness_activation.sql).

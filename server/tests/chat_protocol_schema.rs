@@ -14,7 +14,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 10] = [
+const MIGRATION_VERSIONS: [i64; 11] = [
     20260722000001,
     20260722000002,
     20260722000003,
@@ -25,8 +25,9 @@ const MIGRATION_VERSIONS: [i64; 10] = [
     20260726000003,
     20260728000001,
     20260728000002,
+    20260728000003,
 ];
-const MIGRATION_FILES: [&str; 10] = [
+const MIGRATION_FILES: [&str; 11] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
@@ -37,8 +38,9 @@ const MIGRATION_FILES: [&str; 10] = [
     "20260726000003_finalize_welcome_provenance_triggers.sql",
     "20260728000001_chat_operation_claims.sql",
     "20260728000002_exact_operation_claim_mutation_kind.sql",
+    "20260728000003_defer_operation_claim_principal_fk.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 10] = [
+const MIGRATION_DESCRIPTIONS: [&str; 11] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
@@ -49,15 +51,16 @@ const MIGRATION_DESCRIPTIONS: [&str; 10] = [
     "finalize welcome provenance triggers",
     "chat operation claims",
     "exact operation claim mutation kind",
+    "defer operation claim principal fk",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 //
-// LIVE-DB REFRESH REQUIRED: 20260728000001/00002 require new reviewed
+// LIVE-DB REFRESH REQUIRED: 20260728000001/00002/00003 require new reviewed
 // column, constraint, index, function, and trigger fingerprints. The sequence
 // catalog is structurally unchanged. Preserve these last-reviewed values until
-// the dedicated catalog gate prints the normalized post-00002 catalogs.
+// the dedicated catalog gate prints the normalized post-00003 catalogs.
 const COLUMN_CATALOG_SHA256: &str =
     "dac54118c1335492a399ed735734e557135fe944ed69e9df1bdf9e1d498e2a22";
 const CONSTRAINT_CATALOG_SHA256: &str =
@@ -149,6 +152,39 @@ fn migration_dir() -> PathBuf {
 
 fn migration_path(version: i64, suffix: &str) -> PathBuf {
     migration_dir().join(format!("{version}_{suffix}.sql"))
+}
+
+#[test]
+fn clean_chat_migration_inventory_orders_claim_fk_deferral_last() {
+    assert_eq!(
+        MIGRATION_VERSIONS.len(),
+        MIGRATION_FILES.len(),
+        "every migration version needs one exact file"
+    );
+    assert_eq!(
+        MIGRATION_VERSIONS.len(),
+        MIGRATION_DESCRIPTIONS.len(),
+        "every migration version needs one SQLx description"
+    );
+    assert!(
+        MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
+        "migration versions must remain strictly increasing"
+    );
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260728000003));
+    assert_eq!(
+        MIGRATION_FILES.last(),
+        Some(&"20260728000003_defer_operation_claim_principal_fk.sql")
+    );
+    assert_eq!(
+        MIGRATION_DESCRIPTIONS.last(),
+        Some(&"defer operation claim principal fk")
+    );
+    for file in MIGRATION_FILES {
+        assert!(
+            migration_dir().join(file).is_file(),
+            "missing migration inventory file: {file}"
+        );
+    }
 }
 
 fn declared_chat_tables(sql: &str) -> BTreeSet<String> {
@@ -1088,7 +1124,7 @@ async fn reset_chat(pool: &PgPool) {
             .bind(MIGRATION_VERSIONS.as_slice())
             .execute(pool)
             .await
-            .expect("remove only the ten chat-protocol ledger rows");
+            .expect("remove only the eleven chat-protocol ledger rows");
     }
 }
 
@@ -1192,6 +1228,7 @@ async fn fresh_pool() -> PgPool {
             &[],
             &[],
             OPERATION_CLAIM_TABLES.as_slice(),
+            &[],
             &[],
         ][index];
         cumulative.extend(newly_owned_tables.iter().map(|name| (*name).to_owned()));
@@ -1485,7 +1522,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         "unexpected chat table set"
     );
     // Source-deterministic delta: 00001 adds exactly operation_claims.
-    // The normalized post-00002 catalog fingerprint remains a separate live gate.
+    // The normalized post-00003 catalog fingerprint remains a separate live gate.
     assert_eq!(actual_tables.len(), 48, "clean protocol must own 48 tables");
 
     let applied: Vec<(i64, String, bool)> = sqlx::query_as(
@@ -1517,6 +1554,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
                         || name == "20260726000001_welcome_supersession_provenance.sql"
                         || name == "20260728000001_chat_operation_claims.sql"
                         || name == "20260728000002_exact_operation_claim_mutation_kind.sql"
+                        || name == "20260728000003_defer_operation_claim_principal_fk.sql"
                 })
         })
         .map(|path| {
@@ -1532,7 +1570,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly ten ordered files"
+        "clean schema must be exactly eleven ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1584,6 +1622,11 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         (
             MIGRATION_VERSIONS[9],
             "exact_operation_claim_mutation_kind",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[10],
+            "defer_operation_claim_principal_fk",
             &[],
         ),
     ] {

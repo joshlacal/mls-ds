@@ -26,6 +26,139 @@ fn installed_operation_claim_migration_keeps_its_frozen_raw_bytes() {
 }
 
 #[test]
+fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
+    let migration =
+        include_bytes!("../migrations/20260728000003_defer_operation_claim_principal_fk.sql");
+    let sql = std::str::from_utf8(migration).expect("migration is UTF-8");
+
+    assert_eq!(
+        migration.len(),
+        6_570,
+        "the reviewed 00003 migration changed byte length"
+    );
+    assert_eq!(
+        hex::encode(Sha384::digest(migration)),
+        "67cd6f9033b97d206f478a2baeee31dbd337a4e6d5e3bb5158467afc95064b91a6a81b202e11eae86f8d909de040b467",
+        "the reviewed 00003 migration changed raw-byte SHA-384"
+    );
+    assert!(!sql.lines().any(|line| line.trim() == "BEGIN;"));
+    assert!(!sql.lines().any(|line| line.trim() == "COMMIT;"));
+
+    let lock = sql
+        .find("LOCK TABLE chat.operation_claims IN ACCESS EXCLUSIVE MODE")
+        .expect("claim writer lock");
+    let preflight = sql.find("DO $$").expect("preflight");
+    let drop_fk = sql
+        .find("DROP CONSTRAINT operation_claims_principal_fk")
+        .expect("drop exact principal FK");
+    let add_fk = sql
+        .find("ADD CONSTRAINT operation_claims_principal_fk")
+        .expect("add exact principal FK");
+    let postflight = sql.rfind("DO $$").expect("postflight");
+    assert!(lock < preflight && preflight < drop_fk && drop_fk < add_fk && add_fk < postflight);
+
+    assert_eq!(
+        sql.matches("DROP CONSTRAINT operation_claims_principal_fk")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sql.matches("ADD CONSTRAINT operation_claims_principal_fk")
+            .count(),
+        1
+    );
+    assert_eq!(sql.matches("ALTER TABLE chat.operation_claims").count(), 2);
+    for forbidden in [
+        "ALTER TABLE chat.principals",
+        "ALTER COLUMN",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "INSERT INTO",
+        "UPDATE chat.",
+        "DELETE FROM",
+    ] {
+        assert!(
+            !sql.contains(forbidden),
+            "00003 must alter only the exact claim principal FK: {forbidden}"
+        );
+    }
+
+    let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        "constraint.conrelid = 'chat.operation_claims'::regclass",
+        "constraint.connamespace = 'chat'::regnamespace",
+        "constraint.conname = 'operation_claims_principal_fk'",
+        "actual_type IS DISTINCT FROM 'f'",
+        "actual_validated IS DISTINCT FROM TRUE",
+        "actual_referenced_table IS DISTINCT FROM 'chat.principals'::regclass",
+        "actual_match_type IS DISTINCT FROM 's'",
+        "actual_update_action IS DISTINCT FROM 'a'",
+        "actual_delete_action IS DISTINCT FROM 'a'",
+        "actual_parent IS DISTINCT FROM 0",
+        "actual_source_columns IS DISTINCT FROM ARRAY['principal_did']::TEXT[]",
+        "actual_referenced_columns IS DISTINCT FROM ARRAY['user_did']::TEXT[]",
+        "FROM unnest(constraint.conkey) WITH ORDINALITY",
+        "FROM unnest(constraint.confkey) WITH ORDINALITY",
+        "FOREIGN KEY (principal_did) REFERENCES chat.principals(user_did) DEFERRABLE INITIALLY DEFERRED",
+    ] {
+        assert!(
+            compact.contains(required),
+            "missing exact deferral invariant: {required}"
+        );
+    }
+    assert_eq!(
+        compact
+            .matches("actual_deferrable IS DISTINCT FROM FALSE")
+            .count(),
+        1,
+        "preflight must require an immediate FK"
+    );
+    assert_eq!(
+        compact
+            .matches("actual_deferred IS DISTINCT FROM FALSE")
+            .count(),
+        1,
+        "preflight must require an initially-immediate FK"
+    );
+    assert_eq!(
+        compact
+            .matches("actual_deferrable IS DISTINCT FROM TRUE")
+            .count(),
+        1,
+        "postflight must require a deferrable FK"
+    );
+    assert_eq!(
+        compact
+            .matches("actual_deferred IS DISTINCT FROM TRUE")
+            .count(),
+        1,
+        "postflight must require an initially-deferred FK"
+    );
+}
+
+#[test]
+fn operation_claim_rollout_inventory_orders_deferral_before_activation() {
+    let readme = include_str!("../migrations/README.md");
+    let claims = readme
+        .find("20260728000001_chat_operation_claims.sql")
+        .expect("claim migration docs");
+    let exact_kind = readme
+        .find("20260728000002_exact_operation_claim_mutation_kind.sql")
+        .expect("exact-kind migration docs");
+    let deferred_principal = readme
+        .find("20260728000003_defer_operation_claim_principal_fk.sql")
+        .expect("principal-FK migration docs");
+    let activation = readme
+        .find("The final completeness cutover is not yet a migration")
+        .expect("activation remains staged");
+
+    assert!(
+        claims < exact_kind && exact_kind < deferred_principal && deferred_principal < activation
+    );
+    assert!(readme.contains("normalized live constraint-catalog fingerprint remains pending"));
+}
+
+#[test]
 fn exact_kind_migration_is_nul_safe_and_stages_legacy_receipts() {
     let sql = include_str!("../migrations/20260728000002_exact_operation_claim_mutation_kind.sql");
     assert!(sql.contains("sanitized := set_byte(sanitized,cursor + 4,49)"));
