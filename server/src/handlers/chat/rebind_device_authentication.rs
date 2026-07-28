@@ -21,7 +21,7 @@ use jacquard_common::DefaultStr;
 
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::repository::device_directory::read_device_view;
-use crate::chat_protocol::repository::prelude::{self, OperationOnlyArbitration};
+use crate::chat_protocol::repository::prelude::{self, PreparedRebindOperation};
 use crate::storage::DbPool;
 
 use super::context;
@@ -56,28 +56,19 @@ async fn rebind(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let reservation = match prelude::arbitrate_rebind_operation_only(&mut transaction, &admission)
+    let prepared = match prelude::prepare_rebind_operation(&mut transaction, admission)
         .await
         .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
     {
-        OperationOnlyArbitration::Replay(replay) => {
-            let response =
-                prelude::validate_rebind_operation_replay(&mut transaction, admission, replay)
-                    .await
-                    .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        PreparedRebindOperation::Replay(response) => {
             transaction
                 .commit()
                 .await
                 .map_err(|_| ChatFailure::storage(ENDPOINT))?;
             return Ok(context::replay_response(&response));
         }
-        OperationOnlyArbitration::First(reservation) => reservation,
+        PreparedRebindOperation::First(prepared) => prepared,
     };
-
-    let prepared =
-        prelude::prepare_rebind_bootstrap_prelude(&mut transaction, admission, reservation)
-            .await
-            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
     let (subject, device_id) = {
         let effect = prepared.effect_authority();
         let subject = effect.subject().to_owned();

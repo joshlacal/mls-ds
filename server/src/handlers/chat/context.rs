@@ -30,7 +30,7 @@ use crate::chat_protocol::{
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::auth::{
         self, AuthRepositoryError, CompletedIdempotentResponse, EnrollmentOperationAdmission,
-        RebindOperationAdmission, ReplenishmentOperationAdmission, SignedOperationAdmission,
+        RebindOperationAdmission, SignedOperationAdmission,
     },
     repository::prelude::PreludeError,
     transcript,
@@ -249,7 +249,7 @@ pub(crate) async fn admit_replenishment_operation_only(
     endpoint: ChatEndpoint,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<ReplenishmentOperationAdmission, ChatFailure> {
+) -> Result<SignedOperationAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
     let trust = verifier(runtime, endpoint)?;
     let dpop_headers = read_dpop_headers(headers, endpoint)?;

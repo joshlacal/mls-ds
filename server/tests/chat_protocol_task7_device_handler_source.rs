@@ -5,40 +5,32 @@
 
 #[test]
 fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts() {
-    for (source, admission, arbitration, replay_validator, prelude, effects, completion) in [
+    for (source, admission, preparation, effects, completion) in [
         (
             include_str!("../src/handlers/chat/enroll_device.rs"),
             "admit_enrollment_operation_only",
-            "arbitrate_enrollment_operation_only",
-            "validate_enrollment_operation_replay",
-            "prepare_enrollment_bootstrap_prelude",
+            "prepare_enrollment_operation",
             "persist_enrollment_bootstrap_effects",
             "complete_enrollment_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
             "admit_rebind_operation_only",
-            "arbitrate_rebind_operation_only",
-            "validate_rebind_operation_replay",
-            "prepare_rebind_bootstrap_prelude",
+            "prepare_rebind_operation",
             "persist_rebind_bootstrap_effects",
             "complete_rebind_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
             "admit_replenishment_operation_only",
-            "arbitrate_replenishment_operation_only",
-            "validate_replenishment_operation_replay",
-            "prepare_replenishment_prelude",
+            "prepare_replenishment_operation",
             "publish_replenishment_key_packages",
             "complete_replenishment_operation",
         ),
     ] {
         for required in [
             admission,
-            arbitration,
-            replay_validator,
-            prelude,
+            preparation,
             effects,
             completion,
             "into_completion_guard",
@@ -58,6 +50,19 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             assert!(
                 !source.contains(legacy),
                 "legacy receipt helper remains in active handler: {legacy}"
+            );
+        }
+        for repository_internal in [
+            "VerifiedChatDeviceRequest",
+            "OperationReplayGuard",
+            "OperationReservationGuard",
+            "validate_enrollment_operation_replay",
+            "validate_rebind_operation_replay",
+            "validate_replenishment_operation_replay",
+        ] {
+            assert!(
+                !source.contains(repository_internal),
+                "repository authority escaped into active handler: {repository_internal}"
             );
         }
     }
@@ -120,20 +125,19 @@ fn bootstrap_completion_and_effect_adapters_keep_verified_authority_internal() {
     for admission in [
         "impl EnrollmentOperationAdmission",
         "impl RebindOperationAdmission",
-        "impl ReplenishmentOperationAdmission",
     ] {
         let block = auth
             .split_once(admission)
             .expect("admission implementation exists")
             .1;
-        assert!(block.contains("pub(super) fn authority"));
-        assert!(block.contains("pub(super) fn into_authority"));
-        assert!(!block.contains("pub(crate) fn authority"));
+        assert!(block.contains("pub(super) fn into_first_authority"));
+        assert!(block.contains("pub(super) fn into_replay_authority"));
+        assert!(!block.contains("pub(crate) fn into_first_authority"));
     }
     for wrapper in [
-        "arbitrate_enrollment_operation_only",
-        "arbitrate_rebind_operation_only",
-        "arbitrate_replenishment_operation_only",
+        "prepare_enrollment_operation",
+        "prepare_rebind_operation",
+        "prepare_replenishment_operation",
     ] {
         assert!(
             prelude.contains(wrapper),

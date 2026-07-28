@@ -31,7 +31,7 @@ use super::{
         lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
         release_signed_operation_replay, LockedSignedOperationReplayAuthority,
         OperationCompletionGuard, OperationReservationGuard, PreludeError, PreparedSignedOperation,
-        SignedOperationReplayPostStateProof,
+        PreparedSignedOperationState, SignedOperationReplayPostStateProof,
     },
 };
 use super::{
@@ -1842,14 +1842,14 @@ pub(crate) async fn execute_prepared_reset(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
 ) -> Result<ResetTransactionOutcome, ResetFacadeError> {
-    match prepared {
-        PreparedSignedOperation::First {
+    match prepared.into_state() {
+        PreparedSignedOperationState::First {
             authority,
             reservation,
         } => execute_first_reset(transaction, authority, reservation)
             .await
             .map(ResetTransactionOutcome::First),
-        PreparedSignedOperation::Replay { authority, replay } => {
+        PreparedSignedOperationState::Replay { authority, replay } => {
             let locked =
                 lock_signed_operation_replay_authority(transaction, authority, replay).await?;
             let post_state = lock_reset_replay_post_state(transaction, &locked).await?;

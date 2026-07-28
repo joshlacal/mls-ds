@@ -52,7 +52,8 @@ use super::{
     prelude::{
         canonical_operation_lock_key, CanonicalDeviceIdentity, CanonicalLockScope,
         LockedSignedOperationReplayAuthority, OperationCompletionGuard, OperationReplayGuard,
-        PreludeError, PreparedBusinessPrelude, PreparedSignedOperation, RecoveryOperationEndpoint,
+        PreludeError, PreparedBusinessPrelude, PreparedSignedOperation,
+        PreparedSignedOperationState, RecoveryOperationEndpoint,
         RecoveryPreludeAggregatePlanBinding, RecoveryPreludeClientExpiryError,
         RecoveryPreludePersistenceMode, RecoveryPreludePlanBinding, RecoveryPreludePlanKind,
         RecoveryPreludePrewriteWitness, ScopeBoundBusinessAuthority,
@@ -2807,13 +2808,13 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<RecoveryTransactionOutcome, RecoveryRepositoryError> {
-    let (authority, reservation) = match prepared {
-        PreparedSignedOperation::Replay { authority, replay } => {
+    let (authority, reservation) = match prepared.into_state() {
+        PreparedSignedOperationState::Replay { authority, replay } => {
             return Ok(RecoveryTransactionOutcome::from_replay(
                 validate_recovery_operation_replay(transaction, authority, replay).await?,
             ));
         }
-        PreparedSignedOperation::First {
+        PreparedSignedOperationState::First {
             authority,
             reservation,
         } => (authority, reservation),

@@ -21,7 +21,7 @@ fn generic_signed_admission_and_preparation_are_response_byte_opaque() {
     let admission = function_block(
         auth,
         "pub(crate) struct SignedOperationAdmission",
-        "pub(crate) struct ReplenishmentOperationAdmission",
+        "impl EnrollmentOperationAdmission",
     );
     assert!(admission.contains("pre_replay: PreReplayCryptographicVerification"));
     assert!(admission.contains("canonical: CanonicalSignedMutation"));
@@ -42,22 +42,32 @@ fn generic_signed_admission_and_preparation_are_response_byte_opaque() {
     assert!(authorizer.contains("completed_request_material_matches_without_response"));
 
     let prelude = include_str!("../src/chat_protocol/repository/prelude.rs");
-    let prepared = function_block(
+    let prepared_boundary = function_block(
         prelude,
-        "pub(crate) enum PreparedSignedOperation",
-        "pub(crate) struct PreparedBusinessPrelude",
+        "pub(crate) struct PreparedSignedOperation",
+        "pub(in crate::chat_protocol::repository) enum PreparedSignedOperationState",
     );
-    assert!(prepared.contains("authority: VerifiedChatDeviceRequest"));
-    assert!(prepared.contains("authority: auth::SignedOperationReplayAuthority"));
-    assert!(prepared.contains("reservation: OperationReservationGuard"));
-    assert!(prepared.contains("replay: OperationReplayGuard"));
-    assert!(!prepared.contains("CompletedIdempotentResponse"));
-    assert!(!prepared.contains("response_bytes"));
+    assert!(prepared_boundary.contains("state: PreparedSignedOperationState"));
+    assert!(!prepared_boundary.contains("VerifiedChatDeviceRequest"));
+    assert!(!prepared_boundary.contains("SignedOperationReplayAuthority"));
+    assert!(!prepared_boundary.contains("OperationReplayGuard"));
+
+    let prepared_state = function_block(
+        prelude,
+        "pub(in crate::chat_protocol::repository) enum PreparedSignedOperationState",
+        "impl fmt::Debug for PreparedSignedOperation",
+    );
+    assert!(prepared_state.contains("authority: VerifiedChatDeviceRequest"));
+    assert!(prepared_state.contains("authority: auth::SignedOperationReplayAuthority"));
+    assert!(prepared_state.contains("reservation: OperationReservationGuard"));
+    assert!(prepared_state.contains("replay: OperationReplayGuard"));
+    assert!(!prepared_state.contains("CompletedIdempotentResponse"));
+    assert!(!prepared_state.contains("response_bytes"));
 
     let preparation = function_block(
         prelude,
         "pub(crate) async fn prepare_signed_operation",
-        "pub(crate) async fn prepare_enrollment_bootstrap_prelude",
+        "async fn prepare_enrollment_bootstrap_prelude",
     );
     assert!(!preparation.contains("load_validated_completed_business_replay"));
     assert!(!preparation.contains("CompletedIdempotentResponse"));
@@ -67,18 +77,19 @@ fn generic_signed_admission_and_preparation_are_response_byte_opaque() {
 #[test]
 fn completed_replay_uses_signature_authority_without_reapplying_first_execution_age() {
     let source = include_str!("../src/chat_protocol/repository/auth.rs");
-    let first = function_block(
+    let signed = function_block(
         source,
+        "impl SignedOperationAdmission",
+        "impl SignedOperationReplayAuthority",
+    );
+    let first = function_block(
+        signed,
         "pub(super) fn into_first_authority",
         "pub(super) fn into_replay_authority",
     );
     assert!(first.contains("mint_signed_repository_authority"));
 
-    let replay = function_block(
-        source,
-        "pub(super) fn into_replay_authority",
-        "impl SignedOperationReplayAuthority",
-    );
+    let replay = function_block(signed, "pub(super) fn into_replay_authority", "}");
     assert!(replay.contains("transcript::verify_signed_mutation"));
     assert!(!replay.contains("mint_signed_repository_authority"));
 }
@@ -119,7 +130,7 @@ fn replay_release_is_two_phase_repository_only_and_binds_endpoint_post_state() {
     let release = function_block(
         source,
         "pub(in crate::chat_protocol::repository) async fn release_signed_operation_replay",
-        "pub(crate) async fn validate_enrollment_operation_replay",
+        "async fn validate_enrollment_operation_replay",
     );
     for exact_fact in [
         "transaction_id()",

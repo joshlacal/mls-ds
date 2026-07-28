@@ -26,7 +26,8 @@ use super::{
     prelude::{
         complete_operation, lock_signed_operation_replay_authority, prepare_actor_prelude,
         LockedSignedOperationReplayAuthority, OperationCompletionGuard, PreludeError,
-        PreparedSignedOperation, ScopeBoundBusinessAuthority, WelcomeOperationEndpoint,
+        PreparedSignedOperation, PreparedSignedOperationState, ScopeBoundBusinessAuthority,
+        WelcomeOperationEndpoint,
     },
 };
 use crate::chat_protocol::{
@@ -543,12 +544,12 @@ pub(crate) async fn prepare_welcome_terminal(
     transaction: &mut Transaction<'_, Postgres>,
     operation: PreparedSignedOperation,
 ) -> Result<WelcomeTerminalTransactionOutcome, WelcomeTerminalFacadeError> {
-    match operation {
-        PreparedSignedOperation::First {
+    match operation.into_state() {
+        PreparedSignedOperationState::First {
             authority,
             reservation,
         } => prepare_first_welcome_terminal(transaction, authority, reservation).await,
-        PreparedSignedOperation::Replay { authority, replay } => {
+        PreparedSignedOperationState::Replay { authority, replay } => {
             let replay =
                 lock_signed_operation_replay_authority(transaction, authority, replay).await?;
             prepare_completed_welcome_replay(transaction, replay).await

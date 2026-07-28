@@ -22,7 +22,7 @@ use jacquard_common::DefaultStr;
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::device_directory::read_device_view;
 use crate::chat_protocol::repository::key_packages::NewKeyPackage;
-use crate::chat_protocol::repository::prelude::{self, OperationOnlyArbitration};
+use crate::chat_protocol::repository::prelude::{self, PreparedReplenishmentOperation};
 use crate::chat_protocol::wire::{self, KeyPackageValidationPolicy};
 use crate::storage::DbPool;
 
@@ -62,31 +62,19 @@ async fn replenish(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let reservation =
-        match prelude::arbitrate_replenishment_operation_only(&mut transaction, &admission)
-            .await
-            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
-        {
-            OperationOnlyArbitration::Replay(replay) => {
-                let response = prelude::validate_replenishment_operation_replay(
-                    &mut transaction,
-                    admission,
-                    replay,
-                )
-                .await
-                .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-                return Ok(context::replay_response(&response));
-            }
-            OperationOnlyArbitration::First(reservation) => reservation,
-        };
-
-    let prepared = prelude::prepare_replenishment_prelude(&mut transaction, admission, reservation)
+    let prepared = match prelude::prepare_replenishment_operation(&mut transaction, admission)
         .await
-        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
+    {
+        PreparedReplenishmentOperation::Replay(response) => {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            return Ok(context::replay_response(&response));
+        }
+        PreparedReplenishmentOperation::First(prepared) => prepared,
+    };
 
     let (subject, device_id) = {
         let effect = prepared.key_package_authority();

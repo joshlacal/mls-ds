@@ -208,26 +208,23 @@ const DEVICE_GET_ENDPOINTS: &[&str] = &[
 /// the retired receipt-only helpers cannot re-enter a production handler.
 #[test]
 fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts() {
-    for (source, admission, replay_validator, prelude, completion) in [
+    for (source, admission, preparation, completion) in [
         (
             include_str!("../src/handlers/chat/enroll_device.rs"),
             "admit_enrollment_operation_only",
-            "validate_enrollment_operation_replay",
-            "prepare_enrollment_bootstrap_prelude",
+            "prepare_enrollment_operation",
             "complete_enrollment_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
             "admit_rebind_operation_only",
-            "validate_rebind_operation_replay",
-            "prepare_rebind_bootstrap_prelude",
+            "prepare_rebind_operation",
             "complete_rebind_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
             "admit_replenishment_operation_only",
-            "validate_replenishment_operation_replay",
-            "prepare_replenishment_prelude",
+            "prepare_replenishment_operation",
             "complete_replenishment_operation",
         ),
     ] {
@@ -236,16 +233,8 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             "missing operation-only admission: {admission}"
         );
         assert!(
-            source.contains("arbitrate_operation_only"),
-            "missing opaque operation arbitration"
-        );
-        assert!(
-            source.contains(replay_validator),
-            "missing endpoint replay validation: {replay_validator}"
-        );
-        assert!(
-            source.contains(prelude),
-            "missing locked prelude: {prelude}"
+            source.contains(preparation),
+            "missing endpoint-aware operation preparation: {preparation}"
         );
         assert!(
             source.contains("into_completion_guard"),
@@ -267,6 +256,19 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             assert!(
                 !source.contains(legacy),
                 "legacy receipt helper remains in an active handler: {legacy}"
+            );
+        }
+        for repository_internal in [
+            "VerifiedChatDeviceRequest",
+            "OperationReplayGuard",
+            "OperationReservationGuard",
+            "validate_enrollment_operation_replay",
+            "validate_rebind_operation_replay",
+            "validate_replenishment_operation_replay",
+        ] {
+            assert!(
+                !source.contains(repository_internal),
+                "repository authority escaped into active handler: {repository_internal}"
             );
         }
     }

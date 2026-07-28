@@ -191,6 +191,30 @@ impl OperationClaimRow {
 }
 
 impl OperationClaimBinding {
+    fn from_parts(
+        operation_id: Uuid,
+        pre_replay: &super::super::dpop::PreReplayCryptographicVerification,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        let endpoint = pre_replay.endpoint().as_str();
+        if !endpoint_has_operation_claim(endpoint) || operation_id.get_version_num() != 4 {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        let accepted_request_bytes = mutation
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        Ok(Self {
+            operation_id,
+            principal_did: pre_replay.subject().as_str().to_owned(),
+            endpoint_nsid: endpoint.to_owned(),
+            mutation_kind: mutation.type_id().to_owned(),
+            request_digest: *mutation.request_digest(),
+            accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
+            signature: *mutation.signature(),
+            claimed_at: pre_replay.trusted_instant().datetime(),
+        })
+    }
+
     fn from_authority(authority: &VerifiedChatDeviceRequest) -> Result<Self, PreludeError> {
         let endpoint = authority.endpoint().as_str();
         if !endpoint_has_operation_claim(endpoint) {
@@ -246,6 +270,66 @@ impl OperationClaimBinding {
             signature: *mutation.signature(),
             claimed_at: admission.pre_replay().trusted_instant().datetime(),
         })
+    }
+
+    fn from_enrollment_admission(
+        admission: &auth::EnrollmentOperationAdmission,
+    ) -> Result<Self, PreludeError> {
+        Self::from_parts(
+            admission.operation_id(),
+            admission.pre_replay(),
+            admission.mutation(),
+        )
+    }
+
+    fn from_rebind_admission(
+        admission: &auth::RebindOperationAdmission,
+    ) -> Result<Self, PreludeError> {
+        let canonical = admission.canonical()?;
+        let accepted_request_bytes = canonical
+            .accepted_wrapper_bytes()
+            .ok_or(PreludeError::NonCanonicalOperation)?;
+        let endpoint = admission.pre_replay().endpoint().as_str();
+        let operation_id = admission.operation_id();
+        if !endpoint_has_operation_claim(endpoint) || operation_id.get_version_num() != 4 {
+            return Err(PreludeError::NonCanonicalOperation);
+        }
+        Ok(Self {
+            operation_id,
+            principal_did: admission.pre_replay().subject().as_str().to_owned(),
+            endpoint_nsid: endpoint.to_owned(),
+            mutation_kind: canonical.type_id().to_owned(),
+            request_digest: *canonical.request_digest(),
+            accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
+            signature: *canonical.signature(),
+            claimed_at: admission.pre_replay().trusted_instant().datetime(),
+        })
+    }
+
+    fn from_enrollment_replay_authority(
+        authority: &auth::EnrollmentOperationReplayAuthority,
+    ) -> Result<Self, PreludeError> {
+        Self::from_parts(
+            authority
+                .repository_receipt()
+                .operation_id()
+                .ok_or(PreludeError::NonCanonicalOperation)?,
+            authority.pre_replay(),
+            authority.mutation(),
+        )
+    }
+
+    fn from_rebind_replay_authority(
+        authority: &auth::RebindOperationReplayAuthority,
+    ) -> Result<Self, PreludeError> {
+        Self::from_parts(
+            authority
+                .repository_receipt()
+                .operation_id()
+                .ok_or(PreludeError::NonCanonicalOperation)?,
+            authority.pre_replay(),
+            authority.mutation(),
+        )
     }
 
     fn from_signed_replay_authority(
@@ -331,25 +415,48 @@ pub(crate) enum OperationArbitration {
     First(OperationReservationGuard),
 }
 
-/// Operation arbitration for active handlers. The replay branch is deliberately
-/// byte-opaque until endpoint authority has been locked in this transaction.
-pub(crate) enum OperationOnlyArbitration {
-    Replay(OperationReplayGuard),
-    First(OperationReservationGuard),
+pub(crate) enum PreparedEnrollmentOperation {
+    First(PreparedEnrollmentBootstrapPrelude),
+    Replay(CompletedIdempotentResponse),
 }
+
+pub(crate) enum PreparedRebindOperation {
+    First(PreparedRebindBootstrapPrelude),
+    Replay(CompletedIdempotentResponse),
+}
+
+pub(crate) enum PreparedReplenishmentOperation {
+    First(PreparedReplenishmentPrelude),
+    Replay(CompletedIdempotentResponse),
+}
+
+macro_rules! redacted_endpoint_operation_debug {
+    ($type:ty, $name:literal) => {
+        impl fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::First(_) => {
+                        formatter.write_str(concat!($name, "::First(<sealed-prelude>)"))
+                    }
+                    Self::Replay(_) => {
+                        formatter.write_str(concat!($name, "::Replay(<validated-response>)"))
+                    }
+                }
+            }
+        }
+    };
+}
+
+redacted_endpoint_operation_debug!(PreparedEnrollmentOperation, "PreparedEnrollmentOperation");
+redacted_endpoint_operation_debug!(PreparedRebindOperation, "PreparedRebindOperation");
+redacted_endpoint_operation_debug!(
+    PreparedReplenishmentOperation,
+    "PreparedReplenishmentOperation"
+);
 
 pub(crate) struct OperationReplayGuard {
     operation_lock: auth::CanonicalOperationReservationGuard,
     binding: OperationClaimBinding,
-}
-
-impl fmt::Debug for OperationOnlyArbitration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Replay(_) => formatter.write_str("OperationOnlyArbitration::Replay(<opaque>)"),
-            Self::First(_) => formatter.write_str("OperationOnlyArbitration::First(<sealed>)"),
-        }
-    }
 }
 
 pub(crate) struct ReplayCandidate {
@@ -391,7 +498,11 @@ struct OperationClaimGuard {
 /// Consuming result of global arbitration for an ordinary signed operation.
 /// The replay arm remains byte-opaque; only repository endpoint facades can
 /// lock it and later release exact completion material.
-pub(crate) enum PreparedSignedOperation {
+pub(crate) struct PreparedSignedOperation {
+    state: PreparedSignedOperationState,
+}
+
+pub(in crate::chat_protocol::repository) enum PreparedSignedOperationState {
     First {
         authority: VerifiedChatDeviceRequest,
         reservation: OperationReservationGuard,
@@ -404,9 +515,13 @@ pub(crate) enum PreparedSignedOperation {
 
 impl fmt::Debug for PreparedSignedOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::First { .. } => formatter.write_str("PreparedSignedOperation::First(<sealed>)"),
-            Self::Replay { .. } => formatter.write_str("PreparedSignedOperation::Replay(<opaque>)"),
+        match &self.state {
+            PreparedSignedOperationState::First { .. } => {
+                formatter.write_str("PreparedSignedOperation::First(<sealed>)")
+            }
+            PreparedSignedOperationState::Replay { .. } => {
+                formatter.write_str("PreparedSignedOperation::Replay(<opaque>)")
+            }
         }
     }
 }
@@ -416,10 +531,18 @@ impl PreparedSignedOperation {
     /// request bytes or authority: `submitTransition` may use it only to route
     /// the Recovery fulfillment arm to its stronger repository facade.
     pub(crate) fn mutation_kind(&self) -> Option<SignedMutationKind> {
-        match self {
-            Self::First { authority, .. } => authority.mutation().map(|value| value.kind()),
-            Self::Replay { authority, .. } => Some(authority.mutation().kind()),
+        match &self.state {
+            PreparedSignedOperationState::First { authority, .. } => {
+                authority.mutation().map(|value| value.kind())
+            }
+            PreparedSignedOperationState::Replay { authority, .. } => {
+                Some(authority.mutation().kind())
+            }
         }
+    }
+
+    pub(in crate::chat_protocol::repository) fn into_state(self) -> PreparedSignedOperationState {
+        self.state
     }
 }
 
@@ -1940,14 +2063,26 @@ pub(crate) async fn arbitrate_operation(
     }))
 }
 
-pub(crate) async fn arbitrate_operation_only(
+/// Arbitrate an enrollment's immutable claim before opening either
+/// first-execution age authority or completed-replay authority.
+pub(crate) async fn prepare_enrollment_operation(
     transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-) -> Result<OperationOnlyArbitration, PreludeError> {
-    let binding = OperationClaimBinding::from_authority(authority)?;
-    let operation_lock = auth::reserve_canonical_operation(transaction, authority).await?;
-    if operation_lock.operation_id() != binding.operation_id {
-        return Err(PreludeError::NonCanonicalOperation);
+    admission: auth::EnrollmentOperationAdmission,
+) -> Result<PreparedEnrollmentOperation, PreludeError> {
+    let mut binding = OperationClaimBinding::from_enrollment_admission(&admission)?;
+    let operation_lock = auth::reserve_canonical_operation_id(
+        transaction,
+        binding.operation_id,
+        Some(admission.operation_id()),
+    )
+    .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if operation_lock.transaction_id() != transaction_id
+        || operation_lock.operation_id() != binding.operation_id
+    {
+        return Err(PreludeError::ForeignTransaction);
     }
     let existing: Option<OperationClaimRow> = sqlx::query_as(
         r#"
@@ -1964,42 +2099,126 @@ pub(crate) async fn arbitrate_operation_only(
         if !existing.matches(&binding) {
             return Err(PreludeError::OperationIdConflict);
         }
-        return Ok(OperationOnlyArbitration::Replay(OperationReplayGuard {
+        binding.claimed_at = existing.claimed_at;
+        let authority = admission.into_replay_authority();
+        if !binding.matches_enrollment_replay_authority(&authority)? {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        let response = validate_enrollment_operation_replay(
+            transaction,
+            authority,
+            OperationReplayGuard {
+                operation_lock,
+                binding,
+            },
+        )
+        .await?;
+        return Ok(PreparedEnrollmentOperation::Replay(response));
+    }
+    let authority = admission.into_first_authority()?;
+    if !binding.matches_authority(&authority)? {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    let prepared = prepare_enrollment_bootstrap_prelude(
+        transaction,
+        authority,
+        OperationReservationGuard {
             operation_lock,
             binding,
-        }));
+        },
+    )
+    .await?;
+    Ok(PreparedEnrollmentOperation::First(prepared))
+}
+
+/// Arbitrate a rebind's immutable claim before opening either first-execution
+/// age authority or completed-replay authority.
+pub(crate) async fn prepare_rebind_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::RebindOperationAdmission,
+) -> Result<PreparedRebindOperation, PreludeError> {
+    let mut binding = OperationClaimBinding::from_rebind_admission(&admission)?;
+    let operation_lock = auth::reserve_canonical_operation_id(
+        transaction,
+        binding.operation_id,
+        Some(admission.operation_id()),
+    )
+    .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if operation_lock.transaction_id() != transaction_id
+        || operation_lock.operation_id() != binding.operation_id
+    {
+        return Err(PreludeError::ForeignTransaction);
     }
-    Ok(OperationOnlyArbitration::First(OperationReservationGuard {
-        operation_lock,
-        binding,
-    }))
+    let existing: Option<OperationClaimRow> = sqlx::query_as(
+        r#"
+        SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
+               request_digest,accepted_request_sha256,signature,claimed_at
+          FROM chat.operation_claims
+         WHERE operation_id=$1
+        "#,
+    )
+    .bind(binding.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if let Some(existing) = existing {
+        if !existing.matches(&binding) {
+            return Err(PreludeError::OperationIdConflict);
+        }
+        binding.claimed_at = existing.claimed_at;
+        let authority = admission.into_replay_authority()?;
+        if !binding.matches_rebind_replay_authority(&authority)? {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        let response = validate_rebind_operation_replay(
+            transaction,
+            authority,
+            OperationReplayGuard {
+                operation_lock,
+                binding,
+            },
+        )
+        .await?;
+        return Ok(PreparedRebindOperation::Replay(response));
+    }
+    let authority = admission.into_first_authority()?;
+    if !binding.matches_authority(&authority)? {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    let prepared = prepare_rebind_bootstrap_prelude(
+        transaction,
+        authority,
+        OperationReservationGuard {
+            operation_lock,
+            binding,
+        },
+    )
+    .await?;
+    Ok(PreparedRebindOperation::First(prepared))
 }
 
-/// Endpoint-specific admission wrapper for enrollment. The raw verified
-/// authority remains internal to repository composition.
-pub(crate) async fn arbitrate_enrollment_operation_only(
+pub(crate) async fn prepare_replenishment_operation(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: &auth::EnrollmentOperationAdmission,
-) -> Result<OperationOnlyArbitration, PreludeError> {
-    arbitrate_operation_only(transaction, admission.authority()).await
-}
-
-/// Endpoint-specific admission wrapper for rebind. The raw verified authority
-/// remains internal to repository composition.
-pub(crate) async fn arbitrate_rebind_operation_only(
-    transaction: &mut Transaction<'_, Postgres>,
-    admission: &auth::RebindOperationAdmission,
-) -> Result<OperationOnlyArbitration, PreludeError> {
-    arbitrate_operation_only(transaction, admission.authority()).await
-}
-
-/// Endpoint-specific admission wrapper for replenishment. The raw verified
-/// authority remains internal to repository composition.
-pub(crate) async fn arbitrate_replenishment_operation_only(
-    transaction: &mut Transaction<'_, Postgres>,
-    admission: &auth::ReplenishmentOperationAdmission,
-) -> Result<OperationOnlyArbitration, PreludeError> {
-    arbitrate_operation_only(transaction, admission.authority()).await
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedReplenishmentOperation, PreludeError> {
+    match prepare_signed_operation(transaction, admission)
+        .await?
+        .into_state()
+    {
+        PreparedSignedOperationState::Replay { authority, replay } => {
+            let response =
+                validate_replenishment_operation_replay(transaction, authority, replay).await?;
+            Ok(PreparedReplenishmentOperation::Replay(response))
+        }
+        PreparedSignedOperationState::First {
+            authority,
+            reservation,
+        } => Ok(PreparedReplenishmentOperation::First(
+            prepare_replenishment_prelude(transaction, authority, reservation).await?,
+        )),
+    }
 }
 
 pub(crate) async fn prepare_signed_operation(
@@ -2039,11 +2258,13 @@ pub(crate) async fn prepare_signed_operation(
         if !binding.matches_signed_replay_authority(&authority)? {
             return Err(PreludeError::ClaimIntegrity);
         }
-        return Ok(PreparedSignedOperation::Replay {
-            authority,
-            replay: OperationReplayGuard {
-                operation_lock,
-                binding,
+        return Ok(PreparedSignedOperation {
+            state: PreparedSignedOperationState::Replay {
+                authority,
+                replay: OperationReplayGuard {
+                    operation_lock,
+                    binding,
+                },
             },
         });
     }
@@ -2052,21 +2273,22 @@ pub(crate) async fn prepare_signed_operation(
     if !binding.matches_authority(&authority)? {
         return Err(PreludeError::ClaimIntegrity);
     }
-    Ok(PreparedSignedOperation::First {
-        authority,
-        reservation: OperationReservationGuard {
-            operation_lock,
-            binding,
+    Ok(PreparedSignedOperation {
+        state: PreparedSignedOperationState::First {
+            authority,
+            reservation: OperationReservationGuard {
+                operation_lock,
+                binding,
+            },
         },
     })
 }
 
-pub(crate) async fn prepare_enrollment_bootstrap_prelude(
+async fn prepare_enrollment_bootstrap_prelude(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::EnrollmentOperationAdmission,
+    authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
 ) -> Result<PreparedEnrollmentBootstrapPrelude, PreludeError> {
-    let authority = admission.into_authority();
     let scope =
         auth::lock_enrollment_absence_scope(transaction, &authority, &reservation.operation_lock)
             .await?;
@@ -2081,12 +2303,11 @@ pub(crate) async fn prepare_enrollment_bootstrap_prelude(
     })
 }
 
-pub(crate) async fn prepare_rebind_bootstrap_prelude(
+async fn prepare_rebind_bootstrap_prelude(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::RebindOperationAdmission,
+    authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
 ) -> Result<PreparedRebindBootstrapPrelude, PreludeError> {
-    let authority = admission.into_authority();
     let scope =
         auth::lock_rebind_old_state_scope(transaction, &authority, &reservation.operation_lock)
             .await?;
@@ -2101,12 +2322,11 @@ pub(crate) async fn prepare_rebind_bootstrap_prelude(
     })
 }
 
-pub(crate) async fn prepare_replenishment_prelude(
+async fn prepare_replenishment_prelude(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::ReplenishmentOperationAdmission,
+    authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
 ) -> Result<PreparedReplenishmentPrelude, PreludeError> {
-    let authority = admission.into_authority();
     let inner = prepare_actor_prelude(transaction, &authority, reservation).await?;
     Ok(PreparedReplenishmentPrelude { inner, authority })
 }
@@ -2213,23 +2433,37 @@ async fn ensure_effect_transaction(
     Ok(())
 }
 
-async fn validate_operation_only_replay(
+async fn validate_operation_replay_claim(
     transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-    replay: OperationReplayGuard,
-) -> Result<CompletedIdempotentResponse, PreludeError> {
+    replay: &OperationReplayGuard,
+) -> Result<(), PreludeError> {
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
     if replay.operation_lock.transaction_id() != transaction_id
         || replay.operation_lock.operation_id() != replay.binding.operation_id
-        || !replay.binding.matches_authority(authority)?
     {
         return Err(PreludeError::ForeignTransaction);
     }
-    auth::load_validated_completed_business_replay(transaction, authority)
-        .await?
-        .ok_or(PreludeError::ClaimIntegrity)
+    let live_claim: Option<OperationClaimRow> = sqlx::query_as(
+        r#"
+        SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
+               request_digest,accepted_request_sha256,signature,claimed_at
+          FROM chat.operation_claims
+         WHERE operation_id=$1
+         FOR UPDATE
+        "#,
+    )
+    .bind(replay.binding.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if !live_claim
+        .as_ref()
+        .is_some_and(|claim| claim.matches_exact(&replay.binding))
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    Ok(())
 }
 
 pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_authority(
@@ -2312,31 +2546,50 @@ pub(in crate::chat_protocol::repository) async fn release_signed_operation_repla
     Ok(completed)
 }
 
-pub(crate) async fn validate_enrollment_operation_replay(
+async fn validate_enrollment_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::EnrollmentOperationAdmission,
+    authority: auth::EnrollmentOperationReplayAuthority,
     replay: OperationReplayGuard,
 ) -> Result<CompletedIdempotentResponse, PreludeError> {
-    let authority = admission.into_authority();
-    validate_operation_only_replay(transaction, &authority, replay).await
+    validate_operation_replay_claim(transaction, &replay).await?;
+    if !replay
+        .binding
+        .matches_enrollment_replay_authority(&authority)?
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    auth::load_validated_completed_enrollment_replay(transaction, &authority)
+        .await?
+        .ok_or(PreludeError::ClaimIntegrity)
 }
 
-pub(crate) async fn validate_rebind_operation_replay(
+async fn validate_rebind_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::RebindOperationAdmission,
+    authority: auth::RebindOperationReplayAuthority,
     replay: OperationReplayGuard,
 ) -> Result<CompletedIdempotentResponse, PreludeError> {
-    let authority = admission.into_authority();
-    validate_operation_only_replay(transaction, &authority, replay).await
+    validate_operation_replay_claim(transaction, &replay).await?;
+    if !replay.binding.matches_rebind_replay_authority(&authority)? {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    auth::load_validated_completed_rebind_replay(transaction, &authority)
+        .await?
+        .ok_or(PreludeError::ClaimIntegrity)
 }
 
-pub(crate) async fn validate_replenishment_operation_replay(
+async fn validate_replenishment_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::ReplenishmentOperationAdmission,
+    authority: auth::SignedOperationReplayAuthority,
     replay: OperationReplayGuard,
 ) -> Result<CompletedIdempotentResponse, PreludeError> {
-    let authority = admission.into_authority();
-    validate_operation_only_replay(transaction, &authority, replay).await
+    validate_operation_replay_claim(transaction, &replay).await?;
+    if !replay.binding.matches_signed_replay_authority(&authority)? {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+    auth::load_validated_completed_replenishment_replay(transaction, &authority)
+        .await?
+        .ok_or(PreludeError::ClaimIntegrity)
 }
 
 pub(crate) async fn prepare_actor_prelude(
@@ -2422,6 +2675,34 @@ impl OperationClaimBinding {
         authority: &auth::SignedOperationReplayAuthority,
     ) -> Result<bool, PreludeError> {
         let current = Self::from_signed_replay_authority(authority)?;
+        Ok(self.operation_id == current.operation_id
+            && self.principal_did == current.principal_did
+            && self.endpoint_nsid == current.endpoint_nsid
+            && self.mutation_kind == current.mutation_kind
+            && self.request_digest == current.request_digest
+            && self.accepted_request_sha256 == current.accepted_request_sha256
+            && self.signature == current.signature)
+    }
+
+    fn matches_enrollment_replay_authority(
+        &self,
+        authority: &auth::EnrollmentOperationReplayAuthority,
+    ) -> Result<bool, PreludeError> {
+        let current = Self::from_enrollment_replay_authority(authority)?;
+        Ok(self.operation_id == current.operation_id
+            && self.principal_did == current.principal_did
+            && self.endpoint_nsid == current.endpoint_nsid
+            && self.mutation_kind == current.mutation_kind
+            && self.request_digest == current.request_digest
+            && self.accepted_request_sha256 == current.accepted_request_sha256
+            && self.signature == current.signature)
+    }
+
+    fn matches_rebind_replay_authority(
+        &self,
+        authority: &auth::RebindOperationReplayAuthority,
+    ) -> Result<bool, PreludeError> {
+        let current = Self::from_rebind_replay_authority(authority)?;
         Ok(self.operation_id == current.operation_id
             && self.principal_did == current.principal_did
             && self.endpoint_nsid == current.endpoint_nsid

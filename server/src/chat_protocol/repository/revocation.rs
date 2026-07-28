@@ -43,7 +43,8 @@ use super::{
         complete_operation, lock_signed_operation_replay_authority,
         release_signed_operation_replay, LockedSignedOperationReplayAuthority,
         OperationCompletionGuard, PreludeError, PreparedSignedOperation,
-        ScopeBoundBusinessAuthority, SignedOperationReplayPostStateProof,
+        PreparedSignedOperationState, ScopeBoundBusinessAuthority,
+        SignedOperationReplayPostStateProof,
     },
 };
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
@@ -425,12 +426,12 @@ pub(crate) async fn prepare_device_revocation(
     transaction: &mut Transaction<'_, Postgres>,
     operation: PreparedSignedOperation,
 ) -> Result<DeviceRevocationTransactionOutcome, DeviceRevocationFacadeError> {
-    match operation {
-        PreparedSignedOperation::First {
+    match operation.into_state() {
+        PreparedSignedOperationState::First {
             authority,
             reservation,
         } => prepare_first_device_revocation(transaction, authority, reservation).await,
-        PreparedSignedOperation::Replay { authority, replay } => {
+        PreparedSignedOperationState::Replay { authority, replay } => {
             let locked =
                 lock_signed_operation_replay_authority(transaction, authority, replay).await?;
             prepare_device_revocation_replay(transaction, locked).await

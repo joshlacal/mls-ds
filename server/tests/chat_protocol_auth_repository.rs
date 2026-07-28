@@ -122,13 +122,15 @@ use base64::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use repository::auth::{
-    authorize_enrollment_operation_only, authorize_rebind_operation_only, authorize_signed_request,
-    authorize_unsigned_request, test_arbitrate_business_idempotency,
-    test_recheck_business_authority, test_record_completed_idempotency, AuthRepositoryError,
-    AuthorizationOutcome, EnrollmentOperationAdmission, RebindOperationAdmission,
+    authorize_enrollment_operation_only, authorize_rebind_operation_only,
+    authorize_replenishment_operation_only, authorize_signed_request, authorize_unsigned_request,
+    test_arbitrate_business_idempotency, test_recheck_business_authority,
+    test_record_completed_idempotency, AuthRepositoryError, AuthorizationOutcome,
+    EnrollmentOperationAdmission, RebindOperationAdmission, SignedOperationAdmission,
     TestBusinessIdempotencyOutcome,
 };
-use repository::prelude::{self, OperationOnlyArbitration, PreludeError};
+use repository::key_packages::NewKeyPackage;
+use repository::prelude::{self, PreludeError};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use transcript::{
@@ -141,6 +143,21 @@ const REGISTERED_JKT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const REGISTERED_KEY_ID: &str = "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk";
 const RFC8032_SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
 const FIRST_T: &str = "2026-07-22T14:05:09.123Z";
+const ENROLLMENT_PACKAGE_REF: [u8; 32] = [7_u8; 32];
+const ENROLLMENT_PACKAGE_WRAPPER: [u8; 8] = [7_u8; 8];
+const REPLENISHMENT_PACKAGE_REF: [u8; 32] = [11_u8; 32];
+const REPLENISHMENT_PACKAGE_WRAPPER: [u8; 8] = [11_u8; 8];
+const TEST_PACKAGE_INIT_KEY: [u8; 32] = [19_u8; 32];
+
+fn test_package<'a>(key_package_ref: &'a [u8], wrapper_bytes: &'a [u8]) -> NewKeyPackage<'a> {
+    NewKeyPackage {
+        key_package_ref,
+        wrapper_bytes,
+        init_key: &TEST_PACKAGE_INIT_KEY,
+        not_before_unix: 1_700_000_000,
+        not_after_unix: 2_000_000_000,
+    }
+}
 
 fn registered_signing_key() -> SigningKey {
     let bytes: [u8; 32] = hex::decode(RFC8032_SEED).unwrap().try_into().unwrap();
@@ -216,6 +233,49 @@ fn signed_blob_deletion(operation_id: uuid::Uuid, blob_id: uuid::Uuid, signed_at
         "signedAt": signed_at,
     });
     sign_exact_body(body)
+}
+
+fn signed_replenishment(operation_id: uuid::Uuid, signed_at: &str) -> Vec<u8> {
+    let package_bytes = [11_u8; 8];
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#keyPackageReplenishmentBody",
+        "signatureDomain": "CATBIRD-CHAT-DEVICE-REPLENISH\u{0000}",
+        "actorDid": REGISTERED_DID,
+        "actorDeviceId": REGISTERED_DEVICE,
+        "authGeneration": 1,
+        "dpopJkt": REGISTERED_JKT,
+        "keyId": REGISTERED_KEY_ID,
+        "keyPackages": [{
+            "framing": "mlsMessage",
+            "contentType": "keyPackage",
+            "bytes": STANDARD.encode(package_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(package_bytes)),
+            "keyPackageRef": STANDARD.encode([11_u8; 32]),
+        }],
+        "signaturePublicKey": STANDARD.encode(registered_signing_key().verifying_key().as_bytes()),
+        "idempotencyKey": operation_id,
+        "signedAt": signed_at,
+    });
+    sign_exact_body(body)
+}
+
+async fn replenishment_admission(
+    pool: &sqlx::PgPool,
+    raw: &[u8],
+    trusted_at: &str,
+) -> SignedOperationAdmission {
+    authorize_replenishment_operation_only(
+        pool,
+        dpop::repository_test_evidence::ordinary_registered_device(
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            "blue.catbird.chat.replenishKeyPackages",
+            trusted_at,
+        ),
+        decode_canonical_signed_mutation(raw).unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 fn sign_exact_body(body: serde_json::Value) -> Vec<u8> {
@@ -642,24 +702,24 @@ async fn prepare_enrollment_first(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: EnrollmentOperationAdmission,
 ) -> Result<repository::prelude::PreparedEnrollmentBootstrapPrelude, PreludeError> {
-    let reservation =
-        match prelude::arbitrate_enrollment_operation_only(transaction, &admission).await? {
-            OperationOnlyArbitration::First(reservation) => reservation,
-            OperationOnlyArbitration::Replay(_) => panic!("fresh enrollment unexpectedly replayed"),
-        };
-    prelude::prepare_enrollment_bootstrap_prelude(transaction, admission, reservation).await
+    match prelude::prepare_enrollment_operation(transaction, admission).await? {
+        prelude::PreparedEnrollmentOperation::First(prepared) => Ok(prepared),
+        prelude::PreparedEnrollmentOperation::Replay(_) => {
+            panic!("fresh enrollment unexpectedly replayed")
+        }
+    }
 }
 
 async fn prepare_rebind_first(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: RebindOperationAdmission,
 ) -> Result<repository::prelude::PreparedRebindBootstrapPrelude, PreludeError> {
-    let reservation =
-        match prelude::arbitrate_rebind_operation_only(transaction, &admission).await? {
-            OperationOnlyArbitration::First(reservation) => reservation,
-            OperationOnlyArbitration::Replay(_) => panic!("fresh rebind unexpectedly replayed"),
-        };
-    prelude::prepare_rebind_bootstrap_prelude(transaction, admission, reservation).await
+    match prelude::prepare_rebind_operation(transaction, admission).await? {
+        prelude::PreparedRebindOperation::First(prepared) => Ok(prepared),
+        prelude::PreparedRebindOperation::Replay(_) => {
+            panic!("fresh rebind unexpectedly replayed")
+        }
+    }
 }
 
 async fn persist_and_complete_enrollment(
@@ -672,6 +732,16 @@ async fn persist_and_complete_enrollment(
     {
         let effect = prepared.effect_authority();
         prelude::persist_enrollment_bootstrap_effects(transaction, &effect).await?;
+        prelude::publish_enrollment_key_packages(
+            transaction,
+            &effect,
+            &[test_package(
+                &ENROLLMENT_PACKAGE_REF,
+                &ENROLLMENT_PACKAGE_WRAPPER,
+            )],
+        )
+        .await
+        .map_err(|_| PreludeError::ClaimIntegrity)?;
     }
     prelude::complete_enrollment_bootstrap_operation(
         transaction,
@@ -708,23 +778,24 @@ async fn validate_enrollment_replay(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: EnrollmentOperationAdmission,
 ) -> Result<repository::auth::CompletedIdempotentResponse, PreludeError> {
-    let replay = match prelude::arbitrate_enrollment_operation_only(transaction, &admission).await?
-    {
-        OperationOnlyArbitration::Replay(replay) => replay,
-        OperationOnlyArbitration::First(_) => panic!("completed enrollment unexpectedly executed"),
-    };
-    prelude::validate_enrollment_operation_replay(transaction, admission, replay).await
+    match prelude::prepare_enrollment_operation(transaction, admission).await? {
+        prelude::PreparedEnrollmentOperation::Replay(response) => Ok(response),
+        prelude::PreparedEnrollmentOperation::First(_) => {
+            panic!("completed enrollment unexpectedly executed")
+        }
+    }
 }
 
 async fn validate_rebind_replay(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: RebindOperationAdmission,
 ) -> Result<repository::auth::CompletedIdempotentResponse, PreludeError> {
-    let replay = match prelude::arbitrate_rebind_operation_only(transaction, &admission).await? {
-        OperationOnlyArbitration::Replay(replay) => replay,
-        OperationOnlyArbitration::First(_) => panic!("completed rebind unexpectedly executed"),
-    };
-    prelude::validate_rebind_operation_replay(transaction, admission, replay).await
+    match prelude::prepare_rebind_operation(transaction, admission).await? {
+        prelude::PreparedRebindOperation::Replay(response) => Ok(response),
+        prelude::PreparedRebindOperation::First(_) => {
+            panic!("completed rebind unexpectedly executed")
+        }
+    }
 }
 
 async fn seed_registered_device(pool: &sqlx::PgPool) {
@@ -1110,7 +1181,7 @@ async fn completed_ordinary_replay_rechecks_current_jkt_and_auth_generation() {
         ordinary_evidence(
             &fixture,
             "blue.catbird.chat.deleteBlob",
-            "2026-07-23T14:05:09.123Z",
+            "2026-07-24T14:05:09.123Z",
             &fixture.dpop_jkt,
         ),
         decode_canonical_signed_mutation(&raw).unwrap(),
@@ -1175,7 +1246,7 @@ async fn completed_ordinary_replay_rechecks_current_immutable_signing_key() {
         ordinary_evidence(
             &fixture,
             "blue.catbird.chat.deleteBlob",
-            "2026-07-23T14:05:09.123Z",
+            "2026-07-24T14:05:09.123Z",
             &fixture.dpop_jkt,
         ),
         decode_canonical_signed_mutation(&raw).unwrap(),
@@ -1357,26 +1428,19 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
             uuid::Uuid::new_v4(),
             random_proof_jti(),
             uuid::Uuid::new_v4(),
-            "2026-07-23T14:05:09.123Z",
+            "2026-07-24T14:05:09.123Z",
         ),
     )
     .await
     .unwrap();
     let mut replay_transaction = restarted.begin().await.unwrap();
-    let OperationOnlyArbitration::Replay(replay) =
-        prelude::arbitrate_enrollment_operation_only(&mut replay_transaction, &replay_admission)
+    let prelude::PreparedEnrollmentOperation::Replay(replay) =
+        prelude::prepare_enrollment_operation(&mut replay_transaction, replay_admission)
             .await
             .unwrap()
     else {
         panic!("completed enrollment was not durable across a fresh pool");
     };
-    let replay = prelude::validate_enrollment_operation_replay(
-        &mut replay_transaction,
-        replay_admission,
-        replay,
-    )
-    .await
-    .unwrap();
     replay_transaction.commit().await.unwrap();
     assert_eq!(replay.response_bytes(), response);
 
@@ -1394,12 +1458,10 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     .await
     .unwrap();
     let mut conflict_transaction = restarted.begin().await.unwrap();
-    let conflict = prelude::arbitrate_enrollment_operation_only(
-        &mut conflict_transaction,
-        &conflict_admission,
-    )
-    .await
-    .unwrap_err();
+    let conflict =
+        prelude::prepare_enrollment_operation(&mut conflict_transaction, conflict_admission)
+            .await
+            .unwrap_err();
     assert!(matches!(conflict, PreludeError::OperationIdConflict));
     conflict_transaction.rollback().await.unwrap();
 }
@@ -1460,7 +1522,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
 
     let mut conflict_transaction = pool.begin().await.unwrap();
     let conflict =
-        prelude::arbitrate_rebind_operation_only(&mut conflict_transaction, &conflicting_admission)
+        prelude::prepare_rebind_operation(&mut conflict_transaction, conflicting_admission)
             .await
             .unwrap_err();
     assert!(matches!(conflict, PreludeError::OperationIdConflict));
@@ -1498,26 +1560,19 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
             &raw,
             uuid::Uuid::new_v4(),
             random_proof_jti(),
-            "2026-07-23T14:05:09.123Z",
+            "2026-07-24T14:05:09.123Z",
         ),
     )
     .await
     .unwrap();
     let mut replay_transaction = restarted.begin().await.unwrap();
-    let OperationOnlyArbitration::Replay(replay) =
-        prelude::arbitrate_rebind_operation_only(&mut replay_transaction, &replay_admission)
+    let prelude::PreparedRebindOperation::Replay(replay) =
+        prelude::prepare_rebind_operation(&mut replay_transaction, replay_admission)
             .await
             .unwrap()
     else {
         panic!("completed rebind was not durable across a fresh pool");
     };
-    let replay = prelude::validate_rebind_operation_replay(
-        &mut replay_transaction,
-        replay_admission,
-        replay,
-    )
-    .await
-    .unwrap();
     replay_transaction.commit().await.unwrap();
     assert_eq!(replay.response_bytes(), response);
 
@@ -1548,6 +1603,307 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         conflict,
         AuthRepositoryError::RequestBindingMismatch
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated clean-chat PostgreSQL database"]
+async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no_claim() {
+    let pool = setup_auth_repository_db(3).await;
+    seed_registered_device(&pool).await;
+    let operation_id = uuid::Uuid::new_v4();
+    let raw = signed_replenishment(operation_id, FIRST_T);
+    let first = authorize_replenishment_operation_only(
+        &pool,
+        dpop::repository_test_evidence::ordinary_registered_device(
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            "blue.catbird.chat.replenishKeyPackages",
+            FIRST_T,
+        ),
+        decode_canonical_signed_mutation(&raw).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut first_tx = pool.begin().await.unwrap();
+    let prelude::PreparedReplenishmentOperation::First(prepared) =
+        prelude::prepare_replenishment_operation(&mut first_tx, first)
+            .await
+            .unwrap()
+    else {
+        panic!("fresh replenishment unexpectedly replayed");
+    };
+    {
+        let effect = prepared.key_package_authority();
+        prelude::publish_replenishment_key_packages(
+            &mut first_tx,
+            &effect,
+            &[test_package(
+                &REPLENISHMENT_PACKAGE_REF,
+                &REPLENISHMENT_PACKAGE_WRAPPER,
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    let response = br#"{"device":{"availablePackageCount":1}}"#;
+    prelude::complete_replenishment_operation(
+        &mut first_tx,
+        prepared.into_completion_guard(),
+        200,
+        response,
+        None,
+    )
+    .await
+    .unwrap();
+    first_tx.commit().await.unwrap();
+
+    let replay = authorize_replenishment_operation_only(
+        &pool,
+        dpop::repository_test_evidence::ordinary_registered_device(
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            "blue.catbird.chat.replenishKeyPackages",
+            "2026-07-24T14:05:09.123Z",
+        ),
+        decode_canonical_signed_mutation(&raw).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut replay_tx = pool.begin().await.unwrap();
+    let prelude::PreparedReplenishmentOperation::Replay(completed) =
+        prelude::prepare_replenishment_operation(&mut replay_tx, replay)
+            .await
+            .unwrap()
+    else {
+        panic!("next-day exact replenishment replay was treated as first");
+    };
+    assert_eq!(completed.response_bytes(), response);
+    replay_tx.rollback().await.unwrap();
+
+    let stale_operation_id = uuid::Uuid::new_v4();
+    let stale_raw = signed_replenishment(stale_operation_id, FIRST_T);
+    let stale = authorize_replenishment_operation_only(
+        &pool,
+        dpop::repository_test_evidence::ordinary_registered_device(
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            "blue.catbird.chat.replenishKeyPackages",
+            "2026-07-24T14:05:09.123Z",
+        ),
+        decode_canonical_signed_mutation(&stale_raw).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut stale_tx = pool.begin().await.unwrap();
+    let error = prelude::prepare_replenishment_operation(&mut stale_tx, stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
+    ));
+    stale_tx.rollback().await.unwrap();
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
+            .bind(stale_operation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(claim_count, 0, "stale first execution created a claim");
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated clean-chat PostgreSQL database"]
+async fn replenishment_replay_rejects_missing_ref_hash_and_owner_manifest_drift() {
+    let pool = setup_auth_repository_db(4).await;
+    seed_registered_device(&pool).await;
+    let foreign_owner = DeviceFixture::fresh();
+    seed_device(&pool, &foreign_owner).await;
+    let operation_id = uuid::Uuid::new_v4();
+    let raw = signed_replenishment(operation_id, FIRST_T);
+
+    let first = replenishment_admission(&pool, &raw, FIRST_T).await;
+    let mut first_tx = pool.begin().await.unwrap();
+    let prelude::PreparedReplenishmentOperation::First(prepared) =
+        prelude::prepare_replenishment_operation(&mut first_tx, first)
+            .await
+            .unwrap()
+    else {
+        panic!("fresh replenishment unexpectedly replayed");
+    };
+    {
+        let effect = prepared.key_package_authority();
+        prelude::publish_replenishment_key_packages(
+            &mut first_tx,
+            &effect,
+            &[test_package(
+                &REPLENISHMENT_PACKAGE_REF,
+                &REPLENISHMENT_PACKAGE_WRAPPER,
+            )],
+        )
+        .await
+        .unwrap();
+    }
+    prelude::complete_replenishment_operation(
+        &mut first_tx,
+        prepared.into_completion_guard(),
+        200,
+        br#"{"device":{"availablePackageCount":1}}"#,
+        None,
+    )
+    .await
+    .unwrap();
+    first_tx.commit().await.unwrap();
+
+    let assert_corrupt = |error: PreludeError| {
+        assert!(
+            matches!(
+                error,
+                PreludeError::Authorization(AuthRepositoryError::CorruptIdempotencyRecord)
+            ),
+            "manifest drift escaped exact replay validation: {error:?}"
+        );
+    };
+
+    let admission = replenishment_admission(&pool, &raw, "2026-07-24T14:05:09.123Z").await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM chat.key_packages WHERE key_package_ref=$1")
+        .bind(REPLENISHMENT_PACKAGE_REF.as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_corrupt(
+        prelude::prepare_replenishment_operation(&mut tx, admission)
+            .await
+            .unwrap_err(),
+    );
+    tx.rollback().await.unwrap();
+
+    let admission = replenishment_admission(&pool, &raw, "2026-07-24T14:05:10.123Z").await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE chat.key_packages SET key_package_ref=$2 WHERE key_package_ref=$1")
+        .bind(REPLENISHMENT_PACKAGE_REF.as_slice())
+        .bind([12_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert_corrupt(
+        prelude::prepare_replenishment_operation(&mut tx, admission)
+            .await
+            .unwrap_err(),
+    );
+    tx.rollback().await.unwrap();
+
+    let admission = replenishment_admission(&pool, &raw, "2026-07-24T14:05:11.123Z").await;
+    let mut tx = pool.begin().await.unwrap();
+    let drifted_wrapper = [12_u8; 8];
+    sqlx::query(
+        "UPDATE chat.key_packages SET wrapper_bytes=$2,wrapper_sha256=$3 \
+         WHERE key_package_ref=$1",
+    )
+    .bind(REPLENISHMENT_PACKAGE_REF.as_slice())
+    .bind(drifted_wrapper.as_slice())
+    .bind(Sha256::digest(drifted_wrapper).as_slice())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_corrupt(
+        prelude::prepare_replenishment_operation(&mut tx, admission)
+            .await
+            .unwrap_err(),
+    );
+    tx.rollback().await.unwrap();
+
+    let admission = replenishment_admission(&pool, &raw, "2026-07-24T14:05:12.123Z").await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.key_packages \
+            SET owner_device_id=$2,owner_key_id=$3,owner_auth_generation=1 \
+          WHERE key_package_ref=$1",
+    )
+    .bind(REPLENISHMENT_PACKAGE_REF.as_slice())
+    .bind(foreign_owner.device_id)
+    .bind(&foreign_owner.key_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_corrupt(
+        prelude::prepare_replenishment_operation(&mut tx, admission)
+            .await
+            .unwrap_err(),
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated clean-chat PostgreSQL database"]
+async fn stale_enrollment_and_rebind_first_execution_create_no_operation_claim() {
+    let pool = setup_auth_repository_db(3).await;
+    let late = "2026-07-24T14:05:09.123Z";
+
+    let enrollment_fixture = DeviceFixture::fresh();
+    let enrollment_id = uuid::Uuid::new_v4();
+    let enrollment_raw =
+        enrollment_body(&enrollment_fixture, enrollment_id, "Stale first", FIRST_T);
+    let enrollment = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &enrollment_raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            late,
+        ),
+    )
+    .await
+    .unwrap();
+    let mut enrollment_tx = pool.begin().await.unwrap();
+    let error = prelude::prepare_enrollment_operation(&mut enrollment_tx, enrollment)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
+    ));
+    enrollment_tx.rollback().await.unwrap();
+
+    let rebind_fixture = DeviceFixture::fresh();
+    seed_device(&pool, &rebind_fixture).await;
+    let rebind_id = uuid::Uuid::new_v4();
+    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+    let rebind_raw = rebind_body(
+        &rebind_fixture,
+        rebind_id,
+        &rebind_fixture.dpop_jkt,
+        &new_jkt,
+        1,
+        FIRST_T,
+    );
+    let rebind = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(&rebind_raw, uuid::Uuid::new_v4(), random_proof_jti(), late),
+    )
+    .await
+    .unwrap();
+    let mut rebind_tx = pool.begin().await.unwrap();
+    let error = prelude::prepare_rebind_operation(&mut rebind_tx, rebind)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
+    ));
+    rebind_tx.rollback().await.unwrap();
+
+    for operation_id in [enrollment_id, rebind_id] {
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
+                .bind(operation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(claim_count, 0, "stale first execution created a claim");
+    }
 }
 
 #[tokio::test]
@@ -1646,16 +2002,12 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
     let second_pool = pool.clone();
     let second_task = tokio::spawn(async move {
         let mut second_tx = second_pool.begin().await.unwrap();
-        let result = prelude::arbitrate_enrollment_operation_only(&mut second_tx, &second)
+        let result = prelude::prepare_enrollment_operation(&mut second_tx, second)
             .await
             .unwrap();
-        let OperationOnlyArbitration::Replay(replay) = result else {
+        let prelude::PreparedEnrollmentOperation::Replay(response) = result else {
             panic!("identical enrollment loser executed twice");
         };
-        let response =
-            prelude::validate_enrollment_operation_replay(&mut second_tx, second, replay)
-                .await
-                .unwrap();
         let bytes = response.response_bytes().to_vec();
         second_tx.rollback().await.unwrap();
         bytes
@@ -1667,6 +2019,16 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
         prelude::persist_enrollment_bootstrap_effects(&mut first_tx, &effect)
             .await
             .unwrap();
+        prelude::publish_enrollment_key_packages(
+            &mut first_tx,
+            &effect,
+            &[test_package(
+                &ENROLLMENT_PACKAGE_REF,
+                &ENROLLMENT_PACKAGE_WRAPPER,
+            )],
+        )
+        .await
+        .unwrap();
     }
     prelude::complete_enrollment_bootstrap_operation(
         &mut first_tx,
@@ -1792,15 +2154,12 @@ async fn identical_rebind_business_racers_converge_on_one_cas_and_response() {
     let second_pool = pool.clone();
     let second_task = tokio::spawn(async move {
         let mut second_tx = second_pool.begin().await.unwrap();
-        let result = prelude::arbitrate_rebind_operation_only(&mut second_tx, &second)
+        let result = prelude::prepare_rebind_operation(&mut second_tx, second)
             .await
             .unwrap();
-        let OperationOnlyArbitration::Replay(replay) = result else {
+        let prelude::PreparedRebindOperation::Replay(response) = result else {
             panic!("identical rebind loser executed twice");
         };
-        let response = prelude::validate_rebind_operation_replay(&mut second_tx, second, replay)
-            .await
-            .unwrap();
         let bytes = response.response_bytes().to_vec();
         second_tx.rollback().await.unwrap();
         bytes

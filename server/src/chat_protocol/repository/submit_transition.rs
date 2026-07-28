@@ -48,7 +48,7 @@ use super::{
         complete_operation, lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
         release_signed_operation_replay, CanonicalDeviceIdentity, CanonicalLockScope,
         LockedSignedOperationReplayAuthority, OperationReservationGuard, PreludeError,
-        PreparedSignedOperation, ScopeBoundBusinessAuthority,
+        PreparedSignedOperation, PreparedSignedOperationState, ScopeBoundBusinessAuthority,
     },
     relationship::{
         load_fallback_relationship_projection, seal_non_add_policy_no_pending_admission,
@@ -302,8 +302,8 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
-    match prepared {
-        PreparedSignedOperation::First {
+    match prepared.into_state() {
+        PreparedSignedOperationState::First {
             authority,
             reservation,
         } => {
@@ -315,7 +315,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
             )
             .await
         }
-        PreparedSignedOperation::Replay { authority, replay } => {
+        PreparedSignedOperationState::Replay { authority, replay } => {
             let locked =
                 lock_signed_operation_replay_authority(transaction, authority, replay).await?;
             let (proof, expected_response) =

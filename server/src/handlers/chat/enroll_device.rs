@@ -31,7 +31,7 @@ use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::repository::key_packages::NewKeyPackage;
-use crate::chat_protocol::repository::prelude::{self, OperationOnlyArbitration};
+use crate::chat_protocol::repository::prelude::{self, PreparedEnrollmentOperation};
 use crate::chat_protocol::wire::{self, KeyPackageValidationPolicy};
 use crate::sqlx_jacquard::chrono_to_datetime;
 use crate::storage::DbPool;
@@ -73,32 +73,19 @@ async fn enroll(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let reservation =
-        match prelude::arbitrate_enrollment_operation_only(&mut transaction, &admission)
-            .await
-            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
-        {
-            OperationOnlyArbitration::Replay(replay) => {
-                let response = prelude::validate_enrollment_operation_replay(
-                    &mut transaction,
-                    admission,
-                    replay,
-                )
+    let prepared = match prelude::prepare_enrollment_operation(&mut transaction, admission)
+        .await
+        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?
+    {
+        PreparedEnrollmentOperation::Replay(response) => {
+            transaction
+                .commit()
                 .await
-                .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-                return Ok(context::replay_response(&response));
-            }
-            OperationOnlyArbitration::First(reservation) => reservation,
-        };
-
-    let prepared =
-        prelude::prepare_enrollment_bootstrap_prelude(&mut transaction, admission, reservation)
-            .await
-            .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+            return Ok(context::replay_response(&response));
+        }
+        PreparedEnrollmentOperation::First(prepared) => prepared,
+    };
 
     // The MLS key packages travel in the signed enrollment body. Read and
     // validate them only through the borrowed absence-scope authority, then

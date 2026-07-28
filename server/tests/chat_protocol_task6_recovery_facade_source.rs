@@ -92,9 +92,9 @@ fn handler_safe_facade_consumes_first_or_replay_and_never_commits() {
         "async fn complete_applied_recovery(",
     );
     for required in [
-        "PreparedSignedOperation::Replay",
+        "PreparedSignedOperationState::Replay",
         "validate_recovery_operation_replay(",
-        "PreparedSignedOperation::First",
+        "PreparedSignedOperationState::First",
         "prepare_actor_prelude(",
         "discover_recovery_fulfillment_terminal_scope(",
         "prepare_identity_scope_prelude(",
