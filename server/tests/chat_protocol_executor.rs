@@ -10898,7 +10898,8 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
 }
 
 /// Seed the `revokeDevice` idempotency receipt the DEFERRED mapping trigger
-/// requires (production's request handler writes this via record_completed_idempotency).
+/// requires (production's request handler writes this through the sealed
+/// operation-completion path).
 async fn seed_revoke_receipt(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &RevocationSetup) {
     let response_bytes = b"revokeDevice-ok".to_vec();
     let response_sha256 = Sha256::digest(&response_bytes).to_vec();

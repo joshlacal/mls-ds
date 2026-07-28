@@ -223,13 +223,9 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
     ] {
         assert!(sql.contains(handler));
     }
-    for legacy_api in [
-        "arbitrate_business_idempotency",
-        "recheck_business_authority",
-        "record_completed_idempotency",
-    ] {
-        assert!(sql.contains(legacy_api));
-    }
+    // The cutover remains an operation-claim migration, independent of the
+    // retired handler-level completion helper names.
+    assert!(sql.contains("operation_claims"));
 
     assert!(sql.contains("ACCESS EXCLUSIVE MODE"));
     assert!(sql.contains("operation_claim_completeness_cutover"));

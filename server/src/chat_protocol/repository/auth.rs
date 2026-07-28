@@ -855,20 +855,22 @@ struct RequestMaterial {
     current_jkt: Option<String>,
 }
 
-pub(crate) enum BusinessIdempotencyOutcome {
-    FirstExecution(BusinessIdempotencyGuard),
+#[cfg(test)]
+pub(crate) enum TestBusinessIdempotencyOutcome {
+    FirstExecution(TestBusinessIdempotencyGuard),
     CompletedReplay(CompletedIdempotentResponse),
 }
 
-impl fmt::Debug for BusinessIdempotencyOutcome {
+#[cfg(test)]
+impl fmt::Debug for TestBusinessIdempotencyOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FirstExecution(guard) => formatter
-                .debug_tuple("BusinessIdempotencyOutcome::FirstExecution")
+                .debug_tuple("TestBusinessIdempotencyOutcome::FirstExecution")
                 .field(guard)
                 .finish(),
             Self::CompletedReplay(_) => {
-                formatter.write_str("BusinessIdempotencyOutcome::CompletedReplay(<redacted>)")
+                formatter.write_str("TestBusinessIdempotencyOutcome::CompletedReplay(<redacted>)")
             }
         }
     }
@@ -878,68 +880,14 @@ impl fmt::Debug for BusinessIdempotencyOutcome {
 /// Completion recording requires this guard, closing the skip-arbitration API
 /// path and detecting attempts to carry the guard into another transaction.
 #[derive(Debug)]
-pub(crate) struct BusinessIdempotencyGuard {
+#[cfg(test)]
+pub(crate) struct TestBusinessIdempotencyGuard {
     transaction_id: String,
     subject: String,
     endpoint: String,
     operation_id: Uuid,
     request_digest: [u8; 32],
     signature: [u8; 64],
-}
-
-pub(crate) enum EnrollmentBusinessOutcome {
-    FirstExecution(EnrollmentBusinessGuard),
-    CompletedReplay(CompletedIdempotentResponse),
-}
-
-impl fmt::Debug for EnrollmentBusinessOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FirstExecution(guard) => formatter
-                .debug_tuple("EnrollmentBusinessOutcome::FirstExecution")
-                .field(guard)
-                .finish(),
-            Self::CompletedReplay(_) => {
-                formatter.write_str("EnrollmentBusinessOutcome::CompletedReplay(<redacted>)")
-            }
-        }
-    }
-}
-
-/// Transaction-bound enrollment authority. This value is intentionally
-/// non-Clone and can only be minted after the caller owns both the operation
-/// claim and the canonical principal/device identity lock.
-#[derive(Debug)]
-pub(crate) struct EnrollmentBusinessGuard {
-    idempotency: BusinessIdempotencyGuard,
-    authority: BusinessAuthorityGuard,
-}
-
-pub(crate) enum RebindBusinessOutcome {
-    FirstExecution(RebindBusinessGuard),
-    CompletedReplay(CompletedIdempotentResponse),
-}
-
-impl fmt::Debug for RebindBusinessOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FirstExecution(guard) => formatter
-                .debug_tuple("RebindBusinessOutcome::FirstExecution")
-                .field(guard)
-                .finish(),
-            Self::CompletedReplay(_) => {
-                formatter.write_str("RebindBusinessOutcome::CompletedReplay(<redacted>)")
-            }
-        }
-    }
-}
-
-/// Transaction-bound rebind authority. This value is intentionally non-Clone
-/// and carries the exact old device/key rows locked by the caller.
-#[derive(Debug)]
-pub(crate) struct RebindBusinessGuard {
-    idempotency: BusinessIdempotencyGuard,
-    authority: BusinessAuthorityGuard,
 }
 
 #[derive(Debug)]
@@ -1334,7 +1282,8 @@ pub(crate) async fn authorize_replenishment_operation_only(
 /// Re-establishes the exact locked binding in the caller-owned business
 /// transaction. Handlers must call this before making any mutation authorized
 /// by `VerifiedChatDeviceRequest`.
-pub(crate) async fn recheck_business_authority(
+#[cfg(test)]
+pub(crate) async fn test_recheck_business_authority(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
 ) -> Result<BusinessAuthorityGuard, AuthRepositoryError> {
@@ -2447,13 +2396,14 @@ pub(crate) async fn recheck_existing_business_authority_for_test(
 }
 
 /// Serializes step two of idempotent execution inside the caller's business
-/// transaction. Call this before `recheck_business_authority` or any effects.
+/// transaction. Call this before `test_recheck_business_authority` or any effects.
 /// A concurrent identical winner is returned as a completed replay after its
 /// transaction commits; a different exact wrapper under the same key conflicts.
-pub(crate) async fn arbitrate_business_idempotency(
+#[cfg(test)]
+pub(crate) async fn test_arbitrate_business_idempotency(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
-) -> Result<BusinessIdempotencyOutcome, AuthRepositoryError> {
+) -> Result<TestBusinessIdempotencyOutcome, AuthRepositoryError> {
     let endpoint = authority.endpoint().as_str();
     if !endpoint_has_idempotency_record(endpoint) {
         return Err(AuthRepositoryError::InvalidCompletion);
@@ -2474,14 +2424,14 @@ pub(crate) async fn arbitrate_business_idempotency(
     match completed_replay(transaction, authority.pre_replay(), &material).await? {
         Some(response) => {
             validate_completed_business_authority(transaction, authority).await?;
-            Ok(BusinessIdempotencyOutcome::CompletedReplay(response))
+            Ok(TestBusinessIdempotencyOutcome::CompletedReplay(response))
         }
         None => {
             let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
                 .fetch_one(&mut **transaction)
                 .await?;
-            Ok(BusinessIdempotencyOutcome::FirstExecution(
-                BusinessIdempotencyGuard {
+            Ok(TestBusinessIdempotencyOutcome::FirstExecution(
+                TestBusinessIdempotencyGuard {
                     transaction_id,
                     subject: authority.subject().as_str().to_owned(),
                     endpoint: endpoint.to_owned(),
@@ -2709,10 +2659,11 @@ async fn completed_self_revocation_signing_public_key(
 
 /// Persists the immutable exact-response replay record inside the same
 /// caller-owned transaction as the business mutation and event append.
-pub(crate) async fn record_completed_idempotency(
+#[cfg(test)]
+pub(crate) async fn test_record_completed_idempotency(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
-    guard: &BusinessIdempotencyGuard,
+    guard: &TestBusinessIdempotencyGuard,
     completed_status: i32,
     response_bytes: &[u8],
     event_position: Option<i64>,
@@ -2781,35 +2732,6 @@ pub(crate) async fn record_completed_idempotency(
         Err(error) if is_unique_violation(&error) => Err(AuthRepositoryError::IdempotencyConflict),
         Err(error) => Err(AuthRepositoryError::Database(error)),
     }
-}
-
-pub(crate) async fn prepare_enrollment_business(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-) -> Result<EnrollmentBusinessOutcome, AuthRepositoryError> {
-    if authority.endpoint().as_str() != "blue.catbird.chat.enrollDevice"
-        || authority.repository_receipt().class() != RepositoryAuthorityClass::EnrollmentBootstrap
-    {
-        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
-    }
-    let idempotency = match arbitrate_business_idempotency(transaction, authority).await? {
-        BusinessIdempotencyOutcome::CompletedReplay(response) => {
-            return Ok(EnrollmentBusinessOutcome::CompletedReplay(response));
-        }
-        BusinessIdempotencyOutcome::FirstExecution(guard) => guard,
-    };
-    let authority_guard = recheck_business_authority(transaction, authority).await?;
-    if authority_guard.class() != RepositoryAuthorityClass::EnrollmentBootstrap
-        || authority_guard.transaction_id() != idempotency.transaction_id
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    Ok(EnrollmentBusinessOutcome::FirstExecution(
-        EnrollmentBusinessGuard {
-            idempotency,
-            authority: authority_guard,
-        },
-    ))
 }
 
 /// Apply only the enrollment device-registration effects under the dedicated
@@ -2912,142 +2834,6 @@ pub(super) async fn persist_enrollment_bootstrap_effects(
     Ok(())
 }
 
-pub(crate) async fn persist_enrollment_and_completion(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-    guard: EnrollmentBusinessGuard,
-    completed_status: i32,
-    response_bytes: &[u8],
-    event_position: Option<i64>,
-) -> Result<(), AuthRepositoryError> {
-    let EnrollmentBusinessGuard {
-        idempotency,
-        authority: authority_guard,
-    } = guard;
-    validate_business_guard_transaction(transaction, authority, &authority_guard).await?;
-    if authority_guard.class != RepositoryAuthorityClass::EnrollmentBootstrap
-        || authority_guard.stored_dpop_jkt.is_some()
-        || authority_guard.stored_auth_generation.is_some()
-        || authority_guard.stored_key_id.is_some()
-        || authority_guard.stored_signing_public_key.is_some()
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let mutation = authority
-        .mutation()
-        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let VerifiedMutationProjection::DeviceEnrollment(projection) = mutation.projection() else {
-        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
-    };
-    if mutation.auth_generation() != 0 {
-        return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
-    }
-    let body = projection.body();
-    let device_name = match body.get("deviceName") {
-        Some(CanonicalValueRef::Text(value)) => value,
-        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
-    };
-    let dpop_jkt = match body.get("dpopJkt") {
-        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
-        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
-    };
-    let signing_public_key = match body.get("signaturePublicKey") {
-        Some(CanonicalValueRef::Bytes(value)) => value,
-        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
-    };
-    if dpop_jkt != authority.dpop_jkt().as_str()
-        || mutation.key_id().as_str()
-            != authority
-                .pre_replay()
-                .enrollment()
-                .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?
-                .key_id()
-                .as_str()
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let trusted_at = authority_guard.trusted_instant;
-    sqlx::query(
-        "INSERT INTO chat.principals(user_did, created_at) VALUES ($1,$2) ON CONFLICT (user_did) DO NOTHING",
-    )
-    .bind(&authority_guard.subject)
-    .bind(trusted_at)
-    .execute(&mut **transaction)
-    .await?;
-    let inserted_device = sqlx::query(
-        r#"
-        INSERT INTO chat.devices (
-            user_did, device_id, device_name, status, dpop_jkt,
-            auth_generation, capabilities, created_at, updated_at
-        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),$5,$5)
-        "#,
-    )
-    .bind(&authority_guard.subject)
-    .bind(authority_guard.device_id)
-    .bind(device_name)
-    .bind(dpop_jkt)
-    .bind(trusted_at)
-    .execute(&mut **transaction)
-    .await?;
-    if inserted_device.rows_affected() != 1 {
-        return Err(AuthRepositoryError::DeviceAlreadyRegistered);
-    }
-    let inserted_key = sqlx::query(
-        r#"
-        INSERT INTO chat.device_keys (
-            user_did, device_id, key_id, signing_public_key,
-            enrollment_auth_generation, created_at
-        ) VALUES ($1,$2,$3,$4,1,$5)
-        "#,
-    )
-    .bind(&authority_guard.subject)
-    .bind(authority_guard.device_id)
-    .bind(mutation.key_id().as_str())
-    .bind(signing_public_key)
-    .bind(trusted_at)
-    .execute(&mut **transaction)
-    .await?;
-    if inserted_key.rows_affected() != 1 {
-        return Err(AuthRepositoryError::DeviceKeyMissing);
-    }
-    record_completed_idempotency(
-        transaction,
-        authority,
-        &idempotency,
-        completed_status,
-        response_bytes,
-        event_position,
-    )
-    .await
-}
-
-pub(crate) async fn prepare_rebind_business(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-) -> Result<RebindBusinessOutcome, AuthRepositoryError> {
-    if authority.endpoint().as_str() != "blue.catbird.chat.rebindDeviceAuthentication"
-        || authority.repository_receipt().class() != RepositoryAuthorityClass::RebindBootstrap
-    {
-        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
-    }
-    let idempotency = match arbitrate_business_idempotency(transaction, authority).await? {
-        BusinessIdempotencyOutcome::CompletedReplay(response) => {
-            return Ok(RebindBusinessOutcome::CompletedReplay(response));
-        }
-        BusinessIdempotencyOutcome::FirstExecution(guard) => guard,
-    };
-    let authority_guard = recheck_business_authority(transaction, authority).await?;
-    if authority_guard.class() != RepositoryAuthorityClass::RebindBootstrap
-        || authority_guard.transaction_id() != idempotency.transaction_id
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    Ok(RebindBusinessOutcome::FirstExecution(RebindBusinessGuard {
-        idempotency,
-        authority: authority_guard,
-    }))
-}
-
 /// Apply only the rebind CAS under the dedicated old-state bootstrap scope.
 /// Completion is intentionally separate and can only occur after the handler
 /// has serialized the locked post-state response.
@@ -3123,103 +2909,6 @@ pub(super) async fn persist_rebind_bootstrap_effects(
     .await?;
     if updated.rows_affected() != 1 {
         return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
-    }
-    Ok(())
-}
-
-pub(crate) async fn persist_rebind_and_completion(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-    guard: RebindBusinessGuard,
-    completed_status: i32,
-    response_bytes: &[u8],
-    event_position: Option<i64>,
-) -> Result<(), AuthRepositoryError> {
-    let RebindBusinessGuard {
-        idempotency,
-        authority: authority_guard,
-    } = guard;
-    validate_business_guard_transaction(transaction, authority, &authority_guard).await?;
-    if authority_guard.class != RepositoryAuthorityClass::RebindBootstrap {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let mutation = authority
-        .mutation()
-        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
-    let VerifiedMutationProjection::DeviceAuthenticationRebind(projection) = mutation.projection()
-    else {
-        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
-    };
-    let expected_generation = i64::try_from(mutation.auth_generation())
-        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
-    let new_generation = expected_generation
-        .checked_add(1)
-        .ok_or(AuthRepositoryError::AuthenticationGenerationMismatch)?;
-    let body = projection.body();
-    let current_jkt = match body.get("currentDpopJkt") {
-        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
-        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
-    };
-    let new_jkt = match body.get("newDpopJkt") {
-        Some(CanonicalValueRef::Thumbprint(value)) => value.as_str(),
-        _ => return Err(AuthRepositoryError::RequestBindingMismatch),
-    };
-    if authority_guard.stored_dpop_jkt.as_deref() != Some(current_jkt)
-        || authority_guard.stored_auth_generation != Some(expected_generation)
-        || authority_guard.stored_key_id.as_deref() != Some(mutation.key_id().as_str())
-        || authority_guard.stored_signing_public_key.is_none()
-        || authority.dpop_jkt().as_str() != new_jkt
-        || current_jkt == new_jkt
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
-    }
-    let updated = sqlx::query(
-        r#"
-        UPDATE chat.devices
-           SET dpop_jkt = $4, auth_generation = $5, updated_at = $6
-         WHERE user_did = $1
-           AND device_id = $2
-           AND status = 'active'
-           AND dpop_jkt = $3
-           AND auth_generation = $7
-        "#,
-    )
-    .bind(&authority_guard.subject)
-    .bind(authority_guard.device_id)
-    .bind(current_jkt)
-    .bind(new_jkt)
-    .bind(new_generation)
-    .bind(authority_guard.trusted_instant)
-    .bind(expected_generation)
-    .execute(&mut **transaction)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(AuthRepositoryError::AuthenticationGenerationMismatch);
-    }
-    record_completed_idempotency(
-        transaction,
-        authority,
-        &idempotency,
-        completed_status,
-        response_bytes,
-        event_position,
-    )
-    .await
-}
-
-async fn validate_business_guard_transaction(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: &VerifiedChatDeviceRequest,
-    guard: &BusinessAuthorityGuard,
-) -> Result<(), AuthRepositoryError> {
-    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-        .fetch_one(&mut **transaction)
-        .await?;
-    if transaction_id != guard.transaction_id
-        || guard.subject != authority.subject().as_str()
-        || guard.device_id != canonical_uuid(authority.device_id())
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
     }
     Ok(())
 }

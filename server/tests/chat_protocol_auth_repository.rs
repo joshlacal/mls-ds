@@ -122,13 +122,13 @@ use base64::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use repository::auth::{
-    arbitrate_business_idempotency, authorize_enrollment_request, authorize_rebind_request,
-    authorize_signed_request, authorize_unsigned_request, persist_enrollment_and_completion,
-    persist_rebind_and_completion, prepare_enrollment_business, prepare_rebind_business,
-    recheck_business_authority, record_completed_idempotency, AuthRepositoryError,
-    AuthorizationOutcome, BusinessIdempotencyOutcome, EnrollmentBusinessOutcome,
-    RebindBusinessOutcome,
+    authorize_enrollment_operation_only, authorize_rebind_operation_only, authorize_signed_request,
+    authorize_unsigned_request, test_arbitrate_business_idempotency,
+    test_recheck_business_authority, test_record_completed_idempotency, AuthRepositoryError,
+    AuthorizationOutcome, EnrollmentOperationAdmission, RebindOperationAdmission,
+    TestBusinessIdempotencyOutcome,
 };
+use repository::prelude::{self, OperationOnlyArbitration, PreludeError};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use transcript::{
@@ -341,17 +341,17 @@ async fn complete_blob_deletion(
         AuthorizationOutcome::CompletedReplay(_) => panic!("fresh operation replayed"),
     };
     let mut transaction = pool.begin().await.unwrap();
-    let BusinessIdempotencyOutcome::FirstExecution(idempotency_guard) =
-        arbitrate_business_idempotency(&mut transaction, &authority)
+    let TestBusinessIdempotencyOutcome::FirstExecution(idempotency_guard) =
+        test_arbitrate_business_idempotency(&mut transaction, &authority)
             .await
             .unwrap()
     else {
         panic!("fresh operation completed before execution");
     };
-    let _authority_guard = recheck_business_authority(&mut transaction, &authority)
+    let _authority_guard = test_recheck_business_authority(&mut transaction, &authority)
         .await
         .unwrap();
-    record_completed_idempotency(
+    test_record_completed_idempotency(
         &mut transaction,
         &authority,
         &idempotency_guard,
@@ -638,6 +638,95 @@ fn first_authority(outcome: AuthorizationOutcome) -> dpop::VerifiedChatDeviceReq
     }
 }
 
+async fn prepare_enrollment_first(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: EnrollmentOperationAdmission,
+) -> Result<repository::prelude::PreparedEnrollmentBootstrapPrelude, PreludeError> {
+    let reservation =
+        match prelude::arbitrate_enrollment_operation_only(transaction, &admission).await? {
+            OperationOnlyArbitration::First(reservation) => reservation,
+            OperationOnlyArbitration::Replay(_) => panic!("fresh enrollment unexpectedly replayed"),
+        };
+    prelude::prepare_enrollment_bootstrap_prelude(transaction, admission, reservation).await
+}
+
+async fn prepare_rebind_first(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: RebindOperationAdmission,
+) -> Result<repository::prelude::PreparedRebindBootstrapPrelude, PreludeError> {
+    let reservation =
+        match prelude::arbitrate_rebind_operation_only(transaction, &admission).await? {
+            OperationOnlyArbitration::First(reservation) => reservation,
+            OperationOnlyArbitration::Replay(_) => panic!("fresh rebind unexpectedly replayed"),
+        };
+    prelude::prepare_rebind_bootstrap_prelude(transaction, admission, reservation).await
+}
+
+async fn persist_and_complete_enrollment(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: EnrollmentOperationAdmission,
+    status: i32,
+    response: &[u8],
+) -> Result<(), PreludeError> {
+    let prepared = prepare_enrollment_first(transaction, admission).await?;
+    {
+        let effect = prepared.effect_authority();
+        prelude::persist_enrollment_bootstrap_effects(transaction, &effect).await?;
+    }
+    prelude::complete_enrollment_bootstrap_operation(
+        transaction,
+        prepared.into_completion_guard(),
+        status,
+        response,
+        None,
+    )
+    .await
+}
+
+async fn persist_and_complete_rebind(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: RebindOperationAdmission,
+    status: i32,
+    response: &[u8],
+) -> Result<(), PreludeError> {
+    let prepared = prepare_rebind_first(transaction, admission).await?;
+    {
+        let effect = prepared.effect_authority();
+        prelude::persist_rebind_bootstrap_effects(transaction, &effect).await?;
+    }
+    prelude::complete_rebind_bootstrap_operation(
+        transaction,
+        prepared.into_completion_guard(),
+        status,
+        response,
+        None,
+    )
+    .await
+}
+
+async fn validate_enrollment_replay(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: EnrollmentOperationAdmission,
+) -> Result<repository::auth::CompletedIdempotentResponse, PreludeError> {
+    let replay = match prelude::arbitrate_enrollment_operation_only(transaction, &admission).await?
+    {
+        OperationOnlyArbitration::Replay(replay) => replay,
+        OperationOnlyArbitration::First(_) => panic!("completed enrollment unexpectedly executed"),
+    };
+    prelude::validate_enrollment_operation_replay(transaction, admission, replay).await
+}
+
+async fn validate_rebind_replay(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    admission: RebindOperationAdmission,
+) -> Result<repository::auth::CompletedIdempotentResponse, PreludeError> {
+    let replay = match prelude::arbitrate_rebind_operation_only(transaction, &admission).await? {
+        OperationOnlyArbitration::Replay(replay) => replay,
+        OperationOnlyArbitration::First(_) => panic!("completed rebind unexpectedly executed"),
+    };
+    prelude::validate_rebind_operation_replay(transaction, admission, replay).await
+}
+
 async fn seed_registered_device(pool: &sqlx::PgPool) {
     let public_key = registered_signing_key().verifying_key().to_bytes();
     sqlx::query(
@@ -772,13 +861,13 @@ async fn replay_audit_commits_independently_of_business_rollback() {
     };
 
     let mut business = pool.begin().await.unwrap();
-    let idempotency = arbitrate_business_idempotency(&mut business, &authority)
+    let idempotency = test_arbitrate_business_idempotency(&mut business, &authority)
         .await
         .unwrap();
-    let BusinessIdempotencyOutcome::FirstExecution(idempotency_guard) = idempotency else {
+    let TestBusinessIdempotencyOutcome::FirstExecution(idempotency_guard) = idempotency else {
         panic!("fresh operation completed before its business transaction");
     };
-    let device_guard = recheck_business_authority(&mut business, &authority)
+    let device_guard = test_recheck_business_authority(&mut business, &authority)
         .await
         .unwrap();
     let current_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
@@ -786,7 +875,7 @@ async fn replay_audit_commits_independently_of_business_rollback() {
         .await
         .unwrap();
     assert_eq!(device_guard.transaction_id(), current_transaction_id);
-    record_completed_idempotency(
+    test_record_completed_idempotency(
         &mut business,
         &authority,
         &idempotency_guard,
@@ -859,8 +948,8 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     };
 
     let mut first_tx = pool.begin().await.unwrap();
-    let BusinessIdempotencyOutcome::FirstExecution(first_guard) =
-        arbitrate_business_idempotency(&mut first_tx, &first)
+    let TestBusinessIdempotencyOutcome::FirstExecution(first_guard) =
+        test_arbitrate_business_idempotency(&mut first_tx, &first)
             .await
             .unwrap()
     else {
@@ -870,14 +959,14 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     let second_pool = pool.clone();
     let second_task = tokio::spawn(async move {
         let mut second_tx = second_pool.begin().await.unwrap();
-        let result = arbitrate_business_idempotency(&mut second_tx, &second)
+        let result = test_arbitrate_business_idempotency(&mut second_tx, &second)
             .await
             .unwrap();
         let bytes = match result {
-            BusinessIdempotencyOutcome::CompletedReplay(response) => {
+            TestBusinessIdempotencyOutcome::CompletedReplay(response) => {
                 response.response_bytes().to_vec()
             }
-            BusinessIdempotencyOutcome::FirstExecution(_) => {
+            TestBusinessIdempotencyOutcome::FirstExecution(_) => {
                 panic!("identical losing racer executed twice")
             }
         };
@@ -886,11 +975,11 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
     });
     tokio::task::yield_now().await;
 
-    let _device_guard = recheck_business_authority(&mut first_tx, &first)
+    let _device_guard = test_recheck_business_authority(&mut first_tx, &first)
         .await
         .unwrap();
     let response = br#"{"winner":1}"#;
-    record_completed_idempotency(&mut first_tx, &first, &first_guard, 201, response, None)
+    test_record_completed_idempotency(&mut first_tx, &first, &first_guard, 201, response, None)
         .await
         .unwrap();
     first_tx.commit().await.unwrap();
@@ -1207,7 +1296,7 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Fresh enrollment", FIRST_T);
-    let authority = match authorize_enrollment_request(
+    let admission = authorize_enrollment_operation_only(
         &pool,
         enrollment_evidence(
             &raw,
@@ -1218,22 +1307,11 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
         ),
     )
     .await
-    .unwrap()
-    {
-        AuthorizationOutcome::FirstExecution(authority) => authority,
-        AuthorizationOutcome::CompletedReplay(_) => panic!("fresh enrollment replayed"),
-    };
+    .unwrap();
 
     let mut transaction = pool.begin().await.unwrap();
-    let EnrollmentBusinessOutcome::FirstExecution(guard) =
-        prepare_enrollment_business(&mut transaction, &authority)
-            .await
-            .unwrap()
-    else {
-        panic!("fresh enrollment completed before persistence");
-    };
     let response = br#"{"authGeneration":1}"#;
-    persist_enrollment_and_completion(&mut transaction, &authority, guard, 201, response, None)
+    persist_and_complete_enrollment(&mut transaction, admission, 201, response)
         .await
         .unwrap();
     transaction.commit().await.unwrap();
@@ -1272,7 +1350,7 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     pool.close().await;
 
     let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
-    let replay = authorize_enrollment_request(
+    let replay_admission = authorize_enrollment_operation_only(
         &restarted,
         enrollment_evidence(
             &raw,
@@ -1284,13 +1362,26 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     )
     .await
     .unwrap();
-    let AuthorizationOutcome::CompletedReplay(replay) = replay else {
+    let mut replay_transaction = restarted.begin().await.unwrap();
+    let OperationOnlyArbitration::Replay(replay) =
+        prelude::arbitrate_enrollment_operation_only(&mut replay_transaction, &replay_admission)
+            .await
+            .unwrap()
+    else {
         panic!("completed enrollment was not durable across a fresh pool");
     };
+    let replay = prelude::validate_enrollment_operation_replay(
+        &mut replay_transaction,
+        replay_admission,
+        replay,
+    )
+    .await
+    .unwrap();
+    replay_transaction.commit().await.unwrap();
     assert_eq!(replay.response_bytes(), response);
 
     let changed = enrollment_body(&fixture, operation_id, "Changed enrollment", FIRST_T);
-    let conflict = authorize_enrollment_request(
+    let conflict_admission = authorize_enrollment_operation_only(
         &restarted,
         enrollment_evidence(
             &changed,
@@ -1301,8 +1392,16 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
         ),
     )
     .await
+    .unwrap();
+    let mut conflict_transaction = restarted.begin().await.unwrap();
+    let conflict = prelude::arbitrate_enrollment_operation_only(
+        &mut conflict_transaction,
+        &conflict_admission,
+    )
+    .await
     .unwrap_err();
-    assert!(matches!(conflict, AuthRepositoryError::IdempotencyConflict));
+    assert!(matches!(conflict, PreludeError::OperationIdConflict));
+    conflict_transaction.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -1321,27 +1420,16 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         1,
         FIRST_T,
     );
-    let authority = match authorize_rebind_request(
+    let admission = authorize_rebind_operation_only(
         &pool,
         rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
     )
     .await
-    .unwrap()
-    {
-        AuthorizationOutcome::FirstExecution(authority) => authority,
-        AuthorizationOutcome::CompletedReplay(_) => panic!("fresh rebind replayed"),
-    };
+    .unwrap();
 
     let mut transaction = pool.begin().await.unwrap();
-    let RebindBusinessOutcome::FirstExecution(guard) =
-        prepare_rebind_business(&mut transaction, &authority)
-            .await
-            .unwrap()
-    else {
-        panic!("fresh rebind completed before persistence");
-    };
     let response = br#"{"authGeneration":2}"#;
-    persist_rebind_and_completion(&mut transaction, &authority, guard, 200, response, None)
+    persist_and_complete_rebind(&mut transaction, admission, 200, response)
         .await
         .unwrap();
     transaction.commit().await.unwrap();
@@ -1372,7 +1460,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
     pool.close().await;
 
     let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
-    let replay = authorize_rebind_request(
+    let replay_admission = authorize_rebind_operation_only(
         &restarted,
         rebind_evidence(
             &raw,
@@ -1383,9 +1471,22 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
     )
     .await
     .unwrap();
-    let AuthorizationOutcome::CompletedReplay(replay) = replay else {
+    let mut replay_transaction = restarted.begin().await.unwrap();
+    let OperationOnlyArbitration::Replay(replay) =
+        prelude::arbitrate_rebind_operation_only(&mut replay_transaction, &replay_admission)
+            .await
+            .unwrap()
+    else {
         panic!("completed rebind was not durable across a fresh pool");
     };
+    let replay = prelude::validate_rebind_operation_replay(
+        &mut replay_transaction,
+        replay_admission,
+        replay,
+    )
+    .await
+    .unwrap();
+    replay_transaction.commit().await.unwrap();
     assert_eq!(replay.response_bytes(), response);
 
     let changed_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
@@ -1397,7 +1498,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         1,
         FIRST_T,
     );
-    let conflict = authorize_rebind_request(
+    let conflict = match authorize_rebind_operation_only(
         &restarted,
         rebind_evidence(
             &changed,
@@ -1407,8 +1508,14 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
         ),
     )
     .await
-    .unwrap_err();
-    assert!(matches!(conflict, AuthRepositoryError::IdempotencyConflict));
+    {
+        Ok(_) => panic!("changed completed rebind unexpectedly admitted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        conflict,
+        AuthRepositoryError::AuthenticationGenerationMismatch
+    ));
 }
 
 #[tokio::test]
@@ -1421,32 +1528,16 @@ async fn enrollment_adapter_rolls_back_business_state_without_unburning_replay()
     let token_jti = uuid::Uuid::new_v4();
     let proof_jti = random_proof_jti();
     let auth_txn = uuid::Uuid::new_v4();
-    let authority = first_authority(
-        authorize_enrollment_request(
-            &pool,
-            enrollment_evidence(&raw, token_jti, proof_jti, auth_txn, FIRST_T),
-        )
-        .await
-        .unwrap(),
-    );
-    let mut transaction = pool.begin().await.unwrap();
-    let EnrollmentBusinessOutcome::FirstExecution(guard) =
-        prepare_enrollment_business(&mut transaction, &authority)
-            .await
-            .unwrap()
-    else {
-        panic!("fresh enrollment completed before persistence");
-    };
-    persist_enrollment_and_completion(
-        &mut transaction,
-        &authority,
-        guard,
-        201,
-        br#"{"rolledBack":true}"#,
-        None,
+    let admission = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(&raw, token_jti, proof_jti, auth_txn, FIRST_T),
     )
     .await
     .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    persist_and_complete_enrollment(&mut transaction, admission, 201, br#"{"rolledBack":true}"#)
+        .await
+        .unwrap();
     transaction.rollback().await.unwrap();
 
     let device_count: i64 = sqlx::query_scalar(
@@ -1491,61 +1582,69 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Racing enrollment", FIRST_T);
-    let first = first_authority(
-        authorize_enrollment_request(
-            &pool,
-            enrollment_evidence(
-                &raw,
-                uuid::Uuid::new_v4(),
-                random_proof_jti(),
-                uuid::Uuid::new_v4(),
-                FIRST_T,
-            ),
-        )
-        .await
-        .unwrap(),
-    );
-    let second = first_authority(
-        authorize_enrollment_request(
-            &pool,
-            enrollment_evidence(
-                &raw,
-                uuid::Uuid::new_v4(),
-                random_proof_jti(),
-                uuid::Uuid::new_v4(),
-                FIRST_T,
-            ),
-        )
-        .await
-        .unwrap(),
-    );
+    let first = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            FIRST_T,
+        ),
+    )
+    .await
+    .unwrap();
+    let second = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            FIRST_T,
+        ),
+    )
+    .await
+    .unwrap();
 
     let mut first_tx = pool.begin().await.unwrap();
-    let EnrollmentBusinessOutcome::FirstExecution(first_guard) =
-        prepare_enrollment_business(&mut first_tx, &first)
-            .await
-            .unwrap()
-    else {
-        panic!("first enrollment racer did not claim the operation");
-    };
+    let prepared = prepare_enrollment_first(&mut first_tx, first)
+        .await
+        .unwrap();
     let second_pool = pool.clone();
     let second_task = tokio::spawn(async move {
         let mut second_tx = second_pool.begin().await.unwrap();
-        let result = prepare_enrollment_business(&mut second_tx, &second)
+        let result = prelude::arbitrate_enrollment_operation_only(&mut second_tx, &second)
             .await
             .unwrap();
-        let EnrollmentBusinessOutcome::CompletedReplay(response) = result else {
+        let OperationOnlyArbitration::Replay(replay) = result else {
             panic!("identical enrollment loser executed twice");
         };
+        let response =
+            prelude::validate_enrollment_operation_replay(&mut second_tx, second, replay)
+                .await
+                .unwrap();
         let bytes = response.response_bytes().to_vec();
         second_tx.rollback().await.unwrap();
         bytes
     });
     tokio::task::yield_now().await;
     let response = br#"{"winner":"enrollment"}"#;
-    persist_enrollment_and_completion(&mut first_tx, &first, first_guard, 201, response, None)
-        .await
-        .unwrap();
+    {
+        let effect = prepared.effect_authority();
+        prelude::persist_enrollment_bootstrap_effects(&mut first_tx, &effect)
+            .await
+            .unwrap();
+    }
+    prelude::complete_enrollment_bootstrap_operation(
+        &mut first_tx,
+        prepared.into_completion_guard(),
+        201,
+        response,
+        None,
+    )
+    .await
+    .unwrap();
     first_tx.commit().await.unwrap();
     assert_eq!(second_task.await.unwrap(), response);
 
@@ -1582,29 +1681,16 @@ async fn rebind_adapter_rolls_back_cas_without_unburning_replay() {
     );
     let token_jti = uuid::Uuid::new_v4();
     let proof_jti = random_proof_jti();
-    let authority = first_authority(
-        authorize_rebind_request(&pool, rebind_evidence(&raw, token_jti, proof_jti, FIRST_T))
-            .await
-            .unwrap(),
-    );
-    let mut transaction = pool.begin().await.unwrap();
-    let RebindBusinessOutcome::FirstExecution(guard) =
-        prepare_rebind_business(&mut transaction, &authority)
-            .await
-            .unwrap()
-    else {
-        panic!("fresh rebind completed before persistence");
-    };
-    persist_rebind_and_completion(
-        &mut transaction,
-        &authority,
-        guard,
-        200,
-        br#"{"rolledBack":true}"#,
-        None,
+    let admission = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(&raw, token_jti, proof_jti, FIRST_T),
     )
     .await
     .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    persist_and_complete_rebind(&mut transaction, admission, 200, br#"{"rolledBack":true}"#)
+        .await
+        .unwrap();
     transaction.rollback().await.unwrap();
 
     let device: (String, i64) = sqlx::query_as(
@@ -1656,49 +1742,54 @@ async fn identical_rebind_business_racers_converge_on_one_cas_and_response() {
         1,
         FIRST_T,
     );
-    let first = first_authority(
-        authorize_rebind_request(
-            &pool,
-            rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-        )
-        .await
-        .unwrap(),
-    );
-    let second = first_authority(
-        authorize_rebind_request(
-            &pool,
-            rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-        )
-        .await
-        .unwrap(),
-    );
+    let first = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
+    )
+    .await
+    .unwrap();
+    let second = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
+    )
+    .await
+    .unwrap();
 
     let mut first_tx = pool.begin().await.unwrap();
-    let RebindBusinessOutcome::FirstExecution(first_guard) =
-        prepare_rebind_business(&mut first_tx, &first)
-            .await
-            .unwrap()
-    else {
-        panic!("first rebind racer did not claim the operation");
-    };
+    let prepared = prepare_rebind_first(&mut first_tx, first).await.unwrap();
     let second_pool = pool.clone();
     let second_task = tokio::spawn(async move {
         let mut second_tx = second_pool.begin().await.unwrap();
-        let result = prepare_rebind_business(&mut second_tx, &second)
+        let result = prelude::arbitrate_rebind_operation_only(&mut second_tx, &second)
             .await
             .unwrap();
-        let RebindBusinessOutcome::CompletedReplay(response) = result else {
+        let OperationOnlyArbitration::Replay(replay) = result else {
             panic!("identical rebind loser executed twice");
         };
+        let response = prelude::validate_rebind_operation_replay(&mut second_tx, second, replay)
+            .await
+            .unwrap();
         let bytes = response.response_bytes().to_vec();
         second_tx.rollback().await.unwrap();
         bytes
     });
     tokio::task::yield_now().await;
     let response = br#"{"winner":"rebind"}"#;
-    persist_rebind_and_completion(&mut first_tx, &first, first_guard, 200, response, None)
-        .await
-        .unwrap();
+    {
+        let effect = prepared.effect_authority();
+        prelude::persist_rebind_bootstrap_effects(&mut first_tx, &effect)
+            .await
+            .unwrap();
+    }
+    prelude::complete_rebind_bootstrap_operation(
+        &mut first_tx,
+        prepared.into_completion_guard(),
+        200,
+        response,
+        None,
+    )
+    .await
+    .unwrap();
     first_tx.commit().await.unwrap();
     assert_eq!(second_task.await.unwrap(), response);
 
@@ -1725,7 +1816,7 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
     let enrollment_token = uuid::Uuid::new_v4();
     let enrollment_proof = random_proof_jti();
     let enrollment_auth_txn = uuid::Uuid::new_v4();
-    let error = authorize_enrollment_request(
+    let admission = authorize_enrollment_operation_only(
         &pool,
         enrollment_evidence(
             &enrollment_raw,
@@ -1736,11 +1827,17 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
         ),
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    let mut enrollment_transaction = pool.begin().await.unwrap();
+    let error = match prepare_enrollment_first(&mut enrollment_transaction, admission).await {
+        Ok(_) => panic!("registered enrollment unexpectedly acquired absence scope"),
+        Err(error) => error,
+    };
     assert!(matches!(
         error,
-        AuthRepositoryError::DeviceAlreadyRegistered
+        PreludeError::Authorization(AuthRepositoryError::DeviceAlreadyRegistered)
     ));
+    enrollment_transaction.rollback().await.unwrap();
     let enrollment_replays: i64 = sqlx::query_scalar(
         r#"
         SELECT count(*) FROM chat.dpop_replays
@@ -1770,12 +1867,15 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
     );
     let stale_token = uuid::Uuid::new_v4();
     let stale_proof = random_proof_jti();
-    let error = authorize_rebind_request(
+    let error = match authorize_rebind_operation_only(
         &pool,
         rebind_evidence(&stale_raw, stale_token, stale_proof, FIRST_T),
     )
     .await
-    .unwrap_err();
+    {
+        Ok(_) => panic!("stale rebind unexpectedly admitted"),
+        Err(error) => error,
+    };
     assert!(matches!(
         error,
         AuthRepositoryError::AuthenticationGenerationMismatch
@@ -1816,12 +1916,15 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
     let attacker_raw = sign_exact_body_with_key(attacker_body, &attacker_key);
     let attacker_token = uuid::Uuid::new_v4();
     let attacker_proof = random_proof_jti();
-    let error = authorize_rebind_request(
+    let error = match authorize_rebind_operation_only(
         &pool,
         rebind_evidence(&attacker_raw, attacker_token, attacker_proof, FIRST_T),
     )
     .await
-    .unwrap_err();
+    {
+        Ok(_) => panic!("forged rebind unexpectedly admitted"),
+        Err(error) => error,
+    };
     assert!(matches!(error, AuthRepositoryError::RequestBindingMismatch));
     let attacker_replays: i64 = sqlx::query_scalar(
         r#"
@@ -1855,42 +1958,36 @@ async fn enrollment_business_guard_cannot_cross_postgres_transactions() {
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Transaction bound", FIRST_T);
-    let authority = first_authority(
-        authorize_enrollment_request(
-            &pool,
-            enrollment_evidence(
-                &raw,
-                uuid::Uuid::new_v4(),
-                random_proof_jti(),
-                uuid::Uuid::new_v4(),
-                FIRST_T,
-            ),
-        )
-        .await
-        .unwrap(),
-    );
+    let admission = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            FIRST_T,
+        ),
+    )
+    .await
+    .unwrap();
     let mut first_transaction = pool.begin().await.unwrap();
-    let EnrollmentBusinessOutcome::FirstExecution(guard) =
-        prepare_enrollment_business(&mut first_transaction, &authority)
-            .await
-            .unwrap()
-    else {
-        panic!("fresh enrollment completed before persistence");
-    };
+    let prepared = prepare_enrollment_first(&mut first_transaction, admission)
+        .await
+        .unwrap();
+    let completion = prepared.into_completion_guard();
     first_transaction.rollback().await.unwrap();
 
     let mut different_transaction = pool.begin().await.unwrap();
-    let error = persist_enrollment_and_completion(
+    let error = prelude::complete_enrollment_bootstrap_operation(
         &mut different_transaction,
-        &authority,
-        guard,
+        completion,
         201,
         br#"{"invalid":true}"#,
         None,
     )
     .await
     .unwrap_err();
-    assert!(matches!(error, AuthRepositoryError::RequestBindingMismatch));
+    assert!(matches!(error, PreludeError::ForeignTransaction));
     different_transaction.rollback().await.unwrap();
 }
 
@@ -1912,7 +2009,7 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
         br#"{"orphan":true}"#,
     )
     .await;
-    let error = authorize_enrollment_request(
+    let admission = authorize_enrollment_operation_only(
         &pool,
         enrollment_evidence(
             &orphan_raw,
@@ -1923,11 +2020,19 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
         ),
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    let error = validate_enrollment_replay(&mut transaction, admission)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(error, AuthRepositoryError::DeviceNotRegistered),
+        matches!(
+            error,
+            PreludeError::Authorization(AuthRepositoryError::DeviceNotRegistered)
+        ),
         "orphan enrollment completion was replayed: {error:?}"
     );
+    transaction.rollback().await.unwrap();
 
     let expected = DeviceFixture::fresh();
     let wrong_key_fresh = DeviceFixture::fresh();
@@ -1955,7 +2060,7 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
         br#"{"wrongKey":true}"#,
     )
     .await;
-    let error = authorize_enrollment_request(
+    let admission = authorize_enrollment_operation_only(
         &pool,
         enrollment_evidence(
             &wrong_key_raw,
@@ -1966,11 +2071,19 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
         ),
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    let error = validate_enrollment_replay(&mut transaction, admission)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(error, AuthRepositoryError::RequestBindingMismatch),
+        matches!(
+            error,
+            PreludeError::Authorization(AuthRepositoryError::RequestBindingMismatch)
+        ),
         "enrollment completion ignored the installed immutable key: {error:?}"
     );
+    transaction.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -2000,7 +2113,7 @@ async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature
         br#"{"orphan":true}"#,
     )
     .await;
-    let error = authorize_rebind_request(
+    let admission = authorize_rebind_operation_only(
         &pool,
         rebind_evidence(
             &orphan_raw,
@@ -2010,11 +2123,19 @@ async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature
         ),
     )
     .await
-    .unwrap_err();
+    .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    let error = validate_rebind_replay(&mut transaction, admission)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(error, AuthRepositoryError::DpopBindingMismatch),
+        matches!(
+            error,
+            PreludeError::Authorization(AuthRepositoryError::DpopBindingMismatch)
+        ),
         "pre-CAS rebind completion was replayed: {error:?}"
     );
+    transaction.rollback().await.unwrap();
 
     let forged = DeviceFixture::fresh();
     seed_device(&pool, &forged).await;
@@ -2059,7 +2180,7 @@ async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature
         br#"{"forged":true}"#,
     )
     .await;
-    let error = authorize_rebind_request(
+    let error = match authorize_rebind_operation_only(
         &pool,
         rebind_evidence(
             &forged_raw,
@@ -2069,7 +2190,10 @@ async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature
         ),
     )
     .await
-    .unwrap_err();
+    {
+        Ok(_) => panic!("forged completed rebind unexpectedly admitted"),
+        Err(error) => error,
+    };
     assert!(
         matches!(error, AuthRepositoryError::Primitive(_)),
         "rebind completion escaped immutable-key signature verification: {error:?}"
@@ -2109,7 +2233,7 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
     .await;
     revoke_fixture(&pool, &ordinary).await;
     let mut ordinary_transaction = pool.begin().await.unwrap();
-    let error = arbitrate_business_idempotency(&mut ordinary_transaction, &ordinary_authority)
+    let error = test_arbitrate_business_idempotency(&mut ordinary_transaction, &ordinary_authority)
         .await
         .unwrap_err();
     assert!(
@@ -2126,20 +2250,18 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
         "Missing post-state",
         FIRST_T,
     );
-    let enrollment_authority = first_authority(
-        authorize_enrollment_request(
-            &pool,
-            enrollment_evidence(
-                &enrollment_raw,
-                uuid::Uuid::new_v4(),
-                random_proof_jti(),
-                uuid::Uuid::new_v4(),
-                FIRST_T,
-            ),
-        )
-        .await
-        .unwrap(),
-    );
+    let enrollment_admission = authorize_enrollment_operation_only(
+        &pool,
+        enrollment_evidence(
+            &enrollment_raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            uuid::Uuid::new_v4(),
+            FIRST_T,
+        ),
+    )
+    .await
+    .unwrap();
     insert_completed_bootstrap_fixture(
         &pool,
         "blue.catbird.chat.enrollDevice",
@@ -2151,11 +2273,14 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
     )
     .await;
     let mut enrollment_transaction = pool.begin().await.unwrap();
-    let error = prepare_enrollment_business(&mut enrollment_transaction, &enrollment_authority)
+    let error = validate_enrollment_replay(&mut enrollment_transaction, enrollment_admission)
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AuthRepositoryError::DeviceNotRegistered),
+        matches!(
+            error,
+            PreludeError::Authorization(AuthRepositoryError::DeviceNotRegistered)
+        ),
         "business convergence replay ignored missing enrollment post-state: {error:?}"
     );
     enrollment_transaction.rollback().await.unwrap();
@@ -2172,19 +2297,17 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
         1,
         FIRST_T,
     );
-    let rebind_authority = first_authority(
-        authorize_rebind_request(
-            &pool,
-            rebind_evidence(
-                &rebind_raw,
-                uuid::Uuid::new_v4(),
-                random_proof_jti(),
-                FIRST_T,
-            ),
-        )
-        .await
-        .unwrap(),
-    );
+    let rebind_admission = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(
+            &rebind_raw,
+            uuid::Uuid::new_v4(),
+            random_proof_jti(),
+            FIRST_T,
+        ),
+    )
+    .await
+    .unwrap();
     insert_completed_bootstrap_fixture(
         &pool,
         "blue.catbird.chat.rebindDeviceAuthentication",
@@ -2196,11 +2319,14 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
     )
     .await;
     let mut rebind_transaction = pool.begin().await.unwrap();
-    let error = prepare_rebind_business(&mut rebind_transaction, &rebind_authority)
+    let error = validate_rebind_replay(&mut rebind_transaction, rebind_admission)
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AuthRepositoryError::DpopBindingMismatch),
+        matches!(
+            error,
+            PreludeError::Authorization(AuthRepositoryError::DpopBindingMismatch)
+        ),
         "business convergence replay ignored missing rebind CAS post-state: {error:?}"
     );
     rebind_transaction.rollback().await.unwrap();

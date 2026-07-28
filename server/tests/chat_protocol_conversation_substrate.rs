@@ -245,7 +245,7 @@ mod welcome_terminal_facade_contract {
         assert!(prepare.contains("prepare_welcome_terminal_execution"));
         for forbidden in [
             "lock_device_and_key",
-            "recheck_business_authority",
+            "test_recheck_business_authority",
             "locked_registration_from_guard",
             "FOR UPDATE",
         ] {
@@ -5698,7 +5698,7 @@ mod historical_control_loader {
             TrustedRelationshipPersistenceInstant,
         };
         use crate::chat_protocol::repository::auth::{
-            authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
+            authorize_signed_request, test_recheck_business_authority, AuthorizationOutcome,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_available_acceptance_package,
@@ -12098,7 +12098,7 @@ mod historical_control_loader {
                 .await
                 .expect("begin creator-only Creation transaction");
             let creator_only_business =
-                recheck_business_authority(&mut creator_only_tx, &creator_only_request)
+                test_recheck_business_authority(&mut creator_only_tx, &creator_only_request)
                     .await
                     .expect("recheck creator-only actor authority");
             let creator_only_head =
@@ -12280,7 +12280,7 @@ mod historical_control_loader {
 
             let mut foreign_decision_tx = pool.begin().await.expect("begin foreign decision proof");
             let foreign_business =
-                recheck_business_authority(&mut foreign_decision_tx, &verified_request)
+                test_recheck_business_authority(&mut foreign_decision_tx, &verified_request)
                     .await
                     .expect("recheck actor authority for foreign decision");
             let foreign_head =
@@ -12324,7 +12324,7 @@ mod historical_control_loader {
                 .begin()
                 .await
                 .expect("begin Creation business transaction");
-            let business_guard = recheck_business_authority(&mut tx, &verified_request)
+            let business_guard = test_recheck_business_authority(&mut tx, &verified_request)
                 .await
                 .expect("recheck exact actor authority under business locks");
             let head = hydrate_locked_creation_head(&mut tx, conversation_id, trusted_at)
@@ -12603,7 +12603,7 @@ mod historical_control_loader {
                 .expect("mint locked non-add Policy hydration authority");
 
             let skipped_add_business =
-                recheck_business_authority(&mut tx, &skipped_add_policy_request)
+                test_recheck_business_authority(&mut tx, &skipped_add_policy_request)
                     .await
                     .expect("recheck exact skipped-add Policy authority");
             let skipped_add_registration = policy_hydration
@@ -12646,9 +12646,10 @@ mod historical_control_loader {
                 crate::chat_protocol::state_machine::StateMachineError::InvalidPolicyAuthority
             ));
 
-            let non_add_business = recheck_business_authority(&mut tx, &non_add_policy_request)
-                .await
-                .expect("recheck exact non-add Policy authority");
+            let non_add_business =
+                test_recheck_business_authority(&mut tx, &non_add_policy_request)
+                    .await
+                    .expect("recheck exact non-add Policy authority");
             let non_add_registration = policy_hydration
                 .locked_registration_from_guard(non_add_business)
                 .expect("seal non-add Policy registration");
@@ -12970,7 +12971,7 @@ mod historical_control_loader {
             };
             let mut wrong_leaf_tx = pool.begin().await.expect("begin wrong-leaf proof");
             let wrong_leaf_business =
-                recheck_business_authority(&mut wrong_leaf_tx, &wrong_leaf_request)
+                test_recheck_business_authority(&mut wrong_leaf_tx, &wrong_leaf_request)
                     .await
                     .expect("wrong-leaf request retains production actor authority");
             let wrong_leaf_head =
@@ -14353,7 +14354,7 @@ mod historical_control_loader {
             };
 
             let mut tx = pool.begin().await.expect("begin atomic recovery lifecycle");
-            let creation_business = recheck_business_authority(&mut tx, &creation_request)
+            let creation_business = test_recheck_business_authority(&mut tx, &creation_request)
                 .await
                 .expect("recheck lifecycle Creation authority");
             let creation_head = hydrate_locked_creation_head(&mut tx, conversation_id, trusted_at)
@@ -14440,7 +14441,7 @@ mod historical_control_loader {
                     .expect("lock freshly created invitation graph");
             let policy_hydration = HydrationAuthority::from_locked_conversation(&locked_creation)
                 .expect("mint lifecycle Policy authority");
-            let policy_business = recheck_business_authority(&mut tx, &policy_request)
+            let policy_business = test_recheck_business_authority(&mut tx, &policy_request)
                 .await
                 .expect("recheck lifecycle Policy authority");
             let policy_registration = policy_hydration
@@ -14553,7 +14554,7 @@ mod historical_control_loader {
                     .expect("lock lifecycle Policy invitation graph");
             let acceptance_hydration = HydrationAuthority::from_locked_conversation(&locked_policy)
                 .expect("mint lifecycle Acceptance authority");
-            let acceptance_business = recheck_business_authority(&mut tx, &acceptance_request)
+            let acceptance_business = test_recheck_business_authority(&mut tx, &acceptance_request)
                 .await
                 .expect("recheck lifecycle Acceptance authority");
             let acceptance_registration = acceptance_hydration
@@ -15009,13 +15010,14 @@ mod historical_control_loader {
             let fulfillment_hydration =
                 HydrationAuthority::from_locked_conversation(&locked_acceptance)
                     .expect("mint lifecycle Fulfillment authority");
-            let fulfillment_business = recheck_business_authority(&mut tx, &fulfillment_request)
-                .await
-                .expect("recheck lifecycle Fulfillment actor authority");
+            let fulfillment_business =
+                test_recheck_business_authority(&mut tx, &fulfillment_request)
+                    .await
+                    .expect("recheck lifecycle Fulfillment actor authority");
             let fulfillment_actor_registration = fulfillment_hydration
                 .locked_registration_from_guard(fulfillment_business)
                 .expect("seal lifecycle Fulfillment actor registration");
-            let target_business = recheck_business_authority(&mut tx, &acceptance_request)
+            let target_business = test_recheck_business_authority(&mut tx, &acceptance_request)
                 .await
                 .expect("recheck exact active recovery target registration");
             let target_registration = fulfillment_hydration
@@ -16256,7 +16258,7 @@ mod historical_control_loader {
                             }
                             G6WelcomeTerminalRequestFailureStage::Compositor => {
                                 let welcome_business =
-                                    recheck_business_authority(&mut tx, authority)
+                                    test_recheck_business_authority(&mut tx, authority)
                                         .await
                                         .unwrap_or_else(|error| {
                                             panic!(
@@ -16340,7 +16342,7 @@ mod historical_control_loader {
                     })
                     .await;
                     // ---- Executor-level prewrite negatives ----
-                    let exec_welcome_business = recheck_business_authority(&mut tx, authority)
+                    let exec_welcome_business = test_recheck_business_authority(&mut tx, authority)
                         .await
                         .expect("recheck for executor negatives");
                     let exec_locked = hydrate_locked_conversation_state(
@@ -17080,7 +17082,7 @@ mod historical_control_loader {
                         }
                     }
                 }
-                let welcome_business = recheck_business_authority(&mut tx, authority)
+                let welcome_business = test_recheck_business_authority(&mut tx, authority)
                     .await
                     .expect("recheck lifecycle Welcome terminal authority");
                 let locked = hydrate_locked_conversation_state(
@@ -17791,7 +17793,7 @@ mod historical_control_loader {
                         ),
                     ] {
                         let replay_business =
-                            recheck_business_authority(&mut tx, candidate_authority)
+                            test_recheck_business_authority(&mut tx, candidate_authority)
                                 .await
                                 .unwrap_or_else(|error| {
                                     panic!("recheck {label} business authority: {error:?}")
@@ -17886,7 +17888,7 @@ mod historical_control_loader {
                         .as_ref()
                         .expect("changed-reason replay proof has authority");
                     let replay_business =
-                        recheck_business_authority(&mut tx, changed_reason_authority)
+                        test_recheck_business_authority(&mut tx, changed_reason_authority)
                             .await
                             .expect("recheck changed-reason business authority");
                     let replay_locked = hydrate_locked_conversation_state(
@@ -17996,7 +17998,7 @@ mod historical_control_loader {
                     HydrationAuthority::from_locked_conversation(&locked_before_recovery)
                         .expect("mint prior-bound recovery-request authority");
                 let recovery_request_business =
-                    recheck_business_authority(&mut tx, &prior_bound_recovery_authority)
+                    test_recheck_business_authority(&mut tx, &prior_bound_recovery_authority)
                         .await
                         .expect("recheck prior-bound recovery-request authority");
                 let recovery_request_registration = recovery_request_hydration
@@ -18120,7 +18122,7 @@ mod historical_control_loader {
                     HydrationAuthority::from_locked_conversation(&locked_fulfillment)
                         .expect("mint lifecycle ResetRequest authority");
                 let reset_request_business =
-                    recheck_business_authority(&mut tx, &reset_request_authority)
+                    test_recheck_business_authority(&mut tx, &reset_request_authority)
                         .await
                         .expect("recheck lifecycle ResetRequest authority");
                 let reset_request_registration = reset_request_hydration
@@ -18189,7 +18191,7 @@ mod historical_control_loader {
                     HydrationAuthority::from_locked_conversation(&locked_reset_request)
                         .expect("mint lifecycle ResetActivation authority");
                 let reset_activation_business =
-                    recheck_business_authority(&mut tx, &reset_activation_authority)
+                    test_recheck_business_authority(&mut tx, &reset_activation_authority)
                         .await
                         .expect("recheck lifecycle ResetActivation authority");
                 let reset_activation_registration = reset_activation_hydration
@@ -18199,7 +18201,7 @@ mod historical_control_loader {
                     HydrationAuthority::from_locked_conversation(&locked_reset_request)
                         .expect("mint non-admin ResetActivation authority");
                 let non_admin_business =
-                    recheck_business_authority(&mut tx, &non_admin_reset_activation_authority)
+                    test_recheck_business_authority(&mut tx, &non_admin_reset_activation_authority)
                         .await
                         .expect("recheck genuine non-admin ResetActivation authority");
                 let non_admin_registration = non_admin_hydration
