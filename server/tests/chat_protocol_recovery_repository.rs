@@ -663,6 +663,17 @@ fn recovery_plan_inputs_expose_only_consuming_executor_capsules() {
         assert!(!body.contains("&self) -> RecoveryExecutorCapsule"));
     }
     assert!(source.contains("struct RecoveryExecutorCapsule"));
+    for field in [
+        "request: NewLeafRecoveryRequest",
+        "reservation: NewReservation",
+        "package: RecoveryPackageRow",
+    ] {
+        assert!(source.contains(field), "capsule must retain sealed {field}");
+    }
+    assert!(source.contains("pub(crate) fn into_executor_parts("));
+    assert!(source.contains("self.request,"));
+    assert!(source.contains("self.reservation,"));
+    assert!(source.contains("self.package,"));
     assert!(source.contains("struct RecoverySchedulerExpiryCapsule"));
     assert!(source.contains("prelude: Option<PreparedBusinessPrelude>"));
 }
@@ -675,9 +686,10 @@ fn recovery_executor_capsule_keeps_scheduler_without_client_authority() {
         .and_then(|(_, tail)| tail.split_once("impl RecoverySchedulerExpiryCapsule"))
         .map(|(body, _)| body)
         .expect("scheduler capsule");
-    assert!(scheduler.contains("transaction_id: Box<str>"));
-    assert!(scheduler.contains("request_id: Uuid"));
+    assert!(scheduler.contains("authority: RecoveryExpiryAuthority"));
     assert!(!scheduler.contains("PreparedBusinessPrelude"));
+    assert!(source.contains("fn terminal_cas(&self) -> RecoveryTerminalTripleCas"));
+    assert!(source.contains("debug_assert!(self.prelude.is_none()"));
 }
 
 #[test]

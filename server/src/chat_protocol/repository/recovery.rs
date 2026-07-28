@@ -765,6 +765,9 @@ pub(crate) struct RecoveryExecutorCapsule {
     operation: RecoveryExecutorOperation,
     transaction_id: Box<str>,
     prelude: PreparedBusinessPrelude,
+    request: NewLeafRecoveryRequest,
+    reservation: NewReservation,
+    package: RecoveryPackageRow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -783,26 +786,51 @@ impl RecoveryExecutorCapsule {
         &self.transaction_id
     }
 
-    pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
-        self.prelude
+    /// Consume the sealed capsule at the executor boundary.  This is the only
+    /// route that releases the exact recovery graph selected under the
+    /// authority lock; handlers cannot construct these rows independently.
+    pub(crate) fn into_executor_parts(
+        self,
+    ) -> (
+        RecoveryExecutorOperation,
+        Box<str>,
+        PreparedBusinessPrelude,
+        NewLeafRecoveryRequest,
+        NewReservation,
+        RecoveryPackageRow,
+    ) {
+        (
+            self.operation,
+            self.transaction_id,
+            self.prelude,
+            self.request,
+            self.reservation,
+            self.package,
+        )
     }
 }
 
 /// Scheduler expiry is deliberately a separate capsule: it carries no client
 /// prelude, operation claim, or idempotency completion capability.
-#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RecoverySchedulerExpiryCapsule {
-    transaction_id: Box<str>,
-    request_id: Uuid,
+    authority: RecoveryExpiryAuthority,
 }
 
 impl RecoverySchedulerExpiryCapsule {
     pub(crate) fn transaction_id(&self) -> &str {
-        &self.transaction_id
+        &self.authority.transaction_id
     }
 
     pub(crate) fn request_id(&self) -> Uuid {
-        self.request_id
+        self.authority.request.recovery_request_id
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.authority.trusted_instant
+    }
+
+    pub(crate) fn terminal_cas(&self) -> RecoveryTerminalTripleCas<'_> {
+        self.authority.terminal_cas()
     }
 }
 
@@ -872,6 +900,9 @@ impl RecoveryRequestPlanInput {
             operation: RecoveryExecutorOperation::Request,
             transaction_id: self.context.transaction_id,
             prelude: self.context.prelude,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
         }
     }
 }
@@ -940,6 +971,9 @@ impl RecoveryCancellationPlanInput {
             operation: RecoveryExecutorOperation::Cancellation,
             transaction_id: self.context.transaction_id,
             prelude: self.context.prelude,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
         }
     }
 }
@@ -983,16 +1017,20 @@ impl RecoveryFulfillmentPlanInput {
             },
             transaction_id: self.context.transaction_id,
             prelude: self.context.prelude,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
         }
     }
 }
 
 impl RecoveryExpiryAuthority {
     pub(crate) fn into_scheduler_capsule(self) -> RecoverySchedulerExpiryCapsule {
-        RecoverySchedulerExpiryCapsule {
-            transaction_id: self.transaction_id,
-            request_id: self.request.recovery_request_id,
-        }
+        debug_assert!(
+            self.prelude.is_none(),
+            "scheduler expiry must be prelude-free"
+        );
+        RecoverySchedulerExpiryCapsule { authority: self }
     }
 
     pub(crate) fn terminal_cas(&self) -> RecoveryTerminalTripleCas<'_> {
