@@ -648,6 +648,39 @@ fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
 }
 
 #[test]
+fn recovery_plan_inputs_expose_only_consuming_executor_capsules() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    for plan in [
+        "RecoveryRequestPlanInput",
+        "RecoveryCancellationPlanInput",
+        "RecoveryFulfillmentPlanInput",
+    ] {
+        let body = source
+            .split_once(&format!("impl {plan} {{"))
+            .map(|(_, tail)| tail.split_once("\n}").map_or(tail, |(body, _)| body))
+            .expect("plan impl");
+        assert!(body.contains("into_executor_capsule(self)"));
+        assert!(!body.contains("&self) -> RecoveryExecutorCapsule"));
+    }
+    assert!(source.contains("struct RecoveryExecutorCapsule"));
+    assert!(source.contains("struct RecoverySchedulerExpiryCapsule"));
+    assert!(source.contains("prelude: Option<PreparedBusinessPrelude>"));
+}
+
+#[test]
+fn recovery_executor_capsule_keeps_scheduler_without_client_authority() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    let scheduler = source
+        .split_once("struct RecoverySchedulerExpiryCapsule")
+        .and_then(|(_, tail)| tail.split_once("impl RecoverySchedulerExpiryCapsule"))
+        .map(|(body, _)| body)
+        .expect("scheduler capsule");
+    assert!(scheduler.contains("transaction_id: Box<str>"));
+    assert!(scheduler.contains("request_id: Uuid"));
+    assert!(!scheduler.contains("PreparedBusinessPrelude"));
+}
+
+#[test]
 fn same_transition_fulfilled_row_is_corruption_not_replay() {
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
     assert!(

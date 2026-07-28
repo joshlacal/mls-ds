@@ -16084,6 +16084,9 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // `super::repository::*` paths resolve there as well. See the E2b-3 report.
 // ===========================================================================
 
+pub(crate) use super::repository::recovery::{
+    RecoveryExecutorCapsule, RecoveryExecutorOperation, RecoverySchedulerExpiryCapsule,
+};
 pub(crate) use executor::{
     apply_conversation_persistence_plan, apply_prepared_device_revocation_members,
     apply_prepared_device_revocation_prefix, prepare_device_revocation_batch_members,

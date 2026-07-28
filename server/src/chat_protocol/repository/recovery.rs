@@ -55,7 +55,7 @@ impl RecoverySqlAuthoritySeal {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryLockStage {
     GlobalOperation,
     Principals,
@@ -757,6 +757,55 @@ pub(crate) struct RecoveryFulfillmentPlanInput {
     transition_id: Uuid,
 }
 
+/// The only values a Recovery state-machine bridge may hand to the SQL
+/// executor.  Construction consumes the linear plan input, so callers cannot
+/// retain a second copy of the authority or substitute an unsealed row.
+#[must_use]
+pub(crate) struct RecoveryExecutorCapsule {
+    operation: RecoveryExecutorOperation,
+    transaction_id: Box<str>,
+    prelude: PreparedBusinessPrelude,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryExecutorOperation {
+    Request,
+    Cancellation,
+    Fulfillment { transition_id: Uuid },
+}
+
+impl RecoveryExecutorCapsule {
+    pub(crate) fn operation(&self) -> RecoveryExecutorOperation {
+        self.operation
+    }
+
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
+        self.prelude
+    }
+}
+
+/// Scheduler expiry is deliberately a separate capsule: it carries no client
+/// prelude, operation claim, or idempotency completion capability.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RecoverySchedulerExpiryCapsule {
+    transaction_id: Box<str>,
+    request_id: Uuid,
+}
+
+impl RecoverySchedulerExpiryCapsule {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(crate) fn request_id(&self) -> Uuid {
+        self.request_id
+    }
+}
+
 impl<T> RecoveryTerminalRead<T> {
     pub(crate) fn map_authority<U>(self, adapt: impl FnOnce(T) -> U) -> RecoveryTerminalRead<U> {
         match self {
@@ -816,6 +865,14 @@ impl RecoveryRequestPlanInput {
 
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
         self.context.prelude
+    }
+
+    pub(crate) fn into_executor_capsule(self) -> RecoveryExecutorCapsule {
+        RecoveryExecutorCapsule {
+            operation: RecoveryExecutorOperation::Request,
+            transaction_id: self.context.transaction_id,
+            prelude: self.context.prelude,
+        }
     }
 }
 
@@ -877,6 +934,14 @@ impl RecoveryCancellationPlanInput {
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
         self.context.prelude
     }
+
+    pub(crate) fn into_executor_capsule(self) -> RecoveryExecutorCapsule {
+        RecoveryExecutorCapsule {
+            operation: RecoveryExecutorOperation::Cancellation,
+            transaction_id: self.context.transaction_id,
+            prelude: self.context.prelude,
+        }
+    }
 }
 
 impl RecoveryFulfillmentPlanInput {
@@ -910,9 +975,26 @@ impl RecoveryFulfillmentPlanInput {
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
         self.context.prelude
     }
+
+    pub(crate) fn into_executor_capsule(self) -> RecoveryExecutorCapsule {
+        RecoveryExecutorCapsule {
+            operation: RecoveryExecutorOperation::Fulfillment {
+                transition_id: self.transition_id,
+            },
+            transaction_id: self.context.transaction_id,
+            prelude: self.context.prelude,
+        }
+    }
 }
 
 impl RecoveryExpiryAuthority {
+    pub(crate) fn into_scheduler_capsule(self) -> RecoverySchedulerExpiryCapsule {
+        RecoverySchedulerExpiryCapsule {
+            transaction_id: self.transaction_id,
+            request_id: self.request.recovery_request_id,
+        }
+    }
+
     pub(crate) fn terminal_cas(&self) -> RecoveryTerminalTripleCas<'_> {
         RecoveryTerminalTripleCas::new(
             &self.sql_authority,
