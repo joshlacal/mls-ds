@@ -5573,7 +5573,8 @@ mod historical_control_loader {
             RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
-            EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind,
+            append_event, enqueue_outbox, insert_event_recipients, EntryEntitlementKind,
+            EventEntitlementKind, EventKind, EventRecipient, NewEvent, OutboxWorkKind,
             WelcomeRejectionReason,
         };
         use crate::chat_protocol::repository::execution_context::{
@@ -6627,10 +6628,7 @@ mod historical_control_loader {
                         accepted_control_entry_bytes: None,
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
-                        welcome_disposition_event_payloads: vec![(
-                            first_welcome_id,
-                            b"g6-first-welcome-revoked".to_vec(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 ),
                 ConversationExecutionArtifacts::new(
@@ -6639,10 +6637,7 @@ mod historical_control_loader {
                         accepted_control_entry_bytes: None,
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
-                        welcome_disposition_event_payloads: vec![(
-                            second_welcome_id,
-                            b"g6-second-welcome-revoked".to_vec(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 ),
             ];
@@ -6815,10 +6810,7 @@ mod historical_control_loader {
                         accepted_control_entry_bytes: None,
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
-                        welcome_disposition_event_payloads: vec![(
-                            first_welcome_id,
-                            b"g6-valid-first-authority".to_vec(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 ),
                 ConversationExecutionArtifacts::new(
@@ -6827,10 +6819,7 @@ mod historical_control_loader {
                         accepted_control_entry_bytes: None,
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
-                        welcome_disposition_event_payloads: vec![(
-                            second_welcome_id,
-                            b"g6-invalid-later-authority".to_vec(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 ),
             ];
@@ -10239,34 +10228,72 @@ mod historical_control_loader {
             for (name, sql) in [
                 (
                     "events",
-                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                    "WITH scoped_event_positions AS ( \
+                       SELECT event.event_position \
+                         FROM chat.events event \
+                        WHERE event.protocol_instance_id=$1 \
+                          AND position($2::bytea IN event.payload_bytes)>0 \
+                       UNION \
+                       SELECT disposition.event_position \
+                         FROM chat.welcome_dispositions disposition \
+                         JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                         JOIN chat.events event \
+                           ON event.event_position=disposition.event_position \
+                        WHERE bundle.conversation_id=$3 \
+                          AND event.protocol_instance_id=$1 \
+                     ) \
+                     SELECT COALESCE(jsonb_agg(to_jsonb(row) \
                        ORDER BY to_jsonb(row)::text)::text,'[]') \
                      FROM (SELECT event.* FROM chat.events event \
-                       WHERE event.protocol_instance_id=$1 \
-                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                       JOIN scoped_event_positions scoped USING(event_position)) row",
                 ),
                 (
                     "event_recipients",
-                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                    "WITH scoped_event_positions AS ( \
+                       SELECT event.event_position \
+                         FROM chat.events event \
+                        WHERE event.protocol_instance_id=$1 \
+                          AND position($2::bytea IN event.payload_bytes)>0 \
+                       UNION \
+                       SELECT disposition.event_position \
+                         FROM chat.welcome_dispositions disposition \
+                         JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                         JOIN chat.events event \
+                           ON event.event_position=disposition.event_position \
+                        WHERE bundle.conversation_id=$3 \
+                          AND event.protocol_instance_id=$1 \
+                     ) \
+                     SELECT COALESCE(jsonb_agg(to_jsonb(row) \
                        ORDER BY to_jsonb(row)::text)::text,'[]') \
                      FROM (SELECT recipient.* FROM chat.event_recipients recipient \
-                       JOIN chat.events event USING(event_position) \
-                       WHERE event.protocol_instance_id=$1 \
-                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                       JOIN scoped_event_positions scoped USING(event_position)) row",
                 ),
                 (
                     "outbox",
-                    "SELECT COALESCE(jsonb_agg(to_jsonb(row) \
+                    "WITH scoped_event_positions AS ( \
+                       SELECT event.event_position \
+                         FROM chat.events event \
+                        WHERE event.protocol_instance_id=$1 \
+                          AND position($2::bytea IN event.payload_bytes)>0 \
+                       UNION \
+                       SELECT disposition.event_position \
+                         FROM chat.welcome_dispositions disposition \
+                         JOIN chat.welcome_bundles bundle USING(welcome_id) \
+                         JOIN chat.events event \
+                           ON event.event_position=disposition.event_position \
+                        WHERE bundle.conversation_id=$3 \
+                          AND event.protocol_instance_id=$1 \
+                     ) \
+                     SELECT COALESCE(jsonb_agg(to_jsonb(row) \
                        ORDER BY to_jsonb(row)::text)::text,'[]') \
                      FROM (SELECT outbox.* FROM chat.outbox outbox \
-                       JOIN chat.events event USING(event_position) \
-                       WHERE event.protocol_instance_id=$1 \
-                         AND position($2::bytea IN event.payload_bytes)>0) row",
+                       JOIN scoped_event_positions scoped USING(event_position)) row",
                 ),
             ] {
                 let rows: String = sqlx::query_scalar(sql)
                     .bind(protocol_instance_id)
                     .bind(conversation_marker)
+                    .bind(conversation_id)
                     .fetch_one(&mut **tx)
                     .await
                     .unwrap_or_else(|error| panic!("snapshot chat.{name}: {error}"));
@@ -11704,6 +11731,14 @@ mod historical_control_loader {
             DueExpiry,
         }
 
+        fn expected_welcome_disposition_payload(welcome_id: Uuid, status: &str) -> Vec<u8> {
+            format!(
+                r#"{{"$type":"blue.catbird.chat.defs#welcomeDispositionEvent","status":"{status}","welcomeId":"{}"}}"#,
+                welcome_id.hyphenated()
+            )
+            .into_bytes()
+        }
+
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum G6WelcomeTerminalRequestFailureStage {
             Decode,
@@ -12038,6 +12073,7 @@ mod historical_control_loader {
             welcome_terminal_request_negatives: bool,
             welcome_terminal_executor_negatives: bool,
             welcome_terminal_second_response_negatives: bool,
+            welcome_terminal_exact_recipient_locking: bool,
         ) {
             assert!(
                 !include_reset || welcome_terminal.is_none(),
@@ -12051,6 +12087,11 @@ mod historical_control_loader {
             assert!(
                 !welcome_terminal_executor_negatives || welcome_terminal.is_some(),
                 "executor prewrite negatives require a Welcome terminal plan"
+            );
+            assert!(
+                !welcome_terminal_exact_recipient_locking
+                    || welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged),
+                "the exact-recipient lock proof uses a genuine acknowledgement plan"
             );
             assert!(
                 !welcome_terminal_second_response_negatives
@@ -12111,6 +12152,7 @@ mod historical_control_loader {
                 package_not_after,
             );
             let decoy = unique_acceptance_invitee();
+            let lock_decoy = unique_acceptance_invitee();
             let entry = add_pending_invitee_to_creation(entry, &invitee);
             let entry = add_pending_invitee_to_creation(entry, &decoy);
             let creation_transition_id = Uuid::parse_str(
@@ -12342,7 +12384,7 @@ mod historical_control_loader {
             );
             let actor_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(Uuid::new_v4().as_bytes()));
 
-            for identity in [&entry.actor_did, &invitee.did, &decoy.did] {
+            for identity in [&entry.actor_did, &invitee.did, &decoy.did, &lock_decoy.did] {
                 sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
                     .bind(identity)
                     .bind(trusted_at)
@@ -12374,6 +12416,14 @@ mod historical_control_loader {
                     decoy.signing_key.verifying_key().as_bytes().as_slice(),
                     "g6-lifecycle-decoy",
                     decoy.key_id.as_str(),
+                ),
+                (
+                    lock_decoy.did.as_str(),
+                    lock_decoy.device_id,
+                    lock_decoy.key_id.as_str(),
+                    lock_decoy.signing_key.verifying_key().as_bytes().as_slice(),
+                    "g6-lifecycle-lock-decoy",
+                    lock_decoy.key_id.as_str(),
                 ),
             ] {
                 sqlx::query(
@@ -14821,7 +14871,10 @@ mod historical_control_loader {
             ) {
                 let terminal_observed_at =
                     welcome_terminal_observed_at.expect("terminal mode has an observed instant");
-                if welcome_terminal_request_negatives || welcome_terminal_executor_negatives {
+                if welcome_terminal_request_negatives
+                    || welcome_terminal_executor_negatives
+                    || welcome_terminal_exact_recipient_locking
+                {
                     Box::pin(async {
                     let empty_negative_cases: Vec<G6WelcomeTerminalRequestNegative> = Vec::new();
                     let cases = if welcome_terminal_request_negatives {
@@ -15010,6 +15063,372 @@ mod historical_control_loader {
                         &conversation_marker,
                     )
                     .await;
+                    // Aggregate review I3: a Welcome terminal event belongs only
+                    // to the immutable historical recipient device. A sibling
+                    // active device for the same participant is deliberately
+                    // locked in another transaction. Hydration must not touch it;
+                    // the old `standard_audience` path blocks on that row after
+                    // the aggregate + Welcome locks and times out.
+                    if welcome_terminal_exact_recipient_locking {
+                        sqlx::query("SAVEPOINT welcome_exact_recipient_locking")
+                            .execute(&mut *tx)
+                            .await
+                            .expect("open exact-recipient locking savepoint");
+                        // Make the independently committed lock-decoy device part
+                        // of the broad SQL audience only inside this rollback-only
+                        // proof. It was not a participant during any earlier
+                        // lifecycle hydration, so this transaction does not
+                        // already hold its device-row lock.
+                        sqlx::query(
+                            r#"INSERT INTO chat.participants(
+                                participant_period_id,conversation_id,user_did,status,role,
+                                role_transition_id,role_changed_at,created_by_did,
+                                created_by_device_id,invitation_transition_id,
+                                invitation_entry_id,invited_at,current_membership,created_at
+                            ) VALUES(
+                                $1,$2,$3,'pending','member',$4,$5,$6,$7,$4,$8,$5,TRUE,$5
+                            )"#,
+                        )
+                        .bind(lock_decoy.participant_period_id)
+                        .bind(conversation_id)
+                        .bind(&lock_decoy.did)
+                        .bind(creation_transition_id)
+                        .bind(trusted_at)
+                        .bind(&entry.actor_did)
+                        .bind(entry.actor_device_id)
+                        .bind(entry.entry_id)
+                        .execute(&mut *tx)
+                        .await
+                        .expect("add rollback-only broad-audience decoy participant");
+
+                        let mut sibling_lock = pool
+                            .begin()
+                            .await
+                            .expect("begin sibling device blocker transaction");
+                        sqlx::query(
+                            "SELECT 1 FROM chat.devices \
+                              WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
+                        )
+                        .bind(&lock_decoy.did)
+                        .bind(lock_decoy.device_id)
+                        .execute(&mut *sibling_lock)
+                        .await
+                        .expect("lock sibling device outside the Welcome transaction");
+
+                        sqlx::query("SET LOCAL lock_timeout='150ms'")
+                            .execute(&mut *tx)
+                            .await
+                            .expect("bound exact-recipient lock proof");
+                        let exact_recipient_result = hydrate_execution_context(
+                            &mut tx,
+                            &exec_plan,
+                            ExecutionContextArtifacts {
+                                accepted_control_entry_bytes: None,
+                                genesis_group_info_bytes: None,
+                                primary_event_payload: None,
+                                welcome_disposition_event_payloads: Vec::new(),
+                            },
+                        )
+                        .await;
+                        sqlx::query("ROLLBACK TO SAVEPOINT welcome_exact_recipient_locking")
+                            .execute(&mut *tx)
+                            .await
+                            .expect("recover exact-recipient locking savepoint");
+                        sqlx::query("SET LOCAL lock_timeout='0'")
+                            .execute(&mut *tx)
+                            .await
+                            .expect("restore lock timeout");
+                        sibling_lock
+                            .rollback()
+                            .await
+                            .expect("release sibling device blocker");
+                        assert!(
+                            exact_recipient_result.is_ok(),
+                            "Welcome hydration must not lock a sibling audience device: \
+                             {exact_recipient_result:?}"
+                        );
+                        let post = g6_lifecycle_durable_snapshot(
+                            &mut tx,
+                            conversation_id,
+                            &key_package_ref,
+                            protocol_instance_id,
+                            &conversation_marker,
+                        )
+                        .await;
+                        assert_eq!(
+                            post, exec_baseline,
+                            "exact-recipient hydration is read-only across all 29 families"
+                        );
+                    }
+                    // Aggregate review I1: `ExecutionContext` is an input to the
+                    // executor, not authority by itself. Every field consumed by a
+                    // Welcome terminal write must be re-bound to the sealed plan
+                    // before the first repository writer. Each mutation below
+                    // leaves the plan untouched and changes one independently
+                    // security-relevant context family. The savepoint is only test
+                    // isolation: the expected production result is an error before
+                    // any row is appended.
+                    if welcome_terminal_executor_negatives
+                        && welcome_terminal == Some(G6WelcomeTerminalMode::Acknowledged)
+                    {
+                        let mut context_cases: Vec<(&str, ExecutionContext)> = Vec::new();
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.accepted_payload_bytes.push(0);
+                        }
+                        context_cases.push(("accepted wrapper", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.accepted_payload_sha256[0] ^= 0x80;
+                        }
+                        context_cases.push(("accepted wrapper digest", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.signed_request_bytes.push(0);
+                        }
+                        context_cases.push(("signed request bytes", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.unsigned_projection_bytes.push(0);
+                        }
+                        context_cases.push(("canonical projection", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.signing_transcript_bytes.push(0);
+                        }
+                        context_cases.push(("signing transcript", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.request_digest[0] ^= 0x80;
+                        }
+                        context_cases.push(("request digest", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.signature[0] ^= 0x80;
+                        }
+                        context_cases.push(("signature", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.outer_entry_fingerprint[0] ^= 0x80;
+                        }
+                        context_cases.push(("durable row digest", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        if let ExecutionAuthority::ControlEntry(entry) = &mut bad.authority {
+                            entry.entry_kind = "blue.catbird.chat.defs#requestReset".to_owned();
+                        }
+                        context_cases.push(("entry kind", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.actor.user_did = decoy.did.clone();
+                        context_cases.push(("actor DID", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.actor.device_id = decoy.device_id;
+                        context_cases.push(("actor device", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.actor.key_id = decoy.key_id.clone();
+                        context_cases.push(("actor key", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.actor.auth_generation += 1;
+                        context_cases.push(("actor auth generation", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.actor.device_status = "revoked".to_owned();
+                        context_cases.push(("actor device status", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.applied_at += chrono::Duration::milliseconds(1);
+                        context_cases.push(("applied instant", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.protocol_instance_id = Uuid::new_v4();
+                        context_cases.push(("protocol instance", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .event_id = Uuid::nil();
+                        context_cases.push(("event identity", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .event_kind = EventKind::WelcomeAvailable;
+                        context_cases.push(("event kind", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .payload_bytes = b"caller-selected-welcome-disposition".to_vec();
+                        context_cases.push(("event payload", bad));
+
+                        let decoy_device = DeviceIdentity::new(
+                            PrincipalId::new(decoy.did.as_bytes().to_vec())
+                                .expect("decoy DID is canonical"),
+                            *decoy.device_id.as_bytes(),
+                        )
+                        .expect("decoy device identity is canonical");
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .recipients[0]
+                            .0 = decoy_device;
+                        context_cases.push(("event recipient", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .recipients[0]
+                            .1 = EventEntitlementKind::Participant;
+                        context_cases.push(("event entitlement", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        let predecessor = &mut bad
+                            .welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .recipients[0]
+                            .2;
+                        *predecessor = Some(predecessor.unwrap_or_default() + 1);
+                        context_cases.push(("event predecessor", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .outbox
+                            .clear();
+                        context_cases.push(("missing outbox work", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .outbox[0]
+                            .0 = Uuid::nil();
+                        context_cases.push(("outbox identity", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.welcome_response
+                            .as_mut()
+                            .expect("acknowledgement response")
+                            .event
+                            .outbox[0]
+                            .1 = OutboxWorkKind::Recovery;
+                        context_cases.push(("outbox work kind", bad));
+
+                        let mut bad = exec_ctx.clone();
+                        bad.events.push(
+                            bad.welcome_response
+                                .as_ref()
+                                .expect("acknowledgement response")
+                                .event
+                                .clone(),
+                        );
+                        context_cases.push(("unrelated primary event family", bad));
+
+                        for (label, bad_ctx) in context_cases {
+                            let response_event = &bad_ctx
+                                .welcome_response
+                                .as_ref()
+                                .expect("negative case retains Welcome response")
+                                .event;
+                            let mut attempted_event_ids = vec![response_event.event_id];
+                            attempted_event_ids
+                                .extend(bad_ctx.events.iter().map(|event| event.event_id));
+                            attempted_event_ids.sort_unstable();
+                            attempted_event_ids.dedup();
+                            let mut attempted_outbox_ids = response_event
+                                .outbox
+                                .iter()
+                                .map(|(outbox_id, _)| *outbox_id)
+                                .chain(bad_ctx.events.iter().flat_map(|event| {
+                                    event.outbox.iter().map(|(outbox_id, _)| *outbox_id)
+                                }))
+                                .collect::<Vec<_>>();
+                            attempted_outbox_ids.sort_unstable();
+                            attempted_outbox_ids.dedup();
+                            sqlx::query("SAVEPOINT welcome_context_prewrite_case")
+                                .execute(&mut *tx)
+                                .await
+                                .expect("open Welcome context prewrite savepoint");
+                            let result =
+                                apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
+                                    .await;
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(ExecutorError::InconsistentPlan(_)
+                                        | ExecutorError::MissingContext(_))
+                                ),
+                                "{label} drift must fail before the first writer: {result:?}"
+                            );
+                            let prefix_counts: (i64, i64, i64) = sqlx::query_as(
+                                r#"SELECT
+                                    (SELECT count(*) FROM chat.events
+                                      WHERE event_id=ANY($1)),
+                                    (SELECT count(*)
+                                       FROM chat.event_recipients recipient
+                                       JOIN chat.events event USING(event_position)
+                                      WHERE event.event_id=ANY($1)),
+                                    (SELECT count(*)
+                                       FROM chat.outbox outbox
+                                       LEFT JOIN chat.events event USING(event_position)
+                                      WHERE outbox.outbox_id=ANY($2)
+                                         OR event.event_id=ANY($1))"#,
+                            )
+                            .bind(&attempted_event_ids)
+                            .bind(&attempted_outbox_ids)
+                            .fetch_one(&mut *tx)
+                            .await
+                            .expect("inspect malformed-context prefix before rollback");
+                            assert_eq!(
+                                prefix_counts,
+                                (0, 0, 0),
+                                "{label} drift must leave no event/recipient/outbox prefix before rollback"
+                            );
+                            sqlx::query("ROLLBACK TO SAVEPOINT welcome_context_prewrite_case")
+                                .execute(&mut *tx)
+                                .await
+                                .expect("rollback Welcome context prewrite savepoint");
+                            let post = g6_lifecycle_durable_snapshot(
+                                &mut tx,
+                                conversation_id,
+                                &key_package_ref,
+                                protocol_instance_id,
+                                &conversation_marker,
+                            )
+                            .await;
+                            assert_eq!(
+                                post, exec_baseline,
+                                "{label} drift leaves all 29 families byte-identical"
+                            );
+                        }
+                    }
                     // Case A: CAS drift via corrupted binding.
                     {
                         let mut cas_plan = exec_plan.clone();
@@ -15385,6 +15804,130 @@ mod historical_control_loader {
                 )
                 .await
                 .expect("hydrate server-owned Welcome terminal context");
+
+                // Aggregate review I1/I2: a genuine context is stale as soon as
+                // another event advances its exact recipient's device-global
+                // predecessor. The stale context must be rejected before its own
+                // event/outbox is appendable. This savepoint inserts a real,
+                // independent predecessor and then restores the pending Welcome
+                // for the positive lifecycle below.
+                if welcome_terminal_second_response_negatives {
+                    let stale_baseline = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    sqlx::query("SAVEPOINT stale_welcome_execution_context")
+                        .execute(&mut *tx)
+                        .await
+                        .expect("open stale Welcome context savepoint");
+                    let response = context
+                        .welcome_response
+                        .as_ref()
+                        .expect("second-response proof uses a signed Welcome response");
+                    let historical_recipient = &response.event.recipients[0];
+                    let probe_event_id = Uuid::new_v4();
+                    let probe_position = append_event(
+                        &mut tx,
+                        &NewEvent {
+                            event_id: probe_event_id,
+                            event_kind: EventKind::Watermark,
+                            payload_bytes: b"g6-stale-welcome-context-probe".to_vec(),
+                            created_at: trusted_at,
+                            protocol_instance_id,
+                        },
+                    )
+                    .await
+                    .expect("append independent predecessor probe");
+                    insert_event_recipients(
+                        &mut tx,
+                        probe_position,
+                        &[EventRecipient {
+                            user_did: String::from_utf8(
+                                historical_recipient.0.principal().as_bytes().to_vec(),
+                            )
+                            .expect("historical recipient DID is UTF-8"),
+                            device_id: Uuid::from_bytes(*historical_recipient.0.device_id()),
+                            entitlement_kind: EventEntitlementKind::Participant,
+                            audience_predecessor_position: historical_recipient.2,
+                        }],
+                    )
+                    .await
+                    .expect("append independent predecessor recipient");
+                    enqueue_outbox(
+                        &mut tx,
+                        Uuid::new_v4(),
+                        probe_position,
+                        OutboxWorkKind::Stream,
+                        trusted_at,
+                    )
+                    .await
+                    .expect("append independent predecessor outbox");
+
+                    let mut stale_context = context.clone();
+                    let stale_event = &mut stale_context
+                        .welcome_response
+                        .as_mut()
+                        .expect("signed Welcome response context")
+                        .event;
+                    stale_event.event_id = Uuid::new_v4();
+                    stale_event.outbox[0].0 = Uuid::new_v4();
+                    let stale_event_id = stale_event.event_id;
+                    let stale_outbox_id = stale_event.outbox[0].0;
+                    let stale_result =
+                        apply_conversation_persistence_plan(&mut tx, &plan, &stale_context).await;
+                    assert!(
+                        matches!(
+                            stale_result,
+                            Err(ExecutorError::InconsistentPlan(_)
+                                | ExecutorError::MissingContext(_))
+                        ),
+                        "stale rehydrated context must fail at the executor prewrite fence: \
+                         {stale_result:?}"
+                    );
+                    let stale_prefix: (i64, i64, i64) = sqlx::query_as(
+                        r#"SELECT
+                            (SELECT count(*) FROM chat.events WHERE event_id=$1),
+                            (SELECT count(*)
+                               FROM chat.event_recipients recipient
+                               JOIN chat.events event USING(event_position)
+                              WHERE event.event_id=$1),
+                            (SELECT count(*)
+                               FROM chat.outbox outbox
+                               LEFT JOIN chat.events event USING(event_position)
+                              WHERE outbox.outbox_id=$2 OR event.event_id=$1)"#,
+                    )
+                    .bind(stale_event_id)
+                    .bind(stale_outbox_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("inspect stale-context prefix before rollback");
+                    assert_eq!(
+                        stale_prefix,
+                        (0, 0, 0),
+                        "stale context must leave no event/recipient/outbox prefix before rollback"
+                    );
+                    sqlx::query("ROLLBACK TO SAVEPOINT stale_welcome_execution_context")
+                        .execute(&mut *tx)
+                        .await
+                        .expect("rollback stale Welcome context savepoint");
+                    let stale_post = g6_lifecycle_durable_snapshot(
+                        &mut tx,
+                        conversation_id,
+                        &key_package_ref,
+                        protocol_instance_id,
+                        &conversation_marker,
+                    )
+                    .await;
+                    assert_eq!(
+                        stale_post, stale_baseline,
+                        "stale rehydrated context leaves all 29 durable families byte-identical"
+                    );
+                }
+
                 sqlx::query("SET CONSTRAINTS ALL DEFERRED")
                     .execute(&mut *tx)
                     .await
@@ -15403,21 +15946,151 @@ mod historical_control_loader {
                     Some(*committed.coordinate()),
                     "Welcome terminalization preserves the complete coordinate"
                 );
+                // Aggregate review I4: the canonical disposition payload contains
+                // no conversation UUID, so payload-marker-only snapshots silently
+                // omitted the terminal event topology. The 29-family seal must
+                // include the disposition-linked event position, its exact
+                // recipient, and its outbox row.
+                let terminal_event = match mode {
+                    G6WelcomeTerminalMode::DueExpiry => {
+                        &context
+                            .welcome_expiry
+                            .as_ref()
+                            .expect("expiry context")
+                            .event
+                    }
+                    G6WelcomeTerminalMode::Acknowledged | G6WelcomeTerminalMode::Rejected(_) => {
+                        &context
+                            .welcome_response
+                            .as_ref()
+                            .expect("response context")
+                            .event
+                    }
+                };
+                let terminal_snapshot = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                let snapshot_family = |name: &str| {
+                    terminal_snapshot
+                        .iter()
+                        .find(|(family, _)| family == name)
+                        .map(|(_, rows)| rows.as_str())
+                        .unwrap_or_else(|| panic!("missing {name} snapshot family"))
+                };
+                let event_id_text = terminal_event.event_id.hyphenated().to_string();
+                let event_position_text = applied.event_positions[0].to_string();
+                assert!(
+                    snapshot_family("events").contains(&event_id_text)
+                        && snapshot_family("events").contains(&event_position_text),
+                    "29-family snapshot must include the Welcome terminal event"
+                );
+                assert!(
+                    snapshot_family("event_recipients").contains(&event_position_text)
+                        && snapshot_family("event_recipients").contains(&invitee.did)
+                        && snapshot_family("event_recipients")
+                            .contains(&invitee.device_id.hyphenated().to_string()),
+                    "29-family snapshot must include the exact Welcome recipient topology"
+                );
+                assert!(
+                    snapshot_family("outbox").contains(&event_position_text)
+                        && snapshot_family("outbox")
+                            .contains(&terminal_event.outbox[0].0.hyphenated().to_string()),
+                    "29-family snapshot must include the Welcome terminal outbox"
+                );
+
+                // Mutation sensitivity: changing the linked terminal outbox or
+                // adding a second linked recipient must change the same snapshot.
+                // Both mutations are rollback-only and never cross the immediate
+                // terminal-graph constraint boundary.
+                sqlx::query("SAVEPOINT welcome_snapshot_outbox_mutation")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("open Welcome outbox snapshot mutation");
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("defer Welcome outbox mutation constraints");
+                sqlx::query(
+                    "UPDATE chat.outbox SET status='failed',attempt_count=1 \
+                     WHERE outbox_id=$1",
+                )
+                .bind(terminal_event.outbox[0].0)
+                .execute(&mut *tx)
+                .await
+                .expect("mutate linked Welcome outbox");
+                let mutated_outbox_snapshot = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                sqlx::query("ROLLBACK TO SAVEPOINT welcome_snapshot_outbox_mutation")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("rollback Welcome outbox snapshot mutation");
+                assert_ne!(
+                    mutated_outbox_snapshot, terminal_snapshot,
+                    "29-family snapshot must be sensitive to linked terminal outbox mutation"
+                );
+
+                sqlx::query("SAVEPOINT welcome_snapshot_recipient_mutation")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("open Welcome recipient snapshot mutation");
+                sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("defer Welcome recipient mutation constraints");
+                sqlx::query(
+                    r#"INSERT INTO chat.event_recipients(
+                        event_position,user_did,device_id,entitlement_kind,
+                        audience_predecessor_position
+                    ) VALUES($1,$2,$3,'welcome',NULL)"#,
+                )
+                .bind(applied.event_positions[0])
+                .bind(&lock_decoy.did)
+                .bind(lock_decoy.device_id)
+                .execute(&mut *tx)
+                .await
+                .expect("append rollback-only extra Welcome recipient");
+                let mutated_recipient_snapshot = g6_lifecycle_durable_snapshot(
+                    &mut tx,
+                    conversation_id,
+                    &key_package_ref,
+                    protocol_instance_id,
+                    &conversation_marker,
+                )
+                .await;
+                sqlx::query("ROLLBACK TO SAVEPOINT welcome_snapshot_recipient_mutation")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("rollback Welcome recipient snapshot mutation");
+                assert_ne!(
+                    mutated_recipient_snapshot, terminal_snapshot,
+                    "29-family snapshot must be sensitive to linked terminal recipient mutation"
+                );
 
                 // Finding 6 — second response after another terminal winner
                 // (brief L232). Within the same trusted transaction, after a
                 // genuine Acknowledgement winner is durable, a SECOND terminal
-                // response attempt against the same pending Welcome fails: the
-                // delivery `terminalize_welcome_delivery` CAS finds the row is
-                // no longer `pending` and rejects the writer before a second
-                // disposition is stored. The hard "conversation mutations
+                // response attempt against the same pending Welcome fails. Its
+                // event + outbox use fresh UUIDv4 identities and its predecessor
+                // is advanced to the first winner, so it cannot fail at an
+                // earlier duplicate-event or stale-chain check: it genuinely
+                // reaches the pending-Welcome CAS preflight. The hard "conversation mutations
                 // rollback-only" constraint forbids COMMITTING this transaction
                 // to drive a literally SEPARATE transaction (tx2 would not see
                 // the uncommitted winner), so the same-transaction second apply
-                // is the closed analog: it isolates the durable winner-existence
-                // fence the SQL CAS provides while a SAVEPOINT absorbs the
-                // second attempt's partial event row so the post-winner 29
-                // durable families stay byte-identical. Removing the pending -> acknowledged/rejected CAS predicate (or a
+                // is the closed analog. The loser must fail before an event,
+                // recipient, or outbox prefix exists; the savepoint proves the
+                // post-winner 29 families remain byte-identical. Removing the pending -> acknowledged/rejected CAS predicate (or a
                 // separate-transaction commit) would let the second response
                 // persist a wrong second winner.
                 if welcome_terminal_second_response_negatives {
@@ -15433,8 +16106,32 @@ mod historical_control_loader {
                         .execute(&mut *tx)
                         .await
                         .expect("open finding6 savepoint");
+                    let mut second_context = context.clone();
+                    let second_event = &mut second_context
+                        .welcome_response
+                        .as_mut()
+                        .expect("second response context")
+                        .event;
+                    second_event.event_id = Uuid::new_v4();
+                    second_event.recipients[0].2 = Some(applied.event_positions[0]);
+                    second_event.outbox[0].0 = Uuid::new_v4();
+                    let second_event_id = second_event.event_id;
                     let second_result =
-                        apply_conversation_persistence_plan(&mut tx, &plan, &context).await;
+                        apply_conversation_persistence_plan(&mut tx, &plan, &second_context).await;
+                    let second_prefix: (i64, i64, i64) = sqlx::query_as(
+                        r#"SELECT
+                            (SELECT count(*) FROM chat.events WHERE event_id=$1),
+                            (SELECT count(*) FROM chat.event_recipients recipient
+                              JOIN chat.events event USING(event_position)
+                             WHERE event.event_id=$1),
+                            (SELECT count(*) FROM chat.outbox outbox
+                              JOIN chat.events event USING(event_position)
+                             WHERE event.event_id=$1)"#,
+                    )
+                    .bind(second_event_id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read second-response committable prefix");
                     assert!(
                         matches!(second_result, Err(ExecutorError::Delivery(_))),
                         "second terminal response after the existing winner must fail the delivery CAS: {second_result:?}"
@@ -15443,6 +16140,11 @@ mod historical_control_loader {
                         .execute(&mut *tx)
                         .await
                         .expect("rollback to finding6 savepoint");
+                    assert_eq!(
+                        second_prefix,
+                        (0, 0, 0),
+                        "CAS loser must fail before event/recipient/outbox prefix writers"
+                    );
                     let post_finding6 = g6_lifecycle_durable_snapshot(
                         &mut tx,
                         conversation_id,
@@ -15548,10 +16250,7 @@ mod historical_control_loader {
                     }
                 };
                 let canonical_payload =
-                    crate::chat_protocol::repository::delivery::canonical_welcome_disposition_event_payload(
-                        fulfillment.welcome_id,
-                        terminal_status,
-                    );
+                    expected_welcome_disposition_payload(fulfillment.welcome_id, terminal_status);
                 let canonical_request = decode_canonical_signed_mutation(raw_request)
                     .expect("rehydrate exact Welcome terminal request");
                 let (
@@ -16554,10 +17253,7 @@ mod historical_control_loader {
                         primary_event_payload: Some(
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
-                        welcome_disposition_event_payloads: vec![(
-                            fulfillment.welcome_id,
-                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 )
                 .await
@@ -16582,10 +17278,7 @@ mod historical_control_loader {
                         primary_event_payload: Some(
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
-                        welcome_disposition_event_payloads: vec![(
-                            fulfillment.welcome_id,
-                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 )
                 .await
@@ -16610,10 +17303,7 @@ mod historical_control_loader {
                         primary_event_payload: Some(
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
-                        welcome_disposition_event_payloads: vec![(
-                            fulfillment.welcome_id,
-                            format!("g6-reset-welcome-{conversation_id}").into_bytes(),
-                        )],
+                        welcome_disposition_event_payloads: Vec::new(),
                     },
                 )
                 .await
@@ -17916,7 +18606,10 @@ mod historical_control_loader {
                 .bind(invitee.device_id)
                 .bind(format!("g6-reset-activation-{conversation_id}").into_bytes())
                 .bind(reset_activation_at)
-                .bind(format!("g6-reset-welcome-{conversation_id}").into_bytes())
+                .bind(expected_welcome_disposition_payload(
+                    fulfillment.welcome_id,
+                    "superseded",
+                ))
                 .fetch_one(&mut *tx)
                 .await
                 .expect("read exact Reset request/activation/Welcome event graph");
@@ -17942,14 +18635,32 @@ mod historical_control_loader {
                         UNION ALL SELECT 'entry_recipients',count(*)
                           FROM chat.entry_recipients WHERE conversation_id=$1
                         UNION ALL SELECT 'events',count(*)
-                          FROM chat.events
-                         WHERE protocol_instance_id=$2
-                           AND position($3::bytea IN payload_bytes)>0
+                          FROM chat.events event
+                         WHERE event.protocol_instance_id=$2
+                           AND (
+                                position($3::bytea IN event.payload_bytes)>0
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM chat.welcome_dispositions disposition
+                                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                                     WHERE disposition.event_position=event.event_position
+                                       AND bundle.conversation_id=$1
+                                )
+                           )
                         UNION ALL SELECT 'event_recipients',count(*)
-                          FROM chat.event_recipients recipient
+                         FROM chat.event_recipients recipient
                           JOIN chat.events event USING(event_position)
                          WHERE event.protocol_instance_id=$2
-                           AND position($3::bytea IN event.payload_bytes)>0
+                           AND (
+                                position($3::bytea IN event.payload_bytes)>0
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM chat.welcome_dispositions disposition
+                                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                                     WHERE disposition.event_position=event.event_position
+                                       AND bundle.conversation_id=$1
+                                )
+                           )
                         UNION ALL SELECT 'generations',count(*)
                           FROM chat.generations WHERE conversation_id=$1
                         UNION ALL SELECT 'generation_states',count(*)
@@ -17979,7 +18690,16 @@ mod historical_control_loader {
                           FROM chat.outbox outbox
                           JOIN chat.events event USING(event_position)
                          WHERE event.protocol_instance_id=$2
-                           AND position($3::bytea IN event.payload_bytes)>0
+                           AND (
+                                position($3::bytea IN event.payload_bytes)>0
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM chat.welcome_dispositions disposition
+                                      JOIN chat.welcome_bundles bundle USING(welcome_id)
+                                     WHERE disposition.event_position=event.event_position
+                                       AND bundle.conversation_id=$1
+                                )
+                           )
                         UNION ALL SELECT 'participants',count(*)
                           FROM chat.participants WHERE conversation_id=$1
                         UNION ALL SELECT 'participants.current',count(*)
@@ -18102,7 +18822,7 @@ mod historical_control_loader {
         async fn g6_recovery_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    false, false, None, false, false, false,
+                    false, false, None, false, false, false, false,
                 ),
             )
             .await;
@@ -18114,6 +18834,7 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
                     false,
                     false,
                     false,
@@ -18131,6 +18852,7 @@ mod historical_control_loader {
                     false,
                     false,
                     false,
+                    false,
                 ),
             )
             .await;
@@ -18142,6 +18864,7 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::DueExpiry),
+                    false,
                     false,
                     false,
                     false,
@@ -18159,6 +18882,7 @@ mod historical_control_loader {
                     false,
                     false,
                     false,
+                    false,
                 ),
             )
             .await;
@@ -18172,6 +18896,7 @@ mod historical_control_loader {
                     Some(G6WelcomeTerminalMode::Acknowledged),
                     true,
                     true,
+                    false,
                     false,
                 ),
             )
@@ -18187,6 +18912,7 @@ mod historical_control_loader {
                     true,
                     true,
                     false,
+                    false,
                 ),
             )
             .await;
@@ -18201,6 +18927,7 @@ mod historical_control_loader {
                     false,
                     true,
                     false,
+                    false,
                 ),
             )
             .await;
@@ -18212,6 +18939,22 @@ mod historical_control_loader {
                     false,
                     false,
                     Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
+                    false,
+                    true,
+                    false,
+                ),
+            )
+            .await;
+        }
+
+        async fn run_g6_welcome_terminal_uses_only_exact_recipient_lock() {
+            Box::pin(
+                run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
+                    false,
+                    false,
+                    Some(G6WelcomeTerminalMode::Acknowledged),
+                    false,
                     false,
                     false,
                     true,
@@ -18271,10 +19014,16 @@ mod historical_control_loader {
 
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
+        async fn g6_welcome_terminal_hydration_locks_only_the_exact_historical_recipient() {
+            Box::pin(run_g6_welcome_terminal_uses_only_exact_recipient_lock()).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_reset_lifecycle_uses_locked_production_planners_and_executor() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    true, false, None, false, false, false,
+                    true, false, None, false, false, false, false,
                 ),
             )
             .await;
@@ -18285,7 +19034,7 @@ mod historical_control_loader {
         async fn g6_delegated_reset_request_uses_member_requester_and_admin_activator() {
             Box::pin(
                 run_g6_recovery_lifecycle_uses_locked_production_planners_and_executor(
-                    true, true, None, false, false, false,
+                    true, true, None, false, false, false, false,
                 ),
             )
             .await;
@@ -22460,11 +23209,7 @@ mod historical_control_loader {
                     accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
                     genesis_group_info_bytes: None,
                     primary_event_payload: Some(format!("role-change-{seq}").into_bytes()),
-                    welcome_disposition_event_payloads: superseded_welcome
-                        .map(|welcome_id| {
-                            vec![(welcome_id, format!("welcome-superseded-{seq}").into_bytes())]
-                        })
-                        .unwrap_or_default(),
+                    welcome_disposition_event_payloads: Vec::new(),
                 },
             )
             .await

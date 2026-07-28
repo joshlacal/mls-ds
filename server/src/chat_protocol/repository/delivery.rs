@@ -1330,6 +1330,133 @@ pub(crate) fn canonical_welcome_disposition_event_payload(
     .into_bytes()
 }
 
+#[derive(sqlx::FromRow)]
+struct PendingWelcomeTerminalPreflightRow {
+    welcome_id: Uuid,
+    conversation_id: Uuid,
+    entry_seq: i64,
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: Vec<u8>,
+    expires_at: DateTime<Utc>,
+    status: String,
+}
+
+/// Lock and reverify the exact pending Welcome row before any terminal graph
+/// writer runs. The later `UPDATE ... WHERE status='pending'` remains the
+/// definitive CAS; this preflight closes the earlier prefix window by ensuring
+/// a stale/foreign/losing authority cannot append its event or outbox first.
+pub(crate) async fn preflight_pending_welcome_terminal_cas(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &crate::chat_protocol::state_machine::WelcomeCasBinding,
+    disposition: &WelcomeDisposition,
+    terminal_at: DateTime<Utc>,
+) -> Result<(), DeliveryRepositoryError> {
+    use crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle;
+    use crate::chat_protocol::state_machine::WelcomeStatus;
+
+    let winner_kind = disposition.winner_kind();
+    let expected_successor = match winner_kind {
+        "acknowledged" => WelcomeStatus::Acknowledged,
+        "rejected" => WelcomeStatus::Rejected,
+        "expired" => WelcomeStatus::Expired,
+        _ => return Err(DeliveryRepositoryError::InvalidTerminalAuthority),
+    };
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let recipient_did = std::str::from_utf8(binding.recipient().principal().as_bytes())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let expires_at = DateTime::<Utc>::from_timestamp_millis(binding.expires_at().unix_millis())
+        .ok_or(DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    if !binding.verify_seal()
+        || transaction_id != binding.transaction_id()
+        || binding.expected_status() != WelcomeStatus::Pending
+        || binding.successor_status() != expected_successor
+        || binding.coordinate().lifecycle() != PublicGroupSnapshotLifecycle::Active
+        || (winner_kind == "expired" && terminal_at != expires_at)
+        || (winner_kind != "expired"
+            && (terminal_at.timestamp_millis() != binding.locked_at().unix_millis()
+                || terminal_at >= expires_at))
+    {
+        return Err(DeliveryRepositoryError::InvalidTerminalAuthority);
+    }
+    let transition_seq = i64::try_from(binding.transition_seq())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let generation = i64::try_from(binding.coordinate().generation())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let state_version = i64::try_from(binding.coordinate().state_version())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let epoch = i64::try_from(binding.coordinate().epoch())
+        .map_err(|_| DeliveryRepositoryError::InvalidTerminalAuthority)?;
+    let welcome_id = Uuid::from_bytes(*binding.welcome_id());
+
+    let row: Option<PendingWelcomeTerminalPreflightRow> = sqlx::query_as(
+        r#"
+        SELECT
+            bundle.welcome_id,
+            bundle.conversation_id,
+            bundle.entry_seq,
+            bundle.generation,
+            bundle.state_version,
+            bundle.group_id,
+            bundle.epoch,
+            bundle.group_context_hash,
+            bundle.confirmation_tag,
+            bundle.wrapper_bytes,
+            bundle.wrapper_sha256,
+            delivery.recipient_did,
+            delivery.recipient_device_id,
+            delivery.recovery_request_id,
+            delivery.key_package_ref,
+            delivery.expires_at,
+            delivery.status
+          FROM chat.welcome_bundles AS bundle
+          JOIN chat.welcome_deliveries AS delivery USING(welcome_id)
+         WHERE bundle.welcome_id=$1
+         FOR UPDATE OF delivery
+        "#,
+    )
+    .bind(welcome_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    };
+    if row.status != "pending" {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+    if row.welcome_id != welcome_id
+        || row.conversation_id != Uuid::from_bytes(*binding.conversation_id())
+        || row.entry_seq != transition_seq
+        || row.generation != generation
+        || row.state_version != state_version
+        || row.group_id != binding.coordinate().group_id()
+        || row.epoch != epoch
+        || row.group_context_hash != binding.coordinate().group_context_hash()
+        || row.confirmation_tag != binding.coordinate().confirmation_tag()
+        || row.wrapper_sha256 != binding.opaque_welcome_sha256()
+        || <[u8; 32]>::from(Sha256::digest(&row.wrapper_bytes)) != *binding.opaque_welcome_sha256()
+        || row.recipient_did != recipient_did
+        || row.recipient_device_id != Uuid::from_bytes(*binding.recipient().device_id())
+        || row.recovery_request_id != Uuid::from_bytes(*binding.recovery_request_id())
+        || row.key_package_ref != binding.key_package_ref()
+        || row.expires_at != expires_at
+    {
+        return Err(DeliveryRepositoryError::InvalidTerminalAuthority);
+    }
+    Ok(())
+}
+
 /// Terminalize a pending Welcome delivery: the terminal race. In one call this
 /// compare-and-sets the delivery's status `pending -> winner_kind` (the immutable
 /// identity trigger allows only `status` + `terminal_at` to change, and the

@@ -21,8 +21,8 @@ use super::repository::auth::{BusinessAuthorityGuard, RepositoryAuthorityClass};
 use super::repository::core::{
     LockedConversationHeadGuard, LockedConversationStateGuard, LockedDirectConversationLookupGuard,
     LockedDirectLookupOutcome, LockedInvitationQuotaGuard, LockedRecoveryPackageGuard,
-    LockedRecoveryPackageStatus, LockedRecoveryPackageUse, LockedWelcomeClientAuthorization,
-    LockedWelcomeGuard, LockedWelcomeTerminal,
+    LockedRecoveryPackageStatus, LockedRecoveryPackageUse, LockedWelcomeGuard,
+    LockedWelcomeTerminal,
 };
 #[cfg(not(test))]
 use super::repository::core::{
@@ -35,6 +35,8 @@ use super::repository::relationship::{
     LockedNoPendingAdmissionGuard, LockedRelationshipDecisionGuard, RelationshipConsumptionError,
 };
 
+#[cfg(test)]
+use super::validation::CanonicalUuidV4;
 use super::{
     public_state::{
         process_commit, rebind_active_snapshot, verify_genesis_group_info, verify_recovery_welcome,
@@ -49,8 +51,7 @@ use super::{
         VerifiedControlEntry, VerifiedMutationProjection, VerifiedSignedMutation,
     },
     validation::{
-        ed25519_key_id, BareDid, CanonicalTimestamp, CanonicalUuidV4, KeyThumbprint,
-        TrustedRequestInstant,
+        ed25519_key_id, BareDid, CanonicalTimestamp, KeyThumbprint, TrustedRequestInstant,
     },
     wire::{
         validate_key_package, KeyPackageValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
@@ -809,6 +810,10 @@ enum RequestBodyBinding {
     WelcomeResponse {
         coordinates: PublicGroupSnapshotCoordinate,
         transition_seq: u64,
+        /// Present only for `welcomeRejection`. Retained from the verified
+        /// closed request body so the executor can bind recovery work to the
+        /// signed reason without trusting a separately hydrated value.
+        rejection_reason: Option<String>,
     },
 }
 
@@ -1041,6 +1046,8 @@ impl RequestEvidence {
         evidence.body_binding = Some(RequestBodyBinding::WelcomeResponse {
             coordinates,
             transition_seq,
+            rejection_reason: (kind == RequestEntryKind::WelcomeRejection)
+                .then(|| "invalidWelcome".to_owned()),
         });
         Ok(evidence)
     }
@@ -2668,6 +2675,7 @@ impl HydrationAuthority {
                 RequestBodyBinding::WelcomeResponse {
                     coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
                     transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+                    rejection_reason: None,
                 },
             ),
             VerifiedMutationProjection::WelcomeRejection(value) => (
@@ -2677,6 +2685,7 @@ impl HydrationAuthority {
                 RequestBodyBinding::WelcomeResponse {
                     coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
                     transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+                    rejection_reason: Some(closed_text(&value.body(), "reason")?.to_owned()),
                 },
             ),
             _ => return Err(StateMachineError::InvalidHydrationAuthority),
@@ -4457,6 +4466,7 @@ fn historical_signed_request_evidence(
             RequestBodyBinding::WelcomeResponse {
                 coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
                 transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+                rejection_reason: None,
             },
         ),
         VerifiedMutationProjection::WelcomeRejection(value) => (
@@ -4466,6 +4476,7 @@ fn historical_signed_request_evidence(
             RequestBodyBinding::WelcomeResponse {
                 coordinates: closed_coordinate_from_field(&value.body(), "coordinates")?,
                 transition_seq: closed_integer(&value.body(), "transitionSeq")?,
+                rejection_reason: Some(closed_text(&value.body(), "reason")?.to_owned()),
             },
         ),
         _ => return Err(StateMachineError::InvalidHydrationAuthority),
@@ -10589,7 +10600,10 @@ fn plan_welcome_response(
         Some(RequestBodyBinding::WelcomeResponse {
             coordinates,
             transition_seq,
-        }) if coordinates == &welcome.coordinate && *transition_seq == welcome.transition_seq => {}
+            rejection_reason,
+        }) if coordinates == &welcome.coordinate
+            && *transition_seq == welcome.transition_seq
+            && welcome_response_reason_matches(expected_kind, rejection_reason.as_deref()) => {}
         _ => return Err(StateMachineError::InvalidWelcomeMapping),
     }
     if evidence.received_at >= welcome.expires_at {
@@ -10653,6 +10667,23 @@ fn plan_welcome_expiry(
     })
 }
 
+fn welcome_response_reason_matches(kind: RequestEntryKind, rejection_reason: Option<&str>) -> bool {
+    match (kind, rejection_reason) {
+        (RequestEntryKind::WelcomeAcknowledgement, None) => true,
+        (
+            RequestEntryKind::WelcomeRejection,
+            Some(
+                "noMatchingKeyPackage"
+                | "invalidWelcome"
+                | "unsupportedCipherSuite"
+                | "coordinateMismatch"
+                | "localStateConflict",
+            ),
+        ) => true,
+        _ => false,
+    }
+}
+
 fn welcome_endpoint_matches(
     evidence: &RequestEvidence,
     welcome_id: &[u8; 16],
@@ -10673,7 +10704,13 @@ fn welcome_endpoint_matches(
             Some(RequestBodyBinding::WelcomeResponse {
                 coordinates,
                 transition_seq: signed_transition_seq,
-            }) if coordinates == coordinate && *signed_transition_seq == transition_seq
+                rejection_reason,
+            }) if coordinates == coordinate
+                && *signed_transition_seq == transition_seq
+                && welcome_response_reason_matches(
+                    evidence.kind(),
+                    rejection_reason.as_deref(),
+                )
         )
 }
 
@@ -15844,8 +15881,13 @@ fn validate_welcome_work(state: &ConversationState) -> Result<(), StateMachineEr
                                 Some(RequestBodyBinding::WelcomeResponse {
                                     coordinates,
                                     transition_seq,
+                                    rejection_reason,
                                 }) if coordinates == &welcome.coordinate
                                     && *transition_seq == welcome.transition_seq
+                                    && welcome_response_reason_matches(
+                                        expected_kind,
+                                        rejection_reason.as_deref(),
+                                    )
                             )
                     }
                     _ => false,
@@ -15933,12 +15975,12 @@ mod executor {
         LeafRecoveryKind as RepoLeafRecoveryKind, LeafRecoverySource, LeafRecoveryTermination,
         LeaveRequestTermination, NewDeviceRevocation, NewGeneration, NewGenerationState,
         NewLeafPeriod, NewLeafRecoveryRequest, NewLeaveRequest, NewMetadataSnapshot,
-        NewParticipantPeriod, NewReservation, NewResetRequest, NewTransition,
-        PackageStatus as RepoPackageStatus, PackageSuccessor, ParticipantAcceptance,
-        ParticipantAcceptanceCas, ParticipantInvitation, ParticipantRole as RepoParticipantRole,
-        ParticipantRoleCas, ParticipantStatus as RepoParticipantStatus, RegistrationRevoke,
-        ReservationTermination, ResetRequestTermination, TransitionActorRole,
-        TransitionCoordinates, TransitionKind, TransitionRepositoryError,
+        NewParticipantPeriod, NewReservation, NewTransition, PackageStatus as RepoPackageStatus,
+        PackageSuccessor, ParticipantAcceptance, ParticipantAcceptanceCas, ParticipantInvitation,
+        ParticipantRole as RepoParticipantRole, ParticipantRoleCas,
+        ParticipantStatus as RepoParticipantStatus, RegistrationRevoke, ReservationTermination,
+        ResetRequestTermination, TransitionActorRole, TransitionCoordinates, TransitionKind,
+        TransitionRepositoryError,
     };
     use super::{
         classify_role_producer, coordinate_is_in_lineage, coordinate_only_successor,
@@ -18272,6 +18314,334 @@ mod executor {
         })
     }
 
+    fn terminal_welcome_context_is_closed(
+        ctx: &ExecutionContext,
+        response: bool,
+    ) -> Result<(), ExecutorError> {
+        if !ctx.opened_leaves.is_empty()
+            || ctx.metadata_author.is_some()
+            || !ctx.participant_period_ids.is_empty()
+            || !ctx.leaf_period_ids.is_empty()
+            || !ctx.entry_recipients.is_empty()
+            || !ctx.events.is_empty()
+            || !ctx.closing_leaf_periods.is_empty()
+            || !ctx.closing_participant_periods.is_empty()
+            || ctx.reset_request_row.is_some()
+            || ctx.recovery_open.is_some()
+            || !ctx.welcome_dispositions.is_empty()
+            || (response && ctx.welcome_expiry.is_some())
+            || (!response && ctx.welcome_response.is_some())
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome terminal context carries an unrelated family",
+            ));
+        }
+        Ok(())
+    }
+
+    fn exact_welcome_actor_role(
+        plan: &ConversationPersistencePlan,
+        actor: &DeviceIdentity,
+    ) -> Result<TransitionActorRole, ExecutorError> {
+        let participant = plan
+            .state()
+            .participants
+            .iter()
+            .find(|participant| participant.principal == *actor.principal())
+            .ok_or(ExecutorError::InconsistentPlan(
+                "Welcome actor has no exact participant role",
+            ))?;
+        Ok(match participant.role {
+            ParticipantRole::Member => TransitionActorRole::Member,
+            ParticipantRole::Admin => TransitionActorRole::Admin,
+        })
+    }
+
+    fn repository_welcome_rejection_reason(value: &str) -> Option<WelcomeRejectionReason> {
+        match value {
+            "noMatchingKeyPackage" => Some(WelcomeRejectionReason::NoMatchingKeyPackage),
+            "invalidWelcome" => Some(WelcomeRejectionReason::InvalidWelcome),
+            "unsupportedCipherSuite" => Some(WelcomeRejectionReason::UnsupportedCipherSuite),
+            "coordinateMismatch" => Some(WelcomeRejectionReason::CoordinateMismatch),
+            "localStateConflict" => Some(WelcomeRejectionReason::LocalStateConflict),
+            _ => None,
+        }
+    }
+
+    async fn preflight_welcome_terminal_event(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        event: &EventFanout,
+        welcome_id: Uuid,
+        status: &str,
+        recipient: &DeviceIdentity,
+    ) -> Result<(), ExecutorError> {
+        let protocol_instance_id: Uuid = sqlx::query_scalar(
+            "SELECT protocol_instance_id FROM chat.protocol_instances \
+             WHERE singleton FOR SHARE",
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DeliveryRepositoryError::from)?;
+        if ctx.protocol_instance_id != protocol_instance_id
+            || !super::is_uuid_v4(event.event_id.as_bytes())
+            || event.event_kind != EventKind::WelcomeDisposition
+            || event.payload_bytes
+                != delivery::canonical_welcome_disposition_event_payload(welcome_id, status)
+            || event.recipients.len() != 1
+            || event.recipients[0].0 != *recipient
+            || event.recipients[0].1 != EventEntitlementKind::Welcome
+            || event.outbox.len() != 1
+            || !super::is_uuid_v4(event.outbox[0].0.as_bytes())
+            || event.outbox[0].1 != OutboxWorkKind::Stream
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome terminal event context is not exact",
+            ));
+        }
+        let current_predecessor: Option<i64> = sqlx::query_scalar(
+            "SELECT max(event_position) FROM chat.event_recipients \
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(device_did(recipient)?)
+        .bind(device_uuid(recipient))
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DeliveryRepositoryError::from)?;
+        if event.recipients[0].2 != current_predecessor {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome terminal event predecessor is stale",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn preflight_welcome_response_execution_context(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        head: &super::ConversationHeadCasBinding,
+        welcome_cas: &super::WelcomeCasBinding,
+        responded: &WelcomeWork,
+        response: &WelcomeResponseContext,
+        successor_status: WelcomeStatus,
+    ) -> Result<(), ExecutorError> {
+        terminal_welcome_context_is_closed(ctx, true)?;
+        let expected_kind = match successor_status {
+            WelcomeStatus::Acknowledged => super::RequestEntryKind::WelcomeAcknowledgement,
+            WelcomeStatus::Rejected => super::RequestEntryKind::WelcomeRejection,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "Welcome response has an invalid successor",
+                ))
+            }
+        };
+        let evidence = match plan.effects().authority() {
+            Some(PlanAuthority::Request(evidence)) => evidence,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "Welcome response lacks request authority",
+                ))
+            }
+        };
+        super::validate_request_evidence(
+            evidence,
+            expected_kind,
+            welcome_cas.conversation_id(),
+            responded.welcome_id(),
+            responded.recipient(),
+            evidence.received_at,
+        )
+        .map_err(|_| {
+            ExecutorError::InconsistentPlan("Welcome response request evidence is invalid")
+        })?;
+        let signed = evidence
+            .authority
+            .as_ref()
+            .ok_or(ExecutorError::MissingContext(
+                "authenticated Welcome request evidence",
+            ))?;
+        let signed_reason = match evidence.body_binding.as_ref() {
+            Some(super::RequestBodyBinding::WelcomeResponse {
+                coordinates,
+                transition_seq,
+                rejection_reason,
+            }) if coordinates == responded.coordinate()
+                && *transition_seq == responded.transition_seq()
+                && super::welcome_response_reason_matches(
+                    expected_kind,
+                    rejection_reason.as_deref(),
+                ) =>
+            {
+                rejection_reason.as_deref()
+            }
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "Welcome response body binding is invalid",
+                ))
+            }
+        };
+        let expected_applied_at = server_instant(evidence.received_at)?;
+        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(DeliveryRepositoryError::from)?;
+        if transaction_id != head.transaction_id()
+            || transaction_id != welcome_cas.transaction_id()
+            || head.conversation_id() != welcome_cas.conversation_id()
+            || head.expected_prior() != Some(responded.coordinate())
+            || head.allocated_entry_id().is_some()
+            || head.allocated_seq().is_some()
+            || head.expected_next_entry_seq() != head.successor_next_entry_seq()
+            || head.locked_at() != evidence.received_at
+            || head.locked_at() != welcome_cas.locked_at()
+            || head.locked_head_digest() == &[0; 32]
+            || welcome_cas.locked_row_digest() == &[0; 32]
+            || ctx.applied_at != expected_applied_at
+            || ctx.applied_at != server_instant(welcome_cas.locked_at())?
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome response transaction/head authority is inconsistent",
+            ));
+        }
+        let entry = match &ctx.authority {
+            ExecutionAuthority::ControlEntry(entry) => entry,
+            ExecutionAuthority::Entryless { .. } => {
+                return Err(ExecutorError::MissingContext(
+                    "signed Welcome response execution authority",
+                ))
+            }
+        };
+        let expected_actor_did = device_did(evidence.actor())?;
+        if entry.entry_id.as_bytes() != evidence.request_id()
+            || entry.entry_kind != signed.type_id()
+            || entry.accepted_payload_bytes != signed.signed_request_bytes()
+            || entry.accepted_payload_bytes != evidence.signed_request_bytes
+            || entry.accepted_payload_sha256.as_slice()
+                != sha2::Sha256::digest(&entry.accepted_payload_bytes).as_slice()
+            || entry.signed_request_bytes != signed.signed_request_bytes()
+            || entry.unsigned_projection_bytes != signed.canonical_projection()
+            || entry.signing_transcript_bytes != signed.transcript_bytes()
+            || entry.request_digest != signed.request_digest()
+            || entry.signature != signed.signature()
+            || !entry.server_fields_bytes.is_empty()
+            || entry.outer_entry_fingerprint != evidence.durable_row_digest()
+            || ctx.actor.user_did != expected_actor_did
+            || ctx.actor.device_id != device_uuid(evidence.actor())
+            || ctx.actor.key_id != URL_SAFE_NO_PAD.encode(signed.key_id())
+            || u64::try_from(ctx.actor.auth_generation).ok() != Some(signed.auth_generation())
+            || ctx.actor.role != exact_welcome_actor_role(plan, evidence.actor())?
+            || ctx.actor.device_status != "active"
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome response execution authority/context drifted",
+            ));
+        }
+        match successor_status {
+            WelcomeStatus::Acknowledged if response.rejection.is_none() => {}
+            WelcomeStatus::Rejected => {
+                let rejection =
+                    response
+                        .rejection
+                        .as_ref()
+                        .ok_or(ExecutorError::MissingContext(
+                            "welcome rejection recovery work",
+                        ))?;
+                if !super::is_uuid_v4(rejection.recovery_work_id.as_bytes())
+                    || signed_reason.and_then(repository_welcome_rejection_reason)
+                        != Some(rejection.reason)
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "Welcome rejection work is not bound to the signed reason",
+                    ));
+                }
+            }
+            WelcomeStatus::Acknowledged => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "welcome acknowledgement must not carry rejection recovery work",
+                ))
+            }
+            _ => unreachable!("successor status checked above"),
+        }
+        let status = match successor_status {
+            WelcomeStatus::Acknowledged => "acknowledged",
+            WelcomeStatus::Rejected => "rejected",
+            _ => unreachable!("successor status checked above"),
+        };
+        preflight_welcome_terminal_event(
+            transaction,
+            ctx,
+            &response.event,
+            Uuid::from_bytes(*responded.welcome_id()),
+            status,
+            responded.recipient(),
+        )
+        .await
+    }
+
+    async fn preflight_welcome_expiry_execution_context(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        head: &super::ConversationHeadCasBinding,
+        welcome_cas: &super::WelcomeCasBinding,
+        expired: &WelcomeWork,
+        expiry: &WelcomeExpiryContext,
+    ) -> Result<(), ExecutorError> {
+        terminal_welcome_context_is_closed(ctx, false)?;
+        let evidence = match plan.effects().authority() {
+            Some(PlanAuthority::WelcomeExpiry(evidence)) => evidence,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "Welcome expiry lacks expiry authority",
+                ))
+            }
+        };
+        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(DeliveryRepositoryError::from)?;
+        if transaction_id != head.transaction_id()
+            || transaction_id != welcome_cas.transaction_id()
+            || head.conversation_id() != welcome_cas.conversation_id()
+            || head.expected_prior() != Some(expired.coordinate())
+            || head.allocated_entry_id().is_some()
+            || head.allocated_seq().is_some()
+            || head.expected_next_entry_seq() != head.successor_next_entry_seq()
+            || head.locked_at() != evidence.observed_at()
+            || head.locked_at() != welcome_cas.locked_at()
+            || head.locked_head_digest() == &[0; 32]
+            || welcome_cas.locked_row_digest() == &[0; 32]
+            || evidence.welcome_id() != expired.welcome_id()
+            || evidence.recipient() != expired.recipient()
+            || evidence.coordinate() != expired.coordinate()
+            || evidence.transition_seq() != expired.transition_seq()
+            || evidence.terminal_at() != expired.expires_at()
+            || evidence.observed_at() < evidence.terminal_at()
+            || evidence.locked_row_digest() != welcome_cas.locked_row_digest()
+            || ctx.applied_at != server_instant(evidence.terminal_at())?
+            || ctx.operation_id().as_bytes() != evidence.welcome_id()
+            || ctx.actor.user_did != device_did(evidence.recipient())?
+            || ctx.actor.device_id != device_uuid(evidence.recipient())
+            || ctx.actor.role != exact_welcome_actor_role(plan, evidence.recipient())?
+            || !super::is_uuid_v4(expiry.recovery_work_id.as_bytes())
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "Welcome expiry authority/context drifted",
+            ));
+        }
+        preflight_welcome_terminal_event(
+            transaction,
+            ctx,
+            &expiry.event,
+            Uuid::from_bytes(*expired.welcome_id()),
+            "expired",
+            expired.recipient(),
+        )
+        .await
+    }
+
     /// Apply an entry-less `welcomeExpiry` op: a server-observed pending Welcome
     /// past its `expires_at` is terminalized `expired` and a `welcomeExpired`
     /// `recovery_work_items` row is created so the recipient can be re-added later.
@@ -18406,6 +18776,23 @@ mod executor {
             .welcome_expiry
             .as_ref()
             .ok_or(ExecutorError::MissingContext("welcome expiry context"))?;
+        preflight_welcome_expiry_execution_context(
+            transaction,
+            plan,
+            ctx,
+            head,
+            welcome_cas,
+            expired,
+            expiry,
+        )
+        .await?;
+        delivery::preflight_pending_welcome_terminal_cas(
+            transaction,
+            welcome_cas,
+            &WelcomeDisposition::Expired,
+            terminal_at,
+        )
+        .await?;
 
         // 1. Head CAS VERIFY (coordinate + seq counter both UNCHANGED).
         transition::cas_conversation_head(
@@ -18964,6 +19351,17 @@ mod executor {
             .welcome_response
             .as_ref()
             .ok_or(ExecutorError::MissingContext("welcome response context"))?;
+        preflight_welcome_response_execution_context(
+            transaction,
+            plan,
+            ctx,
+            head,
+            welcome_cas,
+            responded,
+            response,
+            successor_status,
+        )
+        .await?;
         // The client-authored signed authorization the disposition row binds — the
         // signed request's bytes/digest/signature (the signature-shape trigger
         // requires them non-NULL for acknowledged/rejected).
@@ -19007,6 +19405,13 @@ mod executor {
                     ))
                 }
             };
+        delivery::preflight_pending_welcome_terminal_cas(
+            transaction,
+            welcome_cas,
+            &disposition,
+            applied_at,
+        )
+        .await?;
 
         // 1. Head CAS VERIFY (coordinate + seq counter both UNCHANGED).
         transition::cas_conversation_head(

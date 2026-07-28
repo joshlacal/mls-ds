@@ -1217,11 +1217,21 @@ pub(crate) async fn hydrate_execution_context(
     // the actor/key or reading any predecessor. Close deliberately uses only
     // the historical schedule audience; mixing a separate current-audience
     // phase could invert device lock order across two conversations.
+    let terminal_welcome = matches!(
+        plan.effects().kind(),
+        PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection | PlanKind::WelcomeExpiry
+    );
     let (normal_audience, historical_audience) = if plan.effects().kind() == PlanKind::Close {
         (
             Vec::new(),
             historical_schedule_audience(transaction, conversation_id, &facts.actor).await?,
         )
+    } else if terminal_welcome {
+        // A terminal Welcome event has one historical recipient fixed by the
+        // locked Welcome itself. Do not relock the conversation's broad current
+        // audience: `event()` below takes the exact recipient's device-global
+        // serialization lock before reading its predecessor.
+        (Vec::new(), Vec::new())
     } else {
         (
             standard_audience(transaction, plan, &facts.actor).await?,
@@ -1279,14 +1289,11 @@ pub(crate) async fn hydrate_execution_context(
             .collect()
     };
 
-    let mut disposition_payloads = BTreeMap::new();
-    for (welcome_id, payload) in &artifacts.welcome_disposition_event_payloads {
-        if disposition_payloads
-            .insert(*welcome_id, payload.clone())
-            .is_some()
-        {
-            return Err(ExecutionContextHydrationError::ArtifactMismatch);
-        }
+    if !artifacts.welcome_disposition_event_payloads.is_empty() {
+        // Supersession disposition payloads are repository-owned canonical
+        // protocol projections. Accepting caller bytes here lets append-time
+        // and historical terminal-graph verification disagree.
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
     let superseded = plan
         .effects()
@@ -1302,9 +1309,6 @@ pub(crate) async fn hydrate_execution_context(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if superseded.len() != disposition_payloads.len() {
-        return Err(ExecutionContextHydrationError::ArtifactMismatch);
-    }
     let disposition_recipients = superseded
         .iter()
         .map(|welcome| welcome.recipient().clone())
@@ -1315,9 +1319,8 @@ pub(crate) async fn hydrate_execution_context(
     let mut welcome_dispositions = Vec::with_capacity(superseded.len());
     for welcome in superseded {
         let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
-        let payload = disposition_payloads
-            .remove(&welcome_id)
-            .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+        let payload =
+            super::delivery::canonical_welcome_disposition_event_payload(welcome_id, "superseded");
         welcome_dispositions.push(WelcomeDispositionInput {
             welcome_id,
             event: event(
