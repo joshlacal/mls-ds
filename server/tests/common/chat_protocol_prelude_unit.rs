@@ -1,6 +1,7 @@
 use super::{
-    auth, canonical_operation_lock_key, CanonicalDeviceIdentity, CanonicalLockScope,
-    OperationArbitration, ReplayCandidate,
+    auth, bootstrap_completion_digest, canonical_operation_lock_key, BootstrapCompletionGuard,
+    BootstrapCompletionJktShape, CanonicalDeviceIdentity, CanonicalLockScope, OperationArbitration,
+    OperationClaimGuard, ReplayCandidate,
 };
 use super::{OperationClaimBinding, OperationClaimRow};
 use chrono::{TimeZone, Utc};
@@ -613,4 +614,538 @@ fn unvalidated_replay_debug_never_exposes_response_material() {
         assert!(!rendered.contains("598"));
         assert!(!rendered.contains(&format!("{response_bytes:?}")));
     }
+}
+
+#[test]
+fn bootstrap_completion_guard_rejects_foreign_transaction() {
+    let (guard, binding, scope_receipt, scope_digest, instant) = enrollment_guard_fixture();
+    assert!(guard.matches_test_material(
+        "bootstrap-test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+    assert!(!guard.matches_test_material(
+        "foreign-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+}
+
+#[test]
+fn bootstrap_completion_guard_rejects_digest_mismatch() {
+    let (guard, binding, scope_receipt, scope_digest, instant) = enrollment_guard_fixture();
+    assert!(!guard.matches_test_material(
+        "bootstrap-test-tx",
+        &binding,
+        Uuid::from_u128(2),
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+    assert!(!guard.matches_test_material(
+        "bootstrap-test-tx",
+        &binding,
+        scope_receipt,
+        &[2u8; 32],
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+}
+
+#[test]
+fn bootstrap_completion_guard_rejects_claim_and_completion_token_mismatch() {
+    let (guard, binding, scope_receipt, scope_digest, instant) = enrollment_guard_fixture();
+    let mut changed_binding = OperationClaimBinding::for_test(
+        binding.operation_id,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        &binding.mutation_kind,
+        binding.request_digest,
+        binding.accepted_request_sha256,
+        [8u8; 64],
+        instant,
+    );
+    assert!(!guard.matches_test_material(
+        "bootstrap-test-tx",
+        &changed_binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+    changed_binding.operation_id = Uuid::from_u128(9);
+    assert!(!guard.matches_test_material(
+        "bootstrap-test-tx",
+        &changed_binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    ));
+}
+
+#[test]
+fn rebind_completion_guard_rejects_old_jkt_generation_key_and_signature_drift() {
+    let op_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
+    let scope_receipt = Uuid::from_u128(2);
+    let scope_digest = [3u8; 32];
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        op_id,
+        "did:plc:test",
+        "blue.catbird.chat.rebindDeviceAuthentication",
+        "deviceAuthenticationRebind",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        instant,
+    );
+    let guard = BootstrapCompletionGuard {
+        operation: OperationClaimGuard {
+            transaction_id: "rebind-test-tx".to_owned(),
+            binding: OperationClaimBinding::for_test(
+                op_id,
+                "did:plc:test",
+                "blue.catbird.chat.rebindDeviceAuthentication",
+                "deviceAuthenticationRebind",
+                [7u8; 32],
+                [8u8; 32],
+                [9u8; 64],
+                instant,
+            ),
+        },
+        scope_receipt_id: scope_receipt,
+        authority_digest: bootstrap_completion_digest(
+            "rebind-test-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(3),
+            "new-jkt",
+            Some("old-jkt"),
+            Some("key-id"),
+            Some(7),
+            Some(&[2u8; 32]),
+        ),
+        scope_digest,
+        jkt_shape: BootstrapCompletionJktShape::Rebind {
+            historical: "old-jkt".to_owned(),
+            current: "new-jkt".to_owned(),
+        },
+    };
+    for (old_jkt, generation, key_id, key_digest) in [
+        ("drifted-old-jkt", 7, "key-id", [2u8; 32]),
+        ("old-jkt", 8, "key-id", [2u8; 32]),
+        ("old-jkt", 7, "other-key", [2u8; 32]),
+        ("old-jkt", 7, "key-id", [4u8; 32]),
+    ] {
+        assert!(!guard.matches_test_material(
+            "rebind-test-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(3),
+            "new-jkt",
+            Some(old_jkt),
+            Some(key_id),
+            Some(generation),
+            Some(&key_digest),
+        ));
+    }
+}
+
+fn enrollment_guard_fixture() -> (
+    BootstrapCompletionGuard,
+    OperationClaimBinding,
+    Uuid,
+    [u8; 32],
+    chrono::DateTime<Utc>,
+) {
+    let operation_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        operation_id,
+        "did:plc:test",
+        "blue.catbird.chat.enrollDevice",
+        "deviceEnrollment",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        instant,
+    );
+    let scope_receipt = Uuid::from_u128(11);
+    let scope_digest = [1u8; 32];
+    let authority_digest = bootstrap_completion_digest(
+        "bootstrap-test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    );
+    let guard = BootstrapCompletionGuard {
+        operation: OperationClaimGuard {
+            transaction_id: "bootstrap-test-tx".to_owned(),
+            binding: OperationClaimBinding::for_test(
+                operation_id,
+                "did:plc:test",
+                "blue.catbird.chat.enrollDevice",
+                "deviceEnrollment",
+                [7u8; 32],
+                [8u8; 32],
+                [9u8; 64],
+                instant,
+            ),
+        },
+        scope_receipt_id: scope_receipt,
+        authority_digest,
+        scope_digest,
+        jkt_shape: BootstrapCompletionJktShape::Enrollment {
+            current: "new-jkt".to_owned(),
+        },
+    };
+    (guard, binding, scope_receipt, scope_digest, instant)
+}
+
+#[test]
+fn bootstrap_completion_digest_is_deterministic() {
+    let op_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
+    let scope_receipt = Uuid::parse_str("f0000000-0000-4000-a000-000000000001").unwrap();
+    let scope_digest = [1u8; 32];
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        op_id,
+        "did:plc:test",
+        "blue.catbird.chat.enrollDevice",
+        "deviceEnrollment",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        Utc.timestamp_millis_opt(1_785_252_309_123).unwrap(),
+    );
+    let first = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    );
+    let second = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        first, second,
+        "deterministic inputs must produce identical digests"
+    );
+}
+
+#[test]
+fn bootstrap_completion_digest_differs_per_jkt_shape() {
+    let op_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
+    let scope_receipt = Uuid::parse_str("f0000000-0000-4000-a000-000000000001").unwrap();
+    let scope_digest = [1u8; 32];
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        op_id,
+        "did:plc:test",
+        "blue.catbird.chat.enrollDevice",
+        "deviceEnrollment",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        instant,
+    );
+    // Enrollment: (None, Some(new)), Rebind: (Some(old), Some(new)), Replenishment: (None, None)
+    let enrollment = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    );
+    let replenishment = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "",
+        None,
+        None,
+        None,
+        None,
+    );
+    let rebind = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        Some("old-jkt"),
+        Some("key-id"),
+        Some(7),
+        Some(&[2u8; 32]),
+    );
+    assert!(
+        enrollment != replenishment || enrollment != rebind || replenishment != rebind,
+        "each JKT shape must produce a distinct digest"
+    );
+}
+
+#[test]
+fn bootstrap_completion_digest_changes_on_every_input_field() {
+    let op_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
+    let scope_receipt = Uuid::parse_str("f0000000-0000-4000-a000-000000000001").unwrap();
+    let scope_digest = [1u8; 32];
+    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
+    let binding = OperationClaimBinding::for_test(
+        op_id,
+        "did:plc:test",
+        "blue.catbird.chat.enrollDevice",
+        "deviceEnrollment",
+        [7u8; 32],
+        [8u8; 32],
+        [9u8; 64],
+        instant,
+    );
+    let baseline = bootstrap_completion_digest(
+        "test-tx",
+        &binding,
+        scope_receipt,
+        &scope_digest,
+        instant,
+        "did:plc:test",
+        Uuid::from_u128(1),
+        "new-jkt",
+        None,
+        None,
+        None,
+        None,
+    );
+    let variants: Vec<[u8; 32]> = vec![
+        // different operation_id
+        bootstrap_completion_digest(
+            "test-tx",
+            &OperationClaimBinding::for_test(
+                Uuid::parse_str("00000000-0000-4000-a000-000000000001").unwrap(),
+                "did:plc:test",
+                "blue.catbird.chat.enrollDevice",
+                "deviceEnrollment",
+                [7u8; 32],
+                [8u8; 32],
+                [9u8; 64],
+                instant,
+            ),
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(1),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different transaction id
+        bootstrap_completion_digest(
+            "other-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(1),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different scope_receipt
+        bootstrap_completion_digest(
+            "test-tx",
+            &binding,
+            Uuid::from_u128(2),
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(1),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different scope_digest
+        bootstrap_completion_digest(
+            "test-tx",
+            &binding,
+            scope_receipt,
+            &[2u8; 32],
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(1),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different principal
+        bootstrap_completion_digest(
+            "test-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:other",
+            Uuid::from_u128(1),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different device
+        bootstrap_completion_digest(
+            "test-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(2),
+            "new-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+        // different current_jkt
+        bootstrap_completion_digest(
+            "test-tx",
+            &binding,
+            scope_receipt,
+            &scope_digest,
+            instant,
+            "did:plc:test",
+            Uuid::from_u128(1),
+            "other-jkt",
+            None,
+            None,
+            None,
+            None,
+        ),
+    ];
+    for (i, variant) in variants.iter().enumerate() {
+        assert!(
+            baseline != *variant,
+            "variant {i} produced the same digest as the baseline"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_completion_resource_functions_never_commit() {
+    let source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    for function_name in [
+        "complete_enrollment_bootstrap_operation",
+        "complete_rebind_bootstrap_operation",
+        "complete_replenishment_operation",
+    ] {
+        assert!(source.contains(function_name), "missing {function_name}");
+    }
+    assert!(
+        source.contains("validate_bootstrap_completion"),
+        "common completion validator must exist"
+    );
+    // The functions consume the guard and call validate_bootstrap_completion;
+    // no outer commit is performed in any of them.
+    assert!(
+        source.matches(".commit();").count() <= source.matches("self.").count(),
+        "completion functions must not commit the outer transaction"
+    );
 }

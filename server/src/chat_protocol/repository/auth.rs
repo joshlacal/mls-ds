@@ -137,6 +137,25 @@ impl RepositoryAuthorityReceipt {
         }
     }
 
+    fn rebind_operation_only(
+        replay_ids: ReplayAuditIds,
+        operation_id: Uuid,
+        historical_jkt: &str,
+        expected_auth_generation: i64,
+        key_id: &str,
+        signing_public_key: &[u8],
+    ) -> Self {
+        Self {
+            replay_ids,
+            class: RepositoryAuthorityClass::RebindBootstrap,
+            operation_id: Some(operation_id),
+            locked_jkt: Some(historical_jkt.to_owned()),
+            locked_auth_generation: Some(expected_auth_generation),
+            locked_key_id: Some(key_id.to_owned()),
+            locked_signing_key_sha256: Some(Sha256::digest(signing_public_key).into()),
+        }
+    }
+
     pub(crate) fn replay_ids(&self) -> ReplayAuditIds {
         self.replay_ids
     }
@@ -217,6 +236,45 @@ pub(crate) enum AuthorizationOutcome {
     CompletedReplay(CompletedIdempotentResponse),
 }
 
+/// Replay-consumed enrollment capability that deliberately carries no
+/// completed response bytes. Only the operation prelude may open it.
+#[must_use]
+pub(crate) struct EnrollmentOperationAdmission {
+    authority: VerifiedChatDeviceRequest,
+}
+
+/// Replay-consumed rebind capability sealed to the request's exact old
+/// authority tuple. Only the operation prelude may open it.
+#[must_use]
+pub(crate) struct RebindOperationAdmission {
+    authority: VerifiedChatDeviceRequest,
+}
+
+/// Replay-consumed replenishment capability sealed to the current registered
+/// signing authority. Only the operation prelude may open it.
+#[must_use]
+pub(crate) struct ReplenishmentOperationAdmission {
+    authority: VerifiedChatDeviceRequest,
+}
+
+impl EnrollmentOperationAdmission {
+    pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
+        self.authority
+    }
+}
+
+impl RebindOperationAdmission {
+    pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
+        self.authority
+    }
+}
+
+impl ReplenishmentOperationAdmission {
+    pub(super) fn into_authority(self) -> VerifiedChatDeviceRequest {
+        self.authority
+    }
+}
+
 pub(crate) struct CompletedIdempotentResponse {
     status: i32,
     response_bytes: Vec<u8>,
@@ -259,6 +317,96 @@ pub(crate) struct BusinessAuthorityGuard {
     stored_key_id: Option<String>,
     stored_signing_public_key: Option<Vec<u8>>,
     trusted_instant: DateTime<Utc>,
+}
+
+/// Non-clone proof that the globally reserved enrollment operation locked the
+/// exact identity slot and observed no device row.
+#[derive(Debug)]
+pub(crate) struct EnrollmentAbsenceLockedBootstrapScope {
+    transaction_id: String,
+    receipt_id: Uuid,
+    subject: String,
+    device_id: Uuid,
+    new_jkt: String,
+    trusted_instant: DateTime<Utc>,
+    scope_digest: [u8; 32],
+}
+
+/// Non-clone proof that the globally reserved rebind operation locked and
+/// verified the exact old device/key state.
+#[derive(Debug)]
+pub(crate) struct RebindOldStateLockedBootstrapScope {
+    transaction_id: String,
+    receipt_id: Uuid,
+    subject: String,
+    device_id: Uuid,
+    old_jkt: String,
+    new_jkt: String,
+    old_auth_generation: i64,
+    key_id: String,
+    signing_public_key: Vec<u8>,
+    trusted_instant: DateTime<Utc>,
+    scope_digest: [u8; 32],
+}
+
+impl EnrollmentAbsenceLockedBootstrapScope {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+    pub(crate) fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+    pub(crate) fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+    pub(crate) fn new_jkt(&self) -> &str {
+        &self.new_jkt
+    }
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.trusted_instant
+    }
+    pub(crate) fn scope_digest(&self) -> &[u8; 32] {
+        &self.scope_digest
+    }
+}
+
+impl RebindOldStateLockedBootstrapScope {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+    pub(crate) fn receipt_id(&self) -> Uuid {
+        self.receipt_id
+    }
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+    pub(crate) fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+    pub(crate) fn old_jkt(&self) -> &str {
+        &self.old_jkt
+    }
+    pub(crate) fn new_jkt(&self) -> &str {
+        &self.new_jkt
+    }
+    pub(crate) fn old_auth_generation(&self) -> i64 {
+        self.old_auth_generation
+    }
+    pub(crate) fn key_id(&self) -> &str {
+        &self.key_id
+    }
+    pub(crate) fn signing_public_key(&self) -> &[u8] {
+        &self.signing_public_key
+    }
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.trusted_instant
+    }
+    pub(crate) fn scope_digest(&self) -> &[u8; 32] {
+        &self.scope_digest
+    }
 }
 
 /// Opaque proof that this transaction acquired the globally canonical
@@ -817,6 +965,153 @@ pub(crate) async fn authorize_rebind_request(
     }
 }
 
+/// Consumes enrollment replay evidence and returns an opaque operation-only
+/// capability. It intentionally performs neither business arbitration nor
+/// completed-response loading; absence locking and replay release belong to
+/// the caller-owned global operation prelude.
+pub(crate) async fn authorize_enrollment_operation_only(
+    pool: &PgPool,
+    pre_replay: PreReplayCryptographicVerification,
+) -> Result<EnrollmentOperationAdmission, AuthRepositoryError> {
+    let unsupported_shape = pre_replay.endpoint().as_str() != "blue.catbird.chat.enrollDevice"
+        || pre_replay.enrollment_body().is_none()
+        || pre_replay.rebind_bootstrap().is_some()
+        || pre_replay.auth_transaction_replay().is_none();
+    let mut transaction = pool.begin().await?;
+    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
+    let decision = if unsupported_shape {
+        Err(AuthRepositoryError::UnsupportedAuthorizationShape)
+    } else {
+        let body = pre_replay
+            .enrollment_body()
+            .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+        Ok(RepositoryAuthorityReceipt::enrollment(
+            replay_ids,
+            canonical_uuid(body.idempotency_key()),
+        ))
+    };
+    let receipt = commit_semantic_decision(transaction, decision).await?;
+    let authority = dpop::mint_enrollment_repository_authority(pre_replay, receipt)?;
+    Ok(EnrollmentOperationAdmission { authority })
+}
+
+/// Consumes rebind replay evidence without exposing completed response bytes.
+/// The temporary read lock exists only to verify the stored immutable signing
+/// key. The returned receipt is sealed to the request's old JKT/generation
+/// tuple, never to a post-rebind row.
+pub(crate) async fn authorize_rebind_operation_only(
+    pool: &PgPool,
+    pre_replay: PreReplayCryptographicVerification,
+) -> Result<RebindOperationAdmission, AuthRepositoryError> {
+    let unsupported_shape = pre_replay.endpoint().as_str()
+        != "blue.catbird.chat.rebindDeviceAuthentication"
+        || pre_replay.rebind_bootstrap().is_none()
+        || pre_replay.enrollment_body().is_some()
+        || pre_replay.auth_transaction_replay().is_some();
+    let mut transaction = pool.begin().await?;
+    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
+    let decision = async {
+        if unsupported_shape {
+            return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+        }
+        let bootstrap = pre_replay
+            .rebind_bootstrap()
+            .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+        let state = lock_device_and_key(
+            &mut transaction,
+            pre_replay.subject().as_str(),
+            canonical_uuid(pre_replay.device_id()),
+        )
+        .await?;
+        let expected_generation = i64::try_from(bootstrap.expected_auth_generation())
+            .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+        let post_generation = expected_generation
+            .checked_add(1)
+            .ok_or(AuthRepositoryError::AuthenticationGenerationMismatch)?;
+        let old_state = state.dpop_jkt == bootstrap.current_dpop_jkt().as_str()
+            && state.auth_generation == expected_generation;
+        let completed_state = state.dpop_jkt == bootstrap.new_dpop_jkt().as_str()
+            && state.auth_generation == post_generation;
+        if (!old_state && !completed_state)
+            || pre_replay.dpop_jkt() != bootstrap.new_dpop_jkt()
+            || state.key_id != bootstrap.key_id().as_str()
+        {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
+        pre_replay.verify_rebind_stored_signing_key(&state.signing_public_key)?;
+        Ok((
+            RepositoryAuthorityReceipt::rebind_operation_only(
+                replay_ids,
+                canonical_uuid(bootstrap.idempotency_key()),
+                bootstrap.current_dpop_jkt().as_str(),
+                expected_generation,
+                bootstrap.key_id().as_str(),
+                &state.signing_public_key,
+            ),
+            state.signing_public_key,
+        ))
+    }
+    .await;
+    let (receipt, signing_public_key) = commit_semantic_decision(transaction, decision).await?;
+    let authority =
+        dpop::mint_rebind_repository_authority(pre_replay, &signing_public_key, receipt)?;
+    Ok(RebindOperationAdmission { authority })
+}
+
+/// Consumes ordinary replay evidence and seals an exact replenishment request
+/// to the current registered authority without consulting idempotent response
+/// storage. Replay bytes remain inaccessible until the operation prelude has
+/// reacquired the same authority.
+pub(crate) async fn authorize_replenishment_operation_only(
+    pool: &PgPool,
+    pre_replay: PreReplayCryptographicVerification,
+    canonical: CanonicalSignedMutation,
+) -> Result<ReplenishmentOperationAdmission, AuthRepositoryError> {
+    let unsupported_shape = pre_replay.endpoint().as_str()
+        != "blue.catbird.chat.replenishKeyPackages"
+        || canonical.kind() != SignedMutationKind::KeyPackageReplenishment
+        || pre_replay.enrollment_body().is_some()
+        || pre_replay.rebind_bootstrap().is_some()
+        || pre_replay.auth_transaction_replay().is_some();
+    let mut transaction = pool.begin().await?;
+    let replay_ids = consume_replay_set(&mut transaction, &pre_replay).await?;
+    let decision = async {
+        if unsupported_shape
+            || canonical.actor_did() != pre_replay.subject()
+            || canonical.actor_device_id() != pre_replay.device_id()
+        {
+            return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+        }
+        let state = lock_existing_authority(&mut transaction, &pre_replay).await?;
+        validate_replenishment_binding(&pre_replay, &canonical, &state)?;
+        let generation = i64::try_from(canonical.auth_generation())
+            .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+        if state.auth_generation != generation || state.key_id != canonical.key_id().as_str() {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
+        let material = request_material_for_canonical(&pre_replay, &canonical)?
+            .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+        Ok((
+            RepositoryAuthorityReceipt::existing(
+                replay_ids,
+                Some(material.operation_id),
+                &state,
+                RepositoryAuthorityClass::ExistingDevice,
+            ),
+            state.signing_public_key,
+        ))
+    }
+    .await;
+    let (receipt, signing_public_key) = commit_semantic_decision(transaction, decision).await?;
+    let authority = dpop::mint_signed_repository_authority(
+        pre_replay,
+        canonical,
+        &signing_public_key,
+        receipt,
+    )?;
+    Ok(ReplenishmentOperationAdmission { authority })
+}
+
 /// Re-establishes the exact locked binding in the caller-owned business
 /// transaction. Handlers must call this before making any mutation authorized
 /// by `VerifiedChatDeviceRequest`.
@@ -905,6 +1200,184 @@ pub(super) async fn reserve_canonical_operation(
         transaction_id,
         operation_id: material.operation_id,
     })
+}
+
+pub(super) async fn lock_enrollment_absence_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    operation: &CanonicalOperationReservationGuard,
+) -> Result<EnrollmentAbsenceLockedBootstrapScope, AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let receipt = authority.repository_receipt();
+    let body = authority
+        .pre_replay()
+        .enrollment_body()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let mutation = body.mutation();
+    let operation_id = canonical_uuid(body.idempotency_key());
+    if transaction_id != operation.transaction_id()
+        || operation.operation_id() != operation_id
+        || authority.endpoint().as_str() != "blue.catbird.chat.enrollDevice"
+        || receipt.class() != RepositoryAuthorityClass::EnrollmentBootstrap
+        || receipt.operation_id() != Some(operation_id)
+        || receipt.locked_jkt().is_some()
+        || receipt.locked_auth_generation().is_some()
+        || receipt.locked_key_id().is_some()
+        || receipt.locked_signing_key_sha256().is_some()
+        || mutation.kind() != SignedMutationKind::DeviceEnrollment
+        || mutation.auth_generation() != 0
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let subject = authority.subject().as_str().to_owned();
+    let device_id = canonical_uuid(authority.device_id());
+    lock_identity_slot(transaction, &subject, device_id).await?;
+    let existing: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM chat.devices WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
+    )
+    .bind(&subject)
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if existing.is_some() {
+        return Err(AuthRepositoryError::DeviceAlreadyRegistered);
+    }
+    let new_jkt = authority.dpop_jkt().as_str().to_owned();
+    let trusted_instant = authority.trusted_instant().datetime();
+    let scope_digest = bootstrap_scope_digest(
+        b"CATBIRD-CHAT-ENROLLMENT-ABSENCE-SCOPE\0",
+        &transaction_id,
+        &subject,
+        device_id,
+        None,
+        &new_jkt,
+        None,
+        None,
+        None,
+        trusted_instant,
+    );
+    Ok(EnrollmentAbsenceLockedBootstrapScope {
+        transaction_id,
+        receipt_id: Uuid::new_v4(),
+        subject,
+        device_id,
+        new_jkt,
+        trusted_instant,
+        scope_digest,
+    })
+}
+
+pub(super) async fn lock_rebind_old_state_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    operation: &CanonicalOperationReservationGuard,
+) -> Result<RebindOldStateLockedBootstrapScope, AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let receipt = authority.repository_receipt();
+    let bootstrap = authority
+        .pre_replay()
+        .rebind_bootstrap()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    let operation_id = canonical_uuid(bootstrap.idempotency_key());
+    if transaction_id != operation.transaction_id()
+        || operation.operation_id() != operation_id
+        || authority.endpoint().as_str() != "blue.catbird.chat.rebindDeviceAuthentication"
+        || receipt.class() != RepositoryAuthorityClass::RebindBootstrap
+        || receipt.operation_id() != Some(operation_id)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let subject = authority.subject().as_str().to_owned();
+    let device_id = canonical_uuid(authority.device_id());
+    let state = lock_device_and_key(transaction, &subject, device_id).await?;
+    let old_auth_generation = i64::try_from(bootstrap.expected_auth_generation())
+        .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
+    let signing_key_sha256: [u8; 32] = Sha256::digest(&state.signing_public_key).into();
+    if state.dpop_jkt != bootstrap.current_dpop_jkt().as_str()
+        || state.auth_generation != old_auth_generation
+        || state.key_id != bootstrap.key_id().as_str()
+        || authority.dpop_jkt() != bootstrap.new_dpop_jkt()
+        || receipt.locked_jkt() != Some(state.dpop_jkt.as_str())
+        || receipt.locked_auth_generation() != Some(state.auth_generation)
+        || receipt.locked_key_id() != Some(state.key_id.as_str())
+        || receipt.locked_signing_key_sha256() != Some(&signing_key_sha256)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let mutation = authority
+        .mutation()
+        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+    verify_ed25519_strict(
+        &state.signing_public_key,
+        mutation.transcript_bytes(),
+        mutation.signature(),
+    )?;
+    let old_jkt = state.dpop_jkt;
+    let new_jkt = bootstrap.new_dpop_jkt().as_str().to_owned();
+    let key_id = state.key_id;
+    let signing_public_key = state.signing_public_key;
+    let trusted_instant = authority.trusted_instant().datetime();
+    let scope_digest = bootstrap_scope_digest(
+        b"CATBIRD-CHAT-REBIND-OLD-STATE-SCOPE\0",
+        &transaction_id,
+        &subject,
+        device_id,
+        Some(&old_jkt),
+        &new_jkt,
+        Some(old_auth_generation),
+        Some(&key_id),
+        Some(&signing_key_sha256),
+        trusted_instant,
+    );
+    Ok(RebindOldStateLockedBootstrapScope {
+        transaction_id,
+        receipt_id: Uuid::new_v4(),
+        subject,
+        device_id,
+        old_jkt,
+        new_jkt,
+        old_auth_generation,
+        key_id,
+        signing_public_key,
+        trusted_instant,
+        scope_digest,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bootstrap_scope_digest(
+    domain: &[u8],
+    transaction_id: &str,
+    subject: &str,
+    device_id: Uuid,
+    old_jkt: Option<&str>,
+    new_jkt: &str,
+    old_auth_generation: Option<i64>,
+    key_id: Option<&str>,
+    signing_key_sha256: Option<&[u8; 32]>,
+    trusted_instant: DateTime<Utc>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    for value in [
+        transaction_id.as_bytes(),
+        subject.as_bytes(),
+        old_jkt.unwrap_or_default().as_bytes(),
+        new_jkt.as_bytes(),
+        key_id.unwrap_or_default().as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(device_id.as_bytes());
+    digest.update(old_auth_generation.unwrap_or_default().to_be_bytes());
+    digest.update(signing_key_sha256.copied().unwrap_or_default());
+    digest.update(trusted_instant.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
 }
 
 #[derive(Debug, FromRow)]

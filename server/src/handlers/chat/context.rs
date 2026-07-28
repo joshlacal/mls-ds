@@ -34,6 +34,7 @@ use crate::chat_protocol::{
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::auth::{
         self, AuthRepositoryError, AuthorizationOutcome, CompletedIdempotentResponse,
+        EnrollmentOperationAdmission, RebindOperationAdmission, ReplenishmentOperationAdmission,
     },
     transcript,
     validation::{CanonicalHttpMethod, TrustedRequestInstant, ValidatedChatNsid},
@@ -257,6 +258,97 @@ pub(crate) async fn admit_rebind(
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))?;
     Ok(into_admission(outcome))
+}
+
+/// Operation-only enrollment admission. This consumes replay evidence but
+/// cannot surface completed response bytes; the caller-owned operation prelude
+/// must first reserve the global operation and lock the enrollment slot.
+pub(crate) async fn admit_enrollment_operation_only(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EnrollmentOperationAdmission, ChatFailure> {
+    require_cutover(runtime, endpoint)?;
+    let trust = verifier(runtime, endpoint)?;
+    let dpop_headers = read_dpop_headers(headers, endpoint)?;
+    let instant = capture_instant(endpoint)?;
+    let signed_bytes = signed_request_bytes(body, endpoint)?;
+    let enrollment_body = transcript::decode_and_verify_enrollment_body(&signed_bytes)
+        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let pre_replay = dpop::verify_enrollment_request_auth(
+        trust,
+        &dpop_headers.authorization,
+        &dpop_headers.proof,
+        enrollment_body,
+        &instant,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    auth::authorize_enrollment_operation_only(pool, pre_replay)
+        .await
+        .map_err(|error| auth_repository_failure(endpoint, error))
+}
+
+/// Operation-only rebind admission. No completed response can cross this
+/// boundary; post-state replay validation is deferred to the operation prelude.
+pub(crate) async fn admit_rebind_operation_only(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<RebindOperationAdmission, ChatFailure> {
+    require_cutover(runtime, endpoint)?;
+    let trust = verifier(runtime, endpoint)?;
+    let dpop_headers = read_dpop_headers(headers, endpoint)?;
+    let instant = capture_instant(endpoint)?;
+    let signed_bytes = signed_request_bytes(body, endpoint)?;
+    let bootstrap = transcript::decode_rebind_bootstrap(&signed_bytes)
+        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let pre_replay = dpop::verify_rebind_request_auth(
+        trust,
+        &dpop_headers.authorization,
+        &dpop_headers.proof,
+        bootstrap,
+        &instant,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    auth::authorize_rebind_operation_only(pool, pre_replay)
+        .await
+        .map_err(|error| auth_repository_failure(endpoint, error))
+}
+
+/// Operation-only replenishment admission. The exact wrapper is decoded once
+/// and replay response bytes remain opaque until the prelude re-locks the
+/// current actor authority.
+pub(crate) async fn admit_replenishment_operation_only(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<ReplenishmentOperationAdmission, ChatFailure> {
+    require_cutover(runtime, endpoint)?;
+    let trust = verifier(runtime, endpoint)?;
+    let dpop_headers = read_dpop_headers(headers, endpoint)?;
+    let nsid = validated_nsid(endpoint)?;
+    let instant = capture_instant(endpoint)?;
+    let pre_replay = dpop::verify_ordinary_request_auth(
+        trust,
+        &dpop_headers.authorization,
+        &dpop_headers.proof,
+        &nsid,
+        &CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?,
+        &instant,
+    )
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    let signed_bytes = signed_request_bytes(body, endpoint)?;
+    let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes)
+        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    auth::authorize_replenishment_operation_only(pool, pre_replay, canonical)
+        .await
+        .map_err(|error| auth_repository_failure(endpoint, error))
 }
 
 fn into_admission(outcome: AuthorizationOutcome) -> Admission {

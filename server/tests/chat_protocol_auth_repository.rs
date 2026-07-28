@@ -21,6 +21,13 @@ mod dpop;
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
+#[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/repository/mod.rs"]
 mod repository;
 #[allow(dead_code)]
@@ -29,6 +36,85 @@ mod transcript;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
+
+// The production repository module now includes Welcome CAS writers that
+// consume the nested `crate::chat_protocol` authority types. Mirror the
+// production-shaped module graph used by the transition harness so this
+// repository-boundary target compiles without weakening production paths.
+#[allow(dead_code)]
+mod chat_protocol {
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+    pub mod snapshot {
+        pub use catbird_server::chat_protocol::snapshot::*;
+    }
+    pub mod wire {
+        pub use catbird_server::chat_protocol::wire::*;
+    }
+    pub mod public_state {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/public_state.rs"
+        ));
+    }
+    pub mod dpop {
+        pub use crate::dpop::*;
+    }
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
+    pub mod repository {
+        pub mod execution_context {
+            pub(crate) struct ExecutionContextHydrationProof;
+            pub(crate) struct RevocationBatchHydrationProof;
+        }
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
+        pub mod prelude {
+            pub use crate::repository::prelude::*;
+        }
+        pub mod recovery {
+            pub use crate::repository::recovery::*;
+        }
+        pub mod core {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/core.rs"
+            ));
+        }
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
+        pub mod transition {
+            pub use crate::repository::transition::*;
+        }
+        pub mod delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/delivery.rs"
+            ));
+        }
+    }
+    pub mod state_machine {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/state_machine.rs"
+        ));
+    }
+}
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
