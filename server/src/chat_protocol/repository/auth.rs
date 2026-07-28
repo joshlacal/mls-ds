@@ -1380,7 +1380,7 @@ fn bootstrap_scope_digest(
     digest.finalize().into()
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Clone, Debug, Eq, FromRow, PartialEq)]
 pub(crate) struct LockedCanonicalDeviceProjection {
     user_did: String,
     device_id: Uuid,
@@ -1390,7 +1390,7 @@ pub(crate) struct LockedCanonicalDeviceProjection {
     revoked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Clone, Debug, Eq, FromRow, PartialEq)]
 pub(crate) struct LockedCanonicalKeyProjection {
     user_did: String,
     device_id: Uuid,
@@ -1407,6 +1407,27 @@ pub(super) struct LockedCanonicalAuthorityScope {
     devices: Vec<LockedCanonicalDeviceProjection>,
     keys: Vec<LockedCanonicalKeyProjection>,
     scope_digest: [u8; 32],
+}
+
+/// Authority-free, owned copy of the exact canonical rows used to mint one
+/// business scope. Recovery may retain this snapshot for an executor prewrite
+/// re-read, but it cannot use it to complete an operation or mint a repository
+/// receipt.
+pub(super) struct CanonicalAuthorityScopePrewriteSnapshot {
+    transaction_id: Box<str>,
+    actor_class: RepositoryAuthorityClass,
+    actor_did: Box<str>,
+    actor_device_id: Uuid,
+    actor_dpop_jkt: Option<Box<str>>,
+    actor_auth_generation: Option<i64>,
+    actor_key_id: Option<Box<str>>,
+    actor_signing_key_sha256: Option<[u8; 32]>,
+    trusted_instant: DateTime<Utc>,
+    principals: Vec<String>,
+    devices: Vec<LockedCanonicalDeviceProjection>,
+    keys: Vec<LockedCanonicalKeyProjection>,
+    scope_digest: [u8; 32],
+    snapshot_digest: [u8; 32],
 }
 
 impl LockedCanonicalDeviceProjection {
@@ -1552,6 +1573,114 @@ impl LockedCanonicalAuthorityScope {
 
     pub(super) fn scope_digest(&self) -> &[u8; 32] {
         &self.scope_digest
+    }
+
+    pub(super) fn recovery_prewrite_snapshot(&self) -> CanonicalAuthorityScopePrewriteSnapshot {
+        let actor_signing_key_sha256 = self
+            .actor
+            .stored_signing_public_key()
+            .map(|key| <[u8; 32]>::from(Sha256::digest(key)));
+        let mut snapshot = CanonicalAuthorityScopePrewriteSnapshot {
+            transaction_id: self.actor.transaction_id().to_owned().into_boxed_str(),
+            actor_class: self.actor.class(),
+            actor_did: self.actor.subject().to_owned().into_boxed_str(),
+            actor_device_id: self.actor.device_id(),
+            actor_dpop_jkt: self
+                .actor
+                .stored_dpop_jkt()
+                .map(|value| value.to_owned().into_boxed_str()),
+            actor_auth_generation: self.actor.stored_auth_generation(),
+            actor_key_id: self
+                .actor
+                .stored_key_id()
+                .map(|value| value.to_owned().into_boxed_str()),
+            actor_signing_key_sha256,
+            trusted_instant: self.actor.trusted_instant(),
+            principals: self.principals.clone(),
+            devices: self.devices.clone(),
+            keys: self.keys.clone(),
+            scope_digest: self.scope_digest,
+            snapshot_digest: [0; 32],
+        };
+        snapshot.snapshot_digest = canonical_scope_prewrite_snapshot_digest(&snapshot);
+        snapshot
+    }
+}
+
+impl CanonicalAuthorityScopePrewriteSnapshot {
+    pub(super) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(super) fn actor_class(&self) -> RepositoryAuthorityClass {
+        self.actor_class
+    }
+
+    pub(super) fn actor_did(&self) -> &str {
+        &self.actor_did
+    }
+
+    pub(super) fn actor_device_id(&self) -> Uuid {
+        self.actor_device_id
+    }
+
+    pub(super) fn actor_dpop_jkt(&self) -> Option<&str> {
+        self.actor_dpop_jkt.as_deref()
+    }
+
+    pub(super) fn actor_auth_generation(&self) -> Option<i64> {
+        self.actor_auth_generation
+    }
+
+    pub(super) fn actor_key_id(&self) -> Option<&str> {
+        self.actor_key_id.as_deref()
+    }
+
+    pub(super) fn actor_signing_key_sha256(&self) -> Option<&[u8; 32]> {
+        self.actor_signing_key_sha256.as_ref()
+    }
+
+    pub(super) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.trusted_instant
+    }
+
+    pub(super) fn scope_digest(&self) -> &[u8; 32] {
+        &self.scope_digest
+    }
+
+    pub(super) fn snapshot_digest(&self) -> &[u8; 32] {
+        &self.snapshot_digest
+    }
+
+    fn has_valid_seal_and_canonical_order(&self) -> bool {
+        fn strictly_ordered_by<T>(
+            rows: &[T],
+            mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+        ) -> bool {
+            rows.windows(2)
+                .all(|pair| compare(&pair[0], &pair[1]).is_lt())
+        }
+
+        !self.principals.is_empty()
+            && strictly_ordered_by(&self.principals, |left, right| {
+                left.as_bytes().cmp(right.as_bytes())
+            })
+            && strictly_ordered_by(&self.devices, |left, right| {
+                left.user_did
+                    .as_bytes()
+                    .cmp(right.user_did.as_bytes())
+                    .then_with(|| left.device_id.as_bytes().cmp(right.device_id.as_bytes()))
+            })
+            && strictly_ordered_by(&self.keys, |left, right| {
+                left.user_did
+                    .as_bytes()
+                    .cmp(right.user_did.as_bytes())
+                    .then_with(|| left.device_id.as_bytes().cmp(right.device_id.as_bytes()))
+                    .then_with(|| left.key_id.as_bytes().cmp(right.key_id.as_bytes()))
+            })
+            && self.scope_digest
+                == canonical_locked_scope_digest(&self.principals, &self.devices, &self.keys)
+            && self.snapshot_digest == canonical_scope_prewrite_snapshot_digest(self)
     }
 }
 
@@ -1749,6 +1878,184 @@ fn canonical_locked_scope_digest(
         bind_optional_instant(&mut digest, key.revoked_at);
     }
     digest.finalize().into()
+}
+
+fn canonical_scope_prewrite_snapshot_digest(
+    snapshot: &CanonicalAuthorityScopePrewriteSnapshot,
+) -> [u8; 32] {
+    fn bind_bytes(digest: &mut Sha256, value: &[u8]) {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-RECOVERY-CANONICAL-SCOPE-PREWRITE-SNAPSHOT\0");
+    digest.update([match snapshot.actor_class {
+        RepositoryAuthorityClass::ExistingDevice => 1,
+        RepositoryAuthorityClass::EnrollmentBootstrap => 2,
+        RepositoryAuthorityClass::RebindBootstrap => 3,
+    }]);
+    for value in [
+        snapshot.transaction_id.as_bytes(),
+        snapshot.actor_did.as_bytes(),
+        snapshot
+            .actor_dpop_jkt
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+        snapshot
+            .actor_key_id
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    ] {
+        bind_bytes(&mut digest, value);
+    }
+    digest.update(snapshot.actor_device_id.as_bytes());
+    match snapshot.actor_auth_generation {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    match snapshot.actor_signing_key_sha256 {
+        Some(value) => {
+            digest.update([1]);
+            digest.update(value);
+        }
+        None => digest.update([0]),
+    }
+    digest.update(snapshot.trusted_instant.timestamp_micros().to_be_bytes());
+    digest.update(snapshot.scope_digest);
+    digest.finalize().into()
+}
+
+/// Re-locks and compares the exact canonical membership retained by a Recovery
+/// prewrite witness. This is intentionally a validator only: it returns no
+/// business guard, scope receipt, or completion authority.
+pub(super) async fn validate_canonical_authority_scope_prewrite(
+    transaction: &mut Transaction<'_, Postgres>,
+    snapshot: &CanonicalAuthorityScopePrewriteSnapshot,
+) -> Result<(), AuthRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != snapshot.transaction_id() || !snapshot.has_valid_seal_and_canonical_order()
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    let live_principals: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_did
+          FROM chat.principals
+         WHERE user_did = ANY($1::text[])
+         ORDER BY convert_to(user_did,'UTF8')
+         FOR UPDATE
+        "#,
+    )
+    .bind(&snapshot.principals)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if live_principals != snapshot.principals {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    let dids = snapshot
+        .devices
+        .iter()
+        .map(|device| device.user_did.clone())
+        .collect::<Vec<_>>();
+    let device_ids = snapshot
+        .devices
+        .iter()
+        .map(|device| device.device_id)
+        .collect::<Vec<_>>();
+    let live_devices: Vec<LockedCanonicalDeviceProjection> = sqlx::query_as(
+        r#"
+        WITH requested(user_did,device_id) AS (
+            SELECT * FROM unnest($1::text[],$2::uuid[])
+        )
+        SELECT device.user_did,device.device_id,device.status,device.dpop_jkt,
+               device.auth_generation,device.revoked_at
+          FROM requested
+          JOIN chat.devices device USING (user_did,device_id)
+         ORDER BY convert_to(device.user_did,'UTF8'),uuid_send(device.device_id)
+         FOR UPDATE OF device
+        "#,
+    )
+    .bind(&dids)
+    .bind(&device_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if live_devices != snapshot.devices {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    // Fetch all keys for the exact device membership, rather than querying
+    // only the previously observed key ids. This makes both removal and
+    // insertion of a key projection visible to the equality check.
+    let live_keys: Vec<LockedCanonicalKeyProjection> = sqlx::query_as(
+        r#"
+        WITH requested(user_did,device_id) AS (
+            SELECT * FROM unnest($1::text[],$2::uuid[])
+        )
+        SELECT key.user_did,key.device_id,key.key_id,key.signing_public_key,
+               key.enrollment_auth_generation,key.revoked_at
+          FROM requested
+          JOIN chat.device_keys key USING (user_did,device_id)
+         ORDER BY convert_to(key.user_did,'UTF8'),uuid_send(key.device_id),
+                  convert_to(key.key_id,'UTF8')
+         FOR UPDATE OF key
+        "#,
+    )
+    .bind(&dids)
+    .bind(&device_ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if live_keys != snapshot.keys
+        || canonical_locked_scope_digest(&live_principals, &live_devices, &live_keys)
+            != snapshot.scope_digest
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    let actor_device = live_devices
+        .iter()
+        .find(|device| {
+            device.user_did == snapshot.actor_did.as_ref()
+                && device.device_id == snapshot.actor_device_id
+        })
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let actor_key_id = snapshot
+        .actor_key_id
+        .as_deref()
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let actor_key = live_keys
+        .iter()
+        .find(|key| {
+            key.user_did == snapshot.actor_did.as_ref()
+                && key.device_id == snapshot.actor_device_id
+                && key.key_id == actor_key_id
+        })
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    let actor_key_sha256: [u8; 32] = Sha256::digest(&actor_key.signing_public_key).into();
+    if snapshot.actor_class != RepositoryAuthorityClass::ExistingDevice
+        || !live_principals
+            .iter()
+            .any(|principal| principal == snapshot.actor_did.as_ref())
+        || actor_device.status != "active"
+        || actor_device.revoked_at.is_some()
+        || snapshot.actor_dpop_jkt.as_deref() != Some(actor_device.dpop_jkt.as_str())
+        || snapshot.actor_auth_generation != Some(actor_device.auth_generation)
+        || actor_key.revoked_at.is_some()
+        || snapshot.actor_signing_key_sha256.as_ref() != Some(&actor_key_sha256)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+
+    Ok(())
 }
 
 /// Reset-only scope fixture for executable claim-verifier negatives. All

@@ -29,6 +29,8 @@ use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
     LockedRevocationTargetStatus,
 };
+#[cfg(not(test))]
+use super::repository::prelude::RecoveryPreludePrewriteWitness;
 use super::repository::prelude::{OperationCompletionGuard, ScopeBoundBusinessAuthority};
 #[cfg(not(test))]
 use super::repository::recovery::{
@@ -1155,6 +1157,7 @@ pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
     transition: PlannedTransition,
     scope_authority: ScopeBoundBusinessAuthority,
     completion: OperationCompletionGuard,
+    prewrite: RecoveryPreludePrewriteWitness,
     accepted_control_entry_bytes: Option<Vec<u8>>,
     persistence_witness: RecoveryPersistenceWitness,
     kind: RecoveryPlannedKind,
@@ -1168,6 +1171,7 @@ impl PlannedRecoveryMutation {
         PlannedTransition,
         ScopeBoundBusinessAuthority,
         OperationCompletionGuard,
+        RecoveryPreludePrewriteWitness,
         Option<Vec<u8>>,
         RecoveryPersistenceWitness,
         RecoveryPlannedKind,
@@ -1176,6 +1180,7 @@ impl PlannedRecoveryMutation {
             self.transition,
             self.scope_authority,
             self.completion,
+            self.prewrite,
             self.accepted_control_entry_bytes,
             self.persistence_witness,
             self.kind,
@@ -1188,6 +1193,7 @@ pub(in crate::chat_protocol) struct PlannedClientRecoveryExpiry {
     transition: PlannedTransition,
     scope_authority: ScopeBoundBusinessAuthority,
     completion: OperationCompletionGuard,
+    prewrite: RecoveryPreludePrewriteWitness,
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
     persistence_witness: RecoveryPersistenceWitness,
@@ -1202,6 +1208,7 @@ impl PlannedClientRecoveryExpiry {
         PlannedTransition,
         ScopeBoundBusinessAuthority,
         OperationCompletionGuard,
+        RecoveryPreludePrewriteWitness,
         Uuid,
         ServerTimestamp,
         RecoveryPersistenceWitness,
@@ -1211,6 +1218,7 @@ impl PlannedClientRecoveryExpiry {
             self.transition,
             self.scope_authority,
             self.completion,
+            self.prewrite,
             self.recovery_request_id,
             self.terminal_at,
             self.persistence_witness,
@@ -3044,11 +3052,12 @@ impl HydrationAuthority {
             &parts.relationship_decision,
             &parts.trusted_request_instant,
         )?;
-        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        let (scope_authority, completion, prewrite) = parts.prelude.into_recovery_execution_parts();
         Ok(PlannedRecoveryMutation {
             transition,
             scope_authority,
             completion,
+            prewrite,
             accepted_control_entry_bytes: None,
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Request {
@@ -3087,11 +3096,12 @@ impl HydrationAuthority {
             registration,
             parts.execution_package,
         )?;
-        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        let (scope_authority, completion, prewrite) = parts.prelude.into_recovery_execution_parts();
         Ok(PlannedRecoveryMutation {
             transition,
             scope_authority,
             completion,
+            prewrite,
             accepted_control_entry_bytes: None,
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Cancellation {
@@ -3166,11 +3176,12 @@ impl HydrationAuthority {
             &parts.relationship_decision,
             &parts.trusted_request_instant,
         )?;
-        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        let (scope_authority, completion, prewrite) = parts.prelude.into_recovery_execution_parts();
         Ok(PlannedRecoveryMutation {
             transition,
             scope_authority,
             completion,
+            prewrite,
             accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
             persistence_witness: parts.persistence_witness,
             kind: RecoveryPlannedKind::Fulfillment {
@@ -3208,11 +3219,12 @@ impl HydrationAuthority {
                 parts.execution_package,
             )?;
         let terminal_at = ServerTimestamp::from_unix_millis(parts.terminal_at.timestamp_millis())?;
-        let (scope_authority, completion) = parts.prelude.into_execution_parts();
+        let (scope_authority, completion, prewrite) = parts.prelude.into_recovery_execution_parts();
         Ok(PlannedClientRecoveryExpiry {
             transition,
             scope_authority,
             completion,
+            prewrite,
             recovery_request_id: parts.request_id,
             terminal_at,
             persistence_witness: parts.persistence_witness,
@@ -9966,6 +9978,1657 @@ impl ConversationPersistencePlan {
     }
 }
 
+/// Closed Recovery persistence-plan classification retained beside the digest.
+/// `ClientExpiry` and `SchedulerExpiry` intentionally share `Expiry`: the
+/// repository witness owns that caller-class distinction and cross-binds it to
+/// this fingerprint without widening the state-machine plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryPlanClass {
+    Request,
+    Cancellation,
+    Fulfillment,
+    Expiry,
+}
+
+/// Version 1 canonical digest of a complete Recovery persistence plan.
+///
+/// The inner bytes are deliberately private.  Callers can retain and compare a
+/// state-machine-issued value, but cannot substitute an untyped digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoveryPlanFingerprint {
+    digest: [u8; 32],
+    class: RecoveryPlanClass,
+}
+
+impl RecoveryPlanFingerprint {
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    pub(crate) fn class(&self) -> RecoveryPlanClass {
+        self.class
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryPlanFingerprintError {
+    UnsupportedShape,
+    MissingAcceptedControl,
+    UnexpectedAcceptedControl,
+}
+
+/// Canonicalize and seal one closed Recovery write plan.
+///
+/// Every scalar is framed as `u64_be(length) || bytes`; collections additionally
+/// commit their element count, and options commit an explicit presence byte.
+/// This is a private protocol encoding, not serde/Debug output.
+pub(crate) fn recovery_plan_fingerprint(
+    plan: &ConversationPersistencePlan,
+    accepted_control_entry_bytes: Option<&[u8]>,
+) -> Result<RecoveryPlanFingerprint, StateMachineError> {
+    let class = classify_recovery_plan_shape(plan, accepted_control_entry_bytes)
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+    let mut encoder = RecoveryPlanEncoder::new();
+    encoder.bytes(b"CATBIRD-CHAT-RECOVERY-PERSISTENCE-PLAN");
+    encoder.u64(1);
+    encoder.u8(recovery_plan_class_code(class));
+    encoder.option(plan.expected_prior.as_ref(), |encoder, value| {
+        encoder.coordinate(value)
+    });
+    encoder.option(plan.retired_coordinate.as_ref(), |encoder, value| {
+        encoder.coordinate(value)
+    });
+    encoder.option(plan.successor_coordinate.as_ref(), |encoder, value| {
+        encoder.coordinate(value)
+    });
+    encoder.option(accepted_control_entry_bytes, |encoder, bytes| {
+        encoder.bytes(&<[u8; 32]>::from(Sha256::digest(bytes)));
+    });
+    encoder.state_hydration(&plan.state);
+    encoder.transition_effects(&plan.effects);
+    Ok(RecoveryPlanFingerprint {
+        class,
+        digest: encoder.finish(),
+    })
+}
+
+fn recovery_plan_class_code(class: RecoveryPlanClass) -> u8 {
+    match class {
+        RecoveryPlanClass::Request => 1,
+        RecoveryPlanClass::Cancellation => 2,
+        RecoveryPlanClass::Fulfillment => 3,
+        RecoveryPlanClass::Expiry => 4,
+    }
+}
+
+fn classify_recovery_plan_shape(
+    plan: &ConversationPersistencePlan,
+    accepted_control_entry_bytes: Option<&[u8]>,
+) -> Result<RecoveryPlanClass, RecoveryPlanFingerprintError> {
+    let effects = &plan.effects;
+    let head = effects
+        .head_cas
+        .as_ref()
+        .ok_or(RecoveryPlanFingerprintError::UnsupportedShape)?;
+    let expected = plan
+        .expected_prior
+        .as_ref()
+        .ok_or(RecoveryPlanFingerprintError::UnsupportedShape)?;
+    if plan.retired_coordinate.is_some()
+        || head.expected_prior.as_ref() != Some(expected)
+        || head.conversation_id != *expected.conversation_id()
+        || plan.state.coordinate.conversation_id() != expected.conversation_id()
+        || !effects.complete
+        || !package_cas_bijection_valid(effects)
+        || !effects.revocation_package_cas.is_empty()
+        || effects.revocation_target_cas.is_some()
+        || effects.welcome_cas.is_some()
+        || effects.invitation_quota_cas.is_some()
+        || !effects.participant_changes.is_empty()
+        || !effects.terminal_proof_changes.is_empty()
+    {
+        return Err(RecoveryPlanFingerprintError::UnsupportedShape);
+    }
+
+    let coordinate_unchanged = plan.successor_coordinate.as_ref() == Some(expected)
+        && plan.state.coordinate == *expected
+        && head.allocated_entry_id.is_none()
+        && head.allocated_seq.is_none()
+        && head.successor_next_entry_seq == head.expected_next_entry_seq;
+    let entryless_families_absent = effects.metadata_change.is_none()
+        && effects.leaf_changes.is_empty()
+        && effects.interval_changes.is_empty()
+        && effects.reset_request_changes.is_empty()
+        && effects.leave_request_changes.is_empty()
+        && effects.welcome_changes.is_empty()
+        && effects.opened_intervals.is_empty()
+        && effects.closed_intervals.is_empty()
+        && effects.superseded_recovery_requests.is_empty()
+        && effects.terminal_proof_recipients.is_empty();
+
+    let class = match (&effects.kind, effects.authority.as_ref()) {
+        (PlanKind::RecoveryRequest, Some(PlanAuthority::Request(authority)))
+            if authority.kind == RequestEntryKind::LeafRecoveryRequest
+                && authority.conversation_id == head.conversation_id
+                && coordinate_unchanged
+                && entryless_families_absent
+                && effects
+                    .policy_evidence_digest
+                    .is_some_and(|digest| digest != [0; 32])
+                && effects.recovery_request_changes.len() == 1
+                && effects.reservation_changes.len() == 1
+                && effects.package_transitions.len() == 1
+                && exact_recovery_request_edge(
+                    &effects.recovery_request_changes[0],
+                    None,
+                    RecoveryRequestStatus::Open,
+                )
+                && effects.recovery_request_changes[0]
+                    .after
+                    .as_ref()
+                    .is_some_and(|request| {
+                        request.request_id == authority.request_id
+                            && request.target == authority.actor
+                            && request.bound_coordinate == *expected
+                    })
+                && exact_reservation_edge(
+                    &effects.reservation_changes[0],
+                    None,
+                    ReservationStatus::Active,
+                )
+                && effects.package_transitions[0].from == PackageStatus::Available
+                && effects.package_transitions[0].to == PackageStatus::Reserved =>
+        {
+            RecoveryPlanClass::Request
+        }
+        (PlanKind::RecoveryCancellation, Some(PlanAuthority::Request(authority)))
+            if authority.kind == RequestEntryKind::LeafRecoveryCancellation
+                && authority.conversation_id == head.conversation_id
+                && coordinate_unchanged
+                && entryless_families_absent
+                && effects.policy_evidence_digest.is_none()
+                && effects.recovery_request_changes.len() == 1
+                && effects.reservation_changes.len() == 1
+                && effects.package_transitions.len() == 1
+                && exact_recovery_request_edge(
+                    &effects.recovery_request_changes[0],
+                    Some(RecoveryRequestStatus::Open),
+                    RecoveryRequestStatus::Cancelled,
+                )
+                && effects.recovery_request_changes[0]
+                    .after
+                    .as_ref()
+                    .is_some_and(|request| {
+                        request.request_id == authority.request_id
+                            && request.target == authority.actor
+                    })
+                && exact_reservation_edge(
+                    &effects.reservation_changes[0],
+                    Some(ReservationStatus::Active),
+                    ReservationStatus::Released,
+                )
+                && effects.package_transitions[0].from == PackageStatus::Reserved
+                && matches!(
+                    effects.package_transitions[0].to,
+                    PackageStatus::Available | PackageStatus::Expired
+                ) =>
+        {
+            RecoveryPlanClass::Cancellation
+        }
+        (PlanKind::RecoveryExpiry, Some(PlanAuthority::RecoveryExpiry(authority)))
+            if coordinate_unchanged
+                && entryless_families_absent
+                && effects.policy_evidence_digest.is_none()
+                && effects.recovery_request_changes.len() == 1
+                && effects.reservation_changes.len() == 1
+                && effects.package_transitions.len() == 1
+                && exact_recovery_request_edge(
+                    &effects.recovery_request_changes[0],
+                    Some(RecoveryRequestStatus::Open),
+                    RecoveryRequestStatus::Expired,
+                )
+                && effects.recovery_request_changes[0]
+                    .after
+                    .as_ref()
+                    .is_some_and(|request| {
+                        request.request_id == authority.request_id
+                            && request.target == authority.requester
+                    })
+                && exact_reservation_edge(
+                    &effects.reservation_changes[0],
+                    Some(ReservationStatus::Active),
+                    ReservationStatus::Expired,
+                )
+                && effects.package_transitions[0].request_id == authority.request_id
+                && effects.package_transitions[0].from == PackageStatus::Reserved
+                && matches!(
+                    effects.package_transitions[0].to,
+                    PackageStatus::Available | PackageStatus::Expired
+                ) =>
+        {
+            RecoveryPlanClass::Expiry
+        }
+        (PlanKind::Commit, Some(PlanAuthority::Transition(authority)))
+            if authority.authority.as_ref().is_some_and(|signed| {
+                signed.kind == SignedMutationKind::LeafRecoveryFulfillment
+            }) && matches!(
+                authority.body_binding,
+                Some(TransitionBodyBinding::LeafRecoveryFulfillment { .. })
+            ) && plan.successor_coordinate.as_ref() == Some(&plan.state.coordinate)
+                && plan.state.coordinate.conversation_id() == expected.conversation_id()
+                && head.allocated_entry_id == Some(authority.transition_id)
+                && head.allocated_seq == Some(authority.seq)
+                && head.expected_next_entry_seq.checked_add(1)
+                    == Some(head.successor_next_entry_seq)
+                && effects
+                    .policy_evidence_digest
+                    .is_some_and(|digest| digest != [0; 32])
+                && effects
+                    .metadata_change
+                    .as_ref()
+                    .and_then(StateChange::after)
+                    .is_some()
+                && !effects.leaf_changes.is_empty()
+                && !effects.interval_changes.is_empty()
+                && fulfillment_fingerprint_families_are_closed(effects, authority) =>
+        {
+            RecoveryPlanClass::Fulfillment
+        }
+        _ => return Err(RecoveryPlanFingerprintError::UnsupportedShape),
+    };
+
+    match (class, accepted_control_entry_bytes) {
+        (RecoveryPlanClass::Fulfillment, None) => {
+            return Err(RecoveryPlanFingerprintError::MissingAcceptedControl)
+        }
+        (RecoveryPlanClass::Fulfillment, Some(bytes)) if bytes.is_empty() => {
+            return Err(RecoveryPlanFingerprintError::MissingAcceptedControl)
+        }
+        (RecoveryPlanClass::Fulfillment, Some(_)) => {}
+        (_, Some(_)) => return Err(RecoveryPlanFingerprintError::UnexpectedAcceptedControl),
+        (_, None) => {}
+    }
+    Ok(class)
+}
+
+/// Fingerprint admission must reject every Recovery-fulfillment family splice,
+/// not merely find one valid edge inside a larger malformed family. The
+/// executor repeats the deeper identity/bijection checks before its first
+/// writer; this pure fence keeps the sealed fingerprint contract closed too.
+fn fulfillment_fingerprint_families_are_closed(
+    effects: &TransitionEffects,
+    producer: &TransitionEvidence,
+) -> bool {
+    let exact_terminal = |terminal: &Option<WorkTerminalEvidence>| matches!(terminal, Some(WorkTerminalEvidence::Transition(value)) if value == producer);
+
+    let mut own_requests = 0usize;
+    let mut superseded_requests = BTreeSet::new();
+    for change in &effects.recovery_request_changes {
+        let (Some(before), Some(after)) = (&change.before, &change.after) else {
+            return false;
+        };
+        if before.request_id != after.request_id
+            || before.target != after.target
+            || before.kind != after.kind
+            || before.source != after.source
+            || before.bound_coordinate != after.bound_coordinate
+            || before.key_package_ref != after.key_package_ref
+            || before.received_at != after.received_at
+            || before.expires_at != after.expires_at
+            || before.status != RecoveryRequestStatus::Open
+            || before.terminal.is_some()
+            || !exact_terminal(&after.terminal)
+        {
+            return false;
+        }
+        match after.status {
+            RecoveryRequestStatus::Fulfilled => own_requests += 1,
+            RecoveryRequestStatus::Superseded => {
+                if !superseded_requests.insert((after.request_id, after.key_package_ref)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    let mut own_reservations = 0usize;
+    let mut released_reservations = BTreeSet::new();
+    for change in &effects.reservation_changes {
+        let (Some(before), Some(after)) = (&change.before, &change.after) else {
+            return false;
+        };
+        if before.request_id != after.request_id
+            || before.target != after.target
+            || before.bound_coordinate != after.bound_coordinate
+            || before.key_package_ref != after.key_package_ref
+            || before.received_at != after.received_at
+            || before.expires_at != after.expires_at
+            || before.package_not_after != after.package_not_after
+            || before.status != ReservationStatus::Active
+            || before.terminal.is_some()
+            || !exact_terminal(&after.terminal)
+        {
+            return false;
+        }
+        match after.status {
+            ReservationStatus::Consumed => own_reservations += 1,
+            ReservationStatus::Released => {
+                if !released_reservations.insert((after.request_id, after.key_package_ref)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    let consumed_packages = effects
+        .package_transitions
+        .iter()
+        .filter(|edge| edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Consumed)
+        .count();
+    let reactivated_packages = effects
+        .package_transitions
+        .iter()
+        .filter_map(|edge| {
+            (edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available)
+                .then_some((edge.request_id, edge.key_package_ref))
+        })
+        .collect::<BTreeSet<_>>();
+    if effects.package_transitions.iter().any(|edge| {
+        edge.from != PackageStatus::Reserved
+            || !matches!(edge.to, PackageStatus::Consumed | PackageStatus::Available)
+    }) {
+        return false;
+    }
+
+    let mut own_welcomes = 0usize;
+    for change in &effects.welcome_changes {
+        match (&change.before, &change.after) {
+            (None, Some(after))
+                if after.status == WelcomeStatus::Pending && after.terminal.is_none() =>
+            {
+                own_welcomes += 1;
+            }
+            (Some(before), Some(after))
+                if before.status == WelcomeStatus::Pending
+                    && before.terminal.is_none()
+                    && after.status == WelcomeStatus::Superseded
+                    && exact_terminal(&after.terminal)
+                    && before.welcome_id == after.welcome_id
+                    && before.recipient == after.recipient
+                    && before.transition_seq == after.transition_seq
+                    && before.coordinate == after.coordinate
+                    && before.recovery_request_id == after.recovery_request_id
+                    && before.key_package_ref == after.key_package_ref
+                    && before.opaque_welcome == after.opaque_welcome
+                    && before.sha256 == after.sha256
+                    && before.expires_at == after.expires_at => {}
+            _ => return false,
+        }
+    }
+
+    let legal_reset = effects.reset_request_changes.iter().all(|change| {
+        matches!(
+            (&change.before, &change.after),
+            (Some(before), Some(after))
+                if before.status == ResetRequestStatus::Pending
+                    && before.terminal.is_none()
+                    && after.status == ResetRequestStatus::Stale
+                    && exact_terminal(&after.terminal)
+                    && before.request_id == after.request_id
+                    && before.requester == after.requester
+                    && before.bound_coordinate == after.bound_coordinate
+                    && before.received_at == after.received_at
+                    && before.expires_at == after.expires_at
+                    && before.origin == after.origin
+        )
+    });
+    let legal_leave = effects.leave_request_changes.iter().all(|change| {
+        matches!(
+            (&change.before, &change.after),
+            (Some(before), Some(after))
+                if before.status == LeaveRequestStatus::Pending
+                    && before.terminal.is_none()
+                    && after.status == LeaveRequestStatus::Stale
+                    && exact_terminal(&after.terminal)
+                    && before.request_id == after.request_id
+                    && before.requester == after.requester
+                    && before.bound_coordinate == after.bound_coordinate
+                    && before.received_at == after.received_at
+                    && before.expires_at == after.expires_at
+                    && before.origin == after.origin
+                    && before.fulfilled_participant == after.fulfilled_participant
+        )
+    });
+
+    own_requests == 1
+        && own_reservations == 1
+        && consumed_packages == 1
+        && own_welcomes == 1
+        && superseded_requests == released_reservations
+        && superseded_requests == reactivated_packages
+        && legal_reset
+        && legal_leave
+}
+
+fn exact_recovery_request_edge(
+    change: &StateChange<RecoveryRequest>,
+    before_status: Option<RecoveryRequestStatus>,
+    after_status: RecoveryRequestStatus,
+) -> bool {
+    match (&change.before, &change.after, before_status) {
+        (None, Some(after), None) => after.status == after_status,
+        (Some(before), Some(after), Some(before_status)) => {
+            before.request_id == after.request_id
+                && before.status == before_status
+                && after.status == after_status
+        }
+        _ => false,
+    }
+}
+
+fn exact_reservation_edge(
+    change: &StateChange<RecoveryReservation>,
+    before_status: Option<ReservationStatus>,
+    after_status: ReservationStatus,
+) -> bool {
+    match (&change.before, &change.after, before_status) {
+        (None, Some(after), None) => after.status == after_status,
+        (Some(before), Some(after), Some(before_status)) => {
+            before.request_id == after.request_id
+                && before.status == before_status
+                && after.status == after_status
+        }
+        _ => false,
+    }
+}
+
+struct RecoveryPlanEncoder {
+    digest: Sha256,
+}
+
+impl RecoveryPlanEncoder {
+    fn new() -> Self {
+        Self {
+            digest: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.digest.finalize().into()
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.digest.update((bytes.len() as u64).to_be_bytes());
+        self.digest.update(bytes);
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes(&[value]);
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes(&value.to_be_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_be_bytes());
+    }
+
+    fn usize(&mut self, value: usize) {
+        self.u64(value as u64);
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes(&value.to_be_bytes());
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn option<T: ?Sized>(&mut self, value: Option<&T>, encode: impl FnOnce(&mut Self, &T)) {
+        match value {
+            None => self.u8(0),
+            Some(value) => {
+                self.u8(1);
+                encode(self, value);
+            }
+        }
+    }
+
+    fn slice<T>(&mut self, values: &[T], mut encode: impl FnMut(&mut Self, &T)) {
+        self.u64(values.len() as u64);
+        for value in values {
+            encode(self, value);
+        }
+    }
+
+    fn coordinate(&mut self, value: &PublicGroupSnapshotCoordinate) {
+        self.bytes(value.conversation_id());
+        self.u64(value.generation());
+        self.u64(value.state_version());
+        self.bytes(value.group_id());
+        self.u64(value.epoch());
+        self.bytes(value.group_context_hash());
+        self.bytes(value.confirmation_tag());
+        self.u8(match value.lifecycle() {
+            PublicGroupSnapshotLifecycle::Active => 1,
+            PublicGroupSnapshotLifecycle::Superseded => 2,
+        });
+    }
+
+    fn device(&mut self, value: &DeviceIdentity) {
+        self.bytes(value.principal().as_bytes());
+        self.bytes(value.device_id());
+    }
+
+    fn timestamp(&mut self, value: ServerTimestamp) {
+        self.i64(value.unix_millis());
+    }
+
+    fn authenticated_entry(&mut self, value: &AuthenticatedEntryEvidence) {
+        self.u8(signed_mutation_kind_code(value.kind));
+        self.bytes(value.type_id.as_bytes());
+        self.bytes(&value.domain);
+        self.option(value.control_entry_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.option(value.control_conversation_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.device(&value.actor);
+        self.bytes(&value.key_id);
+        self.u64(value.auth_generation);
+        self.timestamp(value.signed_at);
+        self.bytes(&value.request_digest);
+        self.bytes(&value.signature);
+        self.bytes(&value.signed_request_bytes);
+        self.bytes(&value.canonical_projection);
+        self.bytes(&value.transcript_bytes);
+    }
+
+    fn transition(&mut self, value: &TransitionEvidence) {
+        self.u64(value.seq);
+        self.bytes(&value.transition_id);
+        self.bytes(&value.outer_entry_fingerprint);
+        self.bytes(&value.outer_control_projection);
+        self.bytes(&value.server_fields_dag_cbor);
+        self.bytes(&value.durable_row_digest);
+        self.timestamp(value.received_at);
+        self.option(value.authority.as_ref(), Self::authenticated_entry);
+        self.option(value.body_binding.as_ref(), Self::transition_body);
+    }
+
+    fn transition_body(&mut self, value: &TransitionBodyBinding) {
+        match value {
+            TransitionBodyBinding::Creation {
+                kind,
+                next,
+                manifest,
+                group_info_sha256,
+                metadata,
+            } => {
+                self.u8(1);
+                self.u8(conversation_kind_code(*kind));
+                self.coordinate(next);
+                self.roster_manifest(manifest);
+                self.bytes(group_info_sha256);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::Commit {
+                prior,
+                next,
+                aad_digest,
+                manifest,
+                commit_sha256,
+                metadata,
+            } => {
+                self.u8(2);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.bytes(aad_digest);
+                self.transition_manifest(manifest);
+                self.bytes(commit_sha256);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::Policy {
+                prior,
+                next,
+                participant_changes,
+            } => {
+                self.u8(3);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.slice(participant_changes, Self::manifest_participant_change);
+            }
+            TransitionBodyBinding::Acceptance {
+                prior,
+                next,
+                recovery_request_id,
+                invitation_provenance,
+                recovery,
+            } => {
+                self.u8(4);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.bytes(recovery_request_id);
+                self.invitation_binding(invitation_provenance);
+                self.acceptance_recovery(recovery);
+            }
+            TransitionBodyBinding::Metadata {
+                prior,
+                next,
+                metadata,
+            } => {
+                self.u8(5);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::ResetActivation {
+                kind,
+                reset_request_id,
+                prior,
+                retired,
+                successor,
+                manifest,
+                group_info_sha256,
+                metadata,
+            } => {
+                self.u8(6);
+                self.u8(conversation_kind_code(*kind));
+                self.bytes(reset_request_id);
+                self.coordinate(prior);
+                self.coordinate(retired);
+                self.coordinate(successor);
+                self.roster_manifest(manifest);
+                self.bytes(group_info_sha256);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::LeafRecoveryFulfillment {
+                recovery_request_id,
+                prior,
+                next,
+                aad_digest,
+                manifest,
+                commit_sha256,
+                metadata,
+            } => {
+                self.u8(7);
+                self.bytes(recovery_request_id);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.bytes(aad_digest);
+                self.transition_manifest(manifest);
+                self.bytes(commit_sha256);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::ConversationClose {
+                kind,
+                prior,
+                retired,
+            } => {
+                self.u8(8);
+                self.u8(conversation_kind_code(*kind));
+                self.coordinate(prior);
+                self.coordinate(retired);
+            }
+            TransitionBodyBinding::ZeroLeafLeave { prior, next } => {
+                self.u8(9);
+                self.coordinate(prior);
+                self.coordinate(next);
+            }
+            TransitionBodyBinding::LeaveCommitFulfillment {
+                leave_request_id,
+                prior,
+                next,
+                aad_digest,
+                manifest,
+                commit_sha256,
+                metadata,
+            } => {
+                self.u8(10);
+                self.bytes(leave_request_id);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.bytes(aad_digest);
+                self.transition_manifest(manifest);
+                self.bytes(commit_sha256);
+                self.metadata(metadata);
+            }
+        }
+    }
+
+    fn roster_manifest(&mut self, value: &RosterManifestBinding) {
+        self.slice(&value.participants, |encoder, participant| {
+            encoder.bytes(participant.principal.as_bytes());
+            encoder.u8(participant_status_code(participant.status));
+            encoder.u8(participant_role_code(participant.role));
+            encoder.option(participant.invitation.as_ref(), Self::invitation_binding);
+        });
+        self.device(&value.actor_leaf);
+    }
+
+    fn invitation_binding(&mut self, value: &InvitationBinding) {
+        self.bytes(&value.transition_id);
+        self.device(&value.inviter);
+    }
+
+    fn acceptance_recovery(&mut self, value: &AcceptanceRecoveryBinding) {
+        self.bytes(&value.request_id);
+        self.bytes(&value.conversation_id);
+        self.device(&value.target);
+        self.u8(recovery_kind_code(value.kind));
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.requester_key_id);
+        self.u64(value.requester_auth_generation);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.key_package_wrapper);
+        self.bytes(&value.key_package_wrapper_sha256);
+        self.timestamp(value.requested_at);
+        self.timestamp(value.expires_at);
+        self.bytes(&value.canonical_digest);
+    }
+
+    fn transition_manifest(&mut self, value: &TransitionManifestBinding) {
+        self.slice(
+            &value.participant_changes,
+            Self::manifest_participant_change,
+        );
+        self.slice(&value.leaf_changes, Self::manifest_leaf_change);
+        self.option(value.leaf_recovery_request_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.option(value.welcome.as_ref(), |encoder, welcome| {
+            encoder.bytes(&welcome.welcome_id);
+            encoder.bytes(&welcome.opaque_welcome);
+            encoder.bytes(&welcome.sha256);
+            encoder.device(&welcome.recipient);
+            encoder.bytes(&welcome.recovery_request_id);
+            encoder.bytes(&welcome.key_package_ref);
+        });
+    }
+
+    fn manifest_participant_change(&mut self, value: &ManifestParticipantChange) {
+        match value {
+            ManifestParticipantChange::Add(principal) => {
+                self.u8(1);
+                self.bytes(principal.as_bytes());
+            }
+            ManifestParticipantChange::Remove(principal) => {
+                self.u8(2);
+                self.bytes(principal.as_bytes());
+            }
+            ManifestParticipantChange::ChangeRole(principal, role) => {
+                self.u8(3);
+                self.bytes(principal.as_bytes());
+                self.u8(participant_role_code(*role));
+            }
+        }
+    }
+
+    fn manifest_leaf_change(&mut self, value: &ManifestLeafChange) {
+        match value {
+            ManifestLeafChange::Add {
+                device,
+                recovery_request_id,
+                key_package_ref,
+            } => {
+                self.u8(1);
+                self.device(device);
+                self.bytes(recovery_request_id);
+                self.bytes(key_package_ref);
+            }
+            ManifestLeafChange::Remove(device) => {
+                self.u8(2);
+                self.device(device);
+            }
+        }
+    }
+
+    fn request(&mut self, value: &RequestEvidence) {
+        self.u8(request_kind_code(value.kind));
+        self.option(value.control_entry_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.bytes(&value.conversation_id);
+        self.option(value.control_seq.as_ref(), |encoder, value| {
+            encoder.u64(*value)
+        });
+        self.option(
+            value.control_outer_entry_fingerprint.as_ref(),
+            |encoder, value| encoder.bytes(value),
+        );
+        self.option(
+            value.control_outer_projection.as_deref(),
+            |encoder, value| encoder.bytes(value),
+        );
+        self.option(
+            value.control_server_fields_dag_cbor.as_deref(),
+            |encoder, value| encoder.bytes(value),
+        );
+        self.bytes(&value.request_id);
+        self.device(&value.actor);
+        self.bytes(&value.key_id);
+        self.u64(value.auth_generation);
+        self.bytes(&value.request_digest);
+        self.bytes(&value.signature);
+        self.bytes(&value.signed_request_bytes);
+        self.bytes(&value.durable_row_digest);
+        self.timestamp(value.received_at);
+        self.option(value.authority.as_ref(), Self::authenticated_entry);
+        self.option(
+            value.body_binding.as_ref(),
+            |encoder, binding| match binding {
+                RequestBodyBinding::LeafRecoveryRequest { prior, kind } => {
+                    encoder.u8(1);
+                    encoder.coordinate(prior);
+                    encoder.u8(recovery_kind_code(*kind));
+                }
+                RequestBodyBinding::LeafRecoveryCancellation => encoder.u8(2),
+                RequestBodyBinding::ResetRequest { prior } => {
+                    encoder.u8(3);
+                    encoder.coordinate(prior);
+                }
+                RequestBodyBinding::LeaveRequest { prior } => {
+                    encoder.u8(4);
+                    encoder.coordinate(prior);
+                }
+                RequestBodyBinding::LeaveCancellation { conversation_id } => {
+                    encoder.u8(5);
+                    encoder.bytes(conversation_id);
+                }
+                RequestBodyBinding::WelcomeResponse {
+                    coordinates,
+                    transition_seq,
+                    rejection_reason,
+                } => {
+                    encoder.u8(6);
+                    encoder.coordinate(coordinates);
+                    encoder.u64(*transition_seq);
+                    encoder.option(rejection_reason.as_deref(), |encoder, value| {
+                        encoder.bytes(value.as_bytes())
+                    });
+                }
+            },
+        );
+    }
+
+    fn device_revocation(&mut self, value: &DeviceRevocationEvidence) {
+        self.bytes(&value.revocation_id);
+        self.device(&value.actor);
+        self.device(&value.target);
+        self.bytes(&value.actor_key_id);
+        self.u64(value.actor_auth_generation);
+        self.u64(value.expected_target_auth_generation);
+        self.timestamp(value.signed_at);
+        self.timestamp(value.accepted_at);
+        self.bytes(&value.request_digest);
+        self.bytes(&value.signature);
+        self.bytes(&value.signed_request_bytes);
+        self.bytes(&value.signing_transcript_bytes);
+        self.bytes(&value.durable_row_digest);
+    }
+
+    fn plan_authority(&mut self, value: &PlanAuthority) {
+        match value {
+            PlanAuthority::Transition(value) => {
+                self.u8(1);
+                self.transition(value);
+            }
+            PlanAuthority::Request(value) => {
+                self.u8(2);
+                self.request(value);
+            }
+            PlanAuthority::DeviceRevocation(value) => {
+                self.u8(3);
+                self.device_revocation(value);
+            }
+            PlanAuthority::RecoveryExpiry(value) => {
+                self.u8(4);
+                self.bytes(&value.request_id);
+                self.device(&value.requester);
+                self.timestamp(value.terminal_at);
+                self.timestamp(value.observed_at);
+                self.bytes(&value.locked_read_set_digest);
+            }
+            PlanAuthority::WelcomeExpiry(value) => {
+                self.u8(5);
+                self.bytes(&value.welcome_id);
+                self.device(&value.recipient);
+                self.coordinate(&value.coordinate);
+                self.u64(value.transition_seq);
+                self.timestamp(value.terminal_at);
+                self.timestamp(value.observed_at);
+                self.bytes(&value.locked_row_digest);
+            }
+        }
+    }
+
+    fn metadata(&mut self, value: &MetadataSnapshotBinding) {
+        self.bytes(&value.coordinate.conversation_id);
+        self.u64(value.coordinate.generation);
+        self.u64(value.coordinate.epoch);
+        self.bytes(&value.coordinate.group_context_hash);
+        self.bytes(&value.origin_transition_id);
+        self.u64(value.metadata_version);
+        self.bytes(&value.nonce);
+        self.bytes(&value.ciphertext);
+        self.bytes(&value.ciphertext_sha256);
+        self.option(value.avatar_binding_digest.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.device(&value.author_proof.author);
+        self.bytes(&value.author_proof.author_key_id);
+        self.bytes(&value.author_proof.signature_public_key);
+        self.u64(value.author_proof.auth_generation_at_origin);
+        self.bytes(&value.author_proof.origin_transition_id);
+        self.u64(value.author_proof.origin_seq);
+        self.bytes(&value.canonical_snapshot);
+        self.bytes(&value.digest);
+    }
+}
+
+impl RecoveryPlanEncoder {
+    fn public_state(&mut self, value: &ActivePublicState) {
+        self.coordinate(value.coordinate());
+        self.bytes(value.snapshot());
+        self.bytes(value.snapshot_sha256());
+        let tree = value.binding().tree_summary();
+        self.bytes(tree.tree_hash());
+        self.slice(tree.leaves(), |encoder, leaf| {
+            encoder.u32(leaf.leaf_index());
+            encoder.bytes(leaf.basic_credential());
+            encoder.bytes(leaf.signature_key());
+            encoder.bytes(leaf.encryption_key());
+        });
+        self.option(value.verified_group_info_sha256(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.option(
+            value.verified_group_info_signature_key(),
+            |encoder, value| encoder.bytes(value),
+        );
+    }
+
+    fn participant_hydration(&mut self, value: &ParticipantHydrationRow) {
+        self.bytes(value.principal.as_bytes());
+        self.u8(participant_status_code(value.status));
+        self.u8(participant_role_code(value.role));
+        self.option(value.role_producer.as_ref(), Self::transition);
+        self.option(value.invitation.as_ref(), |encoder, invitation| {
+            encoder.transition(&invitation.transition);
+            encoder.device(&invitation.inviter);
+        });
+        self.option(value.acceptance.as_ref(), Self::transition);
+    }
+
+    fn leaf_hydration(&mut self, value: &LeafHydrationRow) {
+        self.device(&value.device);
+        self.u32(value.leaf_index);
+        self.bytes(&value.basic_credential);
+        self.bytes(&value.signature_key);
+        self.bytes(&value.encryption_key);
+        self.option(value.key_package_ref.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+    }
+
+    fn interval_hydration(&mut self, value: &IntervalHydrationRow) {
+        self.device(&value.recipient);
+        self.u64(value.generation);
+        self.transition(&value.opening);
+        self.u8(opening_kind_code(value.opening_kind));
+        self.coordinate(&value.opening_context);
+        self.option(value.end.as_ref(), |encoder, end| {
+            encoder.transition(&end.evidence);
+            encoder.u8(close_kind_code(end.kind));
+        });
+    }
+
+    fn terminal_proof_hydration(&mut self, value: &TerminalProofHydrationRow) {
+        self.device(&value.recipient);
+        self.bytes(&value.conversation_id);
+        self.transition(&value.evidence);
+    }
+
+    fn work_terminal_hydration(&mut self, value: &WorkTerminalHydrationRow) {
+        match value {
+            WorkTerminalHydrationRow::Transition(value) => {
+                self.u8(1);
+                self.transition(value);
+            }
+            WorkTerminalHydrationRow::Request(value) => {
+                self.u8(2);
+                self.request(value);
+            }
+            WorkTerminalHydrationRow::DeviceRevocation(value) => {
+                self.u8(3);
+                self.device_revocation(value);
+            }
+            WorkTerminalHydrationRow::Expiry(value) => {
+                self.u8(4);
+                self.timestamp(*value);
+            }
+        }
+    }
+
+    fn recovery_request_hydration(&mut self, value: &RecoveryRequestHydrationRow) {
+        self.bytes(&value.request_id);
+        self.device(&value.target);
+        self.u8(recovery_kind_code(value.kind));
+        self.u8(recovery_source_code(value.source));
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.key_package_ref);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(recovery_request_status_code(value.status));
+        match &value.origin {
+            RecoveryOriginHydrationRow::Acceptance(value) => {
+                self.u8(1);
+                self.transition(value);
+            }
+            RecoveryOriginHydrationRow::Request(value) => {
+                self.u8(2);
+                self.request(value);
+            }
+        }
+        self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
+    }
+
+    fn recovery_reservation_hydration(&mut self, value: &RecoveryReservationHydrationRow) {
+        self.bytes(&value.request_id);
+        self.device(&value.target);
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.key_package_ref);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.timestamp(value.package_not_after);
+        self.u8(reservation_status_code(value.status));
+        self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
+    }
+
+    fn reset_hydration(&mut self, value: &ResetRequestHydrationRow) {
+        self.bytes(&value.request_id);
+        self.device(&value.requester);
+        self.coordinate(&value.bound_coordinate);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(reset_request_status_code(value.status));
+        self.request(&value.origin);
+        self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
+    }
+
+    fn participant_removal(&mut self, value: &ParticipantRemovalEvidence) {
+        self.participant_hydration(&value.participant_hydration());
+        self.transition(value.terminal());
+    }
+
+    fn leave_hydration(&mut self, value: &LeaveRequestHydrationRow) {
+        self.bytes(&value.request_id);
+        self.device(&value.requester);
+        self.coordinate(&value.bound_coordinate);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(leave_request_status_code(value.status));
+        self.request(&value.origin);
+        self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
+        self.option(
+            value.fulfilled_participant.as_ref(),
+            Self::participant_removal,
+        );
+    }
+
+    fn welcome_hydration(&mut self, value: &WelcomeHydrationRow) {
+        self.bytes(&value.welcome_id);
+        self.device(&value.recipient);
+        self.u64(value.transition_seq);
+        self.coordinate(&value.coordinate);
+        self.bytes(&value.recovery_request_id);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.opaque_welcome);
+        self.bytes(&value.sha256);
+        self.timestamp(value.expires_at);
+        self.u8(welcome_status_code(value.status));
+        self.option(value.terminal.as_ref(), Self::work_terminal_hydration);
+    }
+
+    fn state_hydration(&mut self, value: &ConversationStateHydration) {
+        self.bytes(b"successor-state");
+        self.u8(conversation_kind_code(value.kind));
+        self.coordinate(&value.coordinate);
+        self.transition(&value.producer);
+        self.option(value.public_state.as_ref(), Self::public_state);
+        self.option(value.metadata.as_ref(), Self::metadata);
+        self.option(value.metadata_producer.as_ref(), Self::transition);
+        self.slice(&value.participants, Self::participant_hydration);
+        self.slice(&value.leaves, Self::leaf_hydration);
+        self.slice(&value.intervals, Self::interval_hydration);
+        self.slice(&value.terminal_proofs, Self::terminal_proof_hydration);
+        self.slice(&value.recovery_requests, Self::recovery_request_hydration);
+        self.slice(
+            &value.recovery_reservations,
+            Self::recovery_reservation_hydration,
+        );
+        self.slice(&value.reset_requests, Self::reset_hydration);
+        self.slice(&value.leave_requests, Self::leave_hydration);
+        self.slice(&value.welcomes, Self::welcome_hydration);
+    }
+}
+
+impl RecoveryPlanEncoder {
+    fn work_terminal(&mut self, value: &WorkTerminalEvidence) {
+        match value {
+            WorkTerminalEvidence::Transition(value) => {
+                self.u8(1);
+                self.transition(value);
+            }
+            WorkTerminalEvidence::Request(value) => {
+                self.u8(2);
+                self.request(value);
+            }
+            WorkTerminalEvidence::DeviceRevocation(value) => {
+                self.u8(3);
+                self.device_revocation(value);
+            }
+            WorkTerminalEvidence::Expiry(value) => {
+                self.u8(4);
+                self.timestamp(*value);
+            }
+        }
+    }
+
+    fn participant(&mut self, value: &ParticipantRecord) {
+        self.bytes(value.principal.as_bytes());
+        self.u8(participant_status_code(value.status));
+        self.u8(participant_role_code(value.role));
+        self.option(value.role_producer.as_ref(), Self::transition);
+        self.option(value.invitation.as_ref(), |encoder, invitation| {
+            encoder.transition(&invitation.transition);
+            encoder.device(&invitation.inviter);
+        });
+        self.option(value.acceptance.as_ref(), Self::transition);
+    }
+
+    fn leaf(&mut self, value: &LeafRecord) {
+        self.device(&value.device);
+        self.u32(value.leaf_index);
+        self.bytes(&value.basic_credential);
+        self.bytes(&value.signature_key);
+        self.bytes(&value.encryption_key);
+        self.option(value.key_package_ref.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+    }
+
+    fn interval(&mut self, value: &AccessInterval) {
+        self.device(&value.recipient);
+        self.u64(value.generation);
+        self.transition(&value.opening);
+        self.u8(opening_kind_code(value.opening_kind));
+        self.coordinate(&value.opening_context);
+        self.option(value.end.as_ref(), |encoder, end| {
+            encoder.transition(&end.evidence);
+            encoder.u8(close_kind_code(end.kind));
+        });
+    }
+
+    fn terminal_proof(&mut self, value: &ScheduleTerminalProof) {
+        self.device(&value.recipient);
+        self.bytes(&value.conversation_id);
+        self.transition(&value.evidence);
+    }
+
+    fn recovery_request(&mut self, value: &RecoveryRequest) {
+        self.bytes(&value.request_id);
+        self.device(&value.target);
+        self.u8(recovery_kind_code(value.kind));
+        self.u8(recovery_source_code(value.source));
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.key_package_ref);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(recovery_request_status_code(value.status));
+        match &value.origin {
+            RecoveryOriginEvidence::Acceptance(value) => {
+                self.u8(1);
+                self.transition(value);
+            }
+            RecoveryOriginEvidence::Request(value) => {
+                self.u8(2);
+                self.request(value);
+            }
+        }
+        self.option(value.terminal.as_ref(), Self::work_terminal);
+    }
+
+    fn recovery_reservation(&mut self, value: &RecoveryReservation) {
+        self.bytes(&value.request_id);
+        self.device(&value.target);
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.key_package_ref);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.timestamp(value.package_not_after);
+        self.u8(reservation_status_code(value.status));
+        self.option(value.terminal.as_ref(), Self::work_terminal);
+    }
+
+    fn reset_request(&mut self, value: &ResetRequest) {
+        self.bytes(&value.request_id);
+        self.device(&value.requester);
+        self.coordinate(&value.bound_coordinate);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(reset_request_status_code(value.status));
+        self.request(&value.origin);
+        self.option(value.terminal.as_ref(), Self::work_terminal);
+    }
+
+    fn leave_request(&mut self, value: &LeaveRequest) {
+        self.bytes(&value.request_id);
+        self.device(&value.requester);
+        self.coordinate(&value.bound_coordinate);
+        self.timestamp(value.received_at);
+        self.timestamp(value.expires_at);
+        self.u8(leave_request_status_code(value.status));
+        self.request(&value.origin);
+        self.option(value.terminal.as_ref(), Self::work_terminal);
+        self.option(
+            value.fulfilled_participant.as_ref(),
+            Self::participant_removal,
+        );
+    }
+
+    fn welcome(&mut self, value: &WelcomeWork) {
+        self.bytes(&value.welcome_id);
+        self.device(&value.recipient);
+        self.u64(value.transition_seq);
+        self.coordinate(&value.coordinate);
+        self.bytes(&value.recovery_request_id);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.opaque_welcome);
+        self.bytes(&value.sha256);
+        self.timestamp(value.expires_at);
+        self.u8(welcome_status_code(value.status));
+        self.option(value.terminal.as_ref(), Self::work_terminal);
+    }
+
+    fn state_counts(&mut self, value: &StateCounts) {
+        self.usize(value.participants);
+        self.usize(value.pending_participants);
+        self.usize(value.active_participants);
+        self.usize(value.active_admins);
+        self.usize(value.leaves);
+        self.usize(value.intervals);
+        self.usize(value.open_intervals);
+        self.usize(value.terminal_proofs);
+        self.usize(value.open_recovery_requests);
+        self.usize(value.active_reservations);
+        self.usize(value.pending_reset_requests);
+        self.usize(value.pending_leave_requests);
+        self.usize(value.pending_welcomes);
+    }
+
+    fn state_change<T>(&mut self, value: &StateChange<T>, mut encode: impl FnMut(&mut Self, &T)) {
+        self.option(value.before.as_ref(), |encoder, value| {
+            encode(encoder, value)
+        });
+        self.option(value.after.as_ref(), |encoder, value| {
+            encode(encoder, value)
+        });
+    }
+
+    fn package_transition(&mut self, value: &PackageTransition) {
+        self.bytes(&value.request_id);
+        self.bytes(&value.key_package_ref);
+        self.u8(package_status_code(value.from));
+        self.u8(package_status_code(value.to));
+    }
+
+    fn recovery_package_cas(&mut self, value: &RecoveryPackageCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.bytes(&value.conversation_id);
+        self.bytes(&value.request_id);
+        self.device(&value.target);
+        self.bytes(&value.target_key_id);
+        self.u64(value.target_auth_generation);
+        self.coordinate(&value.bound_coordinate);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.key_package_wrapper_sha256);
+        self.timestamp(value.package_not_after);
+        self.timestamp(value.claimed_at);
+        self.u8(package_status_code(value.expected_status));
+        self.u8(package_status_code(value.successor_status));
+        self.bytes(&value.locked_row_digest);
+        self.bytes(&value.authority_digest);
+    }
+
+    fn revocation_package_cas(&mut self, value: &RevocationPackageCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.device(&value.target);
+        self.bytes(&value.target_key_id);
+        self.u64(value.target_auth_generation);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.wrapper_sha256);
+        self.timestamp(value.package_not_after);
+        self.u8(package_status_code(value.expected_status));
+        self.u8(package_status_code(value.successor_status));
+        self.option(value.conversation_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.option(value.request_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.bytes(&value.revocation_id);
+        self.timestamp(value.revoked_at);
+        self.bytes(&value.revocation_request_digest);
+        self.bytes(&value.revocation_row_digest);
+        self.bytes(&value.locked_row_digest);
+    }
+
+    fn revocation_target_cas(&mut self, value: &RevocationTargetCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.device(&value.target);
+        self.u64(value.expected_auth_generation);
+        self.u8(registration_status_code(value.expected_status));
+        self.u8(registration_status_code(value.successor_status));
+        self.timestamp(value.locked_at);
+        self.bytes(&value.locked_row_digest);
+    }
+
+    fn welcome_cas(&mut self, value: &WelcomeCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.bytes(&value.conversation_id);
+        self.bytes(&value.welcome_id);
+        self.device(&value.recipient);
+        self.u64(value.transition_seq);
+        self.coordinate(&value.coordinate);
+        self.bytes(&value.recovery_request_id);
+        self.bytes(&value.key_package_ref);
+        self.bytes(&value.opaque_welcome_sha256);
+        self.timestamp(value.expires_at);
+        self.u8(welcome_status_code(value.expected_status));
+        self.u8(welcome_status_code(value.successor_status));
+        self.timestamp(value.locked_at);
+        self.bytes(&value.locked_row_digest);
+        self.bytes(&value.seal);
+    }
+
+    fn invitation_quota_cas(&mut self, value: &InvitationQuotaCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.bytes(value.inviter.as_bytes());
+        self.slice(&value.new_recipients, |encoder, value| {
+            encoder.bytes(value.as_bytes())
+        });
+        self.u64(value.expected_inviter_recent_24h);
+        self.u64(value.successor_inviter_recent_24h);
+        self.u64(value.inviter_limit);
+        self.slice(&value.recipient_facts, |encoder, value| {
+            encoder.bytes(value.recipient.as_bytes());
+            encoder.u64(value.expected_pair_live);
+            encoder.u64(value.successor_pair_live);
+            encoder.u64(value.pair_limit);
+            encoder.u64(value.expected_recipient_live);
+            encoder.u64(value.successor_recipient_live);
+            encoder.u64(value.recipient_limit);
+        });
+        self.timestamp(value.locked_at);
+        self.bytes(&value.locked_row_digest);
+    }
+
+    fn head_cas(&mut self, value: &ConversationHeadCasBinding) {
+        self.bytes(value.transaction_id.as_bytes());
+        self.bytes(&value.conversation_id);
+        self.option(value.expected_prior.as_ref(), Self::coordinate);
+        self.u64(value.expected_next_entry_seq);
+        self.option(value.allocated_entry_id.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.option(value.allocated_seq.as_ref(), |encoder, value| {
+            encoder.u64(*value)
+        });
+        self.u64(value.successor_next_entry_seq);
+        self.timestamp(value.locked_at);
+        self.bytes(&value.locked_head_digest);
+    }
+
+    fn transition_effects(&mut self, value: &TransitionEffects) {
+        self.bytes(b"transition-effects");
+        self.u8(plan_kind_code(value.kind));
+        self.slice(&value.opened_intervals, Self::device);
+        self.slice(&value.closed_intervals, Self::device);
+        self.slice(&value.superseded_recovery_requests, |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.slice(&value.terminal_proof_recipients, Self::device);
+        self.bool(value.complete);
+        self.state_counts(&value.before_counts);
+        self.state_counts(&value.after_counts);
+        self.option(value.metadata_change.as_ref(), |encoder, value| {
+            encoder.state_change(value, Self::metadata)
+        });
+        self.option(value.policy_evidence_digest.as_ref(), |encoder, value| {
+            encoder.bytes(value)
+        });
+        self.slice(&value.participant_changes, |encoder, value| {
+            encoder.state_change(value, Self::participant)
+        });
+        self.slice(&value.leaf_changes, |encoder, value| {
+            encoder.state_change(value, Self::leaf)
+        });
+        self.slice(&value.interval_changes, |encoder, value| {
+            encoder.state_change(value, Self::interval)
+        });
+        self.slice(&value.terminal_proof_changes, |encoder, value| {
+            encoder.state_change(value, Self::terminal_proof)
+        });
+        self.slice(&value.recovery_request_changes, |encoder, value| {
+            encoder.state_change(value, Self::recovery_request)
+        });
+        self.slice(&value.reservation_changes, |encoder, value| {
+            encoder.state_change(value, Self::recovery_reservation)
+        });
+        self.slice(&value.reset_request_changes, |encoder, value| {
+            encoder.state_change(value, Self::reset_request)
+        });
+        self.slice(&value.leave_request_changes, |encoder, value| {
+            encoder.state_change(value, Self::leave_request)
+        });
+        self.slice(&value.welcome_changes, |encoder, value| {
+            encoder.state_change(value, Self::welcome)
+        });
+        self.slice(&value.package_transitions, Self::package_transition);
+        self.slice(&value.recovery_package_cas, Self::recovery_package_cas);
+        self.slice(&value.revocation_package_cas, Self::revocation_package_cas);
+        self.option(
+            value.revocation_target_cas.as_ref(),
+            Self::revocation_target_cas,
+        );
+        self.option(value.welcome_cas.as_ref(), Self::welcome_cas);
+        self.option(
+            value.invitation_quota_cas.as_ref(),
+            Self::invitation_quota_cas,
+        );
+        self.option(value.authority.as_ref(), Self::plan_authority);
+        self.option(value.head_cas.as_ref(), Self::head_cas);
+    }
+}
+
+fn conversation_kind_code(value: ConversationKind) -> u8 {
+    match value {
+        ConversationKind::Direct => 1,
+        ConversationKind::Group => 2,
+    }
+}
+
+fn opening_kind_code(value: OpeningKind) -> u8 {
+    match value {
+        OpeningKind::Creation => 1,
+        OpeningKind::Add => 2,
+        OpeningKind::Reset => 3,
+    }
+}
+
+fn close_kind_code(value: CloseKind) -> u8 {
+    match value {
+        CloseKind::Remove => 1,
+        CloseKind::Replace => 2,
+        CloseKind::Reset => 3,
+        CloseKind::Terminal => 4,
+    }
+}
+
+fn recovery_source_code(value: RecoverySource) -> u8 {
+    match value {
+        RecoverySource::Request => 1,
+        RecoverySource::Acceptance => 2,
+    }
+}
+
+fn recovery_request_status_code(value: RecoveryRequestStatus) -> u8 {
+    match value {
+        RecoveryRequestStatus::Open => 1,
+        RecoveryRequestStatus::Fulfilled => 2,
+        RecoveryRequestStatus::Cancelled => 3,
+        RecoveryRequestStatus::Expired => 4,
+        RecoveryRequestStatus::Superseded => 5,
+    }
+}
+
+fn reservation_status_code(value: ReservationStatus) -> u8 {
+    match value {
+        ReservationStatus::Active => 1,
+        ReservationStatus::Consumed => 2,
+        ReservationStatus::Expired => 3,
+        ReservationStatus::Released => 4,
+    }
+}
+
+fn reset_request_status_code(value: ResetRequestStatus) -> u8 {
+    match value {
+        ResetRequestStatus::Pending => 1,
+        ResetRequestStatus::Stale => 2,
+        ResetRequestStatus::Consumed => 3,
+        ResetRequestStatus::Expired => 4,
+    }
+}
+
+fn leave_request_status_code(value: LeaveRequestStatus) -> u8 {
+    match value {
+        LeaveRequestStatus::Pending => 1,
+        LeaveRequestStatus::Fulfilled => 2,
+        LeaveRequestStatus::Cancelled => 3,
+        LeaveRequestStatus::Expired => 4,
+        LeaveRequestStatus::Stale => 5,
+    }
+}
+
+fn package_status_code(value: PackageStatus) -> u8 {
+    match value {
+        PackageStatus::Available => 1,
+        PackageStatus::Reserved => 2,
+        PackageStatus::Consumed => 3,
+        PackageStatus::Expired => 4,
+        PackageStatus::Revoked => 5,
+    }
+}
+
+fn registration_status_code(value: PersistedRegistrationStatus) -> u8 {
+    match value {
+        PersistedRegistrationStatus::Active => 1,
+        PersistedRegistrationStatus::Revoked => 2,
+    }
+}
+
+fn plan_kind_code(value: PlanKind) -> u8 {
+    match value {
+        PlanKind::Creation => 1,
+        PlanKind::Policy => 2,
+        PlanKind::Acceptance => 3,
+        PlanKind::Metadata => 4,
+        PlanKind::Commit => 5,
+        PlanKind::RecoveryRequest => 6,
+        PlanKind::RecoveryCancellation => 7,
+        PlanKind::RecoveryExpiry => 8,
+        PlanKind::DeviceRevocation => 9,
+        PlanKind::ResetRequest => 10,
+        PlanKind::ResetActivation => 11,
+        PlanKind::LeaveRequest => 12,
+        PlanKind::LeaveCancellation => 13,
+        PlanKind::ZeroLeafLeave => 14,
+        PlanKind::WelcomeAcknowledgement => 15,
+        PlanKind::WelcomeRejection => 16,
+        PlanKind::WelcomeExpiry => 17,
+        PlanKind::Close => 18,
+    }
+}
+
+fn participant_status_code(value: ParticipantStatus) -> u8 {
+    match value {
+        ParticipantStatus::Pending => 1,
+        ParticipantStatus::Active => 2,
+    }
+}
+
+fn participant_role_code(value: ParticipantRole) -> u8 {
+    match value {
+        ParticipantRole::Member => 1,
+        ParticipantRole::Admin => 2,
+    }
+}
+
+fn recovery_kind_code(value: LeafRecoveryKind) -> u8 {
+    match value {
+        LeafRecoveryKind::Add => 1,
+        LeafRecoveryKind::Replace => 2,
+    }
+}
+
+fn request_kind_code(value: RequestEntryKind) -> u8 {
+    match value {
+        RequestEntryKind::LeafRecoveryRequest => 1,
+        RequestEntryKind::LeafRecoveryCancellation => 2,
+        RequestEntryKind::ResetRequest => 3,
+        RequestEntryKind::LeaveRequest => 4,
+        RequestEntryKind::LeaveCancellation => 5,
+        RequestEntryKind::WelcomeAcknowledgement => 6,
+        RequestEntryKind::WelcomeRejection => 7,
+    }
+}
+
+fn signed_mutation_kind_code(value: SignedMutationKind) -> u8 {
+    match value {
+        SignedMutationKind::Creation => 1,
+        SignedMutationKind::PolicyTransition => 2,
+        SignedMutationKind::ParticipantAcceptance => 3,
+        SignedMutationKind::MetadataTransition => 4,
+        SignedMutationKind::CommitTransition => 5,
+        SignedMutationKind::LeafRecoveryRequest => 6,
+        SignedMutationKind::LeafRecoveryCancellation => 7,
+        SignedMutationKind::ResetRequest => 8,
+        SignedMutationKind::ResetActivation => 9,
+        SignedMutationKind::LeaveRequest => 10,
+        SignedMutationKind::LeaveCancellation => 11,
+        SignedMutationKind::ZeroLeafLeave => 12,
+        SignedMutationKind::LeaveCommitFulfillment => 13,
+        SignedMutationKind::LeafRecoveryFulfillment => 14,
+        SignedMutationKind::WelcomeAcknowledgement => 15,
+        SignedMutationKind::WelcomeRejection => 16,
+        SignedMutationKind::ConversationClose => 17,
+        SignedMutationKind::DeviceRevocation => 18,
+        SignedMutationKind::ApplicationSend => 19,
+        SignedMutationKind::DeviceEnrollment => 20,
+        SignedMutationKind::KeyPackageReplenishment => 21,
+        SignedMutationKind::DeviceAuthenticationRebind => 22,
+        SignedMutationKind::BlobUploadPreparation => 23,
+        SignedMutationKind::BlobDeletion => 24,
+        SignedMutationKind::Typing => 25,
+    }
+}
+
 fn invitation_quota_recipient_facts_valid(binding: &InvitationQuotaCasBinding) -> bool {
     binding.recipient_facts.len() == binding.new_recipients.len()
         && binding
@@ -10013,6 +11676,567 @@ mod invitation_quota_binding_tests {
             locked_row_digest: [1; 32],
         };
         assert!(!invitation_quota_recipient_facts_valid(&binding));
+    }
+}
+
+#[cfg(test)]
+mod recovery_plan_fingerprint_tests {
+    use super::*;
+
+    fn coordinate(state_version: u64, epoch: u64, marker: u8) -> PublicGroupSnapshotCoordinate {
+        PublicGroupSnapshotCoordinate::new(
+            uuid_from_test_byte(0x31),
+            1,
+            state_version,
+            [0x41; 32],
+            epoch,
+            [marker; 32],
+            [marker.wrapping_add(1); 32],
+            PublicGroupSnapshotLifecycle::Active,
+        )
+    }
+
+    fn device(marker: u8) -> DeviceIdentity {
+        DeviceIdentity::new(
+            PrincipalId::new(format!("did:plc:fingerprint{marker:02x}aaaaaaaaaa").into_bytes())
+                .unwrap(),
+            uuid_from_test_byte(marker),
+        )
+        .unwrap()
+    }
+
+    fn request_evidence(
+        kind: RequestEntryKind,
+        request_id: [u8; 16],
+        actor: DeviceIdentity,
+        prior: PublicGroupSnapshotCoordinate,
+        marker: u8,
+    ) -> RequestEvidence {
+        let mut evidence = RequestEvidence::for_test(
+            kind,
+            7,
+            request_id,
+            actor,
+            *prior.conversation_id(),
+            ServerTimestamp::from_unix_millis(10_000 + i64::from(marker)).unwrap(),
+            marker,
+        )
+        .unwrap();
+        evidence.control_entry_id = None;
+        evidence.control_seq = None;
+        evidence.body_binding = Some(match kind {
+            RequestEntryKind::LeafRecoveryRequest => RequestBodyBinding::LeafRecoveryRequest {
+                prior,
+                kind: LeafRecoveryKind::Add,
+            },
+            RequestEntryKind::LeafRecoveryCancellation => {
+                RequestBodyBinding::LeafRecoveryCancellation
+            }
+            _ => unreachable!(),
+        });
+        evidence
+    }
+
+    fn recovery_package_cas(
+        transaction_id: &str,
+        request: &RecoveryRequest,
+        reservation: &RecoveryReservation,
+        expected_status: PackageStatus,
+        successor_status: PackageStatus,
+    ) -> RecoveryPackageCasBinding {
+        let mut binding = RecoveryPackageCasBinding {
+            transaction_id: transaction_id.to_owned(),
+            conversation_id: *request.bound_coordinate.conversation_id(),
+            request_id: request.request_id,
+            target: request.target.clone(),
+            target_key_id: [0x51; 32],
+            target_auth_generation: 3,
+            bound_coordinate: request.bound_coordinate,
+            key_package_ref: request.key_package_ref,
+            key_package_wrapper_sha256: [0x52; 32],
+            package_not_after: reservation.package_not_after,
+            claimed_at: reservation.received_at,
+            expected_status,
+            successor_status,
+            locked_row_digest: [0x53; 32],
+            authority_digest: [0; 32],
+        };
+        binding.authority_digest = recovery_package_cas_authority_digest(&binding);
+        binding
+    }
+
+    fn request_plan() -> ConversationPersistencePlan {
+        let prior = coordinate(5, 8, 0x61);
+        let actor = device(0x42);
+        let request_id = uuid_from_test_byte(0x43);
+        let evidence = request_evidence(
+            RequestEntryKind::LeafRecoveryRequest,
+            request_id,
+            actor.clone(),
+            prior,
+            0x44,
+        );
+        let received_at = evidence.received_at;
+        let expires_at = ServerTimestamp::from_unix_millis(20_000).unwrap();
+        let request = RecoveryRequest {
+            request_id,
+            target: actor.clone(),
+            kind: LeafRecoveryKind::Add,
+            source: RecoverySource::Request,
+            bound_coordinate: prior,
+            key_package_ref: [0x45; 32],
+            received_at,
+            expires_at,
+            status: RecoveryRequestStatus::Open,
+            origin: RecoveryOriginEvidence::Request(evidence.clone()),
+            terminal: None,
+        };
+        let reservation = RecoveryReservation {
+            request_id,
+            target: actor,
+            bound_coordinate: prior,
+            key_package_ref: request.key_package_ref,
+            received_at,
+            expires_at,
+            package_not_after: ServerTimestamp::from_unix_millis(30_000).unwrap(),
+            status: ReservationStatus::Active,
+            terminal: None,
+        };
+        let transaction_id = "recovery-fingerprint-tx";
+        let package_transition = PackageTransition {
+            request_id,
+            key_package_ref: request.key_package_ref,
+            from: PackageStatus::Available,
+            to: PackageStatus::Reserved,
+        };
+        let package_cas = recovery_package_cas(
+            transaction_id,
+            &request,
+            &reservation,
+            PackageStatus::Available,
+            PackageStatus::Reserved,
+        );
+        let producer = TransitionEvidence::new(6, uuid_from_test_byte(0x46), [0x47; 32]).unwrap();
+        ConversationPersistencePlan {
+            expected_prior: Some(prior),
+            retired_coordinate: None,
+            successor_coordinate: Some(prior),
+            state: ConversationStateHydration {
+                kind: ConversationKind::Group,
+                coordinate: prior,
+                producer,
+                public_state: None,
+                metadata: None,
+                metadata_producer: None,
+                participants: Vec::new(),
+                leaves: Vec::new(),
+                intervals: Vec::new(),
+                terminal_proofs: Vec::new(),
+                recovery_requests: vec![RecoveryRequestHydrationRow {
+                    request_id,
+                    target: request.target.clone(),
+                    kind: request.kind,
+                    source: request.source,
+                    bound_coordinate: prior,
+                    key_package_ref: request.key_package_ref,
+                    received_at,
+                    expires_at,
+                    status: RecoveryRequestStatus::Open,
+                    origin: RecoveryOriginHydrationRow::Request(evidence.clone()),
+                    terminal: None,
+                }],
+                recovery_reservations: vec![RecoveryReservationHydrationRow {
+                    request_id,
+                    target: reservation.target.clone(),
+                    bound_coordinate: prior,
+                    key_package_ref: reservation.key_package_ref,
+                    received_at,
+                    expires_at,
+                    package_not_after: reservation.package_not_after,
+                    status: ReservationStatus::Active,
+                    terminal: None,
+                }],
+                reset_requests: Vec::new(),
+                leave_requests: Vec::new(),
+                welcomes: Vec::new(),
+            },
+            effects: TransitionEffects {
+                kind: PlanKind::RecoveryRequest,
+                opened_intervals: Vec::new(),
+                closed_intervals: Vec::new(),
+                superseded_recovery_requests: Vec::new(),
+                terminal_proof_recipients: Vec::new(),
+                complete: true,
+                before_counts: StateCounts::default(),
+                after_counts: StateCounts {
+                    open_recovery_requests: 1,
+                    active_reservations: 1,
+                    ..StateCounts::default()
+                },
+                metadata_change: None,
+                policy_evidence_digest: Some([0x48; 32]),
+                participant_changes: Vec::new(),
+                leaf_changes: Vec::new(),
+                interval_changes: Vec::new(),
+                terminal_proof_changes: Vec::new(),
+                recovery_request_changes: vec![StateChange {
+                    before: None,
+                    after: Some(request),
+                }],
+                reservation_changes: vec![StateChange {
+                    before: None,
+                    after: Some(reservation),
+                }],
+                reset_request_changes: Vec::new(),
+                leave_request_changes: Vec::new(),
+                welcome_changes: Vec::new(),
+                package_transitions: vec![package_transition],
+                recovery_package_cas: vec![package_cas],
+                revocation_package_cas: Vec::new(),
+                revocation_target_cas: None,
+                welcome_cas: None,
+                invitation_quota_cas: None,
+                authority: Some(PlanAuthority::Request(evidence)),
+                head_cas: Some(ConversationHeadCasBinding {
+                    transaction_id: transaction_id.to_owned(),
+                    conversation_id: *prior.conversation_id(),
+                    expected_prior: Some(prior),
+                    expected_next_entry_seq: 7,
+                    allocated_entry_id: None,
+                    allocated_seq: None,
+                    successor_next_entry_seq: 7,
+                    locked_at: received_at,
+                    locked_head_digest: [0x49; 32],
+                }),
+            },
+        }
+    }
+
+    fn fulfillment_plan() -> ConversationPersistencePlan {
+        let mut plan = request_plan();
+        let prior = plan.expected_prior.unwrap();
+        let next = coordinate(prior.state_version() + 1, prior.epoch() + 1, 0x71);
+        let mut before_request = plan.effects.recovery_request_changes[0]
+            .after
+            .clone()
+            .unwrap();
+        let mut before_reservation = plan.effects.reservation_changes[0].after.clone().unwrap();
+        let target = before_request.target.clone();
+        let actor = device(0x58);
+        let transition_id = uuid_from_test_byte(0x59);
+        let welcome_id = uuid_from_test_byte(0x5a);
+        let applied_at = ServerTimestamp::from_unix_millis(12_000).unwrap();
+        let metadata = MetadataSnapshotBinding::for_test_creation(
+            *prior.conversation_id(),
+            next.generation(),
+            next.epoch(),
+            *next.group_context_hash(),
+            transition_id,
+            7,
+            actor.clone(),
+            [0x5b; 32],
+            [0x5c; 32],
+            2,
+            4,
+            [0x5d; 12],
+            vec![0x5e, 0x5f],
+        );
+        let mut producer = TransitionEvidence::for_test_leaf_recovery_fulfillment_with_metadata(
+            7,
+            transition_id,
+            [0x60; 32],
+            applied_at,
+            before_request.request_id,
+            prior,
+            next,
+            target.clone(),
+            before_request.key_package_ref,
+            welcome_id,
+            vec![0x61, 0x62],
+            metadata.clone(),
+        )
+        .unwrap();
+        producer.authority = Some(AuthenticatedEntryEvidence {
+            kind: SignedMutationKind::LeafRecoveryFulfillment,
+            type_id: "leafRecoveryFulfillmentBody",
+            domain: b"CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0".to_vec(),
+            control_entry_id: Some(transition_id),
+            control_conversation_id: Some(*prior.conversation_id()),
+            actor,
+            key_id: [0x63; 32],
+            auth_generation: 2,
+            signed_at: applied_at,
+            request_digest: [0x64; 32],
+            signature: [0x65; 64],
+            signed_request_bytes: vec![0x66],
+            canonical_projection: vec![0x67],
+            transcript_bytes: vec![0x68],
+        });
+        let terminal = WorkTerminalEvidence::Transition(producer.clone());
+        let mut after_request = before_request.clone();
+        after_request.status = RecoveryRequestStatus::Fulfilled;
+        after_request.terminal = Some(terminal.clone());
+        let mut after_reservation = before_reservation.clone();
+        after_reservation.status = ReservationStatus::Consumed;
+        after_reservation.terminal = Some(terminal.clone());
+        let leaf = LeafRecord {
+            device: target.clone(),
+            leaf_index: 3,
+            basic_credential: target.basic_credential(),
+            signature_key: vec![0x69; 32],
+            encryption_key: vec![0x6a; 32],
+            key_package_ref: Some(before_request.key_package_ref),
+        };
+        let interval = AccessInterval {
+            recipient: target.clone(),
+            generation: next.generation(),
+            opening: producer.clone(),
+            opening_kind: OpeningKind::Add,
+            opening_context: next,
+            end: None,
+        };
+        let welcome = WelcomeWork {
+            welcome_id,
+            recipient: target.clone(),
+            transition_seq: producer.seq,
+            coordinate: next,
+            recovery_request_id: before_request.request_id,
+            key_package_ref: before_request.key_package_ref,
+            opaque_welcome: vec![0x61, 0x62],
+            sha256: Sha256::digest([0x61, 0x62]).into(),
+            expires_at: before_reservation.package_not_after,
+            status: WelcomeStatus::Pending,
+            terminal: None,
+        };
+        let transaction_id = plan
+            .effects
+            .head_cas
+            .as_ref()
+            .unwrap()
+            .transaction_id
+            .clone();
+        let package_cas = recovery_package_cas(
+            &transaction_id,
+            &after_request,
+            &after_reservation,
+            PackageStatus::Reserved,
+            PackageStatus::Consumed,
+        );
+
+        before_request.status = RecoveryRequestStatus::Open;
+        before_request.terminal = None;
+        before_reservation.status = ReservationStatus::Active;
+        before_reservation.terminal = None;
+        plan.successor_coordinate = Some(next);
+        plan.state.coordinate = next;
+        plan.state.producer = producer.clone();
+        plan.state.metadata = Some(metadata.clone());
+        plan.state.metadata_producer = Some(producer.clone());
+        plan.state.leaves = vec![LeafHydrationRow {
+            device: leaf.device.clone(),
+            leaf_index: leaf.leaf_index,
+            basic_credential: leaf.basic_credential.clone(),
+            signature_key: leaf.signature_key.clone(),
+            encryption_key: leaf.encryption_key.clone(),
+            key_package_ref: leaf.key_package_ref,
+        }];
+        plan.state.intervals = vec![IntervalHydrationRow {
+            recipient: interval.recipient.clone(),
+            generation: interval.generation,
+            opening: interval.opening.clone(),
+            opening_kind: interval.opening_kind,
+            opening_context: interval.opening_context,
+            end: None,
+        }];
+        plan.state.recovery_requests[0].status = RecoveryRequestStatus::Fulfilled;
+        plan.state.recovery_requests[0].terminal =
+            Some(WorkTerminalHydrationRow::Transition(producer.clone()));
+        plan.state.recovery_reservations[0].status = ReservationStatus::Consumed;
+        plan.state.recovery_reservations[0].terminal =
+            Some(WorkTerminalHydrationRow::Transition(producer.clone()));
+        plan.state.welcomes = vec![WelcomeHydrationRow {
+            welcome_id,
+            recipient: welcome.recipient.clone(),
+            transition_seq: welcome.transition_seq,
+            coordinate: next,
+            recovery_request_id: welcome.recovery_request_id,
+            key_package_ref: welcome.key_package_ref,
+            opaque_welcome: welcome.opaque_welcome.clone(),
+            sha256: welcome.sha256,
+            expires_at: welcome.expires_at,
+            status: welcome.status,
+            terminal: None,
+        }];
+
+        plan.effects.kind = PlanKind::Commit;
+        plan.effects.opened_intervals = vec![target];
+        plan.effects.metadata_change = Some(StateChange {
+            before: None,
+            after: Some(metadata),
+        });
+        plan.effects.leaf_changes = vec![StateChange {
+            before: None,
+            after: Some(leaf),
+        }];
+        plan.effects.interval_changes = vec![StateChange {
+            before: None,
+            after: Some(interval),
+        }];
+        plan.effects.recovery_request_changes = vec![StateChange {
+            before: Some(before_request),
+            after: Some(after_request.clone()),
+        }];
+        plan.effects.reservation_changes = vec![StateChange {
+            before: Some(before_reservation),
+            after: Some(after_reservation),
+        }];
+        plan.effects.welcome_changes = vec![StateChange {
+            before: None,
+            after: Some(welcome),
+        }];
+        plan.effects.package_transitions = vec![PackageTransition {
+            request_id: after_request.request_id,
+            key_package_ref: after_request.key_package_ref,
+            from: PackageStatus::Reserved,
+            to: PackageStatus::Consumed,
+        }];
+        plan.effects.recovery_package_cas = vec![package_cas];
+        plan.effects.authority = Some(PlanAuthority::Transition(producer.clone()));
+        plan.effects.head_cas = Some(ConversationHeadCasBinding {
+            transaction_id,
+            conversation_id: *prior.conversation_id(),
+            expected_prior: Some(prior),
+            expected_next_entry_seq: producer.seq,
+            allocated_entry_id: Some(transition_id),
+            allocated_seq: Some(producer.seq),
+            successor_next_entry_seq: producer.seq + 1,
+            locked_at: applied_at,
+            locked_head_digest: [0x6b; 32],
+        });
+        plan
+    }
+
+    fn fingerprint(plan: &ConversationPersistencePlan) -> RecoveryPlanFingerprint {
+        recovery_plan_fingerprint(plan, None).expect("valid Recovery request fingerprint")
+    }
+
+    #[test]
+    fn recovery_plan_fingerprint_binds_authority_head_and_coordinates() {
+        let plan = request_plan();
+        let baseline = fingerprint(&plan);
+        assert_eq!(baseline.class(), RecoveryPlanClass::Request);
+
+        let mut authority_drift = plan.clone();
+        let Some(PlanAuthority::Request(authority)) = authority_drift.effects.authority.as_mut()
+        else {
+            unreachable!()
+        };
+        authority.request_digest[0] ^= 1;
+        assert_ne!(baseline.digest(), fingerprint(&authority_drift).digest());
+
+        let mut head_drift = plan.clone();
+        head_drift
+            .effects
+            .head_cas
+            .as_mut()
+            .unwrap()
+            .locked_head_digest[0] ^= 1;
+        assert_ne!(baseline.digest(), fingerprint(&head_drift).digest());
+
+        let mut coordinate_drift = plan.clone();
+        coordinate_drift.state.producer.outer_entry_fingerprint[0] ^= 1;
+        assert_ne!(baseline.digest(), fingerprint(&coordinate_drift).digest());
+    }
+
+    #[test]
+    fn recovery_plan_fingerprint_binds_successor_state_and_every_effect_summary() {
+        let plan = request_plan();
+        let baseline = fingerprint(&plan);
+
+        let mut state_drift = plan.clone();
+        state_drift.state.recovery_requests[0].key_package_ref[0] ^= 1;
+        assert_ne!(baseline.digest(), fingerprint(&state_drift).digest());
+
+        let mut effects_drift = plan.clone();
+        effects_drift.effects.after_counts.active_reservations += 1;
+        assert_ne!(baseline.digest(), fingerprint(&effects_drift).digest());
+    }
+
+    #[test]
+    fn recovery_plan_fingerprint_binds_complete_package_cas_authority() {
+        let plan = request_plan();
+        let baseline = fingerprint(&plan);
+        let mut drift = plan.clone();
+        let binding = &mut drift.effects.recovery_package_cas[0];
+        binding.locked_row_digest[0] ^= 1;
+        binding.authority_digest = recovery_package_cas_authority_digest(binding);
+        assert_ne!(baseline.digest(), fingerprint(&drift).digest());
+    }
+
+    #[test]
+    fn recovery_plan_fingerprint_rejects_control_bytes_and_cross_shape_splices() {
+        let plan = request_plan();
+        assert!(recovery_plan_fingerprint(&plan, Some(b"caller control bytes")).is_err());
+
+        let mut cross_shape = plan.clone();
+        cross_shape.effects.kind = PlanKind::RecoveryCancellation;
+        assert!(recovery_plan_fingerprint(&cross_shape, None).is_err());
+
+        let mut forbidden_family = plan;
+        forbidden_family.effects.leaf_changes.push(StateChange {
+            before: None,
+            after: Some(LeafRecord {
+                device: device(0x55),
+                leaf_index: 1,
+                basic_credential: vec![1],
+                signature_key: vec![2],
+                encryption_key: vec![3],
+                key_package_ref: Some([4; 32]),
+            }),
+        });
+        assert!(recovery_plan_fingerprint(&forbidden_family, None).is_err());
+    }
+
+    #[test]
+    fn relationship_evidence_is_mandatory_for_request_and_fulfillment() {
+        let mut request = request_plan();
+        request.effects.policy_evidence_digest = None;
+        assert!(recovery_plan_fingerprint(&request, None).is_err());
+
+        let mut fulfillment = fulfillment_plan();
+        fulfillment.effects.policy_evidence_digest = Some([0; 32]);
+        assert!(recovery_plan_fingerprint(&fulfillment, Some(b"canonical-control")).is_err());
+    }
+
+    #[test]
+    fn fulfillment_requires_control_bytes_and_binds_their_sha256() {
+        let plan = fulfillment_plan();
+        assert!(recovery_plan_fingerprint(&plan, None).is_err());
+        let first = recovery_plan_fingerprint(&plan, Some(b"canonical-control-a")).unwrap();
+        let second = recovery_plan_fingerprint(&plan, Some(b"canonical-control-b")).unwrap();
+        assert_eq!(first.class(), RecoveryPlanClass::Fulfillment);
+        assert_ne!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn fulfillment_fingerprint_rejects_extra_family_splices() {
+        let plan = fulfillment_plan();
+
+        let mut duplicate_own_request = plan.clone();
+        duplicate_own_request
+            .effects
+            .recovery_request_changes
+            .push(duplicate_own_request.effects.recovery_request_changes[0].clone());
+        assert!(
+            recovery_plan_fingerprint(&duplicate_own_request, Some(b"canonical-control")).is_err()
+        );
+
+        let mut illegal_welcome = plan;
+        let mut malformed = illegal_welcome.effects.welcome_changes[0].clone();
+        malformed.before = malformed.after.clone();
+        malformed.after.as_mut().expect("fixture Welcome").status = WelcomeStatus::Expired;
+        illegal_welcome.effects.welcome_changes.push(malformed);
+        assert!(recovery_plan_fingerprint(&illegal_welcome, Some(b"canonical-control")).is_err());
     }
 }
 
@@ -17591,10 +19815,17 @@ pub(in crate::chat_protocol) mod executor {
         plan: &'plan ConversationPersistencePlan,
         context: ExecutionContext,
         expected_transaction_id: Box<str>,
-        recovery_witness:
-            Option<&'plan crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness>,
+        recovery_write_authority: Option<
+            crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'plan>,
+        >,
         _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
-        #[cfg(test)]
+        #[cfg(any(
+            test,
+            all(
+                feature = "chat-protocol-production-proof",
+                not(feature = "server-bin")
+            )
+        ))]
         drop_safety_probe: Option<DropSafetyProbe>,
     }
 
@@ -17612,9 +19843,15 @@ pub(in crate::chat_protocol) mod executor {
                 plan,
                 context,
                 expected_transaction_id,
-                recovery_witness: None,
+                recovery_write_authority: None,
                 _proof: proof,
-                #[cfg(test)]
+                #[cfg(any(
+                    test,
+                    all(
+                        feature = "chat-protocol-production-proof",
+                        not(feature = "server-bin")
+                    )
+                ))]
                 drop_safety_probe: None,
             }
         }
@@ -17627,18 +19864,41 @@ pub(in crate::chat_protocol) mod executor {
             self
         }
 
-        pub(in crate::chat_protocol) fn with_recovery_witness(
+        /// Attach the same per-capsule post-write probe to the non-shipping
+        /// production-proof build. The proof feature is compile-incompatible
+        /// with `server-bin`, so this seam cannot enter the shipping executor.
+        #[cfg(all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        ))]
+        pub(in crate::chat_protocol) fn with_drop_safety_probe_for_proof(
             mut self,
-            witness: &'plan crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+            probe: DropSafetyProbe,
         ) -> Self {
-            self.recovery_witness = Some(witness);
+            self.drop_safety_probe = Some(probe);
+            self
+        }
+
+        pub(in crate::chat_protocol) fn with_recovery_write_authority(
+            mut self,
+            authority: crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<
+                'plan,
+            >,
+        ) -> Self {
+            self.recovery_write_authority = Some(authority);
             self
         }
     }
 
     /// Test-only behavior at the prepared executor's post-write,
     /// pre-savepoint-release boundary.
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        )
+    ))]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum DropSafetyProbeMode {
         Pending,
@@ -17648,13 +19908,25 @@ pub(in crate::chat_protocol) mod executor {
     /// Per-capsule drop-safety probe. It is neither global nor cloneable and is
     /// attachable only after repository hydration has minted the production
     /// capsule, so it cannot weaken any authority or artifact check.
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        )
+    ))]
     pub(crate) struct DropSafetyProbe {
         mode: DropSafetyProbeMode,
         reached: tokio::sync::oneshot::Sender<()>,
     }
 
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "chat-protocol-production-proof",
+            not(feature = "server-bin")
+        )
+    ))]
     impl DropSafetyProbe {
         pub(crate) fn new(mode: DropSafetyProbeMode) -> (Self, tokio::sync::oneshot::Receiver<()>) {
             let (reached, receiver) = tokio::sync::oneshot::channel();
@@ -19292,8 +21564,8 @@ pub(in crate::chat_protocol) mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &ConversationPersistencePlan,
         ctx: &ExecutionContext,
-        recovery_witness: Option<
-            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        recovery_write_authority: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
@@ -19330,7 +21602,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
-                    recovery_witness,
+                    recovery_write_authority,
                 )
                 .await;
             }
@@ -19343,7 +21615,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
-                    recovery_witness,
+                    recovery_write_authority,
                 )
                 .await;
             }
@@ -19356,7 +21628,7 @@ pub(in crate::chat_protocol) mod executor {
                     generation,
                     state_version,
                     epoch,
-                    recovery_witness,
+                    recovery_write_authority,
                 )
                 .await;
             }
@@ -19541,7 +21813,7 @@ pub(in crate::chat_protocol) mod executor {
                         generation,
                         state_version,
                         epoch,
-                        recovery_witness,
+                        recovery_write_authority,
                     )
                     .await
                 } else {
@@ -19684,9 +21956,15 @@ pub(in crate::chat_protocol) mod executor {
             plan,
             context,
             expected_transaction_id,
-            recovery_witness,
+            recovery_write_authority,
             _proof,
-            #[cfg(test)]
+            #[cfg(any(
+                test,
+                all(
+                    feature = "chat-protocol-production-proof",
+                    not(feature = "server-bin")
+                )
+            ))]
             drop_safety_probe,
         } = prepared;
         let mut savepoint = transaction
@@ -19706,7 +21984,7 @@ pub(in crate::chat_protocol) mod executor {
                     &mut savepoint,
                     plan,
                     &context,
-                    recovery_witness,
+                    recovery_write_authority.as_ref(),
                 )
                 .await
             }
@@ -19715,7 +21993,13 @@ pub(in crate::chat_protocol) mod executor {
         };
         match operation {
             Ok(applied) => {
-                #[cfg(test)]
+                #[cfg(any(
+                    test,
+                    all(
+                        feature = "chat-protocol-production-proof",
+                        not(feature = "server-bin")
+                    )
+                ))]
                 if let Some(probe) = drop_safety_probe {
                     probe.reach().await;
                 }
@@ -19761,8 +22045,8 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
-        recovery_witness: Option<
-            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        recovery_write_authority: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
@@ -19846,15 +22130,15 @@ pub(in crate::chat_protocol) mod executor {
         //    the first durable mutation for production Recovery. The test-only
         //    raw executor seam retains its legacy reconstruction path.
         #[cfg(not(test))]
-        recovery_witness
+        recovery_write_authority
             .ok_or(ExecutorError::MissingContext(
-                "missing exact Recovery persistence witness",
+                "missing validated Recovery executor write authority",
             ))?
             .apply_open(transaction)
             .await?;
         #[cfg(test)]
-        if let Some(witness) = recovery_witness {
-            witness.apply_open(transaction).await?;
+        if let Some(authority) = recovery_write_authority {
+            authority.apply_open(transaction).await?;
         }
 
         // 2. Head CAS VERIFY — coordinate and seq counter both UNCHANGED
@@ -19876,7 +22160,7 @@ pub(in crate::chat_protocol) mod executor {
         .await?;
 
         #[cfg(test)]
-        if recovery_witness.is_none() {
+        if recovery_write_authority.is_none() {
             write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
         }
 
@@ -21509,8 +23793,8 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
-        recovery_witness: Option<
-            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        recovery_write_authority: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
@@ -21609,15 +23893,15 @@ pub(in crate::chat_protocol) mod executor {
         //    durable mutation. The enclosing executor savepoint rolls it back
         //    if the later head/event/completion composition fails.
         #[cfg(not(test))]
-        recovery_witness
+        recovery_write_authority
             .ok_or(ExecutorError::MissingContext(
-                "missing exact Recovery persistence witness",
+                "missing validated Recovery executor write authority",
             ))?
             .apply_terminal(transaction)
             .await?;
         #[cfg(test)]
-        if let Some(witness) = recovery_witness {
-            witness.apply_terminal(transaction).await?;
+        if let Some(authority) = recovery_write_authority {
+            authority.apply_terminal(transaction).await?;
         }
 
         // 2. Head CAS VERIFY (coordinate + seq counter unchanged).
@@ -21637,7 +23921,7 @@ pub(in crate::chat_protocol) mod executor {
         .await?;
 
         #[cfg(test)]
-        if recovery_witness.is_none() {
+        if recovery_write_authority.is_none() {
             // Test-only raw-executor compatibility path.
             transition::terminalize_leaf_recovery_request(
                 transaction,
@@ -21692,8 +23976,8 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
-        recovery_witness: Option<
-            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        recovery_write_authority: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
@@ -21834,15 +24118,15 @@ pub(in crate::chat_protocol) mod executor {
         }
 
         #[cfg(not(test))]
-        recovery_witness
+        recovery_write_authority
             .ok_or(ExecutorError::MissingContext(
-                "missing exact Recovery persistence witness",
+                "missing validated Recovery executor write authority",
             ))?
             .apply_terminal(transaction)
             .await?;
         #[cfg(test)]
-        if let Some(witness) = recovery_witness {
-            witness.apply_terminal(transaction).await?;
+        if let Some(authority) = recovery_write_authority {
+            authority.apply_terminal(transaction).await?;
         }
         transition::cas_conversation_head(
             transaction,
@@ -21859,7 +24143,7 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
         #[cfg(test)]
-        if recovery_witness.is_none() {
+        if recovery_write_authority.is_none() {
             transition::terminalize_leaf_recovery_request(
                 transaction,
                 operation_id,
@@ -21923,8 +24207,8 @@ pub(in crate::chat_protocol) mod executor {
         generation: i64,
         state_version: i64,
         epoch: i64,
-        recovery_witness: Option<
-            &crate::chat_protocol::repository::recovery::RecoveryPersistenceWitness,
+        recovery_write_authority: Option<
+            &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
@@ -22357,18 +24641,18 @@ pub(in crate::chat_protocol) mod executor {
         //    the prewrite reread already rejected all triple drift before the
         //    savepoint's first mutation.
         #[cfg(not(test))]
-        recovery_witness
+        recovery_write_authority
             .ok_or(ExecutorError::MissingContext(
-                "missing exact Recovery persistence witness",
+                "missing validated Recovery executor write authority",
             ))?
             .apply_terminal(transaction)
             .await?;
         #[cfg(test)]
-        if let Some(witness) = recovery_witness {
-            witness.apply_terminal(transaction).await?;
+        if let Some(authority) = recovery_write_authority {
+            authority.apply_terminal(transaction).await?;
         }
         #[cfg(test)]
-        if recovery_witness.is_none() {
+        if recovery_write_authority.is_none() {
             transition::terminalize_leaf_recovery_request(
                 transaction,
                 recovery_request_id,

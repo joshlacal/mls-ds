@@ -121,7 +121,7 @@ pub(crate) fn canonical_operation_lock_key(operation_id: Uuid) -> String {
     format!("chat-operation-id:{operation_id}")
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct OperationClaimBinding {
     operation_id: Uuid,
     principal_did: String,
@@ -142,6 +142,7 @@ pub(crate) struct OperationClaimRow {
     request_digest: Vec<u8>,
     accepted_request_sha256: Vec<u8>,
     signature: Vec<u8>,
+    claimed_at: DateTime<Utc>,
 }
 
 impl OperationClaimRow {
@@ -153,6 +154,10 @@ impl OperationClaimRow {
             && self.request_digest.as_slice() == binding.request_digest
             && self.accepted_request_sha256.as_slice() == binding.accepted_request_sha256
             && self.signature.as_slice() == binding.signature
+    }
+
+    fn matches_exact(&self, binding: &OperationClaimBinding) -> bool {
+        self.matches(binding) && self.claimed_at == binding.claimed_at
     }
 
     #[cfg(test)]
@@ -173,6 +178,8 @@ impl OperationClaimRow {
             request_digest,
             accepted_request_sha256,
             signature,
+            claimed_at: DateTime::<Utc>::from_timestamp_millis(0)
+                .expect("Unix epoch is a valid UTC timestamp"),
         }
     }
 }
@@ -707,6 +714,161 @@ pub(crate) struct OperationCompletionGuard {
     scope_digest: [u8; 32],
 }
 
+/// Non-completing, data-only witness retained by the private Recovery graph.
+/// Construction is confined to `PreparedBusinessPrelude`; the witness contains
+/// no repository receipt or operation-completion capability.
+#[must_use]
+pub(crate) struct RecoveryPreludePrewriteWitness {
+    transaction_id: Box<str>,
+    operation: OperationClaimBinding,
+    scope_receipt_id: Uuid,
+    scope: auth::CanonicalAuthorityScopePrewriteSnapshot,
+    completion_authority_digest: [u8; 32],
+    witness_digest: [u8; 32],
+    plan_seal: Option<RecoveryPreludePlanSeal>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol::repository) enum RecoveryPreludePersistenceMode {
+    Open,
+    Cancelled,
+    Fulfilled,
+    ClientExpired {
+        terminal_at: DateTime<Utc>,
+        post_apply_error: RecoveryPreludeClientExpiryError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol::repository) enum RecoveryPreludeClientExpiryError {
+    CancellationConflict,
+    RecoveryNotFound,
+    RecoveryExpired,
+    RecoverySuperseded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol::repository) enum RecoveryPreludePlanKind {
+    RecoveryRequest,
+    RecoveryCancellation,
+    Commit,
+    RecoveryExpiry,
+}
+
+/// Exact already-sealed Recovery aggregate/head coordinate copied into the
+/// plan-binding digest. The constructor remains inside the repository tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol::repository) struct RecoveryPreludeAggregatePlanBinding {
+    conversation_id: Uuid,
+    generation: i64,
+    state_version: i64,
+    group_id: [u8; 32],
+    epoch: i64,
+    group_context_hash: [u8; 32],
+    confirmation_tag: [u8; 32],
+    aggregate_head_digest: [u8; 32],
+    aggregate_graph_digest: [u8; 32],
+    aggregate_snapshot_digest: Option<[u8; 32]>,
+    recovery_head_digest: [u8; 32],
+    recovery_graph_digest: [u8; 32],
+    cross_binding_digest: [u8; 32],
+}
+
+impl RecoveryPreludeAggregatePlanBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::chat_protocol::repository) fn new(
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        group_id: [u8; 32],
+        epoch: i64,
+        group_context_hash: [u8; 32],
+        confirmation_tag: [u8; 32],
+        aggregate_head_digest: [u8; 32],
+        aggregate_graph_digest: [u8; 32],
+        aggregate_snapshot_digest: Option<[u8; 32]>,
+        recovery_head_digest: [u8; 32],
+        recovery_graph_digest: [u8; 32],
+        cross_binding_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            conversation_id,
+            generation,
+            state_version,
+            group_id,
+            epoch,
+            group_context_hash,
+            confirmation_tag,
+            aggregate_head_digest,
+            aggregate_graph_digest,
+            aggregate_snapshot_digest,
+            recovery_head_digest,
+            recovery_graph_digest,
+            cross_binding_digest,
+        }
+    }
+}
+
+/// Repository-derived description of the actual private Recovery plan. The
+/// fingerprint must cover the complete plan authority, head CAS, Recovery and
+/// package effects; accepted-control bytes are independently hash-bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::chat_protocol::repository) struct RecoveryPreludePlanBinding {
+    endpoint: RecoveryOperationEndpoint,
+    mutation_kind: SignedMutationKind,
+    mode: RecoveryPreludePersistenceMode,
+    plan_kind: RecoveryPreludePlanKind,
+    target_recovery_request_id: Uuid,
+    transaction_id: Box<str>,
+    graph_actor_did: Box<str>,
+    graph_actor_device_id: Uuid,
+    aggregate: RecoveryPreludeAggregatePlanBinding,
+    plan_fingerprint: [u8; 32],
+    accepted_control_sha256: Option<[u8; 32]>,
+}
+
+impl RecoveryPreludePlanBinding {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::chat_protocol::repository) fn new(
+        endpoint: RecoveryOperationEndpoint,
+        mutation_kind: SignedMutationKind,
+        mode: RecoveryPreludePersistenceMode,
+        plan_kind: RecoveryPreludePlanKind,
+        target_recovery_request_id: Uuid,
+        transaction_id: &str,
+        graph_actor_did: &str,
+        graph_actor_device_id: Uuid,
+        aggregate: RecoveryPreludeAggregatePlanBinding,
+        plan_fingerprint: [u8; 32],
+        accepted_control_sha256: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            endpoint,
+            mutation_kind,
+            mode,
+            plan_kind,
+            target_recovery_request_id,
+            transaction_id: transaction_id.to_owned().into_boxed_str(),
+            graph_actor_did: graph_actor_did.to_owned().into_boxed_str(),
+            graph_actor_device_id,
+            aggregate,
+            plan_fingerprint,
+            accepted_control_sha256,
+        }
+    }
+}
+
+struct RecoveryPreludePlanSeal {
+    binding: RecoveryPreludePlanBinding,
+    seal_digest: [u8; 32],
+}
+
+impl fmt::Debug for RecoveryPreludePrewriteWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoveryPreludePrewriteWitness(<sealed>)")
+    }
+}
+
 /// Single-use opaque completion capability for enrollment, rebind, and
 /// replenishment bootstrap operations. The domain-separated digest binds
 /// the exact operation claim, locked scope receipt, and JKT shape.
@@ -859,6 +1021,308 @@ impl ScopeBoundBusinessAuthority {
     }
 }
 
+impl RecoveryPreludePlanBinding {
+    fn is_compatible_with(&self, witness: &RecoveryPreludePrewriteWitness) -> bool {
+        let endpoint_matches = witness.operation.endpoint_nsid == self.endpoint.endpoint_nsid();
+        let mutation_matches = witness.operation.mutation_kind == self.mutation_kind.type_id()
+            && self.endpoint.mutation_kind() == self.mutation_kind.type_id();
+        let shape_matches = match (
+            self.endpoint,
+            self.mutation_kind,
+            self.mode,
+            self.plan_kind,
+            self.accepted_control_sha256,
+        ) {
+            (
+                RecoveryOperationEndpoint::RequestLeafRecovery,
+                SignedMutationKind::LeafRecoveryRequest,
+                RecoveryPreludePersistenceMode::Open,
+                RecoveryPreludePlanKind::RecoveryRequest,
+                None,
+            )
+            | (
+                RecoveryOperationEndpoint::CancelLeafRecovery,
+                SignedMutationKind::LeafRecoveryCancellation,
+                RecoveryPreludePersistenceMode::Cancelled,
+                RecoveryPreludePlanKind::RecoveryCancellation,
+                None,
+            ) => true,
+            (
+                RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                SignedMutationKind::LeafRecoveryFulfillment,
+                RecoveryPreludePersistenceMode::Fulfilled,
+                RecoveryPreludePlanKind::Commit,
+                Some(accepted_control_sha256),
+            ) => accepted_control_sha256 != [0; 32],
+            (
+                RecoveryOperationEndpoint::CancelLeafRecovery,
+                SignedMutationKind::LeafRecoveryCancellation,
+                RecoveryPreludePersistenceMode::ClientExpired {
+                    post_apply_error: RecoveryPreludeClientExpiryError::RecoveryNotFound,
+                    ..
+                },
+                RecoveryPreludePlanKind::RecoveryExpiry,
+                None,
+            )
+            | (
+                RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                SignedMutationKind::LeafRecoveryFulfillment,
+                RecoveryPreludePersistenceMode::ClientExpired {
+                    post_apply_error: RecoveryPreludeClientExpiryError::RecoveryExpired,
+                    ..
+                },
+                RecoveryPreludePlanKind::RecoveryExpiry,
+                None,
+            ) => true,
+            _ => false,
+        };
+        endpoint_matches
+            && mutation_matches
+            && shape_matches
+            && self.target_recovery_request_id.get_version_num() == 4
+            && self.transaction_id.as_ref() == witness.transaction_id.as_ref()
+            && self.graph_actor_did.as_ref() == witness.scope.actor_did()
+            && self.graph_actor_device_id == witness.scope.actor_device_id()
+            && self.graph_actor_did.as_ref() == witness.operation.principal_did
+            && self.aggregate.conversation_id.get_version_num() == 4
+            && self.aggregate.generation >= 0
+            && self.aggregate.state_version >= 0
+            && self.aggregate.epoch >= 0
+            && self.aggregate.cross_binding_digest != [0; 32]
+            && self.plan_fingerprint != [0; 32]
+    }
+}
+
+impl RecoveryPreludePrewriteWitness {
+    fn unbound(
+        operation: OperationClaimBinding,
+        scope_receipt_id: Uuid,
+        scope: auth::CanonicalAuthorityScopePrewriteSnapshot,
+        completion_authority_digest: [u8; 32],
+    ) -> Self {
+        let mut witness = Self {
+            transaction_id: scope.transaction_id().to_owned().into_boxed_str(),
+            operation,
+            scope_receipt_id,
+            scope,
+            completion_authority_digest,
+            witness_digest: [0; 32],
+            plan_seal: None,
+        };
+        witness.witness_digest = witness.rederive_witness_digest();
+        witness
+    }
+
+    pub(in crate::chat_protocol::repository) fn seal_recovery_plan(
+        mut self,
+        binding: RecoveryPreludePlanBinding,
+    ) -> Result<Self, PreludeError> {
+        if self.plan_seal.is_some()
+            || self.witness_digest != self.rederive_witness_digest()
+            || self.completion_authority_digest
+                != completion_digest_from_prewrite_snapshot(
+                    &self.scope,
+                    self.scope_receipt_id,
+                    &self.operation,
+                )
+            || !binding.is_compatible_with(&self)
+        {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        let seal_digest = self.rederive_plan_digest(&binding);
+        self.plan_seal = Some(RecoveryPreludePlanSeal {
+            binding,
+            seal_digest,
+        });
+        Ok(self)
+    }
+
+    /// Validate the exact plan/claim/scope data before the first Recovery,
+    /// event, or outbox write. This validator mints no authority.
+    pub(in crate::chat_protocol::repository) async fn validate_recovery_prewrite(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        live_plan: &RecoveryPreludePlanBinding,
+    ) -> Result<(), PreludeError> {
+        let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut **transaction)
+            .await?;
+        let Some(plan_seal) = self.plan_seal.as_ref() else {
+            return Err(PreludeError::ClaimIntegrity);
+        };
+        if transaction_id != self.transaction_id.as_ref()
+            || self.transaction_id.as_ref() != self.scope.transaction_id()
+            || self.witness_digest != self.rederive_witness_digest()
+            || self.completion_authority_digest
+                != completion_digest_from_prewrite_snapshot(
+                    &self.scope,
+                    self.scope_receipt_id,
+                    &self.operation,
+                )
+            || plan_seal.binding != *live_plan
+            || !live_plan.is_compatible_with(self)
+            || plan_seal.seal_digest != self.rederive_plan_digest(live_plan)
+        {
+            return Err(PreludeError::ForeignTransaction);
+        }
+
+        let live_claim: Option<OperationClaimRow> = sqlx::query_as(
+            r#"
+            SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
+                   request_digest,accepted_request_sha256,signature,claimed_at
+              FROM chat.operation_claims
+             WHERE operation_id=$1
+             FOR UPDATE
+            "#,
+        )
+        .bind(self.operation.operation_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if !live_claim
+            .as_ref()
+            .is_some_and(|claim| claim.matches_exact(&self.operation))
+        {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+
+        auth::validate_canonical_authority_scope_prewrite(transaction, &self.scope).await?;
+        Ok(())
+    }
+
+    fn rederive_witness_digest(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-RECOVERY-PRELUDE-PREWRITE-WITNESS\0");
+        for value in [
+            self.transaction_id.as_bytes(),
+            self.operation.principal_did.as_bytes(),
+            self.operation.endpoint_nsid.as_bytes(),
+            self.operation.mutation_kind.as_bytes(),
+        ] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+        digest.update(self.operation.operation_id.as_bytes());
+        digest.update(self.operation.request_digest);
+        digest.update(self.operation.accepted_request_sha256);
+        digest.update(self.operation.signature);
+        digest.update(self.operation.claimed_at.timestamp_micros().to_be_bytes());
+        digest.update(self.scope_receipt_id.as_bytes());
+        digest.update(self.scope.scope_digest());
+        digest.update(self.scope.snapshot_digest());
+        digest.update(self.completion_authority_digest);
+        digest.finalize().into()
+    }
+
+    fn rederive_plan_digest(&self, binding: &RecoveryPreludePlanBinding) -> [u8; 32] {
+        fn bind_bytes(digest: &mut Sha256, value: &[u8]) {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value);
+        }
+
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-RECOVERY-PRELUDE-PLAN-BINDING\0");
+        digest.update(self.witness_digest);
+        digest.update([match binding.endpoint {
+            RecoveryOperationEndpoint::RequestLeafRecovery => 1,
+            RecoveryOperationEndpoint::CancelLeafRecovery => 2,
+            RecoveryOperationEndpoint::SubmitRecoveryFulfillment => 3,
+        }]);
+        digest.update([match binding.mutation_kind {
+            SignedMutationKind::LeafRecoveryRequest => 1,
+            SignedMutationKind::LeafRecoveryCancellation => 2,
+            SignedMutationKind::LeafRecoveryFulfillment => 3,
+            _ => 0,
+        }]);
+        match binding.mode {
+            RecoveryPreludePersistenceMode::Open => digest.update([1]),
+            RecoveryPreludePersistenceMode::Cancelled => digest.update([2]),
+            RecoveryPreludePersistenceMode::Fulfilled => digest.update([3]),
+            RecoveryPreludePersistenceMode::ClientExpired {
+                terminal_at,
+                post_apply_error,
+            } => {
+                digest.update([4]);
+                digest.update(terminal_at.timestamp_micros().to_be_bytes());
+                digest.update([match post_apply_error {
+                    RecoveryPreludeClientExpiryError::CancellationConflict => 1,
+                    RecoveryPreludeClientExpiryError::RecoveryNotFound => 2,
+                    RecoveryPreludeClientExpiryError::RecoveryExpired => 3,
+                    RecoveryPreludeClientExpiryError::RecoverySuperseded => 4,
+                }]);
+            }
+        }
+        digest.update([match binding.plan_kind {
+            RecoveryPreludePlanKind::RecoveryRequest => 1,
+            RecoveryPreludePlanKind::RecoveryCancellation => 2,
+            RecoveryPreludePlanKind::Commit => 3,
+            RecoveryPreludePlanKind::RecoveryExpiry => 4,
+        }]);
+        digest.update(binding.target_recovery_request_id.as_bytes());
+        for value in [
+            binding.transaction_id.as_bytes(),
+            binding.graph_actor_did.as_bytes(),
+            self.scope.actor_did().as_bytes(),
+            self.scope.actor_dpop_jkt().unwrap_or_default().as_bytes(),
+            self.scope.actor_key_id().unwrap_or_default().as_bytes(),
+        ] {
+            bind_bytes(&mut digest, value);
+        }
+        digest.update(binding.graph_actor_device_id.as_bytes());
+        digest.update([match self.scope.actor_class() {
+            RepositoryAuthorityClass::ExistingDevice => 1,
+            RepositoryAuthorityClass::EnrollmentBootstrap => 2,
+            RepositoryAuthorityClass::RebindBootstrap => 3,
+        }]);
+        digest.update(self.scope.actor_device_id().as_bytes());
+        digest.update(
+            self.scope
+                .actor_auth_generation()
+                .unwrap_or_default()
+                .to_be_bytes(),
+        );
+        digest.update(
+            self.scope
+                .actor_signing_key_sha256()
+                .copied()
+                .unwrap_or_default(),
+        );
+        digest.update(
+            self.scope
+                .trusted_instant()
+                .timestamp_micros()
+                .to_be_bytes(),
+        );
+        digest.update(binding.aggregate.conversation_id.as_bytes());
+        digest.update(binding.aggregate.generation.to_be_bytes());
+        digest.update(binding.aggregate.state_version.to_be_bytes());
+        digest.update(binding.aggregate.group_id);
+        digest.update(binding.aggregate.epoch.to_be_bytes());
+        digest.update(binding.aggregate.group_context_hash);
+        digest.update(binding.aggregate.confirmation_tag);
+        digest.update(binding.aggregate.aggregate_head_digest);
+        digest.update(binding.aggregate.aggregate_graph_digest);
+        match binding.aggregate.aggregate_snapshot_digest {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value);
+            }
+            None => digest.update([0]),
+        }
+        digest.update(binding.aggregate.recovery_head_digest);
+        digest.update(binding.aggregate.recovery_graph_digest);
+        digest.update(binding.aggregate.cross_binding_digest);
+        digest.update(binding.plan_fingerprint);
+        match binding.accepted_control_sha256 {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value);
+            }
+            None => digest.update([0]),
+        }
+        digest.finalize().into()
+    }
+}
+
 impl PreparedBusinessPrelude {
     pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
         &self.authority
@@ -980,6 +1444,38 @@ impl PreparedBusinessPrelude {
             },
         )
     }
+
+    /// Recovery-only consuming split. The completion capability remains linear;
+    /// the third sibling is an authority-free prewrite data witness.
+    pub(crate) fn into_recovery_execution_parts(
+        self,
+    ) -> (
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+        RecoveryPreludePrewriteWitness,
+    ) {
+        let scope_digest = *self.authority.scope_digest();
+        let scope_receipt_id = self.authority.receipt_id();
+        let completion_authority_digest =
+            completion_digest_from_scope_authority(&self.authority, &self.operation.binding);
+        let scope_snapshot = self.authority.locked.recovery_prewrite_snapshot();
+        let prewrite = RecoveryPreludePrewriteWitness::unbound(
+            self.operation.binding.clone(),
+            scope_receipt_id,
+            scope_snapshot,
+            completion_authority_digest,
+        );
+        (
+            self.authority,
+            OperationCompletionGuard {
+                operation: self.operation,
+                scope_receipt_id,
+                authority_digest: completion_authority_digest,
+                scope_digest,
+            },
+            prewrite,
+        )
+    }
 }
 
 pub(crate) async fn arbitrate_operation(
@@ -995,7 +1491,7 @@ pub(crate) async fn arbitrate_operation(
     let existing: Option<OperationClaimRow> = sqlx::query_as(
         r#"
         SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
-               request_digest,accepted_request_sha256,signature
+               request_digest,accepted_request_sha256,signature,claimed_at
           FROM chat.operation_claims
          WHERE operation_id=$1
         "#,
@@ -1036,7 +1532,7 @@ pub(crate) async fn arbitrate_operation_only(
     let existing: Option<OperationClaimRow> = sqlx::query_as(
         r#"
         SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
-               request_digest,accepted_request_sha256,signature
+               request_digest,accepted_request_sha256,signature,claimed_at
           FROM chat.operation_claims
          WHERE operation_id=$1
         "#,
@@ -1310,6 +1806,7 @@ pub(crate) async fn complete_operation(
                 &transaction_id,
                 authority,
                 &claim.binding,
+                scope_receipt_id,
                 &scope_digest,
             )?
         || !claim.binding.matches_authority(authority)?
@@ -1541,6 +2038,7 @@ fn bootstrap_completion_digest(
     digest.update(binding.request_digest);
     digest.update(binding.accepted_request_sha256);
     digest.update(binding.signature);
+    digest.update(binding.claimed_at.timestamp_micros().to_be_bytes());
     digest.update(scope_digest);
     digest.finalize().into()
 }
@@ -1619,6 +2117,7 @@ fn completion_digest_from_scope_authority(
         .map(|key| <[u8; 32]>::from(Sha256::digest(key)));
     completion_authority_digest(
         authority.transaction_id(),
+        authority.receipt_id(),
         authority.actor_class(),
         authority.actor_did(),
         authority.actor_device_id(),
@@ -1632,15 +2131,38 @@ fn completion_digest_from_scope_authority(
     )
 }
 
+fn completion_digest_from_prewrite_snapshot(
+    scope: &auth::CanonicalAuthorityScopePrewriteSnapshot,
+    scope_receipt_id: Uuid,
+    binding: &OperationClaimBinding,
+) -> [u8; 32] {
+    completion_authority_digest(
+        scope.transaction_id(),
+        scope_receipt_id,
+        scope.actor_class(),
+        scope.actor_did(),
+        scope.actor_device_id(),
+        scope.actor_dpop_jkt(),
+        scope.actor_auth_generation(),
+        scope.actor_key_id(),
+        scope.actor_signing_key_sha256(),
+        scope.trusted_instant(),
+        binding,
+        scope.scope_digest(),
+    )
+}
+
 fn completion_digest_from_request(
     transaction_id: &str,
     authority: &VerifiedChatDeviceRequest,
     binding: &OperationClaimBinding,
+    scope_receipt_id: Uuid,
     scope_digest: &[u8; 32],
 ) -> Result<[u8; 32], PreludeError> {
     let receipt = authority.repository_receipt();
     Ok(completion_authority_digest(
         transaction_id,
+        scope_receipt_id,
         receipt.class(),
         authority.subject().as_str(),
         Uuid::from_bytes(*authority.device_id().as_bytes()),
@@ -1657,6 +2179,7 @@ fn completion_digest_from_request(
 #[allow(clippy::too_many_arguments)]
 fn completion_authority_digest(
     transaction_id: &str,
+    scope_receipt_id: Uuid,
     class: RepositoryAuthorityClass,
     subject: &str,
     device_id: Uuid,
@@ -1675,6 +2198,7 @@ fn completion_authority_digest(
         RepositoryAuthorityClass::EnrollmentBootstrap => 2,
         RepositoryAuthorityClass::RebindBootstrap => 3,
     }]);
+    digest.update(scope_receipt_id.as_bytes());
     for value in [
         transaction_id.as_bytes(),
         subject.as_bytes(),
@@ -1695,6 +2219,7 @@ fn completion_authority_digest(
     digest.update(binding.request_digest);
     digest.update(binding.accepted_request_sha256);
     digest.update(binding.signature);
+    digest.update(binding.claimed_at.timestamp_micros().to_be_bytes());
     digest.update(scope_digest);
     digest.finalize().into()
 }

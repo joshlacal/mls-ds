@@ -1916,6 +1916,42 @@ pub(crate) async fn hydrate_execution_context<'borrow, 'connection, 'plan>(
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
 > {
+    // Recovery plans may only cross the private graph facade below, which
+    // performs claim/scope/plan prewrite validation and derives canonical
+    // artifacts. The generic capsule surface must not accept a Recovery plan
+    // or caller-supplied Recovery payloads.
+    if is_recovery_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    hydrate_execution_context_after_authority_validation(transaction, plan, artifacts).await
+}
+
+fn is_recovery_plan(plan: &ConversationPersistencePlan) -> bool {
+    matches!(
+        plan.effects().kind(),
+        PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation | PlanKind::RecoveryExpiry
+    ) || matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if evidence
+                .signed_authority()
+                .is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::LeafRecoveryFulfillment
+                })
+    )
+}
+
+/// Module-private common hydrator. Recovery reaches this only after the
+/// private graph has validated its exact prewrite witness; other repository
+/// callers must use `hydrate_execution_context`, which rejects Recovery.
+async fn hydrate_execution_context_after_authority_validation<'borrow, 'connection, 'plan>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
     let expected_transaction_id = plan
         .effects()
         .head_cas()
@@ -1966,27 +2002,12 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
     ExecutionContextHydrationError,
 > {
     let plan = graph.plan();
-    let valid = matches!(
-        plan.effects().kind(),
-        PlanKind::RecoveryRequest | PlanKind::RecoveryCancellation | PlanKind::RecoveryExpiry
-    ) || matches!(
-        plan.effects().authority(),
-        Some(PlanAuthority::Transition(evidence))
-            if evidence
-                .signed_authority()
-                .is_some_and(|authority| {
-                    authority.kind() == SignedMutationKind::LeafRecoveryFulfillment
-                })
-    );
-    if !valid {
+    if !is_recovery_plan(plan) {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
-    graph
-        .persistence_witness()
-        .validate_prewrite(transaction, plan)
-        .await?;
+    let recovery_write_authority = graph.validate_prewrite(transaction).await?;
     let primary_event_payload = canonical_recovery_primary_event_payload(plan)?;
-    hydrate_execution_context(
+    hydrate_execution_context_after_authority_validation(
         transaction,
         plan,
         ExecutionContextArtifacts {
@@ -1997,7 +2018,7 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
         },
     )
     .await
-    .map(|prepared| prepared.with_recovery_witness(graph.persistence_witness()))
+    .map(|prepared| prepared.with_recovery_write_authority(recovery_write_authority))
 }
 
 pub(in crate::chat_protocol) async fn apply_prepared_recovery_execution(

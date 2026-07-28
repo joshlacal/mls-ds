@@ -6,8 +6,6 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[path = "../src/chat_protocol/relationship_policy.rs"]
@@ -21,24 +19,12 @@ mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 
-mod repository {
-    pub mod auth {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/auth.rs"
-        ));
-    }
-    pub mod prelude {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/prelude.rs"
-        ));
-    }
-}
-
 mod chat_protocol {
     pub mod dpop {
-        pub use crate::dpop::*;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
     }
     pub mod model {
         pub use crate::model::*;
@@ -66,10 +52,16 @@ mod chat_protocol {
     }
     pub mod repository {
         pub mod auth {
-            pub use crate::repository::auth::*;
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
         }
         pub mod prelude {
-            pub use crate::repository::prelude::*;
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/prelude.rs"
+            ));
         }
         pub mod core {
             include!(concat!(
@@ -647,10 +639,11 @@ fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness
 fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_before_hydration() {
     let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
     let witness = recovery
-        .split_once("pub(in crate::chat_protocol) async fn validate_prewrite(")
-        .and_then(|(_, tail)| {
-            tail.split_once("\n    pub(in crate::chat_protocol) async fn apply_open")
+        .split_once("impl RecoveryPersistenceWitness {")
+        .and_then(|(_, implementation)| {
+            implementation.split_once("pub(in crate::chat_protocol) async fn validate_prewrite(")
         })
+        .and_then(|(_, tail)| tail.split_once("\n    async fn apply_open"))
         .map(|(body, _)| body)
         .expect("Recovery witness prewrite validator");
     let transaction = witness.find("SELECT txid_current()::text").unwrap();
@@ -688,30 +681,33 @@ fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_befo
         .expect("Recovery execution facade");
     assert!(
         facade.find(".validate_prewrite(").unwrap()
-            < facade.find("hydrate_execution_context(").unwrap(),
-        "all Recovery-specific drift fences must reject before generic hydration can write"
+            < facade
+                .find("hydrate_execution_context_after_authority_validation(")
+                .unwrap(),
+        "all Recovery-specific drift fences must mint write authority before private hydration"
     );
 }
 
 #[test]
-fn production_executor_requires_exact_recovery_witness_and_fences_legacy_fallbacks_to_tests() {
+fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy_fallbacks_to_tests(
+) {
     let source = include_str!("../src/chat_protocol/state_machine.rs");
     assert!(
         source
-            .matches("missing exact Recovery persistence witness")
+            .matches("missing validated Recovery executor write authority")
             .count()
             >= 4,
-        "request, cancellation, expiry, and fulfillment must each reject a missing witness"
+        "request, cancellation, expiry, and fulfillment must each reject missing write authority"
     );
     assert_eq!(
         source
-            .matches("#[cfg(test)]\n        if recovery_witness.is_none()")
+            .matches("#[cfg(test)]\n        if recovery_write_authority.is_none()")
             .count(),
         4,
         "every status-only Recovery fallback must be a genuine cfg(test) seam"
     );
     assert!(
-        !source.contains("#[cfg(not(test))]\n        if recovery_witness.is_none()"),
+        !source.contains("#[cfg(not(test))]\n        if recovery_write_authority.is_none()"),
         "production must reject, never execute a witnessless fallback"
     );
 }

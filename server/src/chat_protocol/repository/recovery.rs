@@ -26,8 +26,8 @@ use super::super::{
     },
     snapshot::MAX_PROTOCOL_INTEGER,
     state_machine::{
-        AppliedTransition, ConversationPersistencePlan, ExecutorError, HydrationAuthority,
-        ServerTimestamp, StateMachineError,
+        recovery_plan_fingerprint, AppliedTransition, ConversationPersistencePlan, ExecutorError,
+        HydrationAuthority, PlanAuthority, RecoveryPlanClass, ServerTimestamp, StateMachineError,
     },
     transcript::{
         decode_and_verify_signed_mutation, CanonicalValueRef, VerifiedMutationProjection,
@@ -49,7 +49,9 @@ use super::{
     prelude::{
         canonical_operation_lock_key, CanonicalDeviceIdentity, CanonicalLockScope,
         OperationCompletionGuard, PreparedBusinessPrelude, RecoveryOperationEndpoint,
-        ScopeBoundBusinessAuthority,
+        RecoveryPreludeAggregatePlanBinding, RecoveryPreludeClientExpiryError,
+        RecoveryPreludePersistenceMode, RecoveryPreludePlanBinding, RecoveryPreludePlanKind,
+        RecoveryPreludePrewriteWitness, ScopeBoundBusinessAuthority,
     },
     relationship::{
         load_fallback_relationship_projection, seal_recovery_fallback_scope,
@@ -900,6 +902,32 @@ pub(in crate::chat_protocol) struct RecoveryPersistenceWitness {
     mode: RecoveryPersistenceMode,
 }
 
+/// Opaque executor-only capability minted only after the complete Recovery
+/// graph has passed its same-transaction prewrite validation.
+///
+/// The persistence witness remains planner data until this capability exists;
+/// no sibling module can construct one or invoke the Recovery SQL writers from
+/// a separable planned result.
+pub(in crate::chat_protocol) struct RecoveryExecutorWriteAuthority<'witness> {
+    witness: &'witness RecoveryPersistenceWitness,
+}
+
+impl RecoveryExecutorWriteAuthority<'_> {
+    pub(in crate::chat_protocol) async fn apply_open(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), ExecutorError> {
+        self.witness.apply_open(transaction).await
+    }
+
+    pub(in crate::chat_protocol) async fn apply_terminal(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), ExecutorError> {
+        self.witness.apply_terminal(transaction).await
+    }
+}
+
 impl RecoveryPersistenceWitness {
     fn new(
         context: RecoveryAuthorityContext,
@@ -1026,6 +1054,244 @@ impl RecoveryPersistenceWitness {
         coordinate_matches && semantic_edge && mode_matches
     }
 
+    fn aggregate_prelude_plan_binding(&self) -> RecoveryPreludeAggregatePlanBinding {
+        let binding = &self.aggregate_cross_binding;
+        RecoveryPreludeAggregatePlanBinding::new(
+            binding.conversation_id,
+            binding.generation,
+            binding.state_version,
+            binding.group_id,
+            binding.epoch,
+            binding.group_context_hash,
+            binding.confirmation_tag,
+            binding.aggregate_head_digest,
+            binding.aggregate_graph_digest,
+            binding.aggregate_snapshot_digest,
+            binding.recovery_head_digest,
+            binding.recovery_graph_digest,
+            binding.seal_digest,
+        )
+    }
+
+    fn material_matches_plan(
+        &self,
+        plan: &ConversationPersistencePlan,
+        material: RecoveryCanonicalMaterial,
+    ) -> bool {
+        let request_id = self.request.recovery_request_id;
+        let effects = plan.effects();
+        match (material, &self.mode, effects.kind(), effects.authority()) {
+            (
+                RecoveryCanonicalMaterial::Requested {
+                    recovery_request_id,
+                },
+                RecoveryPersistenceMode::Open,
+                super::super::state_machine::PlanKind::RecoveryRequest,
+                Some(PlanAuthority::Request(authority)),
+            ) => {
+                recovery_request_id == request_id
+                    && authority.request_id() == request_id.as_bytes()
+                    && authority.signed_authority().is_some_and(|signed| {
+                        signed.kind()
+                            == super::super::transcript::SignedMutationKind::LeafRecoveryRequest
+                    })
+            }
+            (
+                RecoveryCanonicalMaterial::Cancelled {
+                    recovery_request_id,
+                },
+                RecoveryPersistenceMode::Cancelled { .. },
+                super::super::state_machine::PlanKind::RecoveryCancellation,
+                Some(PlanAuthority::Request(authority)),
+            ) => {
+                recovery_request_id == request_id
+                    && authority.request_id() == request_id.as_bytes()
+                    && authority.signed_authority().is_some_and(|signed| {
+                        signed.kind()
+                        == super::super::transcript::SignedMutationKind::LeafRecoveryCancellation
+                    })
+            }
+            (
+                RecoveryCanonicalMaterial::Fulfilled {
+                    recovery_request_id,
+                    transition_id,
+                },
+                RecoveryPersistenceMode::Fulfilled {
+                    transition_id: sealed_transition_id,
+                    ..
+                },
+                super::super::state_machine::PlanKind::Commit,
+                Some(PlanAuthority::Transition(authority)),
+            ) => {
+                recovery_request_id == request_id
+                    && transition_id == *sealed_transition_id
+                    && authority.transition_id() == transition_id.as_bytes()
+                    && authority.signed_authority().is_some_and(|signed| {
+                        signed.kind()
+                            == super::super::transcript::SignedMutationKind::LeafRecoveryFulfillment
+                    })
+            }
+            (
+                RecoveryCanonicalMaterial::ClientExpired {
+                    recovery_request_id,
+                    terminal_at,
+                    post_apply_error,
+                },
+                RecoveryPersistenceMode::Expired {
+                    terminal_at: sealed_terminal_at,
+                },
+                super::super::state_machine::PlanKind::RecoveryExpiry,
+                Some(PlanAuthority::RecoveryExpiry(authority)),
+            ) => {
+                recovery_request_id == request_id
+                    && terminal_at == *sealed_terminal_at
+                    && authority.request_id() == request_id.as_bytes()
+                    && authority.terminal_at().unix_millis()
+                        == sealed_terminal_at.timestamp_millis()
+                    && matches!(
+                        post_apply_error,
+                        RecoveryClientTerminalError::RecoveryNotFound
+                            | RecoveryClientTerminalError::RecoveryExpired
+                    )
+            }
+            (
+                RecoveryCanonicalMaterial::SchedulerExpired {
+                    recovery_request_id,
+                    terminal_at,
+                },
+                RecoveryPersistenceMode::Expired {
+                    terminal_at: sealed_terminal_at,
+                },
+                super::super::state_machine::PlanKind::RecoveryExpiry,
+                Some(PlanAuthority::RecoveryExpiry(authority)),
+            ) => {
+                recovery_request_id == request_id
+                    && terminal_at == *sealed_terminal_at
+                    && authority.request_id() == request_id.as_bytes()
+                    && authority.terminal_at().unix_millis()
+                        == sealed_terminal_at.timestamp_millis()
+            }
+            _ => false,
+        }
+    }
+
+    fn client_prelude_plan_binding(
+        &self,
+        plan: &ConversationPersistencePlan,
+        accepted_control_entry_bytes: Option<&[u8]>,
+        material: RecoveryCanonicalMaterial,
+    ) -> Result<RecoveryPreludePlanBinding, RecoveryRepositoryError> {
+        if !self.matches_plan(plan) || !self.material_matches_plan(plan, material) {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+        }
+        let fingerprint = recovery_plan_fingerprint(plan, accepted_control_entry_bytes)?;
+        let (endpoint, mutation_kind, mode, plan_kind, expected_class) = match material {
+            RecoveryCanonicalMaterial::Requested { .. } => (
+                RecoveryOperationEndpoint::RequestLeafRecovery,
+                super::super::transcript::SignedMutationKind::LeafRecoveryRequest,
+                RecoveryPreludePersistenceMode::Open,
+                RecoveryPreludePlanKind::RecoveryRequest,
+                RecoveryPlanClass::Request,
+            ),
+            RecoveryCanonicalMaterial::Cancelled { .. } => (
+                RecoveryOperationEndpoint::CancelLeafRecovery,
+                super::super::transcript::SignedMutationKind::LeafRecoveryCancellation,
+                RecoveryPreludePersistenceMode::Cancelled,
+                RecoveryPreludePlanKind::RecoveryCancellation,
+                RecoveryPlanClass::Cancellation,
+            ),
+            RecoveryCanonicalMaterial::Fulfilled { .. } => (
+                RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                super::super::transcript::SignedMutationKind::LeafRecoveryFulfillment,
+                RecoveryPreludePersistenceMode::Fulfilled,
+                RecoveryPreludePlanKind::Commit,
+                RecoveryPlanClass::Fulfillment,
+            ),
+            RecoveryCanonicalMaterial::ClientExpired {
+                terminal_at,
+                post_apply_error,
+                ..
+            } => {
+                let post_apply_error = match post_apply_error {
+                    RecoveryClientTerminalError::RecoveryNotFound => {
+                        RecoveryPreludeClientExpiryError::RecoveryNotFound
+                    }
+                    RecoveryClientTerminalError::RecoveryExpired => {
+                        RecoveryPreludeClientExpiryError::RecoveryExpired
+                    }
+                    _ => return Err(RecoveryRepositoryError::AuthorityBindingMismatch),
+                };
+                let (endpoint, mutation_kind) = match post_apply_error {
+                    RecoveryPreludeClientExpiryError::RecoveryNotFound => (
+                        RecoveryOperationEndpoint::CancelLeafRecovery,
+                        super::super::transcript::SignedMutationKind::LeafRecoveryCancellation,
+                    ),
+                    RecoveryPreludeClientExpiryError::RecoveryExpired => (
+                        RecoveryOperationEndpoint::SubmitRecoveryFulfillment,
+                        super::super::transcript::SignedMutationKind::LeafRecoveryFulfillment,
+                    ),
+                    _ => return Err(RecoveryRepositoryError::AuthorityBindingMismatch),
+                };
+                (
+                    endpoint,
+                    mutation_kind,
+                    RecoveryPreludePersistenceMode::ClientExpired {
+                        terminal_at,
+                        post_apply_error,
+                    },
+                    RecoveryPreludePlanKind::RecoveryExpiry,
+                    RecoveryPlanClass::Expiry,
+                )
+            }
+            RecoveryCanonicalMaterial::SchedulerExpired { .. } => {
+                return Err(RecoveryRepositoryError::AuthorityBindingMismatch)
+            }
+        };
+        if fingerprint.class() != expected_class {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+        }
+        let accepted_control_sha256 =
+            accepted_control_entry_bytes.map(|bytes| Sha256::digest(bytes).into());
+        Ok(RecoveryPreludePlanBinding::new(
+            endpoint,
+            mutation_kind,
+            mode,
+            plan_kind,
+            self.request.recovery_request_id,
+            &self.transaction_id,
+            &self.graph_actor_did,
+            self.graph_actor_device_id,
+            self.aggregate_prelude_plan_binding(),
+            *fingerprint.digest(),
+            accepted_control_sha256,
+        ))
+    }
+
+    fn scheduler_graph_seal(
+        &self,
+        plan_fingerprint: [u8; 32],
+        material: RecoveryCanonicalMaterial,
+    ) -> [u8; 32] {
+        let RecoveryCanonicalMaterial::SchedulerExpired {
+            recovery_request_id,
+            terminal_at,
+        } = material
+        else {
+            return [0; 32];
+        };
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-RECOVERY-SCHEDULER-GRAPH-SEAL\0");
+        digest_len(&mut digest, self.transaction_id.as_bytes());
+        digest.update(self.trusted_instant.timestamp_micros().to_be_bytes());
+        digest_len(&mut digest, self.graph_actor_did.as_bytes());
+        digest.update(self.graph_actor_device_id.as_bytes());
+        digest.update(recovery_request_id.as_bytes());
+        digest.update(terminal_at.timestamp_micros().to_be_bytes());
+        digest.update(self.aggregate_cross_binding.seal_digest);
+        digest.update(plan_fingerprint);
+        digest.finalize().into()
+    }
+
     pub(in crate::chat_protocol) async fn validate_prewrite(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
@@ -1125,7 +1391,7 @@ impl RecoveryPersistenceWitness {
         Ok(())
     }
 
-    pub(in crate::chat_protocol) async fn apply_open(
+    async fn apply_open(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<(), ExecutorError> {
@@ -1145,7 +1411,7 @@ impl RecoveryPersistenceWitness {
         Ok(())
     }
 
-    pub(in crate::chat_protocol) async fn apply_terminal(
+    async fn apply_terminal(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<(), ExecutorError> {
@@ -1506,7 +1772,6 @@ impl RecoveryCompletion {
     }
 }
 
-#[cfg(not(test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveryCanonicalMaterial {
     Requested {
@@ -1534,7 +1799,16 @@ pub(crate) enum RecoveryCanonicalMaterial {
 pub(crate) struct PreparedRecoveryMutation {
     graph: PreparedRecoveryExecutionGraph,
     completion: RecoveryCompletion,
-    material: RecoveryCanonicalMaterial,
+}
+
+enum RecoveryGraphPrewriteOrigin {
+    Client {
+        witness: RecoveryPreludePrewriteWitness,
+    },
+    Scheduler {
+        plan_fingerprint: [u8; 32],
+        seal_digest: [u8; 32],
+    },
 }
 
 /// Private, single-owner graph carrying every serialized product retained by a
@@ -1545,19 +1819,66 @@ pub(in crate::chat_protocol) struct PreparedRecoveryExecutionGraph {
     plan: ConversationPersistencePlan,
     accepted_control_entry_bytes: Option<Vec<u8>>,
     persistence_witness: RecoveryPersistenceWitness,
+    origin: RecoveryGraphPrewriteOrigin,
+    material: RecoveryCanonicalMaterial,
 }
 
 impl PreparedRecoveryExecutionGraph {
-    fn new(
+    fn new_client(
         plan: ConversationPersistencePlan,
         accepted_control_entry_bytes: Option<Vec<u8>>,
         persistence_witness: RecoveryPersistenceWitness,
-    ) -> Self {
-        Self {
+        prewrite: RecoveryPreludePrewriteWitness,
+        material: RecoveryCanonicalMaterial,
+    ) -> Result<Self, RecoveryRepositoryError> {
+        let binding = persistence_witness.client_prelude_plan_binding(
+            &plan,
+            accepted_control_entry_bytes.as_deref(),
+            material,
+        )?;
+        let witness = prewrite
+            .seal_recovery_plan(binding)
+            .map_err(|_| RecoveryRepositoryError::AuthorityBindingMismatch)?;
+        Ok(Self {
             plan,
             accepted_control_entry_bytes,
             persistence_witness,
+            origin: RecoveryGraphPrewriteOrigin::Client { witness },
+            material,
+        })
+    }
+
+    fn new_scheduler(
+        plan: ConversationPersistencePlan,
+        persistence_witness: RecoveryPersistenceWitness,
+        material: RecoveryCanonicalMaterial,
+    ) -> Result<Self, RecoveryRepositoryError> {
+        if !matches!(material, RecoveryCanonicalMaterial::SchedulerExpired { .. })
+            || !matches!(
+                persistence_witness.mode,
+                RecoveryPersistenceMode::Expired { .. }
+            )
+        {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
         }
+        let fingerprint = recovery_plan_fingerprint(&plan, None)?;
+        if fingerprint.class() != RecoveryPlanClass::Expiry
+            || !persistence_witness.material_matches_plan(&plan, material)
+        {
+            return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+        }
+        let plan_fingerprint = *fingerprint.digest();
+        let seal_digest = persistence_witness.scheduler_graph_seal(plan_fingerprint, material);
+        Ok(Self {
+            plan,
+            accepted_control_entry_bytes: None,
+            persistence_witness,
+            origin: RecoveryGraphPrewriteOrigin::Scheduler {
+                plan_fingerprint,
+                seal_digest,
+            },
+            material,
+        })
     }
 
     pub(in crate::chat_protocol::repository) fn plan(&self) -> &ConversationPersistencePlan {
@@ -1570,28 +1891,73 @@ impl PreparedRecoveryExecutionGraph {
         self.accepted_control_entry_bytes.clone()
     }
 
-    pub(in crate::chat_protocol::repository) fn persistence_witness(
+    pub(in crate::chat_protocol::repository) async fn validate_prewrite(
         &self,
-    ) -> &RecoveryPersistenceWitness {
-        &self.persistence_witness
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<RecoveryExecutorWriteAuthority<'_>, ExecutionContextHydrationError> {
+        if !self
+            .persistence_witness
+            .material_matches_plan(&self.plan, self.material)
+        {
+            return Err(ExecutionContextHydrationError::AuthorityMismatch);
+        }
+        match &self.origin {
+            RecoveryGraphPrewriteOrigin::Client { witness } => {
+                let live_binding = self
+                    .persistence_witness
+                    .client_prelude_plan_binding(
+                        &self.plan,
+                        self.accepted_control_entry_bytes.as_deref(),
+                        self.material,
+                    )
+                    .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+                witness
+                    .validate_recovery_prewrite(transaction, &live_binding)
+                    .await
+                    .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+            }
+            RecoveryGraphPrewriteOrigin::Scheduler {
+                plan_fingerprint,
+                seal_digest,
+            } => {
+                let live = recovery_plan_fingerprint(&self.plan, None)
+                    .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
+                if live.class() != RecoveryPlanClass::Expiry
+                    || live.digest() != plan_fingerprint
+                    || *seal_digest
+                        != self
+                            .persistence_witness
+                            .scheduler_graph_seal(*plan_fingerprint, self.material)
+                {
+                    return Err(ExecutionContextHydrationError::AuthorityMismatch);
+                }
+            }
+        }
+        self.persistence_witness
+            .validate_prewrite(transaction, &self.plan)
+            .await?;
+        Ok(RecoveryExecutorWriteAuthority {
+            witness: &self.persistence_witness,
+        })
+    }
+
+    fn material(&self) -> RecoveryCanonicalMaterial {
+        self.material
     }
 }
 
 #[cfg(not(test))]
 impl PreparedRecoveryMutation {
     pub(crate) fn material(&self) -> RecoveryCanonicalMaterial {
-        self.material
+        self.graph.material()
     }
 
     pub(crate) async fn apply(
         self,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
-        let Self {
-            graph,
-            completion,
-            material,
-        } = self;
+        let Self { graph, completion } = self;
+        let material = graph.material();
         let prepared = prepare_recovery_execution(transaction, &graph).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedRecoveryMutation {
@@ -1617,6 +1983,7 @@ fn seal_planned_recovery(
         transition,
         scope_authority,
         completion,
+        prewrite,
         accepted_control_entry_bytes,
         persistence_witness,
         kind,
@@ -1641,16 +2008,17 @@ fn seal_planned_recovery(
         },
     };
     Ok(PreparedRecoveryMutation {
-        graph: PreparedRecoveryExecutionGraph::new(
+        graph: PreparedRecoveryExecutionGraph::new_client(
             transition.into_persistence_plan()?,
             accepted_control_entry_bytes,
             persistence_witness,
-        ),
+            prewrite,
+            material,
+        )?,
         completion: RecoveryCompletion {
             scope_authority,
             completion,
         },
-        material,
     })
 }
 
@@ -1720,47 +2088,47 @@ pub(crate) fn plan_client_recovery_expiry(
         transition,
         scope_authority,
         completion,
+        prewrite,
         request_id,
         terminal_at,
         persistence_witness,
         post_apply_error,
     ) = planned.into_parts();
+    let material = client_expiry_material(request_id, terminal_at, post_apply_error)?;
     Ok(PreparedRecoveryMutation {
-        graph: PreparedRecoveryExecutionGraph::new(
+        graph: PreparedRecoveryExecutionGraph::new_client(
             transition.into_persistence_plan()?,
             None,
             persistence_witness,
-        ),
+            prewrite,
+            material,
+        )?,
         completion: RecoveryCompletion {
             scope_authority,
             completion,
         },
-        material: client_expiry_material(request_id, terminal_at, post_apply_error)?,
     })
 }
 
 #[cfg(not(test))]
 pub(crate) struct PreparedSchedulerRecoveryExpiry {
     graph: PreparedRecoveryExecutionGraph,
-    material: RecoveryCanonicalMaterial,
 }
 
 #[cfg(not(test))]
 impl PreparedSchedulerRecoveryExpiry {
     pub(crate) fn material(&self) -> RecoveryCanonicalMaterial {
-        self.material
+        self.graph.material()
     }
 
     pub(crate) async fn apply(
         self,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
+        let material = self.graph.material();
         let prepared = prepare_recovery_execution(transaction, &self.graph).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
-        Ok(AppliedSchedulerRecoveryExpiry {
-            applied,
-            material: self.material,
-        })
+        Ok(AppliedSchedulerRecoveryExpiry { applied, material })
     }
 }
 
@@ -1777,13 +2145,13 @@ pub(crate) fn plan_scheduler_recovery_expiry(
     let planned: PlannedSchedulerRecoveryExpiry =
         HydrationAuthority::plan_scheduler_recovery_expiry_input(input)?;
     let (transition, request_id, terminal_at, persistence_witness) = planned.into_parts();
+    let material = scheduler_expiry_material(request_id, terminal_at)?;
     Ok(PreparedSchedulerRecoveryExpiry {
-        graph: PreparedRecoveryExecutionGraph::new(
+        graph: PreparedRecoveryExecutionGraph::new_scheduler(
             transition.into_persistence_plan()?,
-            None,
             persistence_witness,
-        ),
-        material: scheduler_expiry_material(request_id, terminal_at)?,
+            material,
+        )?,
     })
 }
 
@@ -1803,7 +2171,81 @@ pub(crate) fn plan_scheduler_recovery_expiry(
 #[allow(dead_code)]
 pub mod production_composition_proof {
     use super::*;
+    use crate::chat_protocol::state_machine::executor::{DropSafetyProbe, DropSafetyProbeMode};
+    use futures::FutureExt as _;
     use sqlx::PgPool;
+    use std::panic::AssertUnwindSafe;
+
+    mod production_proof_fixture {
+        include!("recovery/production_proof_fixture.rs");
+    }
+
+    mod production_client_proof {
+        include!("recovery/production_client_proof.rs");
+    }
+
+    mod production_fulfillment_proof {
+        include!("recovery/production_fulfillment_proof.rs");
+    }
+
+    #[doc(hidden)]
+    pub async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Result<(), String> {
+        production_client_proof::run_request_leaf_recovery_happy_path(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_request_leaf_recovery_operation_claim_drift_negative(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_client_proof::run_request_leaf_recovery_operation_claim_drift_negative(pool)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_request_leaf_recovery_scope_drift_negative(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_client_proof::run_request_leaf_recovery_scope_drift_negative(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_request_leaf_recovery_completion_rollback_negative(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_client_proof::run_request_leaf_recovery_completion_rollback_negative(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_leaf_recovery_cancellation_happy_path(pool: &PgPool) -> Result<(), String> {
+        production_client_proof::run_leaf_recovery_cancellation_happy_path(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_leaf_recovery_cancellation_due_for_expiry_ordering(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_client_proof::run_leaf_recovery_cancellation_due_for_expiry_ordering(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_client_recovery_expiry_due_for_expiry_ordering(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_client_proof::run_client_recovery_expiry_due_for_expiry_ordering(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_leaf_recovery_fulfillment_happy_path(pool: &PgPool) -> Result<(), String> {
+        production_fulfillment_proof::run_leaf_recovery_fulfillment_happy_path(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_leaf_recovery_fulfillment_due_for_expiry_ordering(
+        pool: &PgPool,
+    ) -> Result<(), String> {
+        production_fulfillment_proof::run_leaf_recovery_fulfillment_due_for_expiry_ordering(pool)
+            .await
+    }
 
     const PROOF_DATABASE: &str = "catbird_chat_protocol_test_20260722";
 
@@ -1864,26 +2306,63 @@ pub mod production_composition_proof {
         Ok((request_id, prepared))
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RecoveryResidue {
+        request_status: String,
+        reservation_status: String,
+        package_status: String,
+        protocol_instance_id: Uuid,
+        event_count: i64,
+        outbox_count: i64,
+        request_completion_count: i64,
+    }
+
     async fn residue_counts(
         transaction: &mut Transaction<'_, Postgres>,
         request_id: Uuid,
-    ) -> Result<(String, String, String, i64, i64, i64), String> {
-        sqlx::query_as(
+    ) -> Result<RecoveryResidue, String> {
+        let (
+            request_status,
+            reservation_status,
+            package_status,
+            protocol_instance_id,
+            event_count,
+            outbox_count,
+            request_completion_count,
+        ): (String, String, String, Uuid, i64, i64, i64) = sqlx::query_as(
             "SELECT request.status,reservation.status,package.status,\
-                    (SELECT count(*) FROM chat.events),\
-                    (SELECT count(*) FROM chat.outbox),\
-                    (SELECT count(*) FROM chat.idempotency_records)\
+                    conversation.protocol_instance_id,\
+                    (SELECT count(*) FROM chat.events event\
+                      WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                    (SELECT count(*) FROM chat.outbox outbox\
+                      JOIN chat.events event USING(event_position)\
+                      WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                    (SELECT count(*) FROM chat.idempotency_records completion\
+                      WHERE completion.principal_did=request.requester_did\
+                        AND completion.endpoint_nsid='blue.catbird.chat.requestLeafRecovery'\
+                        AND completion.operation_id=request.recovery_request_id)\
              FROM chat.leaf_recovery_requests request\
              JOIN chat.key_package_reservations reservation\
                ON reservation.recovery_request_id=request.recovery_request_id\
              JOIN chat.key_packages package\
                ON package.key_package_ref=request.key_package_ref\
+             JOIN chat.conversations conversation\
+               ON conversation.conversation_id=request.conversation_id\
              WHERE request.recovery_request_id=$1",
         )
         .bind(request_id)
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|error| format!("read Recovery proof residue: {error}"))
+        .map_err(|error| format!("read Recovery proof residue: {error}"))?;
+        Ok(RecoveryResidue {
+            request_status,
+            reservation_status,
+            package_status,
+            protocol_instance_id,
+            event_count,
+            outbox_count,
+            request_completion_count,
+        })
     }
 
     fn require_prewrite_authority_mismatch(error: RecoveryRepositoryError) -> Result<(), String> {
@@ -1910,13 +2389,28 @@ pub mod production_composition_proof {
             .await
             .map_err(|error| format!("enter privileged aggregate-drift simulation: {error}"))?;
         let changed = sqlx::query(
-            "UPDATE chat.metadata_snapshots metadata SET \
+            "WITH target AS (\
+               SELECT metadata.metadata_snapshot_id\
+                 FROM chat.leaf_recovery_requests request\
+                 JOIN chat.conversations conversation\
+                   ON conversation.conversation_id=request.conversation_id\
+                 JOIN chat.metadata_snapshots metadata\
+                   ON metadata.conversation_id=request.conversation_id\
+                  AND metadata.generation=request.generation\
+                 JOIN chat.transitions producer\
+                   ON producer.conversation_id=metadata.conversation_id\
+                  AND producer.transition_id=metadata.producing_transition_id\
+                WHERE request.recovery_request_id=$1\
+                  AND producer.entry_seq < conversation.next_entry_seq\
+                ORDER BY producer.entry_seq DESC,metadata.metadata_snapshot_id DESC\
+                LIMIT 1\
+             )\
+             UPDATE chat.metadata_snapshots metadata SET \
                  ciphertext=set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),\
                  ciphertext_sha256=digest(\
                    set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),'sha256')\
-             FROM chat.leaf_recovery_requests request\
-             WHERE request.recovery_request_id=$1\
-               AND metadata.conversation_id=request.conversation_id",
+             FROM target\
+             WHERE metadata.metadata_snapshot_id=target.metadata_snapshot_id",
         )
         .bind(request_id)
         .execute(&mut **transaction)
@@ -1973,6 +2467,355 @@ pub mod production_composition_proof {
         Ok(())
     }
 
+    #[derive(Clone, Copy)]
+    enum ExactRecoveryDrift {
+        Request,
+        Reservation,
+        Package,
+    }
+
+    async fn corrupt_exact_recovery_row(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+        drift: ExactRecoveryDrift,
+    ) -> Result<(), String> {
+        sqlx::query("SET LOCAL session_replication_role='replica'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("enter exact-row drift simulation: {error}"))?;
+        let changed = match drift {
+            ExactRecoveryDrift::Request => {
+                sqlx::query(
+                    "UPDATE chat.leaf_recovery_requests\
+                    SET requester_auth_generation=requester_auth_generation+1\
+                  WHERE recovery_request_id=$1",
+                )
+                .bind(request_id)
+                .execute(&mut **transaction)
+                .await
+            }
+            ExactRecoveryDrift::Reservation => {
+                sqlx::query(
+                    "UPDATE chat.key_package_reservations\
+                    SET requester_auth_generation=requester_auth_generation+1\
+                  WHERE recovery_request_id=$1",
+                )
+                .bind(request_id)
+                .execute(&mut **transaction)
+                .await
+            }
+            ExactRecoveryDrift::Package => {
+                sqlx::query(
+                    "UPDATE chat.key_packages package SET\
+                    wrapper_bytes=set_byte(package.wrapper_bytes,0,\
+                        get_byte(package.wrapper_bytes,0) # 1),\
+                    wrapper_sha256=digest(set_byte(package.wrapper_bytes,0,\
+                        get_byte(package.wrapper_bytes,0) # 1),'sha256')\
+                  FROM chat.leaf_recovery_requests request\
+                 WHERE request.recovery_request_id=$1\
+                   AND package.key_package_ref=request.key_package_ref",
+                )
+                .bind(request_id)
+                .execute(&mut **transaction)
+                .await
+            }
+        }
+        .map_err(|error| format!("inject exact Recovery row drift: {error}"))?
+        .rows_affected();
+        sqlx::query("SET LOCAL session_replication_role='origin'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("leave exact-row drift simulation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "exact-row drift expected one durable row, changed {changed}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn run_exact_row_drift(pool: &PgPool, drift: ExactRecoveryDrift) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin exact-row drift proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
+        corrupt_exact_recovery_row(&mut transaction, request_id, drift).await?;
+        let error = match prepared.apply(&mut transaction).await {
+            Ok(_) => return Err("exact Recovery row drift reached executor writes".to_owned()),
+            Err(error) => error,
+        };
+        require_prewrite_authority_mismatch(error)?;
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "exact-row prewrite drift left residue: before={before:?} after={after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback exact-row drift proof: {error}"))
+    }
+
+    /// Moves a genuine prepared scheduler graph across transaction identity and
+    /// requires executor prewrite rejection with no durable residue.
+    #[doc(hidden)]
+    pub async fn run_foreign_transaction_negative(pool: &PgPool) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut planning = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin foreign planning transaction: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut planning).await?;
+        planning
+            .rollback()
+            .await
+            .map_err(|error| format!("release foreign planning transaction: {error}"))?;
+        let mut execution = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin foreign execution transaction: {error}"))?;
+        let before = residue_counts(&mut execution, request_id).await?;
+        let error = match prepared.apply(&mut execution).await {
+            Ok(_) => return Err("foreign transaction applied a Recovery graph".to_owned()),
+            Err(error) => error,
+        };
+        require_prewrite_authority_mismatch(error)?;
+        let after = residue_counts(&mut execution, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "foreign transaction left residue: before={before:?} after={after:?}"
+            ));
+        }
+        execution
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback foreign execution transaction: {error}"))
+    }
+
+    /// Preparing and then abandoning a real private graph performs no write.
+    #[doc(hidden)]
+    pub async fn run_prepare_abandon_negative(pool: &PgPool) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin prepare-abandon proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
+        drop(prepared);
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("validate abandoned graph constraints: {error}"))?;
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "abandoned prepared graph left residue: before={before:?} after={after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback prepare-abandon proof: {error}"))
+    }
+
+    async fn install_exact_head_cas_blocker(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+    ) -> Result<(), String> {
+        let conversation_id: Uuid = sqlx::query_scalar(
+            "SELECT conversation_id FROM chat.leaf_recovery_requests \
+             WHERE recovery_request_id=$1",
+        )
+        .bind(request_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| format!("locate exact Recovery conversation: {error}"))?;
+        sqlx::query("SELECT set_config('catbird.recovery_proof_conversation',$1,true)")
+            .bind(conversation_id.hyphenated().to_string())
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("bind exact Recovery CAS blocker: {error}"))?;
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION pg_temp.catbird_recovery_proof_block_head() \
+             RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF OLD.conversation_id::text = \
+                    current_setting('catbird.recovery_proof_conversation',true) \
+               THEN RETURN NULL; \
+               END IF; \
+               RETURN NEW; \
+             END $$",
+        )
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| format!("create Recovery CAS blocker function: {error}"))?;
+        sqlx::query(
+            "CREATE TRIGGER catbird_recovery_proof_block_head \
+             BEFORE UPDATE ON chat.conversations \
+             FOR EACH ROW EXECUTE FUNCTION pg_temp.catbird_recovery_proof_block_head()",
+        )
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| format!("install Recovery CAS blocker trigger: {error}"))?;
+        Ok(())
+    }
+
+    /// Forces the exact conversation-head CAS to fail after the Recovery
+    /// terminal triple has been written inside the executor savepoint. The
+    /// executor must synchronously roll that savepoint back before returning.
+    #[doc(hidden)]
+    pub async fn run_terminal_head_cas_rollback_negative(pool: &PgPool) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin late-CAS rollback proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
+        install_exact_head_cas_blocker(&mut transaction, request_id).await?;
+        let error = match prepared.apply(&mut transaction).await {
+            Ok(_) => return Err("blocked Recovery head CAS unexpectedly applied".to_owned()),
+            Err(error) => error,
+        };
+        if !matches!(
+            error,
+            RecoveryRepositoryError::Execution(ExecutorError::Transition(
+                transition::TransitionRepositoryError::CompareAndSetConflict
+            ))
+        ) {
+            return Err(format!(
+                "expected late exact head CompareAndSetConflict, got {error:?}"
+            ));
+        }
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("validate late-CAS rollback constraints: {error}"))?;
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "late head-CAS failure left savepoint residue: before={before:?} after={after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback late-CAS proof: {error}"))
+    }
+
+    #[derive(Clone, Copy)]
+    enum PostWriteAbort {
+        Cancellation,
+        Panic,
+    }
+
+    async fn run_postwrite_abort(pool: &PgPool, abort: PostWriteAbort) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin post-write abort proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
+        let PreparedSchedulerRecoveryExpiry { graph } = prepared;
+        {
+            let prepared_execution = prepare_recovery_execution(&mut transaction, &graph)
+                .await
+                .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
+            let mode = match abort {
+                PostWriteAbort::Cancellation => DropSafetyProbeMode::Pending,
+                PostWriteAbort::Panic => DropSafetyProbeMode::Panic,
+            };
+            let (probe, reached) = DropSafetyProbe::new(mode);
+            let execution = apply_prepared_recovery_execution(
+                prepared_execution.with_drop_safety_probe_for_proof(probe),
+            );
+            match abort {
+                PostWriteAbort::Cancellation => {
+                    tokio::pin!(execution);
+                    tokio::select! {
+                        signal = reached => {
+                            signal.map_err(|_| {
+                                "post-write cancellation probe closed before executor writes"
+                                    .to_owned()
+                            })?;
+                        }
+                        result = &mut execution => {
+                            return Err(format!(
+                                "post-write cancellation executor completed before cancellation: \
+                                 {result:?}"
+                            ));
+                        }
+                    }
+                }
+                PostWriteAbort::Panic => {
+                    let result = AssertUnwindSafe(execution).catch_unwind().await;
+                    if result.is_ok() {
+                        return Err("post-write panic probe returned without unwinding".to_owned());
+                    }
+                    reached.await.map_err(|_| {
+                        "post-write panic probe closed before executor writes".to_owned()
+                    })?;
+                }
+            }
+        }
+        // Dropping/unwinding the SQLx savepoint queues ROLLBACK TO SAVEPOINT.
+        // The first same-connection round trip drains that rollback before the
+        // caller is allowed to inspect or reuse the outer transaction.
+        sqlx::query("SELECT 1")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("drain queued post-write rollback: {error}"))?;
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| format!("validate post-write rollback constraints: {error}"))?;
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "post-write abort left savepoint residue: before={before:?} after={after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback post-write abort proof: {error}"))
+    }
+
+    /// Cancels a real Recovery executor future after all writes and before
+    /// savepoint release, then proves the queued SQLx rollback erases them.
+    #[doc(hidden)]
+    pub async fn run_postwrite_cancellation_rollback_negative(pool: &PgPool) -> Result<(), String> {
+        run_postwrite_abort(pool, PostWriteAbort::Cancellation).await
+    }
+
+    /// Unwinds a real Recovery executor future after all writes and before
+    /// savepoint release, then proves the queued SQLx rollback erases them.
+    #[doc(hidden)]
+    pub async fn run_postwrite_panic_rollback_negative(pool: &PgPool) -> Result<(), String> {
+        run_postwrite_abort(pool, PostWriteAbort::Panic).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_request_row_drift_negative(pool: &PgPool) -> Result<(), String> {
+        run_exact_row_drift(pool, ExactRecoveryDrift::Request).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_reservation_row_drift_negative(pool: &PgPool) -> Result<(), String> {
+        run_exact_row_drift(pool, ExactRecoveryDrift::Reservation).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_package_row_drift_negative(pool: &PgPool) -> Result<(), String> {
+        run_exact_row_drift(pool, ExactRecoveryDrift::Package).await
+    }
+
     /// Executes the real scheduler lifecycle through its opaque authority,
     /// planner, private graph, witness prewrite, prepared executor, exact
     /// terminal triple, event/outbox, and scheduler-only material. The outer
@@ -1985,6 +2828,7 @@ pub mod production_composition_proof {
             .await
             .map_err(|error| format!("begin scheduler production proof: {error}"))?;
         let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
         let applied = prepared
             .apply(&mut transaction)
             .await
@@ -1999,12 +2843,42 @@ pub mod production_composition_proof {
             return Err("scheduler proof returned client/completion material".to_owned());
         }
         let after = residue_counts(&mut transaction, request_id).await?;
-        if after.0 != "expired"
-            || after.1 != "expired"
-            || !matches!(after.2.as_str(), "available" | "expired")
+        if after.request_status != "expired"
+            || after.reservation_status != "expired"
+            || !matches!(after.package_status.as_str(), "available" | "expired")
         {
             return Err(format!(
                 "scheduler proof did not terminalize exact triple: {after:?}"
+            ));
+        }
+        if applied.applied.event_positions.len() != 1 {
+            return Err(format!(
+                "scheduler proof emitted {} event positions, expected exactly one",
+                applied.applied.event_positions.len()
+            ));
+        }
+        let event_position = applied.applied.event_positions[0];
+        let (event_kind, protocol_instance_id, outbox_rows): (String, Uuid, i64) = sqlx::query_as(
+            "SELECT event.event_kind,event.protocol_instance_id,\
+                        (SELECT count(*) FROM chat.outbox outbox\
+                          WHERE outbox.event_position=event.event_position)\
+                   FROM chat.events event WHERE event.event_position=$1",
+        )
+        .bind(event_position)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| format!("read scheduler proof event/outbox: {error}"))?;
+        if event_kind != "leafRecovery"
+            || protocol_instance_id != before.protocol_instance_id
+            || outbox_rows != 1
+            || after.event_count != before.event_count + 1
+            || after.outbox_count != before.outbox_count + 1
+            || after.request_completion_count != before.request_completion_count
+        {
+            return Err(format!(
+                "scheduler proof event/outbox/completion delta mismatch: \
+                 before={before:?} after={after:?} event_kind={event_kind:?} \
+                 protocol_instance_id={protocol_instance_id} outbox_rows={outbox_rows}"
             ));
         }
         transaction
@@ -2131,9 +3005,10 @@ pub mod production_composition_proof {
     }
 
     fn exact_executor_surface_typechecks() {
+        let _ = PreparedRecoveryExecutionGraph::validate_prewrite;
         let _ = RecoveryPersistenceWitness::validate_prewrite;
-        let _ = RecoveryPersistenceWitness::apply_open;
-        let _ = RecoveryPersistenceWitness::apply_terminal;
+        let _ = RecoveryExecutorWriteAuthority::apply_open;
+        let _ = RecoveryExecutorWriteAuthority::apply_terminal;
         let _ = prepare_recovery_execution;
         let _ = apply_prepared_recovery_execution;
     }

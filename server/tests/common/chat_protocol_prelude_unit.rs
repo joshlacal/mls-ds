@@ -1,10 +1,22 @@
 use super::{
-    auth, bootstrap_completion_digest, canonical_operation_lock_key, BootstrapCompletionGuard,
+    auth, bootstrap_completion_digest, canonical_operation_lock_key,
+    completion_digest_from_prewrite_snapshot, BootstrapCompletionGuard,
     BootstrapCompletionJktShape, CanonicalDeviceIdentity, CanonicalLockScope, OperationArbitration,
-    OperationClaimGuard, ReplayCandidate,
+    OperationClaimGuard, RecoveryOperationEndpoint, RecoveryPreludeAggregatePlanBinding,
+    RecoveryPreludePersistenceMode, RecoveryPreludePlanBinding, RecoveryPreludePlanKind,
+    RecoveryPreludePrewriteWitness, ReplayCandidate,
 };
 use super::{OperationClaimBinding, OperationClaimRow};
-use chrono::{TimeZone, Utc};
+use crate::chat_protocol::{
+    transcript::{
+        decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
+    },
+    validation::ed25519_key_id,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::{SecondsFormat, TimeZone, Utc};
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1148,4 +1160,321 @@ fn bootstrap_completion_resource_functions_never_commit() {
         source.matches(".commit();").count() <= source.matches("self.").count(),
         "completion functions must not commit the outer transaction"
     );
+}
+
+fn recovery_prelude_fixture(
+    endpoint: RecoveryOperationEndpoint,
+) -> (RecoveryPreludePrewriteWitness, RecoveryPreludePlanBinding) {
+    const ACTOR_DID: &str = "did:plc:alicefixtureaaaaaaaaaaaa";
+    const ACTOR_DEVICE: &str = "72727272-7272-4272-b272-727272727272";
+    const DPOP_JKT: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SIGNING_SEED: [u8; 32] = [
+        0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85, 0x55,
+        0xa6, 0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e, 0x8c, 0x6b,
+        0x12, 0x8d,
+    ];
+
+    // The existing reset fixture is used only to derive an authority-free,
+    // sealed scope snapshot. Recovery's witness and plan are constructed from
+    // their real private prelude types below; this adds no authority seam.
+    let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
+    let signing_public_key = signing_key.verifying_key().to_bytes();
+    let key_id = ed25519_key_id(&signing_public_key).unwrap();
+    let actor_device_id = Uuid::parse_str(ACTOR_DEVICE).unwrap();
+    let signed_at = Utc.timestamp_millis_opt(1_785_252_309_000).unwrap();
+    let reset_request_id = Uuid::parse_str("00000000-0000-4000-8000-000000000029").unwrap();
+    let reset_operation_id = Uuid::parse_str("00000000-0000-4000-8000-00000000002c").unwrap();
+    let mut wrapper = json!({
+        "body": {
+            "$type": SignedMutationKind::ResetRequest.type_id(),
+            "signatureDomain": String::from_utf8(SignedMutationKind::ResetRequest.domain().to_vec()).unwrap(),
+            "resetRequestId": reset_request_id.to_string(),
+            "actorDid": ACTOR_DID,
+            "actorDeviceId": actor_device_id.to_string(),
+            "keyId": key_id.as_str(),
+            "authGeneration": 1,
+            "prior": {
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "generation": 0,
+                "stateVersion": 0,
+                "groupId": STANDARD.encode([0x5a; 32]),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode([0x5a; 32]),
+                "confirmationTag": STANDARD.encode([0x5a; 32]),
+                "lifecycle": "active",
+            },
+            "reason": "manualRecovery",
+            "idempotencyKey": reset_operation_id.to_string(),
+            "signedAt": signed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        },
+        "signature": STANDARD.encode([0_u8; 64]),
+    });
+    let canonical =
+        decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap()).unwrap();
+    wrapper["signature"] =
+        json!(STANDARD.encode(signing_key.sign(canonical.transcript_bytes()).to_bytes()));
+    let reset_mutation = decode_and_verify_signed_mutation(
+        &serde_json::to_vec(&wrapper).unwrap(),
+        &signing_public_key,
+    )
+    .unwrap();
+    let locked =
+        auth::reset_locked_scope_for_claim_test(&reset_mutation, DPOP_JKT, &signing_public_key)
+            .unwrap();
+    let scope = locked.recovery_prewrite_snapshot();
+
+    let (mutation_kind, mode, plan_kind, accepted_control_sha256) = match endpoint {
+        RecoveryOperationEndpoint::RequestLeafRecovery => (
+            SignedMutationKind::LeafRecoveryRequest,
+            RecoveryPreludePersistenceMode::Open,
+            RecoveryPreludePlanKind::RecoveryRequest,
+            None,
+        ),
+        RecoveryOperationEndpoint::CancelLeafRecovery => (
+            SignedMutationKind::LeafRecoveryCancellation,
+            RecoveryPreludePersistenceMode::Cancelled,
+            RecoveryPreludePlanKind::RecoveryCancellation,
+            None,
+        ),
+        RecoveryOperationEndpoint::SubmitRecoveryFulfillment => (
+            SignedMutationKind::LeafRecoveryFulfillment,
+            RecoveryPreludePersistenceMode::Fulfilled,
+            RecoveryPreludePlanKind::Commit,
+            Some([0x9b; 32]),
+        ),
+    };
+    let operation = OperationClaimBinding {
+        operation_id: Uuid::parse_str("00000000-0000-4000-8000-000000000041").unwrap(),
+        principal_did: ACTOR_DID.to_owned(),
+        endpoint_nsid: endpoint.endpoint_nsid().to_owned(),
+        mutation_kind: mutation_kind.type_id().to_owned(),
+        request_digest: [0x41; 32],
+        accepted_request_sha256: [0x42; 32],
+        signature: [0x43; 64],
+        claimed_at: signed_at,
+    };
+    let scope_receipt_id = Uuid::parse_str("00000000-0000-4000-8000-000000000042").unwrap();
+    let completion_authority_digest =
+        completion_digest_from_prewrite_snapshot(&scope, scope_receipt_id, &operation);
+    let witness = RecoveryPreludePrewriteWitness::unbound(
+        operation,
+        scope_receipt_id,
+        scope,
+        completion_authority_digest,
+    );
+    let aggregate = RecoveryPreludeAggregatePlanBinding::new(
+        Uuid::parse_str("00000000-0000-4000-8000-000000000043").unwrap(),
+        2,
+        3,
+        [0x44; 32],
+        4,
+        [0x45; 32],
+        [0x46; 32],
+        [0x47; 32],
+        [0x48; 32],
+        Some([0x49; 32]),
+        [0x4a; 32],
+        [0x4b; 32],
+        [0x4c; 32],
+    );
+    let binding = RecoveryPreludePlanBinding::new(
+        endpoint,
+        mutation_kind,
+        mode,
+        plan_kind,
+        Uuid::parse_str("00000000-0000-4000-8000-000000000044").unwrap(),
+        witness.transaction_id.as_ref(),
+        ACTOR_DID,
+        actor_device_id,
+        aggregate,
+        [0x4d; 32],
+        accepted_control_sha256,
+    );
+    (witness, binding)
+}
+
+#[test]
+fn recovery_prelude_seals_one_compatible_unbound_witness() {
+    let (witness, binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+    assert!(witness.seal_recovery_plan(binding).is_ok());
+}
+
+#[test]
+fn recovery_prelude_rejects_transaction_claim_and_scope_receipt_drift_at_seal() {
+    macro_rules! assert_rejected {
+        ($name:literal, $alter:expr) => {{
+            let (mut witness, binding) =
+                recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+            $alter(&mut witness);
+            assert!(
+                matches!(
+                    witness.seal_recovery_plan(binding),
+                    Err(super::PreludeError::ClaimIntegrity)
+                ),
+                "Recovery prelude accepted altered {}",
+                $name
+            );
+        }};
+    }
+
+    assert_rejected!(
+        "transaction id",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.transaction_id = "other-recovery-transaction".into();
+        }
+    );
+    assert_rejected!(
+        "operation id",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.operation_id = Uuid::new_v4();
+        }
+    );
+    assert_rejected!(
+        "claim principal",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.principal_did.push('x');
+        }
+    );
+    assert_rejected!(
+        "claim endpoint",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.endpoint_nsid = "blue.catbird.chat.cancelLeafRecovery".to_owned();
+        }
+    );
+    assert_rejected!(
+        "claim mutation kind",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.mutation_kind = SignedMutationKind::LeafRecoveryCancellation
+                .type_id()
+                .to_owned();
+        }
+    );
+    assert_rejected!(
+        "claim request digest",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.request_digest[0] ^= 1;
+        }
+    );
+    assert_rejected!(
+        "claim accepted request hash",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.accepted_request_sha256[0] ^= 1;
+        }
+    );
+    assert_rejected!(
+        "claim signature",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.signature[0] ^= 1;
+        }
+    );
+    assert_rejected!(
+        "claim timestamp",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.operation.claimed_at = Utc.timestamp_millis_opt(1_785_252_310_000).unwrap();
+        }
+    );
+    assert_rejected!(
+        "scope receipt",
+        |witness: &mut RecoveryPreludePrewriteWitness| {
+            witness.scope_receipt_id = Uuid::new_v4();
+        }
+    );
+}
+
+#[test]
+fn recovery_prelude_rejects_incompatible_actor_tuple_and_mode_at_seal() {
+    let (witness, mut binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+    binding.graph_actor_did = "did:plc:otherfixtureaaaaaaaaaaaa".into();
+    assert!(matches!(
+        witness.seal_recovery_plan(binding),
+        Err(super::PreludeError::ClaimIntegrity)
+    ));
+
+    let (witness, mut binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+    binding.graph_actor_device_id = Uuid::new_v4();
+    assert!(matches!(
+        witness.seal_recovery_plan(binding),
+        Err(super::PreludeError::ClaimIntegrity)
+    ));
+
+    let (witness, mut binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+    binding.mode = RecoveryPreludePersistenceMode::Cancelled;
+    assert!(matches!(
+        witness.seal_recovery_plan(binding),
+        Err(super::PreludeError::ClaimIntegrity)
+    ));
+}
+
+#[test]
+fn recovery_prelude_plan_digest_binds_target_fingerprint_and_accepted_control() {
+    let (witness, binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::RequestLeafRecovery);
+    let sealed = witness.seal_recovery_plan(binding.clone()).unwrap();
+    let seal_digest = sealed.plan_seal.as_ref().unwrap().seal_digest;
+
+    let mut changed_target = binding.clone();
+    changed_target.target_recovery_request_id = Uuid::new_v4();
+    assert_ne!(seal_digest, sealed.rederive_plan_digest(&changed_target));
+
+    let mut changed_fingerprint = binding;
+    changed_fingerprint.plan_fingerprint[0] ^= 1;
+    assert_ne!(
+        seal_digest,
+        sealed.rederive_plan_digest(&changed_fingerprint)
+    );
+
+    let (witness, binding) =
+        recovery_prelude_fixture(RecoveryOperationEndpoint::SubmitRecoveryFulfillment);
+    let sealed = witness.seal_recovery_plan(binding.clone()).unwrap();
+    let seal_digest = sealed.plan_seal.as_ref().unwrap().seal_digest;
+    let mut changed_accepted_control = binding;
+    changed_accepted_control
+        .accepted_control_sha256
+        .as_mut()
+        .unwrap()[0] ^= 1;
+    assert_ne!(
+        seal_digest,
+        sealed.rederive_plan_digest(&changed_accepted_control)
+    );
+}
+
+#[test]
+fn recovery_prelude_scope_snapshot_contract_and_recovery_split_remain_sealed() {
+    // auth owns the snapshot fields privately, so sibling prelude tests cannot
+    // forge or mutate its canonical scope digest/snapshot seal. Verify the
+    // reachable source contracts instead of adding a test-only constructor.
+    let prelude_source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    let witness_digest = prelude_source
+        .split_once("fn rederive_witness_digest(&self)")
+        .unwrap()
+        .1
+        .split_once("fn rederive_plan_digest(&self")
+        .unwrap()
+        .0;
+    assert!(witness_digest.contains("self.scope.scope_digest()"));
+    assert!(witness_digest.contains("self.scope.snapshot_digest()"));
+    let seal = prelude_source
+        .split_once("fn seal_recovery_plan(")
+        .unwrap()
+        .1
+        .split_once("/// Validate the exact plan/claim/scope data")
+        .unwrap()
+        .0;
+    assert!(seal.contains("completion_digest_from_prewrite_snapshot"));
+    assert!(prelude_source.contains("pub(crate) fn into_recovery_execution_parts("));
+
+    let auth_source = include_str!("../../src/chat_protocol/repository/auth.rs");
+    let snapshot = auth_source
+        .split_once("fn has_valid_seal_and_canonical_order(&self)")
+        .unwrap()
+        .1
+        .split_once("/// Locks one already-canonical principal/device scope")
+        .unwrap()
+        .0;
+    assert!(snapshot.contains("canonical_locked_scope_digest"));
+    assert!(snapshot.contains("canonical_scope_prewrite_snapshot_digest"));
 }
