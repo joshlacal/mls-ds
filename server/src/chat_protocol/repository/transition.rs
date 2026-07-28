@@ -1721,6 +1721,528 @@ pub(crate) async fn release_reserved_recovery_package(
     Ok(())
 }
 
+/// Complete immutable KeyPackage row supplied to recovery SQL primitives.
+///
+/// Fields are private so callers cannot construct a partial semantic
+/// `(key_package_ref,status)` guard. Both the available->reserved edge and the
+/// terminal recovery triple compare every field represented here, plus the
+/// exact live status and all-null terminal provenance. This is deliberately a
+/// SQL-layer value, not a sealed protocol-authority token: the future recovery
+/// repository must consume its own lock witness before calling this constructor.
+#[derive(Debug)]
+pub(crate) struct RecoveryKeyPackageRowCas<'a> {
+    key_package_ref: &'a [u8],
+    wrapper_bytes: &'a [u8],
+    wrapper_sha256: &'a [u8],
+    init_key: &'a [u8],
+    owner_did: &'a str,
+    owner_device_id: Uuid,
+    owner_key_id: &'a str,
+    owner_auth_generation: i64,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+impl<'a> RecoveryKeyPackageRowCas<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        key_package_ref: &'a [u8],
+        wrapper_bytes: &'a [u8],
+        wrapper_sha256: &'a [u8],
+        init_key: &'a [u8],
+        owner_did: &'a str,
+        owner_device_id: Uuid,
+        owner_key_id: &'a str,
+        owner_auth_generation: i64,
+        not_before: DateTime<Utc>,
+        not_after: DateTime<Utc>,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            key_package_ref,
+            wrapper_bytes,
+            wrapper_sha256,
+            init_key,
+            owner_did,
+            owner_device_id,
+            owner_key_id,
+            owner_auth_generation,
+            not_before,
+            not_after,
+            created_at,
+        }
+    }
+}
+
+/// Full-row SQL binding for the available->reserved package edge.
+///
+/// This prevents accidental partial CAS inside the transition adapter; it does
+/// not by itself prove that a repository lock witness was consumed.
+#[derive(Debug)]
+pub(crate) struct AvailableRecoveryPackageReservationCas<'a> {
+    transaction_id: &'a str,
+    package: RecoveryKeyPackageRowCas<'a>,
+}
+
+impl<'a> AvailableRecoveryPackageReservationCas<'a> {
+    pub(crate) fn new(transaction_id: &'a str, package: RecoveryKeyPackageRowCas<'a>) -> Self {
+        Self {
+            transaction_id,
+            package,
+        }
+    }
+}
+
+pub(crate) const AVAILABLE_RECOVERY_PACKAGE_RESERVATION_SQL: &str = r#"
+    UPDATE chat.key_packages AS kp
+       SET status = 'reserved'
+     WHERE txid_current()::text = $1
+       AND kp.key_package_ref = $2
+       AND kp.wrapper_bytes = $3
+       AND kp.wrapper_sha256 = $4
+       AND kp.init_key = $5
+       AND kp.owner_did = $6
+       AND kp.owner_device_id = $7
+       AND kp.owner_key_id = $8
+       AND kp.owner_auth_generation = $9
+       AND kp.not_before = $10
+       AND kp.not_after = $11
+       AND kp.created_at = $12
+       AND kp.status = 'available'
+       AND kp.terminal_transition_id IS NULL
+       AND kp.terminal_revocation_id IS NULL
+       AND kp.terminal_at IS NULL
+"#;
+
+/// Reserve an available package only if its complete locked durable row still
+/// matches. No request/reservation row is inserted here; the composing
+/// transaction owns those writes and their deferred exact-pair constraints.
+pub(crate) async fn reserve_available_recovery_package(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &AvailableRecoveryPackageReservationCas<'_>,
+) -> Result<(), TransitionRepositoryError> {
+    let package = &binding.package;
+    let result = sqlx::query(AVAILABLE_RECOVERY_PACKAGE_RESERVATION_SQL)
+        .bind(binding.transaction_id)
+        .bind(package.key_package_ref)
+        .bind(package.wrapper_bytes)
+        .bind(package.wrapper_sha256)
+        .bind(package.init_key)
+        .bind(package.owner_did)
+        .bind(package.owner_device_id)
+        .bind(package.owner_key_id)
+        .bind(package.owner_auth_generation)
+        .bind(package.not_before)
+        .bind(package.not_after)
+        .bind(package.created_at)
+        .execute(&mut **transaction)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(TransitionRepositoryError::CompareAndSetConflict);
+    }
+    Ok(())
+}
+
+/// The only legal terminal shapes for an Open/Active/Reserved recovery triple.
+///
+/// A single transition id is reused by the request, reservation and package
+/// consumed arms. A single cancellation digest/evidence tuple is reused by the
+/// request and reservation cancellation arms. All three rows use the same
+/// terminal instant.
+#[derive(Debug)]
+pub(crate) enum RecoveryTerminalTripleTermination<'a> {
+    Fulfilled {
+        transition_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
+    Cancelled {
+        terminal_signed_request_bytes: &'a [u8],
+        terminal_signing_transcript_bytes: &'a [u8],
+        terminal_request_digest: &'a [u8],
+        terminal_signature: &'a [u8],
+        terminal_at: DateTime<Utc>,
+    },
+    Expired {
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+impl RecoveryTerminalTripleTermination<'_> {
+    pub(crate) fn sql_projection(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Fulfilled { .. } => ("fulfilled", "consumed", "consumed"),
+            Self::Cancelled { .. } => ("cancelled", "released", "available"),
+            Self::Expired { .. } => ("expired", "expired", "availableOrExpired"),
+        }
+    }
+
+    fn sql_bindings(
+        &self,
+    ) -> (
+        &'static str,
+        Option<Uuid>,
+        Option<&[u8]>,
+        Option<&[u8]>,
+        Option<&[u8]>,
+        Option<&[u8]>,
+        DateTime<Utc>,
+    ) {
+        match self {
+            Self::Fulfilled {
+                transition_id,
+                terminal_at,
+            } => (
+                "fulfilled",
+                Some(*transition_id),
+                None,
+                None,
+                None,
+                None,
+                *terminal_at,
+            ),
+            Self::Cancelled {
+                terminal_signed_request_bytes,
+                terminal_signing_transcript_bytes,
+                terminal_request_digest,
+                terminal_signature,
+                terminal_at,
+            } => (
+                "cancelled",
+                None,
+                Some(*terminal_signed_request_bytes),
+                Some(*terminal_signing_transcript_bytes),
+                Some(*terminal_request_digest),
+                Some(*terminal_signature),
+                *terminal_at,
+            ),
+            Self::Expired { terminal_at } => {
+                ("expired", None, None, None, None, None, *terminal_at)
+            }
+        }
+    }
+}
+
+/// Complete SQL binding for terminalizing one recovery request, reservation and
+/// reserved KeyPackage together.
+///
+/// The request and reservation inputs are the full insertion-shaped immutable
+/// rows. The SQL additionally requires every terminal column to remain NULL.
+/// Holding references prevents either row witness from being mutated while the
+/// binding is live. This type deliberately makes no sealed-authority claim:
+/// minting remains available to the future recovery repository after it has
+/// consumed its private lock witness.
+#[derive(Debug)]
+pub(crate) struct RecoveryTerminalTripleCas<'a> {
+    transaction_id: &'a str,
+    request: &'a NewLeafRecoveryRequest,
+    reservation: &'a NewReservation,
+    package: RecoveryKeyPackageRowCas<'a>,
+    termination: RecoveryTerminalTripleTermination<'a>,
+}
+
+impl<'a> RecoveryTerminalTripleCas<'a> {
+    pub(crate) fn new(
+        transaction_id: &'a str,
+        request: &'a NewLeafRecoveryRequest,
+        reservation: &'a NewReservation,
+        package: RecoveryKeyPackageRowCas<'a>,
+        termination: RecoveryTerminalTripleTermination<'a>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            request,
+            reservation,
+            package,
+            termination,
+        }
+    }
+}
+
+/// One statement owns all three terminal writes. The final integer division is
+/// deliberate: any count other than exactly `(1,1,1)` raises SQLSTATE 22012,
+/// which rolls back the whole statement before it is mapped to a typed CAS
+/// conflict. Returning counts to Rust and checking afterward would be unsafe
+/// because successful earlier CTE updates would remain visible.
+pub(crate) const RECOVERY_TERMINAL_TRIPLE_SQL: &str = r#"
+    WITH request_terminal AS (
+        UPDATE chat.leaf_recovery_requests AS rr
+           SET status = CASE $52
+                            WHEN 'fulfilled' THEN 'fulfilled'
+                            WHEN 'cancelled' THEN 'cancelled'
+                            WHEN 'expired' THEN 'expired'
+                        END,
+               fulfilling_transition_id =
+                   CASE WHEN $52 = 'fulfilled' THEN $53 ELSE NULL END,
+               terminal_signed_request_bytes =
+                   CASE WHEN $52 = 'cancelled' THEN $54 ELSE NULL END,
+               terminal_signing_transcript_bytes =
+                   CASE WHEN $52 = 'cancelled' THEN $55 ELSE NULL END,
+               terminal_request_digest =
+                   CASE WHEN $52 = 'cancelled' THEN $56 ELSE NULL END,
+               terminal_signature =
+                   CASE WHEN $52 = 'cancelled' THEN $57 ELSE NULL END,
+               terminal_at = $58
+         WHERE txid_current()::text = $1
+           AND rr.recovery_request_id = $2
+           AND rr.conversation_id = $3
+           AND rr.generation = $4
+           AND rr.requester_did = $5
+           AND rr.requester_device_id = $6
+           AND rr.requester_key_id = $7
+           AND rr.requester_auth_generation = $8
+           AND rr.recovery_kind = $9
+           AND rr.source = $10
+           AND rr.bound_state_version = $11
+           AND rr.bound_group_id = $12
+           AND rr.bound_epoch = $13
+           AND rr.bound_group_context_hash = $14
+           AND rr.bound_confirmation_tag = $15
+           AND rr.reservation_request_id = $16
+           AND rr.replaced_leaf_period_id IS NOT DISTINCT FROM $17
+           AND rr.signed_request_bytes = $18
+           AND rr.signing_transcript_bytes = $19
+           AND rr.request_digest = $20
+           AND rr.signature = $21
+           AND rr.requested_at = $22
+           AND rr.expires_at = $23
+           AND rr.status = 'open'
+           AND rr.fulfilling_transition_id IS NULL
+           AND rr.terminal_transition_id IS NULL
+           AND rr.terminal_revocation_id IS NULL
+           AND rr.terminal_signed_request_bytes IS NULL
+           AND rr.terminal_signing_transcript_bytes IS NULL
+           AND rr.terminal_request_digest IS NULL
+           AND rr.terminal_signature IS NULL
+           AND rr.terminal_at IS NULL
+           AND (
+                ($52 = 'fulfilled' AND $53 IS NOT NULL
+                    AND $54 IS NULL AND $55 IS NULL
+                    AND $56 IS NULL AND $57 IS NULL
+                    AND $58 >= rr.requested_at AND $58 < rr.expires_at)
+                OR
+                ($52 = 'cancelled' AND $53 IS NULL
+                    AND $54 IS NOT NULL AND $55 IS NOT NULL
+                    AND $56 IS NOT NULL AND $57 IS NOT NULL
+                    AND $58 >= rr.requested_at AND $58 < rr.expires_at)
+                OR
+                ($52 = 'expired' AND $53 IS NULL
+                    AND $54 IS NULL AND $55 IS NULL
+                    AND $56 IS NULL AND $57 IS NULL
+                    AND $58 = rr.expires_at)
+           )
+        RETURNING rr.recovery_request_id
+    ),
+    reservation_terminal AS (
+        UPDATE chat.key_package_reservations AS kr
+           SET status = CASE $52
+                            WHEN 'fulfilled' THEN 'consumed'
+                            WHEN 'cancelled' THEN 'released'
+                            WHEN 'expired' THEN 'expired'
+                        END,
+               consumed_transition_id =
+                   CASE WHEN $52 = 'fulfilled' THEN $53 ELSE NULL END,
+               terminal_request_digest =
+                   CASE WHEN $52 = 'cancelled' THEN $56 ELSE NULL END,
+               terminal_at = $58
+          FROM request_terminal AS request_match
+         WHERE kr.recovery_request_id = $24
+           AND request_match.recovery_request_id = kr.recovery_request_id
+           AND $24 = $2
+           AND $24 = $16
+           AND kr.key_package_ref = $25
+           AND kr.conversation_id = $26
+           AND $26 = $3
+           AND kr.generation = $27
+           AND $27 = $4
+           AND kr.requester_did = $28
+           AND $28 = $5
+           AND kr.requester_device_id = $29
+           AND $29 = $6
+           AND kr.requester_key_id = $30
+           AND $30 = $7
+           AND kr.requester_auth_generation = $31
+           AND $31 = $8
+           AND kr.recipient_did = $32
+           AND kr.recipient_device_id = $33
+           AND kr.bound_state_version = $34
+           AND $34 = $11
+           AND kr.bound_group_id = $35
+           AND $35 = $12
+           AND kr.bound_epoch = $36
+           AND $36 = $13
+           AND kr.bound_group_context_hash = $37
+           AND $37 = $14
+           AND kr.bound_confirmation_tag = $38
+           AND $38 = $15
+           AND kr.purpose = 'leafRecovery'
+           AND kr.expires_at = $39
+           AND $39 = $23
+           AND kr.created_at = $40
+           AND kr.status = 'active'
+           AND kr.consumed_transition_id IS NULL
+           AND kr.terminal_transition_id IS NULL
+           AND kr.terminal_revocation_id IS NULL
+           AND kr.terminal_request_digest IS NULL
+           AND kr.terminal_at IS NULL
+           AND (
+                ($52 IN ('fulfilled','cancelled')
+                    AND $58 >= kr.created_at AND $58 < kr.expires_at)
+                OR ($52 = 'expired' AND $58 = kr.expires_at)
+           )
+        RETURNING kr.recovery_request_id, kr.key_package_ref
+    ),
+    package_terminal AS (
+        UPDATE chat.key_packages AS kp
+           SET status = CASE
+                            WHEN $52 = 'fulfilled' THEN 'consumed'
+                            WHEN $52 = 'expired' AND kp.not_after = $58
+                                THEN 'expired'
+                            ELSE 'available'
+                        END,
+               terminal_transition_id =
+                   CASE WHEN $52 = 'fulfilled' THEN $53 ELSE NULL END,
+               terminal_revocation_id = NULL,
+               terminal_at = CASE
+                   WHEN $52 = 'fulfilled'
+                       OR ($52 = 'expired' AND kp.not_after = $58)
+                   THEN $58
+                   ELSE NULL
+               END
+          FROM reservation_terminal AS reservation_match
+         WHERE kp.key_package_ref = $41
+           AND reservation_match.recovery_request_id = $24
+           AND reservation_match.key_package_ref = kp.key_package_ref
+           AND $41 = $25
+           AND kp.wrapper_bytes = $42
+           AND kp.wrapper_sha256 = $43
+           AND kp.init_key = $44
+           AND kp.owner_did = $45
+           AND $45 = $32
+           AND kp.owner_device_id = $46
+           AND $46 = $33
+           AND kp.owner_key_id = $47
+           AND $47 = $30
+           AND kp.owner_auth_generation = $48
+           AND $48 = $31
+           AND kp.not_before = $49
+           AND kp.not_after = $50
+           AND $39 <= $50
+           AND kp.created_at = $51
+           AND kp.status = 'reserved'
+           AND kp.terminal_transition_id IS NULL
+           AND kp.terminal_revocation_id IS NULL
+           AND kp.terminal_at IS NULL
+           AND (
+                ($52 IN ('fulfilled','cancelled') AND $58 < kp.not_after)
+                OR ($52 = 'expired' AND $58 <= kp.not_after)
+           )
+        RETURNING kp.key_package_ref
+    ),
+    exact_counts AS (
+        SELECT
+            (SELECT count(*) FROM request_terminal) AS request_count,
+            (SELECT count(*) FROM reservation_terminal) AS reservation_count,
+            (SELECT count(*) FROM package_terminal) AS package_count
+    )
+    SELECT 1 / CASE
+        WHEN request_count = 1
+         AND reservation_count = 1
+         AND package_count = 1
+        THEN 1 ELSE 0 END
+      FROM exact_counts
+"#;
+
+/// Atomically terminalize the exact Open/Active/Reserved recovery triple.
+///
+/// On any full-row drift the in-statement exact-count guard aborts all three
+/// writes and this returns `CompareAndSetConflict`.
+pub(crate) async fn terminalize_recovery_triple(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &RecoveryTerminalTripleCas<'_>,
+) -> Result<(), TransitionRepositoryError> {
+    let request = binding.request;
+    let reservation = binding.reservation;
+    let package = &binding.package;
+    let (mode, transition_id, signed, transcript, digest, signature, terminal_at) =
+        binding.termination.sql_bindings();
+    let result = sqlx::query_scalar::<_, i32>(RECOVERY_TERMINAL_TRIPLE_SQL)
+        .bind(binding.transaction_id)
+        .bind(request.recovery_request_id)
+        .bind(request.conversation_id)
+        .bind(request.generation)
+        .bind(&request.requester_did)
+        .bind(request.requester_device_id)
+        .bind(&request.requester_key_id)
+        .bind(request.requester_auth_generation)
+        .bind(request.recovery_kind.as_str())
+        .bind(request.source.as_str())
+        .bind(request.bound_state_version)
+        .bind(&request.bound_group_id)
+        .bind(request.bound_epoch)
+        .bind(&request.bound_group_context_hash)
+        .bind(&request.bound_confirmation_tag)
+        .bind(request.reservation_request_id)
+        .bind(request.recovery_kind.replaced_leaf_period_id())
+        .bind(&request.signed_request_bytes)
+        .bind(&request.signing_transcript_bytes)
+        .bind(&request.request_digest)
+        .bind(&request.signature)
+        .bind(request.requested_at)
+        .bind(request.expires_at)
+        .bind(reservation.recovery_request_id)
+        .bind(&reservation.key_package_ref)
+        .bind(reservation.conversation_id)
+        .bind(reservation.generation)
+        .bind(&reservation.requester_did)
+        .bind(reservation.requester_device_id)
+        .bind(&reservation.requester_key_id)
+        .bind(reservation.requester_auth_generation)
+        .bind(&reservation.recipient_did)
+        .bind(reservation.recipient_device_id)
+        .bind(reservation.bound_state_version)
+        .bind(&reservation.bound_group_id)
+        .bind(reservation.bound_epoch)
+        .bind(&reservation.bound_group_context_hash)
+        .bind(&reservation.bound_confirmation_tag)
+        .bind(reservation.expires_at)
+        .bind(reservation.created_at)
+        .bind(package.key_package_ref)
+        .bind(package.wrapper_bytes)
+        .bind(package.wrapper_sha256)
+        .bind(package.init_key)
+        .bind(package.owner_did)
+        .bind(package.owner_device_id)
+        .bind(package.owner_key_id)
+        .bind(package.owner_auth_generation)
+        .bind(package.not_before)
+        .bind(package.not_after)
+        .bind(package.created_at)
+        .bind(mode)
+        .bind(transition_id)
+        .bind(signed)
+        .bind(transcript)
+        .bind(digest)
+        .bind(signature)
+        .bind(terminal_at)
+        .fetch_one(&mut **transaction)
+        .await;
+    match result {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(TransitionRepositoryError::CompareAndSetConflict),
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("22012") =>
+        {
+            Err(TransitionRepositoryError::CompareAndSetConflict)
+        }
+        Err(error) => Err(TransitionRepositoryError::Database(error)),
+    }
+}
+
 // ===========================================================================
 // Family 6b — chat.device_revocations + the target-registration revoke.
 //
