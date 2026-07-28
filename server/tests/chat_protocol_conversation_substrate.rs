@@ -120,11 +120,11 @@ mod chat_protocol {
 #[test]
 fn g6_execution_context_facade_is_production_reachable() {
     use chat_protocol::repository::execution_context::{
-        hydrate_execution_context, ExecutionContextArtifacts,
+        hydrate_execution_context_unscoped_for_test, ExecutionContextArtifacts,
     };
 
     fn reachable<T>(_value: T) {}
-    reachable(hydrate_execution_context);
+    reachable(hydrate_execution_context_unscoped_for_test);
     reachable(ExecutionContextArtifacts::default());
 }
 
@@ -3122,13 +3122,14 @@ mod historical_control_loader {
     };
     use crate::chat_protocol::repository::delivery::{EntryEntitlementKind, EventKind};
     use crate::chat_protocol::repository::execution_context::{
-        hydrate_execution_context, ExecutionContextArtifacts, ExecutionContextHydrationError,
+        hydrate_execution_context_unscoped_for_test, ExecutionContextArtifacts,
+        ExecutionContextHydrationError,
     };
     use crate::chat_protocol::snapshot::{
         PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
     };
     use crate::chat_protocol::state_machine::{
-        apply_conversation_persistence_plan, hydrate_conversation_state,
+        apply_conversation_persistence_plan_unscoped_for_test, hydrate_conversation_state,
         metadata_binding_of_transition, persistence_plan_for_test, plan_close, CloseConversation,
         ConversationHeadCasBinding, ConversationKind, DeviceIdentity,
         HistoricalRehydrationAuthority, HydrationAuthority, MetadataSnapshotBinding, OpeningKind,
@@ -3910,7 +3911,7 @@ mod historical_control_loader {
             crate::chat_protocol::state_machine::PlanAuthority::Transition(transition),
         );
 
-        let rejected = hydrate_execution_context(
+        let rejected = hydrate_execution_context_unscoped_for_test(
             &mut tx,
             &plan,
             ExecutionContextArtifacts {
@@ -3925,7 +3926,7 @@ mod historical_control_loader {
             rejected,
             Err(ExecutionContextHydrationError::ControlEntryMismatch)
         ));
-        let context = hydrate_execution_context(
+        let context = hydrate_execution_context_unscoped_for_test(
             &mut tx,
             &plan,
             ExecutionContextArtifacts {
@@ -3953,9 +3954,10 @@ mod historical_control_loader {
         assert_eq!(context.closing_leaf_periods.len(), 1);
         assert_eq!(context.events.len(), 1);
         assert_eq!(context.events[0].event_kind, EventKind::ConversationClosed);
-        let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
-            .await
-            .expect("production executor applies genuine close");
+        let applied =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &context)
+                .await
+                .expect("production executor applies genuine close");
         assert_eq!(applied.allocated_seq, 2);
         tx.commit()
             .await
@@ -5555,6 +5557,7 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::repository::auth::{
             authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
+            G6BusinessAuthorityBinding,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_available_acceptance_package,
@@ -5569,8 +5572,9 @@ mod historical_control_loader {
             map_recovery_control_evidence_error, recovery_acceptance_authority_matches_durable,
             select_fulfilled_recovery_terminal, select_single_acceptance_origin,
             select_welcome_terminal, ControlEvidenceLoadError, FulfilledRecoveryTerminalColumns,
-            InvitationQuotaHydrationError, LockedConversationHeadGuard, RecoveryHydrationError,
-            RecoveryPackageHydrationError, WelcomeTerminalColumns, WelcomeTerminalSelection,
+            InvitationQuotaHydrationError, LockedConversationHeadGuard, LockedG6Prelude,
+            RecoveryHydrationError, RecoveryPackageHydrationError, WelcomeTerminalColumns,
+            WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
             append_event, enqueue_outbox, insert_event_recipients, EntryEntitlementKind,
@@ -5578,9 +5582,13 @@ mod historical_control_loader {
             WelcomeRejectionReason,
         };
         use crate::chat_protocol::repository::execution_context::{
-            apply_device_revocation_batch_sequential, hydrate_execution_context,
-            ConversationExecutionArtifacts, ExecutionContextArtifacts,
-            ExecutionContextHydrationError, SequentialDeviceRevocationError,
+            apply_device_revocation_batch_sequential,
+            apply_device_revocation_batch_unscoped_for_test,
+            hydrate_execution_context_unscoped_for_test, prepare_device_revocation_batch_execution,
+            prepare_device_revocation_batch_execution_from_contexts_for_test,
+            ConversationExecutionArtifacts, DeviceRevocationCancellationPoint,
+            ExecutionContextArtifacts, ExecutionContextHydrationError,
+            SequentialDeviceRevocationError,
         };
         use crate::chat_protocol::repository::relationship::{
             allocate_projection_revision, load_fallback_relationship_projection,
@@ -5595,10 +5603,11 @@ mod historical_control_loader {
             PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            acceptance_recovery_package_artifact_matches, apply_conversation_persistence_plan,
-            apply_device_revocation_batch, device_revocation_plan_for_test,
-            persistence_plan_for_test, plan_device_revocation, plan_policy,
-            plan_welcome_expiry_for_test, recovery_fulfillment_terminal_matches,
+            acceptance_recovery_package_artifact_matches,
+            apply_conversation_persistence_plan_unscoped_for_test,
+            apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test,
+            device_revocation_plan_for_test, persistence_plan_for_test, plan_device_revocation,
+            plan_policy, plan_welcome_expiry_for_test, recovery_fulfillment_terminal_matches,
             ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
             ConversationPersistencePlan, ConversationState, ConversationStateHydration,
             CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
@@ -6440,9 +6449,10 @@ mod historical_control_loader {
             let cid = Uuid::from_bytes(graph.entry.cid);
 
             let mut tx = pool.begin().await.expect("begin policy authority probe");
-            let error = apply_conversation_persistence_plan(&mut tx, &plan, &context)
-                .await
-                .expect_err("entry-bearing policy must reject Entryless authority");
+            let error =
+                apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &context)
+                    .await
+                    .expect_err("entry-bearing policy must reject Entryless authority");
             assert!(matches!(
                 error,
                 ExecutorError::MissingContext("control-entry authority")
@@ -6480,10 +6490,13 @@ mod historical_control_loader {
             context.authority = g6_control_authority(fixture.revocation_id);
 
             let mut tx = pool.begin().await.expect("begin batch authority probe");
-            let error =
-                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
-                    .await
-                    .expect_err("revocation batch must reject ControlEntry authority");
+            let error = apply_device_revocation_contexts_unscoped_for_test(
+                &mut tx,
+                &batch,
+                std::slice::from_ref(&context),
+            )
+            .await
+            .expect_err("revocation batch must reject ControlEntry authority");
             assert!(matches!(
                 error,
                 ExecutorError::MissingContext("entryless operation authority")
@@ -6501,7 +6514,7 @@ mod historical_control_loader {
             let batch = fixture.batch(vec![binding], vec![fixture.conversation_plan.clone()]);
 
             let mut tx = pool.begin().await.expect("begin batch count probe");
-            let error = apply_device_revocation_batch(&mut tx, &batch, &[])
+            let error = apply_device_revocation_contexts_unscoped_for_test(&mut tx, &batch, &[])
                 .await
                 .expect_err("revocation batch must reject a missing context");
             assert!(matches!(
@@ -6526,10 +6539,13 @@ mod historical_control_loader {
             };
 
             let mut tx = pool.begin().await.expect("begin batch identity probe");
-            let error =
-                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
-                    .await
-                    .expect_err("revocation batch must reject the wrong operation ID");
+            let error = apply_device_revocation_contexts_unscoped_for_test(
+                &mut tx,
+                &batch,
+                std::slice::from_ref(&context),
+            )
+            .await
+            .expect_err("revocation batch must reject the wrong operation ID");
             assert!(matches!(
                 error,
                 ExecutorError::MissingContext("exact device revocation operation id")
@@ -6550,10 +6566,13 @@ mod historical_control_loader {
             let batch = fixture.batch(Vec::new(), vec![policy_plan]);
 
             let mut tx = pool.begin().await.expect("begin batch plan-kind probe");
-            let error =
-                apply_device_revocation_batch(&mut tx, &batch, std::slice::from_ref(&context))
-                    .await
-                    .expect_err("revocation batch must reject a non-revocation plan");
+            let error = apply_device_revocation_contexts_unscoped_for_test(
+                &mut tx,
+                &batch,
+                std::slice::from_ref(&context),
+            )
+            .await
+            .expect_err("revocation batch must reject a non-revocation plan");
             assert!(matches!(
                 error,
                 ExecutorError::InconsistentPlan(
@@ -6654,7 +6673,7 @@ mod historical_control_loader {
             let second_plan = device_revocation_plan_for_test(
                 second_planned,
                 ConversationHeadCasBinding::for_test_internal_with_transaction_id(
-                    transaction_id,
+                    transaction_id.clone(),
                     *second_cid.as_bytes(),
                     *second_state.coordinate(),
                     5,
@@ -6662,11 +6681,193 @@ mod historical_control_loader {
                 ),
                 fixture.evidence.clone(),
             );
-            let batch = fixture.batch(Vec::new(), vec![first_plan, second_plan]);
+            let actor = fixture.evidence.actor().clone();
+            let target = fixture.evidence.target().clone();
+            let target_cas = RevocationTargetCasBinding::for_test_with_transaction_id(
+                transaction_id.clone(),
+                target.clone(),
+                fixture.evidence.expected_target_auth_generation(),
+                accepted,
+            );
+            let first_head_digest = *first_plan
+                .effects()
+                .head_cas()
+                .expect("first exact head binding")
+                .locked_head_digest();
+            let second_head_digest = *second_plan
+                .effects()
+                .head_cas()
+                .expect("second exact head binding")
+                .locked_head_digest();
+            let batch = DeviceRevocationBatchPersistencePlan::for_test(
+                fixture.evidence.clone(),
+                target_cas,
+                Vec::new(),
+                vec![first_plan, second_plan],
+            );
+            let actor_did = String::from_utf8(actor.principal().as_bytes().to_vec())
+                .expect("actor DID is UTF-8");
+            let actor_device_id = Uuid::from_bytes(*actor.device_id());
+            let (dpop_jkt, auth_generation, key_id, signing_public_key): (
+                String,
+                i64,
+                String,
+                Vec<u8>,
+            ) = sqlx::query_as(
+                r#"
+                SELECT d.dpop_jkt,d.auth_generation,k.key_id,k.signing_public_key
+                  FROM chat.devices d
+                  JOIN chat.device_keys k
+                    ON k.user_did=d.user_did AND k.device_id=d.device_id
+                   AND k.revoked_at IS NULL
+                 WHERE d.user_did=$1 AND d.device_id=$2
+                 FOR UPDATE OF d,k
+                "#,
+            )
+            .bind(&actor_did)
+            .bind(actor_device_id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("lock exact actor/device key for prepared proof");
+            let make_prelude = || {
+                LockedG6Prelude::for_test(
+                    G6BusinessAuthorityBinding::for_test(
+                        transaction_id.clone(),
+                        actor_did.clone(),
+                        actor_device_id,
+                        dpop_jkt.clone(),
+                        auth_generation,
+                        key_id.clone(),
+                        signing_public_key.clone(),
+                        fixture.accepted_at,
+                    ),
+                    fixture.target_did.clone(),
+                    fixture.target_device_id,
+                    fixture.evidence.expected_target_auth_generation(),
+                    vec![first_cid, second_cid],
+                    vec![first_head_digest, second_head_digest],
+                    vec![(
+                        target.clone(),
+                        dpop_jkt.clone(),
+                        auth_generation,
+                        pre_batch_tail,
+                    )],
+                    [1; 32],
+                )
+            };
+
+            // Production-capsule negative: the first member is valid and the
+            // later member is malformed by deleting its exact Welcome
+            // disposition. The same opaque capsule constructor must reject the
+            // whole batch before the immutable prefix can write anything.
+            let mut raw_contexts = Vec::new();
+            for conversation in batch.conversations() {
+                raw_contexts.push(
+                    hydrate_execution_context_unscoped_for_test(
+                        &mut tx,
+                        conversation,
+                        ExecutionContextArtifacts {
+                            accepted_control_entry_bytes: None,
+                            genesis_group_info_bytes: None,
+                            primary_event_payload: None,
+                            welcome_disposition_event_payloads: Vec::new(),
+                        },
+                    )
+                    .await
+                    .expect("hydrate mutation-harness revocation member"),
+                );
+            }
+            assert!(
+                !raw_contexts[1].welcome_dispositions.is_empty(),
+                "later member must carry a Welcome disposition before corruption"
+            );
+            raw_contexts[1].welcome_dispositions.clear();
+            let malformed = match prepare_device_revocation_batch_execution_from_contexts_for_test(
+                &mut tx,
+                &batch,
+                make_prelude(),
+                raw_contexts,
+            )
+            .await
+            {
+                Ok(_) => panic!("malformed later member must reject before prefix"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                malformed,
+                SequentialDeviceRevocationError::Executor(ExecutorError::MissingContext(
+                    "exact welcome disposition events for superseded welcomes"
+                ))
+            ));
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+
             seed_g6_revoke_receipt(&mut tx, &fixture).await;
-            let applied = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
+            prepare_device_revocation_batch_execution(
+                &mut tx,
+                &batch,
+                make_prelude(),
+                artifacts.clone(),
+            )
+            .await
+            .expect("prepare capsule for explicit rollback")
+            .rollback()
+            .await
+            .expect("explicit capsule rollback completes");
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+
+            let mut cancellation_capsule = prepare_device_revocation_batch_execution(
+                &mut tx,
+                &batch,
+                make_prelude(),
+                artifacts.clone(),
+            )
+            .await
+            .expect("prepare capsule for deterministic cancellation");
+            let reached_after_prefix =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_reached = reached_after_prefix.clone();
+            cancellation_capsule.set_cancellation_hook(Box::new(move |point| {
+                let hook_reached = hook_reached.clone();
+                Box::pin(async move {
+                    if point == DeviceRevocationCancellationPoint::AfterPrefix {
+                        hook_reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                })
+            }));
+            let mut cancelled = Box::pin(apply_device_revocation_batch_sequential(
+                cancellation_capsule,
+            ));
+            tokio::select! {
+                result = &mut cancelled => {
+                    panic!("cancellation capsule completed before hook: {result:?}")
+                }
+                () = async {
+                    while !reached_after_prefix.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            drop(cancelled);
+            // Dropping the apply future queues SQLx's savepoint rollback. This
+            // same-connection query deterministically drains it before reuse.
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(&mut *tx)
                 .await
-                .expect("production sequential revocation orchestration applies");
+                .expect("drain queued savepoint rollback after cancellation");
+            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
+
+            let prepared = prepare_device_revocation_batch_execution(
+                &mut tx,
+                &batch,
+                make_prelude(),
+                artifacts,
+            )
+            .await
+            .expect("production prepared revocation capsule seals");
+            let applied = apply_device_revocation_batch_sequential(prepared)
+                .await
+                .expect("production prepared revocation orchestration applies");
             assert_eq!(applied.len(), 2);
             let first_event: (i64, Option<i64>) = sqlx::query_as(
                 r#"
@@ -6861,7 +7062,7 @@ mod historical_control_loader {
                 invalid_evidence,
             );
             let batch = fixture.batch(vec![binding], vec![first_plan, second_plan]);
-            let error = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
+            let error = apply_device_revocation_batch_unscoped_for_test(&mut tx, &batch, artifacts)
                 .await
                 .expect_err("invalid later authority must reject the complete batch");
             assert!(matches!(
@@ -6951,9 +7152,10 @@ mod historical_control_loader {
 
             for (case, artifacts) in cases {
                 let mut tx = pool.begin().await.expect("begin artifact-set probe");
-                let error = apply_device_revocation_batch_sequential(&mut tx, &batch, artifacts)
-                    .await
-                    .expect_err("invalid artifact set must fail before global writes");
+                let error =
+                    apply_device_revocation_batch_unscoped_for_test(&mut tx, &batch, artifacts)
+                        .await
+                        .expect_err("invalid artifact set must fail before global writes");
                 match (case, error) {
                     (
                         "missing",
@@ -7122,7 +7324,7 @@ mod historical_control_loader {
             )
             .await;
             let (mut transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
-            let error = hydrate_execution_context(
+            let error = hydrate_execution_context_unscoped_for_test(
                 &mut transaction,
                 &plan,
                 ExecutionContextArtifacts {
@@ -7155,10 +7357,13 @@ mod historical_control_loader {
             )
             .await;
             let (mut transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
-            let context =
-                hydrate_execution_context(&mut transaction, &plan, g6_welcome_expiry_artifacts())
-                    .await
-                    .expect("production facade hydrates genuine Welcome expiry");
+            let context = hydrate_execution_context_unscoped_for_test(
+                &mut transaction,
+                &plan,
+                g6_welcome_expiry_artifacts(),
+            )
+            .await
+            .expect("production facade hydrates genuine Welcome expiry");
 
             assert!(context.authority.control_entry().is_none());
             assert_eq!(
@@ -7174,7 +7379,7 @@ mod historical_control_loader {
                 .begin()
                 .await
                 .expect("begin mismatched transaction proof");
-            let error = hydrate_execution_context(
+            let error = hydrate_execution_context_unscoped_for_test(
                 &mut different_transaction,
                 &plan,
                 g6_welcome_expiry_artifacts(),
@@ -7204,7 +7409,7 @@ mod historical_control_loader {
             let locked_device_did = graph.entry.actor_did.clone();
             let locked_device_id = graph.entry.actor_device_id;
             let (mut locking_transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
-            hydrate_execution_context(
+            hydrate_execution_context_unscoped_for_test(
                 &mut locking_transaction,
                 &plan,
                 g6_welcome_expiry_artifacts(),
@@ -10843,7 +11048,7 @@ mod historical_control_loader {
             let creator_only_plan = creator_only_planned
                 .into_persistence_plan()
                 .expect("seal creator-only persistence plan");
-            let creator_only_context = hydrate_execution_context(
+            let creator_only_context = hydrate_execution_context_unscoped_for_test(
                 &mut creator_only_tx,
                 &creator_only_plan,
                 ExecutionContextArtifacts {
@@ -10855,7 +11060,7 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate creator-only execution context");
-            apply_conversation_persistence_plan(
+            apply_conversation_persistence_plan_unscoped_for_test(
                 &mut creator_only_tx,
                 &creator_only_plan,
                 &creator_only_context,
@@ -11157,7 +11362,7 @@ mod historical_control_loader {
                 "conversationId": conversation_id.hyphenated().to_string(),
             }))
             .expect("serialize conversation-scoped Creation event payload");
-            let artifact_error = hydrate_execution_context(
+            let artifact_error = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &plan,
                 ExecutionContextArtifacts {
@@ -11187,7 +11392,7 @@ mod historical_control_loader {
             mutated_control_entry["signedRequest"]["body"]["absence"] = json!(false);
             let mutated_control_entry =
                 serde_json::to_vec(&mutated_control_entry).expect("serialize control mutation");
-            let mutation_error = hydrate_execution_context(
+            let mutation_error = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &plan,
                 ExecutionContextArtifacts {
@@ -11203,7 +11408,7 @@ mod historical_control_loader {
                 mutation_error,
                 ExecutionContextHydrationError::ControlEntryMismatch
             ));
-            let context = hydrate_execution_context(
+            let context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &plan,
                 ExecutionContextArtifacts {
@@ -11215,9 +11420,10 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate exact production Creation execution context");
-            let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
-                .await
-                .expect("apply complete Creation persistence plan");
+            let applied =
+                apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &context)
+                    .await
+                    .expect("apply complete Creation persistence plan");
             assert_eq!(applied.allocated_seq, 1);
             assert_eq!(
                 applied.entry_id,
@@ -11379,7 +11585,7 @@ mod historical_control_loader {
             let non_add_plan = non_add_planned
                 .into_persistence_plan()
                 .expect("seal complete non-add Policy persistence plan");
-            let non_add_context = hydrate_execution_context(
+            let non_add_context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &non_add_plan,
                 ExecutionContextArtifacts {
@@ -11399,10 +11605,13 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate exact production non-add Policy execution context");
-            let non_add_applied =
-                apply_conversation_persistence_plan(&mut tx, &non_add_plan, &non_add_context)
-                    .await
-                    .expect("apply complete non-add Policy persistence plan");
+            let non_add_applied = apply_conversation_persistence_plan_unscoped_for_test(
+                &mut tx,
+                &non_add_plan,
+                &non_add_context,
+            )
+            .await
+            .expect("apply complete non-add Policy persistence plan");
             assert_eq!(non_add_applied.allocated_seq, 2);
             assert_eq!(non_add_applied.event_positions.len(), 1);
             sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
@@ -13088,7 +13297,7 @@ mod historical_control_loader {
             let creation_plan = creation_planned
                 .into_persistence_plan()
                 .expect("seal lifecycle Creation plan");
-            let creation_context = hydrate_execution_context(
+            let creation_context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &creation_plan,
                 ExecutionContextArtifacts {
@@ -13102,9 +13311,13 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate lifecycle Creation context");
-            apply_conversation_persistence_plan(&mut tx, &creation_plan, &creation_context)
-                .await
-                .expect("apply lifecycle Creation");
+            apply_conversation_persistence_plan_unscoped_for_test(
+                &mut tx,
+                &creation_plan,
+                &creation_context,
+            )
+            .await
+            .expect("apply lifecycle Creation");
 
             let locked_creation =
                 hydrate_locked_conversation_state(&mut tx, conversation_id, trusted_at)
@@ -13153,7 +13366,7 @@ mod historical_control_loader {
             let policy_plan = policy_planned
                 .into_persistence_plan()
                 .expect("seal lifecycle Policy plan");
-            let policy_context = hydrate_execution_context(
+            let policy_context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &policy_plan,
                 ExecutionContextArtifacts {
@@ -13167,9 +13380,13 @@ mod historical_control_loader {
             )
             .await
             .expect("hydrate lifecycle Policy context");
-            apply_conversation_persistence_plan(&mut tx, &policy_plan, &policy_context)
-                .await
-                .expect("apply lifecycle Policy");
+            apply_conversation_persistence_plan_unscoped_for_test(
+                &mut tx,
+                &policy_plan,
+                &policy_context,
+            )
+            .await
+            .expect("apply lifecycle Policy");
             let retained_invitee_period_id: Uuid = sqlx::query_scalar(
                 r#"SELECT participant_period_id
                      FROM chat.participants
@@ -13301,7 +13518,7 @@ mod historical_control_loader {
             let acceptance_plan = acceptance_planned
                 .into_persistence_plan()
                 .expect("seal lifecycle Acceptance plan");
-            let acceptance_context = hydrate_execution_context(
+            let acceptance_context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &acceptance_plan,
                 ExecutionContextArtifacts {
@@ -13330,7 +13547,7 @@ mod historical_control_loader {
             let broken_acceptance_plan = acceptance_plan
                 .clone()
                 .with_recovery_package_cas_cleared_for_test();
-            let broken_acceptance = apply_conversation_persistence_plan(
+            let broken_acceptance = apply_conversation_persistence_plan_unscoped_for_test(
                 &mut tx,
                 &broken_acceptance_plan,
                 &acceptance_context,
@@ -13341,9 +13558,13 @@ mod historical_control_loader {
                 broken_acceptance,
                 ExecutorError::InconsistentPlan(_)
             ));
-            apply_conversation_persistence_plan(&mut tx, &acceptance_plan, &acceptance_context)
-                .await
-                .expect("apply lifecycle Acceptance");
+            apply_conversation_persistence_plan_unscoped_for_test(
+                &mut tx,
+                &acceptance_plan,
+                &acceptance_context,
+            )
+            .await
+            .expect("apply lifecycle Acceptance");
             sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
                 .execute(&mut *tx)
                 .await
@@ -13886,7 +14107,7 @@ mod historical_control_loader {
                 .as_ref()
                 .expect("Fulfillment plan carries verified metadata re-encryption")
                 .clone();
-            let fulfillment_context = hydrate_execution_context(
+            let fulfillment_context = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &fulfillment_plan,
                 ExecutionContextArtifacts {
@@ -13903,7 +14124,7 @@ mod historical_control_loader {
             let broken_fulfillment_plan = fulfillment_plan
                 .clone()
                 .with_recovery_package_cas_cleared_for_test();
-            let broken_fulfillment = apply_conversation_persistence_plan(
+            let broken_fulfillment = apply_conversation_persistence_plan_unscoped_for_test(
                 &mut tx,
                 &broken_fulfillment_plan,
                 &fulfillment_context,
@@ -13925,7 +14146,7 @@ mod historical_control_loader {
                 &conversation_marker,
             )
             .await;
-            let extra_recovery_delta = apply_conversation_persistence_plan(
+            let extra_recovery_delta = apply_conversation_persistence_plan_unscoped_for_test(
                 &mut tx,
                 &extra_recovery_delta_plan,
                 &fulfillment_context,
@@ -13961,9 +14182,13 @@ mod historical_control_loader {
                 after_extra_recovery_delta, before_extra_recovery_delta,
                 "malformed fulfillment changed durable rows before rejection"
             );
-            apply_conversation_persistence_plan(&mut tx, &fulfillment_plan, &fulfillment_context)
-                .await
-                .expect("apply lifecycle Fulfillment");
+            apply_conversation_persistence_plan_unscoped_for_test(
+                &mut tx,
+                &fulfillment_plan,
+                &fulfillment_context,
+            )
+            .await
+            .expect("apply lifecycle Fulfillment");
             sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
                 .execute(&mut *tx)
                 .await
@@ -15043,7 +15268,7 @@ mod historical_control_loader {
                     let exec_plan = exec_transition
                         .into_persistence_plan()
                         .expect("seal plan for executor negatives");
-                    let exec_ctx = hydrate_execution_context(
+                    let exec_ctx = hydrate_execution_context_unscoped_for_test(
                         &mut tx,
                         &exec_plan,
                         ExecutionContextArtifacts {
@@ -15119,7 +15344,7 @@ mod historical_control_loader {
                             .execute(&mut *tx)
                             .await
                             .expect("bound exact-recipient lock proof");
-                        let exact_recipient_result = hydrate_execution_context(
+                        let exact_recipient_result = hydrate_execution_context_unscoped_for_test(
                             &mut tx,
                             &exec_plan,
                             ExecutionContextArtifacts {
@@ -15376,9 +15601,10 @@ mod historical_control_loader {
                                 .execute(&mut *tx)
                                 .await
                                 .expect("open Welcome context prewrite savepoint");
-                            let result =
-                                apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
-                                    .await;
+                            let result = apply_conversation_persistence_plan_unscoped_for_test(
+                                &mut tx, &exec_plan, &bad_ctx,
+                            )
+                            .await;
                             assert!(
                                 matches!(
                                     result,
@@ -15434,7 +15660,7 @@ mod historical_control_loader {
                         let mut cas_plan = exec_plan.clone();
                         let exec_ctx_clone = exec_ctx.clone();
                         cas_plan = cas_plan.with_welcome_cas_corrupted_for_test();
-                        let result = apply_conversation_persistence_plan(
+                        let result = apply_conversation_persistence_plan_unscoped_for_test(
                             &mut tx,
                             &cas_plan,
                             &exec_ctx_clone,
@@ -15459,7 +15685,7 @@ mod historical_control_loader {
                     }
                     // Case B: Caller primary event payload rejected at hydration.
                     {
-                        let result = hydrate_execution_context(
+                        let result = hydrate_execution_context_unscoped_for_test(
                             &mut tx,
                             &exec_plan,
                             ExecutionContextArtifacts {
@@ -15489,7 +15715,7 @@ mod historical_control_loader {
                     }
                     // Case C: Welcome disposition event payloads at hydration.
                     {
-                        let result = hydrate_execution_context(
+                        let result = hydrate_execution_context_unscoped_for_test(
                             &mut tx,
                             &exec_plan,
                             ExecutionContextArtifacts {
@@ -15536,9 +15762,10 @@ mod historical_control_loader {
                                 reason: WelcomeRejectionReason::NoMatchingKeyPackage,
                             });
                         }
-                        let result =
-                            apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
-                                .await;
+                        let result = apply_conversation_persistence_plan_unscoped_for_test(
+                            &mut tx, &exec_plan, &bad_ctx,
+                        )
+                        .await;
                         assert!(
                             matches!(
                                 result,
@@ -15573,9 +15800,10 @@ mod historical_control_loader {
                             if let Some(response) = bad_ctx.welcome_response.as_mut() {
                                 response.rejection = None;
                             }
-                            let result =
-                                apply_conversation_persistence_plan(&mut tx, &exec_plan, &bad_ctx)
-                                    .await;
+                            let result = apply_conversation_persistence_plan_unscoped_for_test(
+                                &mut tx, &exec_plan, &bad_ctx,
+                            )
+                            .await;
                             assert!(
                                 matches!(
                                     result,
@@ -15605,7 +15833,7 @@ mod historical_control_loader {
                             let duplicate_plan = exec_plan
                                 .clone()
                                 .with_welcome_rejection_duplicate_for_test();
-                            let result = apply_conversation_persistence_plan(
+                            let result = apply_conversation_persistence_plan_unscoped_for_test(
                                 &mut tx,
                                 &duplicate_plan,
                                 &exec_ctx,
@@ -15643,7 +15871,7 @@ mod historical_control_loader {
                     // rolls back without leaking any partial row).
                     {
                         let mut foreign_tx = pool.begin().await.expect("begin foreign tx");
-                        let foreign_result = hydrate_execution_context(
+                        let foreign_result = hydrate_execution_context_unscoped_for_test(
                             &mut foreign_tx,
                             &exec_plan,
                             ExecutionContextArtifacts {
@@ -15707,7 +15935,7 @@ mod historical_control_loader {
                             ),
                         ] {
                             let drifted_plan = corrupt(exec_plan.clone());
-                            let result = apply_conversation_persistence_plan(
+                            let result = apply_conversation_persistence_plan_unscoped_for_test(
                                 &mut tx,
                                 &drifted_plan,
                                 &exec_ctx,
@@ -15792,7 +16020,7 @@ mod historical_control_loader {
                 let plan = transition
                     .into_persistence_plan()
                     .expect("seal Welcome terminal persistence plan");
-                let context = hydrate_execution_context(
+                let context = hydrate_execution_context_unscoped_for_test(
                     &mut tx,
                     &plan,
                     ExecutionContextArtifacts {
@@ -15877,8 +16105,12 @@ mod historical_control_loader {
                     stale_event.outbox[0].0 = Uuid::new_v4();
                     let stale_event_id = stale_event.event_id;
                     let stale_outbox_id = stale_event.outbox[0].0;
-                    let stale_result =
-                        apply_conversation_persistence_plan(&mut tx, &plan, &stale_context).await;
+                    let stale_result = apply_conversation_persistence_plan_unscoped_for_test(
+                        &mut tx,
+                        &plan,
+                        &stale_context,
+                    )
+                    .await;
                     assert!(
                         matches!(
                             stale_result,
@@ -15932,9 +16164,10 @@ mod historical_control_loader {
                     .execute(&mut *tx)
                     .await
                     .expect("defer Welcome terminal cross-row constraints");
-                let applied = apply_conversation_persistence_plan(&mut tx, &plan, &context)
-                    .await
-                    .expect("apply genuine Welcome terminal lifecycle");
+                let applied =
+                    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &context)
+                        .await
+                        .expect("apply genuine Welcome terminal lifecycle");
                 sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
                     .execute(&mut *tx)
                     .await
@@ -16116,8 +16349,12 @@ mod historical_control_loader {
                     second_event.recipients[0].2 = Some(applied.event_positions[0]);
                     second_event.outbox[0].0 = Uuid::new_v4();
                     let second_event_id = second_event.event_id;
-                    let second_result =
-                        apply_conversation_persistence_plan(&mut tx, &plan, &second_context).await;
+                    let second_result = apply_conversation_persistence_plan_unscoped_for_test(
+                        &mut tx,
+                        &plan,
+                        &second_context,
+                    )
+                    .await;
                     let second_prefix: (i64, i64, i64) = sqlx::query_as(
                         r#"SELECT
                             (SELECT count(*) FROM chat.events WHERE event_id=$1),
@@ -16711,7 +16948,7 @@ mod historical_control_loader {
                     .expect("plan genuine prior-bound recovery request")
                     .into_persistence_plan()
                     .expect("seal prior-bound recovery request plan");
-                let recovery_request_context = hydrate_execution_context(
+                let recovery_request_context = hydrate_execution_context_unscoped_for_test(
                     &mut tx,
                     &recovery_request_plan,
                     ExecutionContextArtifacts {
@@ -16725,7 +16962,7 @@ mod historical_control_loader {
                 )
                 .await
                 .expect("hydrate prior-bound recovery request context");
-                apply_conversation_persistence_plan(
+                apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &recovery_request_plan,
                     &recovery_request_context,
@@ -16794,7 +17031,7 @@ mod historical_control_loader {
                     .expect("plan genuine lifecycle ResetRequest")
                     .into_persistence_plan()
                     .expect("seal lifecycle ResetRequest plan");
-                let reset_request_context = hydrate_execution_context(
+                let reset_request_context = hydrate_execution_context_unscoped_for_test(
                     &mut tx,
                     &reset_request_plan,
                     ExecutionContextArtifacts {
@@ -16810,7 +17047,7 @@ mod historical_control_loader {
                 )
                 .await
                 .expect("hydrate lifecycle ResetRequest context");
-                apply_conversation_persistence_plan(
+                apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &reset_request_plan,
                     &reset_request_context,
@@ -17242,7 +17479,7 @@ mod historical_control_loader {
                     bytes[0] ^= 1;
                     bytes
                 };
-                let swapped_context_error = hydrate_execution_context(
+                let swapped_context_error = hydrate_execution_context_unscoped_for_test(
                     &mut tx,
                     &reset_activation_plan,
                     ExecutionContextArtifacts {
@@ -17267,7 +17504,7 @@ mod historical_control_loader {
                     .begin()
                     .await
                     .expect("begin second-transaction Reset context negative");
-                let second_transaction_error = hydrate_execution_context(
+                let second_transaction_error = hydrate_execution_context_unscoped_for_test(
                     &mut second_tx,
                     &reset_activation_plan,
                     ExecutionContextArtifacts {
@@ -17292,7 +17529,7 @@ mod historical_control_loader {
                     .await
                     .expect("rollback second-transaction negative");
 
-                let reset_activation_context = hydrate_execution_context(
+                let reset_activation_context = hydrate_execution_context_unscoped_for_test(
                     &mut tx,
                     &reset_activation_plan,
                     ExecutionContextArtifacts {
@@ -17319,7 +17556,7 @@ mod historical_control_loader {
                     &conversation_marker,
                 )
                 .await;
-                let drifted_package_guard_error = apply_conversation_persistence_plan(
+                let drifted_package_guard_error = apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &drifted_package_guard_plan,
                     &reset_activation_context,
@@ -17362,7 +17599,7 @@ mod historical_control_loader {
                     &conversation_marker,
                 )
                 .await;
-                let malformed_reset_error = apply_conversation_persistence_plan(
+                let malformed_reset_error = apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &malformed_reset_plan,
                     &reset_activation_context,
@@ -17406,7 +17643,7 @@ mod historical_control_loader {
                     &conversation_marker,
                 )
                 .await;
-                let malformed_interval_error = apply_conversation_persistence_plan(
+                let malformed_interval_error = apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &malformed_interval_plan,
                     &reset_activation_context,
@@ -17439,7 +17676,7 @@ mod historical_control_loader {
                     "malformed Reset interval evidence changed durable rows before rejection"
                 );
 
-                apply_conversation_persistence_plan(
+                apply_conversation_persistence_plan_unscoped_for_test(
                     &mut tx,
                     &reset_activation_plan,
                     &reset_activation_context,
@@ -23202,7 +23439,7 @@ mod historical_control_loader {
             );
             let plan = persistence_plan_for_test(planned, head)
                 .with_execution_context_authority_for_test(PlanAuthority::Transition(transition));
-            let ctx = hydrate_execution_context(
+            let ctx = hydrate_execution_context_unscoped_for_test(
                 &mut tx,
                 &plan,
                 ExecutionContextArtifacts {
@@ -23273,9 +23510,10 @@ mod historical_control_loader {
                     .expect("rollback facade-only genuine role change");
                 return resulting_state;
             }
-            let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
-                .await
-                .expect("production ChangeRole executor applies");
+            let applied =
+                apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
+                    .await
+                    .expect("production ChangeRole executor applies");
             assert_eq!(applied.allocated_seq, seq);
             tx.commit()
                 .await
@@ -27061,7 +27299,7 @@ mod historical_control_loader {
             PublicGroupSnapshotTreeSummary,
         };
         use crate::chat_protocol::state_machine::{
-            apply_conversation_persistence_plan, hydrate_conversation_state,
+            apply_conversation_persistence_plan_unscoped_for_test, hydrate_conversation_state,
             persistence_plan_for_test, plan_reset_activation, ControlEntryContent,
             ConversationHeadCasBinding, ConversationKind, ConversationStateHydration,
             DeviceIdentity, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
@@ -28980,9 +29218,13 @@ mod historical_control_loader {
             };
 
             let mut transaction = pool.begin().await.expect("begin genuine reset");
-            let applied = apply_conversation_persistence_plan(&mut transaction, &plan, &context)
-                .await
-                .expect("production executor applies genuine reset");
+            let applied = apply_conversation_persistence_plan_unscoped_for_test(
+                &mut transaction,
+                &plan,
+                &context,
+            )
+            .await
+            .expect("production executor applies genuine reset");
             assert_eq!(applied.allocated_seq, seq);
             let retired_spine: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
                 r#"SELECT public_snapshot_bytes,snapshot_sha256,

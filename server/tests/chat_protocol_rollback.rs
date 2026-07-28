@@ -33,7 +33,7 @@
 //! | event audience / outbox                 | executor     | fanout writers composed by the plan |
 //!
 //! Every "executor" row is a real durability boundary INSIDE
-//! `state_machine::apply_conversation_persistence_plan`, which requires the full
+//! `state_machine::apply_conversation_persistence_plan_unscoped_for_test`, which requires the full
 //! plan-evidence machinery the executor harness builds; it is NOT reachable from
 //! a standalone repository writer. Those boundaries inherit the SAME PostgreSQL
 //! all-or-nothing rollback guarantee this file proves at the reachable boundaries,

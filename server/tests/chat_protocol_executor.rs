@@ -1,5 +1,5 @@
 //! Live-PostgreSQL end-to-end verification of the E2b-2/E2b-3 transition
-//! executor `apply_conversation_persistence_plan` and the spine/seq-seam writers
+//! executor `apply_conversation_persistence_plan_unscoped_for_test` and the spine/seq-seam writers
 //! it composes.
 //!
 //! Two kinds of coverage:
@@ -70,6 +70,14 @@ mod chat_protocol {
         pub use crate::relationship_policy_source::*;
     }
     pub mod repository {
+        // The raw executor harness never mints production capsules, but the
+        // included state-machine module retains their sealed proof types in
+        // signatures. Minimal opaque stubs keep that production boundary
+        // unforgeable while allowing the legacy test seam to compile.
+        pub mod execution_context {
+            pub(crate) struct ExecutionContextHydrationProof;
+            pub(crate) struct RevocationBatchHydrationProof;
+        }
         pub mod auth {
             pub use crate::repository::auth::*;
         }
@@ -135,25 +143,25 @@ use chat_protocol::repository::transition::{
 };
 use chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, apply_device_revocation_batch,
-    device_revocation_plan_for_test, persistence_plan_for_test, plan_accept_conversation,
-    plan_close, plan_commit, plan_creation, plan_device_revocation,
-    plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment, plan_leaf_recovery_request,
-    plan_leave_cancellation, plan_leave_fulfillment, plan_leave_request, plan_policy,
-    plan_reset_activation, plan_reset_request, plan_welcome_expiry_for_test,
-    plan_welcome_response_for_test, plan_zero_leaf_leave, AcceptConversation, CloseConversation,
-    CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
-    ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
-    DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
-    ExecutionAuthority, ExecutionContext, ExecutorError, HydrationAuthority,
-    LeafPersistenceColumns, LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
-    LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
-    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding,
-    PolicyPlanMutation, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
-    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
-    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
-    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
-    WelcomeStatus, ZeroLeafLeave,
+    apply_conversation_persistence_plan_unscoped_for_test,
+    apply_device_revocation_batch_unscoped_for_test, device_revocation_plan_for_test,
+    persistence_plan_for_test, plan_accept_conversation, plan_close, plan_commit, plan_creation,
+    plan_device_revocation, plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment,
+    plan_leaf_recovery_request, plan_leave_cancellation, plan_leave_fulfillment,
+    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request,
+    plan_welcome_expiry_for_test, plan_welcome_response_for_test, plan_zero_leaf_leave,
+    AcceptConversation, CloseConversation, CommitCommand, ControlEntryContent,
+    ConversationHeadCasBinding, ConversationKind, ConversationState, CreationCommand,
+    CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
+    DeviceRevocationEvidence, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
+    ExecutorError, HydrationAuthority, LeafPersistenceColumns, LeafRecoveryCancellation,
+    LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
+    LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
+    MetadataSnapshotBinding, PolicyPlanMutation, PrincipalId, RecoveryOpenContext,
+    RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand, ResetRequestRow,
+    RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts,
+    TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
+    WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
 };
 use chat_protocol::transcript::{
     decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -744,9 +752,10 @@ async fn group_creation_commits_full_graph_past_all_deferred_triggers() {
     let conversation_id = fixture.conversation_id;
 
     let mut tx = pool.begin().await.expect("begin");
-    let applied = apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
-        .await
-        .expect("creation applies");
+    let applied =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
+            .await
+            .expect("creation applies");
     tx.commit()
         .await
         .expect("COMMIT past all deferred triggers");
@@ -883,7 +892,12 @@ async fn group_creation_commits_full_graph_past_all_deferred_triggers() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin re-apply");
-    let reapply = apply_conversation_persistence_plan(&mut tx2, &fixture.plan, &fixture.ctx).await;
+    let reapply = apply_conversation_persistence_plan_unscoped_for_test(
+        &mut tx2,
+        &fixture.plan,
+        &fixture.ctx,
+    )
+    .await;
     assert!(
         matches!(reapply, Err(ExecutorError::Transition(_))),
         "re-apply must conflict on the head PK"
@@ -906,7 +920,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
 
     // 1. Commit the creation the policy edge builds on.
     let mut tx = pool.begin().await.expect("begin creation");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
@@ -1037,7 +1051,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
 
     // 5. Apply + COMMIT the policy edge.
     let mut tx2 = pool.begin().await.expect("begin policy");
-    let applied = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx)
         .await
         .expect("policy applies");
     tx2.commit()
@@ -1107,7 +1121,8 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
             .await
             .unwrap();
     let mut tx3 = pool.begin().await.expect("begin re-apply policy");
-    let reapply = apply_conversation_persistence_plan(&mut tx3, &plan, &ctx).await;
+    let reapply =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx3, &plan, &ctx).await;
     assert!(
         matches!(reapply, Err(ExecutorError::Transition(_))),
         "policy re-apply must conflict on the head CAS, got {reapply:?}"
@@ -1226,9 +1241,10 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
     .expect("participant before policy");
 
     let mut transaction = pool.begin().await.expect("begin signed ChangeRole");
-    let applied = apply_conversation_persistence_plan(&mut transaction, plan, ctx)
-        .await
-        .expect("signed ChangeRole policy applies");
+    let applied =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, plan, ctx)
+            .await
+            .expect("signed ChangeRole policy applies");
     transaction
         .commit()
         .await
@@ -1336,8 +1352,12 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
     .execute(&mut *mixed_conflict)
     .await
     .expect("drift mixed role CAS target");
-    let mixed_result =
-        apply_conversation_persistence_plan(&mut mixed_conflict, &mixed.plan, &mixed.ctx).await;
+    let mixed_result = apply_conversation_persistence_plan_unscoped_for_test(
+        &mut mixed_conflict,
+        &mixed.plan,
+        &mixed.ctx,
+    )
+    .await;
     assert!(matches!(
         mixed_result,
         Err(ExecutorError::Transition(
@@ -1371,7 +1391,7 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
     assert_eq!(leaked_add, 0, "mixed CAS failure leaked its Add");
 
     let mut mixed_tx = pool.begin().await.expect("begin mixed policy");
-    apply_conversation_persistence_plan(&mut mixed_tx, &mixed.plan, &mixed.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut mixed_tx, &mixed.plan, &mixed.ctx)
         .await
         .expect("mixed Add+ChangeRole applies");
     mixed_tx
@@ -1406,7 +1426,7 @@ async fn direct_creation_commits_with_direct_pair_shape() {
     let fixture = build_creation(&pool, ConversationKind::Direct).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("direct creation applies");
     tx.commit().await.expect("COMMIT");
@@ -1437,7 +1457,7 @@ async fn creation_failure_injection_rolls_back_whole_graph() {
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("apply");
     // Force a mid-transaction failure: a duplicate entry at (conversation_id, 1).
@@ -1500,7 +1520,7 @@ async fn creation_failure_injection_rolls_back_whole_graph() {
 async fn commit_creation(pool: &PgPool, kind: ConversationKind) -> CreationApply {
     let fixture = build_creation(pool, kind).await;
     let mut tx = pool.begin().await.expect("begin creation");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
@@ -1704,7 +1724,7 @@ async fn commit_accepted_group(pool: &PgPool) -> AcceptedGroupFixture {
     )
     .await;
     let mut transaction = pool.begin().await.expect("begin acceptance");
-    apply_conversation_persistence_plan(&mut transaction, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, &plan, &ctx)
         .await
         .expect("acceptance applies");
     transaction
@@ -1738,7 +1758,8 @@ async fn assert_policy_prewrite_rejection(
     .fetch_one(&mut *transaction)
     .await
     .expect("count policy rows before rejection");
-    let result = apply_conversation_persistence_plan(&mut transaction, plan, ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, plan, ctx).await;
     match (expected, result) {
         ("inconsistent", Err(ExecutorError::InconsistentPlan(_))) => {}
         (_, other) => panic!("unexpected policy rejection for {expected}: {other:?}"),
@@ -1817,7 +1838,8 @@ async fn assert_policy_role_cas_conflict_rolls_back(
         }
         _ => unreachable!("unknown role CAS drift"),
     }
-    let result = apply_conversation_persistence_plan(&mut transaction, plan, ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, plan, ctx).await;
     assert!(
         matches!(
             result,
@@ -1910,7 +1932,7 @@ async fn direct_close_commits_terminal_graph_and_reapply_conflicts() {
     let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
 
     let mut tx = pool.begin().await.expect("begin close");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("close applies");
     tx.commit()
@@ -1986,7 +2008,8 @@ async fn direct_close_commits_terminal_graph_and_reapply_conflicts() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin re-close");
-    let reapply = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let reapply =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(reapply, Err(ExecutorError::Transition(_))),
         "re-close must conflict, got {reapply:?}"
@@ -2139,7 +2162,7 @@ async fn close_supersedes_pending_leaf_recovery_request() {
     let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
 
     let mut tx = pool.begin().await.expect("begin close");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("close with a pending recovery request applies");
     tx.commit()
@@ -2188,7 +2211,7 @@ async fn close_supersedes_pending_leaf_recovery_request() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "close replay must conflict on the head CAS, got {replay:?}"
@@ -2325,7 +2348,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
     };
 
     let mut tx = pool.begin().await.expect("begin reset");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset request applies");
     tx.commit().await.expect("reset request COMMIT");
@@ -2479,7 +2502,7 @@ async fn commit_reset_request(
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin reset request");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset request applies");
     tx.commit().await.expect("reset request COMMIT");
@@ -2683,7 +2706,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
     };
 
     let mut tx = pool.begin().await.expect("begin activation");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset activation applies");
     tx.commit()
@@ -2779,7 +2802,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "second activation must conflict on the head CAS, got {replay:?}"
@@ -2947,7 +2970,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
-        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &req_plan, &req_ctx)
             .await
             .expect("reset request applies");
         tx.commit()
@@ -3136,7 +3159,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset activation applies");
     tx.commit()
@@ -3278,7 +3301,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "reset activation replay must conflict on the head CAS, got {replay:?}"
@@ -3448,7 +3471,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
-        apply_conversation_persistence_plan(&mut tx, &rec_plan, &rec_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &rec_plan, &rec_ctx)
             .await
             .expect("leaf recovery request applies");
         tx.commit().await.expect("leaf recovery request COMMIT");
@@ -3573,7 +3596,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
-        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &req_plan, &req_ctx)
             .await
             .expect("reset request applies");
         tx.commit()
@@ -3759,7 +3782,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset activation applies");
     tx.commit()
@@ -3815,7 +3838,9 @@ async fn creation_plan_without_invitation_quota_binding_is_rejected() {
     // The executor rejects the stripped plan as InconsistentPlan BEFORE any write.
     let stripped = fixture.plan.with_invitation_quota_cleared_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &stripped, &fixture.ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &stripped, &fixture.ctx)
+            .await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "missing invitation-quota binding must be an InconsistentPlan, got {result:?}"
@@ -3841,7 +3866,7 @@ async fn creation_mid_executor_metadata_conflict_rolls_back_whole_graph() {
     // key we then force a collision against.
     let first = build_creation(&pool, ConversationKind::Group).await;
     let mut tx0 = pool.begin().await.expect("begin first");
-    apply_conversation_persistence_plan(&mut tx0, &first.plan, &first.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx0, &first.plan, &first.ctx)
         .await
         .expect("first creation applies");
     tx0.commit().await.expect("first COMMIT");
@@ -3867,7 +3892,9 @@ async fn creation_mid_executor_metadata_conflict_rolls_back_whole_graph() {
         .metadata_snapshot_id = existing_snapshot_id;
 
     let mut tx = pool.begin().await.expect("begin second");
-    let result = apply_conversation_persistence_plan(&mut tx, &second.plan, &second.ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &second.plan, &second.ctx)
+            .await;
     assert!(
         matches!(result, Err(ExecutorError::Transition(_))),
         "mid-executor metadata PK collision must surface as a Transition error, got {result:?}"
@@ -4072,7 +4099,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("acceptance applies");
     tx.commit()
@@ -4157,7 +4184,8 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin re-apply acceptance");
-    let reapply = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let reapply =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(reapply, Err(ExecutorError::Transition(_))),
         "acceptance re-apply must conflict on the head CAS, got {reapply:?}"
@@ -4331,7 +4359,7 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("acceptance that supersedes a co-open recovery request applies");
     tx.commit()
@@ -4537,7 +4565,7 @@ async fn acceptance_stales_prior_pending_reset_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("acceptance that stales a co-pending reset request applies");
     tx.commit()
@@ -4701,7 +4729,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
     };
 
     let mut tx = pool.begin().await.expect("begin leaf recovery request");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("leaf recovery request applies");
     tx.commit()
@@ -4777,7 +4805,7 @@ async fn commit_replace_recovery_request(
 ) -> CommittedRecoveryRequest {
     let built = build_replace_recovery_request(pool, fixture, request_byte).await;
     let mut tx = pool.begin().await.expect("begin recovery request");
-    apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &built.plan, &built.ctx)
         .await
         .expect("recovery request applies");
     tx.commit().await.expect("recovery request COMMIT");
@@ -4936,7 +4964,8 @@ async fn recovery_package_cas_desync_is_rejected() {
     let built = build_replace_recovery_request(&pool, &fixture, 0x93).await;
     let stripped = built.plan.with_recovery_package_cas_cleared_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &stripped, &built.ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &stripped, &built.ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a desynced recovery_package_cas must be an InconsistentPlan, got {result:?}"
@@ -5055,7 +5084,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
     };
 
     let mut tx = pool.begin().await.expect("begin cancellation");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("cancellation applies");
     tx.commit()
@@ -5099,7 +5128,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
     // Replay the cancellation -> the request is no longer 'open', the terminalize
     // CAS conflicts, whole transaction rolls back with zero residue.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "cancellation replay must conflict on the terminalize CAS, got {replay:?}"
@@ -5223,7 +5252,7 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
     };
 
     let mut tx = pool.begin().await.expect("begin welcome expiry");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome expiry applies");
     tx.commit()
@@ -5317,7 +5346,7 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
     .await
     .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "welcome expiry replay must conflict, got {replay:?}"
@@ -5475,7 +5504,7 @@ async fn welcome_acknowledgement_terminalizes_delivery_without_recovery_work() {
     .await;
 
     let mut tx = pool.begin().await.expect("begin ack");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome acknowledgement applies");
     tx.commit().await.expect("welcome acknowledgement COMMIT");
@@ -5522,7 +5551,7 @@ async fn welcome_acknowledgement_terminalizes_delivery_without_recovery_work() {
 
     // Replay -> delivery-CAS conflict, zero residue.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "acknowledgement replay must conflict on the delivery CAS, got {replay:?}"
@@ -5552,7 +5581,7 @@ async fn welcome_rejection_terminalizes_delivery_and_creates_recovery_work() {
     .await;
 
     let mut tx = pool.begin().await.expect("begin reject");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome rejection applies");
     tx.commit().await.expect("welcome rejection COMMIT");
@@ -5592,7 +5621,7 @@ async fn welcome_rejection_terminalizes_delivery_and_creates_recovery_work() {
 
     // Replay -> delivery-CAS conflict, no duplicate recovery work.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "rejection replay must conflict on the delivery CAS, got {replay:?}"
@@ -5628,7 +5657,7 @@ async fn welcome_response_corrupted_cas_binding_is_rejected() {
     .await;
     let bad = plan.with_welcome_cas_corrupted_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a corrupted welcome_cas binding must be an InconsistentPlan, got {result:?}"
@@ -5658,7 +5687,8 @@ async fn fulfillment_untracked_recovery_request_delta_is_rejected() {
     let recovery_request_id = built.recovery_request_id;
     let bad = built.plan.with_extra_untracked_recovery_request_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &built.ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &built.ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "an untracked recovery-request delta must be an InconsistentPlan, got {result:?}"
@@ -6301,9 +6331,10 @@ async fn signed_generic_remove_commit_closes_only_removed_leaf_and_interval() {
         .clone();
 
     let mut tx = pool.begin().await.expect("begin signed generic Remove");
-    let applied = apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
-        .await
-        .expect("signed generic Remove applies");
+    let applied =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &built.plan, &built.ctx)
+            .await
+            .expect("signed generic Remove applies");
     tx.commit()
         .await
         .expect("signed generic Remove COMMIT past deferred constraints");
@@ -6568,7 +6599,8 @@ async fn signed_generic_remove_commit_rejects_nonbijective_effect_shapes() {
             | GenericRemoveCorruption::MismatchedClosingLeafPeriod => built.plan,
         };
         let mut tx = pool.begin().await.expect("begin corrupted generic Remove");
-        let result = apply_conversation_persistence_plan(&mut tx, &plan, &built.ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &built.ctx).await;
         match case {
             GenericRemoveCorruption::MissingClosingLeafContext => assert!(
                 matches!(result, Err(ExecutorError::MissingContext(_))),
@@ -6636,7 +6668,7 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
     } = build_generic_commit(&pool, &scenario).await;
 
     let mut tx = pool.begin().await.expect("begin generic commit");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("generic commit applies");
     tx.commit()
@@ -6709,7 +6741,7 @@ async fn generic_commit_commits_epoch_bump_and_reencrypts_metadata() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "generic commit replay must conflict on the head CAS, got {replay:?}"
@@ -6739,7 +6771,8 @@ async fn generic_commit_untracked_welcome_delta_is_rejected() {
     let built = build_generic_commit(&pool, &scenario).await;
     let bad = built.plan.with_welcome_supersession_corrupted_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &built.ctx).await;
+    let result =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &built.ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a corrupted welcome supersession must be an InconsistentPlan, got {result:?}"
@@ -6885,7 +6918,7 @@ async fn commit_leave_request(
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin leave request");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("leave request applies");
     tx.commit().await.expect("leave request COMMIT");
@@ -6942,7 +6975,7 @@ async fn leave_request_commits_pending_consent_without_advancing_coordinate() {
     // Replay -> the head CAS conflicts (seq already advanced 4->5), zero residue
     // (symmetric with the cancellation + zero-leaf happy paths).
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "leave request replay must conflict on the head CAS, got {replay:?}"
@@ -7074,7 +7107,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin leave cancellation");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("leave cancellation applies");
     tx.commit().await.expect("leave cancellation COMMIT");
@@ -7119,7 +7152,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
 
     // Replay -> the head CAS conflicts (seq already advanced to 6), zero residue.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "leave cancellation replay must conflict on the head CAS, got {replay:?}"
@@ -7139,7 +7172,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
     // Commit the creation (alice active/admin + bob pending/member, no leaf).
     {
         let mut tx = pool.begin().await.expect("begin creation");
-        apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
             .await
             .expect("creation applies");
         tx.commit().await.expect("creation COMMIT");
@@ -7247,7 +7280,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("zero-leaf leave applies");
     tx.commit()
@@ -7313,7 +7346,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "zero-leaf leave replay must conflict on the head CAS, got {replay:?}"
@@ -7344,7 +7377,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
     let bob_device = Uuid::from_bytes(*bob_id.device_id());
     {
         let mut tx = pool.begin().await.expect("begin creation");
-        apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
             .await
             .expect("creation applies");
         tx.commit().await.expect("creation COMMIT");
@@ -7451,7 +7484,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("zero-leaf leave over a co-open recovery request applies");
     tx.commit()
@@ -7700,7 +7733,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
     };
 
     let mut tx = pool.begin().await.expect("begin leave fulfillment");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("leave fulfillment applies");
     tx.commit()
@@ -7791,7 +7824,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "leave fulfillment replay must conflict on the head CAS, got {replay:?}"
@@ -7963,7 +7996,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
     };
     {
         let mut tx = pool.begin().await.expect("begin replace request");
-        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &req_plan, &req_ctx)
             .await
             .expect("replace request applies");
         tx.commit()
@@ -8223,7 +8256,7 @@ async fn leaf_recovery_replace_fulfillment_rotates_leaf_and_closes_prior_interva
     } = Box::pin(build_replace_fulfillment(&pool)).await;
 
     let mut tx = pool.begin().await.expect("begin replace fulfillment");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("replace fulfillment applies");
     tx.commit()
@@ -8356,7 +8389,7 @@ async fn leaf_recovery_replace_fulfillment_rotates_leaf_and_closes_prior_interva
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "replace fulfillment replay must conflict on the head CAS, got {replay:?}"
@@ -8399,7 +8432,7 @@ async fn leaf_recovery_replace_fulfillment_without_old_leaf_period_is_rejected()
         .begin()
         .await
         .expect("begin rejected replace fulfillment");
-    let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::MissingContext(_))),
         "replace fulfillment without the old leaf period must hard-error, got {result:?}"
@@ -8431,7 +8464,7 @@ async fn commit_bob_leave_fulfillment(
     let (plan, ctx, post_leave) =
         build_bob_leave_fulfillment(pool, scenario, pending_state, leave_request_id).await;
     let mut tx = pool.begin().await.expect("begin leave fulfillment");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("leave fulfillment applies");
     tx.commit()
@@ -8668,7 +8701,7 @@ async fn leave_fulfillment_staling_its_own_request_is_rejected() {
         .begin()
         .await
         .expect("begin corrupted leave fulfillment");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "staling the fulfilled request must be InconsistentPlan, got {result:?}"
@@ -8844,7 +8877,7 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
     };
 
     let mut tx = pool.begin().await.expect("begin close");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("close applies");
     tx.commit()
@@ -8917,7 +8950,7 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "close replay must conflict on the head CAS, got {replay:?}"
@@ -9064,7 +9097,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     };
     {
         let mut tx = pool.begin().await.expect("begin request");
-        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &req_plan, &req_ctx)
             .await
             .expect("recovery request applies");
         tx.commit().await.expect("recovery request COMMIT");
@@ -9243,7 +9276,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin generic commit");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("generic commit with supersession applies");
     tx.commit()
@@ -9417,7 +9450,7 @@ async fn seed_reset_leave_then_build_commit(
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
-        apply_conversation_persistence_plan(&mut tx, &reset_plan, &reset_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &reset_plan, &reset_ctx)
             .await
             .expect("reset request applies");
         tx.commit().await.expect("reset request COMMIT");
@@ -9519,7 +9552,7 @@ async fn seed_reset_leave_then_build_commit(
     };
     {
         let mut tx = pool.begin().await.expect("begin leave request");
-        apply_conversation_persistence_plan(&mut tx, &leave_plan, &leave_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &leave_plan, &leave_ctx)
             .await
             .expect("leave request applies");
         tx.commit().await.expect("leave request COMMIT");
@@ -9722,7 +9755,7 @@ async fn generic_commit_stales_prior_pending_reset_and_leave_requests() {
         .clone();
 
     let mut tx = pool.begin().await.expect("begin generic commit");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("generic commit that stales reset + leave requests applies");
     tx.commit()
@@ -9766,7 +9799,7 @@ async fn generic_commit_corrupted_reset_staling_is_rejected() {
         seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
     let bad = plan.with_reset_staling_corrupted_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a corrupted reset staling must be InconsistentPlan, got {result:?}"
@@ -9795,7 +9828,7 @@ async fn generic_commit_corrupted_leave_staling_is_rejected() {
         seed_reset_leave_then_build_commit(pool.clone(), &scenario).await;
     let bad = plan.with_leave_staling_corrupted_for_test();
     let mut tx = pool.begin().await.expect("begin");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a corrupted leave staling must be InconsistentPlan, got {result:?}"
@@ -9991,7 +10024,7 @@ async fn seed_three_member_bob_pending_leave(
     };
     {
         let mut tx = pool.begin().await.expect("begin policy add carol");
-        apply_conversation_persistence_plan(&mut tx, &policy_plan, &policy_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &policy_plan, &policy_ctx)
             .await
             .expect("policy add carol applies");
         tx.commit().await.expect("policy add carol COMMIT");
@@ -10102,7 +10135,7 @@ async fn seed_three_member_bob_pending_leave(
     };
     {
         let mut tx = pool.begin().await.expect("begin bob leave request");
-        apply_conversation_persistence_plan(&mut tx, &leave_plan, &leave_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &leave_plan, &leave_ctx)
             .await
             .expect("bob leave request applies");
         tx.commit().await.expect("bob leave request COMMIT");
@@ -10263,7 +10296,7 @@ async fn zero_leaf_leave_stales_other_members_pending_leave_request() {
         .clone();
 
     let mut tx = pool.begin().await.expect("begin carol zero-leaf leave");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("carol zero-leaf leave staling bob's pending leave applies");
     tx.commit()
@@ -10327,7 +10360,7 @@ async fn zero_leaf_leave_carrying_a_fulfilled_leave_delta_is_rejected() {
     let bad = plan.with_leave_staling_flipped_to_fulfilled_for_test();
 
     let mut tx = pool.begin().await.expect("begin corrupted zero-leaf leave");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "a Fulfilled leave delta in a zeroLeafLeave must be InconsistentPlan, got {result:?}"
@@ -10555,7 +10588,7 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
-        apply_conversation_persistence_plan(&mut tx, &req_plan, &req_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &req_plan, &req_ctx)
             .await
             .expect("leaf recovery request applies");
         tx.commit().await.expect("leaf recovery request COMMIT");
@@ -10699,10 +10732,13 @@ async fn device_revocation_batch_commits_and_supersedes_target_work() {
 
     let mut tx = pool.begin().await.expect("begin revocation");
     seed_revoke_receipt(&mut tx, &s).await;
-    let applied =
-        apply_device_revocation_batch(&mut tx, &s.batch_plan, std::slice::from_ref(&s.conv_ctx))
-            .await
-            .expect("device revocation batch applies");
+    let applied = apply_device_revocation_batch_unscoped_for_test(
+        &mut tx,
+        &s.batch_plan,
+        std::slice::from_ref(&s.conv_ctx),
+    )
+    .await
+    .expect("device revocation batch applies");
     tx.commit()
         .await
         .expect("device revocation COMMIT past enforce_device_revocation_mapping");
@@ -10943,9 +10979,13 @@ async fn commit_bob_welcome_revocation(
     .execute(&mut *tx)
     .await
     .expect("seed Welcome revocation receipt");
-    apply_device_revocation_batch(&mut tx, &batch_plan, std::slice::from_ref(&ctx))
-        .await
-        .expect("apply Welcome revocation batch");
+    apply_device_revocation_batch_unscoped_for_test(
+        &mut tx,
+        &batch_plan,
+        std::slice::from_ref(&ctx),
+    )
+    .await
+    .expect("apply Welcome revocation batch");
     tx.commit()
         .await
         .expect("commit Welcome revocation provenance");
@@ -11008,7 +11048,7 @@ async fn device_revocation_supersedes_pending_welcome_with_exact_revocation_sour
 /// The device-revocation batch's AVAILABLE-package path (step 3): a target device
 /// with an available (`conversation_id IS NULL`) key package alongside its reserved
 /// one has BOTH revoked in one transaction — the reserved by the per-conversation
-/// arm, the available by `apply_device_revocation_batch`'s
+/// arm, the available by `apply_device_revocation_batch_unscoped_for_test`'s
 /// `cas_key_package_status(Available, Revoke)` loop over the plan's
 /// `revoked_packages`. The available package MUST be seeded BEFORE the batch and
 /// carried in `revoked_packages` (not post-hoc), or the DEFERRED
@@ -11084,9 +11124,13 @@ async fn device_revocation_batch_revokes_available_target_package() {
         vec![available_binding],
         conversations,
     );
-    apply_device_revocation_batch(&mut tx, &batch_plan, std::slice::from_ref(&s.conv_ctx))
-        .await
-        .expect("device revocation batch with available package applies");
+    apply_device_revocation_batch_unscoped_for_test(
+        &mut tx,
+        &batch_plan,
+        std::slice::from_ref(&s.conv_ctx),
+    )
+    .await
+    .expect("device revocation batch with available package applies");
     tx.commit()
         .await
         .expect("device revocation COMMIT past the footprint trigger");
@@ -11256,7 +11300,7 @@ async fn prepare_transition_supersession_history() -> (PgPool, FreshDbGuard, Pre
         .begin()
         .await
         .expect("begin historical transition supersession");
-    apply_conversation_persistence_plan(&mut tx, &built.plan, &built.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &built.plan, &built.ctx)
         .await
         .expect("apply historical transition supersession");
     tx.commit()
@@ -12148,9 +12192,13 @@ async fn device_revocation_without_receipt_fails_the_commit_trigger() {
     // all succeed (the mapping trigger is DEFERRED), but COMMIT RAISEs because the
     // target-footprint provenance (the receipt) is missing.
     let mut tx = pool.begin().await.expect("begin revocation");
-    apply_device_revocation_batch(&mut tx, &s.batch_plan, std::slice::from_ref(&s.conv_ctx))
-        .await
-        .expect("batch applies (the mapping trigger is deferred to COMMIT)");
+    apply_device_revocation_batch_unscoped_for_test(
+        &mut tx,
+        &s.batch_plan,
+        std::slice::from_ref(&s.conv_ctx),
+    )
+    .await
+    .expect("batch applies (the mapping trigger is deferred to COMMIT)");
     let committed = tx.commit().await;
     assert!(
         committed.is_err(),
@@ -12162,7 +12210,7 @@ async fn device_revocation_without_receipt_fails_the_commit_trigger() {
 // E3 — real-Postgres concurrency races over the executor edges.
 //
 // Each case commits a coherent prior state, then applies competing edges from
-// ONE prior coordinate CONCURRENTLY: two `apply_conversation_persistence_plan`
+// ONE prior coordinate CONCURRENTLY: two `apply_conversation_persistence_plan_unscoped_for_test`
 // futures interleave under `tokio::join!` (a Barrier lines them up at the head
 // write), and the Postgres conversation-head row lock is the serialization
 // authority. Exactly one edge commits; every loser hits a typed executor error
@@ -12367,7 +12415,7 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin creation");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
@@ -12378,7 +12426,8 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
     let racer_a = async {
         let mut tx = pool.begin().await.expect("begin A");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("A commit");
@@ -12394,7 +12443,8 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
     let racer_b = async {
         let mut tx = pool.begin().await.expect("begin B");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("B commit");
@@ -12571,7 +12621,7 @@ async fn seed_alice_open_recovery(
         welcome_dispositions: vec![],
     };
     let mut tx = pool.begin().await.expect("begin recovery request");
-    apply_conversation_persistence_plan(&mut tx, &rec_plan, &rec_ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &rec_plan, &rec_ctx)
         .await
         .expect("leaf recovery request applies");
     tx.commit().await.expect("leaf recovery request COMMIT");
@@ -12590,7 +12640,7 @@ async fn policy_add_supersedes_prior_open_recovery_request() {
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin creation");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
@@ -12599,7 +12649,7 @@ async fn policy_add_supersedes_prior_open_recovery_request() {
     let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
 
     let mut tx = pool.begin().await.expect("begin policy");
-    apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("policy add over a co-open recovery request applies");
     tx.commit()
@@ -12647,7 +12697,7 @@ async fn policy_untracked_recovery_delta_is_rejected() {
     let fixture = build_creation(&pool, ConversationKind::Group).await;
     let conversation_id = fixture.conversation_id;
     let mut tx = pool.begin().await.expect("begin creation");
-    apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+    apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
         .await
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
@@ -12656,7 +12706,7 @@ async fn policy_untracked_recovery_delta_is_rejected() {
     let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
     let bad = plan.with_extra_untracked_recovery_request_for_test();
     let mut tx = pool.begin().await.expect("begin policy");
-    let result = apply_conversation_persistence_plan(&mut tx, &bad, &ctx).await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
         "an untracked policy recovery delta must be InconsistentPlan, got {result:?}"
@@ -12690,7 +12740,9 @@ async fn concurrent_close_apply_yields_one_supersede_zero_residue() {
     let racer_a = async {
         let mut tx = pool.begin().await.expect("begin A");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &close_plan, &close_ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &close_plan, &close_ctx)
+                .await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("A commit");
@@ -12706,7 +12758,9 @@ async fn concurrent_close_apply_yields_one_supersede_zero_residue() {
     let racer_b = async {
         let mut tx = pool.begin().await.expect("begin B");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &close_plan, &close_ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &close_plan, &close_ctx)
+                .await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("B commit");
@@ -12753,8 +12807,12 @@ async fn concurrent_duplicate_creation_yields_one_commit() {
     let racer_a = async {
         let mut tx = pool.begin().await.expect("begin A");
         barrier.wait().await;
-        let result =
-            apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx).await;
+        let result = apply_conversation_persistence_plan_unscoped_for_test(
+            &mut tx,
+            &fixture.plan,
+            &fixture.ctx,
+        )
+        .await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("A commit");
@@ -12766,8 +12824,12 @@ async fn concurrent_duplicate_creation_yields_one_commit() {
     let racer_b = async {
         let mut tx = pool.begin().await.expect("begin B");
         barrier.wait().await;
-        let result =
-            apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx).await;
+        let result = apply_conversation_persistence_plan_unscoped_for_test(
+            &mut tx,
+            &fixture.plan,
+            &fixture.ctx,
+        )
+        .await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("B commit");
@@ -13025,7 +13087,8 @@ async fn concurrent_reset_activation_yields_one_commit_zero_residue() {
     let racer_a = async {
         let mut tx = pool.begin().await.expect("begin A");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("A commit");
@@ -13041,7 +13104,8 @@ async fn concurrent_reset_activation_yields_one_commit_zero_residue() {
     let racer_b = async {
         let mut tx = pool.begin().await.expect("begin B");
         barrier.wait().await;
-        let result = apply_conversation_persistence_plan(&mut tx, &plan, &ctx).await;
+        let result =
+            apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
         let ok = result.is_ok();
         if ok {
             tx.commit().await.expect("B commit");

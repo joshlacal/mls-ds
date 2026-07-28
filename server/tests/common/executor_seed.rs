@@ -36,24 +36,25 @@ use crate::chat_protocol::repository::transition::{
 };
 use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
 use crate::chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, apply_device_revocation_batch,
-    device_revocation_plan_for_test, persistence_plan_for_test, plan_accept_conversation,
-    plan_close, plan_commit, plan_creation, plan_device_revocation,
-    plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment, plan_leaf_recovery_request,
-    plan_leave_cancellation, plan_leave_fulfillment, plan_leave_request, plan_policy,
-    plan_reset_activation, plan_reset_request, plan_welcome_expiry_for_test,
-    plan_welcome_response_for_test, plan_zero_leaf_leave, AcceptConversation, CloseConversation,
-    CommitCommand, ControlEntryContent, ConversationHeadCasBinding, ConversationKind,
-    ConversationState, CreationCommand, CreationDecision, DeviceIdentity,
-    DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, EventFanout, ExecutionActor,
-    ExecutionAuthority, ExecutionContext, ExecutorError, LeafPersistenceColumns,
-    LeafRecoveryCancellation, LeafRecoveryFulfillment, LeafRecoveryKind,
-    LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment, LeaveRequestCommand,
-    LockedRegistrationProjection, MetadataAuthorColumns, MetadataSnapshotBinding, PrincipalId,
-    RecoveryOpenContext, RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand,
-    ResetRequestRow, RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp,
-    SpineArtifacts, TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext,
-    WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
+    apply_conversation_persistence_plan_unscoped_for_test,
+    apply_device_revocation_batch_unscoped_for_test, device_revocation_plan_for_test,
+    persistence_plan_for_test, plan_accept_conversation, plan_close, plan_commit, plan_creation,
+    plan_device_revocation, plan_leaf_recovery_cancellation, plan_leaf_recovery_fulfillment,
+    plan_leaf_recovery_request, plan_leave_cancellation, plan_leave_fulfillment,
+    plan_leave_request, plan_policy, plan_reset_activation, plan_reset_request,
+    plan_welcome_expiry_for_test, plan_welcome_response_for_test, plan_zero_leaf_leave,
+    AcceptConversation, CloseConversation, CommitCommand, ControlEntryContent,
+    ConversationHeadCasBinding, ConversationKind, ConversationState, CreationCommand,
+    CreationDecision, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
+    DeviceRevocationEvidence, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
+    ExecutorError, LeafPersistenceColumns, LeafRecoveryCancellation, LeafRecoveryFulfillment,
+    LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation, LeaveFulfillment,
+    LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
+    MetadataSnapshotBinding, PrincipalId, RecoveryOpenContext, RequestEntryKind, RequestEvidence,
+    ResetActivation, ResetRequestCommand, ResetRequestRow, RevocationPackageCasBinding,
+    RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts, TransitionEvidence,
+    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+    WelcomeStatus, ZeroLeafLeave,
 };
 use crate::chat_protocol::validation::ed25519_key_id;
 #[path = "frozen_public_state.rs"]
@@ -832,7 +833,7 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     let conversation_id = fixture.conversation_id;
     {
         let mut tx = pool.begin().await.expect("begin creation");
-        apply_conversation_persistence_plan(&mut tx, &fixture.plan, &fixture.ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &fixture.plan, &fixture.ctx)
             .await
             .expect("creation applies");
         tx.commit().await.expect("creation COMMIT");
@@ -920,7 +921,7 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     .await;
     {
         let mut tx = pool.begin().await.expect("begin acceptance");
-        apply_conversation_persistence_plan(&mut tx, &accept_plan, &accept_ctx)
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &accept_plan, &accept_ctx)
             .await
             .expect("acceptance applies");
         tx.commit().await.expect("acceptance COMMIT");
@@ -1123,7 +1124,7 @@ pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
     let pool = pool.clone();
 
     let mut tx = pool.begin().await.expect("begin fulfillment");
-    let applied = apply_conversation_persistence_plan(&mut tx, &plan, &ctx)
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("fulfillment applies");
     tx.commit()
@@ -1243,7 +1244,7 @@ pub async fn run_fulfillment_scenario(pool: &PgPool) -> FulfillmentScenario {
             .await
             .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan(&mut tx2, &plan, &ctx).await;
+    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
     assert!(
         matches!(replay, Err(ExecutorError::Transition(_))),
         "fulfillment replay must conflict on the head CAS, got {replay:?}"

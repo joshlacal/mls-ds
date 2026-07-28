@@ -54,8 +54,8 @@ use super::{
         ed25519_key_id, BareDid, CanonicalTimestamp, KeyThumbprint, TrustedRequestInstant,
     },
     wire::{
-        validate_key_package, KeyPackageValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
-        MAX_KEY_PACKAGE_WIRE_BYTES, MAX_WELCOME_WIRE_BYTES,
+        trusted_unix_millis_to_seconds, validate_key_package, KeyPackageValidationPolicy,
+        MAX_GROUP_INFO_WIRE_BYTES, MAX_KEY_PACKAGE_WIRE_BYTES, MAX_WELCOME_WIRE_BYTES,
     },
 };
 
@@ -1562,8 +1562,10 @@ impl HydrationAuthority {
                 coordinate: next,
                 expected_basic_credential: &registration.actor().basic_credential(),
                 expected_signature_key: registration.registered_mls_signature_key(),
-                now_unix_seconds: u64::try_from(transition.received_at.unix_millis() / 1_000)
-                    .map_err(|_| StateMachineError::InvalidServerTime)?,
+                now_unix_seconds: trusted_unix_millis_to_seconds(
+                    transition.received_at.unix_millis(),
+                )
+                .ok_or(StateMachineError::InvalidServerTime)?,
                 max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_members: MAX_PARTICIPANTS,
@@ -1702,8 +1704,10 @@ impl HydrationAuthority {
                 coordinate: next,
                 expected_basic_credential: &registration.actor().basic_credential(),
                 expected_signature_key: registration.registered_mls_signature_key(),
-                now_unix_seconds: u64::try_from(transition.received_at.unix_millis() / 1_000)
-                    .map_err(|_| StateMachineError::InvalidServerTime)?,
+                now_unix_seconds: trusted_unix_millis_to_seconds(
+                    transition.received_at.unix_millis(),
+                )
+                .ok_or(StateMachineError::InvalidServerTime)?,
                 max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_members: MAX_PARTICIPANTS,
@@ -2091,8 +2095,8 @@ impl HydrationAuthority {
             &commit_bytes,
             &aad,
             next,
-            u64::try_from(transition.received_at.unix_millis() / 1_000)
-                .map_err(|_| StateMachineError::InvalidServerTime)?,
+            trusted_unix_millis_to_seconds(transition.received_at.unix_millis())
+                .ok_or(StateMachineError::InvalidServerTime)?,
             MAX_PARTICIPANTS,
         )?;
         let plan = plan_commit_inner(
@@ -2181,8 +2185,8 @@ impl HydrationAuthority {
             &commit_bytes,
             &aad,
             next,
-            u64::try_from(transition.received_at.unix_millis() / 1_000)
-                .map_err(|_| StateMachineError::InvalidServerTime)?,
+            trusted_unix_millis_to_seconds(transition.received_at.unix_millis())
+                .ok_or(StateMachineError::InvalidServerTime)?,
             MAX_PARTICIPANTS,
         )?;
         let signed_welcome = match transition.body_binding.as_ref() {
@@ -2276,8 +2280,8 @@ impl HydrationAuthority {
             &commit_bytes,
             &aad,
             next,
-            u64::try_from(transition.received_at.unix_millis() / 1_000)
-                .map_err(|_| StateMachineError::InvalidServerTime)?,
+            trusted_unix_millis_to_seconds(transition.received_at.unix_millis())
+                .ok_or(StateMachineError::InvalidServerTime)?,
             MAX_PARTICIPANTS,
         )?;
         let authority = transition.clone();
@@ -2334,8 +2338,10 @@ impl HydrationAuthority {
                 coordinate: successor,
                 expected_basic_credential: &registration.actor().basic_credential(),
                 expected_signature_key: registration.registered_mls_signature_key(),
-                now_unix_seconds: u64::try_from(transition.received_at.unix_millis() / 1_000)
-                    .map_err(|_| StateMachineError::InvalidServerTime)?,
+                now_unix_seconds: trusted_unix_millis_to_seconds(
+                    transition.received_at.unix_millis(),
+                )
+                .ok_or(StateMachineError::InvalidServerTime)?,
                 max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
                 max_members: MAX_PARTICIPANTS,
@@ -3793,8 +3799,8 @@ impl HydrationAuthority {
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        let now_unix_seconds = u64::try_from(claimed_at.unix_millis() / 1_000)
-            .map_err(|_| StateMachineError::InvalidServerTime)?;
+        let now_unix_seconds = trusted_unix_millis_to_seconds(claimed_at.unix_millis())
+            .ok_or(StateMachineError::InvalidServerTime)?;
         let validated = validate_key_package(
             guard.wrapper_bytes(),
             KeyPackageValidationPolicy {
@@ -7249,6 +7255,10 @@ impl ConversationState {
             .find(|request| request.request_id == *request_id)
     }
 
+    pub(crate) fn recovery_requests(&self) -> &[RecoveryRequest] {
+        &self.recovery_requests
+    }
+
     pub(crate) fn recovery_reservation(
         &self,
         request_id: &[u8; 16],
@@ -7274,6 +7284,10 @@ impl ConversationState {
         self.welcomes
             .iter()
             .find(|welcome| welcome.welcome_id == *welcome_id)
+    }
+
+    pub(crate) fn welcomes(&self) -> &[WelcomeWork] {
+        &self.welcomes
     }
 
     #[cfg(test)]
@@ -8549,8 +8563,22 @@ impl RevocationTargetCasBinding {
         expected_auth_generation: u64,
         locked_at: ServerTimestamp,
     ) -> Self {
+        Self::for_test_with_transaction_id(
+            "e2b7-revocation-test".to_owned(),
+            target,
+            expected_auth_generation,
+            locked_at,
+        )
+    }
+
+    pub(crate) fn for_test_with_transaction_id(
+        transaction_id: String,
+        target: DeviceIdentity,
+        expected_auth_generation: u64,
+        locked_at: ServerTimestamp,
+    ) -> Self {
         Self {
-            transaction_id: "e2b7-revocation-test".to_owned(),
+            transaction_id,
             target,
             expected_auth_generation,
             expected_status: PersistedRegistrationStatus::Active,
@@ -15943,22 +15971,31 @@ fn would_remove_last_active_admin(state: &ConversationState, principal: &Princip
 // `super::repository::*` paths resolve there as well. See the E2b-3 report.
 // ===========================================================================
 
-#[cfg(test)]
-pub(crate) use executor::apply_device_revocation_batch;
 pub(crate) use executor::{
-    apply_conversation_persistence_plan, apply_device_revocation_batch_prefix, AppliedTransition,
-    ControlEntryContent, EventFanout, ExecutionActor, ExecutionAuthority, ExecutionContext,
-    ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns, RecoveryOpenContext,
-    ResetRequestRow, SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext,
-    WelcomeRejectionWork, WelcomeResponseContext,
+    apply_conversation_persistence_plan, apply_prepared_device_revocation_members,
+    apply_prepared_device_revocation_prefix, prepare_device_revocation_batch_members,
+    AppliedTransition, ControlEntryContent, EventChainCursorError, EventFanout, ExecutionActor,
+    ExecutionAuthority, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
+    PreparedDeviceRevocationBatchMembers, RecoveryOpenContext, ResetRequestRow, SpineArtifacts,
+    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
+};
+#[cfg(test)]
+pub(crate) use executor::{
+    apply_conversation_persistence_plan_unscoped_for_test,
+    apply_device_revocation_batch_unscoped_for_test, ExecutionContext,
+};
+pub(crate) use executor::{
+    batch_transaction_bindings_match, plan_transaction_bindings_match,
+    PreparedConversationExecution,
 };
 
-mod executor {
+pub(in crate::chat_protocol) mod executor {
     use chrono::{DateTime, Utc};
     use sha2::Digest;
     use uuid::Uuid;
 
-    use std::collections::{BTreeSet, HashMap};
+    use sqlx::Acquire;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
     use super::super::public_state::encode_public_tree_summary;
     use super::super::repository::delivery::{
@@ -16025,6 +16062,23 @@ mod executor {
         MissingContext(&'static str),
         /// A protocol integer or timestamp fell outside the safe `i64` range.
         ValueOutOfRange,
+        /// The prepared execution no longer belongs to the live SQL
+        /// transaction, or one of its transaction-bound effects disagrees.
+        TransactionBindingMismatch,
+        /// SQLx could not read the live database transaction identity.
+        TransactionIdentity(sqlx::Error),
+        /// SQLx could not create the executor's nested savepoint.
+        SavepointBegin(sqlx::Error),
+        /// The operation succeeded but SQLx could not release its savepoint.
+        SavepointRelease(sqlx::Error),
+        /// The operation failed and its savepoint rollback also failed. The
+        /// caller must treat the outer transaction as fatal.
+        SavepointRollback {
+            operation: Box<ExecutorError>,
+            rollback: sqlx::Error,
+        },
+        /// Symbolic revocation event schedule or predecessor-chain drift.
+        EventChain(EventChainCursorError),
     }
 
     impl From<TransitionRepositoryError> for ExecutorError {
@@ -16036,6 +16090,20 @@ mod executor {
     impl From<DeliveryRepositoryError> for ExecutorError {
         fn from(error: DeliveryRepositoryError) -> Self {
             Self::Delivery(error)
+        }
+    }
+
+    impl ExecutorError {
+        /// Infrastructure failures at the savepoint boundary do not promise
+        /// that the caller-owned outer transaction remains reusable.
+        pub(crate) fn requires_outer_abort(&self) -> bool {
+            matches!(
+                self,
+                Self::TransactionIdentity(_)
+                    | Self::SavepointBegin(_)
+                    | Self::SavepointRelease(_)
+                    | Self::SavepointRollback { .. }
+            )
         }
     }
 
@@ -16158,6 +16226,340 @@ mod executor {
         pub(crate) outbox: Vec<(Uuid, OutboxWorkKind)>,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    pub(crate) struct EventChainSlot(pub(crate) u32);
+
+    #[cfg_attr(test, derive(Clone))]
+    #[derive(Debug, Eq, PartialEq)]
+    pub(crate) struct PreparedRevocationRecipient {
+        pub(crate) slot: EventChainSlot,
+        pub(crate) entitlement: EventEntitlementKind,
+    }
+
+    /// One fully frozen revocation event shape. Its digest binds every value
+    /// except the predecessor positions, which the transaction-local cursor
+    /// resolves from the retained prelude tails.
+    #[cfg_attr(test, derive(Clone))]
+    #[derive(Debug)]
+    pub(crate) struct PreparedRevocationEvent {
+        pub(crate) event_id: Uuid,
+        pub(crate) event_kind: EventKind,
+        pub(crate) payload_bytes: Vec<u8>,
+        pub(crate) recipients: Vec<PreparedRevocationRecipient>,
+        pub(crate) outbox: Vec<(Uuid, OutboxWorkKind)>,
+        schedule_digest: [u8; 32],
+    }
+
+    impl PreparedRevocationEvent {
+        pub(crate) fn new(
+            event_id: Uuid,
+            event_kind: EventKind,
+            payload_bytes: Vec<u8>,
+            recipients: Vec<PreparedRevocationRecipient>,
+            outbox: Vec<(Uuid, OutboxWorkKind)>,
+        ) -> Result<Self, EventChainCursorError> {
+            if payload_bytes.is_empty() || recipients.is_empty() {
+                return Err(EventChainCursorError::EventShapeMismatch);
+            }
+            if recipients
+                .windows(2)
+                .any(|pair| pair[0].slot >= pair[1].slot)
+            {
+                return Err(EventChainCursorError::DuplicateRecipient);
+            }
+            let schedule_digest = prepared_revocation_event_digest(
+                event_id,
+                event_kind,
+                &payload_bytes,
+                &recipients,
+                &outbox,
+            );
+            Ok(Self {
+                event_id,
+                event_kind,
+                payload_bytes,
+                recipients,
+                outbox,
+                schedule_digest,
+            })
+        }
+    }
+
+    fn prepared_revocation_event_digest(
+        event_id: Uuid,
+        event_kind: EventKind,
+        payload_bytes: &[u8],
+        recipients: &[PreparedRevocationRecipient],
+        outbox: &[(Uuid, OutboxWorkKind)],
+    ) -> [u8; 32] {
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"CATBIRD-CHAT-PREPARED-REVOCATION-EVENT\0");
+        digest.update(event_id.as_bytes());
+        digest.update([match event_kind {
+            EventKind::ConversationChanged => 1,
+            EventKind::ConversationClosed => 2,
+            EventKind::MessageAvailable => 3,
+            EventKind::WelcomeAvailable => 4,
+            EventKind::WelcomeDisposition => 5,
+            EventKind::ResetRequested => 6,
+            EventKind::LeafRecovery => 7,
+            EventKind::LeaveRequest => 8,
+            EventKind::AccessEnded => 9,
+            EventKind::Watermark => 10,
+        }]);
+        digest.update((payload_bytes.len() as u64).to_be_bytes());
+        digest.update(payload_bytes);
+        digest.update((recipients.len() as u64).to_be_bytes());
+        for recipient in recipients {
+            digest.update(recipient.slot.0.to_be_bytes());
+            digest.update([match recipient.entitlement {
+                EventEntitlementKind::Participant => 1,
+                EventEntitlementKind::Leaf => 2,
+                EventEntitlementKind::Welcome => 3,
+                EventEntitlementKind::Recovery => 4,
+                EventEntitlementKind::HistoricalSchedule => 5,
+            }]);
+        }
+        digest.update((outbox.len() as u64).to_be_bytes());
+        for (outbox_id, work_kind) in outbox {
+            digest.update(outbox_id.as_bytes());
+            digest.update([match work_kind {
+                OutboxWorkKind::Stream => 1,
+                OutboxWorkKind::Notification => 2,
+                OutboxWorkKind::Recovery => 3,
+            }]);
+        }
+        digest.finalize().into()
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+    pub(crate) enum EventChainCursorError {
+        #[error("event-chain prelude digest or device vector is invalid")]
+        PreludeDigestMismatch,
+        #[error("event-chain schedule received an unexpected event")]
+        UnexpectedEvent,
+        #[error("event-chain event shape changed after preparation")]
+        EventShapeMismatch,
+        #[error("event-chain event repeats or reorders a recipient")]
+        DuplicateRecipient,
+        #[error("event-chain event names a device outside the locked prelude")]
+        UnknownSlot,
+        #[error("event-chain cursor already has an event pending completion")]
+        EventAlreadyPending,
+        #[error("event-chain cursor has no event pending completion")]
+        NoPendingEvent,
+        #[error("event-chain event position is not monotonic")]
+        PositionNotMonotonic,
+        #[error("event-chain schedule was not fully consumed")]
+        IncompleteSchedule,
+    }
+
+    struct PendingPreparedEvent {
+        event_id: Uuid,
+        slots: Vec<EventChainSlot>,
+    }
+
+    /// Pure, SQL-free resolver for the device-global event predecessor chain.
+    /// It is deliberately single-use and remains owned by the opaque prepared
+    /// revocation batch.
+    pub(crate) struct EventChainCursor {
+        prelude_digest: [u8; 32],
+        devices: Vec<DeviceIdentity>,
+        current_tails: Vec<Option<i64>>,
+        remaining: VecDeque<PreparedRevocationEvent>,
+        pending_event: Option<PendingPreparedEvent>,
+    }
+
+    impl EventChainCursor {
+        pub(crate) fn new(
+            prelude_digest: [u8; 32],
+            devices: Vec<DeviceIdentity>,
+            current_tails: Vec<Option<i64>>,
+            schedule: Vec<PreparedRevocationEvent>,
+        ) -> Result<Self, EventChainCursorError> {
+            if prelude_digest == [0; 32] {
+                return Err(EventChainCursorError::PreludeDigestMismatch);
+            }
+            if devices.len() != current_tails.len()
+                || devices.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(EventChainCursorError::PreludeDigestMismatch);
+            }
+            let mut event_ids = BTreeSet::new();
+            for event in &schedule {
+                if !event_ids.insert(event.event_id) {
+                    return Err(EventChainCursorError::EventShapeMismatch);
+                }
+                let mut previous = None;
+                for recipient in &event.recipients {
+                    let slot = usize::try_from(recipient.slot.0)
+                        .map_err(|_| EventChainCursorError::UnknownSlot)?;
+                    if slot >= devices.len() {
+                        return Err(EventChainCursorError::UnknownSlot);
+                    }
+                    if previous.is_some_and(|prior| prior >= recipient.slot) {
+                        return Err(EventChainCursorError::DuplicateRecipient);
+                    }
+                    previous = Some(recipient.slot);
+                }
+            }
+            Ok(Self {
+                prelude_digest,
+                devices,
+                current_tails,
+                remaining: schedule.into(),
+                pending_event: None,
+            })
+        }
+
+        pub(crate) fn begin_event(
+            &mut self,
+            event: &PreparedRevocationEvent,
+        ) -> Result<Vec<EventRecipient>, EventChainCursorError> {
+            if self.pending_event.is_some() {
+                return Err(EventChainCursorError::EventAlreadyPending);
+            }
+            let expected = self
+                .remaining
+                .front()
+                .ok_or(EventChainCursorError::UnexpectedEvent)?;
+            if event.event_id != expected.event_id {
+                return Err(EventChainCursorError::UnexpectedEvent);
+            }
+            let actual_digest = prepared_revocation_event_digest(
+                event.event_id,
+                event.event_kind,
+                &event.payload_bytes,
+                &event.recipients,
+                &event.outbox,
+            );
+            if actual_digest != expected.schedule_digest
+                || actual_digest != event.schedule_digest
+                || event.event_kind != expected.event_kind
+                || event.payload_bytes != expected.payload_bytes
+                || event.recipients != expected.recipients
+                || event.outbox != expected.outbox
+            {
+                return Err(EventChainCursorError::EventShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(event.recipients.len());
+            let mut slots = Vec::with_capacity(event.recipients.len());
+            for recipient in &event.recipients {
+                let slot = usize::try_from(recipient.slot.0)
+                    .map_err(|_| EventChainCursorError::UnknownSlot)?;
+                let device = self
+                    .devices
+                    .get(slot)
+                    .ok_or(EventChainCursorError::UnknownSlot)?;
+                rows.push(EventRecipient {
+                    user_did: String::from_utf8(device.principal().as_bytes().to_vec())
+                        .map_err(|_| EventChainCursorError::UnknownSlot)?,
+                    device_id: Uuid::from_bytes(*device.device_id()),
+                    entitlement_kind: recipient.entitlement,
+                    audience_predecessor_position: self.current_tails[slot],
+                });
+                slots.push(recipient.slot);
+            }
+            self.pending_event = Some(PendingPreparedEvent {
+                event_id: event.event_id,
+                slots,
+            });
+            Ok(rows)
+        }
+
+        fn begin_fanout(
+            &mut self,
+            event: &EventFanout,
+        ) -> Result<Vec<EventRecipient>, EventChainCursorError> {
+            if self.pending_event.is_some() {
+                return Err(EventChainCursorError::EventAlreadyPending);
+            }
+            let expected = self
+                .remaining
+                .front()
+                .ok_or(EventChainCursorError::UnexpectedEvent)?;
+            if event.event_id != expected.event_id {
+                return Err(EventChainCursorError::UnexpectedEvent);
+            }
+            if event.event_kind != expected.event_kind
+                || event.payload_bytes != expected.payload_bytes
+                || event.outbox != expected.outbox
+                || event.recipients.len() != expected.recipients.len()
+            {
+                return Err(EventChainCursorError::EventShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(expected.recipients.len());
+            let mut slots = Vec::with_capacity(expected.recipients.len());
+            for (actual, expected_recipient) in event.recipients.iter().zip(&expected.recipients) {
+                let slot = expected_recipient.slot.0 as usize;
+                let expected_device = self
+                    .devices
+                    .get(slot)
+                    .ok_or(EventChainCursorError::UnknownSlot)?;
+                if &actual.0 != expected_device || actual.1 != expected_recipient.entitlement {
+                    return Err(EventChainCursorError::EventShapeMismatch);
+                }
+                rows.push(EventRecipient {
+                    user_did: device_did(expected_device)
+                        .map_err(|_| EventChainCursorError::UnknownSlot)?,
+                    device_id: device_uuid(expected_device),
+                    entitlement_kind: expected_recipient.entitlement,
+                    audience_predecessor_position: self.current_tails[slot],
+                });
+                slots.push(expected_recipient.slot);
+            }
+            self.pending_event = Some(PendingPreparedEvent {
+                event_id: event.event_id,
+                slots,
+            });
+            Ok(rows)
+        }
+
+        pub(crate) fn complete_event(
+            &mut self,
+            event_id: Uuid,
+            event_position: i64,
+        ) -> Result<(), EventChainCursorError> {
+            let pending = self
+                .pending_event
+                .as_ref()
+                .ok_or(EventChainCursorError::NoPendingEvent)?;
+            if pending.event_id != event_id {
+                return Err(EventChainCursorError::UnexpectedEvent);
+            }
+            if event_position <= 0
+                || pending.slots.iter().any(|slot| {
+                    self.current_tails[slot.0 as usize].is_some_and(|tail| event_position <= tail)
+                })
+            {
+                return Err(EventChainCursorError::PositionNotMonotonic);
+            }
+            let pending = self.pending_event.take().expect("checked pending event");
+            for slot in pending.slots {
+                self.current_tails[slot.0 as usize] = Some(event_position);
+            }
+            self.remaining.pop_front();
+            Ok(())
+        }
+
+        pub(crate) fn finish(self) -> Result<(), EventChainCursorError> {
+            if self.pending_event.is_some() || !self.remaining.is_empty() {
+                return Err(EventChainCursorError::IncompleteSchedule);
+            }
+            let _ = self.prelude_digest;
+            Ok(())
+        }
+
+        #[cfg(test)]
+        fn finish_for_test(&self) -> Result<(), EventChainCursorError> {
+            if self.pending_event.is_some() || !self.remaining.is_empty() {
+                Err(EventChainCursorError::IncompleteSchedule)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     /// For a `welcomeExpiry` edge: the DB-side facts the plan does not carry — the
     /// fresh `recovery_work_items` primary key and the `welcomeDisposition` event
     /// whose position binds the disposition row. The welcome id / recipient /
@@ -16192,7 +16594,8 @@ mod executor {
 
     /// Everything the plan does NOT carry. AUDIENCE IS INPUT, NOT DERIVED: the
     /// executor never queries `chat.devices` to invent an audience.
-    #[derive(Clone, Debug)]
+    #[cfg_attr(test, derive(Clone))]
+    #[derive(Debug)]
     pub(crate) struct ExecutionContext {
         pub(crate) protocol_instance_id: Uuid,
         /// The trusted request instant `T` — every `*_at` the executor writes.
@@ -16256,6 +16659,81 @@ mod executor {
         fn operation_id(&self) -> Uuid {
             self.authority.operation_id()
         }
+    }
+
+    /// A single-use execution capsule minted only after repository hydration
+    /// has bound one exact plan and context to the live SQL transaction.
+    ///
+    /// The constructor requires an unforgeable token owned by
+    /// `repository::execution_context`. No production API accepts a separable
+    /// plan or raw `ExecutionContext`.
+    #[must_use = "a prepared execution must be consumed by the atomic executor"]
+    pub(crate) struct PreparedConversationExecution<'borrow, 'connection, 'plan> {
+        transaction: &'borrow mut sqlx::Transaction<'connection, sqlx::Postgres>,
+        plan: &'plan ConversationPersistencePlan,
+        context: ExecutionContext,
+        expected_transaction_id: Box<str>,
+        _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
+    }
+
+    impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connection, 'plan> {
+        pub(crate) fn from_hydrated_parts(
+            transaction: &'borrow mut sqlx::Transaction<'connection, sqlx::Postgres>,
+            plan: &'plan ConversationPersistencePlan,
+            context: ExecutionContext,
+            expected_transaction_id: Box<str>,
+            proof: crate::chat_protocol::repository::execution_context::
+                ExecutionContextHydrationProof,
+        ) -> Self {
+            Self {
+                transaction,
+                plan,
+                context,
+                expected_transaction_id,
+                _proof: proof,
+            }
+        }
+    }
+
+    pub(crate) fn plan_transaction_bindings_match(
+        plan: &ConversationPersistencePlan,
+        expected_transaction_id: &str,
+    ) -> bool {
+        let effects = plan.effects();
+        effects
+            .head_cas()
+            .is_some_and(|binding| binding.transaction_id() == expected_transaction_id)
+            && effects
+                .recovery_package_cas()
+                .iter()
+                .all(|binding| binding.transaction_id() == expected_transaction_id)
+            && effects
+                .revocation_package_cas()
+                .iter()
+                .all(|binding| binding.transaction_id() == expected_transaction_id)
+            && effects
+                .revocation_target_cas()
+                .is_none_or(|binding| binding.transaction_id() == expected_transaction_id)
+            && effects
+                .welcome_cas()
+                .is_none_or(|binding| binding.transaction_id() == expected_transaction_id)
+            && effects
+                .invitation_quota_cas()
+                .is_none_or(|binding| binding.transaction_id() == expected_transaction_id)
+    }
+
+    pub(crate) fn batch_transaction_bindings_match(
+        plan: &DeviceRevocationBatchPersistencePlan,
+        expected_transaction_id: &str,
+    ) -> bool {
+        plan.target_cas().transaction_id() == expected_transaction_id
+            && plan
+                .revoked_packages()
+                .iter()
+                .all(|binding| binding.transaction_id() == expected_transaction_id)
+            && plan.conversations().iter().all(|conversation| {
+                plan_transaction_bindings_match(conversation, expected_transaction_id)
+            })
     }
 
     /// The `welcomeDisposition` event + outbox the executor appends when a
@@ -17833,7 +18311,7 @@ mod executor {
     /// families → audience → events). Every effect family is consumed
     /// exhaustively; a non-empty family this path does not handle is a hard
     /// `UnsupportedEffect`, never a silent skip.
-    pub(crate) async fn apply_conversation_persistence_plan(
+    async fn apply_conversation_persistence_plan_inner(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &ConversationPersistencePlan,
         ctx: &ExecutionContext,
@@ -17934,6 +18412,7 @@ mod executor {
                     generation,
                     state_version,
                     epoch,
+                    None,
                 )
                 .await;
             }
@@ -18188,6 +18667,70 @@ mod executor {
                 .await
             }
         }
+    }
+
+    /// Apply one repository-prepared plan inside a nested SQL savepoint.
+    ///
+    /// Every returned body error explicitly rolls the savepoint back before the
+    /// caller regains the outer transaction. A release failure, cancellation,
+    /// or panic may rely on SQLx's queued savepoint rollback; such callers must
+    /// abandon or explicitly roll back the outer transaction before reuse.
+    pub(crate) async fn apply_conversation_persistence_plan(
+        prepared: PreparedConversationExecution<'_, '_, '_>,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let PreparedConversationExecution {
+            transaction,
+            plan,
+            context,
+            expected_transaction_id,
+            _proof,
+        } = prepared;
+        let mut savepoint = transaction
+            .begin()
+            .await
+            .map_err(ExecutorError::SavepointBegin)?;
+        let live_transaction_id: Result<String, sqlx::Error> =
+            sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *savepoint)
+                .await;
+        let operation = match live_transaction_id {
+            Ok(live_transaction_id)
+                if live_transaction_id == expected_transaction_id.as_ref()
+                    && plan_transaction_bindings_match(plan, expected_transaction_id.as_ref()) =>
+            {
+                apply_conversation_persistence_plan_inner(&mut savepoint, plan, &context).await
+            }
+            Ok(_) => Err(ExecutorError::TransactionBindingMismatch),
+            Err(error) => Err(ExecutorError::TransactionIdentity(error)),
+        };
+        match operation {
+            Ok(applied) => {
+                savepoint
+                    .commit()
+                    .await
+                    .map_err(ExecutorError::SavepointRelease)?;
+                Ok(applied)
+            }
+            Err(operation) => match savepoint.rollback().await {
+                Ok(()) => Err(operation),
+                Err(rollback) => Err(ExecutorError::SavepointRollback {
+                    operation: Box::new(operation),
+                    rollback,
+                }),
+            },
+        }
+    }
+
+    /// Raw executor seam retained only for cfg(test) mutation/shape harnesses.
+    /// Its explicit name prevents it from shadowing or being counted as the
+    /// production prepared-capsule path above.
+    #[cfg(test)]
+    pub(crate) async fn apply_conversation_persistence_plan_unscoped_for_test(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        plan: &ConversationPersistencePlan,
+        context: &ExecutionContext,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        apply_conversation_persistence_plan_inner(transaction, plan, context).await
     }
 
     /// Apply an entry-less `leafRecoveryRequest` internal op. The coordinate and
@@ -18902,6 +19445,7 @@ mod executor {
         generation: i64,
         state_version: i64,
         _epoch: i64,
+        mut event_cursor: Option<&mut EventChainCursor>,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
         let head = effects
@@ -19003,13 +19547,14 @@ mod executor {
                 .await?;
         // 3. The target's pending welcomes (Pending->Superseded), each bound to a
         //    `welcomeDisposition` event (stamped at ctx.applied_at == accepted_at).
-        superseded.welcomes = write_welcome_supersessions(
+        superseded.welcomes = write_welcome_supersessions_with_cursor(
             transaction,
             ctx,
             effects,
             WelcomeSupersessionCause::Revocation {
                 terminal_revocation_id: revocation_id,
             },
+            event_cursor.as_deref_mut(),
         )
         .await?;
         // 4. Silent-drop guard: a device revocation FULFILLS nothing (own == 0),
@@ -19017,7 +19562,8 @@ mod executor {
         reconcile_coordinate_change_families(effects, &FamilyCounts::default(), &superseded)?;
 
         // 5. No control entry (internal op) -> no entry recipients; only events.
-        let event_positions = write_events(transaction, ctx).await?;
+        let event_positions =
+            write_events_with_cursor(transaction, ctx, event_cursor.as_deref_mut()).await?;
 
         Ok(AppliedTransition {
             // No control entry / seq was allocated; echo the unchanged counter.
@@ -19026,6 +19572,391 @@ mod executor {
             event_positions,
             successor_coordinate: plan.successor_coordinate().copied(),
         })
+    }
+
+    /// A single member whose complete rejectable semantics were checked before
+    /// the batch prefix. The fields are private and the type is held only by the
+    /// opaque batch, so application cannot receive a newly substituted plan or
+    /// context after the first write.
+    struct PreparedRevocationMember<'plan> {
+        plan: &'plan ConversationPersistencePlan,
+        context: ExecutionContext,
+        conversation_id: Uuid,
+        generation: i64,
+        state_version: i64,
+        next_entry_seq: i64,
+        revocation_id: Uuid,
+        accepted_at: DateTime<Utc>,
+    }
+
+    /// Opaque state-machine half of the G6 capsule. Raw members, cursors and
+    /// symbolic events never cross the module boundary.
+    #[must_use = "prepared revocation members must be consumed atomically"]
+    pub(crate) struct PreparedDeviceRevocationBatchMembers<'plan> {
+        plan: &'plan DeviceRevocationBatchPersistencePlan,
+        members: Vec<PreparedRevocationMember<'plan>>,
+        cursor: EventChainCursor,
+    }
+
+    /// Typestate returned only after the immutable/device-global prefix has
+    /// succeeded. It remains opaque and can be consumed exactly once.
+    pub(crate) struct PrefixedDeviceRevocationBatchMembers<'plan> {
+        members: Vec<PreparedRevocationMember<'plan>>,
+        cursor: EventChainCursor,
+    }
+
+    /// Complete SQL-free preflight for every semantic rejection formerly
+    /// reachable from `apply_device_revocation`. In particular, this validates
+    /// every family edge and requires an exact bijection between superseded
+    /// Welcome IDs and disposition artifacts.
+    fn preflight_device_revocation_plan_and_context<'plan>(
+        plan: &'plan ConversationPersistencePlan,
+        context: ExecutionContext,
+        batch_revocation_id: Uuid,
+    ) -> Result<PreparedRevocationMember<'plan>, ExecutorError> {
+        let effects = plan.effects();
+        if effects.kind() != PlanKind::DeviceRevocation {
+            return Err(ExecutorError::InconsistentPlan(
+                "prepared revocation member has non-revocation plan",
+            ));
+        }
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan("missing head CAS binding"))?;
+        let expected_prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "device revocation needs a prior",
+            ))?;
+        let expected_generation = checked_i64(expected_prior.generation())?;
+        let expected_state_version = checked_i64(expected_prior.state_version())?;
+        let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
+        let successor_next_entry_seq = checked_i64(head.successor_next_entry_seq())?;
+        let evidence = match effects.authority() {
+            Some(PlanAuthority::DeviceRevocation(evidence)) => evidence,
+            _ => {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation plan missing revocation authority",
+                ))
+            }
+        };
+        let revocation_id = Uuid::from_bytes(*evidence.revocation_id());
+        if revocation_id != batch_revocation_id || context.operation_id() != revocation_id {
+            return Err(ExecutorError::MissingContext(
+                "exact device revocation operation id",
+            ));
+        }
+        let accepted_at = server_instant(evidence.accepted_at())?;
+        if context.applied_at != accepted_at {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation context instant disagrees with authority",
+            ));
+        }
+
+        reject_if_present("participant_changes", effects.participant_changes())?;
+        reject_if_present("leaf_changes", effects.leaf_changes())?;
+        reject_if_present("interval_changes", effects.interval_changes())?;
+        reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
+        reject_if_present("reset_request_changes", effects.reset_request_changes())?;
+        reject_if_present("leave_request_changes", effects.leave_request_changes())?;
+        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        if effects.metadata_change().is_some() {
+            return Err(ExecutorError::UnsupportedEffect(
+                "device revocation metadata change",
+            ));
+        }
+        if effects.welcome_cas().is_some()
+            || effects.revocation_target_cas().is_some()
+            || effects.invitation_quota_cas().is_some()
+        {
+            return Err(ExecutorError::UnsupportedEffect(
+                "device revocation welcome/target/quota CAS",
+            ));
+        }
+        let coordinate = &plan.state().coordinate;
+        let generation = checked_i64(coordinate.generation())?;
+        let state_version = checked_i64(coordinate.state_version())?;
+        let _epoch = checked_i64(coordinate.epoch())?;
+        if successor_next_entry_seq != expected_next_entry_seq {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation must not advance the seq counter",
+            ));
+        }
+        if generation != expected_generation || state_version != expected_state_version {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation must not change the coordinate",
+            ));
+        }
+        if !effects.package_transitions().is_empty()
+            && !revocation_package_cas_bijection_valid(effects)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation package CAS is not bijective with the Reserved->Revoked edges",
+            ));
+        }
+        if effects.recovery_request_changes().iter().any(|change| {
+            !matches!(
+                (change.before(), change.after()),
+                (Some(before), Some(after))
+                    if before.status() == RecoveryRequestStatus::Open
+                        && after.status() == RecoveryRequestStatus::Superseded
+            )
+        }) {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation recovery request family is not exact Open->Superseded",
+            ));
+        }
+        if effects.reservation_changes().iter().any(|change| {
+            !matches!(
+                (change.before(), change.after()),
+                (Some(before), Some(after))
+                    if before.status() == ReservationStatus::Active
+                        && after.status() == ReservationStatus::Released
+            )
+        }) {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation reservation family is not exact Active->Released",
+            ));
+        }
+        if effects
+            .package_transitions()
+            .iter()
+            .any(|edge| edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Revoked)
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation package family is not exact Reserved->Revoked",
+            ));
+        }
+
+        let mut welcome_ids = BTreeSet::new();
+        for change in effects.welcome_changes() {
+            let (before, after) = match (change.before(), change.after()) {
+                (Some(before), Some(after))
+                    if before.status() == WelcomeStatus::Pending
+                        && after.status() == WelcomeStatus::Superseded =>
+                {
+                    (before, after)
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "device revocation Welcome family is not exact Pending->Superseded",
+                    ))
+                }
+            };
+            if before.welcome_id() != after.welcome_id()
+                || !welcome_ids.insert(Uuid::from_bytes(*after.welcome_id()))
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "device revocation Welcome family repeats or changes identity",
+                ));
+            }
+        }
+        let mut disposition_ids = BTreeSet::new();
+        for disposition in &context.welcome_dispositions {
+            if !disposition_ids.insert(disposition.welcome_id) {
+                return Err(ExecutorError::MissingContext(
+                    "unique welcome disposition event per superseded welcome",
+                ));
+            }
+        }
+        if welcome_ids != disposition_ids {
+            return Err(ExecutorError::MissingContext(
+                "exact welcome disposition events for superseded welcomes",
+            ));
+        }
+
+        Ok(PreparedRevocationMember {
+            plan,
+            context,
+            conversation_id: Uuid::from_bytes(*coordinate.conversation_id()),
+            generation,
+            state_version,
+            next_entry_seq: successor_next_entry_seq,
+            revocation_id,
+            accepted_at,
+        })
+    }
+
+    /// Mint the opaque state-machine batch only after repository hydration has
+    /// produced the unforgeable proof. All member preflights and the complete
+    /// event schedule are frozen before this returns.
+    pub(crate) fn prepare_device_revocation_batch_members<'plan>(
+        plan: &'plan DeviceRevocationBatchPersistencePlan,
+        contexts: Vec<ExecutionContext>,
+        prelude_digest: [u8; 32],
+        devices: Vec<DeviceIdentity>,
+        initial_tails: Vec<Option<i64>>,
+        _proof: crate::chat_protocol::repository::execution_context::RevocationBatchHydrationProof,
+    ) -> Result<PreparedDeviceRevocationBatchMembers<'plan>, ExecutorError> {
+        if plan.conversations().len() != contexts.len() {
+            return Err(ExecutorError::InconsistentPlan(
+                "device revocation batch needs one execution context per conversation",
+            ));
+        }
+        let revocation_id = preflight_device_revocation_batch(plan)?;
+        let slots = devices
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, device)| {
+                let slot = u32::try_from(index)
+                    .map(EventChainSlot)
+                    .map_err(|_| ExecutorError::EventChain(EventChainCursorError::UnknownSlot))?;
+                Ok((device, slot))
+            })
+            .collect::<Result<BTreeMap<_, _>, ExecutorError>>()?;
+        let mut members = Vec::with_capacity(contexts.len());
+        let mut schedule = Vec::new();
+        for (member_plan, context) in plan.conversations().iter().zip(contexts) {
+            let member =
+                preflight_device_revocation_plan_and_context(member_plan, context, revocation_id)?;
+            for disposition in &member.context.welcome_dispositions {
+                schedule.push(prepared_revocation_event_from_fanout(
+                    &disposition.event,
+                    &slots,
+                )?);
+            }
+            for event in &member.context.events {
+                schedule.push(prepared_revocation_event_from_fanout(event, &slots)?);
+            }
+            members.push(member);
+        }
+        let cursor = EventChainCursor::new(prelude_digest, devices, initial_tails, schedule)
+            .map_err(ExecutorError::EventChain)?;
+        Ok(PreparedDeviceRevocationBatchMembers {
+            plan,
+            members,
+            cursor,
+        })
+    }
+
+    fn prepared_revocation_event_from_fanout(
+        event: &EventFanout,
+        slots: &BTreeMap<DeviceIdentity, EventChainSlot>,
+    ) -> Result<PreparedRevocationEvent, ExecutorError> {
+        let recipients = event
+            .recipients
+            .iter()
+            .map(|(device, entitlement, _)| {
+                let slot = slots.get(device).copied().ok_or(ExecutorError::EventChain(
+                    EventChainCursorError::UnknownSlot,
+                ))?;
+                Ok(PreparedRevocationRecipient {
+                    slot,
+                    entitlement: *entitlement,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+        PreparedRevocationEvent::new(
+            event.event_id,
+            event.event_kind,
+            event.payload_bytes.clone(),
+            recipients,
+            event.outbox.clone(),
+        )
+        .map_err(ExecutorError::EventChain)
+    }
+
+    async fn apply_prepared_device_revocation_member(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        member: PreparedRevocationMember<'_>,
+        event_cursor: &mut EventChainCursor,
+    ) -> Result<AppliedTransition, ExecutorError> {
+        let effects = member.plan.effects();
+        transition::cas_conversation_head(
+            transaction,
+            &transition::ConversationHeadCas {
+                conversation_id: member.conversation_id,
+                expected_generation: member.generation,
+                expected_state_version: member.state_version,
+                expected_next_entry_seq: member.next_entry_seq,
+                successor_generation: member.generation,
+                successor_state_version: member.state_version,
+                successor_next_entry_seq: member.next_entry_seq,
+                close: None,
+            },
+        )
+        .await?;
+        write_revocation_bound_supersessions(
+            transaction,
+            effects,
+            member.revocation_id,
+            member.accepted_at,
+        )
+        .await?;
+        for change in effects.welcome_changes() {
+            let after = change
+                .after()
+                .expect("prepared revocation Welcome has an after image");
+            let welcome_id = Uuid::from_bytes(*after.welcome_id());
+            let disposition = member
+                .context
+                .welcome_dispositions
+                .iter()
+                .find(|input| input.welcome_id == welcome_id)
+                .expect("prepared revocation has exact Welcome dispositions");
+            let position = append_one_event_with_cursor(
+                transaction,
+                &member.context,
+                &disposition.event,
+                Some(event_cursor),
+            )
+            .await?;
+            delivery::terminalize_welcome_delivery_for_supersession(
+                transaction,
+                welcome_id,
+                &WelcomeDisposition::SupersededByRevocation {
+                    terminal_revocation_id: member.revocation_id,
+                },
+                member.context.applied_at,
+                position,
+            )
+            .await?;
+        }
+        let event_positions =
+            write_events_with_cursor(transaction, &member.context, Some(event_cursor)).await?;
+        Ok(AppliedTransition {
+            allocated_seq: u64::try_from(member.next_entry_seq)
+                .expect("prepared next entry sequence is nonnegative"),
+            entry_id: member.revocation_id,
+            event_positions,
+            successor_coordinate: member.plan.successor_coordinate().copied(),
+        })
+    }
+
+    /// Consume the state-machine half of the opaque capsule. The only errors
+    /// after the prefix are durable SQL/CAS failures or violations of the
+    /// already-frozen event-position cursor; no plan/context semantics are
+    /// revalidated here.
+    pub(crate) async fn apply_prepared_device_revocation_prefix<'plan>(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        prepared: PreparedDeviceRevocationBatchMembers<'plan>,
+    ) -> Result<PrefixedDeviceRevocationBatchMembers<'plan>, ExecutorError> {
+        let PreparedDeviceRevocationBatchMembers {
+            plan,
+            members,
+            cursor,
+        } = prepared;
+        apply_device_revocation_batch_prefix(transaction, plan).await?;
+        Ok(PrefixedDeviceRevocationBatchMembers { members, cursor })
+    }
+
+    pub(crate) async fn apply_prepared_device_revocation_members(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        prepared: PrefixedDeviceRevocationBatchMembers<'_>,
+    ) -> Result<Vec<AppliedTransition>, ExecutorError> {
+        let PrefixedDeviceRevocationBatchMembers {
+            members,
+            mut cursor,
+        } = prepared;
+        let mut applied = Vec::with_capacity(members.len());
+        for member in members {
+            applied.push(
+                apply_prepared_device_revocation_member(transaction, member, &mut cursor).await?,
+            );
+        }
+        cursor.finish().map_err(ExecutorError::EventChain)?;
+        Ok(applied)
     }
 
     /// Terminalize the target's OWN open recovery requests / active reservations /
@@ -19140,7 +20071,7 @@ mod executor {
     /// This function never begins, commits, or rolls back a transaction. The
     /// eventual handler owns the idempotency receipt required by the deferred
     /// revocation mapping.
-    pub(crate) async fn apply_device_revocation_batch_prefix(
+    async fn apply_device_revocation_batch_prefix(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &DeviceRevocationBatchPersistencePlan,
     ) -> Result<(), ExecutorError> {
@@ -19194,7 +20125,7 @@ mod executor {
     /// Compatibility seam for executor harnesses that construct contexts
     /// directly. Production callers cannot prehydrate a revocation batch.
     #[cfg(test)]
-    pub(crate) async fn apply_device_revocation_batch(
+    pub(crate) async fn apply_device_revocation_batch_unscoped_for_test(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &DeviceRevocationBatchPersistencePlan,
         conversation_ctxs: &[ExecutionContext],
@@ -19217,8 +20148,14 @@ mod executor {
         apply_device_revocation_batch_prefix(transaction, plan).await?;
         let mut applied = Vec::with_capacity(plan.conversations().len());
         for (conversation, ctx) in plan.conversations().iter().zip(conversation_ctxs) {
-            applied
-                .push(apply_conversation_persistence_plan(transaction, conversation, ctx).await?);
+            applied.push(
+                apply_conversation_persistence_plan_unscoped_for_test(
+                    transaction,
+                    conversation,
+                    ctx,
+                )
+                .await?,
+            );
         }
         Ok(applied)
     }
@@ -24358,6 +25295,16 @@ mod executor {
         effects: &TransitionEffects,
         cause: WelcomeSupersessionCause,
     ) -> Result<usize, ExecutorError> {
+        write_welcome_supersessions_with_cursor(transaction, ctx, effects, cause, None).await
+    }
+
+    async fn write_welcome_supersessions_with_cursor(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        effects: &TransitionEffects,
+        cause: WelcomeSupersessionCause,
+        mut event_cursor: Option<&mut EventChainCursor>,
+    ) -> Result<usize, ExecutorError> {
         let mut superseded = 0usize;
         for change in effects.welcome_changes() {
             // Only prior-bound supersessions here; a fulfillment's OWN new welcome
@@ -24379,7 +25326,13 @@ mod executor {
                 .ok_or(ExecutorError::MissingContext(
                     "welcome disposition event for a superseded welcome",
                 ))?;
-            let position = append_one_event(transaction, ctx, &disposition.event).await?;
+            let position = append_one_event_with_cursor(
+                transaction,
+                ctx,
+                &disposition.event,
+                event_cursor.as_deref_mut(),
+            )
+            .await?;
             let terminal_disposition = match cause {
                 WelcomeSupersessionCause::Transition {
                     terminal_transition_id,
@@ -24411,6 +25364,34 @@ mod executor {
         ctx: &ExecutionContext,
         event: &EventFanout,
     ) -> Result<i64, ExecutorError> {
+        append_one_event_with_cursor(transaction, ctx, event, None).await
+    }
+
+    async fn append_one_event_with_cursor(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        event: &EventFanout,
+        mut event_cursor: Option<&mut EventChainCursor>,
+    ) -> Result<i64, ExecutorError> {
+        // The symbolic schedule is a prewrite contract. Resolve and validate
+        // the exact audience before allocating the durable event position.
+        let recipients = match event_cursor.as_deref_mut() {
+            Some(cursor) => cursor
+                .begin_fanout(event)
+                .map_err(ExecutorError::EventChain)?,
+            None => event
+                .recipients
+                .iter()
+                .map(|(device, kind, predecessor)| {
+                    Ok(EventRecipient {
+                        user_did: device_did(device)?,
+                        device_id: device_uuid(device),
+                        entitlement_kind: *kind,
+                        audience_predecessor_position: *predecessor,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExecutorError>>()?,
+        };
         let position = delivery::append_event(
             transaction,
             &NewEvent {
@@ -24422,18 +25403,6 @@ mod executor {
             },
         )
         .await?;
-        let recipients = event
-            .recipients
-            .iter()
-            .map(|(device, kind, predecessor)| {
-                Ok(EventRecipient {
-                    user_did: device_did(device)?,
-                    device_id: device_uuid(device),
-                    entitlement_kind: *kind,
-                    audience_predecessor_position: *predecessor,
-                })
-            })
-            .collect::<Result<Vec<_>, ExecutorError>>()?;
         delivery::insert_event_recipients(transaction, position, &recipients).await?;
         for (outbox_id, work_kind) in &event.outbox {
             delivery::enqueue_outbox(
@@ -24445,6 +25414,11 @@ mod executor {
             )
             .await?;
         }
+        if let Some(cursor) = event_cursor {
+            cursor
+                .complete_event(event.event_id, position)
+                .map_err(ExecutorError::EventChain)?;
+        }
         Ok(position)
     }
 
@@ -24452,42 +25426,19 @@ mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         ctx: &ExecutionContext,
     ) -> Result<Vec<i64>, ExecutorError> {
+        write_events_with_cursor(transaction, ctx, None).await
+    }
+
+    async fn write_events_with_cursor(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        mut event_cursor: Option<&mut EventChainCursor>,
+    ) -> Result<Vec<i64>, ExecutorError> {
         let mut positions = Vec::with_capacity(ctx.events.len());
         for event in &ctx.events {
-            let position = delivery::append_event(
-                transaction,
-                &NewEvent {
-                    event_id: event.event_id,
-                    event_kind: event.event_kind,
-                    payload_bytes: event.payload_bytes.clone(),
-                    created_at: ctx.applied_at,
-                    protocol_instance_id: ctx.protocol_instance_id,
-                },
-            )
-            .await?;
-            let recipients = event
-                .recipients
-                .iter()
-                .map(|(device, kind, predecessor)| {
-                    Ok(EventRecipient {
-                        user_did: device_did(device)?,
-                        device_id: device_uuid(device),
-                        entitlement_kind: *kind,
-                        audience_predecessor_position: *predecessor,
-                    })
-                })
-                .collect::<Result<Vec<_>, ExecutorError>>()?;
-            delivery::insert_event_recipients(transaction, position, &recipients).await?;
-            for (outbox_id, work_kind) in &event.outbox {
-                delivery::enqueue_outbox(
-                    transaction,
-                    *outbox_id,
-                    position,
-                    *work_kind,
-                    ctx.applied_at,
-                )
-                .await?;
-            }
+            let position =
+                append_one_event_with_cursor(transaction, ctx, event, event_cursor.as_deref_mut())
+                    .await?;
             positions.push(position);
         }
         Ok(positions)
@@ -24496,6 +25447,203 @@ mod executor {
     #[cfg(test)]
     mod authority_shape_tests {
         use super::*;
+
+        fn cursor_device(seed: u8) -> DeviceIdentity {
+            let mut device_id = [seed; 16];
+            device_id[6] = (device_id[6] & 0x0f) | 0x40;
+            device_id[8] = (device_id[8] & 0x3f) | 0x80;
+            DeviceIdentity::new(
+                PrincipalId::new(format!("did:plc:cursorproof{seed:02}xxxxxxxx").into_bytes())
+                    .expect("valid cursor DID"),
+                device_id,
+            )
+            .expect("valid cursor device")
+        }
+
+        fn prepared_cursor_event(
+            event_id: Uuid,
+            slot: u32,
+            payload: &[u8],
+        ) -> PreparedRevocationEvent {
+            PreparedRevocationEvent::new(
+                event_id,
+                EventKind::ConversationChanged,
+                payload.to_vec(),
+                vec![PreparedRevocationRecipient {
+                    slot: EventChainSlot(slot),
+                    entitlement: EventEntitlementKind::Participant,
+                }],
+                vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            )
+            .expect("valid prepared cursor event")
+        }
+
+        #[test]
+        fn revocation_event_cursor_rejects_shape_and_state_mutations() {
+            let first_id = Uuid::new_v4();
+            let second_id = Uuid::new_v4();
+            let first = prepared_cursor_event(first_id, 0, b"first");
+            let second = prepared_cursor_event(second_id, 0, b"second");
+            let devices = vec![cursor_device(1)];
+
+            let mut cursor = EventChainCursor::new(
+                [7; 32],
+                devices.clone(),
+                vec![Some(41)],
+                vec![first.clone(), second.clone()],
+            )
+            .expect("valid cursor");
+            let recipients = cursor.begin_event(&first).expect("first event begins");
+            assert_eq!(recipients.len(), 1);
+            assert_eq!(recipients[0].audience_predecessor_position, Some(41));
+            assert!(matches!(
+                cursor.begin_event(&first),
+                Err(EventChainCursorError::EventAlreadyPending)
+            ));
+            assert!(matches!(
+                cursor.complete_event(first_id, 41),
+                Err(EventChainCursorError::PositionNotMonotonic)
+            ));
+            cursor
+                .complete_event(first_id, 42)
+                .expect("first event completes");
+            assert!(matches!(
+                cursor.finish_for_test(),
+                Err(EventChainCursorError::IncompleteSchedule)
+            ));
+            let recipients = cursor.begin_event(&second).expect("second event begins");
+            assert_eq!(
+                recipients[0].audience_predecessor_position,
+                Some(42),
+                "the first prepared event must advance the shared device tail"
+            );
+            cursor
+                .complete_event(second_id, 43)
+                .expect("second event completes");
+            cursor.finish().expect("complete schedule finishes");
+
+            let mut reordered = EventChainCursor::new(
+                [7; 32],
+                devices.clone(),
+                vec![Some(41)],
+                vec![first.clone(), second.clone()],
+            )
+            .expect("valid cursor");
+            assert!(matches!(
+                reordered.begin_event(&second),
+                Err(EventChainCursorError::UnexpectedEvent)
+            ));
+
+            let changed = prepared_cursor_event(first_id, 0, b"changed");
+            let mut changed_cursor = EventChainCursor::new(
+                [7; 32],
+                devices.clone(),
+                vec![Some(41)],
+                vec![first.clone()],
+            )
+            .expect("valid cursor");
+            assert!(matches!(
+                changed_cursor.begin_event(&changed),
+                Err(EventChainCursorError::EventShapeMismatch)
+            ));
+
+            let unknown = prepared_cursor_event(first_id, 1, b"first");
+            assert!(matches!(
+                EventChainCursor::new([7; 32], devices, vec![Some(41)], vec![unknown]),
+                Err(EventChainCursorError::UnknownSlot)
+            ));
+
+            let duplicate = PreparedRevocationEvent::new(
+                first_id,
+                EventKind::ConversationChanged,
+                b"first".to_vec(),
+                vec![
+                    PreparedRevocationRecipient {
+                        slot: EventChainSlot(0),
+                        entitlement: EventEntitlementKind::Participant,
+                    },
+                    PreparedRevocationRecipient {
+                        slot: EventChainSlot(0),
+                        entitlement: EventEntitlementKind::Participant,
+                    },
+                ],
+                vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+            );
+            assert!(matches!(
+                duplicate,
+                Err(EventChainCursorError::DuplicateRecipient)
+            ));
+
+            let mut no_pending =
+                EventChainCursor::new([7; 32], vec![cursor_device(1)], vec![None], vec![])
+                    .expect("empty schedule cursor");
+            assert!(matches!(
+                no_pending.complete_event(first_id, 1),
+                Err(EventChainCursorError::NoPendingEvent)
+            ));
+        }
+
+        #[test]
+        fn revocation_event_cursor_preserves_exact_historical_welcome_recipient() {
+            let current_participant = cursor_device(1);
+            // This slot models an inactive/historical target device retained
+            // solely because a pending Welcome names it exactly.
+            let historical_welcome_recipient = cursor_device(2);
+            let event_id = Uuid::new_v4();
+            let outbox = vec![(Uuid::new_v4(), OutboxWorkKind::Stream)];
+            let prepared = PreparedRevocationEvent::new(
+                event_id,
+                EventKind::WelcomeDisposition,
+                b"exact historical Welcome".to_vec(),
+                vec![PreparedRevocationRecipient {
+                    slot: EventChainSlot(1),
+                    entitlement: EventEntitlementKind::Welcome,
+                }],
+                outbox.clone(),
+            )
+            .expect("exact historical Welcome schedule");
+            let live = EventFanout {
+                event_id,
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: b"exact historical Welcome".to_vec(),
+                recipients: vec![(
+                    historical_welcome_recipient.clone(),
+                    EventEntitlementKind::Welcome,
+                    Some(999), // Ignored: the locked prelude owns the true tail.
+                )],
+                outbox,
+            };
+            let mut cursor = EventChainCursor::new(
+                [9; 32],
+                vec![current_participant, historical_welcome_recipient.clone()],
+                vec![Some(40), Some(73)],
+                vec![prepared],
+            )
+            .expect("cursor retains historical Welcome recipient slot");
+            let recipients = cursor
+                .begin_fanout(&live)
+                .expect("exact historical Welcome event matches");
+            assert_eq!(recipients.len(), 1);
+            assert_eq!(
+                recipients[0].device_id,
+                Uuid::from_bytes(*historical_welcome_recipient.device_id())
+            );
+            assert_eq!(
+                recipients[0].entitlement_kind,
+                EventEntitlementKind::Welcome
+            );
+            assert_eq!(recipients[0].audience_predecessor_position, Some(73));
+            cursor.complete_event(event_id, 74).expect("event advances");
+            cursor.finish().expect("exact Welcome schedule consumed");
+        }
+
+        #[test]
+        fn transaction_identity_failure_requires_outer_abort() {
+            assert!(
+                ExecutorError::TransactionIdentity(sqlx::Error::RowNotFound).requires_outer_abort()
+            );
+            assert!(!ExecutorError::TransactionBindingMismatch.requires_outer_abort());
+        }
 
         #[test]
         fn welcome_expiry_authority_is_entryless_and_retains_exact_welcome_id() {

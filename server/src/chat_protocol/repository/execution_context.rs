@@ -13,24 +13,30 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
+use sqlx::{Acquire, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::core::LockedG6Prelude;
 use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
 };
 use super::transition::{ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
+#[cfg(test)]
+use crate::chat_protocol::state_machine::apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test;
+use crate::chat_protocol::state_machine::executor::ExecutionContext;
 use crate::chat_protocol::state_machine::{
-    apply_conversation_persistence_plan, apply_device_revocation_batch_prefix, AppliedTransition,
-    ControlEntryContent, ConversationPersistencePlan, DeviceIdentity,
-    DeviceRevocationBatchPersistencePlan, EventFanout, ExecutionActor, ExecutionAuthority,
-    ExecutionContext, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
-    MetadataAuthorColumns, ParticipantRole, PlanAuthority, PlanKind, PrincipalId,
-    RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp, SpineArtifacts,
-    WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
-    WelcomeStatus,
+    apply_prepared_device_revocation_members, apply_prepared_device_revocation_prefix,
+    batch_transaction_bindings_match, plan_transaction_bindings_match,
+    prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
+    ConversationPersistencePlan, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
+    EventChainCursorError, EventFanout, ExecutionActor, ExecutionAuthority, ExecutorError,
+    LeafPersistenceColumns, LeafRecoveryKind, MetadataAuthorColumns, ParticipantRole,
+    PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
+    PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
+    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
+    WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
     decode_and_verify_control_entry, decode_and_verify_signed_mutation, CanonicalValueRef,
@@ -88,8 +94,40 @@ pub(crate) enum SequentialDeviceRevocationError {
     ExtraConversationArtifacts(Uuid),
     #[error("device revocation execution-context hydration failed")]
     Hydration(ExecutionContextHydrationError),
+    #[error("device revocation G6 prelude does not match the sealed batch")]
+    PreludeMismatch,
+    #[error("device revocation event schedule does not match the locked G6 audience")]
+    EventChain(#[from] EventChainCursorError),
     #[error("device revocation persistence execution failed")]
     Executor(ExecutorError),
+    #[error("device revocation savepoint begin failed")]
+    SavepointBegin(sqlx::Error),
+    #[error("device revocation live transaction identity read failed")]
+    TransactionIdentity(sqlx::Error),
+    #[error("device revocation savepoint release failed")]
+    SavepointRelease(sqlx::Error),
+    #[error("device revocation explicit savepoint rollback failed")]
+    ExplicitRollback(sqlx::Error),
+    #[error("device revocation operation and savepoint rollback both failed")]
+    SavepointRollback {
+        operation: Box<SequentialDeviceRevocationError>,
+        rollback: sqlx::Error,
+    },
+}
+
+impl SequentialDeviceRevocationError {
+    /// Savepoint infrastructure failures require abandonment or rollback of the
+    /// caller-owned outer transaction before it can be reused.
+    pub(crate) fn requires_outer_abort(&self) -> bool {
+        matches!(
+            self,
+            Self::SavepointBegin(_)
+                | Self::TransactionIdentity(_)
+                | Self::SavepointRelease(_)
+                | Self::ExplicitRollback(_)
+                | Self::SavepointRollback { .. }
+        ) || matches!(self, Self::Executor(error) if error.requires_outer_abort())
+    }
 }
 
 impl From<ExecutionContextHydrationError> for SequentialDeviceRevocationError {
@@ -1190,7 +1228,7 @@ async fn recovery_open(
 /// events for one device. H1b's revocation-fanout orchestration therefore reuses
 /// this facade inside its per-conversation apply loop rather than constructing
 /// the current executor's test-oriented `Vec<ExecutionContext>` up front.
-pub(crate) async fn hydrate_execution_context(
+async fn hydrate_execution_context_inner(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
@@ -1512,6 +1550,89 @@ pub(crate) async fn hydrate_execution_context(
     })
 }
 
+/// Unforgeable proof that execution-context hydration completed inside the
+/// transaction exclusively borrowed by `PreparedConversationExecution`.
+pub(crate) struct ExecutionContextHydrationProof {
+    _minted_here: (),
+}
+
+/// Unforgeable witness that the repository layer hydrated the complete G6
+/// member set under the capsule-owned savepoint. The state-machine executor
+/// requires this token before it will mint opaque prepared members; no caller
+/// can assemble a raw plan/context/cursor execution surface.
+pub(crate) struct RevocationBatchHydrationProof {
+    _minted_here: (),
+}
+
+/// Production hydration returns a single-use capsule that exclusively retains
+/// the caller's transaction until apply consumes it. No raw context escapes
+/// this module in production builds.
+pub(crate) async fn hydrate_execution_context<'borrow, 'connection, 'plan>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    let expected_transaction_id = plan
+        .effects()
+        .head_cas()
+        .ok_or(ExecutionContextHydrationError::MissingAuthority)?
+        .transaction_id()
+        .to_owned();
+    if !plan_transaction_bindings_match(plan, &expected_transaction_id) {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let context = hydrate_execution_context_inner(transaction, plan, artifacts).await?;
+    Ok(PreparedConversationExecution::from_hydrated_parts(
+        transaction,
+        plan,
+        context,
+        expected_transaction_id.into_boxed_str(),
+        ExecutionContextHydrationProof { _minted_here: () },
+    ))
+}
+
+/// cfg(test) mutation harnesses retain raw contexts so they can corrupt one
+/// family at a time. Production builds do not compile this separable seam.
+#[cfg(test)]
+pub(crate) async fn hydrate_execution_context_unscoped_for_test(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+) -> Result<ExecutionContext, ExecutionContextHydrationError> {
+    hydrate_execution_context_inner(transaction, plan, artifacts).await
+}
+
+/// Test-only constructor for exercising the exact production capsule and
+/// savepoint executor with a mutation-harness context. It never rewrites a
+/// plan binding: the live transaction must already match every retained
+/// transaction-bound effect.
+#[cfg(test)]
+pub(crate) async fn prepare_execution_context_for_test<'borrow, 'connection, 'plan>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    context: ExecutionContext,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if !plan_transaction_bindings_match(plan, &live_transaction_id) {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    Ok(PreparedConversationExecution::from_hydrated_parts(
+        transaction,
+        plan,
+        context,
+        live_transaction_id.into_boxed_str(),
+        ExecutionContextHydrationProof { _minted_here: () },
+    ))
+}
+
 /// Read-only preflight for one conversation's entryless revocation authority.
 ///
 /// This deliberately verifies only the authority needed before the batch's
@@ -1560,23 +1681,296 @@ async fn preflight_device_revocation_execution_authority(
     }
 }
 
-/// Apply a sealed device-revocation batch inside the caller-owned transaction.
-///
-/// The complete keyed artifact set is validated before the immutable/global
-/// prefix performs its first write. Conversations then run strictly in the
-/// planner's canonical order, with each context hydrated immediately before its
-/// persistence plan is applied. This ordering makes the prior conversation's
-/// newly appended device event visible to the next hydration's predecessor read.
-///
-/// The caller must already hold every revocation guard consumed by
-/// `plan_device_revocation_batch`; this seam acquires no revocation-specific
-/// target, fanout, package, or conversation guards. It does not begin, commit, or
-/// roll back the transaction and does not record an idempotency receipt.
-pub(crate) async fn apply_device_revocation_batch_sequential(
+fn validate_g6_prelude_binding(
+    plan: &DeviceRevocationBatchPersistencePlan,
+    prelude: &LockedG6Prelude,
+) -> Result<(), SequentialDeviceRevocationError> {
+    let authority = plan.authority();
+    let actor = authority.actor();
+    let target = authority.target();
+    let (prelude_target_did, prelude_target_device_id, prelude_target_generation) =
+        prelude.target();
+    let conversation_ids = plan
+        .conversations()
+        .iter()
+        .map(|conversation| Uuid::from_bytes(*conversation.state().coordinate.conversation_id()))
+        .collect::<Vec<_>>();
+    let head_digests = plan
+        .conversations()
+        .iter()
+        .map(|conversation| {
+            conversation
+                .effects()
+                .head_cas()
+                .map(|head| *head.locked_head_digest())
+                .ok_or(SequentialDeviceRevocationError::PreludeMismatch)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if prelude.transaction_id() != plan.target_cas().transaction_id()
+        || !batch_transaction_bindings_match(plan, prelude.transaction_id())
+        || prelude.fanout_digest() != plan.fanout_manifest_digest()
+        || prelude.conversation_ids() != conversation_ids
+        || prelude.head_digests() != head_digests
+        || prelude.trusted_instant().timestamp_millis() != authority.accepted_at().unix_millis()
+        || prelude.business().actor_did().as_bytes() != actor.principal().as_bytes()
+        || prelude.business().actor_device_id().as_bytes() != actor.device_id()
+        || u64::try_from(prelude.business().auth_generation()).ok()
+            != Some(authority.actor_auth_generation())
+        || prelude_target_did.as_bytes() != target.principal().as_bytes()
+        || prelude_target_device_id.as_bytes() != target.device_id()
+        || prelude_target_generation != authority.expected_target_auth_generation()
+    {
+        return Err(SequentialDeviceRevocationError::PreludeMismatch);
+    }
+    Ok(())
+}
+
+async fn prepare_device_revocation_contexts(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &DeviceRevocationBatchPersistencePlan,
+    artifact_inputs: Vec<ConversationExecutionArtifacts>,
+) -> Result<Vec<ExecutionContext>, SequentialDeviceRevocationError> {
+    let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(SequentialDeviceRevocationError::TransactionIdentity)?;
+    if !batch_transaction_bindings_match(plan, &live_transaction_id) {
+        return Err(SequentialDeviceRevocationError::Hydration(
+            ExecutionContextHydrationError::AuthorityMismatch,
+        ));
+    }
+    let mut expected_ids = BTreeSet::new();
+    for conversation in plan.conversations() {
+        let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+        if !expected_ids.insert(conversation_id) {
+            return Err(SequentialDeviceRevocationError::Executor(
+                ExecutorError::InconsistentPlan("device revocation batch repeats a conversation"),
+            ));
+        }
+    }
+    let mut artifacts_by_id = BTreeMap::new();
+    for input in artifact_inputs {
+        if !expected_ids.contains(&input.conversation_id) {
+            return Err(SequentialDeviceRevocationError::ExtraConversationArtifacts(
+                input.conversation_id,
+            ));
+        }
+        if artifacts_by_id
+            .insert(input.conversation_id, input.artifacts)
+            .is_some()
+        {
+            return Err(
+                SequentialDeviceRevocationError::DuplicateConversationArtifacts(
+                    input.conversation_id,
+                ),
+            );
+        }
+    }
+    for conversation_id in &expected_ids {
+        if !artifacts_by_id.contains_key(conversation_id) {
+            return Err(
+                SequentialDeviceRevocationError::MissingConversationArtifacts(*conversation_id),
+            );
+        }
+    }
+    let batch_revocation_id = Uuid::from_bytes(*plan.authority().revocation_id());
+    let mut contexts = Vec::with_capacity(plan.conversations().len());
+    for conversation in plan.conversations() {
+        preflight_device_revocation_execution_authority(
+            transaction,
+            conversation,
+            batch_revocation_id,
+        )
+        .await?;
+        let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
+        let artifacts = artifacts_by_id
+            .remove(&conversation_id)
+            .expect("complete artifact set was preflighted");
+        contexts.push(hydrate_execution_context_inner(transaction, conversation, artifacts).await?);
+    }
+    Ok(contexts)
+}
+
+/// Opaque, savepoint-owning G6 execution. Construction freezes every context
+/// and event shape before the prefix can write; application can only consume
+/// this exact plan/prelude/context set once.
+#[must_use = "a prepared revocation batch must be consumed or explicitly rolled back"]
+pub(crate) struct PreparedDeviceRevocationBatchExecution<'transaction, 'plan> {
+    savepoint: Transaction<'transaction, Postgres>,
+    members: PreparedDeviceRevocationBatchMembers<'plan>,
+    expected_transaction_id: Box<str>,
+    #[cfg(test)]
+    cancellation_hook: Option<DeviceRevocationCancellationHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceRevocationCancellationPoint {
+    BeforePrefix,
+    AfterPrefix,
+    BeforeRelease,
+}
+
+#[cfg(test)]
+type DeviceRevocationCancellationHook = Box<
+    dyn FnMut(
+            DeviceRevocationCancellationPoint,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send,
+>;
+
+impl PreparedDeviceRevocationBatchExecution<'_, '_> {
+    /// Explicitly unwind the capsule savepoint before returning the borrowed
+    /// outer transaction to its owner.
+    pub(crate) async fn rollback(self) -> Result<(), SequentialDeviceRevocationError> {
+        self.savepoint
+            .rollback()
+            .await
+            .map_err(SequentialDeviceRevocationError::ExplicitRollback)
+    }
+
+    /// Capsule-local deterministic cancellation seam. It is test-only and
+    /// travels with this one prepared batch; there is no process-global hook.
+    #[cfg(test)]
+    pub(crate) fn set_cancellation_hook(&mut self, hook: DeviceRevocationCancellationHook) {
+        self.cancellation_hook = Some(hook);
+    }
+}
+
+/// Mutation-harness constructor for the exact production capsule. It bypasses
+/// SQL hydration only so a test can corrupt a later raw context and prove the
+/// complete pure preflight rejects it before the prefix. The returned type and
+/// application path are identical to production.
+#[cfg(test)]
+pub(crate) async fn prepare_device_revocation_batch_execution_from_contexts_for_test<
+    'transaction,
+    'connection,
+    'plan,
+>(
+    transaction: &'transaction mut Transaction<'connection, Postgres>,
+    plan: &'plan DeviceRevocationBatchPersistencePlan,
+    prelude: LockedG6Prelude,
+    contexts: Vec<ExecutionContext>,
+) -> Result<
+    PreparedDeviceRevocationBatchExecution<'transaction, 'plan>,
+    SequentialDeviceRevocationError,
+> {
+    validate_g6_prelude_binding(plan, &prelude)?;
+    let expected_transaction_id = prelude.transaction_id().to_owned().into_boxed_str();
+    let mut savepoint = transaction
+        .begin()
+        .await
+        .map_err(SequentialDeviceRevocationError::SavepointBegin)?;
+    let devices = prelude
+        .devices()
+        .iter()
+        .map(|fact| fact.device().clone())
+        .collect();
+    let initial_tails = prelude
+        .devices()
+        .iter()
+        .map(|fact| fact.initial_event_tail())
+        .collect();
+    let operation = prepare_device_revocation_batch_members(
+        plan,
+        contexts,
+        *prelude.scope_digest(),
+        devices,
+        initial_tails,
+        RevocationBatchHydrationProof { _minted_here: () },
+    )
+    .map_err(SequentialDeviceRevocationError::Executor);
+    match operation {
+        Ok(members) => Ok(PreparedDeviceRevocationBatchExecution {
+            savepoint,
+            members,
+            expected_transaction_id,
+            cancellation_hook: None,
+        }),
+        Err(operation) => match savepoint.rollback().await {
+            Ok(()) => Err(operation),
+            Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
+                operation: Box::new(operation),
+                rollback,
+            }),
+        },
+    }
+}
+
+pub(crate) async fn prepare_device_revocation_batch_execution<'transaction, 'connection, 'plan>(
+    transaction: &'transaction mut Transaction<'connection, Postgres>,
+    plan: &'plan DeviceRevocationBatchPersistencePlan,
+    prelude: LockedG6Prelude,
+    artifact_inputs: Vec<ConversationExecutionArtifacts>,
+) -> Result<
+    PreparedDeviceRevocationBatchExecution<'transaction, 'plan>,
+    SequentialDeviceRevocationError,
+> {
+    validate_g6_prelude_binding(plan, &prelude)?;
+    let expected_transaction_id = prelude.transaction_id().to_owned().into_boxed_str();
+    let mut savepoint = transaction
+        .begin()
+        .await
+        .map_err(SequentialDeviceRevocationError::SavepointBegin)?;
+    let operation = async {
+        let contexts =
+            prepare_device_revocation_contexts(&mut savepoint, plan, artifact_inputs).await?;
+        let devices = prelude
+            .devices()
+            .iter()
+            .map(|fact| fact.device().clone())
+            .collect();
+        let initial_tails = prelude
+            .devices()
+            .iter()
+            .map(|fact| fact.initial_event_tail())
+            .collect();
+        prepare_device_revocation_batch_members(
+            plan,
+            contexts,
+            *prelude.scope_digest(),
+            devices,
+            initial_tails,
+            RevocationBatchHydrationProof { _minted_here: () },
+        )
+        .map_err(SequentialDeviceRevocationError::Executor)
+    }
+    .await;
+    match operation {
+        Ok(members) => Ok(PreparedDeviceRevocationBatchExecution {
+            savepoint,
+            members,
+            expected_transaction_id,
+            #[cfg(test)]
+            cancellation_hook: None,
+        }),
+        Err(operation) => match savepoint.rollback().await {
+            Ok(()) => Err(operation),
+            Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
+                operation: Box::new(operation),
+                rollback,
+            }),
+        },
+    }
+}
+
+/// Test compatibility for legacy mutation harnesses. Production does not
+/// compile this separable plan/context execution seam.
+#[cfg(test)]
+async fn apply_device_revocation_batch_unscoped_for_test_inner(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &DeviceRevocationBatchPersistencePlan,
     artifact_inputs: Vec<ConversationExecutionArtifacts>,
 ) -> Result<Vec<AppliedTransition>, SequentialDeviceRevocationError> {
+    let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(ExecutionContextHydrationError::from)?;
+    if !batch_transaction_bindings_match(plan, &live_transaction_id) {
+        return Err(SequentialDeviceRevocationError::Hydration(
+            ExecutionContextHydrationError::AuthorityMismatch,
+        ));
+    }
     let mut expected_ids = BTreeSet::new();
     for conversation in plan.conversations() {
         let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
@@ -1624,17 +2018,116 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
         .await?;
     }
 
-    apply_device_revocation_batch_prefix(transaction, plan).await?;
-
-    let mut applied = Vec::with_capacity(plan.conversations().len());
+    let mut contexts = Vec::with_capacity(plan.conversations().len());
     for conversation in plan.conversations() {
         let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
         let artifacts = artifacts_by_id
             .remove(&conversation_id)
             .expect("complete artifact set was preflighted");
-        let context = hydrate_execution_context(transaction, conversation, artifacts).await?;
-        applied
-            .push(apply_conversation_persistence_plan(transaction, conversation, &context).await?);
+        let context =
+            hydrate_execution_context_unscoped_for_test(transaction, conversation, artifacts)
+                .await?;
+        contexts.push(context);
     }
-    Ok(applied)
+    apply_device_revocation_contexts_unscoped_for_test(transaction, plan, &contexts)
+        .await
+        .map_err(SequentialDeviceRevocationError::Executor)
+}
+
+#[cfg(test)]
+pub(crate) async fn apply_device_revocation_batch_unscoped_for_test(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &DeviceRevocationBatchPersistencePlan,
+    artifact_inputs: Vec<ConversationExecutionArtifacts>,
+) -> Result<Vec<AppliedTransition>, SequentialDeviceRevocationError> {
+    let mut savepoint = transaction
+        .begin()
+        .await
+        .map_err(SequentialDeviceRevocationError::SavepointBegin)?;
+    let operation = apply_device_revocation_batch_unscoped_for_test_inner(
+        &mut savepoint,
+        plan,
+        artifact_inputs,
+    )
+    .await;
+    match operation {
+        Ok(applied) => {
+            savepoint
+                .commit()
+                .await
+                .map_err(SequentialDeviceRevocationError::SavepointRelease)?;
+            Ok(applied)
+        }
+        Err(operation) => match savepoint.rollback().await {
+            Ok(()) => Err(operation),
+            Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
+                operation: Box::new(operation),
+                rollback,
+            }),
+        },
+    }
+}
+
+/// Consume the opaque G6 batch. No SQL hydration or audience read occurs after
+/// the prefix; only sealed writes and cursor-resolved event predecessors remain.
+///
+/// Cancellation contract: dropping this future drops SQLx's nested
+/// `Transaction`, whose `Drop` queues a savepoint rollback on the same
+/// connection. The owner must not detach that connection; it must perform and
+/// await a subsequent operation on the outer transaction so the connection
+/// drains the queued rollback before reuse, or roll back the outer transaction.
+/// A caller cancelling before application should prefer
+/// `PreparedDeviceRevocationBatchExecution::rollback`, which awaits the rollback
+/// directly.
+pub(crate) async fn apply_device_revocation_batch_sequential(
+    prepared: PreparedDeviceRevocationBatchExecution<'_, '_>,
+) -> Result<Vec<AppliedTransition>, SequentialDeviceRevocationError> {
+    let PreparedDeviceRevocationBatchExecution {
+        mut savepoint,
+        members,
+        expected_transaction_id,
+        #[cfg(test)]
+        mut cancellation_hook,
+    } = prepared;
+    let operation = async {
+        let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+            .fetch_one(&mut *savepoint)
+            .await
+            .map_err(SequentialDeviceRevocationError::TransactionIdentity)?;
+        if live_transaction_id != expected_transaction_id.as_ref() {
+            return Err(SequentialDeviceRevocationError::PreludeMismatch);
+        }
+        #[cfg(test)]
+        if let Some(hook) = cancellation_hook.as_mut() {
+            hook(DeviceRevocationCancellationPoint::BeforePrefix).await;
+        }
+        let prefixed = apply_prepared_device_revocation_prefix(&mut savepoint, members).await?;
+        #[cfg(test)]
+        if let Some(hook) = cancellation_hook.as_mut() {
+            hook(DeviceRevocationCancellationPoint::AfterPrefix).await;
+        }
+        let applied = apply_prepared_device_revocation_members(&mut savepoint, prefixed).await?;
+        #[cfg(test)]
+        if let Some(hook) = cancellation_hook.as_mut() {
+            hook(DeviceRevocationCancellationPoint::BeforeRelease).await;
+        }
+        Ok(applied)
+    }
+    .await;
+    match operation {
+        Ok(applied) => {
+            savepoint
+                .commit()
+                .await
+                .map_err(SequentialDeviceRevocationError::SavepointRelease)?;
+            Ok(applied)
+        }
+        Err(operation) => match savepoint.rollback().await {
+            Ok(()) => Err(operation),
+            Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
+                operation: Box::new(operation),
+                rollback,
+            }),
+        },
+    }
 }

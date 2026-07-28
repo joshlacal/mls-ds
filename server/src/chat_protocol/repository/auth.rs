@@ -1,10 +1,10 @@
-//! Replay consumption and database-bound authorization for clean chat.
-//!
-//! This is the authority seam between cryptographic evidence and business
-//! mutations. Every cryptographically valid token/proof/auth-transaction set
-//! is inserted as one PostgreSQL statement. Semantic authorization failures
-//! are deliberately returned only after that transaction commits, so a bad
-//! device binding can never be retried with the same proof material.
+// Replay consumption and database-bound authorization for clean chat.
+//
+// This is the authority seam between cryptographic evidence and business
+// mutations. Every cryptographically valid token/proof/auth-transaction set
+// is inserted as one PostgreSQL statement. Semantic authorization failures
+// are deliberately returned only after that transaction commits, so a bad
+// device binding can never be retried with the same proof material.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{DateTime, Duration, Utc};
@@ -13,6 +13,8 @@ use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(test)]
+use super::super::validation::{ed25519_key_id, BareDid, KeyThumbprint};
 use super::super::{
     dpop::{self, PreReplayCryptographicVerification, VerifiedChatDeviceRequest},
     model::AuthPrimitiveError,
@@ -194,6 +196,94 @@ pub(crate) struct BusinessAuthorityGuard {
     trusted_instant: DateTime<Utc>,
 }
 
+/// Closed authority projection for the G6 lock prelude. It can only be minted
+/// from a repository-issued `BusinessAuthorityGuard`; no field constructor,
+/// clone, or loose-value reseal exists.
+#[derive(Debug)]
+pub(crate) struct G6BusinessAuthorityBinding {
+    transaction_id: String,
+    actor_did: String,
+    actor_device_id: Uuid,
+    dpop_jkt: String,
+    auth_generation: i64,
+    key_id: String,
+    signing_public_key: Vec<u8>,
+    trusted_instant: DateTime<Utc>,
+    domain_digest: [u8; 32],
+}
+
+impl G6BusinessAuthorityBinding {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(crate) fn actor_did(&self) -> &str {
+        &self.actor_did
+    }
+
+    pub(crate) fn actor_device_id(&self) -> Uuid {
+        self.actor_device_id
+    }
+
+    pub(crate) fn dpop_jkt(&self) -> &str {
+        &self.dpop_jkt
+    }
+
+    pub(crate) fn auth_generation(&self) -> i64 {
+        self.auth_generation
+    }
+
+    pub(crate) fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub(crate) fn signing_public_key(&self) -> &[u8] {
+        &self.signing_public_key
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.trusted_instant
+    }
+
+    pub(crate) fn domain_digest(&self) -> &[u8; 32] {
+        &self.domain_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        transaction_id: String,
+        actor_did: String,
+        actor_device_id: Uuid,
+        dpop_jkt: String,
+        auth_generation: i64,
+        key_id: String,
+        signing_public_key: Vec<u8>,
+        trusted_instant: DateTime<Utc>,
+    ) -> Self {
+        let domain_digest = g6_business_authority_digest(
+            &transaction_id,
+            &actor_did,
+            actor_device_id,
+            &dpop_jkt,
+            auth_generation,
+            &key_id,
+            &signing_public_key,
+            trusted_instant,
+        );
+        Self {
+            transaction_id,
+            actor_did,
+            actor_device_id,
+            dpop_jkt,
+            auth_generation,
+            key_id,
+            signing_public_key,
+            trusted_instant,
+            domain_digest,
+        }
+    }
+}
+
 impl BusinessAuthorityGuard {
     /// Exact PostgreSQL transaction identity that held the device/key lock.
     /// Other non-forgeable repository guards must carry the same value before
@@ -233,6 +323,71 @@ impl BusinessAuthorityGuard {
     pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
         self.trusted_instant
     }
+
+    /// Seal this already-locked authority for the G6 prelude without exposing
+    /// any constructor that accepts caller-selected authority fields.
+    pub(crate) fn seal_g6_binding(&self) -> Option<G6BusinessAuthorityBinding> {
+        if self.class != RepositoryAuthorityClass::ExistingDevice {
+            return None;
+        }
+        let dpop_jkt = self.stored_dpop_jkt.as_ref()?.clone();
+        let auth_generation = self.stored_auth_generation?;
+        let key_id = self.stored_key_id.as_ref()?.clone();
+        let signing_public_key = self.stored_signing_public_key.as_ref()?.clone();
+        if auth_generation <= 0 || signing_public_key.is_empty() {
+            return None;
+        }
+        let domain_digest = g6_business_authority_digest(
+            &self.transaction_id,
+            &self.subject,
+            self.device_id,
+            &dpop_jkt,
+            auth_generation,
+            &key_id,
+            &signing_public_key,
+            self.trusted_instant,
+        );
+        Some(G6BusinessAuthorityBinding {
+            transaction_id: self.transaction_id.clone(),
+            actor_did: self.subject.clone(),
+            actor_device_id: self.device_id,
+            dpop_jkt,
+            auth_generation,
+            key_id,
+            signing_public_key,
+            trusted_instant: self.trusted_instant,
+            domain_digest,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn g6_business_authority_digest(
+    transaction_id: &str,
+    actor_did: &str,
+    actor_device_id: Uuid,
+    dpop_jkt: &str,
+    auth_generation: i64,
+    key_id: &str,
+    signing_public_key: &[u8],
+    trusted_instant: DateTime<Utc>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-G6-BUSINESS-AUTHORITY\0");
+    for value in [
+        transaction_id.as_bytes(),
+        actor_did.as_bytes(),
+        dpop_jkt.as_bytes(),
+        key_id.as_bytes(),
+        signing_public_key,
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest.update(actor_device_id.as_bytes());
+    digest.update(auth_generation.to_be_bytes());
+    digest.update(trusted_instant.timestamp_millis().to_be_bytes());
+    digest.finalize().into()
 }
 
 impl CompletedIdempotentResponse {
@@ -580,6 +735,88 @@ pub(crate) async fn recheck_business_authority(
         stored_key_id: Some(state.key_id),
         stored_signing_public_key: Some(state.signing_public_key),
         trusted_instant: authority.trusted_instant().datetime(),
+    })
+}
+
+/// Repository-slice test seam for operations whose production caller already
+/// completed cryptographic authorization. It derives every authority field
+/// from exact locked rows; callers supply only the identity and trusted T.
+#[cfg(test)]
+pub(crate) async fn recheck_existing_business_authority_for_test(
+    transaction: &mut Transaction<'_, Postgres>,
+    subject: &str,
+    device_id: Uuid,
+    trusted_instant: DateTime<Utc>,
+) -> Result<BusinessAuthorityGuard, AuthRepositoryError> {
+    let device_bytes = device_id.as_bytes();
+    if BareDid::parse(subject).is_err()
+        || device_bytes[6] >> 4 != 4
+        || device_bytes[8] >> 6 != 2
+        || trusted_instant.timestamp_millis() < 0
+        || trusted_instant.timestamp_subsec_nanos() % 1_000_000 != 0
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let device: Option<DeviceRow> = sqlx::query_as(
+        r#"
+        SELECT status,dpop_jkt,auth_generation
+          FROM chat.devices
+         WHERE user_did=$1 AND device_id=$2
+         FOR UPDATE
+        "#,
+    )
+    .bind(subject)
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let device = device.ok_or(AuthRepositoryError::DeviceNotRegistered)?;
+    if device.status != "active" {
+        return Err(AuthRepositoryError::DeviceRevoked);
+    }
+    if device.auth_generation <= 0 || KeyThumbprint::parse(&device.dpop_jkt).is_err() {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    let keys: Vec<(String, Vec<u8>, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+        r#"
+        SELECT key_id,signing_public_key,enrollment_auth_generation,revoked_at
+          FROM chat.device_keys
+         WHERE user_did=$1 AND device_id=$2
+         ORDER BY convert_to(key_id,'UTF8')
+         FOR UPDATE
+        "#,
+    )
+    .bind(subject)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut eligible = None;
+    for (key_id, signing_public_key, enrollment_auth_generation, revoked_at) in keys {
+        if revoked_at.is_some() || enrollment_auth_generation != device.auth_generation {
+            continue;
+        }
+        let canonical = KeyThumbprint::parse(&key_id)
+            .map_err(|_| AuthRepositoryError::RequestBindingMismatch)?;
+        let derived = ed25519_key_id(&signing_public_key)
+            .map_err(|_| AuthRepositoryError::RequestBindingMismatch)?;
+        if canonical != derived || eligible.is_some() {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
+        eligible = Some((key_id, signing_public_key));
+    }
+    let (key_id, signing_public_key) = eligible.ok_or(AuthRepositoryError::DeviceKeyMissing)?;
+    Ok(BusinessAuthorityGuard {
+        transaction_id,
+        class: RepositoryAuthorityClass::ExistingDevice,
+        subject: subject.to_owned(),
+        device_id,
+        stored_dpop_jkt: Some(device.dpop_jkt),
+        stored_auth_generation: Some(device.auth_generation),
+        stored_key_id: Some(key_id),
+        stored_signing_public_key: Some(signing_public_key),
+        trusted_instant,
     })
 }
 

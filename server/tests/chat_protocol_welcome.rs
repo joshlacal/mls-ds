@@ -12,7 +12,7 @@
 //! pending Welcome is only coherent after a completed leaf-recovery fulfillment,
 //! and the deferred `chat.assert_welcome_mapping` / roster-coherence triggers
 //! reject any raw pre-fulfillment insert. The correct seed is the executor's
-//! `apply_conversation_persistence_plan` leaf-recovery Welcome emission (see
+//! `apply_conversation_persistence_plan_unscoped_for_test` leaf-recovery Welcome emission (see
 //! `tests/chat_protocol_executor.rs`); the populated worker-claim / non-empty
 //! read assertions belong beside that harness. See the Slice 4b report for the
 //! precise remainder.
