@@ -216,6 +216,8 @@ make status         # Check service status
 - **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Command reference
 - **[CLAUDE.md](CLAUDE.md)** - Developer guide
 - **[DATABASE_SCHEMA.md](DATABASE_SCHEMA.md)** - Database schema documentation
+- **[migrations/README.md](migrations/README.md)** - Migration ordering, checksums, and staged rollouts
+- **[Operation claim completeness activation](docs/operation_claim_completeness_activation.sql)** - Reviewed cutover body; not yet a migration
 - **[scripts/README.md](scripts/README.md)** - Scripts documentation
 
 ## 🔒 Security

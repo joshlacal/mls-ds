@@ -14,7 +14,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 8] = [
+const MIGRATION_VERSIONS: [i64; 10] = [
     20260722000001,
     20260722000002,
     20260722000003,
@@ -23,8 +23,10 @@ const MIGRATION_VERSIONS: [i64; 8] = [
     20260726000001,
     20260726000002,
     20260726000003,
+    20260728000001,
+    20260728000002,
 ];
-const MIGRATION_FILES: [&str; 8] = [
+const MIGRATION_FILES: [&str; 10] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
@@ -33,8 +35,10 @@ const MIGRATION_FILES: [&str; 8] = [
     "20260726000001_welcome_supersession_provenance.sql",
     "20260726000002_restore_welcome_provenance_deferred_triggers.sql",
     "20260726000003_finalize_welcome_provenance_triggers.sql",
+    "20260728000001_chat_operation_claims.sql",
+    "20260728000002_exact_operation_claim_mutation_kind.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 8] = [
+const MIGRATION_DESCRIPTIONS: [&str; 10] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
@@ -43,10 +47,17 @@ const MIGRATION_DESCRIPTIONS: [&str; 8] = [
     "welcome supersession provenance",
     "restore welcome provenance deferred triggers",
     "finalize welcome provenance triggers",
+    "chat operation claims",
+    "exact operation claim mutation kind",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
+//
+// LIVE-DB REFRESH REQUIRED: 20260728000001/00002 require new reviewed
+// column, constraint, index, function, and trigger fingerprints. The sequence
+// catalog is structurally unchanged. Preserve these last-reviewed values until
+// the dedicated catalog gate prints the normalized post-00002 catalogs.
 const COLUMN_CATALOG_SHA256: &str =
     "dac54118c1335492a399ed735734e557135fe944ed69e9df1bdf9e1d498e2a22";
 const CONSTRAINT_CATALOG_SHA256: &str =
@@ -116,6 +127,8 @@ const BLOB_TABLES: [&str; 4] = [
     "blobs",
 ];
 
+const OPERATION_CLAIM_TABLES: [&str; 1] = ["operation_claims"];
+
 fn fixture_uuid(suffix: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(0x11111111111141118111111111111000 + suffix)
 }
@@ -125,6 +138,7 @@ fn expected_tables() -> BTreeSet<String> {
         .iter()
         .chain(DELIVERY_TABLES.iter())
         .chain(BLOB_TABLES.iter())
+        .chain(OPERATION_CLAIM_TABLES.iter())
         .map(|name| (*name).to_owned())
         .collect()
 }
@@ -1074,7 +1088,7 @@ async fn reset_chat(pool: &PgPool) {
             .bind(MIGRATION_VERSIONS.as_slice())
             .execute(pool)
             .await
-            .expect("remove only the eight chat-protocol ledger rows");
+            .expect("remove only the ten chat-protocol ledger rows");
     }
 }
 
@@ -1176,6 +1190,8 @@ async fn fresh_pool() -> PgPool {
             &[],
             &[],
             &[],
+            &[],
+            OPERATION_CLAIM_TABLES.as_slice(),
             &[],
         ][index];
         cumulative.extend(newly_owned_tables.iter().map(|name| (*name).to_owned()));
@@ -1468,6 +1484,9 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         expected_tables(),
         "unexpected chat table set"
     );
+    // LIVE-DB REFRESH REQUIRED: the source-owned set has the exact +1
+    // operation_claims table delta; update this reviewed aggregate count only
+    // after the normalized post-00002 catalog confirms it.
     assert_eq!(actual_tables.len(), 47, "clean protocol must own 47 tables");
 
     let applied: Vec<(i64, String, bool)> = sqlx::query_as(
@@ -1497,6 +1516,8 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
                     name.contains("_chat_protocol_")
                         || name.contains("welcome_provenance")
                         || name == "20260726000001_welcome_supersession_provenance.sql"
+                        || name == "20260728000001_chat_operation_claims.sql"
+                        || name == "20260728000002_exact_operation_claim_mutation_kind.sql"
                 })
         })
         .map(|path| {
@@ -1512,7 +1533,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly eight ordered files"
+        "clean schema must be exactly ten ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1554,6 +1575,16 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         (
             MIGRATION_VERSIONS[7],
             "finalize_welcome_provenance_triggers",
+            &[],
+        ),
+        (
+            MIGRATION_VERSIONS[8],
+            "chat_operation_claims",
+            OPERATION_CLAIM_TABLES.as_slice(),
+        ),
+        (
+            MIGRATION_VERSIONS[9],
+            "exact_operation_claim_mutation_kind",
             &[],
         ),
     ] {
@@ -1614,6 +1645,9 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .fetch_one(&pool)
     .await
     .expect("count chat FKs");
+    // LIVE-DB REFRESH REQUIRED: 00001 adds operation_claims_principal_fk and
+    // 00002 drops the staged receipt->claim FK, an exact expected net +1.
+    // Update this reviewed count only with the regenerated constraint catalog.
     assert_eq!(foreign_keys, 185, "unexpected FK coverage");
     assert_eq!(unvalidated_foreign_keys, 0, "all FKs must be validated");
 
@@ -1858,6 +1892,9 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     )
     .await;
     assert_catalog("trigger", &trigger_catalog, TRIGGER_CATALOG_SHA256);
+    // LIVE-DB REFRESH REQUIRED: 00001 adds the claim/receipt deferred pair and
+    // operation_claims_immutable, an exact expected +3 authored triggers.
+    // Update this reviewed count only with the regenerated trigger catalog.
     assert_eq!(
         trigger_catalog.len(),
         151,

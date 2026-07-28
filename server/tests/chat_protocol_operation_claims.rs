@@ -6,8 +6,24 @@
 
 mod common;
 
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+
+#[test]
+fn installed_operation_claim_migration_keeps_its_frozen_raw_bytes() {
+    let migration = include_bytes!("../migrations/20260728000001_chat_operation_claims.sql");
+
+    assert_eq!(
+        migration.len(),
+        6_299,
+        "the installed 00001 migration changed byte length"
+    );
+    assert_eq!(
+        hex::encode(Sha384::digest(migration)),
+        "fd71f2eb5235226371f113b5738b752b27e901b72810e9ec1e1f201e979606e0b09a16be087103e4146b4fb9f8bdff8f",
+        "the installed 00001 migration changed raw-byte SHA-384"
+    );
+}
 
 #[test]
 fn exact_kind_migration_is_nul_safe_and_stages_legacy_receipts() {

@@ -26,6 +26,30 @@ Migrations are executed in order by filename:
    - Creates `blobs` table
    - Indexes: uploader, conversation, uploaded_at, size
 
+## Clean-Chat Operation Claim Rollout
+
+The global operation-ID rollout is deliberately split across forward-only
+migrations:
+
+1. **20260728000001_chat_operation_claims.sql**
+   - Creates `chat.operation_claims` and initially backfills it from completed
+     idempotency receipts.
+   - This migration has been installed in a gate database and is immutable.
+   - Raw-file size: `6299` bytes.
+   - SQLx SHA-384:
+     `fd71f2eb5235226371f113b5738b752b27e901b72810e9ec1e1f201e979606e0b09a16be087103e4146b4fb9f8bdff8f`.
+
+2. **20260728000002_exact_operation_claim_mutation_kind.sql**
+   - Refines endpoint-family claims to exact signed mutation kinds.
+   - Keeps receipt-to-claim completeness staged while handlers move to the
+     shared operation prelude.
+
+The final completeness cutover is not yet a migration. Its reviewed readiness
+body lives at
+[`../docs/operation_claim_completeness_activation.sql`](../docs/operation_claim_completeness_activation.sql).
+Freeze it into a new forward migration only after its preflight proves that no
+receipt-only writer remains. Never edit `20260728000001` to perform activation.
+
 ## Running Migrations
 
 ### Using sqlx-cli
