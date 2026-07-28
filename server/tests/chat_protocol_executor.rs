@@ -34,6 +34,10 @@ mod model;
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
 #[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/repository/mod.rs"]
 mod repository;
 #[allow(dead_code)]
@@ -80,6 +84,12 @@ mod chat_protocol {
         }
         pub mod auth {
             pub use crate::repository::auth::*;
+        }
+        pub mod prelude {
+            pub use crate::repository::prelude::*;
+        }
+        pub mod recovery {
+            pub use crate::repository::recovery::*;
         }
         pub mod relationship {
             #![allow(dead_code)]

@@ -363,6 +363,116 @@ async fn lock_actor(
     Ok(row)
 }
 
+fn g6_actor(
+    plan: &ConversationPersistencePlan,
+    facts: &AuthorityFacts,
+    prelude: &LockedG6Prelude,
+) -> Result<LockedActorRow, ExecutionContextHydrationError> {
+    let actor_did = device_did(&facts.actor)?;
+    let actor_device_id = device_uuid(&facts.actor);
+    let actor_fact = prelude
+        .devices()
+        .iter()
+        .find(|fact| fact.device() == &facts.actor)
+        .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+    let expected_key_id = facts
+        .expected_key_id
+        .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
+    let locked_key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(prelude.actor_key_id())
+        .ok()
+        .and_then(|value| value.try_into().ok())
+        .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+    if plan.effects().kind() != PlanKind::DeviceRevocation
+        || prelude.actor_did() != actor_did
+        || prelude.actor_device_id() != actor_device_id
+        || prelude.actor_auth_generation() <= 0
+        || u64::try_from(prelude.actor_auth_generation()).ok() != facts.expected_auth_generation
+        || locked_key_id != expected_key_id
+        || prelude.actor_signing_public_key().is_empty()
+        || actor_fact.status() != "active"
+        || actor_fact.dpop_jkt() != prelude.actor_dpop_jkt()
+        || actor_fact.auth_generation() != prelude.actor_auth_generation()
+    {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    Ok(LockedActorRow {
+        user_did: actor_did,
+        device_id: actor_device_id,
+        status: actor_fact.status().to_owned(),
+        auth_generation: prelude.actor_auth_generation(),
+        key_id: prelude.actor_key_id().to_owned(),
+        signing_public_key: prelude.actor_signing_public_key().to_vec(),
+    })
+}
+
+fn validate_g6_hydration_shape(
+    plan: &ConversationPersistencePlan,
+    artifacts: &ExecutionContextArtifacts,
+) -> Result<(), ExecutionContextHydrationError> {
+    let effects = plan.effects();
+    let head = effects
+        .head_cas()
+        .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
+    if effects.kind() != PlanKind::DeviceRevocation
+        || !matches!(
+            effects.authority(),
+            Some(PlanAuthority::DeviceRevocation(_))
+        )
+        || head.allocated_entry_id().is_some()
+        || primary_event_kind(plan).is_some()
+        || artifacts.accepted_control_entry_bytes.is_some()
+        || artifacts.genesis_group_info_bytes.is_some()
+        || artifacts.primary_event_payload.is_some()
+        || !artifacts.welcome_disposition_event_payloads.is_empty()
+        || !effects.participant_changes().is_empty()
+        || !effects.leaf_changes().is_empty()
+        || !effects.interval_changes().is_empty()
+        || !effects.terminal_proof_changes().is_empty()
+        || !effects.reset_request_changes().is_empty()
+        || !effects.leave_request_changes().is_empty()
+        || !effects.recovery_package_cas().is_empty()
+        || effects.metadata_change().is_some()
+        || effects.welcome_cas().is_some()
+        || effects.revocation_target_cas().is_some()
+        || effects.invitation_quota_cas().is_some()
+    {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    Ok(())
+}
+
+fn g6_spine_artifacts(
+    plan: &ConversationPersistencePlan,
+) -> Result<SpineArtifacts, ExecutionContextHydrationError> {
+    Ok(SpineArtifacts {
+        public_snapshot_bytes: Vec::new(),
+        public_snapshot_sha256: Vec::new(),
+        tree_summary_bytes: Vec::new(),
+        tree_summary_sha256: Vec::new(),
+        leaf_count: i64::try_from(plan.state().leaves.len())
+            .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?,
+        genesis_group_info_bytes: Vec::new(),
+        genesis_group_info_sha256: Vec::new(),
+    })
+}
+
+fn planned_actor_role(
+    plan: &ConversationPersistencePlan,
+    actor: &DeviceIdentity,
+) -> Result<TransitionActorRole, ExecutionContextHydrationError> {
+    let participant = plan
+        .state()
+        .participants
+        .iter()
+        .find(|participant| participant.principal.as_bytes() == actor.principal().as_bytes())
+        .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?;
+    Ok(match participant.role {
+        ParticipantRole::Member => TransitionActorRole::Member,
+        ParticipantRole::Admin => TransitionActorRole::Admin,
+    })
+}
+
 async fn actor_role(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
@@ -1100,6 +1210,43 @@ async fn event(
     })
 }
 
+fn g6_event(
+    prelude: &LockedG6Prelude,
+    kind: EventKind,
+    payload: Vec<u8>,
+    recipients: Vec<(DeviceIdentity, EventEntitlementKind)>,
+) -> Result<EventFanout, ExecutionContextHydrationError> {
+    if payload.is_empty() {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let mut canonical = recipients;
+    canonical.sort_by(|left, right| left.0.cmp(&right.0));
+    if canonical.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(ExecutionContextHydrationError::AudienceMismatch);
+    }
+    let with_predecessors = canonical
+        .into_iter()
+        .map(|(device, entitlement)| {
+            let predecessor = prelude
+                .devices()
+                .iter()
+                .find(|fact| fact.device() == &device)
+                .map(|fact| fact.initial_event_tail())
+                .ok_or(ExecutionContextHydrationError::AudienceMismatch)?;
+            Ok((device, entitlement, predecessor))
+        })
+        .collect::<Result<Vec<_>, ExecutionContextHydrationError>>()?;
+    Ok(EventFanout {
+        event_id: Uuid::new_v4(),
+        event_kind: kind,
+        payload_bytes: payload,
+        recipients: with_predecessors,
+        outbox: (0..STREAM_OUTBOX_COUNT)
+            .map(|_| (Uuid::new_v4(), OutboxWorkKind::Stream))
+            .collect(),
+    })
+}
+
 fn reset_reason(
     mutation: Option<&VerifiedSignedMutation>,
 ) -> Result<ResetReason, ExecutionContextHydrationError> {
@@ -1218,22 +1365,34 @@ async fn recovery_open(
 
 /// Hydrate the executor's complete context while the caller-owned transaction
 /// remains open. The caller must have produced `plan` from guards acquired in
-/// this same transaction. This function additionally row-locks every mutable
-/// actor/audience/period fact it projects, so no lock-free audience path exists.
+/// this same transaction. Generic plans additionally row-lock every mutable
+/// actor/audience/period fact they project. G6 instead consumes the actor,
+/// exact device audience, and predecessor tails already sealed by its
+/// pre-head-lock `LockedG6Prelude`; it must not reacquire identity locks here.
 ///
 /// A caller applying more than one plan in the same transaction must hydrate
 /// each context immediately before applying that plan. Event predecessors are
 /// intentionally frozen from the device-global chain tail visible at hydration
 /// time; pre-hydrating a batch could assign the same predecessor to two later
-/// events for one device. H1b's revocation-fanout orchestration therefore reuses
-/// this facade inside its per-conversation apply loop rather than constructing
-/// the current executor's test-oriented `Vec<ExecutionContext>` up front.
-async fn hydrate_execution_context_inner(
+/// events for one device. G6 is the deliberate exception: its prelude freezes
+/// initial tails before any head lock and its single-use state-machine cursor
+/// advances them across the completely preflighted batch.
+async fn hydrate_execution_context_inner_with_g6(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
+    g6_prelude: Option<&LockedG6Prelude>,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
+    if g6_prelude.is_some() {
+        // This SQL-free shape gate runs before the first transaction query.
+        // It makes every generic identity-reading family unreachable for G6,
+        // including opened-leaf key lookup and metadata-author role/key lookup.
+        validate_g6_hydration_shape(plan, &artifacts)?;
+    }
     let facts = authority_facts(plan)?;
+    if g6_prelude.is_some() && plan.effects().kind() != PlanKind::DeviceRevocation {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
     let head = plan
         .effects()
         .head_cas()
@@ -1259,7 +1418,12 @@ async fn hydrate_execution_context_inner(
         plan.effects().kind(),
         PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection | PlanKind::WelcomeExpiry
     );
-    let (normal_audience, historical_audience) = if plan.effects().kind() == PlanKind::Close {
+    let (normal_audience, historical_audience) = if g6_prelude.is_some() {
+        // G6 locked the exact device-global scope before conversation heads.
+        // Device revocation is entryless and has no broad primary event, so its
+        // only recipients are the pending-Welcome recipients projected below.
+        (Vec::new(), Vec::new())
+    } else if plan.effects().kind() == PlanKind::Close {
         (
             Vec::new(),
             historical_schedule_audience(transaction, conversation_id, &facts.actor).await?,
@@ -1276,7 +1440,10 @@ async fn hydrate_execution_context_inner(
             Vec::new(),
         )
     };
-    let actor_row = lock_actor(transaction, &facts).await?;
+    let actor_row = match g6_prelude {
+        Some(prelude) => g6_actor(plan, &facts, prelude)?,
+        None => lock_actor(transaction, &facts).await?,
+    };
     if actor_row.status != "active"
         && !matches!(
             plan.effects().kind(),
@@ -1285,7 +1452,10 @@ async fn hydrate_execution_context_inner(
     {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
-    let role = actor_role(transaction, plan, &facts.actor).await?;
+    let role = match g6_prelude {
+        Some(_) => planned_actor_role(plan, &facts.actor)?,
+        None => actor_role(transaction, plan, &facts.actor).await?,
+    };
     let (authority, mutation) = build_execution_authority(plan, &facts, &actor_row, &artifacts)?;
 
     let protocol_instance_id: Uuid = sqlx::query_scalar(
@@ -1294,7 +1464,11 @@ async fn hydrate_execution_context_inner(
     .fetch_one(&mut **transaction)
     .await?;
 
-    let closing_leaf_periods = closing_leaf_periods(transaction, plan).await?;
+    let closing_leaf_periods = if g6_prelude.is_some() {
+        Vec::new()
+    } else {
+        closing_leaf_periods(transaction, plan).await?
+    };
     let closing_devices = closing_leaf_periods
         .iter()
         .map(|(device, _)| device.clone())
@@ -1359,16 +1533,20 @@ async fn hydrate_execution_context_inner(
         let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
         let payload =
             super::delivery::canonical_welcome_disposition_event_payload(welcome_id, "superseded");
-        welcome_dispositions.push(WelcomeDispositionInput {
-            welcome_id,
-            event: event(
-                transaction,
-                EventKind::WelcomeDisposition,
-                payload,
-                vec![(welcome.recipient().clone(), EventEntitlementKind::Welcome)],
-            )
-            .await?,
-        });
+        let recipients = vec![(welcome.recipient().clone(), EventEntitlementKind::Welcome)];
+        let event = match g6_prelude {
+            Some(prelude) => g6_event(prelude, EventKind::WelcomeDisposition, payload, recipients)?,
+            None => {
+                event(
+                    transaction,
+                    EventKind::WelcomeDisposition,
+                    payload,
+                    recipients,
+                )
+                .await?
+            }
+        };
+        welcome_dispositions.push(WelcomeDispositionInput { welcome_id, event });
     }
 
     let primary_kind = primary_event_kind(plan);
@@ -1514,12 +1692,36 @@ async fn hydrate_execution_context_inner(
         None
     };
 
-    let (opened_leaves, leaf_period_ids) = opened_leaf_columns(transaction, plan).await?;
-    let participant_period_ids = participant_period_ids(transaction, plan).await?;
-    let closing_participant_periods = closing_participant_periods(transaction, plan).await?;
-    let metadata_author = metadata_author(transaction, plan, &facts, &actor_row).await?;
-    let spine = spine_artifacts(transaction, plan, &artifacts).await?;
-    let recovery_open = recovery_open(transaction, plan).await?;
+    let (
+        opened_leaves,
+        leaf_period_ids,
+        participant_period_ids,
+        closing_participant_periods,
+        metadata_author,
+        spine,
+        recovery_open,
+    ) = if g6_prelude.is_some() {
+        (
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            g6_spine_artifacts(plan)?,
+            None,
+        )
+    } else {
+        let (opened_leaves, leaf_period_ids) = opened_leaf_columns(transaction, plan).await?;
+        (
+            opened_leaves,
+            leaf_period_ids,
+            participant_period_ids(transaction, plan).await?,
+            closing_participant_periods(transaction, plan).await?,
+            metadata_author(transaction, plan, &facts, &actor_row).await?,
+            spine_artifacts(transaction, plan, &artifacts).await?,
+            recovery_open(transaction, plan).await?,
+        )
+    };
 
     Ok(ExecutionContext {
         protocol_instance_id,
@@ -1548,6 +1750,23 @@ async fn hydrate_execution_context_inner(
         welcome_response,
         welcome_dispositions,
     })
+}
+
+async fn hydrate_execution_context_inner(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+) -> Result<ExecutionContext, ExecutionContextHydrationError> {
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, None).await
+}
+
+async fn hydrate_g6_execution_context_inner(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    artifacts: ExecutionContextArtifacts,
+    prelude: &LockedG6Prelude,
+) -> Result<ExecutionContext, ExecutionContextHydrationError> {
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, Some(prelude)).await
 }
 
 /// Unforgeable proof that execution-context hydration completed inside the
@@ -1633,7 +1852,8 @@ pub(crate) async fn prepare_execution_context_for_test<'borrow, 'connection, 'pl
     ))
 }
 
-/// Read-only preflight for one conversation's entryless revocation authority.
+/// Legacy test-harness preflight for one conversation's entryless revocation
+/// authority.
 ///
 /// This deliberately verifies only the authority needed before the batch's
 /// first writer: it locks the durable actor registration/key, re-verifies the
@@ -1641,6 +1861,7 @@ pub(crate) async fn prepare_execution_context_for_test<'borrow, 'connection, 'pl
 /// operation ID to the global batch revocation ID. It never derives audiences or
 /// predecessors and never constructs an `ExecutionContext`; full hydration still
 /// occurs immediately before each later apply.
+#[cfg(test)]
 async fn preflight_device_revocation_execution_authority(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
@@ -1681,7 +1902,7 @@ async fn preflight_device_revocation_execution_authority(
     }
 }
 
-fn validate_g6_prelude_binding(
+pub(crate) fn validate_g6_prelude_binding(
     plan: &DeviceRevocationBatchPersistencePlan,
     prelude: &LockedG6Prelude,
 ) -> Result<(), SequentialDeviceRevocationError> {
@@ -1712,10 +1933,13 @@ fn validate_g6_prelude_binding(
         || prelude.conversation_ids() != conversation_ids
         || prelude.head_digests() != head_digests
         || prelude.trusted_instant().timestamp_millis() != authority.accepted_at().unix_millis()
-        || prelude.business().actor_did().as_bytes() != actor.principal().as_bytes()
-        || prelude.business().actor_device_id().as_bytes() != actor.device_id()
-        || u64::try_from(prelude.business().auth_generation()).ok()
+        || prelude.actor_did().as_bytes() != actor.principal().as_bytes()
+        || prelude.actor_device_id().as_bytes() != actor.device_id()
+        || u64::try_from(prelude.actor_auth_generation()).ok()
             != Some(authority.actor_auth_generation())
+        || prelude.authority_scope_digest() == &[0; 32]
+        || prelude.authority_scope_digest() != plan.authority_scope_digest()
+        || prelude.scope_digest() == &[0; 32]
         || prelude_target_did.as_bytes() != target.principal().as_bytes()
         || prelude_target_device_id.as_bytes() != target.device_id()
         || prelude_target_generation != authority.expected_target_auth_generation()
@@ -1728,6 +1952,7 @@ fn validate_g6_prelude_binding(
 async fn prepare_device_revocation_contexts(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &DeviceRevocationBatchPersistencePlan,
+    prelude: &LockedG6Prelude,
     artifact_inputs: Vec<ConversationExecutionArtifacts>,
 ) -> Result<Vec<ExecutionContext>, SequentialDeviceRevocationError> {
     let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
@@ -1773,32 +1998,50 @@ async fn prepare_device_revocation_contexts(
             );
         }
     }
-    let batch_revocation_id = Uuid::from_bytes(*plan.authority().revocation_id());
     let mut contexts = Vec::with_capacity(plan.conversations().len());
     for conversation in plan.conversations() {
-        preflight_device_revocation_execution_authority(
-            transaction,
-            conversation,
-            batch_revocation_id,
-        )
-        .await?;
         let conversation_id = Uuid::from_bytes(*conversation.state().coordinate.conversation_id());
         let artifacts = artifacts_by_id
             .remove(&conversation_id)
             .expect("complete artifact set was preflighted");
-        contexts.push(hydrate_execution_context_inner(transaction, conversation, artifacts).await?);
+        contexts.push(
+            hydrate_g6_execution_context_inner(transaction, conversation, artifacts, prelude)
+                .await?,
+        );
     }
     Ok(contexts)
 }
 
+fn g6_capsule_scope_binding(
+    transaction_id: &str,
+    authority_scope_digest: &[u8; 32],
+    prelude_scope_digest: &[u8; 32],
+    prepared_members_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-G6-EXECUTION-CAPSULE\0");
+    digest.update((transaction_id.len() as u64).to_be_bytes());
+    digest.update(transaction_id.as_bytes());
+    digest.update(authority_scope_digest);
+    digest.update(prelude_scope_digest);
+    digest.update(prepared_members_digest);
+    digest.finalize().into()
+}
+
 /// Opaque, savepoint-owning G6 execution. Construction freezes every context
 /// and event shape before the prefix can write; application can only consume
-/// this exact plan/prelude/context set once.
+/// this exact plan/prelude/context set once. The capsule separately retains
+/// both the shared canonical authority-scope digest and the complete G6 scope
+/// digest so neither authority nor event-chain scope can be detached.
 #[must_use = "a prepared revocation batch must be consumed or explicitly rolled back"]
 pub(crate) struct PreparedDeviceRevocationBatchExecution<'transaction, 'plan> {
     savepoint: Transaction<'transaction, Postgres>,
     members: PreparedDeviceRevocationBatchMembers<'plan>,
     expected_transaction_id: Box<str>,
+    authority_scope_digest: [u8; 32],
+    prelude_scope_digest: [u8; 32],
+    prepared_members_digest: [u8; 32],
+    scope_binding_digest: [u8; 32],
     #[cfg(test)]
     cancellation_hook: Option<DeviceRevocationCancellationHook>,
 }
@@ -1809,6 +2052,7 @@ pub(crate) enum DeviceRevocationCancellationPoint {
     BeforePrefix,
     AfterPrefix,
     BeforeRelease,
+    AfterRelease,
 }
 
 #[cfg(test)]
@@ -1857,7 +2101,9 @@ pub(crate) async fn prepare_device_revocation_batch_execution_from_contexts_for_
 > {
     validate_g6_prelude_binding(plan, &prelude)?;
     let expected_transaction_id = prelude.transaction_id().to_owned().into_boxed_str();
-    let mut savepoint = transaction
+    let authority_scope_digest = *prelude.authority_scope_digest();
+    let prelude_scope_digest = *prelude.scope_digest();
+    let savepoint = transaction
         .begin()
         .await
         .map_err(SequentialDeviceRevocationError::SavepointBegin)?;
@@ -1881,12 +2127,25 @@ pub(crate) async fn prepare_device_revocation_batch_execution_from_contexts_for_
     )
     .map_err(SequentialDeviceRevocationError::Executor);
     match operation {
-        Ok(members) => Ok(PreparedDeviceRevocationBatchExecution {
-            savepoint,
-            members,
-            expected_transaction_id,
-            cancellation_hook: None,
-        }),
+        Ok(members) => {
+            let prepared_members_digest = *members.binding_digest();
+            let scope_binding_digest = g6_capsule_scope_binding(
+                &expected_transaction_id,
+                &authority_scope_digest,
+                &prelude_scope_digest,
+                &prepared_members_digest,
+            );
+            Ok(PreparedDeviceRevocationBatchExecution {
+                savepoint,
+                members,
+                expected_transaction_id,
+                authority_scope_digest,
+                prelude_scope_digest,
+                prepared_members_digest,
+                scope_binding_digest,
+                cancellation_hook: None,
+            })
+        }
         Err(operation) => match savepoint.rollback().await {
             Ok(()) => Err(operation),
             Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
@@ -1908,13 +2167,16 @@ pub(crate) async fn prepare_device_revocation_batch_execution<'transaction, 'con
 > {
     validate_g6_prelude_binding(plan, &prelude)?;
     let expected_transaction_id = prelude.transaction_id().to_owned().into_boxed_str();
+    let authority_scope_digest = *prelude.authority_scope_digest();
+    let prelude_scope_digest = *prelude.scope_digest();
     let mut savepoint = transaction
         .begin()
         .await
         .map_err(SequentialDeviceRevocationError::SavepointBegin)?;
     let operation = async {
         let contexts =
-            prepare_device_revocation_contexts(&mut savepoint, plan, artifact_inputs).await?;
+            prepare_device_revocation_contexts(&mut savepoint, plan, &prelude, artifact_inputs)
+                .await?;
         let devices = prelude
             .devices()
             .iter()
@@ -1937,13 +2199,26 @@ pub(crate) async fn prepare_device_revocation_batch_execution<'transaction, 'con
     }
     .await;
     match operation {
-        Ok(members) => Ok(PreparedDeviceRevocationBatchExecution {
-            savepoint,
-            members,
-            expected_transaction_id,
-            #[cfg(test)]
-            cancellation_hook: None,
-        }),
+        Ok(members) => {
+            let prepared_members_digest = *members.binding_digest();
+            let scope_binding_digest = g6_capsule_scope_binding(
+                &expected_transaction_id,
+                &authority_scope_digest,
+                &prelude_scope_digest,
+                &prepared_members_digest,
+            );
+            Ok(PreparedDeviceRevocationBatchExecution {
+                savepoint,
+                members,
+                expected_transaction_id,
+                authority_scope_digest,
+                prelude_scope_digest,
+                prepared_members_digest,
+                scope_binding_digest,
+                #[cfg(test)]
+                cancellation_hook: None,
+            })
+        }
         Err(operation) => match savepoint.rollback().await {
             Ok(()) => Err(operation),
             Err(rollback) => Err(SequentialDeviceRevocationError::SavepointRollback {
@@ -2071,14 +2346,14 @@ pub(crate) async fn apply_device_revocation_batch_unscoped_for_test(
 /// Consume the opaque G6 batch. No SQL hydration or audience read occurs after
 /// the prefix; only sealed writes and cursor-resolved event predecessors remain.
 ///
-/// Cancellation contract: dropping this future drops SQLx's nested
-/// `Transaction`, whose `Drop` queues a savepoint rollback on the same
-/// connection. The owner must not detach that connection; it must perform and
-/// await a subsequent operation on the outer transaction so the connection
-/// drains the queued rollback before reuse, or roll back the outer transaction.
-/// A caller cancelling before application should prefer
-/// `PreparedDeviceRevocationBatchExecution::rollback`, which awaits the rollback
-/// directly.
+/// Cancellation contract: once application starts, dropping or aborting this
+/// future makes the savepoint outcome commit-unknown. In particular, PostgreSQL
+/// may have completed `RELEASE SAVEPOINT` before cancellation becomes visible
+/// to Rust. The caller MUST therefore roll back the outer transaction and MUST
+/// NOT drain the connection and continue using that transaction. A caller that
+/// decides not to apply a still-owned capsule should instead call
+/// `PreparedDeviceRevocationBatchExecution::rollback`, which explicitly awaits
+/// the savepoint rollback before returning the outer transaction.
 pub(crate) async fn apply_device_revocation_batch_sequential(
     prepared: PreparedDeviceRevocationBatchExecution<'_, '_>,
 ) -> Result<Vec<AppliedTransition>, SequentialDeviceRevocationError> {
@@ -2086,15 +2361,35 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
         mut savepoint,
         members,
         expected_transaction_id,
+        authority_scope_digest,
+        prelude_scope_digest,
+        prepared_members_digest,
+        scope_binding_digest,
         #[cfg(test)]
         mut cancellation_hook,
     } = prepared;
     let operation = async {
+        if !members.binding_is_intact()
+            || members.binding_digest() != &prepared_members_digest
+            || scope_binding_digest
+                != g6_capsule_scope_binding(
+                    &expected_transaction_id,
+                    &authority_scope_digest,
+                    &prelude_scope_digest,
+                    &prepared_members_digest,
+                )
+        {
+            return Err(SequentialDeviceRevocationError::PreludeMismatch);
+        }
         let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
             .fetch_one(&mut *savepoint)
             .await
             .map_err(SequentialDeviceRevocationError::TransactionIdentity)?;
-        if live_transaction_id != expected_transaction_id.as_ref() {
+        if live_transaction_id != expected_transaction_id.as_ref()
+            || authority_scope_digest == [0; 32]
+            || prelude_scope_digest == [0; 32]
+            || prepared_members_digest == [0; 32]
+        {
             return Err(SequentialDeviceRevocationError::PreludeMismatch);
         }
         #[cfg(test)]
@@ -2120,6 +2415,10 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
                 .commit()
                 .await
                 .map_err(SequentialDeviceRevocationError::SavepointRelease)?;
+            #[cfg(test)]
+            if let Some(hook) = cancellation_hook.as_mut() {
+                hook(DeviceRevocationCancellationPoint::AfterRelease).await;
+            }
             Ok(applied)
         }
         Err(operation) => match savepoint.rollback().await {
@@ -2130,4 +2429,21 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
             }),
         },
     }
+}
+
+/// Feature-gated compiler witness for the production-only G6 chain. Integration
+/// harnesses compile source modules with `cfg(test)`, which intentionally omits
+/// the production batch planner; this witness is compiled in the real library
+/// configuration and keeps every opaque stage reachable as one typed path.
+#[cfg(feature = "chat-protocol-production-proof")]
+#[allow(dead_code)]
+fn g6_scope_bound_production_pipeline_typecheck() {
+    let _ = super::core::prepare_g6_identity_scope;
+    let _ = super::core::seal_g6_scope_authority;
+    let _ = super::core::lock_g6_revocation_prehead_scope;
+    let _ = super::core::LockedG6PreheadScope::seal_fanout;
+    let _ = super::core::hydrate_locked_g6_prelude;
+    let _ = crate::chat_protocol::state_machine::HydrationAuthority::plan_device_revocation_batch;
+    let _ = prepare_device_revocation_batch_execution;
+    let _ = apply_device_revocation_batch_sequential;
 }

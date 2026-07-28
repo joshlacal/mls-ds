@@ -1,6 +1,22 @@
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/dpop.rs"]
+mod dpop;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/relationship_policy.rs"]
+mod relationship_policy_source;
+#[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/repository/mod.rs"]
+mod repository;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -15,6 +31,10 @@ mod chat_protocol {
 
     pub mod transcript {
         pub use crate::transcript::*;
+    }
+
+    pub mod dpop {
+        pub use crate::dpop::*;
     }
 
     pub mod snapshot {
@@ -33,6 +53,10 @@ mod chat_protocol {
         ));
     }
 
+    pub mod relationship_policy {
+        pub use crate::relationship_policy_source::*;
+    }
+
     // The E2b-2/E2b-3 transition executor lives in `state_machine.rs` (included
     // below) and is now compiled unconditionally, so its `super::repository::*`
     // references must resolve inside this test crate too. The repository writer
@@ -40,6 +64,31 @@ mod chat_protocol {
     // `include!` directly — mirroring `chat_protocol_transition_repository.rs`.
     // The existing 27 state-machine tests do not use these; they are inert here.
     pub mod repository {
+        pub mod execution_context {
+            pub(crate) struct ExecutionContextHydrationProof;
+            pub(crate) struct RevocationBatchHydrationProof;
+        }
+
+        pub mod auth {
+            pub use crate::repository::auth::*;
+        }
+
+        pub mod prelude {
+            pub use crate::repository::prelude::*;
+        }
+
+        pub mod recovery {
+            pub use crate::repository::recovery::*;
+        }
+
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
+            ));
+        }
+
         pub mod core {
             #![allow(dead_code)]
             include!(concat!(

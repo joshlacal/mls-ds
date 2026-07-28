@@ -16482,6 +16482,7 @@ pub(in crate::chat_protocol) mod executor {
         current_tails: Vec<Option<i64>>,
         remaining: VecDeque<PreparedRevocationEvent>,
         pending_event: Option<PendingPreparedEvent>,
+        initial_binding_digest: [u8; 32],
     }
 
     impl EventChainCursor {
@@ -16517,13 +16518,40 @@ pub(in crate::chat_protocol) mod executor {
                     previous = Some(recipient.slot);
                 }
             }
+            let initial_binding_digest = event_chain_cursor_binding_digest(
+                &prelude_digest,
+                &devices,
+                &current_tails,
+                schedule.len(),
+                schedule.iter(),
+            );
             Ok(Self {
                 prelude_digest,
                 devices,
                 current_tails,
                 remaining: schedule.into(),
                 pending_event: None,
+                initial_binding_digest,
             })
+        }
+
+        fn recompute_initial_binding_digest(&self) -> [u8; 32] {
+            event_chain_cursor_binding_digest(
+                &self.prelude_digest,
+                &self.devices,
+                &self.current_tails,
+                self.remaining.len(),
+                self.remaining.iter(),
+            )
+        }
+
+        fn initial_binding_is_intact(&self) -> bool {
+            self.pending_event.is_none()
+                && self.initial_binding_digest == self.recompute_initial_binding_digest()
+        }
+
+        fn initial_binding_digest(&self) -> &[u8; 32] {
+            &self.initial_binding_digest
         }
 
         pub(crate) fn begin_event(
@@ -16672,6 +16700,36 @@ pub(in crate::chat_protocol) mod executor {
                 Ok(())
             }
         }
+    }
+
+    fn event_chain_cursor_binding_digest<'event>(
+        prelude_digest: &[u8; 32],
+        devices: &[DeviceIdentity],
+        initial_tails: &[Option<i64>],
+        schedule_len: usize,
+        schedule: impl IntoIterator<Item = &'event PreparedRevocationEvent>,
+    ) -> [u8; 32] {
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"CATBIRD-CHAT-G6-EVENT-CHAIN-CURSOR\0");
+        digest.update(prelude_digest);
+        digest.update((devices.len() as u64).to_be_bytes());
+        for (device, tail) in devices.iter().zip(initial_tails) {
+            digest.update((device.principal().as_bytes().len() as u64).to_be_bytes());
+            digest.update(device.principal().as_bytes());
+            digest.update(device.device_id());
+            match tail {
+                Some(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_be_bytes());
+                }
+                None => digest.update([0]),
+            }
+        }
+        digest.update((schedule_len as u64).to_be_bytes());
+        for event in schedule {
+            digest.update(event.schedule_digest);
+        }
+        digest.finalize().into()
     }
 
     /// For a `welcomeExpiry` edge: the DB-side facts the plan does not carry — the
@@ -19749,6 +19807,7 @@ pub(in crate::chat_protocol) mod executor {
     /// the batch prefix. The fields are private and the type is held only by the
     /// opaque batch, so application cannot receive a newly substituted plan or
     /// context after the first write.
+    #[derive(Debug)]
     struct PreparedRevocationMember<'plan> {
         plan: &'plan ConversationPersistencePlan,
         context: ExecutionContext,
@@ -19767,6 +19826,23 @@ pub(in crate::chat_protocol) mod executor {
         plan: &'plan DeviceRevocationBatchPersistencePlan,
         members: Vec<PreparedRevocationMember<'plan>>,
         cursor: EventChainCursor,
+        binding_digest: [u8; 32],
+    }
+
+    impl PreparedDeviceRevocationBatchMembers<'_> {
+        pub(crate) fn binding_digest(&self) -> &[u8; 32] {
+            &self.binding_digest
+        }
+
+        pub(crate) fn binding_is_intact(&self) -> bool {
+            self.cursor.initial_binding_is_intact()
+                && self.binding_digest
+                    == prepared_device_revocation_members_binding_digest(
+                        self.plan,
+                        &self.members,
+                        &self.cursor,
+                    )
+        }
     }
 
     /// Typestate returned only after the immutable/device-global prefix has
@@ -19994,11 +20070,34 @@ pub(in crate::chat_protocol) mod executor {
         }
         let cursor = EventChainCursor::new(prelude_digest, devices, initial_tails, schedule)
             .map_err(ExecutorError::EventChain)?;
+        let binding_digest =
+            prepared_device_revocation_members_binding_digest(plan, &members, &cursor);
         Ok(PreparedDeviceRevocationBatchMembers {
             plan,
             members,
             cursor,
+            binding_digest,
         })
+    }
+
+    fn prepared_device_revocation_members_binding_digest(
+        plan: &DeviceRevocationBatchPersistencePlan,
+        members: &[PreparedRevocationMember<'_>],
+        cursor: &EventChainCursor,
+    ) -> [u8; 32] {
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"CATBIRD-CHAT-G6-PREPARED-MEMBERS\0");
+        let plan_projection = format!("{plan:?}");
+        digest.update((plan_projection.len() as u64).to_be_bytes());
+        digest.update(plan_projection.as_bytes());
+        digest.update((members.len() as u64).to_be_bytes());
+        for member in members {
+            let member_projection = format!("{member:?}");
+            digest.update((member_projection.len() as u64).to_be_bytes());
+            digest.update(member_projection.as_bytes());
+        }
+        digest.update(cursor.initial_binding_digest());
+        digest.finalize().into()
     }
 
     fn prepared_revocation_event_from_fanout(
@@ -20103,10 +20202,16 @@ pub(in crate::chat_protocol) mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         prepared: PreparedDeviceRevocationBatchMembers<'plan>,
     ) -> Result<PrefixedDeviceRevocationBatchMembers<'plan>, ExecutorError> {
+        if !prepared.binding_is_intact() {
+            return Err(ExecutorError::InconsistentPlan(
+                "prepared revocation member binding changed before the prefix",
+            ));
+        }
         let PreparedDeviceRevocationBatchMembers {
             plan,
             members,
             cursor,
+            binding_digest: _,
         } = prepared;
         apply_device_revocation_batch_prefix(transaction, plan).await?;
         Ok(PrefixedDeviceRevocationBatchMembers { members, cursor })

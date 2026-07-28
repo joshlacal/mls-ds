@@ -33,6 +33,10 @@ mod model;
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
 #[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/repository/mod.rs"]
 mod repository;
 #[allow(dead_code)]
@@ -71,6 +75,12 @@ mod chat_protocol {
     pub mod repository {
         pub mod auth {
             pub use crate::repository::auth::*;
+        }
+        pub mod prelude {
+            pub use crate::repository::prelude::*;
+        }
+        pub mod recovery {
+            pub use crate::repository::recovery::*;
         }
         pub mod core {
             #![allow(dead_code)]
@@ -5558,7 +5568,6 @@ mod historical_control_loader {
         };
         use crate::chat_protocol::repository::auth::{
             authorize_signed_request, recheck_business_authority, AuthorizationOutcome,
-            G6BusinessAuthorityBinding,
         };
         use crate::chat_protocol::repository::core::{
             active_conversation_graph_digest_for_test, hydrate_locked_available_acceptance_package,
@@ -5570,12 +5579,13 @@ mod historical_control_loader {
             load_participant_hydration_rows, load_producer_transition_evidence,
             load_recovery_work_hydration_rows, load_reset_request_hydration_rows,
             load_welcome_hydration_rows, lock_welcome_terminal,
-            map_recovery_control_evidence_error, recovery_acceptance_authority_matches_durable,
-            select_fulfilled_recovery_terminal, select_single_acceptance_origin,
-            select_welcome_terminal, ControlEvidenceLoadError, FulfilledRecoveryTerminalColumns,
-            InvitationQuotaHydrationError, LockedConversationHeadGuard, LockedG6Prelude,
-            RecoveryHydrationError, RecoveryPackageHydrationError, WelcomeTerminalColumns,
-            WelcomeTerminalSelection,
+            locked_revocation_packages_match_fanout_for_test, map_recovery_control_evidence_error,
+            recovery_acceptance_authority_matches_durable, select_fulfilled_recovery_terminal,
+            select_single_acceptance_origin, select_welcome_terminal, ControlEvidenceLoadError,
+            FulfilledRecoveryTerminalColumns, InvitationQuotaHydrationError,
+            LockedConversationHeadGuard, LockedG6Prelude, LockedRecoveryPackageStatus,
+            LockedRevocationPackageGuard, RecoveryHydrationError, RecoveryPackageHydrationError,
+            WelcomeTerminalColumns, WelcomeTerminalSelection,
         };
         use crate::chat_protocol::repository::delivery::{
             append_event, canonical_welcome_disposition_event_payload, enqueue_outbox,
@@ -5587,9 +5597,9 @@ mod historical_control_loader {
             apply_device_revocation_batch_unscoped_for_test, hydrate_execution_context,
             hydrate_execution_context_unscoped_for_test, prepare_device_revocation_batch_execution,
             prepare_device_revocation_batch_execution_from_contexts_for_test,
-            ConversationExecutionArtifacts, DeviceRevocationCancellationPoint,
-            ExecutionContextArtifacts, ExecutionContextHydrationError,
-            SequentialDeviceRevocationError,
+            validate_g6_prelude_binding, ConversationExecutionArtifacts,
+            DeviceRevocationCancellationPoint, ExecutionContextArtifacts,
+            ExecutionContextHydrationError, SequentialDeviceRevocationError,
         };
         use crate::chat_protocol::repository::relationship::{
             allocate_projection_revision, load_fallback_relationship_projection,
@@ -5637,6 +5647,685 @@ mod historical_control_loader {
         };
         use crate::common;
         use crate::random_plc_did;
+
+        fn g6_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+            let mut cursor = start;
+            if bytes.get(cursor) == Some(&b'b') {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'r') {
+                return None;
+            }
+            cursor += 1;
+            let mut hashes = 0;
+            while bytes.get(cursor) == Some(&b'#') {
+                hashes += 1;
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'"') {
+                return None;
+            }
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'"'
+                    && bytes
+                        .get(cursor + 1..cursor + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+                {
+                    return Some(cursor + 1 + hashes);
+                }
+                cursor += 1;
+            }
+            Some(bytes.len())
+        }
+
+        fn g6_quoted_literal_end(bytes: &[u8], quote: usize) -> usize {
+            let mut cursor = quote + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                    b'"' => return cursor + 1,
+                    _ => cursor += 1,
+                }
+            }
+            bytes.len()
+        }
+
+        fn g6_char_literal_end(source: &str, quote: usize) -> Option<usize> {
+            let bytes = source.as_bytes();
+            let mut cursor = quote + 1;
+            match *bytes.get(cursor)? {
+                b'\\' => {
+                    cursor += 1;
+                    match *bytes.get(cursor)? {
+                        b'x' => cursor += 3,
+                        b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                            cursor += 2;
+                            while !matches!(bytes.get(cursor), Some(b'}') | None) {
+                                cursor += 1;
+                            }
+                            cursor += 1;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                b'\n' | b'\r' | b'\'' => return None,
+                _ => {
+                    let character = source[cursor..].chars().next()?;
+                    cursor += character.len_utf8();
+                }
+            }
+            (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
+        }
+
+        /// Produce same-length code and literal projections. Comments are
+        /// absent from both; literals are absent from `code`, and non-literal
+        /// code is absent from `literals`. Keeping byte positions stable lets
+        /// source-item extraction use compiler-like lexical boundaries without
+        /// a comment or raw SQL brace changing the selected item.
+        fn g6_source_projections(source: &str) -> (String, String) {
+            let bytes = source.as_bytes();
+            let mut code = vec![b' '; bytes.len()];
+            let mut literals = vec![b' '; bytes.len()];
+            let mut cursor = 0;
+            while cursor < bytes.len() {
+                if bytes.get(cursor..cursor + 2) == Some(b"//") {
+                    cursor += 2;
+                    while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                        cursor += 1;
+                    }
+                    if cursor < bytes.len() {
+                        code[cursor] = b'\n';
+                        literals[cursor] = b'\n';
+                        cursor += 1;
+                    }
+                    continue;
+                }
+                if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                    let mut depth = 1_u64;
+                    cursor += 2;
+                    while cursor < bytes.len() && depth > 0 {
+                        if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                            depth += 1;
+                            cursor += 2;
+                        } else if bytes.get(cursor..cursor + 2) == Some(b"*/") {
+                            depth -= 1;
+                            cursor += 2;
+                        } else {
+                            if bytes[cursor] == b'\n' {
+                                code[cursor] = b'\n';
+                                literals[cursor] = b'\n';
+                            }
+                            cursor += 1;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(end) = g6_raw_literal_end(bytes, cursor) {
+                    literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                    continue;
+                }
+                if bytes[cursor] == b'"'
+                    || (bytes[cursor] == b'b' && bytes.get(cursor + 1) == Some(&b'"'))
+                {
+                    let quote = cursor + usize::from(bytes[cursor] == b'b');
+                    let end = g6_quoted_literal_end(bytes, quote);
+                    literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                    continue;
+                }
+                let char_quote = if bytes[cursor] == b'\'' {
+                    Some(cursor)
+                } else if bytes[cursor] == b'b' && bytes.get(cursor + 1) == Some(&b'\'') {
+                    Some(cursor + 1)
+                } else {
+                    None
+                };
+                if let Some(quote) = char_quote {
+                    if let Some(end) = g6_char_literal_end(source, quote) {
+                        literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                        cursor = end;
+                        continue;
+                    }
+                }
+                code[cursor] = bytes[cursor];
+                cursor += 1;
+            }
+            (
+                String::from_utf8(code).expect("Rust source code projection remains UTF-8"),
+                String::from_utf8(literals).expect("Rust source literal projection remains UTF-8"),
+            )
+        }
+
+        fn g6_source_code(source: &str) -> String {
+            g6_source_projections(source).0
+        }
+
+        fn g6_source_literals(source: &str) -> String {
+            g6_source_projections(source).1
+        }
+
+        fn g6_compact_code(source: &str) -> String {
+            g6_source_code(source)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn g6_source_item<'a>(source: &'a str, marker: &str) -> &'a str {
+            let code = g6_source_code(source);
+            let start = code
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing G6 source marker: {marker}"));
+            let open = code[start..]
+                .find('{')
+                .map(|offset| start + offset)
+                .unwrap_or_else(|| panic!("missing opening brace for: {marker}"));
+            let mut depth = 0_i64;
+            for (offset, byte) in code.as_bytes()[open..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..=open + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated G6 source item: {marker}");
+        }
+
+        #[test]
+        fn g6_source_item_ignores_comment_and_literal_decoys() {
+            let source = r####"
+                // fn selected() { COMMENT_DECOY }
+                const DECOY: &str = r###"fn selected() { RAW_DECOY }"###;
+                fn selected() {
+                    let ordinary = "} STRING_DECOY {";
+                    let raw = r##"} RAW_BODY_DECOY {"##;
+                    if true { let character = '}'; }
+                    CODE_SENTINEL
+                }
+                fn following() { FOLLOWING_SENTINEL }
+            "####;
+            let item = g6_source_item(source, "fn selected()");
+            let code = g6_source_code(item);
+            let literals = g6_source_literals(item);
+            assert!(code.contains("CODE_SENTINEL"));
+            assert!(!code.contains("FOLLOWING_SENTINEL"));
+            assert!(!code.contains("COMMENT_DECOY"));
+            assert!(!code.contains("STRING_DECOY"));
+            assert!(literals.contains("STRING_DECOY"));
+            assert!(literals.contains("RAW_BODY_DECOY"));
+        }
+
+        #[test]
+        fn g6_production_authority_path_has_no_raw_business_guard() {
+            let core = include_str!("../src/chat_protocol/repository/core.rs");
+            let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
+            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+
+            let scope_seal = g6_source_item(core, "pub(crate) async fn seal_g6_scope_authority(");
+            let scope_seal = g6_source_code(scope_seal);
+            assert!(scope_seal.contains("scope: &ScopeBoundBusinessAuthority"));
+            let planner =
+                g6_source_item(state_machine, "pub(crate) fn plan_device_revocation_batch(");
+            let planner = g6_source_code(planner);
+            assert!(planner.contains("actor_registration: LockedRegistrationProjection"));
+            let executor_binding = g6_source_item(execution, "fn validate_g6_prelude_binding(");
+            let executor_binding = g6_source_code(executor_binding);
+            assert!(
+                executor_binding
+                    .contains("prelude.authority_scope_digest() != plan.authority_scope_digest()"),
+                "executor must anchor the G6 prelude to the planner's exact shared scope"
+            );
+
+            for (label, item) in [
+                ("scope seal", scope_seal),
+                ("revocation planner", planner),
+                ("executor binding", executor_binding),
+            ] {
+                assert!(
+                    !item.contains("BusinessAuthorityGuard")
+                        && !item.contains("G6BusinessAuthorityBinding")
+                        && !item.contains("seal_g6_binding")
+                        && !item.contains("locked_registration_from_guard"),
+                    "G6 {label} must not accept or recover the raw business guard"
+                );
+            }
+            assert!(
+                !g6_source_code(core).contains("G6BusinessAuthorityBinding"),
+                "the complete G6 repository prelude must be rooted in shared scope authority"
+            );
+            for (label, source) in [("core", core), ("execution", execution)] {
+                let code = g6_source_code(source);
+                assert!(
+                    !code.contains("BusinessAuthorityGuard")
+                        && !code.contains("G6BusinessAuthorityBinding"),
+                    "G6 {label} must not expose a raw business-authority primitive"
+                );
+            }
+            let production_witness = g6_source_code(g6_source_item(
+                execution,
+                "fn g6_scope_bound_production_pipeline_typecheck()",
+            ));
+            for stage in [
+                "prepare_g6_identity_scope",
+                "seal_g6_scope_authority",
+                "lock_g6_revocation_prehead_scope",
+                "LockedG6PreheadScope::seal_fanout",
+                "hydrate_locked_g6_prelude",
+                "HydrationAuthority::plan_device_revocation_batch",
+                "prepare_device_revocation_batch_execution",
+                "apply_device_revocation_batch_sequential",
+            ] {
+                assert!(
+                    production_witness.contains(stage),
+                    "production configuration omitted typed G6 stage: {stage}"
+                );
+            }
+        }
+
+        #[test]
+        fn g6_capsule_binding_covers_prepared_plan_context_and_event_schedule() {
+            let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
+            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+            let member_digest_item = g6_source_item(
+                state_machine,
+                "fn prepared_device_revocation_members_binding_digest(",
+            );
+            let member_digest = g6_source_code(member_digest_item);
+            for bound_projection in [
+                "let plan_projection = format!(",
+                "let member_projection = format!(",
+                "cursor.initial_binding_digest()",
+            ] {
+                assert!(
+                    member_digest.contains(bound_projection),
+                    "prepared-member digest omitted {bound_projection}"
+                );
+            }
+            let member_digest_literals = g6_source_literals(member_digest_item);
+            assert!(member_digest_literals.contains("\"{plan:?}\""));
+            assert!(member_digest_literals.contains("\"{member:?}\""));
+            let cursor_digest = g6_source_code(g6_source_item(
+                state_machine,
+                "fn event_chain_cursor_binding_digest",
+            ));
+            for bound_projection in [
+                "prelude_digest",
+                "devices",
+                "initial_tails",
+                "schedule_len",
+                "event.schedule_digest",
+            ] {
+                assert!(
+                    cursor_digest.contains(bound_projection),
+                    "event-chain cursor digest omitted {bound_projection}"
+                );
+            }
+            let capsule_digest =
+                g6_source_code(g6_source_item(execution, "fn g6_capsule_scope_binding("));
+            assert!(capsule_digest.contains("prepared_members_digest"));
+            let apply = g6_source_code(g6_source_item(
+                execution,
+                "pub(crate) async fn apply_device_revocation_batch_sequential(",
+            ));
+            let intact = apply
+                .find("members.binding_is_intact()")
+                .expect("capsule revalidates the complete prepared members");
+            let prefix = apply
+                .find("apply_prepared_device_revocation_prefix")
+                .expect("capsule applies its immutable prefix");
+            assert!(
+                intact < prefix
+                    && apply.contains("members.binding_digest() != &prepared_members_digest")
+                    && apply.contains("&prepared_members_digest"),
+                "capsule must compare its independent prepared-member binding before first write"
+            );
+        }
+
+        #[test]
+        fn g6_discovery_and_prehead_typestate_enforce_lock_order() {
+            let core = include_str!("../src/chat_protocol/repository/core.rs");
+            let discovery =
+                g6_source_item(core, "pub(crate) async fn discover_g6_revocation_scope(");
+            let discovery_code = g6_source_code(discovery);
+            let discovery_literals = g6_source_literals(discovery);
+            let discovery_upper = discovery_literals.to_ascii_uppercase();
+            assert!(
+                !discovery_upper.contains("FOR UPDATE") && !discovery_upper.contains("FOR SHARE"),
+                "complete G6 discovery must remain read-only"
+            );
+            for required_source in [
+                "chat.member_devices",
+                "chat.leaf_recovery_requests",
+                "chat.key_package_reservations",
+                "chat.welcome_deliveries",
+                "chat.recovery_work_items",
+                "chat.participants",
+                "chat.devices",
+            ] {
+                assert!(
+                    discovery_literals.contains(required_source),
+                    "G6 discovery omitted {required_source}"
+                );
+            }
+            assert_eq!(
+                discovery_code.matches("sqlx::query_as(").count(),
+                1,
+                "all discovery families must share one statement snapshot"
+            );
+            let identity = g6_source_item(core, "pub(crate) async fn prepare_g6_identity_scope(");
+            let identity = g6_source_code(identity);
+            let discovery_call = identity
+                .find("discover_g6_revocation_scope")
+                .expect("G6 identity facade performs discovery");
+            let identity_locks = identity
+                .find("prepare_identity_scope_prelude")
+                .expect("G6 identity facade acquires canonical identity locks");
+            assert!(
+                discovery_call < identity_locks,
+                "G6 discovery must complete before canonical identity locks"
+            );
+
+            let prehead = g6_source_item(
+                core,
+                "pub(crate) async fn lock_g6_revocation_prehead_scope(",
+            );
+            let prehead = g6_source_code(prehead);
+            let packages = prehead
+                .find("hydrate_locked_revocation_packages")
+                .expect("pre-head stage locks target packages");
+            let global = prehead
+                .find("lock_g6_revocation_global_work")
+                .expect("pre-head stage locks target-global work");
+            assert!(packages < global);
+            assert!(!prehead.contains("hydrate_locked_conversation"));
+
+            let raw_scope_impl = g6_source_item(core, "impl LockedG6ScopeAuthority");
+            let raw_scope_impl = g6_source_code(raw_scope_impl);
+            assert!(
+                !raw_scope_impl.contains("conversation_ids"),
+                "conversation IDs must not escape before package/global locks"
+            );
+            let prehead_impl = g6_source_item(core, "impl LockedG6PreheadScope");
+            let prehead_impl = g6_source_code(prehead_impl);
+            assert!(prehead_impl.contains("fn conversation_ids"));
+        }
+
+        #[test]
+        fn g6_post_head_path_has_no_identity_lock_or_identity_query() {
+            let core = include_str!("../src/chat_protocol/repository/core.rs");
+            let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
+
+            let post_head = g6_source_item(core, "pub(crate) async fn hydrate_locked_g6_prelude(");
+            let post_head_code = g6_source_code(post_head);
+            let post_head_upper = g6_source_literals(post_head).to_ascii_uppercase();
+            for forbidden in [
+                "FROM CHAT.DEVICES",
+                "JOIN CHAT.DEVICE_KEYS",
+                "FOR UPDATE",
+                "FOR SHARE",
+            ] {
+                assert!(
+                    !post_head_upper.contains(forbidden),
+                    "post-head G6 prelude contains forbidden identity access: {forbidden}"
+                );
+            }
+
+            let actor = g6_source_item(execution, "fn g6_actor(");
+            let event = g6_source_item(execution, "fn g6_event(");
+            let scoped = g6_source_item(execution, "async fn hydrate_g6_execution_context_inner(");
+            let batch = g6_source_item(execution, "async fn prepare_device_revocation_contexts(");
+            let actor = g6_source_code(actor);
+            let event = g6_source_code(event);
+            let scoped = g6_source_code(scoped);
+            let batch_code = g6_source_code(batch);
+            let batch_sql = g6_source_literals(batch).to_ascii_uppercase();
+            for (label, item) in [
+                ("actor", actor.as_str()),
+                ("event", event.as_str()),
+                ("scoped wrapper", scoped.as_str()),
+            ] {
+                assert!(
+                    !item.contains("sqlx::")
+                        && !item.contains("lock_actor(")
+                        && !item.contains("standard_audience(")
+                        && !item.contains("event(transaction"),
+                    "G6 {label} reintroduced post-head identity SQL"
+                );
+            }
+            assert!(
+                !batch_code.contains("lock_actor(")
+                    && !batch_code.contains("standard_audience(")
+                    && !batch_code.contains("event(transaction")
+                    && !batch_sql.contains("FROM CHAT.DEVICES")
+                    && !batch_sql.contains("JOIN CHAT.DEVICE_KEYS"),
+                "G6 batch hydration reintroduced post-head identity access"
+            );
+            assert!(scoped.contains("Some(prelude)"));
+            assert!(batch_code.contains("hydrate_g6_execution_context_inner"));
+            assert!(!batch_code.contains("preflight_device_revocation_execution_authority"));
+
+            let shared = g6_source_item(
+                execution,
+                "async fn hydrate_execution_context_inner_with_g6(",
+            );
+            let shared_code = g6_source_code(shared);
+            let validator = shared_code
+                .find("validate_g6_hydration_shape(plan, &artifacts)?")
+                .expect("G6 shape validation is in the actual shared hydrator");
+            let first_query = shared_code
+                .find("sqlx::query_scalar")
+                .expect("shared hydrator retains transaction identity query");
+            assert!(
+                validator < first_query,
+                "G6 shape validation must precede every transaction query"
+            );
+            let shared_compact = g6_compact_code(shared);
+            assert!(
+                shared_compact.contains(
+                    "let closing_leaf_periods = if g6_prelude.is_some() { Vec::new() } else"
+                ),
+                "actual shared G6 hydrator must bypass closing-leaf SQL"
+            );
+            let helper_bundle_declaration = shared_code
+                .find("opened_leaves,")
+                .expect("actual shared G6 hydrator declares the terminal helper bundle");
+            let pure_bundle_start = shared_code[helper_bundle_declaration..]
+                .find(") = if g6_prelude.is_some() {")
+                .map(|offset| helper_bundle_declaration + offset)
+                .expect("actual shared G6 hydrator has a pure terminal helper bundle");
+            let pure_bundle_end = shared_code[pure_bundle_start..]
+                .find("} else {")
+                .map(|offset| pure_bundle_start + offset)
+                .expect("actual shared G6 terminal helper bundle has a generic alternate");
+            let pure_bundle = &shared_code[pure_bundle_start..pure_bundle_end];
+            assert!(pure_bundle.contains("g6_spine_artifacts(plan)?"));
+            for forbidden in [
+                "opened_leaf_columns(",
+                "participant_period_ids(",
+                "closing_participant_periods(",
+                "metadata_author(",
+                "spine_artifacts(transaction",
+                "recovery_open(",
+            ] {
+                assert!(
+                    !pure_bundle.contains(forbidden),
+                    "G6 pure helper bundle reached generic hydrator: {forbidden}"
+                );
+            }
+            let shape_gate =
+                g6_source_code(g6_source_item(execution, "fn validate_g6_hydration_shape("));
+            let spine = g6_source_code(g6_source_item(execution, "fn g6_spine_artifacts("));
+            for (label, code) in [
+                ("shape gate", shape_gate.as_str()),
+                ("actor", actor.as_str()),
+                ("event", event.as_str()),
+                ("spine", spine.as_str()),
+            ] {
+                assert!(
+                    !code.contains("sqlx::")
+                        && !code.contains("lock_actor(")
+                        && !code.contains("actor_role(")
+                        && !code.contains("standard_audience(")
+                        && !code.contains("historical_schedule_audience("),
+                    "G6 {label} must remain a pure sealed-projection helper"
+                );
+            }
+            assert!(
+                !post_head_code.contains("BusinessAuthorityGuard"),
+                "post-head repository hydration must consume only sealed G6 projections"
+            );
+        }
+
+        #[test]
+        fn g6_locked_prelude_digest_binds_shared_authority_scope() {
+            let actor_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+            let actor_device_id = Uuid::new_v4();
+            let actor = DeviceIdentity::new(
+                PrincipalId::new(actor_did.as_bytes().to_vec()).expect("test principal"),
+                *actor_device_id.as_bytes(),
+            )
+            .expect("test device");
+            let conversation_id = Uuid::new_v4();
+            let trusted_instant = DateTime::parse_from_rfc3339("2026-07-28T12:00:00.000Z")
+                .expect("fixed test instant")
+                .with_timezone(&Utc);
+            let make = |authority_scope_digest| {
+                LockedG6Prelude::for_test(
+                    "424242".to_owned(),
+                    trusted_instant,
+                    authority_scope_digest,
+                    actor_did.clone(),
+                    actor_device_id,
+                    "g6-dpop-jkt".to_owned(),
+                    1,
+                    "g6-key-id".to_owned(),
+                    vec![7; 32],
+                    actor_did.clone(),
+                    actor_device_id,
+                    1,
+                    vec![conversation_id],
+                    vec![[8; 32]],
+                    vec![(actor.clone(), "g6-dpop-jkt".to_owned(), 1, Some(9))],
+                    [10; 32],
+                )
+            };
+            let first = make([1; 32]);
+            let second = make([2; 32]);
+            assert_ne!(
+                first.authority_scope_digest(),
+                second.authority_scope_digest()
+            );
+            assert_ne!(first.scope_digest(), second.scope_digest());
+        }
+
+        #[test]
+        fn g6_prelude_binding_rejects_foreign_shared_scope_without_sql() {
+            let actor_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+            let actor_device_id = Uuid::new_v4();
+            let actor = DeviceIdentity::new(
+                PrincipalId::new(actor_did.as_bytes().to_vec()).expect("canonical actor DID"),
+                *actor_device_id.as_bytes(),
+            )
+            .expect("canonical actor device");
+            let accepted_at = DateTime::parse_from_rfc3339("2026-07-28T12:00:00.000Z")
+                .expect("fixed G6 binding instant")
+                .with_timezone(&Utc);
+            let accepted =
+                ServerTimestamp::from_unix_millis_for_test(accepted_at.timestamp_millis())
+                    .expect("canonical G6 binding instant");
+            let evidence = DeviceRevocationEvidence::for_test(
+                *Uuid::new_v4().as_bytes(),
+                actor.clone(),
+                actor.clone(),
+                [3; 32],
+                1,
+                1,
+                accepted,
+                accepted,
+                [4; 32],
+                [5; 64],
+                vec![6],
+                vec![7],
+            );
+            let plan = DeviceRevocationBatchPersistencePlan::for_test(
+                evidence,
+                RevocationTargetCasBinding::for_test_with_transaction_id(
+                    "424242".to_owned(),
+                    actor.clone(),
+                    1,
+                    accepted,
+                ),
+                Vec::new(),
+                Vec::new(),
+            );
+            let prelude = |authority_scope_digest| {
+                LockedG6Prelude::for_test(
+                    "424242".to_owned(),
+                    accepted_at,
+                    authority_scope_digest,
+                    actor_did.clone(),
+                    actor_device_id,
+                    "g6-dpop-jkt".to_owned(),
+                    1,
+                    URL_SAFE_NO_PAD.encode([3; 32]),
+                    vec![8; 32],
+                    actor_did.clone(),
+                    actor_device_id,
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![(actor.clone(), "g6-dpop-jkt".to_owned(), 1, None)],
+                    [1; 32],
+                )
+            };
+            assert!(
+                validate_g6_prelude_binding(&plan, &prelude([1; 32])).is_ok(),
+                "the exact shared scope must bind without touching PostgreSQL"
+            );
+            assert!(matches!(
+                validate_g6_prelude_binding(&plan, &prelude([2; 32])),
+                Err(SequentialDeviceRevocationError::PreludeMismatch)
+            ));
+        }
+
+        #[test]
+        fn g6_package_completeness_rejects_a_proper_subset() {
+            let first = LockedRevocationPackageGuard::for_g6_completeness_test(
+                [1; 32],
+                LockedRecoveryPackageStatus::Available,
+                None,
+                None,
+            );
+            let second = LockedRevocationPackageGuard::for_g6_completeness_test(
+                [2; 32],
+                LockedRecoveryPackageStatus::Available,
+                None,
+                None,
+            );
+            let manifests = vec![
+                first.manifest_for_g6_completeness_test(),
+                second.manifest_for_g6_completeness_test(),
+            ];
+            let packages = vec![first, second];
+            assert!(locked_revocation_packages_match_fanout_for_test(
+                &packages, &manifests
+            ));
+            assert!(
+                !locked_revocation_packages_match_fanout_for_test(&packages[..1], &manifests),
+                "a caller-selected proper subset cannot satisfy the complete fanout manifest"
+            );
+            assert!(
+                !locked_revocation_packages_match_fanout_for_test(&packages, &manifests[..1]),
+                "a truncated manifest cannot authenticate the complete locked package set"
+            );
+        }
 
         #[derive(Clone, Copy)]
         struct CreationRelationshipTransport;
@@ -6733,16 +7422,15 @@ mod historical_control_loader {
             .expect("lock exact actor/device key for prepared proof");
             let make_prelude = || {
                 LockedG6Prelude::for_test(
-                    G6BusinessAuthorityBinding::for_test(
-                        transaction_id.clone(),
-                        actor_did.clone(),
-                        actor_device_id,
-                        dpop_jkt.clone(),
-                        auth_generation,
-                        key_id.clone(),
-                        signing_public_key.clone(),
-                        fixture.accepted_at,
-                    ),
+                    transaction_id.clone(),
+                    fixture.accepted_at,
+                    [1; 32],
+                    actor_did.clone(),
+                    actor_device_id,
+                    dpop_jkt.clone(),
+                    auth_generation,
+                    key_id.clone(),
+                    signing_public_key.clone(),
                     fixture.target_did.clone(),
                     fixture.target_device_id,
                     fixture.evidence.expected_target_auth_generation(),
@@ -6817,53 +7505,11 @@ mod historical_control_loader {
             .expect("explicit capsule rollback completes");
             assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
 
-            let mut cancellation_capsule = prepare_device_revocation_batch_execution(
-                &mut tx,
-                &batch,
-                make_prelude(),
-                artifacts.clone(),
-            )
-            .await
-            .expect("prepare capsule for deterministic cancellation");
-            let reached_after_prefix =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let hook_reached = reached_after_prefix.clone();
-            cancellation_capsule.set_cancellation_hook(Box::new(move |point| {
-                let hook_reached = hook_reached.clone();
-                Box::pin(async move {
-                    if point == DeviceRevocationCancellationPoint::AfterPrefix {
-                        hook_reached.store(true, std::sync::atomic::Ordering::SeqCst);
-                        std::future::pending::<()>().await;
-                    }
-                })
-            }));
-            let mut cancelled = Box::pin(apply_device_revocation_batch_sequential(
-                cancellation_capsule,
-            ));
-            tokio::select! {
-                result = &mut cancelled => {
-                    panic!("cancellation capsule completed before hook: {result:?}")
-                }
-                () = async {
-                    while !reached_after_prefix.load(std::sync::atomic::Ordering::SeqCst) {
-                        tokio::task::yield_now().await;
-                    }
-                } => {}
-            }
-            drop(cancelled);
-            // Dropping the apply future queues SQLx's savepoint rollback. This
-            // same-connection query deterministically drains it before reuse.
-            sqlx::query_scalar::<_, i32>("SELECT 1")
-                .fetch_one(&mut *tx)
-                .await
-                .expect("drain queued savepoint rollback after cancellation");
-            assert_g6_batch_preflight_left_no_writes(&mut tx, &fixture, None).await;
-
             let prepared = prepare_device_revocation_batch_execution(
                 &mut tx,
                 &batch,
                 make_prelude(),
-                artifacts,
+                artifacts.clone(),
             )
             .await
             .expect("production prepared revocation capsule seals");
@@ -6936,6 +7582,136 @@ mod historical_control_loader {
             .await
             .expect("read shared device after rollback");
             assert_eq!(durable_status, ("active".to_owned(), None));
+
+            // Deterministically cancel only after PostgreSQL has acknowledged
+            // RELEASE SAVEPOINT. At that boundary the nested writes already
+            // belong to the outer transaction, so the documented recovery is
+            // an immediate outer rollback, never a connection-draining query
+            // followed by transaction reuse.
+            let mut cancel_tx = pool
+                .begin()
+                .await
+                .expect("begin post-release cancellation proof");
+            let cancel_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                .fetch_one(&mut *cancel_tx)
+                .await
+                .expect("read post-release cancellation transaction ID");
+            let cancel_first_plan =
+                fixture.conversation_plan_for_transaction(&cancel_transaction_id);
+            let cancel_second_planned =
+                plan_device_revocation(&second_state, fixture.evidence.clone())
+                    .expect("replan second conversation for cancellation proof");
+            let cancel_second_plan = device_revocation_plan_for_test(
+                cancel_second_planned,
+                ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+                    cancel_transaction_id.clone(),
+                    *second_cid.as_bytes(),
+                    *second_state.coordinate(),
+                    5,
+                    accepted,
+                ),
+                fixture.evidence.clone(),
+            );
+            let cancel_head_digests = vec![
+                *cancel_first_plan
+                    .effects()
+                    .head_cas()
+                    .expect("first cancellation head binding")
+                    .locked_head_digest(),
+                *cancel_second_plan
+                    .effects()
+                    .head_cas()
+                    .expect("second cancellation head binding")
+                    .locked_head_digest(),
+            ];
+            let cancel_target_cas = RevocationTargetCasBinding::for_test_with_transaction_id(
+                cancel_transaction_id.clone(),
+                target.clone(),
+                fixture.evidence.expected_target_auth_generation(),
+                accepted,
+            );
+            let cancel_batch = DeviceRevocationBatchPersistencePlan::for_test(
+                fixture.evidence.clone(),
+                cancel_target_cas,
+                Vec::new(),
+                vec![cancel_first_plan, cancel_second_plan],
+            );
+            let cancel_prelude = LockedG6Prelude::for_test(
+                cancel_transaction_id,
+                fixture.accepted_at,
+                [1; 32],
+                actor_did,
+                actor_device_id,
+                dpop_jkt.clone(),
+                auth_generation,
+                key_id,
+                signing_public_key,
+                fixture.target_did.clone(),
+                fixture.target_device_id,
+                fixture.evidence.expected_target_auth_generation(),
+                vec![first_cid, second_cid],
+                cancel_head_digests,
+                vec![(target, dpop_jkt, auth_generation, pre_batch_tail)],
+                [1; 32],
+            );
+            seed_g6_revoke_receipt(&mut cancel_tx, &fixture).await;
+            let mut cancellation_capsule = prepare_device_revocation_batch_execution(
+                &mut cancel_tx,
+                &cancel_batch,
+                cancel_prelude,
+                artifacts,
+            )
+            .await
+            .expect("prepare capsule for post-release cancellation");
+            let reached_after_release =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_reached = reached_after_release.clone();
+            cancellation_capsule.set_cancellation_hook(Box::new(move |point| {
+                let hook_reached = hook_reached.clone();
+                Box::pin(async move {
+                    if point == DeviceRevocationCancellationPoint::AfterRelease {
+                        hook_reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    }
+                })
+            }));
+            let mut cancelled = Box::pin(apply_device_revocation_batch_sequential(
+                cancellation_capsule,
+            ));
+            tokio::select! {
+                result = &mut cancelled => {
+                    panic!("cancellation capsule completed before post-release hook: {result:?}")
+                }
+                () = async {
+                    while !reached_after_release.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            drop(cancelled);
+            cancel_tx
+                .rollback()
+                .await
+                .expect("post-release cancellation requires outer rollback");
+
+            let durable_after_cancellation: (String, Option<Uuid>, i64) = sqlx::query_as(
+                "SELECT d.status,d.revocation_id,\
+                        (SELECT count(*) FROM chat.device_revocations r \
+                          WHERE r.revocation_id=$3) \
+                   FROM chat.devices d \
+                  WHERE d.user_did=$1 AND d.device_id=$2",
+            )
+            .bind(&fixture.target_did)
+            .bind(fixture.target_device_id)
+            .bind(fixture.revocation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read durable state after post-release outer rollback");
+            assert_eq!(
+                durable_after_cancellation,
+                ("active".to_owned(), None, 0),
+                "outer rollback erases a cancellation observed after savepoint release"
+            );
         }
 
         #[tokio::test]

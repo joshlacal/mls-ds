@@ -9,7 +9,7 @@
 // (`tests/chat_protocol_conversation_substrate.rs`) can inline this file as a
 // module, matching the sibling repository writers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -23,6 +23,7 @@ use super::super::transcript::{
     SignedMutationKind, VerifiedMutationProjection,
 };
 use super::super::{
+    dpop::VerifiedChatDeviceRequest,
     snapshot::{
         PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
     },
@@ -44,7 +45,14 @@ use super::super::{
     validation::{BareDid, KeyThumbprint},
     wire::{validate_key_package, KeyPackageValidationPolicy, MAX_KEY_PACKAGE_WIRE_BYTES},
 };
-use super::auth::G6BusinessAuthorityBinding;
+use super::{
+    auth::RepositoryAuthorityClass,
+    prelude::{
+        prepare_identity_scope_prelude, CanonicalDeviceIdentity, CanonicalLockScope,
+        OperationReservationGuard, PreludeError, PreparedBusinessPrelude,
+        ScopeBoundBusinessAuthority,
+    },
+};
 
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -979,6 +987,66 @@ impl LockedRevocationPackageGuard {
     pub(crate) fn durable_row_digest(&self) -> &[u8; 32] {
         &self.durable_row_digest
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_g6_completeness_test(
+        key_package_ref: [u8; 32],
+        status: LockedRecoveryPackageStatus,
+        conversation_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+    ) -> Self {
+        let transaction_id = "424242".to_owned();
+        let target_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let target_device_id = Uuid::new_v4();
+        let target_key_id = URL_SAFE_NO_PAD.encode([3; 32]);
+        let target_auth_generation = 1;
+        let wrapper_sha256 = [4; 32];
+        let locked_at = DateTime::parse_from_rfc3339("2026-07-28T12:00:00.000Z")
+            .expect("fixed G6 package instant")
+            .with_timezone(&Utc);
+        let not_after = locked_at + chrono::Duration::hours(1);
+        let durable_row_digest = revocation_package_guard_digest(
+            &transaction_id,
+            &target_did,
+            target_device_id,
+            &target_key_id,
+            target_auth_generation,
+            &key_package_ref,
+            &wrapper_sha256,
+            not_after,
+            status,
+            conversation_id,
+            request_id,
+            locked_at,
+        );
+        Self::from_locked_row(
+            transaction_id,
+            target_did,
+            target_device_id,
+            target_key_id,
+            target_auth_generation,
+            key_package_ref,
+            wrapper_sha256,
+            not_after,
+            status,
+            conversation_id,
+            request_id,
+            locked_at,
+            durable_row_digest,
+        )
+        .expect("valid G6 package completeness fixture")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_for_g6_completeness_test(&self) -> LockedRevocationPackageManifest {
+        LockedRevocationPackageManifest {
+            key_package_ref: self.key_package_ref,
+            status: self.status,
+            conversation_id: self.conversation_id,
+            request_id: self.request_id,
+            locked_row_digest: self.durable_row_digest,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,9 +1234,131 @@ impl LockedRevocationFanoutGuard {
     }
 }
 
+/// Read-only, canonical G6 discovery result. It is intentionally created
+/// before any principal/device/key lock and can only be turned into a business
+/// lock scope containing the complete affected conversation audience.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct DiscoveredG6RevocationScope {
+    actor_did: String,
+    actor_device_id: Uuid,
+    target_did: String,
+    target_device_id: Uuid,
+    conversation_ids: Vec<Uuid>,
+    principals: Vec<String>,
+    devices: Vec<CanonicalDeviceIdentity>,
+    discovery_digest: [u8; 32],
+}
+
+impl DiscoveredG6RevocationScope {
+    pub(crate) fn canonical_lock_scope(&self) -> Result<CanonicalLockScope, LockedG6PreludeError> {
+        CanonicalLockScope::new(self.principals.clone(), self.devices.clone())
+            .map_err(|_| LockedG6PreludeError::AudienceMismatch)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ScopeBoundG6DeviceFact {
+    did: String,
+    device_id: Uuid,
+    status: String,
+    dpop_jkt: String,
+    auth_generation: i64,
+}
+
+/// Opaque bridge from the shared identity-scope prelude to G6. Construction
+/// re-runs the read-only discovery after the canonical identity locks and
+/// rejects any scope drift before package/global or conversation-head locks.
+#[derive(Debug)]
+pub(crate) struct LockedG6ScopeAuthority {
+    transaction_id: String,
+    trusted_instant: DateTime<Utc>,
+    authority_scope_digest: [u8; 32],
+    discovery_digest: [u8; 32],
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_dpop_jkt: String,
+    actor_auth_generation: i64,
+    actor_key_id: String,
+    actor_signing_public_key: Vec<u8>,
+    target_did: String,
+    target_device_id: Uuid,
+    target_auth_generation: u64,
+    target_status: LockedRevocationTargetStatus,
+    conversation_ids: Vec<Uuid>,
+    principals: Vec<String>,
+    devices: Vec<ScopeBoundG6DeviceFact>,
+}
+
+impl LockedG6ScopeAuthority {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.trusted_instant
+    }
+}
+
+#[derive(Debug)]
+struct LockedG6GlobalWorkGuard {
+    transaction_id: String,
+    locked_at: DateTime<Utc>,
+    target_did: String,
+    target_device_id: Uuid,
+    discovery_digest: [u8; 32],
+}
+
+/// The only G6 value that exposes canonical conversation IDs. It is minted
+/// after both target package locks and the target-global recovery-work lock,
+/// making the package/global-before-head order a type boundary rather than a
+/// caller convention.
+#[derive(Debug)]
+pub(crate) struct LockedG6PreheadScope {
+    authority: LockedG6ScopeAuthority,
+    target: LockedRevocationTargetGuard,
+    packages: Vec<LockedRevocationPackageGuard>,
+    global: LockedG6GlobalWorkGuard,
+}
+
+impl LockedG6PreheadScope {
+    pub(crate) fn conversation_ids(&self) -> &[Uuid] {
+        &self.authority.conversation_ids
+    }
+
+    pub(crate) fn seal_fanout(
+        &self,
+        locked_conversations: &[LockedConversationStateGuard],
+    ) -> Result<LockedRevocationFanoutGuard, RevocationScopeHydrationError> {
+        seal_locked_revocation_fanout(&self.target, &self.packages, locked_conversations)
+    }
+}
+
+/// Final repository products retained across pure planning. The target and
+/// package guards remain single-use inputs to the state-machine batch planner;
+/// the G6 prelude is retained by the opaque executor capsule.
+#[derive(Debug)]
+pub(crate) struct LockedG6RepositoryPrelude {
+    prelude: LockedG6Prelude,
+    target: LockedRevocationTargetGuard,
+    packages: Vec<LockedRevocationPackageGuard>,
+}
+
+impl LockedG6RepositoryPrelude {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LockedG6Prelude,
+        LockedRevocationTargetGuard,
+        Vec<LockedRevocationPackageGuard>,
+    ) {
+        (self.prelude, self.target, self.packages)
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LockedG6DeviceFact {
     device: DeviceIdentity,
+    status: String,
     dpop_jkt: String,
     auth_generation: i64,
     initial_event_tail: Option<i64>,
@@ -1177,6 +1367,18 @@ pub(crate) struct LockedG6DeviceFact {
 impl LockedG6DeviceFact {
     pub(crate) fn device(&self) -> &DeviceIdentity {
         &self.device
+    }
+
+    pub(crate) fn status(&self) -> &str {
+        &self.status
+    }
+
+    pub(crate) fn dpop_jkt(&self) -> &str {
+        &self.dpop_jkt
+    }
+
+    pub(crate) fn auth_generation(&self) -> i64 {
+        self.auth_generation
     }
 
     pub(crate) fn initial_event_tail(&self) -> Option<i64> {
@@ -1191,7 +1393,13 @@ impl LockedG6DeviceFact {
 pub(crate) struct LockedG6Prelude {
     transaction_id: String,
     trusted_instant: DateTime<Utc>,
-    business: G6BusinessAuthorityBinding,
+    authority_scope_digest: [u8; 32],
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_dpop_jkt: String,
+    actor_auth_generation: i64,
+    actor_key_id: String,
+    actor_signing_public_key: Vec<u8>,
     target_did: String,
     target_device_id: Uuid,
     target_auth_generation: u64,
@@ -1211,8 +1419,32 @@ impl LockedG6Prelude {
         self.trusted_instant
     }
 
-    pub(crate) fn business(&self) -> &G6BusinessAuthorityBinding {
-        &self.business
+    pub(crate) fn authority_scope_digest(&self) -> &[u8; 32] {
+        &self.authority_scope_digest
+    }
+
+    pub(crate) fn actor_did(&self) -> &str {
+        &self.actor_did
+    }
+
+    pub(crate) fn actor_device_id(&self) -> Uuid {
+        self.actor_device_id
+    }
+
+    pub(crate) fn actor_dpop_jkt(&self) -> &str {
+        &self.actor_dpop_jkt
+    }
+
+    pub(crate) fn actor_auth_generation(&self) -> i64 {
+        self.actor_auth_generation
+    }
+
+    pub(crate) fn actor_key_id(&self) -> &str {
+        &self.actor_key_id
+    }
+
+    pub(crate) fn actor_signing_public_key(&self) -> &[u8] {
+        &self.actor_signing_public_key
     }
 
     pub(crate) fn target(&self) -> (&str, Uuid, u64) {
@@ -1246,7 +1478,15 @@ impl LockedG6Prelude {
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test(
-        business: G6BusinessAuthorityBinding,
+        transaction_id: String,
+        trusted_instant: DateTime<Utc>,
+        authority_scope_digest: [u8; 32],
+        actor_did: String,
+        actor_device_id: Uuid,
+        actor_dpop_jkt: String,
+        actor_auth_generation: i64,
+        actor_key_id: String,
+        actor_signing_public_key: Vec<u8>,
         target_did: String,
         target_device_id: Uuid,
         target_auth_generation: u64,
@@ -1255,13 +1495,13 @@ impl LockedG6Prelude {
         device_facts: Vec<(DeviceIdentity, String, i64, Option<i64>)>,
         fanout_digest: [u8; 32],
     ) -> Self {
-        let transaction_id = business.transaction_id().to_owned();
-        let trusted_instant = business.trusted_instant();
+        assert_ne!(authority_scope_digest, [0; 32]);
         let devices = device_facts
             .into_iter()
             .map(
                 |(device, dpop_jkt, auth_generation, initial_event_tail)| LockedG6DeviceFact {
                     device,
+                    status: "active".to_owned(),
                     dpop_jkt,
                     auth_generation,
                     initial_event_tail,
@@ -1271,19 +1511,32 @@ impl LockedG6Prelude {
         assert!(devices
             .windows(2)
             .all(|pair| pair[0].device < pair[1].device));
-        let mut digest = Sha256::new();
-        digest.update(b"CATBIRD-CHAT-LOCKED-G6-PRELUDE-TEST\0");
-        digest.update(business.domain_digest());
-        digest.update(&fanout_digest);
-        for device in &devices {
-            digest.update(device.device.principal().as_bytes());
-            digest.update(device.device.device_id());
-            digest.update(device.initial_event_tail.unwrap_or_default().to_be_bytes());
-        }
+        let target = LockedRevocationTargetGuard::for_test(
+            transaction_id.clone(),
+            target_did.clone(),
+            target_device_id,
+            target_auth_generation,
+            LockedRevocationTargetStatus::Active,
+            trusted_instant,
+        );
+        let scope_digest = locked_g6_scope_digest(
+            &authority_scope_digest,
+            &target,
+            &conversation_ids,
+            &head_digests,
+            &devices,
+            &fanout_digest,
+        );
         Self {
             transaction_id,
             trusted_instant,
-            business,
+            authority_scope_digest,
+            actor_did,
+            actor_device_id,
+            actor_dpop_jkt,
+            actor_auth_generation,
+            actor_key_id,
+            actor_signing_public_key,
             target_did,
             target_device_id,
             target_auth_generation,
@@ -1291,7 +1544,7 @@ impl LockedG6Prelude {
             head_digests,
             devices,
             fanout_digest,
-            scope_digest: digest.finalize().into(),
+            scope_digest,
         }
     }
 }
@@ -1300,6 +1553,8 @@ impl LockedG6Prelude {
 pub(crate) enum LockedG6PreludeError {
     #[error("G6 prelude authority, transaction, target, or scope binding drifted")]
     PreludeBindingMismatch,
+    #[error("G6 read-only discovery changed after canonical identity locking")]
+    DiscoveryDrift,
     #[error("G6 revocation requires recovery-request expiry before planning")]
     RecoveryRequestRequiresExpiry,
     #[error("G6 revocation requires Welcome expiry before planning")]
@@ -1308,34 +1563,486 @@ pub(crate) enum LockedG6PreludeError {
     PendingRecoveryWorkUnsupported,
     #[error("G6 revocation audience is incomplete or non-canonical")]
     AudienceMismatch,
+    #[error(transparent)]
+    Prelude(#[from] PreludeError),
+    #[error(transparent)]
+    RevocationScope(#[from] RevocationScopeHydrationError),
     #[error("G6 prelude database read failed")]
     Database(#[from] sqlx::Error),
 }
 
-/// Seal the complete G6 audience and device-global event tails before the
-/// revocation prefix can write. This is intentionally a pre-planning facade:
-/// it accepts only repository-issued guards and rechecks their common
-/// transaction/trusted-instant/scope binding.
-pub(crate) async fn hydrate_locked_g6_prelude(
+/// Discover every conversation and active audience device affected by one
+/// revocation without taking any row lock. The caller must run this after the
+/// global operation reservation and before `prepare_identity_scope_prelude`.
+#[derive(sqlx::FromRow)]
+struct G6DiscoveryRow {
+    conversation_ids: Vec<Uuid>,
+    principals: Vec<String>,
+    device_dids: Vec<String>,
+    device_ids: Vec<Uuid>,
+}
+
+pub(crate) async fn discover_g6_revocation_scope(
     transaction: &mut Transaction<'_, Postgres>,
-    business: G6BusinessAuthorityBinding,
-    target: &LockedRevocationTargetGuard,
-    fanout: &LockedRevocationFanoutGuard,
-    locked_conversations: &[LockedConversationStateGuard],
-) -> Result<LockedG6Prelude, LockedG6PreludeError> {
+    actor_did: &str,
+    actor_device_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+) -> Result<DiscoveredG6RevocationScope, LockedG6PreludeError> {
+    if BareDid::parse(actor_did).is_err()
+        || BareDid::parse(target_did).is_err()
+        || !uuid_is_canonical_v4(actor_device_id)
+        || !uuid_is_canonical_v4(target_device_id)
+    {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+    // One statement deliberately freezes all discovery families to one
+    // READ-COMMITTED statement snapshot. Splitting these projections across
+    // statements could synthesize a scope that never existed.
+    let row: G6DiscoveryRow = sqlx::query_as(
+        r#"
+        WITH affected AS (
+                SELECT leaf.conversation_id
+                  FROM chat.member_devices AS leaf
+                 WHERE leaf.user_did=$1
+                   AND leaf.device_id=$2
+                   AND leaf.active
+                UNION
+                SELECT request.conversation_id
+                  FROM chat.leaf_recovery_requests AS request
+                 WHERE request.requester_did=$1
+                   AND request.requester_device_id=$2
+                   AND request.status='open'
+                UNION
+                SELECT reservation.conversation_id
+                  FROM chat.key_package_reservations AS reservation
+                 WHERE reservation.recipient_did=$1
+                   AND reservation.recipient_device_id=$2
+                   AND reservation.status='active'
+                UNION
+                SELECT bundle.conversation_id
+                  FROM chat.welcome_deliveries AS delivery
+                  JOIN chat.welcome_bundles AS bundle
+                    ON bundle.welcome_id=delivery.welcome_id
+                 WHERE delivery.recipient_did=$1
+                   AND delivery.recipient_device_id=$2
+                   AND delivery.status='pending'
+                UNION
+                SELECT work.conversation_id
+                  FROM chat.recovery_work_items AS work
+                 WHERE work.recipient_did=$1
+                   AND work.recipient_device_id=$2
+                   AND work.status='pending'
+        ),
+        audience_principals AS (
+                SELECT participant.user_did
+                  FROM chat.participants AS participant
+                 WHERE participant.conversation_id IN (
+                           SELECT conversation_id FROM affected
+                       )
+                   AND participant.current_membership
+                UNION SELECT $1::text
+                UNION SELECT $3::text
+        ),
+        audience_devices AS (
+                SELECT device.user_did,device.device_id
+                  FROM chat.devices AS device
+                 WHERE device.user_did IN (
+                           SELECT user_did FROM audience_principals
+                       )
+                   AND device.status='active'
+                UNION SELECT $1::text,$2::uuid
+                UNION SELECT $3::text,$4::uuid
+        )
+        SELECT ARRAY(
+                   SELECT conversation_id
+                     FROM affected
+                    ORDER BY uuid_send(conversation_id)
+               ) AS conversation_ids,
+               ARRAY(
+                   SELECT user_did
+                     FROM audience_principals
+                    ORDER BY convert_to(user_did,'UTF8')
+               ) AS principals,
+               ARRAY(
+                   SELECT user_did
+                     FROM audience_devices
+                    ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id)
+               ) AS device_dids,
+               ARRAY(
+                   SELECT device_id
+                     FROM audience_devices
+                    ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id)
+               ) AS device_ids
+        "#,
+    )
+    .bind(target_did)
+    .bind(target_device_id)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    let conversation_ids = row.conversation_ids;
+    if !sorted_unique_uuid_v4(&conversation_ids) {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+    let principals = row.principals;
+    if principals
+        .windows(2)
+        .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        || principals
+            .iter()
+            .any(|principal| BareDid::parse(principal).is_err())
+    {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+    if row.device_dids.len() != row.device_ids.len() {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+    let devices = row
+        .device_dids
+        .into_iter()
+        .zip(row.device_ids)
+        .map(|(did, device_id)| CanonicalDeviceIdentity::new(did, device_id))
+        .collect::<Vec<_>>();
+    if devices.windows(2).any(|pair| {
+        pair[0].did().as_bytes() > pair[1].did().as_bytes()
+            || (pair[0].did() == pair[1].did()
+                && pair[0].device_id().as_bytes() >= pair[1].device_id().as_bytes())
+    }) {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+
+    let discovery_digest = g6_discovery_digest(
+        actor_did,
+        actor_device_id,
+        target_did,
+        target_device_id,
+        &conversation_ids,
+        &principals,
+        &devices,
+    );
+    Ok(DiscoveredG6RevocationScope {
+        actor_did: actor_did.to_owned(),
+        actor_device_id,
+        target_did: target_did.to_owned(),
+        target_device_id,
+        conversation_ids,
+        principals,
+        devices,
+        discovery_digest,
+    })
+}
+
+/// Execute the required G6 identity-lock order behind one facade. The caller
+/// already owns the operation reservation; this function discovers the full
+/// read-only scope first, then and only then hands that scope to the shared
+/// canonical principal/device/key prelude.
+pub(crate) async fn prepare_g6_identity_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    reservation: OperationReservationGuard,
+    target_did: &str,
+    target_device_id: Uuid,
+) -> Result<(PreparedBusinessPrelude, DiscoveredG6RevocationScope), LockedG6PreludeError> {
+    let discovery = discover_g6_revocation_scope(
+        transaction,
+        authority.subject().as_str(),
+        Uuid::from_bytes(*authority.device_id().as_bytes()),
+        target_did,
+        target_device_id,
+    )
+    .await?;
+    let lock_scope = discovery.canonical_lock_scope()?;
+    let prepared =
+        prepare_identity_scope_prelude(transaction, authority, reservation, lock_scope).await?;
+    Ok((prepared, discovery))
+}
+
+fn g6_discovery_digest(
+    actor_did: &str,
+    actor_device_id: Uuid,
+    target_did: &str,
+    target_device_id: Uuid,
+    conversation_ids: &[Uuid],
+    principals: &[String],
+    devices: &[CanonicalDeviceIdentity],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-G6-READ-ONLY-DISCOVERY\0");
+    digest.update((actor_did.len() as u64).to_be_bytes());
+    digest.update(actor_did.as_bytes());
+    digest.update(actor_device_id.as_bytes());
+    digest.update((target_did.len() as u64).to_be_bytes());
+    digest.update(target_did.as_bytes());
+    digest.update(target_device_id.as_bytes());
+    digest.update((conversation_ids.len() as u64).to_be_bytes());
+    for conversation_id in conversation_ids {
+        digest.update(conversation_id.as_bytes());
+    }
+    digest.update((principals.len() as u64).to_be_bytes());
+    for principal in principals {
+        digest.update((principal.len() as u64).to_be_bytes());
+        digest.update(principal.as_bytes());
+    }
+    digest.update((devices.len() as u64).to_be_bytes());
+    for device in devices {
+        digest.update((device.did().len() as u64).to_be_bytes());
+        digest.update(device.did().as_bytes());
+        digest.update(device.device_id().as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// Revalidate the discovery under the shared canonical identity locks, then
+/// seal only projections copied from that opaque authority. No raw business
+/// authority or caller-selected registration fields cross this boundary.
+pub(crate) async fn seal_g6_scope_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &ScopeBoundBusinessAuthority,
+    discovery: DiscoveredG6RevocationScope,
+) -> Result<LockedG6ScopeAuthority, LockedG6PreludeError> {
     let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
-    let trusted_instant = business.trusted_instant();
-    if live_transaction_id != business.transaction_id()
-        || target.transaction_id() != business.transaction_id()
-        || fanout.transaction_id() != business.transaction_id()
+    if live_transaction_id != scope.transaction_id()
+        || scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+        || scope.scope_digest() == &[0; 32]
+        || scope.actor_did() != discovery.actor_did
+        || scope.actor_device_id() != discovery.actor_device_id
+    {
+        return Err(LockedG6PreludeError::PreludeBindingMismatch);
+    }
+    let rediscovered = discover_g6_revocation_scope(
+        transaction,
+        &discovery.actor_did,
+        discovery.actor_device_id,
+        &discovery.target_did,
+        discovery.target_device_id,
+    )
+    .await?;
+    if rediscovered != discovery {
+        return Err(LockedG6PreludeError::DiscoveryDrift);
+    }
+    if scope.principals() != discovery.principals {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+    let locked_identities = scope
+        .devices()
+        .iter()
+        .map(|device| CanonicalDeviceIdentity::new(device.user_did(), device.device_id()))
+        .collect::<Vec<_>>();
+    if locked_identities != discovery.devices {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
+
+    let actor_dpop_jkt = scope
+        .actor_dpop_jkt()
+        .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
+    let actor_auth_generation = scope
+        .actor_auth_generation()
+        .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
+    let actor_key_id = scope
+        .actor_key_id()
+        .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
+    let actor_signing_public_key = scope
+        .actor_signing_public_key()
+        .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
+    if KeyThumbprint::parse(actor_dpop_jkt).is_err()
+        || KeyThumbprint::parse(actor_key_id).is_err()
+        || actor_signing_public_key.len() != 32
+        || !(1..=i64::try_from(MAX_PROTOCOL_INTEGER).unwrap()).contains(&actor_auth_generation)
+    {
+        return Err(LockedG6PreludeError::PreludeBindingMismatch);
+    }
+
+    let mut devices = Vec::with_capacity(scope.devices().len());
+    for device in scope.devices() {
+        let valid_status = match device.status() {
+            "active" => device.revoked_at().is_none(),
+            "revoked" => device.revoked_at().is_some(),
+            _ => false,
+        };
+        if !valid_status
+            || KeyThumbprint::parse(device.dpop_jkt()).is_err()
+            || !(1..=i64::try_from(MAX_PROTOCOL_INTEGER).unwrap())
+                .contains(&device.auth_generation())
+        {
+            return Err(LockedG6PreludeError::AudienceMismatch);
+        }
+        devices.push(ScopeBoundG6DeviceFact {
+            did: device.user_did().to_owned(),
+            device_id: device.device_id(),
+            status: device.status().to_owned(),
+            dpop_jkt: device.dpop_jkt().to_owned(),
+            auth_generation: device.auth_generation(),
+        });
+    }
+    let target = devices
+        .iter()
+        .find(|device| {
+            device.did == discovery.target_did && device.device_id == discovery.target_device_id
+        })
+        .ok_or(LockedG6PreludeError::AudienceMismatch)?;
+    let target_status = match target.status.as_str() {
+        "active" => LockedRevocationTargetStatus::Active,
+        "revoked" => LockedRevocationTargetStatus::Revoked,
+        _ => return Err(LockedG6PreludeError::AudienceMismatch),
+    };
+    let target_auth_generation = u64::try_from(target.auth_generation)
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(LockedG6PreludeError::AudienceMismatch)?;
+    // Discovery names the expected target/audience set, but the sealed value
+    // copies every canonical identity fact from the shared locked projection.
+    let target_did = target.did.clone();
+    let target_device_id = target.device_id;
+    let principals = scope.principals().to_vec();
+
+    Ok(LockedG6ScopeAuthority {
+        transaction_id: live_transaction_id,
+        trusted_instant: scope.trusted_instant(),
+        authority_scope_digest: *scope.scope_digest(),
+        discovery_digest: discovery.discovery_digest,
+        actor_did: scope.actor_did().to_owned(),
+        actor_device_id: scope.actor_device_id(),
+        actor_dpop_jkt: actor_dpop_jkt.to_owned(),
+        actor_auth_generation,
+        actor_key_id: actor_key_id.to_owned(),
+        actor_signing_public_key: actor_signing_public_key.to_vec(),
+        target_did,
+        target_device_id,
+        target_auth_generation,
+        target_status,
+        conversation_ids: discovery.conversation_ids,
+        principals,
+        devices,
+    })
+}
+
+/// Derive the revocation target solely from the already-locked shared scope.
+fn seal_locked_revocation_target_from_scope_authority(
+    scope: &LockedG6ScopeAuthority,
+) -> Result<LockedRevocationTargetGuard, RevocationScopeHydrationError> {
+    let digest = revocation_target_guard_digest(
+        scope.transaction_id(),
+        &scope.target_did,
+        scope.target_device_id,
+        scope.target_auth_generation,
+        scope.target_status,
+        scope.trusted_instant(),
+    );
+    LockedRevocationTargetGuard::from_locked_row(
+        scope.transaction_id.clone(),
+        scope.target_did.clone(),
+        scope.target_device_id,
+        i64::try_from(scope.target_auth_generation)
+            .map_err(|_| RevocationScopeHydrationError::OutOfDomain)?,
+        scope.target_status,
+        scope.trusted_instant,
+        digest,
+    )
+    .ok_or(RevocationScopeHydrationError::GuardInvariant)
+}
+
+/// Lock the target's device-global recovery-work predicate before any
+/// conversation head is acquired. The target device is already held by the
+/// shared identity scope, so an empty result remains stable against inserts
+/// that must satisfy the device foreign key.
+async fn lock_g6_revocation_global_work(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &LockedG6ScopeAuthority,
+) -> Result<LockedG6GlobalWorkGuard, LockedG6PreludeError> {
+    let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if live_transaction_id != scope.transaction_id {
+        return Err(LockedG6PreludeError::PreludeBindingMismatch);
+    }
+    let pending: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT recovery_work_id
+          FROM chat.recovery_work_items
+         WHERE recipient_did=$1
+           AND recipient_device_id=$2
+           AND status='pending'
+         ORDER BY uuid_send(recovery_work_id)
+         FOR UPDATE
+        "#,
+    )
+    .bind(&scope.target_did)
+    .bind(scope.target_device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if !pending.is_empty() {
+        return Err(LockedG6PreludeError::PendingRecoveryWorkUnsupported);
+    }
+    Ok(LockedG6GlobalWorkGuard {
+        transaction_id: live_transaction_id,
+        locked_at: scope.trusted_instant,
+        target_did: scope.target_did.clone(),
+        target_device_id: scope.target_device_id,
+        discovery_digest: scope.discovery_digest,
+    })
+}
+
+/// Complete the G6 pre-head stage in fixed order: derive the target from the
+/// shared scope, lock its package rows, then lock/check device-global recovery
+/// work. Only the resulting guard reveals conversation IDs for head hydration.
+pub(crate) async fn lock_g6_revocation_prehead_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: LockedG6ScopeAuthority,
+) -> Result<LockedG6PreheadScope, LockedG6PreludeError> {
+    let target = seal_locked_revocation_target_from_scope_authority(&scope)?;
+    let packages = hydrate_locked_revocation_packages(transaction, &target).await?;
+    let global = lock_g6_revocation_global_work(transaction, &scope).await?;
+    Ok(LockedG6PreheadScope {
+        authority: scope,
+        target,
+        packages,
+        global,
+    })
+}
+
+/// Seal the complete G6 audience and device-global event tails after the
+/// package/global locks and canonical conversation heads are held. This phase
+/// contains no `chat.devices` or `chat.device_keys` access: identity facts come
+/// only from the shared prelude projections.
+pub(crate) async fn hydrate_locked_g6_prelude(
+    transaction: &mut Transaction<'_, Postgres>,
+    prehead: LockedG6PreheadScope,
+    fanout: &LockedRevocationFanoutGuard,
+    locked_conversations: &[LockedConversationStateGuard],
+) -> Result<LockedG6RepositoryPrelude, LockedG6PreludeError> {
+    let LockedG6PreheadScope {
+        authority: scope,
+        target,
+        packages,
+        global,
+    } = prehead;
+    let live_transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let trusted_instant = scope.trusted_instant;
+    if live_transaction_id != scope.transaction_id
+        || global.transaction_id != scope.transaction_id
+        || global.locked_at != trusted_instant
+        || global.target_did != scope.target_did
+        || global.target_device_id != scope.target_device_id
+        || global.discovery_digest != scope.discovery_digest
+        || target.transaction_id() != scope.transaction_id
+        || fanout.transaction_id() != scope.transaction_id
         || target.locked_at() != trusted_instant
         || fanout.locked_at() != trusted_instant
         || target.status() != LockedRevocationTargetStatus::Active
+        || target.target_did() != scope.target_did
+        || target.target_device_id() != scope.target_device_id
+        || target.target_auth_generation() != scope.target_auth_generation
         || fanout.target_did() != target.target_did()
         || fanout.target_device_id() != target.target_device_id()
+        || !locked_revocation_packages_match_fanout(&packages, fanout.live_packages())
         || fanout.conversations().len() != locked_conversations.len()
+        || locked_conversations.len() != scope.conversation_ids.len()
     {
         return Err(LockedG6PreludeError::PreludeBindingMismatch);
     }
@@ -1343,34 +2050,13 @@ pub(crate) async fn hydrate_locked_g6_prelude(
     let mut conversation_ids = Vec::with_capacity(locked_conversations.len());
     let mut head_digests = Vec::with_capacity(locked_conversations.len());
     let trusted_millis = trusted_instant.timestamp_millis();
-    let mut audience_dids = BTreeMap::<Vec<u8>, String>::new();
-    let mut exact_devices = BTreeMap::<(Vec<u8>, Uuid), String>::new();
-    audience_dids.insert(
-        business.actor_did().as_bytes().to_vec(),
-        business.actor_did().to_owned(),
-    );
-    exact_devices.insert(
-        (
-            business.actor_did().as_bytes().to_vec(),
-            business.actor_device_id(),
-        ),
-        business.actor_did().to_owned(),
-    );
-    audience_dids.insert(
-        target.target_did().as_bytes().to_vec(),
-        target.target_did().to_owned(),
-    );
-    exact_devices.insert(
-        (
-            target.target_did().as_bytes().to_vec(),
-            target.target_device_id(),
-        ),
-        target.target_did().to_owned(),
-    );
+    let mut audience_dids = BTreeSet::<String>::new();
+    audience_dids.insert(scope.actor_did.clone());
+    audience_dids.insert(scope.target_did.clone());
 
     for (locked, manifest) in locked_conversations.iter().zip(fanout.conversations()) {
         let head = locked.head();
-        if head.transaction_id() != business.transaction_id()
+        if head.transaction_id() != scope.transaction_id
             || head.locked_at() != trusted_instant
             || head.conversation_id() != manifest.conversation_id()
             || head.durable_row_digest() != manifest.locked_head_digest()
@@ -1385,7 +2071,7 @@ pub(crate) async fn hydrate_locked_g6_prelude(
         for participant in locked.state().participants() {
             let did = String::from_utf8(participant.principal().as_bytes().to_vec())
                 .map_err(|_| LockedG6PreludeError::AudienceMismatch)?;
-            audience_dids.insert(did.as_bytes().to_vec(), did);
+            audience_dids.insert(did);
         }
         for request in locked.state().recovery_requests() {
             if request.target().principal().as_bytes() == target.target_did().as_bytes()
@@ -1396,7 +2082,7 @@ pub(crate) async fn hydrate_locked_g6_prelude(
                 return Err(LockedG6PreludeError::RecoveryRequestRequiresExpiry);
             }
         }
-        let mut named_pending_welcomes = BTreeMap::<Uuid, ()>::new();
+        let mut named_pending_welcomes = BTreeSet::<Uuid>::new();
         for welcome in locked.state().welcomes() {
             let welcome_id = Uuid::from_bytes(*welcome.welcome_id());
             if welcome.recipient().principal().as_bytes() == target.target_did().as_bytes()
@@ -1408,17 +2094,7 @@ pub(crate) async fn hydrate_locked_g6_prelude(
                     .binary_search_by(|candidate| candidate.as_bytes().cmp(welcome_id.as_bytes()))
                     .is_ok()
                 {
-                    named_pending_welcomes.insert(welcome_id, ());
-                    let recipient_did =
-                        String::from_utf8(welcome.recipient().principal().as_bytes().to_vec())
-                            .map_err(|_| LockedG6PreludeError::AudienceMismatch)?;
-                    exact_devices.insert(
-                        (
-                            recipient_did.as_bytes().to_vec(),
-                            Uuid::from_bytes(*welcome.recipient().device_id()),
-                        ),
-                        recipient_did,
-                    );
+                    named_pending_welcomes.insert(welcome_id);
                 }
                 if trusted_millis >= welcome.expires_at().unix_millis() {
                     return Err(LockedG6PreludeError::WelcomeRequiresExpiry);
@@ -1429,96 +2105,33 @@ pub(crate) async fn hydrate_locked_g6_prelude(
             return Err(LockedG6PreludeError::PreludeBindingMismatch);
         }
     }
-
-    let pending_recovery_work: Option<i32> = sqlx::query_scalar(
-        r#"
-        SELECT 1
-          FROM chat.recovery_work_items
-         WHERE recipient_did=$1
-           AND recipient_device_id=$2
-           AND status='pending'
-         LIMIT 1
-         FOR UPDATE
-        "#,
-    )
-    .bind(target.target_did())
-    .bind(target.target_device_id())
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if pending_recovery_work.is_some() {
-        return Err(LockedG6PreludeError::PendingRecoveryWorkUnsupported);
-    }
-
-    let dids = audience_dids.into_values().collect::<Vec<_>>();
-    let active_candidates: Vec<(String, Uuid)> = sqlx::query_as(
-        r#"
-        SELECT user_did,device_id
-          FROM chat.devices
-         WHERE status='active'
-           AND user_did = ANY($1)
-         ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id)
-        "#,
-    )
-    .bind(&dids)
-    .fetch_all(&mut **transaction)
-    .await?;
-    if active_candidates.windows(2).any(|pair| {
-        pair[0].0.as_bytes() > pair[1].0.as_bytes()
-            || (pair[0].0 == pair[1].0 && pair[0].1.as_bytes() >= pair[1].1.as_bytes())
-    }) {
+    if conversation_ids != scope.conversation_ids
+        || scope.principals.iter().cloned().collect::<BTreeSet<_>>() != audience_dids
+    {
         return Err(LockedG6PreludeError::AudienceMismatch);
     }
-    let mut candidates = exact_devices;
-    for (did, device_id) in active_candidates {
-        candidates
-            .entry((did.as_bytes().to_vec(), device_id))
-            .or_insert(did);
-    }
 
-    let mut devices = Vec::with_capacity(candidates.len());
-    for ((_, device_id), did) in candidates {
-        let row: Option<(String, i64, String)> = sqlx::query_as(
-            r#"
-            SELECT dpop_jkt,auth_generation,status
-              FROM chat.devices
-             WHERE user_did=$1
-               AND device_id=$2
-             FOR UPDATE
-            "#,
-        )
-        .bind(&did)
-        .bind(device_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        let (dpop_jkt, auth_generation, status) =
-            row.ok_or(LockedG6PreludeError::AudienceMismatch)?;
-        let is_exact = (did == business.actor_did() && device_id == business.actor_device_id())
-            || (did == target.target_did() && device_id == target.target_device_id())
-            || locked_conversations.iter().any(|locked| {
-                locked.state().welcomes().iter().any(|welcome| {
-                    welcome.status() == WelcomeStatus::Pending
-                        && welcome.recipient().principal().as_bytes() == did.as_bytes()
-                        && welcome.recipient().device_id() == device_id.as_bytes()
-                })
-            });
-        if !is_exact && status != "active" {
+    let mut devices = Vec::with_capacity(scope.devices.len());
+    for fact in &scope.devices {
+        let is_actor = fact.did == scope.actor_did && fact.device_id == scope.actor_device_id;
+        let is_target = fact.did == scope.target_did && fact.device_id == scope.target_device_id;
+        if !audience_dids.contains(&fact.did)
+            || (!is_actor && !is_target && fact.status != "active")
+            || (is_actor
+                && (fact.status != "active"
+                    || fact.dpop_jkt != scope.actor_dpop_jkt
+                    || fact.auth_generation != scope.actor_auth_generation))
+            || (is_target
+                && (fact.status != "active"
+                    || fact.auth_generation
+                        != i64::try_from(scope.target_auth_generation)
+                            .map_err(|_| LockedG6PreludeError::PreludeBindingMismatch)?))
+        {
             return Err(LockedG6PreludeError::AudienceMismatch);
         }
-        if did == business.actor_did()
-            && device_id == business.actor_device_id()
-            && (dpop_jkt != business.dpop_jkt() || auth_generation != business.auth_generation())
-        {
-            return Err(LockedG6PreludeError::PreludeBindingMismatch);
-        }
-        if did == target.target_did()
-            && device_id == target.target_device_id()
-            && u64::try_from(auth_generation).ok() != Some(target.target_auth_generation())
-        {
-            return Err(LockedG6PreludeError::PreludeBindingMismatch);
-        }
-        let principal = PrincipalId::new(did.as_bytes().to_vec())
+        let principal = PrincipalId::new(fact.did.as_bytes().to_vec())
             .map_err(|_| LockedG6PreludeError::AudienceMismatch)?;
-        let device = DeviceIdentity::new(principal, *device_id.as_bytes())
+        let device = DeviceIdentity::new(principal, *fact.device_id.as_bytes())
             .map_err(|_| LockedG6PreludeError::AudienceMismatch)?;
         let initial_event_tail: Option<i64> = sqlx::query_scalar(
             r#"
@@ -1527,30 +2140,43 @@ pub(crate) async fn hydrate_locked_g6_prelude(
              WHERE user_did=$1 AND device_id=$2
             "#,
         )
-        .bind(&did)
-        .bind(device_id)
+        .bind(&fact.did)
+        .bind(fact.device_id)
         .fetch_one(&mut **transaction)
         .await?;
         devices.push(LockedG6DeviceFact {
             device,
-            dpop_jkt,
-            auth_generation,
+            status: fact.status.clone(),
+            dpop_jkt: fact.dpop_jkt.clone(),
+            auth_generation: fact.auth_generation,
             initial_event_tail,
         });
     }
+    if devices
+        .windows(2)
+        .any(|pair| pair[0].device >= pair[1].device)
+    {
+        return Err(LockedG6PreludeError::AudienceMismatch);
+    }
 
     let scope_digest = locked_g6_scope_digest(
-        business.domain_digest(),
-        target,
+        &scope.authority_scope_digest,
+        &target,
         &conversation_ids,
         &head_digests,
         &devices,
         fanout.durable_manifest_digest(),
     );
-    Ok(LockedG6Prelude {
+    let prelude = LockedG6Prelude {
         transaction_id: live_transaction_id,
         trusted_instant,
-        business,
+        authority_scope_digest: scope.authority_scope_digest,
+        actor_did: scope.actor_did,
+        actor_device_id: scope.actor_device_id,
+        actor_dpop_jkt: scope.actor_dpop_jkt,
+        actor_auth_generation: scope.actor_auth_generation,
+        actor_key_id: scope.actor_key_id,
+        actor_signing_public_key: scope.actor_signing_public_key,
         target_did: target.target_did().to_owned(),
         target_device_id: target.target_device_id(),
         target_auth_generation: target.target_auth_generation(),
@@ -1559,11 +2185,16 @@ pub(crate) async fn hydrate_locked_g6_prelude(
         devices,
         fanout_digest: *fanout.durable_manifest_digest(),
         scope_digest,
+    };
+    Ok(LockedG6RepositoryPrelude {
+        prelude,
+        target,
+        packages,
     })
 }
 
 fn locked_g6_scope_digest(
-    business_digest: &[u8; 32],
+    authority_scope_digest: &[u8; 32],
     target: &LockedRevocationTargetGuard,
     conversation_ids: &[Uuid],
     head_digests: &[[u8; 32]],
@@ -1572,7 +2203,7 @@ fn locked_g6_scope_digest(
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-LOCKED-G6-PRELUDE\0");
-    digest.update(business_digest);
+    digest.update(authority_scope_digest);
     digest.update((target.target_did().len() as u64).to_be_bytes());
     digest.update(target.target_did().as_bytes());
     digest.update(target.target_device_id().as_bytes());
@@ -1586,6 +2217,8 @@ fn locked_g6_scope_digest(
     for fact in devices {
         digest.update(fact.device.principal().as_bytes());
         digest.update(fact.device.device_id());
+        digest.update((fact.status.len() as u64).to_be_bytes());
+        digest.update(fact.status.as_bytes());
         digest.update((fact.dpop_jkt.len() as u64).to_be_bytes());
         digest.update(fact.dpop_jkt.as_bytes());
         digest.update(fact.auth_generation.to_be_bytes());
@@ -1682,63 +2315,6 @@ pub(crate) enum RevocationScopeHydrationError {
 }
 
 #[derive(sqlx::FromRow)]
-struct RevocationTargetRow {
-    status: String,
-    auth_generation: i64,
-}
-
-pub(crate) async fn hydrate_locked_revocation_target(
-    transaction: &mut Transaction<'_, Postgres>,
-    target_did: &str,
-    target_device_id: Uuid,
-    locked_at: DateTime<Utc>,
-) -> Result<LockedRevocationTargetGuard, RevocationScopeHydrationError> {
-    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-        .fetch_one(&mut **transaction)
-        .await?;
-    let row: RevocationTargetRow = sqlx::query_as(
-        r#"
-        SELECT status,auth_generation
-          FROM chat.devices
-         WHERE user_did=$1 AND device_id=$2
-         FOR UPDATE
-        "#,
-    )
-    .bind(target_did)
-    .bind(target_device_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(RevocationScopeHydrationError::TargetMissing)?;
-    let status = match row.status.as_str() {
-        "active" => LockedRevocationTargetStatus::Active,
-        "revoked" => LockedRevocationTargetStatus::Revoked,
-        _ => return Err(RevocationScopeHydrationError::OutOfDomain),
-    };
-    let generation = u64::try_from(row.auth_generation)
-        .ok()
-        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
-        .ok_or(RevocationScopeHydrationError::OutOfDomain)?;
-    let digest = revocation_target_guard_digest(
-        &transaction_id,
-        target_did,
-        target_device_id,
-        generation,
-        status,
-        locked_at,
-    );
-    LockedRevocationTargetGuard::from_locked_row(
-        transaction_id,
-        target_did.to_owned(),
-        target_device_id,
-        row.auth_generation,
-        status,
-        locked_at,
-        digest,
-    )
-    .ok_or(RevocationScopeHydrationError::GuardInvariant)
-}
-
-#[derive(sqlx::FromRow)]
 struct RevocationPackageRow {
     key_package_ref: Vec<u8>,
     wrapper_sha256: Vec<u8>,
@@ -1750,7 +2326,7 @@ struct RevocationPackageRow {
     request_id: Option<Uuid>,
 }
 
-pub(crate) async fn hydrate_locked_revocation_packages(
+async fn hydrate_locked_revocation_packages(
     transaction: &mut Transaction<'_, Postgres>,
     target: &LockedRevocationTargetGuard,
 ) -> Result<Vec<LockedRevocationPackageGuard>, RevocationScopeHydrationError> {
@@ -1847,7 +2423,7 @@ pub(crate) async fn hydrate_locked_revocation_packages(
     Ok(guards)
 }
 
-pub(crate) fn seal_locked_revocation_fanout(
+fn seal_locked_revocation_fanout(
     target: &LockedRevocationTargetGuard,
     packages: &[LockedRevocationPackageGuard],
     locked_conversations: &[LockedConversationStateGuard],
@@ -1933,6 +2509,28 @@ pub(crate) fn seal_locked_revocation_fanout(
         digest,
     )
     .ok_or(RevocationScopeHydrationError::GuardInvariant)
+}
+
+fn locked_revocation_packages_match_fanout(
+    packages: &[LockedRevocationPackageGuard],
+    manifest: &[LockedRevocationPackageManifest],
+) -> bool {
+    packages.len() == manifest.len()
+        && packages.iter().zip(manifest).all(|(package, sealed)| {
+            package.key_package_ref() == sealed.key_package_ref()
+                && package.status() == sealed.status()
+                && package.conversation_id() == sealed.conversation_id()
+                && package.request_id() == sealed.request_id()
+                && package.durable_row_digest() == sealed.locked_row_digest()
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn locked_revocation_packages_match_fanout_for_test(
+    packages: &[LockedRevocationPackageGuard],
+    manifest: &[LockedRevocationPackageManifest],
+) -> bool {
+    locked_revocation_packages_match_fanout(packages, manifest)
 }
 
 /// Exact conversation-head row locked by the current database transaction.
