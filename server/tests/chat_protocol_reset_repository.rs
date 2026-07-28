@@ -59,6 +59,13 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/auth.rs"
             ));
         }
+        pub mod prelude {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/prelude.rs"
+            ));
+        }
         pub mod relationship {
             #![allow(dead_code)]
             include!(concat!(
@@ -126,17 +133,31 @@ mod chat_protocol {
                 PendingResetCasExpectationMutation::ExpiresAt,
             ];
 
-            pub(crate) async fn candidate_scope_rows_for_test(
-                transaction: &mut Transaction<'_, Postgres>,
-                conversation_id: Uuid,
-                business: &BusinessAuthorityGuard,
-            ) -> Result<Vec<(String, Uuid, Option<String>)>, ResetRepositoryError> {
-                let rows = load_candidate_scope(transaction, conversation_id, business).await?;
-                Ok(rows
-                    .rows
-                    .into_iter()
-                    .map(|row| (row.user_did, row.device_id, row.key_id))
-                    .collect())
+            pub(crate) fn scope_rows_for_test(
+                prelude: &PreparedBusinessPrelude,
+            ) -> Vec<(String, Uuid, Option<String>)> {
+                let scope = prelude.scope_authority();
+                let mut rows = scope
+                    .keys()
+                    .iter()
+                    .map(|key| {
+                        (
+                            key.user_did().to_owned(),
+                            key.device_id(),
+                            Some(key.key_id().to_owned()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for device in scope.devices() {
+                    if !rows
+                        .iter()
+                        .any(|row| row.0 == device.user_did() && row.1 == device.device_id())
+                    {
+                        rows.push((device.user_did().to_owned(), device.device_id(), None));
+                    }
+                }
+                rows.sort();
+                rows
             }
 
             pub(crate) fn activation_request_for_test(
@@ -329,6 +350,12 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/transition.rs"
             ));
         }
+        pub mod recovery {
+            #[derive(Debug)]
+            pub(crate) struct RecoverySqlAuthoritySeal {
+                _private: (),
+            }
+        }
         pub mod delivery {
             #![allow(dead_code)]
             include!(concat!(
@@ -366,20 +393,25 @@ use chat_protocol::{
     repository::{
         auth::{
             recheck_existing_business_authority_for_test, AuthRepositoryError,
-            BusinessAuthorityGuard,
+            RepositoryAuthorityClass,
         },
         core::hydrate_locked_conversation_state,
+        prelude::{
+            arbitrate_operation, prepare_identity_scope_prelude, OperationArbitration,
+            PreparedBusinessPrelude,
+        },
         reset::{
             self, LockedPendingResetRequestGuard, LockedResetRequestDisposition,
-            ResetCompositionError, ResetRepositoryError,
-            ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS,
+            PendingResetCryptographicBindingMutationForTest, ResetCompositionError,
+            ResetRepositoryError, ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS,
         },
     },
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
     transcript::{
         build_verified_control_entry, decode_and_verify_signed_mutation,
         decode_canonical_signed_mutation, CanonicalControlEntryProducts,
-        CanonicalControlServerFields, ControlEntryKind, SignedMutationKind, VerifiedSignedMutation,
+        CanonicalControlServerFields, ControlEntryKind, SignedMutationKind,
+        VerifiedMutationProjection, VerifiedSignedMutation,
     },
     validation::{CanonicalTimestamp, CanonicalUuidV4, TrustedRequestInstant, ValidatedChatNsid},
 };
@@ -404,6 +436,7 @@ struct ResetFixture {
     conversation_id: Uuid,
     actor_did: String,
     actor_device_id: Uuid,
+    actor_dpop_jkt: String,
     actor_key_id: String,
     signing_public_key: Vec<u8>,
     auth_generation: i64,
@@ -454,6 +487,7 @@ async fn fixture(tx: &mut Transaction<'_, Postgres>, has_pending_welcome: bool) 
     let rows: Vec<ResetFixture> = sqlx::query_as(
         r#"
         SELECT c.conversation_id,p.user_did actor_did,d.device_id actor_device_id,
+               d.dpop_jkt actor_dpop_jkt,
                k.key_id actor_key_id,k.signing_public_key,d.auth_generation,
                c.kind conversation_kind,
                s.generation,s.state_version,
@@ -511,19 +545,63 @@ async fn fixture(tx: &mut Transaction<'_, Postgres>, has_pending_welcome: bool) 
     row
 }
 
-async fn business(
+fn verified_request(
+    fixture: &ResetFixture,
+    at: DateTime<Utc>,
+    mutation: &VerifiedSignedMutation,
+) -> dpop::VerifiedChatDeviceRequest {
+    let endpoint = match mutation.projection() {
+        VerifiedMutationProjection::ResetRequest(_) => "blue.catbird.chat.requestReset",
+        VerifiedMutationProjection::ResetActivation(_) => "blue.catbird.chat.activateReset",
+        _ => panic!("reset test helper requires a Reset mutation"),
+    };
+    let pre_replay = dpop::repository_test_evidence::ordinary_device_with_binding(
+        Uuid::new_v4(),
+        *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
+        endpoint,
+        &at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_dpop_jkt,
+    );
+    let canonical =
+        decode_canonical_signed_mutation(mutation.accepted_wrapper_bytes().unwrap()).unwrap();
+    let receipt = chat_protocol::repository::auth::reset_existing_device_receipt_for_test(
+        mutation,
+        &fixture.actor_dpop_jkt,
+        &fixture.signing_public_key,
+    )
+    .unwrap();
+    assert_eq!(receipt.class(), RepositoryAuthorityClass::ExistingDevice);
+    dpop::mint_signed_repository_authority(
+        pre_replay,
+        canonical,
+        &fixture.signing_public_key,
+        receipt,
+    )
+    .unwrap()
+}
+
+async fn prelude(
     tx: &mut Transaction<'_, Postgres>,
     fixture: &ResetFixture,
     at: DateTime<Utc>,
-) -> BusinessAuthorityGuard {
-    recheck_existing_business_authority_for_test(
-        tx,
-        &fixture.actor_did,
-        fixture.actor_device_id,
-        at,
-    )
-    .await
-    .unwrap()
+    mutation: &VerifiedSignedMutation,
+) -> PreparedBusinessPrelude {
+    let request = verified_request(fixture, at, mutation);
+    let scope =
+        reset::discover_reset_identity_scope(tx, &request, mutation, fixture.conversation_id)
+            .await
+            .unwrap();
+    let reservation = match arbitrate_operation(tx, &request).await.unwrap() {
+        OperationArbitration::First(reservation) => reservation,
+        OperationArbitration::Replay(_) => {
+            panic!("fresh Reset test operation unexpectedly replayed")
+        }
+    };
+    prepare_identity_scope_prelude(tx, &request, reservation, scope)
+        .await
+        .unwrap()
 }
 
 fn coordinate_json(prior: &PublicGroupSnapshotCoordinate) -> Value {
@@ -814,9 +892,9 @@ async fn guard(
         &f.prior(),
         at,
     );
-    let business = business(tx, f, at).await;
+    let prelude = prelude(tx, f, at, &authority).await;
     reset::activation_request_for_test(
-        reset::prepare_reset_activation_authority(tx, &business, &authority)
+        reset::prepare_reset_activation_authority(tx, prelude, &authority)
             .await
             .unwrap(),
     )
@@ -849,6 +927,202 @@ async fn durable_snapshot(
     .unwrap()
 }
 
+#[test]
+fn reset_source_has_no_raw_business_guard_or_duplicate_identity_lock_path() {
+    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    for forbidden in [
+        "BusinessAuthorityGuard",
+        "LockedResetScope",
+        "ResetCandidateRow",
+        "load_candidate_scope",
+        "lock_principals",
+        "lock_candidate_devices_and_keys",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "Reset production source regained forbidden authority seam `{forbidden}`"
+        );
+    }
+    assert!(source.contains("prelude: PreparedBusinessPrelude"));
+    assert!(source.contains("scope: &ScopeBoundBusinessAuthority"));
+}
+
+#[test]
+fn reset_identity_discovery_is_read_only_and_locked_preparation_does_not_relock_identity_rows() {
+    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let discovery = source
+        .split_once("pub(crate) async fn discover_reset_identity_scope(")
+        .unwrap()
+        .1
+        .split_once("fn request_contains_exact_mutation(")
+        .unwrap()
+        .0;
+    assert!(!discovery.contains("FOR UPDATE"));
+
+    let preparation = source
+        .split_once("async fn prepare_reset_read_set_inner(")
+        .unwrap()
+        .1
+        .split_once("fn validate_sealed_admission(")
+        .unwrap()
+        .0;
+    for forbidden in ["lock_principals", "lock_candidate_devices_and_keys"] {
+        assert!(
+            !preparation.contains(forbidden),
+            "sealed Reset preparation regained identity lock path `{forbidden}`"
+        );
+    }
+    let normalized = preparation
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    for (offset, _) in normalized.match_indices("for update") {
+        let context = &normalized[offset.saturating_sub(512)..(offset + 512).min(normalized.len())];
+        for identity_table in ["chat.principals", "chat.devices", "chat.device_keys"] {
+            assert!(
+                !context.contains(identity_table),
+                "sealed Reset preparation relocks `{identity_table}` near `{context}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn reset_scope_drift_is_not_an_inner_savepoint_retry() {
+    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+    let preparation = source
+        .split_once("async fn prepare_reset_read_set_inner(")
+        .unwrap()
+        .1
+        .split_once("async fn prepare_reset_attempt(")
+        .unwrap()
+        .0;
+    assert!(preparation.contains("matches!(error, ResetRepositoryError::HeadBusy)"));
+    assert!(!preparation.contains("matches!(error, ResetRepositoryError::CandidateScopeDrift)"));
+}
+
+#[test]
+fn reset_request_fixture_authority_remains_test_only() {
+    let source = include_str!("../src/chat_protocol/dpop.rs");
+    assert!(source.contains("#[cfg(test)]\npub(crate) mod repository_test_evidence"));
+    let fixture_module = source
+        .split_once("pub(crate) mod repository_test_evidence")
+        .unwrap()
+        .1;
+    assert!(fixture_module.contains("pub(crate) fn ordinary_device_with_binding("));
+}
+
+#[test]
+fn reset_receipt_fixture_is_test_only_reset_specific_and_not_forged_by_harness() {
+    let auth_source = include_str!("../src/chat_protocol/repository/auth.rs");
+    let fixture = auth_source
+        .split_once("pub(crate) fn reset_existing_device_receipt_for_test(")
+        .unwrap();
+    assert!(fixture.0.ends_with("#[cfg(test)]\n"));
+    let fixture_body = fixture
+        .1
+        .split_once("pub(crate) enum AuthorizationOutcome")
+        .unwrap()
+        .0;
+    assert!(fixture_body.contains("VerifiedMutationProjection::ResetRequest"));
+    assert!(fixture_body.contains("VerifiedMutationProjection::ResetActivation"));
+    assert!(fixture_body.contains("UnsupportedAuthorizationShape"));
+    assert!(fixture_body.contains("ed25519_key_id(signing_public_key)"));
+
+    let harness = include_str!("chat_protocol_reset_repository.rs");
+    let receipt_struct_literal = ["RepositoryAuthority", "Receipt {"].concat();
+    let replay_struct_literal = ["ReplayAudit", "Ids {"].concat();
+    assert!(!harness.contains(&receipt_struct_literal));
+    assert!(!harness.contains(&replay_struct_literal));
+}
+
+#[test]
+fn reset_operation_claim_verification_binds_every_exact_authority_dimension() {
+    let prelude_source = include_str!("../src/chat_protocol/repository/prelude.rs");
+    let reset_verifier = prelude_source
+        .split_once("pub(crate) fn verify_reset_operation(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn verify_device_revocation_operation(")
+        .unwrap()
+        .0;
+    assert!(reset_verifier.contains("self.verify_exact_operation_claim("));
+    assert!(reset_verifier.contains("endpoint.endpoint_nsid()"));
+    assert!(reset_verifier.contains("endpoint.mutation_kind()"));
+
+    let exact_claim = prelude_source
+        .split_once("fn verify_exact_operation_claim(")
+        .unwrap()
+        .1
+        .split_once("pub(crate) fn into_execution_parts(")
+        .unwrap()
+        .0;
+    for (dimension, fragment) in [
+        ("UUIDv4 operation", "operation_id.get_version_num() != 4"),
+        (
+            "transaction",
+            "self.operation.transaction_id != self.authority.transaction_id()",
+        ),
+        ("operation id", "binding.operation_id != operation_id"),
+        (
+            "principal",
+            "binding.principal_did != mutation.actor_did().as_str()",
+        ),
+        ("endpoint", "binding.endpoint_nsid != endpoint_nsid"),
+        (
+            "claimed mutation kind",
+            "binding.mutation_kind != mutation_kind.type_id()",
+        ),
+        ("actual mutation kind", "mutation.kind() != mutation_kind"),
+        (
+            "request digest",
+            "binding.request_digest != *mutation.request_digest()",
+        ),
+        (
+            "accepted wrapper hash",
+            "Sha256::digest(accepted_request_bytes)",
+        ),
+        ("signature", "binding.signature != *mutation.signature()"),
+    ] {
+        assert!(
+            exact_claim.contains(fragment),
+            "exact Reset claim omitted {dimension}: `{fragment}`"
+        );
+    }
+
+    let reset_source = include_str!("../src/chat_protocol/repository/reset.rs");
+    assert!(reset_source.contains("ResetOperationEndpoint::RequestReset"));
+    assert!(reset_source.contains("ResetOperationEndpoint::ActivateReset"));
+    assert_eq!(reset_source.matches(".verify_reset_operation(").count(), 3);
+    assert!(reset_source.contains("!uuid_v4(operation_id)"));
+    let uuid_v4 = reset_source
+        .split_once("fn uuid_v4(")
+        .unwrap()
+        .1
+        .split_once("fn whole_millis(")
+        .unwrap()
+        .0;
+    assert!(uuid_v4.contains("value.get_version_num() == 4"));
+    assert!(uuid_v4.contains("value.get_variant() == uuid::Variant::RFC4122"));
+}
+
+#[test]
+fn pending_reset_rejects_each_cryptographic_binding_mutation() {
+    for mutation in [
+        PendingResetCryptographicBindingMutationForTest::ScopeDigest,
+        PendingResetCryptographicBindingMutationForTest::RequesterDeviceDigest,
+        PendingResetCryptographicBindingMutationForTest::RequesterKeyDigest,
+        PendingResetCryptographicBindingMutationForTest::RawPublicKey,
+        PendingResetCryptographicBindingMutationForTest::StoredRawPublicKeyHash,
+    ] {
+        assert!(
+            reset::pending_reset_cryptographic_binding_mutation_rejected_for_test(mutation),
+            "pending Reset accepted cryptographic binding mutation {mutation:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn reset_scope_locks_full_canonical_device_key_union_before_head() {
     let _serial = SERIAL.get_or_init(|| Mutex::new(())).lock().await;
@@ -857,7 +1131,9 @@ async fn reset_scope_locks_full_canonical_device_key_union_before_head() {
     let f = fixture(&mut contender, true).await;
     let conversation_id = f.conversation_id;
     let at = trusted_now(&mut contender).await;
-    let business = business(&mut contender, &f, at).await;
+    let id = Uuid::new_v4();
+    let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
+    let prepared_prelude = prelude(&mut contender, &f, at, &request).await;
     let blocked_identity: (String, Uuid) = sqlx::query_as(
         "SELECT wd.recipient_did,wd.recipient_device_id FROM chat.welcome_bundles wb \
          JOIN chat.welcome_deliveries wd USING(welcome_id) \
@@ -872,9 +1148,7 @@ async fn reset_scope_locks_full_canonical_device_key_union_before_head() {
         (f.actor_did.clone(), f.actor_device_id),
         "lock-order witness requires a non-actor retained Welcome recipient"
     );
-    let scope = reset::candidate_scope_rows_for_test(&mut contender, conversation_id, &business)
-        .await
-        .unwrap();
+    let scope = reset::scope_rows_for_test(&prepared_prelude);
     assert!(
         scope.windows(2).all(|pair| pair[0] < pair[1]),
         "device/key union is strictly canonical"
@@ -912,8 +1186,6 @@ async fn reset_scope_locks_full_canonical_device_key_union_before_head() {
             .await
             .unwrap();
 
-    let id = Uuid::new_v4();
-    let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
     let reached = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let mut probe =
@@ -921,7 +1193,7 @@ async fn reset_scope_locks_full_canonical_device_key_union_before_head() {
     let prepare = tokio::spawn(async move {
         let result = reset::prepare_reset_request_authority_with_probe_for_test(
             &mut contender,
-            &business,
+            prepared_prelude,
             &request,
             &mut probe,
         )
@@ -985,7 +1257,9 @@ async fn reset_scope_includes_exact_pending_welcome_recipient() {
     let mut tx = pool.begin().await.unwrap();
     let f = fixture(&mut tx, true).await;
     let at = trusted_now(&mut tx).await;
-    let business = business(&mut tx, &f, at).await;
+    let id = Uuid::new_v4();
+    let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
+    let prepared_prelude = prelude(&mut tx, &f, at, &request).await;
     let (did, device): (String, Uuid) = sqlx::query_as(
         "SELECT wd.recipient_did,wd.recipient_device_id FROM chat.welcome_bundles wb \
          JOIN chat.welcome_deliveries wd USING(welcome_id) \
@@ -1004,14 +1278,11 @@ async fn reset_scope_includes_exact_pending_welcome_recipient() {
     .fetch_all(&mut *tx)
     .await
     .unwrap();
-    let actual: Vec<Option<String>> =
-        reset::candidate_scope_rows_for_test(&mut tx, f.conversation_id, &business)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.0 == did && row.1 == device)
-            .map(|row| row.2)
-            .collect();
+    let actual: Vec<Option<String>> = reset::scope_rows_for_test(&prepared_prelude)
+        .into_iter()
+        .filter(|row| row.0 == did && row.1 == device)
+        .map(|row| row.2)
+        .collect();
     assert_eq!(actual, expected);
     tx.rollback().await.unwrap();
 }
@@ -1029,9 +1300,9 @@ async fn reset_head_nowait_contention_retries_without_writes() {
         .unwrap();
     let mut contender = pool.begin().await.unwrap();
     let at = trusted_now(&mut contender).await;
-    let business = business(&mut contender, &f, at).await;
     let id = Uuid::new_v4();
     let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
+    let prepared_prelude = prelude(&mut contender, &f, at, &request).await;
     let before: i64 =
         sqlx::query_scalar("SELECT count(*) FROM chat.reset_requests WHERE conversation_id=$1")
             .bind(f.conversation_id)
@@ -1039,7 +1310,7 @@ async fn reset_head_nowait_contention_retries_without_writes() {
             .await
             .unwrap();
     assert_error(
-        reset::prepare_reset_request_authority(&mut contender, &business, &request).await,
+        reset::prepare_reset_request_authority(&mut contender, prepared_prelude, &request).await,
         |error| matches!(error, ResetRepositoryError::RetryExhausted),
     );
     let after: i64 =
@@ -1054,33 +1325,30 @@ async fn reset_head_nowait_contention_retries_without_writes() {
 }
 
 #[tokio::test]
-async fn reset_scope_drift_retries_and_rehydrates_current_head() {
+async fn reset_scope_drift_is_explicit_outer_transaction_retry_outcome() {
     let _serial = SERIAL.get_or_init(|| Mutex::new(())).lock().await;
     let pool = pool().await;
     let mut tx = pool.begin().await.unwrap();
     let f = fixture(&mut tx, false).await;
     let at = trusted_now(&mut tx).await;
-    let business = business(&mut tx, &f, at).await;
     let before = durable_snapshot(&mut tx, f.conversation_id).await;
-    let scope_before = reset::candidate_scope_rows_for_test(&mut tx, f.conversation_id, &business)
-        .await
-        .unwrap();
     let id = Uuid::new_v4();
     let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
+    let prepared_prelude = prelude(&mut tx, &f, at, &request).await;
+    let scope_before = reset::scope_rows_for_test(&prepared_prelude);
     let mut probe = reset::ResetPrepareProbeForTest::candidate_scope_drift_once();
-    // Deterministic retry-control-flow evidence: the probe injects only the
-    // retry outcome after the genuine canonical scope locks.
-    let prepared = reset::prepare_reset_request_authority_with_probe_for_test(
-        &mut tx, &business, &request, &mut probe,
-    )
-    .await
-    .unwrap();
-    let scope_after = reset::candidate_scope_rows_for_test(&mut tx, f.conversation_id, &business)
-        .await
-        .unwrap();
-    assert_eq!(probe.attempts(), 2);
-    assert_eq!(reset::authority_prior_for_test(&prepared), Some(f.prior()));
-    assert_eq!(scope_before, scope_after);
+    assert_error(
+        reset::prepare_reset_request_authority_with_probe_for_test(
+            &mut tx,
+            prepared_prelude,
+            &request,
+            &mut probe,
+        )
+        .await,
+        |error| matches!(error, ResetRepositoryError::CandidateScopeDrift),
+    );
+    assert_eq!(probe.attempts(), 1);
+    assert!(!scope_before.is_empty());
     assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
     tx.rollback().await.unwrap();
 }
@@ -1158,7 +1426,6 @@ async fn reset_activation_rejects_retained_pending_row_with_foreign_signed_seman
     assert_eq!(row_wrapper, expected_foreign_wrapper);
     assert_eq!(row_reason, "manualRecovery");
     let before = durable_snapshot(&mut tx, f.conversation_id).await;
-    let business = business(&mut tx, &f, at).await;
     let activation = signed_reset(
         &f,
         SignedMutationKind::ResetActivation,
@@ -1167,9 +1434,10 @@ async fn reset_activation_rejects_retained_pending_row_with_foreign_signed_seman
         &f.prior(),
         at,
     );
+    let prepared_prelude = prelude(&mut tx, &f, at, &activation).await;
 
     assert_error(
-        reset::prepare_reset_activation_authority(&mut tx, &business, &activation).await,
+        reset::prepare_reset_activation_authority(&mut tx, prepared_prelude, &activation).await,
         |error| matches!(error, ResetRepositoryError::InvalidResetRow),
     );
     assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
@@ -1243,7 +1511,6 @@ async fn reset_activation_rejects_retained_pending_row_with_corrupt_signature() 
     assert_eq!(entry_signature, expected_corrupt_signature);
     assert_eq!(row_signature, expected_corrupt_signature);
     let before = durable_snapshot(&mut tx, f.conversation_id).await;
-    let business = business(&mut tx, &f, at).await;
     let activation = signed_reset(
         &f,
         SignedMutationKind::ResetActivation,
@@ -1252,9 +1519,10 @@ async fn reset_activation_rejects_retained_pending_row_with_corrupt_signature() 
         &f.prior(),
         at,
     );
+    let prepared_prelude = prelude(&mut tx, &f, at, &activation).await;
 
     assert_error(
-        reset::prepare_reset_activation_authority(&mut tx, &business, &activation).await,
+        reset::prepare_reset_activation_authority(&mut tx, prepared_prelude, &activation).await,
         |error| matches!(error, ResetRepositoryError::InvalidResetRow),
     );
     assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);
@@ -1319,8 +1587,8 @@ async fn sealed_reset_admission_rejects_alternate_wrapper_with_same_transcript()
     )
     .unwrap();
     let before = durable_snapshot(&mut tx, f.conversation_id).await;
-    let business = business(&mut tx, &f, at).await;
-    let authority = reset::prepare_reset_request_authority(&mut tx, &business, &original)
+    let prepared_prelude = prelude(&mut tx, &f, at, &original).await;
+    let authority = reset::prepare_reset_request_authority(&mut tx, prepared_prelude, &original)
         .await
         .unwrap();
     assert!(matches!(
@@ -1328,8 +1596,7 @@ async fn sealed_reset_admission_rejects_alternate_wrapper_with_same_transcript()
         LockedResetRequestDisposition::Vacant
     ));
 
-    let result =
-        authority.plan_vacant_reset_request_entry(business, &alternate_for_admission, entry);
+    let result = authority.plan_vacant_reset_request_entry(&alternate_for_admission, entry);
     assert!(matches!(
         result,
         Err(ResetCompositionError::Repository(
@@ -1403,7 +1670,6 @@ async fn reset_activation_requires_exact_pending_id_and_prior() {
     let id = Uuid::new_v4();
     let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &f.prior(), at);
     insert_pending(&mut tx, &f, id, at, request).await;
-    let business = business(&mut tx, &f, at).await;
     let wrong_id = signed_reset(
         &f,
         SignedMutationKind::ResetActivation,
@@ -1412,8 +1678,9 @@ async fn reset_activation_requires_exact_pending_id_and_prior() {
         &f.prior(),
         at,
     );
+    let wrong_id_prelude = prelude(&mut tx, &f, at, &wrong_id).await;
     assert_error(
-        reset::prepare_reset_activation_authority(&mut tx, &business, &wrong_id).await,
+        reset::prepare_reset_activation_authority(&mut tx, wrong_id_prelude, &wrong_id).await,
         |error| matches!(error, ResetRepositoryError::PendingResetNotFound),
     );
     let prior = f.prior();
@@ -1435,8 +1702,14 @@ async fn reset_activation_requires_exact_pending_id_and_prior() {
         &wrong_prior,
         at,
     );
+    let wrong_coordinate_prelude = prelude(&mut tx, &f, at, &wrong_coordinate).await;
     assert_error(
-        reset::prepare_reset_activation_authority(&mut tx, &business, &wrong_coordinate).await,
+        reset::prepare_reset_activation_authority(
+            &mut tx,
+            wrong_coordinate_prelude,
+            &wrong_coordinate,
+        )
+        .await,
         |error| matches!(error, ResetRepositoryError::PendingResetCoordinateMismatch),
     );
     tx.rollback().await.unwrap();
@@ -1459,7 +1732,6 @@ async fn reset_activation_rejects_at_exact_expiry_boundary() {
         at - Duration::hours(24),
     );
     insert_pending(&mut tx, &f, id, at - Duration::hours(24), request).await;
-    let business = business(&mut tx, &f, at).await;
     let activation = signed_reset(
         &f,
         SignedMutationKind::ResetActivation,
@@ -1468,8 +1740,9 @@ async fn reset_activation_rejects_at_exact_expiry_boundary() {
         &f.prior(),
         at,
     );
+    let prepared_prelude = prelude(&mut tx, &f, at, &activation).await;
     assert_error(
-        reset::prepare_reset_activation_authority(&mut tx, &business, &activation).await,
+        reset::prepare_reset_activation_authority(&mut tx, prepared_prelude, &activation).await,
         |error| matches!(error, ResetRepositoryError::PendingResetExpired),
     );
     assert_eq!(
@@ -1505,8 +1778,8 @@ async fn expired_pending_reset_can_be_replaced_at_exact_boundary() {
         &f.prior(),
         at,
     );
-    let business = business(&mut tx, &f, at).await;
-    let authority = reset::prepare_reset_request_authority(&mut tx, &business, &incoming)
+    let prepared_prelude = prelude(&mut tx, &f, at, &incoming).await;
+    let authority = reset::prepare_reset_request_authority(&mut tx, prepared_prelude, &incoming)
         .await
         .unwrap();
     assert!(matches!(
@@ -1517,7 +1790,7 @@ async fn expired_pending_reset_can_be_replaced_at_exact_boundary() {
         .await
         .unwrap();
     assert_eq!(proof.expired_request_id(), old_id);
-    assert!(proof.authorizes_replacement(&business, &incoming));
+    assert!(proof.authorizes_replacement(&incoming));
     let status: String =
         sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
             .bind(old_id)
@@ -1554,9 +1827,9 @@ async fn unexpired_pending_reset_blocks_replacement() {
         &f.prior(),
         at,
     );
-    let business = business(&mut tx, &f, at).await;
+    let prepared_prelude = prelude(&mut tx, &f, at, &incoming).await;
     assert_error(
-        reset::prepare_reset_request_authority(&mut tx, &business, &incoming).await,
+        reset::prepare_reset_request_authority(&mut tx, prepared_prelude, &incoming).await,
         |error| matches!(error, ResetRepositoryError::PendingResetAlreadyExists),
     );
     tx.rollback().await.unwrap();
@@ -1635,9 +1908,9 @@ async fn terminal_operation_id_reuse_is_rejected_before_insert() {
         &f.prior(),
         at,
     );
-    let business = business(&mut tx, &f, at).await;
+    let prepared_prelude = prelude(&mut tx, &f, at, &incoming).await;
     assert_error(
-        reset::prepare_reset_request_authority(&mut tx, &business, &incoming).await,
+        reset::prepare_reset_request_authority(&mut tx, prepared_prelude, &incoming).await,
         |error| matches!(error, ResetRepositoryError::OperationIdAlreadyUsed),
     );
     let rows: i64 =
@@ -1671,9 +1944,9 @@ async fn reset_repository_failure_leaves_head_request_and_events_unchanged() {
     );
     let id = Uuid::new_v4();
     let request = signed_reset(&f, SignedMutationKind::ResetRequest, id, id, &wrong, at);
-    let business = business(&mut tx, &f, at).await;
+    let prepared_prelude = prelude(&mut tx, &f, at, &request).await;
     assert_error(
-        reset::prepare_reset_request_authority(&mut tx, &business, &request).await,
+        reset::prepare_reset_request_authority(&mut tx, prepared_prelude, &request).await,
         |error| matches!(error, ResetRepositoryError::PendingResetCoordinateMismatch),
     );
     assert_eq!(before, durable_snapshot(&mut tx, f.conversation_id).await);

@@ -14,13 +14,18 @@ use sqlx::{Acquire, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::{
-    auth::{BusinessAuthorityGuard, RepositoryAuthorityClass},
+    auth::RepositoryAuthorityClass,
     core::{
         hydrate_locked_conversation_state, ConversationHeadHydrationError,
         ConversationStateHydrationError, LockedConversationStateGuard, LockedRecoveryPackageGuard,
     },
+    prelude::{
+        CanonicalDeviceIdentity, CanonicalLockScope, PreparedBusinessPrelude,
+        ResetOperationEndpoint, ScopeBoundBusinessAuthority,
+    },
 };
 use crate::chat_protocol::{
+    dpop::VerifiedChatDeviceRequest,
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, MAX_PROTOCOL_INTEGER},
     state_machine::{
         HydrationAuthority, ParticipantRole, PlannedTransition, PrincipalId, StateMachineError,
@@ -35,7 +40,6 @@ use crate::chat_protocol::{
 const MAX_PREPARE_ATTEMPTS: usize = 3;
 const RESET_REQUEST_IMMUTABLE_DOMAIN: &[u8] = b"CATBIRD-CHAT-RESET-REQUEST-IMMUTABLE-ROW\0";
 const LOCKED_PENDING_RESET_DOMAIN: &[u8] = b"CATBIRD-CHAT-LOCKED-PENDING-RESET-REQUEST\0";
-const RESET_CANDIDATE_SCOPE_DOMAIN: &[u8] = b"CATBIRD-CHAT-RESET-CANDIDATE-SCOPE\0";
 const RESET_ADMISSION_DOMAIN: &[u8] = b"CATBIRD-CHAT-RESET-ADMISSION\0";
 const RESET_ADMITTED_MUTATION_DOMAIN: &[u8] = b"CATBIRD-CHAT-RESET-ADMITTED-MUTATION\0";
 
@@ -146,32 +150,6 @@ pub(crate) fn classify_pending_reset_at(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, FromRow)]
-struct ResetCandidateRow {
-    user_did: String,
-    device_id: Uuid,
-    status: String,
-    auth_generation: i64,
-    key_id: Option<String>,
-    signing_public_key: Option<Vec<u8>>,
-    enrollment_auth_generation: Option<i64>,
-    device_revoked_at: Option<DateTime<Utc>>,
-    key_revoked_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResetCandidateSnapshot {
-    principals: Vec<String>,
-    rows: Vec<ResetCandidateRow>,
-}
-
-#[derive(Debug)]
-struct LockedResetScope {
-    principals: Box<[String]>,
-    rows: Box<[ResetCandidateRow]>,
-    digest: [u8; 32],
-}
-
 #[derive(Debug, FromRow)]
 struct PendingResetRow {
     reset_request_id: Uuid,
@@ -264,6 +242,7 @@ pub(crate) enum LockedResetRequestDisposition {
 #[must_use]
 #[derive(Debug)]
 pub(crate) struct LockedResetRequestAuthority {
+    prelude: PreparedBusinessPrelude,
     aggregate: LockedConversationStateGuard,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
@@ -289,15 +268,14 @@ impl LockedResetRequestAuthority {
 
     pub(crate) fn plan_vacant_reset_request_entry(
         self,
-        business: BusinessAuthorityGuard,
         mutation: &VerifiedSignedMutation,
         entry: VerifiedControlEntry,
-    ) -> Result<PlannedTransition, ResetCompositionError> {
+    ) -> Result<(PlannedTransition, PreparedBusinessPrelude), ResetCompositionError> {
         if !matches!(self.disposition, LockedResetRequestDisposition::Vacant) {
             return Err(ResetRepositoryError::PendingResetAlreadyExists.into());
         }
         validate_sealed_admission(
-            &business,
+            self.prelude.scope_authority(),
             mutation,
             SignedMutationKind::ResetRequest,
             self.operation_id,
@@ -316,13 +294,16 @@ impl LockedResetRequestAuthority {
             &self.admission_digest,
         )?;
         validate_control_entry_mutation(&entry, mutation)?;
-        plan_reset_request_entry(self.aggregate, business, entry)
+        let plan =
+            plan_reset_request_entry(&self.aggregate, self.prelude.scope_authority(), entry)?;
+        Ok((plan, self.prelude))
     }
 }
 
 #[must_use]
 #[derive(Debug)]
 pub(crate) struct LockedResetActivationAuthority {
+    prelude: PreparedBusinessPrelude,
     aggregate: LockedConversationStateGuard,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
@@ -348,13 +329,19 @@ impl LockedResetActivationAuthority {
 
     pub(crate) fn plan_reset_activation_entry(
         self,
-        business: BusinessAuthorityGuard,
         mutation: &VerifiedSignedMutation,
         entry: VerifiedControlEntry,
         terminal_packages: Vec<LockedRecoveryPackageGuard>,
-    ) -> Result<(PlannedTransition, LockedPendingResetRequestGuard), ResetCompositionError> {
+    ) -> Result<
+        (
+            PlannedTransition,
+            LockedPendingResetRequestGuard,
+            PreparedBusinessPrelude,
+        ),
+        ResetCompositionError,
+    > {
         validate_sealed_admission(
-            &business,
+            self.prelude.scope_authority(),
             mutation,
             SignedMutationKind::ResetActivation,
             self.operation_id,
@@ -373,14 +360,20 @@ impl LockedResetActivationAuthority {
             &self.admission_digest,
         )?;
         validate_control_entry_mutation(&entry, mutation)?;
-        let plan = plan_reset_activation_entry(self.aggregate, business, entry, terminal_packages)?;
-        Ok((plan, self.request))
+        let plan = plan_reset_activation_entry(
+            &self.aggregate,
+            self.prelude.scope_authority(),
+            entry,
+            terminal_packages,
+        )?;
+        Ok((plan, self.request, self.prelude))
     }
 }
 
 #[must_use]
 #[derive(Debug)]
 pub(crate) struct ExpiredResetReplacementProof {
+    prelude: PreparedBusinessPrelude,
     aggregate: LockedConversationStateGuard,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
@@ -420,13 +413,9 @@ impl ExpiredResetReplacementProof {
         &self.admission_digest
     }
 
-    pub(crate) fn authorizes_replacement(
-        &self,
-        business: &BusinessAuthorityGuard,
-        mutation: &VerifiedSignedMutation,
-    ) -> bool {
+    pub(crate) fn authorizes_replacement(&self, mutation: &VerifiedSignedMutation) -> bool {
         validate_sealed_admission(
-            business,
+            self.prelude.scope_authority(),
             mutation,
             SignedMutationKind::ResetRequest,
             self.incoming_operation_id,
@@ -449,12 +438,11 @@ impl ExpiredResetReplacementProof {
 
     pub(crate) fn plan_replacement_reset_request_entry(
         self,
-        business: BusinessAuthorityGuard,
         mutation: &VerifiedSignedMutation,
         entry: VerifiedControlEntry,
-    ) -> Result<PlannedTransition, ResetCompositionError> {
+    ) -> Result<(PlannedTransition, PreparedBusinessPrelude), ResetCompositionError> {
         validate_sealed_admission(
-            &business,
+            self.prelude.scope_authority(),
             mutation,
             SignedMutationKind::ResetRequest,
             self.incoming_operation_id,
@@ -473,7 +461,9 @@ impl ExpiredResetReplacementProof {
             &self.admission_digest,
         )?;
         validate_control_entry_mutation(&entry, mutation)?;
-        plan_reset_request_entry(self.aggregate, business, entry)
+        let plan =
+            plan_reset_request_entry(&self.aggregate, self.prelude.scope_authority(), entry)?;
+        Ok((plan, self.prelude))
     }
 }
 
@@ -499,6 +489,7 @@ struct ParsedResetAuthority {
 }
 
 struct PreparedResetReadSet {
+    prelude: PreparedBusinessPrelude,
     aggregate: LockedConversationStateGuard,
     transaction_id: String,
     trusted_instant: DateTime<Utc>,
@@ -511,18 +502,43 @@ struct PreparedResetReadSet {
     actor_auth_generation: i64,
     actor_signing_public_key: Vec<u8>,
     actor_dpop_jkt: String,
-    scope: LockedResetScope,
+    scope_digest: [u8; 32],
+    head_digest: [u8; 32],
+    pending: Option<LockedPendingResetRequestGuard>,
+}
+
+struct PreparedResetAttempt {
+    aggregate: LockedConversationStateGuard,
+    transaction_id: String,
+    trusted_instant: DateTime<Utc>,
+    operation_id: Uuid,
+    incoming_request_digest: [u8; 32],
+    admitted_mutation_digest: [u8; 32],
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+    actor_signing_public_key: Vec<u8>,
+    actor_dpop_jkt: String,
+    scope_digest: [u8; 32],
     head_digest: [u8; 32],
     pending: Option<LockedPendingResetRequestGuard>,
 }
 
 pub(crate) async fn prepare_reset_request_authority(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
 ) -> Result<LockedResetRequestAuthority, ResetRepositoryError> {
     let parsed = parse_reset_authority(authority, ResetPreparationKind::Request)?;
-    let prepared = prepare_reset_read_set(transaction, business, authority, &parsed).await?;
+    let prelude = prelude
+        .verify_reset_operation(
+            ResetOperationEndpoint::RequestReset,
+            parsed.operation_id,
+            authority,
+        )
+        .map_err(|_| ResetRepositoryError::NonCanonicalOperation)?;
+    let prepared = prepare_reset_read_set(transaction, prelude, authority, &parsed).await?;
     finish_reset_request_authority(prepared)
 }
 
@@ -547,10 +563,11 @@ fn finish_reset_request_authority(
         &prepared.actor_key_id,
         prepared.actor_auth_generation,
         prepared.trusted_instant,
-        &prepared.scope.digest,
+        &prepared.scope_digest,
         &prepared.head_digest,
     );
     Ok(LockedResetRequestAuthority {
+        prelude: prepared.prelude,
         aggregate: prepared.aggregate,
         transaction_id: prepared.transaction_id.into_boxed_str(),
         trusted_instant: prepared.trusted_instant,
@@ -563,7 +580,7 @@ fn finish_reset_request_authority(
         actor_auth_generation: prepared.actor_auth_generation,
         actor_signing_public_key: prepared.actor_signing_public_key.into_boxed_slice(),
         actor_dpop_jkt: prepared.actor_dpop_jkt.into_boxed_str(),
-        scope_digest: prepared.scope.digest,
+        scope_digest: prepared.scope_digest,
         head_digest: prepared.head_digest,
         admission_digest,
         disposition,
@@ -573,23 +590,37 @@ fn finish_reset_request_authority(
 #[cfg(test)]
 pub(crate) async fn prepare_reset_request_authority_with_probe_for_test(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
     probe: &mut ResetPrepareProbeForTest,
 ) -> Result<LockedResetRequestAuthority, ResetRepositoryError> {
     let parsed = parse_reset_authority(authority, ResetPreparationKind::Request)?;
+    let prelude = prelude
+        .verify_reset_operation(
+            ResetOperationEndpoint::RequestReset,
+            parsed.operation_id,
+            authority,
+        )
+        .map_err(|_| ResetRepositoryError::NonCanonicalOperation)?;
     let prepared =
-        prepare_reset_read_set_with_probe(transaction, business, authority, &parsed, probe).await?;
+        prepare_reset_read_set_with_probe(transaction, prelude, authority, &parsed, probe).await?;
     finish_reset_request_authority(prepared)
 }
 
 pub(crate) async fn prepare_reset_activation_authority(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
 ) -> Result<LockedResetActivationAuthority, ResetRepositoryError> {
     let parsed = parse_reset_authority(authority, ResetPreparationKind::Activation)?;
-    let prepared = prepare_reset_read_set(transaction, business, authority, &parsed).await?;
+    let prelude = prelude
+        .verify_reset_operation(
+            ResetOperationEndpoint::ActivateReset,
+            parsed.operation_id,
+            authority,
+        )
+        .map_err(|_| ResetRepositoryError::NonCanonicalOperation)?;
+    let prepared = prepare_reset_read_set(transaction, prelude, authority, &parsed).await?;
     let request = prepared
         .pending
         .ok_or(ResetRepositoryError::PendingResetNotFound)?;
@@ -612,10 +643,11 @@ pub(crate) async fn prepare_reset_activation_authority(
         &prepared.actor_key_id,
         prepared.actor_auth_generation,
         prepared.trusted_instant,
-        &prepared.scope.digest,
+        &prepared.scope_digest,
         &prepared.head_digest,
     );
     Ok(LockedResetActivationAuthority {
+        prelude: prepared.prelude,
         aggregate: prepared.aggregate,
         transaction_id: prepared.transaction_id.into_boxed_str(),
         trusted_instant: prepared.trusted_instant,
@@ -628,7 +660,7 @@ pub(crate) async fn prepare_reset_activation_authority(
         actor_auth_generation: prepared.actor_auth_generation,
         actor_signing_public_key: prepared.actor_signing_public_key.into_boxed_slice(),
         actor_dpop_jkt: prepared.actor_dpop_jkt.into_boxed_str(),
-        scope_digest: prepared.scope.digest,
+        scope_digest: prepared.scope_digest,
         head_digest: prepared.head_digest,
         admission_digest,
         request,
@@ -640,6 +672,7 @@ pub(crate) async fn expire_pending_reset_for_replacement(
     authority: LockedResetRequestAuthority,
 ) -> Result<ExpiredResetReplacementProof, ResetRepositoryError> {
     let LockedResetRequestAuthority {
+        prelude,
         transaction_id,
         trusted_instant,
         operation_id,
@@ -680,6 +713,7 @@ pub(crate) async fn expire_pending_reset_for_replacement(
         return Err(ResetRepositoryError::GuardInvariant);
     }
     Ok(ExpiredResetReplacementProof {
+        prelude,
         aggregate,
         transaction_id,
         trusted_instant,
@@ -704,20 +738,17 @@ pub(crate) async fn terminalize_locked_reset_request(
     guard: LockedPendingResetRequestGuard,
 ) -> Result<(), ResetRepositoryError> {
     ensure_live_transaction(transaction, &guard.transaction_id).await?;
-    if guard.guard_digest
-        != locked_pending_reset_digest(
-            &guard.transaction_id,
-            guard.trusted_instant,
-            &guard.scope_digest,
-            &guard.head_digest,
-            &guard.immutable_row_digest,
-            &guard.requester_device_digest,
-            &guard.requester_key_digest,
-            guard.authorized_terminal,
-        )
-    {
-        return Err(ResetRepositoryError::GuardInvariant);
-    }
+    validate_locked_pending_reset_digest(
+        &guard.guard_digest,
+        &guard.transaction_id,
+        guard.trusted_instant,
+        &guard.scope_digest,
+        &guard.head_digest,
+        &guard.immutable_row_digest,
+        &guard.requester_device_digest,
+        &guard.requester_key_digest,
+        guard.authorized_terminal,
+    )?;
     match guard.authorized_terminal {
         SealedResetTerminal::Unavailable => {
             return Err(ResetRepositoryError::AuthorityBindingMismatch);
@@ -743,40 +774,51 @@ pub(crate) async fn terminalize_locked_reset_request(
 
 async fn prepare_reset_read_set(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
     parsed: &ParsedResetAuthority,
 ) -> Result<PreparedResetReadSet, ResetRepositoryError> {
     #[cfg(test)]
     {
-        return prepare_reset_read_set_inner(transaction, business, authority, parsed, None).await;
+        return prepare_reset_read_set_inner(transaction, prelude, authority, parsed, None).await;
     }
     #[cfg(not(test))]
     {
-        prepare_reset_read_set_inner(transaction, business, authority, parsed).await
+        prepare_reset_read_set_inner(transaction, prelude, authority, parsed).await
     }
 }
 
 #[cfg(test)]
 async fn prepare_reset_read_set_with_probe(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
     parsed: &ParsedResetAuthority,
     probe: &mut ResetPrepareProbeForTest,
 ) -> Result<PreparedResetReadSet, ResetRepositoryError> {
-    prepare_reset_read_set_inner(transaction, business, authority, parsed, Some(probe)).await
+    prepare_reset_read_set_inner(transaction, prelude, authority, parsed, Some(probe)).await
 }
 
 async fn prepare_reset_read_set_inner(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
     parsed: &ParsedResetAuthority,
     #[cfg(test)] mut probe: Option<&mut ResetPrepareProbeForTest>,
 ) -> Result<PreparedResetReadSet, ResetRepositoryError> {
-    validate_business_binding(business, authority)?;
     let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+    let scope = prelude.scope_authority();
+    validate_scope_and_mutation(transaction, scope, authority).await?;
+    let discovered = discover_reset_identity_scope_for_actor(
+        transaction,
+        conversation_id,
+        authority.actor_did().as_str(),
+        Uuid::from_bytes(*authority.actor_device_id().as_bytes()),
+    )
+    .await?;
+    if !scope_matches_discovery(scope, &discovered) {
+        return Err(ResetRepositoryError::CandidateScopeDrift);
+    }
 
     for attempt in 0..MAX_PREPARE_ATTEMPTS {
         #[cfg(test)]
@@ -786,7 +828,7 @@ async fn prepare_reset_read_set_inner(
         let mut savepoint = (&mut **transaction).begin().await?;
         match prepare_reset_attempt(
             &mut savepoint,
-            business,
+            scope,
             authority,
             parsed,
             conversation_id,
@@ -797,23 +839,34 @@ async fn prepare_reset_read_set_inner(
         {
             Ok(value) => {
                 savepoint.commit().await?;
-                return Ok(value);
+                return Ok(PreparedResetReadSet {
+                    prelude,
+                    aggregate: value.aggregate,
+                    transaction_id: value.transaction_id,
+                    trusted_instant: value.trusted_instant,
+                    operation_id: value.operation_id,
+                    incoming_request_digest: value.incoming_request_digest,
+                    admitted_mutation_digest: value.admitted_mutation_digest,
+                    actor_did: value.actor_did,
+                    actor_device_id: value.actor_device_id,
+                    actor_key_id: value.actor_key_id,
+                    actor_auth_generation: value.actor_auth_generation,
+                    actor_signing_public_key: value.actor_signing_public_key,
+                    actor_dpop_jkt: value.actor_dpop_jkt,
+                    scope_digest: value.scope_digest,
+                    head_digest: value.head_digest,
+                    pending: value.pending,
+                });
             }
             Err(error)
                 if attempt + 1 < MAX_PREPARE_ATTEMPTS
-                    && matches!(
-                        error,
-                        ResetRepositoryError::HeadBusy | ResetRepositoryError::CandidateScopeDrift
-                    ) =>
+                    && matches!(error, ResetRepositoryError::HeadBusy) =>
             {
                 savepoint.rollback().await?;
             }
             Err(error) => {
                 savepoint.rollback().await?;
-                return if matches!(
-                    error,
-                    ResetRepositoryError::HeadBusy | ResetRepositoryError::CandidateScopeDrift
-                ) {
+                return if matches!(error, ResetRepositoryError::HeadBusy) {
                     Err(ResetRepositoryError::RetryExhausted)
                 } else {
                     Err(error)
@@ -826,30 +879,23 @@ async fn prepare_reset_read_set_inner(
 
 async fn prepare_reset_attempt(
     transaction: &mut Transaction<'_, Postgres>,
-    business: &BusinessAuthorityGuard,
+    scope: &ScopeBoundBusinessAuthority,
     authority: &VerifiedSignedMutation,
     parsed: &ParsedResetAuthority,
     conversation_id: Uuid,
     #[cfg(test)] probe: Option<&mut ResetPrepareProbeForTest>,
-) -> Result<PreparedResetReadSet, ResetRepositoryError> {
+) -> Result<PreparedResetAttempt, ResetRepositoryError> {
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
-    if transaction_id != business.transaction_id() {
+    if transaction_id != scope.transaction_id() {
         return Err(ResetRepositoryError::ForeignTransaction);
     }
-    let trusted_instant = business.trusted_instant();
+    let trusted_instant = scope.trusted_instant();
     if !whole_millis(trusted_instant) {
         return Err(ResetRepositoryError::TrustedInstantMismatch);
     }
 
-    let s0 = load_candidate_scope(transaction, conversation_id, business).await?;
-    lock_principals(transaction, &s0.principals).await?;
-    let s1 = load_candidate_scope(transaction, conversation_id, business).await?;
-    if s1 != s0 {
-        return Err(ResetRepositoryError::CandidateScopeDrift);
-    }
-    lock_candidate_devices_and_keys(transaction, &s1.rows).await?;
     #[cfg(test)]
     if let Some(probe) = probe {
         if probe.inject_candidate_scope_drift_once {
@@ -865,16 +911,16 @@ async fn prepare_reset_attempt(
         }
     }
     lock_head_nowait(transaction, conversation_id).await?;
-    let s2 = load_candidate_scope(transaction, conversation_id, business).await?;
-    if s2 != s1 {
+    let discovered = discover_reset_identity_scope_for_actor(
+        transaction,
+        conversation_id,
+        authority.actor_did().as_str(),
+        Uuid::from_bytes(*authority.actor_device_id().as_bytes()),
+    )
+    .await?;
+    if !scope_matches_discovery(scope, &discovered) {
         return Err(ResetRepositoryError::CandidateScopeDrift);
     }
-    let scope = LockedResetScope {
-        digest: candidate_scope_digest(&s2),
-        principals: s2.principals.into_boxed_slice(),
-        rows: s2.rows.into_boxed_slice(),
-    };
-    validate_actor_scope_binding(&scope, business)?;
 
     lock_operation_and_pending_rows(
         transaction,
@@ -925,7 +971,7 @@ async fn prepare_reset_attempt(
             row,
             &transaction_id,
             trusted_instant,
-            &scope,
+            scope,
             head_coordinate,
             head_digest,
             parsed.kind,
@@ -933,7 +979,7 @@ async fn prepare_reset_attempt(
         )?),
     };
 
-    Ok(PreparedResetReadSet {
+    Ok(PreparedResetAttempt {
         aggregate,
         transaction_id,
         trusted_instant,
@@ -945,44 +991,68 @@ async fn prepare_reset_attempt(
         actor_key_id: authority.key_id().as_str().to_owned(),
         actor_auth_generation: i64::try_from(authority.auth_generation())
             .map_err(|_| ResetRepositoryError::AuthorityBindingMismatch)?,
-        actor_signing_public_key: business
-            .stored_signing_public_key()
+        actor_signing_public_key: scope
+            .actor_signing_public_key()
             .ok_or(ResetRepositoryError::AuthorityBindingMismatch)?
             .to_vec(),
-        actor_dpop_jkt: business
-            .stored_dpop_jkt()
+        actor_dpop_jkt: scope
+            .actor_dpop_jkt()
             .ok_or(ResetRepositoryError::AuthorityBindingMismatch)?
             .to_owned(),
-        scope,
+        scope_digest: *scope.scope_digest(),
         head_digest,
         pending,
     })
 }
 
-fn validate_business_binding(
-    business: &BusinessAuthorityGuard,
+async fn validate_scope_and_mutation(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &ScopeBoundBusinessAuthority,
     authority: &VerifiedSignedMutation,
 ) -> Result<(), ResetRepositoryError> {
-    if business.class() != RepositoryAuthorityClass::ExistingDevice {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != scope.transaction_id()
+        || scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+    {
         return Err(ResetRepositoryError::UnsupportedAuthority);
     }
     let actor_device_id = Uuid::from_bytes(*authority.actor_device_id().as_bytes());
     let auth_generation = i64::try_from(authority.auth_generation())
         .map_err(|_| ResetRepositoryError::AuthorityBindingMismatch)?;
-    if business.subject() != authority.actor_did().as_str()
-        || business.device_id() != actor_device_id
-        || business.stored_auth_generation() != Some(auth_generation)
-        || business.stored_key_id() != Some(authority.key_id().as_str())
-        || business.stored_signing_public_key().is_none()
+    if scope.actor_did() != authority.actor_did().as_str()
+        || scope.actor_device_id() != actor_device_id
+        || scope.actor_auth_generation() != Some(auth_generation)
+        || scope.actor_key_id() != Some(authority.key_id().as_str())
+        || scope.actor_signing_public_key().is_none()
+        || scope.actor_dpop_jkt().is_none()
+        || authority.accepted_wrapper_bytes().is_none()
+        || !whole_millis(scope.trusted_instant())
     {
         return Err(ResetRepositoryError::AuthorityBindingMismatch);
     }
     Ok(())
 }
 
+fn scope_matches_discovery(
+    scope: &ScopeBoundBusinessAuthority,
+    discovered: &CanonicalLockScope,
+) -> bool {
+    scope.principals() == discovered.principals()
+        && scope.devices().len() == discovered.devices().len()
+        && scope
+            .devices()
+            .iter()
+            .zip(discovered.devices())
+            .all(|(locked, expected)| {
+                locked.user_did() == expected.did() && locked.device_id() == expected.device_id()
+            })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_sealed_admission(
-    business: &BusinessAuthorityGuard,
+    scope: &ScopeBoundBusinessAuthority,
     mutation: &VerifiedSignedMutation,
     expected_kind: SignedMutationKind,
     operation_id: Uuid,
@@ -1000,7 +1070,6 @@ fn validate_sealed_admission(
     head_digest: &[u8; 32],
     admission_digest: &[u8; 32],
 ) -> Result<(), ResetRepositoryError> {
-    validate_business_binding(business, mutation)?;
     let expected_preparation = match expected_kind {
         SignedMutationKind::ResetRequest => ResetPreparationKind::Request,
         SignedMutationKind::ResetActivation => ResetPreparationKind::Activation,
@@ -1015,15 +1084,16 @@ fn validate_sealed_admission(
         || Uuid::from_bytes(*mutation.actor_device_id().as_bytes()) != actor_device_id
         || mutation.key_id().as_str() != actor_key_id
         || i64::try_from(mutation.auth_generation()).ok() != Some(actor_auth_generation)
-        || business.class() != RepositoryAuthorityClass::ExistingDevice
-        || business.transaction_id() != transaction_id
-        || business.trusted_instant() != trusted_instant
-        || business.subject() != actor_did
-        || business.device_id() != actor_device_id
-        || business.stored_key_id() != Some(actor_key_id)
-        || business.stored_auth_generation() != Some(actor_auth_generation)
-        || business.stored_signing_public_key() != Some(actor_signing_public_key)
-        || business.stored_dpop_jkt() != Some(actor_dpop_jkt)
+        || scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
+        || scope.transaction_id() != transaction_id
+        || scope.trusted_instant() != trusted_instant
+        || scope.actor_did() != actor_did
+        || scope.actor_device_id() != actor_device_id
+        || scope.actor_key_id() != Some(actor_key_id)
+        || scope.actor_auth_generation() != Some(actor_auth_generation)
+        || scope.actor_signing_public_key() != Some(actor_signing_public_key)
+        || scope.actor_dpop_jkt() != Some(actor_dpop_jkt)
+        || scope.scope_digest() != scope_digest
         || admission_digest
             != &reset_admission_digest(
                 operation_id,
@@ -1067,54 +1137,31 @@ fn validate_control_entry_mutation(
 }
 
 fn plan_reset_request_entry(
-    aggregate: LockedConversationStateGuard,
-    business: BusinessAuthorityGuard,
+    aggregate: &LockedConversationStateGuard,
+    scope: &ScopeBoundBusinessAuthority,
     entry: VerifiedControlEntry,
 ) -> Result<PlannedTransition, ResetCompositionError> {
-    let hydration = HydrationAuthority::from_locked_conversation(&aggregate)?;
-    let registration = hydration.locked_registration_from_guard(business)?;
-    Ok(hydration.plan_reset_request_entry(&aggregate, entry, registration)?)
+    let hydration = HydrationAuthority::from_locked_conversation(aggregate)?;
+    let registration = hydration.locked_registration_from_scope_authority(scope)?;
+    Ok(hydration.plan_reset_request_entry(aggregate, entry, registration)?)
 }
 
 fn plan_reset_activation_entry(
-    aggregate: LockedConversationStateGuard,
-    business: BusinessAuthorityGuard,
+    aggregate: &LockedConversationStateGuard,
+    scope: &ScopeBoundBusinessAuthority,
     entry: VerifiedControlEntry,
     terminal_packages: Vec<LockedRecoveryPackageGuard>,
 ) -> Result<PlannedTransition, ResetCompositionError> {
-    let hydration = HydrationAuthority::from_locked_conversation(&aggregate)?;
-    let registration = hydration.locked_registration_from_guard(business)?;
-    Ok(hydration.plan_reset_activation_entry(
-        &aggregate,
-        entry,
-        &registration,
-        terminal_packages,
-    )?)
-}
-
-fn validate_actor_scope_binding(
-    scope: &LockedResetScope,
-    business: &BusinessAuthorityGuard,
-) -> Result<(), ResetRepositoryError> {
-    let row = scope
-        .rows
-        .iter()
-        .find(|row| {
-            row.user_did == business.subject()
-                && row.device_id == business.device_id()
-                && row.key_id.as_deref() == business.stored_key_id()
-        })
-        .ok_or(ResetRepositoryError::MissingDeviceKey)?;
-    if row.status != "active"
-        || row.device_revoked_at.is_some()
-        || row.key_revoked_at.is_some()
-        || Some(row.auth_generation) != business.stored_auth_generation()
-        || row.enrollment_auth_generation != Some(row.auth_generation)
-        || row.signing_public_key.as_deref() != business.stored_signing_public_key()
-    {
-        return Err(ResetRepositoryError::AuthorityBindingMismatch);
-    }
-    Ok(())
+    let hydration = HydrationAuthority::from_locked_conversation(aggregate)?;
+    let registration = hydration.locked_registration_from_scope_authority(scope)?;
+    Ok(
+        hydration.plan_reset_activation_entry(
+            aggregate,
+            entry,
+            &registration,
+            terminal_packages,
+        )?,
+    )
 }
 
 fn map_aggregate_error(error: ConversationStateHydrationError) -> ResetRepositoryError {
@@ -1212,11 +1259,42 @@ fn parse_coordinate(
     ))
 }
 
-async fn load_candidate_scope(
+/// Discover the complete Reset principal/device identity scope without taking
+/// locks. The caller passes this exact scope to the global business prelude;
+/// locked Reset preparation later compares the live identity set with the
+/// prelude's sealed projection and returns `CandidateScopeDrift` on mismatch.
+pub(crate) async fn discover_reset_identity_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    mutation: &VerifiedSignedMutation,
+    conversation_id: Uuid,
+) -> Result<CanonicalLockScope, ResetRepositoryError> {
+    let preparation_kind = match mutation.kind() {
+        SignedMutationKind::ResetRequest => ResetPreparationKind::Request,
+        SignedMutationKind::ResetActivation => ResetPreparationKind::Activation,
+        _ => return Err(ResetRepositoryError::UnsupportedAuthority),
+    };
+    let parsed = parse_reset_authority(mutation, preparation_kind)?;
+    if parsed.prior.conversation_id() != conversation_id.as_bytes()
+        || !request_contains_exact_mutation(authority, mutation)
+    {
+        return Err(ResetRepositoryError::AuthorityBindingMismatch);
+    }
+    discover_reset_identity_scope_for_actor(
+        transaction,
+        conversation_id,
+        mutation.actor_did().as_str(),
+        Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
+    )
+    .await
+}
+
+async fn discover_reset_identity_scope_for_actor(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
-    business: &BusinessAuthorityGuard,
-) -> Result<ResetCandidateSnapshot, ResetRepositoryError> {
+    actor_did: &str,
+    actor_device_id: Uuid,
+) -> Result<CanonicalLockScope, ResetRepositoryError> {
     let principals: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT user_did
@@ -1232,16 +1310,16 @@ async fn load_candidate_scope(
               JOIN chat.welcome_deliveries wd ON wd.welcome_id=wb.welcome_id
              WHERE wb.conversation_id=$1 AND wd.status='pending'
           ) candidate_principals
-         ORDER BY convert_to(user_did,'UTF8')
         "#,
     )
     .bind(conversation_id)
-    .bind(business.subject())
+    .bind(actor_did)
     .fetch_all(&mut **transaction)
     .await?;
-    let rows = sqlx::query_as(
+    let devices: Vec<(String, Uuid)> = sqlx::query_as(
         r#"
-        WITH candidate_identities(user_did,device_id) AS (
+        SELECT user_did,device_id
+          FROM (
             SELECT DISTINCT p.user_did,d.device_id
               FROM chat.participants p
               JOIN chat.devices d ON d.user_did=p.user_did
@@ -1253,116 +1331,43 @@ async fn load_candidate_scope(
               FROM chat.welcome_bundles wb
               JOIN chat.welcome_deliveries wd ON wd.welcome_id=wb.welcome_id
              WHERE wb.conversation_id=$1 AND wd.status='pending'
-        )
-        SELECT c.user_did,c.device_id,d.status,d.auth_generation,
-               k.key_id,k.signing_public_key,k.enrollment_auth_generation,
-               d.revoked_at AS device_revoked_at,k.revoked_at AS key_revoked_at
-          FROM candidate_identities c
-          JOIN chat.devices d
-            ON d.user_did=c.user_did AND d.device_id=c.device_id
-          LEFT JOIN chat.device_keys k
-            ON k.user_did=d.user_did AND k.device_id=d.device_id
-         ORDER BY convert_to(c.user_did,'UTF8'),uuid_send(c.device_id),
-                  k.key_id IS NULL,convert_to(k.key_id,'UTF8')
+          ) candidate_devices
         "#,
     )
     .bind(conversation_id)
-    .bind(business.subject())
-    .bind(business.device_id())
+    .bind(actor_did)
+    .bind(actor_device_id)
     .fetch_all(&mut **transaction)
     .await?;
-    if principals.is_empty() || rows.is_empty() {
-        return Err(ResetRepositoryError::NonCanonicalScope);
-    }
-    Ok(ResetCandidateSnapshot { principals, rows })
+    CanonicalLockScope::new(
+        principals,
+        devices
+            .into_iter()
+            .map(|(did, device_id)| CanonicalDeviceIdentity::new(did, device_id))
+            .collect(),
+    )
+    .map_err(|_| ResetRepositoryError::NonCanonicalScope)
 }
 
-async fn lock_principals(
-    transaction: &mut Transaction<'_, Postgres>,
-    principals: &[String],
-) -> Result<(), ResetRepositoryError> {
-    if !principals
-        .windows(2)
-        .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
-    {
-        return Err(ResetRepositoryError::NonCanonicalScope);
-    }
-    for did in principals {
-        let locked: Option<String> =
-            sqlx::query_scalar("SELECT user_did FROM chat.principals WHERE user_did=$1 FOR UPDATE")
-                .bind(did)
-                .fetch_optional(&mut **transaction)
-                .await?;
-        if locked.as_deref() != Some(did.as_str()) {
-            return Err(ResetRepositoryError::MissingPrincipal);
-        }
-    }
-    Ok(())
-}
-
-async fn lock_candidate_devices_and_keys(
-    transaction: &mut Transaction<'_, Postgres>,
-    rows: &[ResetCandidateRow],
-) -> Result<(), ResetRepositoryError> {
-    let mut last_device: Option<(&str, Uuid)> = None;
-    for row in rows {
-        let identity = (row.user_did.as_str(), row.device_id);
-        if last_device == Some(identity) {
-            continue;
-        }
-        let locked: Option<(String, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT status,auth_generation,revoked_at FROM chat.devices \
-             WHERE user_did=$1 AND device_id=$2 FOR UPDATE",
-        )
-        .bind(&row.user_did)
-        .bind(row.device_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if locked.as_ref()
-            != Some(&(
-                row.status.clone(),
-                row.auth_generation,
-                row.device_revoked_at,
-            ))
-        {
-            return Err(ResetRepositoryError::DeviceOrKeyDrift);
-        }
-        last_device = Some(identity);
-    }
-
-    for row in rows {
-        let Some(key_id) = row.key_id.as_deref() else {
-            if row.signing_public_key.is_some()
-                || row.enrollment_auth_generation.is_some()
-                || row.key_revoked_at.is_some()
-            {
-                return Err(ResetRepositoryError::DeviceOrKeyDrift);
-            }
-            continue;
-        };
-        let locked: Option<(Vec<u8>, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT signing_public_key,enrollment_auth_generation,revoked_at FROM chat.device_keys \
-             WHERE user_did=$1 AND device_id=$2 AND key_id=$3 FOR UPDATE",
-        )
-        .bind(&row.user_did)
-        .bind(row.device_id)
-        .bind(key_id)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        if locked.as_ref().map(|(public_key, generation, revoked_at)| {
-            (public_key.as_slice(), *generation, *revoked_at)
-        }) != Some((
-            row.signing_public_key
-                .as_deref()
-                .ok_or(ResetRepositoryError::DeviceOrKeyDrift)?,
-            row.enrollment_auth_generation
-                .ok_or(ResetRepositoryError::DeviceOrKeyDrift)?,
-            row.key_revoked_at,
-        )) {
-            return Err(ResetRepositoryError::DeviceOrKeyDrift);
-        }
-    }
-    Ok(())
+fn request_contains_exact_mutation(
+    authority: &VerifiedChatDeviceRequest,
+    mutation: &VerifiedSignedMutation,
+) -> bool {
+    authority.mutation().is_some_and(|admitted| {
+        admitted.kind() == mutation.kind()
+            && admitted.type_id() == mutation.type_id()
+            && admitted.domain() == mutation.domain()
+            && admitted.canonical_projection() == mutation.canonical_projection()
+            && admitted.transcript_bytes() == mutation.transcript_bytes()
+            && admitted.request_digest() == mutation.request_digest()
+            && admitted.signature() == mutation.signature()
+            && admitted.accepted_wrapper_bytes() == mutation.accepted_wrapper_bytes()
+            && admitted.actor_did() == mutation.actor_did()
+            && admitted.actor_device_id() == mutation.actor_device_id()
+            && admitted.key_id() == mutation.key_id()
+            && admitted.auth_generation() == mutation.auth_generation()
+            && admitted.signed_at() == mutation.signed_at()
+    })
 }
 
 async fn lock_head_nowait(
@@ -1459,7 +1464,7 @@ fn seal_pending_reset(
     row: PendingResetRow,
     transaction_id: &str,
     trusted_instant: DateTime<Utc>,
-    scope: &LockedResetScope,
+    scope: &ScopeBoundBusinessAuthority,
     head_coordinate: &PublicGroupSnapshotCoordinate,
     head_digest: [u8; 32],
     preparation_kind: ResetPreparationKind,
@@ -1491,27 +1496,41 @@ fn seal_pending_reset(
     if &prior != head_coordinate {
         return Err(ResetRepositoryError::PendingResetCoordinateMismatch);
     }
-    let candidate = scope
-        .rows
+    let device = scope
+        .devices()
         .iter()
         .find(|candidate| {
-            candidate.user_did == row.requester_did
-                && candidate.device_id == row.requester_device_id
-                && candidate.key_id.as_deref() == Some(row.requester_key_id.as_str())
+            candidate.user_did() == row.requester_did
+                && candidate.device_id() == row.requester_device_id
+        })
+        .ok_or(ResetRepositoryError::MissingDevice)?;
+    let key = scope
+        .keys()
+        .iter()
+        .find(|candidate| {
+            candidate.user_did() == row.requester_did
+                && candidate.device_id() == row.requester_device_id
+                && candidate.key_id() == row.requester_key_id
+                && candidate.enrollment_auth_generation() == row.requester_auth_generation
         })
         .ok_or(ResetRepositoryError::MissingDeviceKey)?;
-    if candidate.auth_generation != row.requester_auth_generation
-        || candidate.enrollment_auth_generation != Some(row.requester_auth_generation)
-        || candidate.status != "active"
-        || candidate.device_revoked_at.is_some()
-        || candidate.key_revoked_at.is_some()
+    if device.auth_generation() != row.requester_auth_generation
+        || key.enrollment_auth_generation() != row.requester_auth_generation
+        || device.status() != "active"
+        || device.revoked_at().is_some()
+        || key.revoked_at().is_some()
     {
         return Err(ResetRepositoryError::DeviceOrKeyDrift);
     }
-    let requester_public_key = candidate
-        .signing_public_key
-        .as_deref()
+    let requester_public_key = scope
+        .signing_public_key_for(
+            &row.requester_did,
+            row.requester_device_id,
+            &row.requester_key_id,
+            row.requester_auth_generation,
+        )
         .ok_or(ResetRepositoryError::MissingDeviceKey)?;
+    validate_requester_public_key_hash(requester_public_key, &key.signing_public_key_sha256())?;
     let verified =
         decode_and_verify_signed_mutation(&row.signed_request_bytes, requester_public_key)
             .map_err(|_| ResetRepositoryError::InvalidResetRow)?;
@@ -1544,8 +1563,21 @@ fn seal_pending_reset(
         .as_slice()
         .try_into()
         .map_err(|_| ResetRepositoryError::InvalidResetRow)?;
-    let device_digest = candidate_device_digest(candidate);
-    let key_digest = candidate_key_digest(candidate)?;
+    let device_digest = candidate_device_digest(
+        device.user_did(),
+        device.device_id(),
+        device.status(),
+        device.auth_generation(),
+        device.revoked_at(),
+    );
+    let key_digest = candidate_key_digest(
+        key.user_did(),
+        key.device_id(),
+        key.key_id(),
+        requester_public_key,
+        key.enrollment_auth_generation(),
+        key.revoked_at(),
+    );
     let immutable_row_digest = reset_immutable_row_digest(&row, &prior);
     let authorized_terminal = match preparation_kind {
         ResetPreparationKind::Request if trusted_instant >= row.expires_at => {
@@ -1559,7 +1591,7 @@ fn seal_pending_reset(
     let guard_digest = locked_pending_reset_digest(
         transaction_id,
         trusted_instant,
-        &scope.digest,
+        scope.scope_digest(),
         &head_digest,
         &immutable_row_digest,
         &device_digest,
@@ -1569,7 +1601,7 @@ fn seal_pending_reset(
     Ok(LockedPendingResetRequestGuard {
         transaction_id: transaction_id.to_owned().into_boxed_str(),
         trusted_instant,
-        scope_digest: scope.digest,
+        scope_digest: *scope.scope_digest(),
         head_digest,
         reset_request_id: row.reset_request_id,
         conversation_id: row.conversation_id,
@@ -1718,71 +1750,149 @@ fn whole_millis(value: DateTime<Utc>) -> bool {
     value.timestamp_millis() >= 0 && value.timestamp_subsec_nanos() % 1_000_000 == 0
 }
 
-fn candidate_scope_digest(snapshot: &ResetCandidateSnapshot) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(RESET_CANDIDATE_SCOPE_DOMAIN);
-    digest.update((snapshot.principals.len() as u64).to_be_bytes());
-    for principal in &snapshot.principals {
-        digest_len(&mut digest, principal.as_bytes());
-    }
-    digest.update((snapshot.rows.len() as u64).to_be_bytes());
-    for row in &snapshot.rows {
-        digest_len(&mut digest, row.user_did.as_bytes());
-        digest.update(row.device_id.as_bytes());
-        digest_len(&mut digest, row.status.as_bytes());
-        digest.update(row.auth_generation.to_be_bytes());
-        match (
-            row.key_id.as_deref(),
-            row.signing_public_key.as_deref(),
-            row.enrollment_auth_generation,
-        ) {
-            (None, None, None) => digest.update([0]),
-            (Some(key_id), Some(signing_public_key), Some(enrollment_auth_generation)) => {
-                digest.update([1]);
-                digest_len(&mut digest, key_id.as_bytes());
-                digest_len(&mut digest, signing_public_key);
-                digest.update(enrollment_auth_generation.to_be_bytes());
-            }
-            _ => digest.update([2]),
-        }
-        digest_optional_time(&mut digest, row.device_revoked_at);
-        digest_optional_time(&mut digest, row.key_revoked_at);
-    }
-    digest.finalize().into()
-}
-
-fn candidate_device_digest(row: &ResetCandidateRow) -> [u8; 32] {
+fn candidate_device_digest(
+    user_did: &str,
+    device_id: Uuid,
+    status: &str,
+    auth_generation: i64,
+    revoked_at: Option<DateTime<Utc>>,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-RESET-CANDIDATE-DEVICE\0");
-    digest_len(&mut digest, row.user_did.as_bytes());
-    digest.update(row.device_id.as_bytes());
-    digest_len(&mut digest, row.status.as_bytes());
-    digest.update(row.auth_generation.to_be_bytes());
-    digest_optional_time(&mut digest, row.device_revoked_at);
+    digest_len(&mut digest, user_did.as_bytes());
+    digest.update(device_id.as_bytes());
+    digest_len(&mut digest, status.as_bytes());
+    digest.update(auth_generation.to_be_bytes());
+    digest_optional_time(&mut digest, revoked_at);
     digest.finalize().into()
 }
 
-fn candidate_key_digest(row: &ResetCandidateRow) -> Result<[u8; 32], ResetRepositoryError> {
-    let key_id = row
-        .key_id
-        .as_deref()
-        .ok_or(ResetRepositoryError::MissingDeviceKey)?;
-    let signing_public_key = row
-        .signing_public_key
-        .as_deref()
-        .ok_or(ResetRepositoryError::MissingDeviceKey)?;
-    let enrollment_auth_generation = row
-        .enrollment_auth_generation
-        .ok_or(ResetRepositoryError::MissingDeviceKey)?;
+fn candidate_key_digest(
+    user_did: &str,
+    device_id: Uuid,
+    key_id: &str,
+    signing_public_key: &[u8],
+    enrollment_auth_generation: i64,
+    revoked_at: Option<DateTime<Utc>>,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-RESET-CANDIDATE-KEY\0");
-    digest_len(&mut digest, row.user_did.as_bytes());
-    digest.update(row.device_id.as_bytes());
+    digest_len(&mut digest, user_did.as_bytes());
+    digest.update(device_id.as_bytes());
     digest_len(&mut digest, key_id.as_bytes());
     digest_len(&mut digest, signing_public_key);
     digest.update(enrollment_auth_generation.to_be_bytes());
-    digest_optional_time(&mut digest, row.key_revoked_at);
-    Ok(digest.finalize().into())
+    digest_optional_time(&mut digest, revoked_at);
+    digest.finalize().into()
+}
+
+fn validate_requester_public_key_hash(
+    requester_public_key: &[u8],
+    stored_public_key_sha256: &[u8; 32],
+) -> Result<(), ResetRepositoryError> {
+    if <[u8; 32]>::from(Sha256::digest(requester_public_key)) != *stored_public_key_sha256 {
+        return Err(ResetRepositoryError::DeviceOrKeyDrift);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_locked_pending_reset_digest(
+    expected_guard_digest: &[u8; 32],
+    transaction_id: &str,
+    trusted_instant: DateTime<Utc>,
+    scope_digest: &[u8; 32],
+    head_digest: &[u8; 32],
+    immutable_row_digest: &[u8; 32],
+    requester_device_digest: &[u8; 32],
+    requester_key_digest: &[u8; 32],
+    terminal: SealedResetTerminal,
+) -> Result<(), ResetRepositoryError> {
+    if expected_guard_digest
+        != &locked_pending_reset_digest(
+            transaction_id,
+            trusted_instant,
+            scope_digest,
+            head_digest,
+            immutable_row_digest,
+            requester_device_digest,
+            requester_key_digest,
+            terminal,
+        )
+    {
+        return Err(ResetRepositoryError::GuardInvariant);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PendingResetCryptographicBindingMutationForTest {
+    ScopeDigest,
+    RequesterDeviceDigest,
+    RequesterKeyDigest,
+    RawPublicKey,
+    StoredRawPublicKeyHash,
+}
+
+#[cfg(test)]
+pub(crate) fn pending_reset_cryptographic_binding_mutation_rejected_for_test(
+    mutation: PendingResetCryptographicBindingMutationForTest,
+) -> bool {
+    let transaction_id = "reset-pure-fixture-transaction";
+    let trusted_instant = DateTime::from_timestamp_millis(1_784_942_400_000).unwrap();
+    let mut scope_digest = [1; 32];
+    let head_digest = [2; 32];
+    let immutable_row_digest = [3; 32];
+    let mut requester_device_digest = [4; 32];
+    let mut requester_key_digest = [5; 32];
+    let terminal = SealedResetTerminal::Expired;
+    let expected_guard_digest = locked_pending_reset_digest(
+        transaction_id,
+        trusted_instant,
+        &scope_digest,
+        &head_digest,
+        &immutable_row_digest,
+        &requester_device_digest,
+        &requester_key_digest,
+        terminal,
+    );
+    match mutation {
+        PendingResetCryptographicBindingMutationForTest::ScopeDigest => scope_digest[0] ^= 1,
+        PendingResetCryptographicBindingMutationForTest::RequesterDeviceDigest => {
+            requester_device_digest[0] ^= 1
+        }
+        PendingResetCryptographicBindingMutationForTest::RequesterKeyDigest => {
+            requester_key_digest[0] ^= 1
+        }
+        PendingResetCryptographicBindingMutationForTest::RawPublicKey
+        | PendingResetCryptographicBindingMutationForTest::StoredRawPublicKeyHash => {
+            let mut raw_public_key = [6; 32];
+            let mut stored_hash: [u8; 32] = Sha256::digest(raw_public_key).into();
+            match mutation {
+                PendingResetCryptographicBindingMutationForTest::RawPublicKey => {
+                    raw_public_key[0] ^= 1
+                }
+                PendingResetCryptographicBindingMutationForTest::StoredRawPublicKeyHash => {
+                    stored_hash[0] ^= 1
+                }
+                _ => unreachable!(),
+            }
+            return validate_requester_public_key_hash(&raw_public_key, &stored_hash).is_err();
+        }
+    }
+    validate_locked_pending_reset_digest(
+        &expected_guard_digest,
+        transaction_id,
+        trusted_instant,
+        &scope_digest,
+        &head_digest,
+        &immutable_row_digest,
+        &requester_device_digest,
+        &requester_key_digest,
+        terminal,
+    )
+    .is_err()
 }
 
 fn reset_immutable_row_digest(

@@ -166,6 +166,52 @@ impl RepositoryAuthorityReceipt {
     }
 }
 
+/// Narrow Reset integration fixture. It derives the operation identifier and
+/// immutable signer binding from an already verified Reset mutation and cannot
+/// mint receipts for other protocol operations.
+#[cfg(test)]
+pub(crate) fn reset_existing_device_receipt_for_test(
+    mutation: &VerifiedSignedMutation,
+    dpop_jkt: &str,
+    signing_public_key: &[u8],
+) -> Result<RepositoryAuthorityReceipt, AuthRepositoryError> {
+    let operation_id = match mutation.projection() {
+        VerifiedMutationProjection::ResetRequest(reset) => {
+            Uuid::from_bytes(*reset.reset_request_id().as_bytes())
+        }
+        VerifiedMutationProjection::ResetActivation(reset) => {
+            Uuid::from_bytes(*reset.transition_id().as_bytes())
+        }
+        _ => return Err(AuthRepositoryError::UnsupportedAuthorizationShape),
+    };
+    let auth_generation = i64::try_from(mutation.auth_generation())
+        .ok()
+        .filter(|generation| *generation > 0)
+        .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
+    if operation_id.get_version_num() != 4
+        || operation_id.get_variant() != uuid::Variant::RFC4122
+        || KeyThumbprint::parse(dpop_jkt).is_err()
+        || ed25519_key_id(signing_public_key)
+            .map(|key_id| key_id.as_str() != mutation.key_id().as_str())
+            .unwrap_or(true)
+    {
+        return Err(AuthRepositoryError::RequestBindingMismatch);
+    }
+    Ok(RepositoryAuthorityReceipt {
+        replay_ids: ReplayAuditIds {
+            token: Uuid::new_v4(),
+            proof: Uuid::new_v4(),
+            auth_transaction: None,
+        },
+        class: RepositoryAuthorityClass::ExistingDevice,
+        operation_id: Some(operation_id),
+        locked_jkt: Some(dpop_jkt.to_owned()),
+        locked_auth_generation: Some(auth_generation),
+        locked_key_id: Some(mutation.key_id().as_str().to_owned()),
+        locked_signing_key_sha256: Some(Sha256::digest(signing_public_key).into()),
+    })
+}
+
 pub(crate) enum AuthorizationOutcome {
     FirstExecution(VerifiedChatDeviceRequest),
     CompletedReplay(CompletedIdempotentResponse),
