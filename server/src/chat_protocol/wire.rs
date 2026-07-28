@@ -1663,12 +1663,13 @@ pub fn validate_group_info(
     .map_err(|_| WireValidationError::WrongGroupInfoSigner)?;
 
     let (public_group, _group_info) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        PublicGroup::from_external(
+        PublicGroup::from_external_at(
             provider.crypto(),
             provider.storage(),
             ratchet_tree,
             verifiable_group_info,
             ProposalStore::new(),
+            openmls::prelude::UnixSeconds::new(policy.now_unix_seconds),
         )
     }))
     .map_err(|_| WireValidationError::InvalidGroupInfo)?

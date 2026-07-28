@@ -33,12 +33,12 @@ serde_bytes = "0.11"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "uuid", "chrono", "migrate"] }
 
 # MLS
-openmls = "=0.8.1"
-openmls_traits = "=0.5.0"
-openmls_basic_credential = "=0.5.0"
-openmls_rust_crypto = "=0.5.1"
-openmls_libcrux_crypto = "=0.3.1"
-openmls_memory_storage = "=0.5.0"
+openmls = { version = "=0.8.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
+openmls_traits = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
+openmls_basic_credential = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
+openmls_rust_crypto = { version = "=0.5.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
+openmls_libcrux_crypto = { version = "=0.3.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
+openmls_memory_storage = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
 libcrux-kem = "=0.0.7"
 x25519-dalek = "=2.0.1"
 
