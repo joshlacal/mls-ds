@@ -48,14 +48,16 @@ mod repository {
 
 use chrono::{Duration, TimeZone, Utc};
 use repository::recovery::{
-    cancellation_actor_matches_requester, classify_locked_recovery, persisted_recovery_origin,
-    requester_key_liveness_matches, requester_row_liveness_matches, RecoveryLockStage,
+    cancellation_actor_matches_requester, classify_client_terminal_disposition,
+    classify_locked_recovery, persisted_recovery_origin, requester_key_liveness_matches,
+    requester_row_liveness_matches, RecoveryClientTerminalAction,
+    RecoveryClientTerminalDisposition, RecoveryClientTerminalError, RecoveryLockStage,
     RecoveryPersistedOrigin, RecoveryRowStatus, RecoveryTerminalClassification,
     CANONICAL_RECOVERY_LOCK_ORDER, LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL,
     LOCK_RECOVERY_CONVERSATION_SQL, LOCK_RECOVERY_EXPIRY_DEVICE_SQL, LOCK_RECOVERY_EXPIRY_KEY_SQL,
     LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL, LOCK_RECOVERY_GENERATION_SQL,
     LOCK_RECOVERY_GENERATION_STATE_SQL, LOCK_RECOVERY_MEMBER_DEVICE_SQL, LOCK_RECOVERY_PACKAGE_SQL,
-    LOCK_RECOVERY_REQUEST_SQL, LOCK_RECOVERY_RESERVATION_SQL,
+    LOCK_RECOVERY_REQUEST_SQL, LOCK_RECOVERY_RESERVATION_SQL, RECOVERY_TERMINAL_LOCATOR_SQL,
 };
 
 fn compact(sql: &str) -> String {
@@ -399,10 +401,12 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
     let source = include_str!("../src/chat_protocol/repository/recovery.rs");
     for authority in [
         "RecoveryRequestAuthority",
-        "ReservedRecoveryRequestAuthority",
         "RecoveryCancellationAuthority",
         "RecoveryFulfillmentAuthority",
         "RecoveryExpiryAuthority",
+        "RecoveryRequestPlanInput",
+        "RecoveryCancellationPlanInput",
+        "RecoveryFulfillmentPlanInput",
     ] {
         let declaration = format!("pub(crate) struct {authority}");
         let declaration_start = source.find(&declaration).expect("missing authority");
@@ -421,10 +425,10 @@ fn authority_surface_is_non_cloneable_opaque_and_only_emits_sealed_transition_bi
             "{authority} must not gain a loose-value constructor"
         );
     }
-    assert!(source.contains("reserve_available_recovery_package("));
+    assert!(!source.contains("reserve_available_recovery_package("));
     assert!(source.contains("RecoveryTerminalTripleCas::new("));
-    assert!(source.contains("RecoveryTerminalTripleTermination::Cancelled"));
-    assert!(source.contains("RecoveryTerminalTripleTermination::Fulfilled"));
+    assert!(!source.contains("RecoveryTerminalTripleTermination::Cancelled"));
+    assert!(!source.contains("RecoveryTerminalTripleTermination::Fulfilled"));
     assert!(source.contains("RecoveryTerminalTripleTermination::Expired"));
     assert!(source.contains("struct RecoverySqlAuthoritySeal"));
     assert!(!source.contains("impl Clone for RecoverySqlAuthoritySeal"));
@@ -459,8 +463,7 @@ fn recovery_sql_bindings_require_the_private_repository_seal_everywhere() {
     );
     let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
     assert!(recovery.contains("RecoveryKeyPackageRowCas::new(\n        authority,"));
-    assert!(recovery
-        .contains("RecoveryTerminalTripleCas::new(\n            &self.context.sql_authority,"));
+    assert!(recovery.contains("RecoveryTerminalTripleCas::new(\n            &self.sql_authority,"));
 }
 
 #[test]
@@ -477,4 +480,200 @@ fn every_client_recovery_acquisition_consumes_the_exact_operation_claim() {
         );
     }
     assert_eq!(source.matches(".verify_recovery_operation(").count(), 3);
+}
+
+#[test]
+fn client_terminal_disposition_matrix_matches_frozen_brief() {
+    use RecoveryClientTerminalAction::*;
+    use RecoveryClientTerminalDisposition::*;
+    use RecoveryClientTerminalError::*;
+    use RecoveryTerminalClassification::*;
+    // (action, classification) -> expected disposition
+    let cases: &[(
+        RecoveryClientTerminalAction,
+        RecoveryTerminalClassification,
+        RecoveryClientTerminalDisposition,
+    )] = &[
+        (Cancel, OpenLive, Execute),
+        (Fulfill, OpenLive, Execute),
+        (Cancel, OpenDue, ExpireFirst(RecoveryNotFound)),
+        (Fulfill, OpenDue, ExpireFirst(RecoveryExpired)),
+        (Cancel, RetainedCancelled, Retained(CancellationConflict)),
+        (Cancel, RetainedFulfilled, Retained(RecoveryNotFound)),
+        (Cancel, RetainedExpired, Retained(RecoveryNotFound)),
+        (Cancel, RetainedSuperseded, Retained(RecoveryNotFound)),
+        (Fulfill, RetainedExpired, Retained(RecoveryExpired)),
+        (Fulfill, RetainedSuperseded, Retained(RecoverySuperseded)),
+        (Fulfill, RetainedCancelled, Retained(RecoveryNotFound)),
+        (Fulfill, RetainedFulfilled, Retained(RecoveryNotFound)),
+    ];
+    for (action, classification, expected) in cases {
+        assert_eq!(
+            classify_client_terminal_disposition(*action, *classification),
+            *expected,
+            "mismatch for action={action:?} classification={classification:?}"
+        );
+    }
+}
+
+#[test]
+fn client_preparation_performs_no_package_reservation_or_terminal_write() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(
+        !source.contains("reserve_available_recovery_package("),
+        "preparation must not call the package reservation writer"
+    );
+    assert!(
+        !source.contains("AvailableRecoveryPackageReservationCas"),
+        "preparation must not construct reservation CAS bindings"
+    );
+    assert!(
+        !source.contains("RecoveryTerminalTripleTermination::Cancelled"),
+        "client terminal Cancelled write must move to the executor"
+    );
+    assert!(
+        !source.contains("RecoveryTerminalTripleTermination::Fulfilled"),
+        "client terminal Fulfilled write must move to the executor"
+    );
+    assert!(
+        !source.contains("fn reserve_available_package"),
+        "the reserve method must be removed"
+    );
+}
+
+#[test]
+fn plan_inputs_are_opaque_linear_and_retain_the_prelude() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    for plan in [
+        "RecoveryRequestPlanInput",
+        "RecoveryCancellationPlanInput",
+        "RecoveryFulfillmentPlanInput",
+    ] {
+        assert!(
+            source.contains(&format!("pub(crate) struct {plan}")),
+            "{plan} struct must be declared"
+        );
+        assert!(
+            !source.contains(&format!("impl Clone for {plan}")),
+            "{plan} must remain linear"
+        );
+        assert!(
+            source.contains(&format!("into_plan_input(self) -> {plan}")),
+            "{plan} must have an adapter from the corresponding authority"
+        );
+        assert!(
+            source.contains(&format!("impl {plan}")),
+            "{plan} must have an impl block"
+        );
+    }
+    assert_eq!(
+        source.matches("validate_same_transaction(").count(),
+        3,
+        "each plan input must have validate_same_transaction"
+    );
+    assert_eq!(
+        source.matches("into_plan_input(self)").count(),
+        3,
+        "each authority must have an into_plan_input adapter"
+    );
+}
+
+#[test]
+fn fulfillment_scope_discovery_is_read_only_and_includes_actor_plus_requester() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(source.contains("pub(crate) async fn discover_recovery_fulfillment_terminal_scope("));
+    assert!(
+        !compact(RECOVERY_TERMINAL_LOCATOR_SQL).contains("FOR UPDATE"),
+        "terminal locator SQL must not acquire a row lock"
+    );
+    assert!(
+        source.contains("mutation_contains_exact_admission"),
+        "scope discovery must bind the exact admitted mutation"
+    );
+    assert!(
+        source.contains("let actor_did = authority.subject().as_str().to_owned()"),
+        "scope discovery must include the admitted actor DID"
+    );
+    assert!(
+        source
+            .contains("let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes())"),
+        "scope discovery must include the admitted actor device"
+    );
+    assert!(
+        source.contains("CanonicalDeviceIdentity::new(actor_did, actor_device_id)"),
+        "canonical scope must lock the actor identity"
+    );
+    assert!(
+        source.contains("CanonicalDeviceIdentity::new(locator.requester_did"),
+        "canonical scope must lock the original requester identity"
+    );
+}
+
+#[test]
+fn scheduler_expiry_stays_unclaimed_and_prelude_free() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(source.contains("prelude: None"));
+    assert!(
+        source.contains("RecoveryExpiryAuthority"),
+        "RecoveryExpiryAuthority must exist"
+    );
+    let function = source
+        .split_once("pub(crate) async fn prepare_recovery_expiry_authority(")
+        .map(|(_, tail)| {
+            tail.split_once("\npub(crate) async fn")
+                .map_or(tail, |(body, _)| body)
+        });
+    if let Some(expiry_fn) = function {
+        assert!(
+            !expiry_fn.contains("claim_operation"),
+            "scheduler expiry must not claim an operation"
+        );
+        assert!(
+            !expiry_fn.contains("complete_operation"),
+            "scheduler expiry must not complete an operation"
+        );
+        assert!(
+            !expiry_fn.contains("verify_recovery_operation"),
+            "scheduler expiry must not verify a recovery operation claim"
+        );
+    }
+    assert!(
+        source.contains("fn terminalize("),
+        "terminalize must exist for scheduler/expiry writes"
+    );
+    assert!(
+        source.matches("prelude: None").count() >= 2,
+        "the scheduler prepare must set prelude=None (authority + retained arms)"
+    );
+}
+
+#[test]
+fn same_transition_fulfilled_row_is_corruption_not_replay() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(
+        source.contains("if context.fulfilling_transition_id == Some(transition_id)"),
+        "the fulfillment guard must error on the same transition (corruption)"
+    );
+    assert!(
+        !source.contains("if context.fulfilling_transition_id != Some(transition_id)"),
+        "a differing transition is a fulfilled-by-another classification, not corruption"
+    );
+}
+
+#[test]
+fn recovery_terminal_locator_row_carries_request_id() {
+    let source = include_str!("../src/chat_protocol/repository/recovery.rs");
+    assert!(
+        source.contains("recovery_request_id: Uuid"),
+        "RecoveryTerminalLocatorRow must carry recovery_request_id for \
+         cross-binding in scheduler and scope-discovery paths"
+    );
+    assert!(
+        source.contains("struct RecoveryTerminalLocatorRow"),
+        "RecoveryTerminalLocatorRow must exist"
+    );
+    assert!(
+        !source.contains("struct RecoveryExpiryLocatorRow"),
+        "the old locator row name must be completely renamed"
+    );
 }

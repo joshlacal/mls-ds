@@ -16,6 +16,7 @@ use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use super::super::{
+    dpop::VerifiedChatDeviceRequest,
     snapshot::MAX_PROTOCOL_INTEGER,
     transcript::{
         decode_and_verify_signed_mutation, CanonicalValueRef, VerifiedMutationProjection,
@@ -25,13 +26,12 @@ use super::super::{
 use super::{
     auth::RepositoryAuthorityClass,
     prelude::{
-        canonical_operation_lock_key, PreparedBusinessPrelude, RecoveryOperationEndpoint,
-        ScopeBoundBusinessAuthority,
+        canonical_operation_lock_key, CanonicalDeviceIdentity, CanonicalLockScope,
+        PreparedBusinessPrelude, RecoveryOperationEndpoint, ScopeBoundBusinessAuthority,
     },
     transition::{
-        self, AvailableRecoveryPackageReservationCas, LeafRecoveryKind, LeafRecoverySource,
-        NewLeafRecoveryRequest, NewReservation, RecoveryKeyPackageRowCas,
-        RecoveryTerminalTripleCas, RecoveryTerminalTripleTermination,
+        self, LeafRecoveryKind, LeafRecoverySource, NewLeafRecoveryRequest, NewReservation,
+        RecoveryKeyPackageRowCas, RecoveryTerminalTripleCas, RecoveryTerminalTripleTermination,
     },
 };
 
@@ -97,8 +97,8 @@ pub(crate) const LOCK_RECOVERY_EXPIRY_KEY_SQL: &str = r#"
      FOR UPDATE
 "#;
 
-const RECOVERY_EXPIRY_LOCATOR_SQL: &str = r#"
-    SELECT conversation_id,requester_did,requester_device_id,
+pub(crate) const RECOVERY_TERMINAL_LOCATOR_SQL: &str = r#"
+    SELECT recovery_request_id,conversation_id,requester_did,requester_device_id,
            requester_key_id,requester_auth_generation
       FROM chat.leaf_recovery_requests
      WHERE recovery_request_id=$1
@@ -121,6 +121,55 @@ pub(crate) enum RecoveryTerminalClassification {
     RetainedCancelled,
     RetainedExpired,
     RetainedSuperseded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryClientTerminalAction {
+    Cancel,
+    Fulfill,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryClientTerminalError {
+    CancellationConflict,
+    RecoveryNotFound,
+    RecoveryExpired,
+    RecoverySuperseded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryClientTerminalDisposition {
+    Execute,
+    ExpireFirst(RecoveryClientTerminalError),
+    Retained(RecoveryClientTerminalError),
+}
+
+pub(crate) fn classify_client_terminal_disposition(
+    action: RecoveryClientTerminalAction,
+    classification: RecoveryTerminalClassification,
+) -> RecoveryClientTerminalDisposition {
+    use RecoveryClientTerminalAction::{Cancel, Fulfill};
+    use RecoveryClientTerminalDisposition::{Execute, ExpireFirst, Retained};
+    use RecoveryClientTerminalError::{
+        CancellationConflict, RecoveryExpired, RecoveryNotFound, RecoverySuperseded,
+    };
+    use RecoveryTerminalClassification::{
+        OpenDue, OpenLive, RetainedCancelled, RetainedExpired, RetainedFulfilled,
+        RetainedSuperseded,
+    };
+
+    match (action, classification) {
+        (_, OpenLive) => Execute,
+        (Cancel, OpenDue) => ExpireFirst(RecoveryNotFound),
+        (Fulfill, OpenDue) => ExpireFirst(RecoveryExpired),
+        (Cancel, RetainedCancelled) => Retained(CancellationConflict),
+        (Cancel, RetainedFulfilled | RetainedExpired | RetainedSuperseded) => {
+            Retained(RecoveryNotFound)
+        }
+        (Fulfill, RetainedExpired) => Retained(RecoveryExpired),
+        (Fulfill, RetainedSuperseded) => Retained(RecoverySuperseded),
+        (Fulfill, RetainedCancelled | RetainedFulfilled) => Retained(RecoveryNotFound),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,7 +616,8 @@ struct RecoveryReservationRow {
 }
 
 #[derive(FromRow)]
-struct RecoveryExpiryLocatorRow {
+struct RecoveryTerminalLocatorRow {
+    recovery_request_id: Uuid,
     conversation_id: Uuid,
     requester_did: String,
     requester_device_id: Uuid,
@@ -615,23 +665,15 @@ struct RecoveryAuthorityContext {
     authority_digest: [u8; 32],
 }
 
-/// Sealed available-package authority. It has no constructor and is consumed
-/// exactly once by `reserve_available_package`.
+/// Sealed available-package authority. Its single exit is
+/// [`into_plan_input`](RecoveryRequestAuthority::into_plan_input). No package
+/// reservation occurs before the state-machine executor.
 #[must_use]
 pub(crate) struct RecoveryRequestAuthority {
     context: RecoveryAuthorityContext,
     request: NewLeafRecoveryRequest,
     reservation: NewReservation,
     package: RecoveryPackageRow,
-}
-
-/// Post-CAS request authority. The available-package edge has already matched
-/// its complete locked row; only this value exposes the exact insertion rows.
-#[must_use]
-pub(crate) struct ReservedRecoveryRequestAuthority {
-    context: RecoveryAuthorityContext,
-    request: NewLeafRecoveryRequest,
-    reservation: NewReservation,
 }
 
 #[must_use]
@@ -686,28 +728,77 @@ impl RecoveryRetainedTerminal {
     }
 }
 
-impl RecoveryRequestAuthority {
-    pub(crate) async fn reserve_available_package(
-        self,
-        transaction: &mut Transaction<'_, Postgres>,
-    ) -> Result<ReservedRecoveryRequestAuthority, RecoveryRepositoryError> {
-        validate_client_context(transaction, &self.context).await?;
-        let package = package_cas(&self.context.sql_authority, &self.package);
-        let binding = AvailableRecoveryPackageReservationCas::new(
-            &self.context.sql_authority,
-            &self.context.transaction_id,
-            package,
-        );
-        transition::reserve_available_recovery_package(transaction, &binding).await?;
-        Ok(ReservedRecoveryRequestAuthority {
-            context: self.context,
-            request: self.request,
-            reservation: self.reservation,
-        })
+/// Opaque state-machine plan input sealing the exact recovery-request
+/// read-set. No DB write has occurred; the executor bridge is the sole writer.
+#[must_use]
+pub(crate) struct RecoveryRequestPlanInput {
+    context: RecoveryAuthorityContext,
+    request: NewLeafRecoveryRequest,
+    reservation: NewReservation,
+    package: RecoveryPackageRow,
+}
+
+/// Opaque cancellation plan input.
+#[must_use]
+pub(crate) struct RecoveryCancellationPlanInput {
+    context: RecoveryAuthorityContext,
+    request: NewLeafRecoveryRequest,
+    reservation: NewReservation,
+    package: RecoveryPackageRow,
+}
+
+/// Opaque fulfillment plan input.
+#[must_use]
+pub(crate) struct RecoveryFulfillmentPlanInput {
+    context: RecoveryAuthorityContext,
+    request: NewLeafRecoveryRequest,
+    reservation: NewReservation,
+    package: RecoveryPackageRow,
+    transition_id: Uuid,
+}
+
+impl<T> RecoveryTerminalRead<T> {
+    pub(crate) fn map_authority<U>(self, adapt: impl FnOnce(T) -> U) -> RecoveryTerminalRead<U> {
+        match self {
+            RecoveryTerminalRead::Authority(authority) => {
+                RecoveryTerminalRead::Authority(adapt(authority))
+            }
+            RecoveryTerminalRead::DueForExpiry(authority) => {
+                RecoveryTerminalRead::DueForExpiry(authority)
+            }
+            RecoveryTerminalRead::Retained(terminal) => RecoveryTerminalRead::Retained(terminal),
+        }
     }
 }
 
-impl ReservedRecoveryRequestAuthority {
+impl RecoveryTerminalRead<RecoveryRequestAuthority> {
+    pub(crate) fn map_authority_into_plan_input(
+        self,
+    ) -> RecoveryTerminalRead<RecoveryRequestPlanInput> {
+        self.map_authority(RecoveryRequestAuthority::into_plan_input)
+    }
+}
+
+impl RecoveryRequestAuthority {
+    pub(crate) fn into_plan_input(self) -> RecoveryRequestPlanInput {
+        RecoveryRequestPlanInput {
+            context: self.context,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
+        }
+    }
+}
+
+impl RecoveryRequestPlanInput {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.context.transaction_id
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.context.trusted_instant
+    }
+
     pub(crate) fn request(&self) -> &NewLeafRecoveryRequest {
         &self.request
     }
@@ -716,28 +807,26 @@ impl ReservedRecoveryRequestAuthority {
         &self.reservation
     }
 
+    pub(crate) async fn validate_same_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), RecoveryRepositoryError> {
+        validate_client_context(transaction, &self.context).await
+    }
+
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
         self.context.prelude
     }
 }
 
 impl RecoveryCancellationAuthority {
-    pub(crate) fn terminal_cas(&self) -> RecoveryTerminalTripleCas<'_> {
-        RecoveryTerminalTripleCas::new(
-            &self.context.sql_authority,
-            &self.context.transaction_id,
-            &self.request,
-            &self.reservation,
-            package_cas(&self.context.sql_authority, &self.package),
-            RecoveryTerminalTripleTermination::Cancelled {
-                authority: &self.context.sql_authority,
-                terminal_signed_request_bytes: &self.context.evidence.signed_request_bytes,
-                terminal_signing_transcript_bytes: &self.context.evidence.signing_transcript_bytes,
-                terminal_request_digest: &self.context.evidence.request_digest,
-                terminal_signature: &self.context.evidence.signature,
-                terminal_at: self.context.trusted_instant,
-            },
-        )
+    pub(crate) fn into_plan_input(self) -> RecoveryCancellationPlanInput {
+        RecoveryCancellationPlanInput {
+            context: self.context,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
+        }
     }
 
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
@@ -746,19 +835,76 @@ impl RecoveryCancellationAuthority {
 }
 
 impl RecoveryFulfillmentAuthority {
-    pub(crate) fn terminal_cas(&self) -> RecoveryTerminalTripleCas<'_> {
-        RecoveryTerminalTripleCas::new(
-            &self.context.sql_authority,
-            &self.context.transaction_id,
-            &self.request,
-            &self.reservation,
-            package_cas(&self.context.sql_authority, &self.package),
-            RecoveryTerminalTripleTermination::Fulfilled {
-                authority: &self.context.sql_authority,
-                transition_id: self.transition_id,
-                terminal_at: self.context.trusted_instant,
-            },
-        )
+    pub(crate) fn into_plan_input(self) -> RecoveryFulfillmentPlanInput {
+        RecoveryFulfillmentPlanInput {
+            context: self.context,
+            request: self.request,
+            reservation: self.reservation,
+            package: self.package,
+            transition_id: self.transition_id,
+        }
+    }
+
+    pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
+        self.context.prelude
+    }
+}
+
+impl RecoveryCancellationPlanInput {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.context.transaction_id
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.context.trusted_instant
+    }
+
+    pub(crate) fn request(&self) -> &NewLeafRecoveryRequest {
+        &self.request
+    }
+
+    pub(crate) fn reservation(&self) -> &NewReservation {
+        &self.reservation
+    }
+
+    pub(crate) async fn validate_same_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), RecoveryRepositoryError> {
+        validate_client_context(transaction, &self.context).await
+    }
+
+    pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
+        self.context.prelude
+    }
+}
+
+impl RecoveryFulfillmentPlanInput {
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.context.transaction_id
+    }
+
+    pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
+        self.context.trusted_instant
+    }
+
+    pub(crate) fn transition_id(&self) -> Uuid {
+        self.transition_id
+    }
+
+    pub(crate) fn request(&self) -> &NewLeafRecoveryRequest {
+        &self.request
+    }
+
+    pub(crate) fn reservation(&self) -> &NewReservation {
+        &self.reservation
+    }
+
+    pub(crate) async fn validate_same_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), RecoveryRepositoryError> {
+        validate_client_context(transaction, &self.context).await
     }
 
     pub(crate) fn into_prelude(self) -> PreparedBusinessPrelude {
@@ -1044,14 +1190,78 @@ pub(crate) async fn prepare_recovery_fulfillment_authority(
             context.into_expiry_authority()?,
         )),
         RecoveryTerminalClassification::RetainedFulfilled
-            if context.fulfilling_transition_id != Some(transition_id) =>
+            if context.fulfilling_transition_id == Some(transition_id) =>
         {
+            // Fulfilled by this exact transition. The same-token operation
+            // replay must have returned completed response bytes before
+            // repository preparation. Reaching the terminal classifier
+            // without a completed receipt is an invariant failure.
             Err(RecoveryRepositoryError::InvalidDurableRow)
         }
         retained => Ok(RecoveryTerminalRead::Retained(
             context.into_retained_terminal(retained),
         )),
     }
+}
+
+/// Read-only fulfillment terminal-scope discovery, executed before the shared
+/// operation prelude. The returned canonical scope contains both the exact
+/// admitted acting fulfiller and the original requester identity. The locator
+/// read acquires no row lock; every authoritative fact is re-read under the
+/// canonical locks during authority preparation.
+pub(crate) async fn discover_recovery_fulfillment_terminal_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    mutation: &VerifiedSignedMutation,
+) -> Result<CanonicalLockScope, RecoveryRepositoryError> {
+    let request_id = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
+            Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+        }
+        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+    };
+    if !mutation_contains_exact_admission(authority, mutation) {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
+    let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
+        .bind(request_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
+    if locator.recovery_request_id != request_id {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
+    let actor_did = authority.subject().as_str().to_owned();
+    let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
+    CanonicalLockScope::new(
+        vec![actor_did.clone(), locator.requester_did.clone()],
+        vec![
+            CanonicalDeviceIdentity::new(actor_did, actor_device_id),
+            CanonicalDeviceIdentity::new(locator.requester_did, locator.requester_device_id),
+        ],
+    )
+    .map_err(|_| RecoveryRepositoryError::NonCanonicalOperation)
+}
+
+fn mutation_contains_exact_admission(
+    authority: &VerifiedChatDeviceRequest,
+    mutation: &VerifiedSignedMutation,
+) -> bool {
+    authority.mutation().is_some_and(|admitted| {
+        admitted.kind() == mutation.kind()
+            && admitted.type_id() == mutation.type_id()
+            && admitted.domain() == mutation.domain()
+            && admitted.canonical_projection() == mutation.canonical_projection()
+            && admitted.transcript_bytes() == mutation.transcript_bytes()
+            && admitted.request_digest() == mutation.request_digest()
+            && admitted.signature() == mutation.signature()
+            && admitted.accepted_wrapper_bytes() == mutation.accepted_wrapper_bytes()
+            && admitted.actor_did() == mutation.actor_did()
+            && admitted.actor_device_id() == mutation.actor_device_id()
+            && admitted.key_id() == mutation.key_id()
+            && admitted.auth_generation() == mutation.auth_generation()
+            && admitted.signed_at() == mutation.signed_at()
+    })
 }
 
 /// Mint scheduler expiry authority in a fresh transaction.
@@ -1074,12 +1284,14 @@ pub(crate) async fn prepare_recovery_expiry_authority(
         .execute(&mut **transaction)
         .await?;
 
-    let locator: RecoveryExpiryLocatorRow = sqlx::query_as(RECOVERY_EXPIRY_LOCATOR_SQL)
+    let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
         .bind(request_id)
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
-
+    if locator.recovery_request_id != request_id {
+        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    }
     let principal: Option<String> = sqlx::query_scalar(LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL)
         .bind(&locator.requester_did)
         .fetch_optional(&mut **transaction)
