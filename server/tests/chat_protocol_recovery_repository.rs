@@ -644,7 +644,7 @@ fn exact_task4_recovery_sql_bindings_are_sealed_and_consumed_only_by_the_witness
 }
 
 #[test]
-fn recovery_prewrite_reloads_custom_head_and_every_exact_row_before_hydration() {
+fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_before_hydration() {
     let recovery = include_str!("../src/chat_protocol/repository/recovery.rs");
     let witness = recovery
         .split_once("pub(in crate::chat_protocol) async fn validate_prewrite(")
@@ -654,18 +654,22 @@ fn recovery_prewrite_reloads_custom_head_and_every_exact_row_before_hydration() 
         .map(|(body, _)| body)
         .expect("Recovery witness prewrite validator");
     let transaction = witness.find("SELECT txid_current()::text").unwrap();
+    let aggregate = witness.find("hydrate_locked_conversation_state(").unwrap();
     let custom_head = witness.find("lock_head_graph(").unwrap();
-    let cross_binding = witness.find("validates_reloaded_recovery_head").unwrap();
+    let cross_binding = witness
+        .find(".validates(&reloaded_aggregate, &reloaded_head)")
+        .unwrap();
     let package = witness.find("LOCK_RECOVERY_PACKAGE_SQL").unwrap();
     let request = witness.find("LOCK_RECOVERY_REQUEST_SQL").unwrap();
     let reservation = witness.find("LOCK_RECOVERY_RESERVATION_SQL").unwrap();
     assert!(
-        transaction < custom_head
+        transaction < aggregate
+            && aggregate < custom_head
             && custom_head < cross_binding
             && cross_binding < package
             && package < request
             && request < reservation,
-        "transaction, aggregate/custom-head, package, request, and reservation drift fences \
+        "transaction, full aggregate, custom-head, package, request, and reservation drift fences \
          must run in deterministic prewrite order"
     );
     assert!(witness.contains("package != self.package"));
@@ -686,6 +690,29 @@ fn recovery_prewrite_reloads_custom_head_and_every_exact_row_before_hydration() 
         facade.find(".validate_prewrite(").unwrap()
             < facade.find("hydrate_execution_context(").unwrap(),
         "all Recovery-specific drift fences must reject before generic hydration can write"
+    );
+}
+
+#[test]
+fn production_executor_requires_exact_recovery_witness_and_fences_legacy_fallbacks_to_tests() {
+    let source = include_str!("../src/chat_protocol/state_machine.rs");
+    assert!(
+        source
+            .matches("missing exact Recovery persistence witness")
+            .count()
+            >= 4,
+        "request, cancellation, expiry, and fulfillment must each reject a missing witness"
+    );
+    assert_eq!(
+        source
+            .matches("#[cfg(test)]\n        if recovery_witness.is_none()")
+            .count(),
+        4,
+        "every status-only Recovery fallback must be a genuine cfg(test) seam"
+    );
+    assert!(
+        !source.contains("#[cfg(not(test))]\n        if recovery_witness.is_none()"),
+        "production must reject, never execute a witnessless fallback"
     );
 }
 

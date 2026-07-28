@@ -62,8 +62,12 @@ mod chat_protocol {
         ));
     }
     #[allow(dead_code)]
-    #[path = "../../src/chat_protocol/dpop.rs"]
-    pub mod dpop;
+    pub mod dpop {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
+    }
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
     }
@@ -77,11 +81,19 @@ mod chat_protocol {
             pub(crate) struct RevocationBatchHydrationProof;
         }
         #[allow(dead_code)]
-        #[path = "../../../src/chat_protocol/repository/auth.rs"]
-        pub mod auth;
+        pub mod auth {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
+        }
         #[allow(dead_code)]
-        #[path = "../../../src/chat_protocol/repository/prelude.rs"]
-        pub mod prelude;
+        pub mod prelude {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/prelude.rs"
+            ));
+        }
         pub mod recovery {
             /// The raw executor harness never mints a production Recovery
             /// witness. This opaque test-topology stand-in exists only because

@@ -187,13 +187,29 @@ impl RecoveryAggregateCrossBinding {
         aggregate: &LockedConversationStateGuard,
         recovery: &LockedRecoveryHeadGraph,
     ) -> bool {
-        Self::seal(
+        self.validates_live_aggregate_digests(
+            aggregate.head().durable_row_digest(),
+            aggregate.locked_graph_digest(),
+            aggregate.locked_snapshot_digest(),
+        ) && Self::seal(
             &self.transaction_id,
             self.trusted_instant,
             aggregate,
             recovery,
         )
         .is_ok_and(|expected| expected == *self && self.seal_digest == self.rederive_digest())
+    }
+
+    fn validates_live_aggregate_digests(
+        &self,
+        head: &[u8; 32],
+        graph: &[u8; 32],
+        snapshot: Option<&[u8; 32]>,
+    ) -> bool {
+        self.seal_digest == self.rederive_digest()
+            && &self.aggregate_head_digest == head
+            && &self.aggregate_graph_digest == graph
+            && self.aggregate_snapshot_digest.as_ref() == snapshot
     }
 
     fn validates_reloaded_recovery_head(&self, recovery: &LockedRecoveryHeadGraph) -> bool {
@@ -1021,6 +1037,17 @@ impl RecoveryPersistenceWitness {
         if live_transaction_id != self.transaction_id.as_ref() || !self.matches_plan(plan) {
             return Err(ExecutionContextHydrationError::AuthorityMismatch);
         }
+        // Rehydrate and reseal the complete durable aggregate before touching
+        // any Recovery row. This makes the aggregate graph and active public
+        // snapshot digests load-bearing at executor prewrite rather than merely
+        // self-authenticated fields copied from planning.
+        let reloaded_aggregate = hydrate_locked_conversation_state(
+            transaction,
+            self.request.conversation_id,
+            self.trusted_instant,
+        )
+        .await
+        .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
         let reloaded_head = lock_head_graph(
             transaction,
             self.request.conversation_id,
@@ -1031,7 +1058,7 @@ impl RecoveryPersistenceWitness {
         .map_err(|_| ExecutionContextHydrationError::AuthorityMismatch)?;
         if !self
             .aggregate_cross_binding
-            .validates_reloaded_recovery_head(&reloaded_head)
+            .validates(&reloaded_aggregate, &reloaded_head)
         {
             return Err(ExecutionContextHydrationError::AuthorityMismatch);
         }
@@ -1758,6 +1785,358 @@ pub(crate) fn plan_scheduler_recovery_expiry(
         ),
         material: scheduler_expiry_material(request_id, terminal_at)?,
     })
+}
+
+/// Non-shipping compiler proof for the exact production Recovery composition.
+///
+/// This module is deliberately compiled in the normal library configuration,
+/// not through a path-included `cfg(test)` shadow. Each function consumes a real
+/// opaque repository authority/input, crosses the real planner and private
+/// `PreparedRecoveryExecutionGraph`, then invokes the facade whose prewrite
+/// witness and prepared executor are the only write path. The returned client
+/// result still owns the exact completion guards; scheduler expiry has no
+/// completion authority by construction.
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+#[allow(dead_code)]
+pub mod production_composition_proof {
+    use super::*;
+    use sqlx::PgPool;
+
+    const PROOF_DATABASE: &str = "catbird_chat_protocol_test_20260722";
+
+    async fn require_local_owned_gate(pool: &PgPool) -> Result<(), String> {
+        let (database, user, owner, address): (String, String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT current_database(),current_user,pg_get_userbyid(d.datdba),\
+                 inet_server_addr()::text FROM pg_database d \
+                 WHERE d.datname=current_database()",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("inspect production-proof database: {error}"))?;
+        if database != PROOF_DATABASE
+            || user != owner
+            || !address.as_deref().is_none_or(|value| {
+                matches!(value, "127.0.0.1" | "127.0.0.1/32" | "::1" | "::1/128")
+            })
+        {
+            return Err(format!(
+                "refusing Recovery production proof on database={database:?} \
+                 user={user:?} owner={owner:?} address={address:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn due_request_id(transaction: &mut Transaction<'_, Postgres>) -> Result<Uuid, String> {
+        sqlx::query_scalar(
+            "SELECT recovery_request_id FROM chat.leaf_recovery_requests \
+             WHERE status='open' \
+               AND expires_at <= date_trunc('milliseconds',transaction_timestamp()) \
+             ORDER BY requested_at DESC,recovery_request_id DESC LIMIT 1",
+        )
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|error| format!("locate due Recovery proof fixture: {error}"))?
+        .ok_or_else(|| {
+            "production proof requires one production-valid due open Recovery fixture".to_owned()
+        })
+    }
+
+    async fn prepare_scheduler(
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<(Uuid, PreparedSchedulerRecoveryExpiry), String> {
+        let request_id = due_request_id(transaction).await?;
+        let authority = match prepare_recovery_expiry_authority(transaction, request_id)
+            .await
+            .map_err(|error| format!("prepare scheduler authority: {error:?}"))?
+        {
+            RecoverySchedulerExpiryRead::Authority(authority) => authority,
+            RecoverySchedulerExpiryRead::Retained(_) => {
+                return Err("due Recovery proof fixture became retained".to_owned())
+            }
+        };
+        let prepared = plan_scheduler_recovery_expiry(authority.into_plan_input())
+            .map_err(|error| format!("plan scheduler Recovery expiry: {error:?}"))?;
+        Ok((request_id, prepared))
+    }
+
+    async fn residue_counts(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+    ) -> Result<(String, String, String, i64, i64, i64), String> {
+        sqlx::query_as(
+            "SELECT request.status,reservation.status,package.status,\
+                    (SELECT count(*) FROM chat.events),\
+                    (SELECT count(*) FROM chat.outbox),\
+                    (SELECT count(*) FROM chat.idempotency_records)\
+             FROM chat.leaf_recovery_requests request\
+             JOIN chat.key_package_reservations reservation\
+               ON reservation.recovery_request_id=request.recovery_request_id\
+             JOIN chat.key_packages package\
+               ON package.key_package_ref=request.key_package_ref\
+             WHERE request.recovery_request_id=$1",
+        )
+        .bind(request_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| format!("read Recovery proof residue: {error}"))
+    }
+
+    fn require_prewrite_authority_mismatch(error: RecoveryRepositoryError) -> Result<(), String> {
+        if matches!(
+            error,
+            RecoveryRepositoryError::ExecutionHydration(
+                ExecutionContextHydrationError::AuthorityMismatch
+            )
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected executor-prewrite AuthorityMismatch, got {error:?}"
+            ))
+        }
+    }
+
+    async fn corrupt_aggregate_graph(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+    ) -> Result<(), String> {
+        sqlx::query("SET LOCAL session_replication_role='replica'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("enter privileged aggregate-drift simulation: {error}"))?;
+        let changed = sqlx::query(
+            "UPDATE chat.metadata_snapshots metadata SET \
+                 ciphertext=set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),\
+                 ciphertext_sha256=digest(\
+                   set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),'sha256')\
+             FROM chat.leaf_recovery_requests request\
+             WHERE request.recovery_request_id=$1\
+               AND metadata.conversation_id=request.conversation_id",
+        )
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| format!("inject aggregate graph drift: {error}"))?
+        .rows_affected();
+        sqlx::query("SET LOCAL session_replication_role='origin'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("leave aggregate-drift simulation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "aggregate-drift fixture expected one metadata row, changed {changed}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn corrupt_public_snapshot(
+        transaction: &mut Transaction<'_, Postgres>,
+        request_id: Uuid,
+    ) -> Result<(), String> {
+        sqlx::query("SET LOCAL session_replication_role='replica'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("enter privileged snapshot-drift simulation: {error}"))?;
+        let changed = sqlx::query(
+            "UPDATE chat.generation_states state SET \
+                 public_snapshot_bytes=set_byte(\
+                   state.public_snapshot_bytes,0,get_byte(state.public_snapshot_bytes,0) # 1),\
+                 snapshot_sha256=digest(set_byte(\
+                   state.public_snapshot_bytes,0,get_byte(state.public_snapshot_bytes,0) # 1),\
+                   'sha256')\
+             FROM chat.leaf_recovery_requests request\
+             WHERE request.recovery_request_id=$1\
+               AND state.conversation_id=request.conversation_id\
+               AND state.generation=request.generation\
+               AND state.state_version=request.bound_state_version",
+        )
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| format!("inject public-snapshot drift: {error}"))?
+        .rows_affected();
+        sqlx::query("SET LOCAL session_replication_role='origin'")
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| format!("leave snapshot-drift simulation: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "snapshot-drift fixture expected one generation-state row, changed {changed}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Executes the real scheduler lifecycle through its opaque authority,
+    /// planner, private graph, witness prewrite, prepared executor, exact
+    /// terminal triple, event/outbox, and scheduler-only material. The outer
+    /// transaction is rolled back so the gate fixture remains reusable.
+    #[doc(hidden)]
+    pub async fn run_scheduler_expiry_lifecycle(pool: &PgPool) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin scheduler production proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let applied = prepared
+            .apply(&mut transaction)
+            .await
+            .map_err(|error| format!("apply scheduler production proof: {error:?}"))?;
+        if !matches!(
+            applied.material,
+            RecoveryCanonicalMaterial::SchedulerExpired {
+                recovery_request_id,
+                ..
+            } if recovery_request_id == request_id
+        ) {
+            return Err("scheduler proof returned client/completion material".to_owned());
+        }
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after.0 != "expired"
+            || after.1 != "expired"
+            || !matches!(after.2.as_str(), "available" | "expired")
+        {
+            return Err(format!(
+                "scheduler proof did not terminalize exact triple: {after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback scheduler production proof: {error}"))
+    }
+
+    async fn run_prewrite_drift(pool: &PgPool, snapshot: bool) -> Result<(), String> {
+        require_local_owned_gate(pool).await?;
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| format!("begin Recovery drift proof: {error}"))?;
+        let (request_id, prepared) = prepare_scheduler(&mut transaction).await?;
+        let before = residue_counts(&mut transaction, request_id).await?;
+        if snapshot {
+            corrupt_public_snapshot(&mut transaction, request_id).await?;
+        } else {
+            corrupt_aggregate_graph(&mut transaction, request_id).await?;
+        }
+        let error = match prepared.apply(&mut transaction).await {
+            Ok(_) => return Err("durable aggregate drift reached executor writes".to_owned()),
+            Err(error) => error,
+        };
+        require_prewrite_authority_mismatch(error)?;
+        let after = residue_counts(&mut transaction, request_id).await?;
+        if after != before {
+            return Err(format!(
+                "prewrite drift left business/event/outbox/completion residue: \
+                 before={before:?} after={after:?}"
+            ));
+        }
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| format!("rollback Recovery drift proof: {error}"))
+    }
+
+    /// Privileged gate-only corruption simulation for a durable aggregate graph
+    /// fact. It bypasses the immutable-row trigger, then requires the real
+    /// executor prewrite to reject with zero residue.
+    #[doc(hidden)]
+    pub async fn run_aggregate_graph_drift_negative(pool: &PgPool) -> Result<(), String> {
+        run_prewrite_drift(pool, false).await
+    }
+
+    /// Privileged gate-only corruption simulation for the active public
+    /// snapshot. It bypasses the immutable-row trigger, then requires the real
+    /// executor prewrite to reject with zero residue.
+    #[doc(hidden)]
+    pub async fn run_public_snapshot_drift_negative(pool: &PgPool) -> Result<(), String> {
+        run_prewrite_drift(pool, true).await
+    }
+
+    async fn request<T: PublicTransport>(
+        authority: RecoveryRequestAuthority,
+        transaction: &mut Transaction<'_, Postgres>,
+        relationship_authority: &RelationshipAuthority<T>,
+        trusted_request_instant: &TrustedRequestInstant,
+    ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
+        let input = authority
+            .into_plan_input(transaction, relationship_authority, trusted_request_instant)
+            .await?;
+        plan_recovery_request(input, relationship_authority)?
+            .apply(transaction)
+            .await
+    }
+
+    async fn cancellation(
+        authority: RecoveryCancellationAuthority,
+        transaction: &mut Transaction<'_, Postgres>,
+        trusted_request_instant: &TrustedRequestInstant,
+    ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
+        let input = authority.into_plan_input(trusted_request_instant)?;
+        plan_recovery_cancellation(input)?.apply(transaction).await
+    }
+
+    async fn fulfillment<T: PublicTransport>(
+        authority: RecoveryFulfillmentAuthority,
+        transaction: &mut Transaction<'_, Postgres>,
+        relationship_authority: &RelationshipAuthority<T>,
+        trusted_request_instant: &TrustedRequestInstant,
+    ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
+        let input = authority
+            .into_plan_input(transaction, relationship_authority, trusted_request_instant)
+            .await?;
+        plan_recovery_fulfillment(input, relationship_authority)?
+            .apply(transaction)
+            .await
+    }
+
+    async fn client_expiry(
+        input: RecoveryClientExpiryPlanInput,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<AppliedRecoveryMutation, RecoveryRepositoryError> {
+        plan_client_recovery_expiry(input)?.apply(transaction).await
+    }
+
+    async fn scheduler_expiry(
+        input: RecoverySchedulerExpiryPlanInput,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
+        plan_scheduler_recovery_expiry(input)?
+            .apply(transaction)
+            .await
+    }
+
+    fn client_completion(
+        applied: AppliedRecoveryMutation,
+    ) -> (
+        AppliedTransition,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+        RecoveryCanonicalMaterial,
+    ) {
+        let AppliedRecoveryMutation {
+            applied,
+            completion,
+            material,
+        } = applied;
+        let (scope, completion) = completion.into_parts();
+        (applied, scope, completion, material)
+    }
+
+    fn exact_executor_surface_typechecks() {
+        let _ = RecoveryPersistenceWitness::validate_prewrite;
+        let _ = RecoveryPersistenceWitness::apply_open;
+        let _ = RecoveryPersistenceWitness::apply_terminal;
+        let _ = prepare_recovery_execution;
+        let _ = apply_prepared_recovery_execution;
+    }
 }
 
 impl RecoveryRequestAuthority {
@@ -3045,6 +3424,27 @@ mod aggregate_cross_binding_tests {
         rejects_drift!(aggregate_snapshot_digest, None);
         rejects_drift!(recovery_head_digest, [0x71; 32]);
         rejects_drift!(recovery_graph_digest, [0x81; 32]);
+    }
+
+    #[test]
+    fn live_aggregate_graph_and_public_snapshot_drift_reject_independently() {
+        let binding = fixture();
+        assert!(binding.validates_live_aggregate_digests(
+            &[0x40; 32],
+            &[0x50; 32],
+            Some(&[0x60; 32]),
+        ));
+        assert!(!binding.validates_live_aggregate_digests(
+            &[0x40; 32],
+            &[0x51; 32],
+            Some(&[0x60; 32]),
+        ));
+        assert!(!binding.validates_live_aggregate_digests(
+            &[0x40; 32],
+            &[0x50; 32],
+            Some(&[0x61; 32]),
+        ));
+        assert!(!binding.validates_live_aggregate_digests(&[0x40; 32], &[0x50; 32], None,));
     }
 }
 

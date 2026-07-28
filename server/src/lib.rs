@@ -37,11 +37,6 @@
 #![allow(clippy::should_implement_trait)]
 #![allow(deprecated)]
 
-#[cfg(all(feature = "server-bin", feature = "chat-protocol-production-proof"))]
-compile_error!(
-    "`chat-protocol-production-proof` is a non-shipping test surface and cannot coexist with `server-bin`"
-);
-
 pub mod actors;
 pub mod atproto_bytes;
 pub mod auth;

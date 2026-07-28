@@ -19766,6 +19766,7 @@ pub(in crate::chat_protocol) mod executor {
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
+        #[cfg(test)]
         let applied_at = ctx.applied_at;
         let head = effects
             .head_cas()
@@ -19844,6 +19845,14 @@ pub(in crate::chat_protocol) mod executor {
         // 1. The repository-owned exact package/request/reservation witness is
         //    the first durable mutation for production Recovery. The test-only
         //    raw executor seam retains its legacy reconstruction path.
+        #[cfg(not(test))]
+        recovery_witness
+            .ok_or(ExecutorError::MissingContext(
+                "missing exact Recovery persistence witness",
+            ))?
+            .apply_open(transaction)
+            .await?;
+        #[cfg(test)]
         if let Some(witness) = recovery_witness {
             witness.apply_open(transaction).await?;
         }
@@ -19866,6 +19875,7 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
 
+        #[cfg(test)]
         if recovery_witness.is_none() {
             write_recovery_open(transaction, ctx, recovery, conversation_id, applied_at).await?;
         }
@@ -21504,6 +21514,7 @@ pub(in crate::chat_protocol) mod executor {
         >,
     ) -> Result<AppliedTransition, ExecutorError> {
         let effects = plan.effects();
+        #[cfg(test)]
         let applied_at = ctx.applied_at;
         let head = effects
             .head_cas()
@@ -21585,15 +21596,26 @@ pub(in crate::chat_protocol) mod executor {
             PackageStatus::Reserved,
             PackageStatus::Available,
         )?;
+        #[cfg(test)]
         let recovery_request_id = Uuid::from_bytes(*recovery.request_id());
+        #[cfg(test)]
         let key_package_ref = recovery.key_package_ref().to_vec();
         // The signed cancellation request's digest — the SAME value the released
         // reservation records, per the cancelled-status mapping cross-check.
+        #[cfg(test)]
         let terminal_request_digest = ctx.entry().request_digest.clone();
 
         // 1. Production consumes the Task-4 full-row triple as the first
         //    durable mutation. The enclosing executor savepoint rolls it back
         //    if the later head/event/completion composition fails.
+        #[cfg(not(test))]
+        recovery_witness
+            .ok_or(ExecutorError::MissingContext(
+                "missing exact Recovery persistence witness",
+            ))?
+            .apply_terminal(transaction)
+            .await?;
+        #[cfg(test)]
         if let Some(witness) = recovery_witness {
             witness.apply_terminal(transaction).await?;
         }
@@ -21614,6 +21636,7 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
 
+        #[cfg(test)]
         if recovery_witness.is_none() {
             // Test-only raw-executor compatibility path.
             transition::terminalize_leaf_recovery_request(
@@ -21810,6 +21833,14 @@ pub(in crate::chat_protocol) mod executor {
             ));
         }
 
+        #[cfg(not(test))]
+        recovery_witness
+            .ok_or(ExecutorError::MissingContext(
+                "missing exact Recovery persistence witness",
+            ))?
+            .apply_terminal(transaction)
+            .await?;
+        #[cfg(test)]
         if let Some(witness) = recovery_witness {
             witness.apply_terminal(transaction).await?;
         }
@@ -21827,6 +21858,7 @@ pub(in crate::chat_protocol) mod executor {
             },
         )
         .await?;
+        #[cfg(test)]
         if recovery_witness.is_none() {
             transition::terminalize_leaf_recovery_request(
                 transaction,
@@ -22324,9 +22356,19 @@ pub(in crate::chat_protocol) mod executor {
         //    transition insert because the fulfilled rows reference it, while
         //    the prewrite reread already rejected all triple drift before the
         //    savepoint's first mutation.
+        #[cfg(not(test))]
+        recovery_witness
+            .ok_or(ExecutorError::MissingContext(
+                "missing exact Recovery persistence witness",
+            ))?
+            .apply_terminal(transaction)
+            .await?;
+        #[cfg(test)]
         if let Some(witness) = recovery_witness {
             witness.apply_terminal(transaction).await?;
-        } else {
+        }
+        #[cfg(test)]
+        if recovery_witness.is_none() {
             transition::terminalize_leaf_recovery_request(
                 transaction,
                 recovery_request_id,

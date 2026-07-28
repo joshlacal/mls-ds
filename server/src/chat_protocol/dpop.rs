@@ -1,9 +1,9 @@
-//! Trusted-Nest token and DPoP cryptographic verification for clean chat.
-//!
-//! Successful values are deliberately *pre-replay* evidence. They are
-//! non-Clone, cannot be constructed outside this module, and do not represent
-//! device authority until the repository atomically consumes all replay keys
-//! and validates stored device state in the same transaction.
+// Trusted-Nest token and DPoP cryptographic verification for clean chat.
+//
+// Successful values are deliberately *pre-replay* evidence. They are
+// non-Clone, cannot be constructed outside this module, and do not represent
+// device authority until the repository atomically consumes all replay keys
+// and validates stored device state in the same transaction.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use p256::{

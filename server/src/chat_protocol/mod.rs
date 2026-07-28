@@ -65,6 +65,12 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
 }
 
 mod cursor;
+/// Trusted-Nest token and DPoP cryptographic verification for clean chat.
+///
+/// Successful values are deliberately pre-replay evidence. They are
+/// non-Clone, cannot be constructed outside this module, and do not represent
+/// device authority until the repository atomically consumes all replay keys
+/// and validates stored device state in the same transaction.
 pub(crate) mod dpop;
 pub mod error;
 pub(crate) mod model;
@@ -76,3 +82,18 @@ pub(crate) mod state_machine;
 pub(crate) mod transcript;
 pub(crate) mod validation;
 pub mod wire;
+
+/// Non-shipping executable proof runners. Only zero-authority scenario
+/// functions are exported; opaque protocol authorities and prepared graphs
+/// remain crate-private.
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+#[doc(hidden)]
+pub mod production_proof {
+    pub use super::repository::recovery::production_composition_proof::{
+        run_aggregate_graph_drift_negative, run_public_snapshot_drift_negative,
+        run_scheduler_expiry_lifecycle,
+    };
+}
