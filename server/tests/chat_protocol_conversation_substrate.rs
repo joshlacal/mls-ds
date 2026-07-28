@@ -12062,11 +12062,25 @@ mod historical_control_loader {
                 "second-response negatives require an Acknowledgement or Rejection terminal winner"
             );
             let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
-            let trusted_at: DateTime<Utc> =
+            let sampled_at: DateTime<Utc> =
                 sqlx::query_scalar("SELECT date_trunc('second', clock_timestamp())")
                     .fetch_one(&pool)
                     .await
                     .expect("sample lifecycle trusted instant");
+            // The Reset matrix deliberately builds one leaf whose `not_before`
+            // equals the locked protocol instant so the production verifier
+            // rejects that strict lower-bound equality. OpenMLS also validates
+            // the same leaf against `SystemTime::now()` while importing the
+            // fixture GroupInfo. Keep the protocol clock ten seconds behind the
+            // sampled PostgreSQL wall clock so the leaf is current for the
+            // independent OpenMLS import but still invalid at the exact locked
+            // protocol instant. Non-Reset lifecycle fixtures retain the sampled
+            // instant unchanged.
+            let trusted_at = if include_reset {
+                sampled_at - chrono::Duration::seconds(10)
+            } else {
+                sampled_at
+            };
             let trusted_text = trusted_at.to_rfc3339_opts(SecondsFormat::Millis, true);
             let signed_text = (trusted_at - chrono::Duration::milliseconds(500))
                 .to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -26253,6 +26267,8 @@ mod historical_control_loader {
     // `InvalidOrigin`, and the empty collection — are live on the gate DB.
     // -----------------------------------------------------------------------
     pub(super) mod reset_leave_leg {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         use base64::{engine::general_purpose::STANDARD, Engine};
         use chrono::{DateTime, Duration, SecondsFormat, Utc};
         use ed25519_dalek::Signer;
@@ -26563,6 +26579,17 @@ mod historical_control_loader {
                 .clone();
             let external_provider =
                 openmls_libcrux_crypto::Provider::new().expect("external reset provider");
+            let import_unix_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("OpenMLS reset import instant is after the Unix epoch")
+                .as_secs();
+            assert!(
+                lifetime_not_before < import_unix_seconds
+                    && import_unix_seconds < lifetime_not_after,
+                "reset leaf lifetime must cover the OpenMLS wall-clock import instant: \
+                 not_before={lifetime_not_before}, import={import_unix_seconds}, \
+                 not_after={lifetime_not_after}"
+            );
             PublicGroup::from_external(
                 external_provider.crypto(),
                 external_provider.storage(),
