@@ -72,15 +72,15 @@ const MIGRATION_DESCRIPTIONS: [&str; 12] = [
 // catalog is structurally unchanged. Preserve these last-reviewed values until
 // the dedicated catalog gate prints the normalized post-00004 catalogs.
 const COLUMN_CATALOG_SHA256: &str =
-    "dac54118c1335492a399ed735734e557135fe944ed69e9df1bdf9e1d498e2a22";
+    "04cecd00d6161b25101d0f036db1e3ab13eb239b49d550e648e738f4c07a0fec";
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "e1b4cd1b68ecc8f79facffab07ea76d41118eb639b989e4a6354097a2b30d791";
+    "fa2eb2eafe26d419b20fec8f89a92204052c52904f6f552b639fcf994af4de3a";
 const INDEX_CATALOG_SHA256: &str =
-    "4eb4de367adc3591c12bc758c125899818bb7f0104a65d7469102bda76616759";
+    "c9f788921036d88ab4fcabdb783b9ab0e32836e6cfb1d73285c58a1ac220e188";
 const FUNCTION_CATALOG_SHA256: &str =
-    "950c1ea9dab68e2eb361e4276402da302d97ef848041da9f4c68aedef3109081";
+    "4198ea57597a3b1466a9c27c1a63efce02c34e9b1a263b9be2c5b7fdfc9e6eac";
 const TRIGGER_CATALOG_SHA256: &str =
-    "c179499a10d3ac474de660a6f473bd4840fac400fd742d1f343f0c5f35e2fa87";
+    "9c2be15c13c0b23d06b2ab0014b67ffa0f6dc8e3ed99c8a2220f20c07cd6c671";
 const SEQUENCE_CATALOG_SHA256: &str =
     "0f5fdcab044481afeaca50ac88cff13edd4b583df914da2c798e4a4194464abe";
 
@@ -2603,8 +2603,22 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     // Revocation is a signed, receipt-backed terminal event. It revokes the
     // transport/device key without rewriting already accepted MLS history.
     let revocation_id = fixture_uuid(250);
-    let revocation_request = vec![21_u8; 8];
-    let revocation_transcript = vec![22_u8; 8];
+    // Post-cutover receipts must carry the exact corresponding operation
+    // claim. Keep this representative revocation graph canonical enough for
+    // the migration-owned wrapper/transcript classifier rather than bypassing
+    // the durable mapping contract with arbitrary fixture bytes.
+    let revocation_request = serde_json::to_vec(&serde_json::json!({
+        "body": {
+            "$type": "blue.catbird.chat.defs#deviceRevocationBody",
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-REVOKE\u{0000}",
+            "idempotencyKey": revocation_id,
+        },
+        "signature": "test-only",
+    }))
+    .expect("serialize canonical revocation wrapper");
+    let mut revocation_transcript = b"CATBIRD-CHAT-DEVICE-REVOKE\0".to_vec();
+    revocation_transcript
+        .extend_from_slice(format!("schema-revocation:{revocation_id}").as_bytes());
     let revocation_digest = Sha256::digest(&revocation_transcript).to_vec();
     let revocation_signature = vec![23_u8; 64];
     let revocation_response = vec![24_u8; 8];
@@ -2613,6 +2627,26 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         .await
         .expect("capture revocation acceptance time");
     let mut revoke = pool.begin().await.expect("begin exact revocation mapping");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.operation_claims(
+            operation_id,principal_did,endpoint_nsid,mutation_kind,
+            request_digest,accepted_request_sha256,signature,claimed_at
+        ) VALUES(
+            $1,$2,'blue.catbird.chat.revokeDevice',
+            'blue.catbird.chat.defs#deviceRevocationBody',$3,$4,$5,$6
+        )
+        "#,
+    )
+    .bind(revocation_id)
+    .bind(principal)
+    .bind(&revocation_digest)
+    .bind(Sha256::digest(&revocation_request).to_vec())
+    .bind(&revocation_signature)
+    .bind(&revoked_at)
+    .execute(&mut *revoke)
+    .await
+    .expect("insert exact revocation operation claim");
     sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
@@ -3564,14 +3598,50 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         .await
         .expect("roll back invalid declaration probe");
 
-    let request_bytes = vec![61_u8; 8];
-    let request_transcript = vec![62_u8; 8];
+    let admitted_operation_id = fixture_uuid(500);
+    let request_bytes = serde_json::to_vec(&serde_json::json!({
+        "body": {
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+            "idempotencyKey": admitted_operation_id,
+        },
+        "signature": "test-only",
+    }))
+    .expect("serialize canonical reset wrapper");
+    let mut request_transcript = b"CATBIRD-CHAT-RESET-REQUEST\0".to_vec();
+    request_transcript
+        .extend_from_slice(format!("schema-reset:{admitted_operation_id}").as_bytes());
     let request_digest = Sha256::digest(&request_transcript).to_vec();
     let response_bytes = vec![63_u8; 8];
+    let request_signature = vec![64_u8; 64];
     let completed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&pool)
         .await
         .expect("capture idempotency completion time");
+    let mut admitted = pool
+        .begin()
+        .await
+        .expect("begin exact reset claim and receipt graph");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.operation_claims(
+            operation_id,principal_did,endpoint_nsid,mutation_kind,
+            request_digest,accepted_request_sha256,signature,claimed_at
+        ) VALUES(
+            $1,$2,'blue.catbird.chat.requestReset',
+            'blue.catbird.chat.defs#resetRequestBody',$3,$4,$5,$6
+        )
+        "#,
+    )
+    .bind(admitted_operation_id)
+    .bind(principal)
+    .bind(&request_digest)
+    .bind(Sha256::digest(&request_bytes).to_vec())
+    .bind(&request_signature)
+    .bind(&completed_at)
+    .execute(&mut *admitted)
+    .await
+    .expect("insert exact reset operation claim");
     sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
@@ -3582,17 +3652,21 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         "#,
     )
     .bind(principal)
-    .bind(fixture_uuid(500))
+    .bind(admitted_operation_id)
     .bind(&request_digest)
     .bind(&request_bytes)
     .bind(&request_transcript)
-    .bind(vec![64_u8; 64])
+    .bind(&request_signature)
     .bind(&response_bytes)
     .bind(Sha256::digest(&response_bytes).to_vec())
     .bind(&completed_at)
-    .execute(&pool)
+    .execute(&mut *admitted)
     .await
     .expect("insert admitted idempotency receipt");
+    admitted
+        .commit()
+        .await
+        .expect("commit exact reset claim and receipt graph");
 
     let excluded_endpoint = sqlx::query(
         r#"

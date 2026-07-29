@@ -33,30 +33,16 @@ mod model;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
+// `cursor.rs` and `dpop.rs` are path-included at this integration crate root,
+// where their production-relative `super::repository` imports still resolve.
+// Re-export the physically nested repository modules here without moving their
+// private visibility boundary out of `crate::chat_protocol::repository`.
+mod repository {
+    pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
+}
 #[allow(dead_code)]
 mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
-}
-#[allow(dead_code)]
-mod repository {
-    pub mod auth {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/auth.rs"
-        ));
-    }
-    pub mod prelude {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/prelude.rs"
-        ));
-    }
-    pub mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
-    }
 }
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
@@ -66,6 +52,12 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
+    pub mod cursor {
+        pub use crate::cursor::*;
+    }
+    pub mod model {
+        pub use crate::model::*;
+    }
     pub mod validation {
         pub use crate::validation::*;
     }
@@ -93,10 +85,39 @@ mod chat_protocol {
     }
     pub mod repository {
         pub mod auth {
-            pub use crate::repository::auth::*;
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
+        }
+        pub mod blobs {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/blobs.rs"
+            ));
+        }
+        pub mod key_packages {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/key_packages.rs"
+            ));
         }
         pub mod prelude {
-            pub use crate::repository::prelude::*;
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/prelude.rs"
+            ));
+        }
+        pub mod inventory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/inventory.rs"
+            ));
         }
         pub mod recovery {
             #![allow(dead_code)]
@@ -533,7 +554,7 @@ async fn g6_locked_creation_rejects_a_control_entry_from_another_trusted_instant
 
     let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let conversation_id = Uuid::new_v4();
-    let fresh = historical_control_loader::recovery_leg::build_fresh_add_crypto_fixture(
+    let fresh = historical_control_loader::recovery_leg::build_fresh_add_crypto_fixture_for_gate(
         conversation_id,
         Uuid::new_v4(),
     );
@@ -6579,7 +6600,8 @@ mod historical_control_loader {
         const ROLE_MEMBER_AT: &str = "2026-07-27T04:06:12.000Z";
 
         async fn g6_gate_pool(label: &str) -> PgPool {
-            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            const FIXED_GATE_DB: &str =
+                "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722";
             let database_url = std::env::var("TEST_DATABASE_URL")
                 .expect("TEST_DATABASE_URL must name the existing gate database");
             assert_eq!(
@@ -7021,6 +7043,7 @@ mod historical_control_loader {
                 },
                 opened_leaves: Vec::new(),
                 metadata_author: None,
+                metadata_avatar: None,
                 participant_period_ids: Vec::new(),
                 leaf_period_ids: Vec::new(),
                 entry_recipients: Vec::new(),
@@ -7121,6 +7144,26 @@ mod historical_control_loader {
             fixture: &G6RevocationPreflightFixture,
         ) {
             let response_bytes = b"g6-sequential-revocation-ok".to_vec();
+            sqlx::query(
+                r#"
+                INSERT INTO chat.operation_claims(
+                    operation_id,principal_did,endpoint_nsid,mutation_kind,
+                    request_digest,accepted_request_sha256,signature,claimed_at
+                ) VALUES(
+                    $1,$2,'blue.catbird.chat.revokeDevice',
+                    'blue.catbird.chat.defs#deviceRevocationBody',$3,$4,$5,$6
+                )
+                "#,
+            )
+            .bind(fixture.revocation_id)
+            .bind(&fixture.target_did)
+            .bind(fixture.evidence.request_digest().to_vec())
+            .bind(Sha256::digest(fixture.evidence.signed_request_bytes()).to_vec())
+            .bind(fixture.evidence.signature().to_vec())
+            .bind(fixture.accepted_at)
+            .execute(&mut **transaction)
+            .await
+            .expect("seed exact revokeDevice operation claim before receipt");
             sqlx::query(
                 r#"
                 INSERT INTO chat.idempotency_records(
@@ -7253,6 +7296,7 @@ mod historical_control_loader {
                 },
                 opened_leaves: Vec::new(),
                 metadata_author: None,
+                metadata_avatar: None,
                 participant_period_ids: Vec::new(),
                 leaf_period_ids: Vec::new(),
                 entry_recipients: Vec::new(),
@@ -8025,7 +8069,7 @@ mod historical_control_loader {
         async fn g6_sequential_revocation_rejects_missing_duplicate_and_extra_artifacts() {
             let pool = g6_gate_pool("sequential artifact-set preflight").await;
             let (_, fixture) = g6_revocation_preflight_fixture(&pool).await;
-            let (available_ref, binding) = append_g6_available_package(&pool, &fixture).await;
+            let (available_ref, _) = append_g6_available_package(&pool, &fixture).await;
             let cid = Uuid::from_bytes(
                 *fixture
                     .conversation_plan
@@ -8033,8 +8077,6 @@ mod historical_control_loader {
                     .coordinate
                     .conversation_id(),
             );
-            let batch = fixture.batch(vec![binding], vec![fixture.conversation_plan.clone()]);
-
             let cases = [
                 ("missing", Vec::new()),
                 (
@@ -8067,6 +8109,45 @@ mod historical_control_loader {
 
             for (case, artifacts) in cases {
                 let mut tx = pool.begin().await.expect("begin artifact-set probe");
+                let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("read artifact-set transaction ID");
+                let accepted = ServerTimestamp::from_unix_millis_for_test(
+                    fixture.accepted_at.timestamp_millis(),
+                )
+                .expect("canonical artifact-set revocation instant");
+                let conversation = fixture.conversation_plan_for_transaction(&transaction_id);
+                let target_cas = RevocationTargetCasBinding::for_test_with_transaction_id(
+                    transaction_id.clone(),
+                    fixture.evidence.target().clone(),
+                    fixture.evidence.expected_target_auth_generation(),
+                    accepted,
+                );
+                let package = RevocationPackageCasBinding::for_test_available_with_transaction_id(
+                    transaction_id.clone(),
+                    fixture.evidence.target().clone(),
+                    available_ref,
+                    *fixture.revocation_id.as_bytes(),
+                    accepted,
+                );
+                assert_eq!(
+                    conversation
+                        .effects()
+                        .head_cas()
+                        .expect("artifact-set head CAS")
+                        .transaction_id(),
+                    transaction_id,
+                    "artifact-set head binding must be rebuilt inside its live transaction"
+                );
+                assert_eq!(target_cas.transaction_id(), transaction_id);
+                assert_eq!(package.transaction_id(), transaction_id);
+                let batch = DeviceRevocationBatchPersistencePlan::for_test(
+                    fixture.evidence.clone(),
+                    target_cas,
+                    vec![package],
+                    vec![conversation],
+                );
                 let error =
                     apply_device_revocation_batch_unscoped_for_test(&mut tx, &batch, artifacts)
                         .await
@@ -8095,7 +8176,8 @@ mod historical_control_loader {
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
         async fn g6_actor_role_is_locked_predecessor_role_during_self_demotion() {
-            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            const FIXED_GATE_DB: &str =
+                "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722";
             let database_url = std::env::var("TEST_DATABASE_URL")
                 .expect("TEST_DATABASE_URL must name the existing gate database");
             assert_eq!(
@@ -8155,12 +8237,19 @@ mod historical_control_loader {
             graph: &GenuinePolicyRoleGraph,
         ) -> (Transaction<'a, Postgres>, ConversationPersistencePlan) {
             let cid = Uuid::from_bytes(graph.entry.cid);
-            let observed_at = instant(KP_NOT_AFTER) + chrono::Duration::milliseconds(1);
             let mut read = pool
                 .begin()
                 .await
                 .expect("begin Welcome-expiry aggregate read");
-            let locked = hydrate_locked_conversation_state(&mut read, cid, observed_at)
+            let persisted_expires_at: DateTime<Utc> = sqlx::query_scalar(
+                "SELECT expires_at FROM chat.welcome_deliveries WHERE welcome_id=$1",
+            )
+            .bind(graph.fulfillment.welcome_id)
+            .fetch_one(&mut *read)
+            .await
+            .expect("read exact persisted pending-Welcome expiry");
+            let hydration_at = persisted_expires_at - chrono::Duration::milliseconds(1);
+            let locked = hydrate_locked_conversation_state(&mut read, cid, hydration_at)
                 .await
                 .expect("lock genuine pending-Welcome aggregate");
             let state = locked.state().clone();
@@ -8171,6 +8260,19 @@ mod historical_control_loader {
                 .expect("genuine pending Welcome retained")
                 .clone();
             assert_eq!(welcome.status(), WelcomeStatus::Pending);
+            assert_eq!(
+                welcome.expires_at().unix_millis(),
+                persisted_expires_at.timestamp_millis(),
+                "Welcome expiry observation must derive from the exact hydrated delivery row"
+            );
+            let observed_at =
+                DateTime::<Utc>::from_timestamp_millis(welcome.expires_at().unix_millis())
+                    .expect("hydrated Welcome expiry is a valid instant")
+                    + chrono::Duration::milliseconds(1);
+            assert!(
+                observed_at > persisted_expires_at,
+                "Welcome expiry observation must be strictly after the exact persisted expiry"
+            );
             read.rollback()
                 .await
                 .expect("rollback Welcome-expiry aggregate read");
@@ -8522,8 +8624,10 @@ mod historical_control_loader {
                 Uuid::new_v4(),
             )
             .await;
-            let locked_device_did = graph.entry.actor_did.clone();
-            let locked_device_id = graph.entry.actor_device_id;
+            // Welcome expiry is entryless: the only event audience and locked
+            // actor row are the pending Welcome recipient, not the creator.
+            let locked_device_did = graph.invitee.did.clone();
+            let locked_device_id = graph.invitee.device_id;
             let (mut locking_transaction, plan) = begin_g6_welcome_expiry_plan(&pool, &graph).await;
             hydrate_execution_context_unscoped_for_test(
                 &mut locking_transaction,
@@ -8597,7 +8701,8 @@ mod historical_control_loader {
         #[tokio::test]
         #[ignore = "requires the dedicated append-only gate database"]
         async fn terminal_family_b_fulfilled_leave_and_later_rejoin() {
-            const FIXED_GATE_DB: &str = "postgres://localhost/catbird_chat_protocol_test_20260722";
+            const FIXED_GATE_DB: &str =
+                "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722";
             let database_url = std::env::var("TEST_DATABASE_URL")
                 .expect("TEST_DATABASE_URL must name the existing gate database");
             assert_eq!(
@@ -10563,6 +10668,33 @@ mod historical_control_loader {
             add_transition_id: Uuid,
         ) -> FreshAddCryptoFixture {
             build_fresh_add_crypto_fixture_for_invitee(cid, add_transition_id, corpus_invitee())
+        }
+
+        pub(crate) fn build_fresh_add_crypto_fixture_for_gate(
+            cid: Uuid,
+            add_transition_id: Uuid,
+        ) -> FreshAddCryptoFixture {
+            const GATE_CRYPTO_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
+            let trusted_at = DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0)
+                .expect("current G6 fixture time is representable at whole-second precision");
+            let package_not_before = trusted_at - chrono::Duration::minutes(1);
+            let package_not_after =
+                package_not_before + chrono::Duration::seconds(GATE_CRYPTO_LIFETIME_SECONDS);
+            assert_eq!(
+                (package_not_after - package_not_before).num_seconds(),
+                GATE_CRYPTO_LIFETIME_SECONDS,
+                "G6 standalone creation fixture must retain the protocol-valid 30-day crypto lifetime"
+            );
+            build_fresh_add_crypto_fixture_for_invitee_at(
+                cid,
+                add_transition_id,
+                corpus_invitee(),
+                trusted_at,
+                trusted_at,
+                trusted_at,
+                package_not_before,
+                package_not_after,
+            )
         }
 
         fn build_fresh_creation_crypto_fixture(
@@ -20423,6 +20555,17 @@ mod historical_control_loader {
             package_not_before: DateTime<Utc>,
             package_not_after: DateTime<Utc>,
         ) -> FreshAddCryptoFixture {
+            // The caller owns the validity interval. G6 callers derive their
+            // persisted and generated KeyPackage bounds from the same sampled
+            // runtime instant; fixed-corpus callers retain their historical
+            // durable bounds.
+            assert!(
+                package_not_before <= package_evaluated_at
+                    && package_evaluated_at <= package_not_after
+                    && package_not_before <= fulfilled_at
+                    && fulfilled_at <= package_not_after,
+                "fresh Add crypto validity must cover its supplied evaluation and fulfillment instants"
+            );
             let creation_signed_at = (creation_at - chrono::Duration::milliseconds(500))
                 .to_rfc3339_opts(SecondsFormat::Millis, true);
             let creation_received_at = creation_at.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -20440,8 +20583,10 @@ mod historical_control_loader {
             let alice_credential =
                 format!("{}#{}", entry.actor_did, entry.actor_device_id).into_bytes();
             let lifetime = Lifetime::init(
-                u64::try_from(package_not_before.timestamp()).unwrap(),
-                u64::try_from(package_not_after.timestamp()).unwrap(),
+                u64::try_from(package_not_before.timestamp())
+                    .expect("test crypto lifetime starts after Unix epoch"),
+                u64::try_from(package_not_after.timestamp())
+                    .expect("test crypto lifetime ends after Unix epoch"),
             );
             let config = MlsGroupCreateConfig::builder()
                 .ciphersuite(XWING_CIPHERSUITE)
@@ -20555,6 +20700,28 @@ mod historical_control_loader {
                 },
             )
             .expect("production validates fresh Add Bob KeyPackage");
+            let validated_not_before = DateTime::<Utc>::from_timestamp(
+                i64::try_from(validated_package.not_before())
+                    .expect("validated KeyPackage not-before fits Chrono"),
+                0,
+            )
+            .expect("validated KeyPackage not-before is representable");
+            let validated_not_after = DateTime::<Utc>::from_timestamp(
+                i64::try_from(validated_package.not_after())
+                    .expect("validated KeyPackage not-after fits Chrono"),
+                0,
+            )
+            .expect("validated KeyPackage not-after is representable");
+            assert_eq!(
+                validated_not_before.timestamp_millis(),
+                package_not_before.timestamp_millis(),
+                "validated KeyPackage not-before must equal the persisted millisecond bound"
+            );
+            assert_eq!(
+                validated_not_after.timestamp_millis(),
+                package_not_after.timestamp_millis(),
+                "validated KeyPackage not-after must equal the persisted millisecond bound"
+            );
             let key_package_ref = *validated_package.key_package_ref();
 
             let add_prior = rebound_state(&rebound_state(&genesis, 1), 2);
@@ -23874,6 +24041,9 @@ mod historical_control_loader {
                 key_package_wrapper,
                 commit_bytes,
                 welcome_bytes,
+                key_package_not_before,
+                key_package_not_after,
+                key_package_created_at,
             ) = if cid == fixed_cid {
                 assert!(
                     invitee.is_none(),
@@ -23895,13 +24065,44 @@ mod historical_control_loader {
                     corpus_file("key-package.mls"),
                     corpus_file("commit-public.mls"),
                     corpus_file("welcome.mls"),
+                    instant(KP_NOT_BEFORE),
+                    instant(KP_NOT_AFTER),
+                    instant(REQUESTED_AT),
                 )
             } else {
+                const GATE_CRYPTO_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
+                let crypto_evaluated_at =
+                    DateTime::<Utc>::from_timestamp(Utc::now().timestamp(), 0)
+                        .expect("current G6 graph time is representable at whole-second precision");
+                let crypto_not_before = crypto_evaluated_at - chrono::Duration::minutes(1);
+                let crypto_not_after =
+                    crypto_not_before + chrono::Duration::seconds(GATE_CRYPTO_LIFETIME_SECONDS);
+                assert_eq!(
+                    (crypto_not_after - crypto_not_before).num_seconds(),
+                    GATE_CRYPTO_LIFETIME_SECONDS,
+                    "non-corpus G6 graph must retain one policy-valid KeyPackage window"
+                );
                 let fresh = match invitee {
-                    Some(invitee) => {
-                        build_fresh_add_crypto_fixture_for_invitee(cid, add_transition_id, invitee)
-                    }
-                    None => build_fresh_add_crypto_fixture(cid, add_transition_id),
+                    Some(invitee) => build_fresh_add_crypto_fixture_for_invitee_at(
+                        cid,
+                        add_transition_id,
+                        invitee,
+                        crypto_evaluated_at,
+                        crypto_evaluated_at,
+                        crypto_evaluated_at,
+                        crypto_not_before,
+                        crypto_not_after,
+                    ),
+                    None => build_fresh_add_crypto_fixture_for_invitee_at(
+                        cid,
+                        add_transition_id,
+                        corpus_invitee(),
+                        crypto_evaluated_at,
+                        crypto_evaluated_at,
+                        crypto_evaluated_at,
+                        crypto_not_before,
+                        crypto_not_after,
+                    ),
                 };
                 (
                     fresh.entry,
@@ -23913,6 +24114,9 @@ mod historical_control_loader {
                     fresh.key_package_wrapper,
                     fresh.commit,
                     fresh.welcome,
+                    crypto_not_before,
+                    crypto_not_after,
+                    crypto_evaluated_at,
                 )
             };
             entry.head_next_entry_seq = 2;
@@ -24091,7 +24295,17 @@ mod historical_control_loader {
                 Some((key_package_ref, key_package_wrapper)),
             );
             let acceptance_state = rebound_state(&policy_state, 2);
-            commit_genuine_acceptance(pool, &entry, &invitee, &acceptance, &acceptance_state).await;
+            commit_genuine_acceptance(
+                pool,
+                &entry,
+                &invitee,
+                &acceptance,
+                &acceptance_state,
+                key_package_not_before,
+                key_package_not_after,
+                key_package_created_at,
+            )
+            .await;
 
             assert_eq!(committed.coordinate().state_version(), 3);
             let fulfillment = build_genuine_add_fulfillment_entry_with_bytes(
@@ -24118,8 +24332,33 @@ mod historical_control_loader {
                 &fulfillment,
                 creation_transition_id,
                 &committed,
+                key_package_not_after,
             )
             .await;
+
+            // Migrations intentionally create, but do not populate, the
+            // process-singleton delivery identity. The production execution
+            // facade reads it while hydrating a role-change context, so seed
+            // the canonical immutable fixture row before any such hydration.
+            let cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+                .bind(vec![0x51_u8; 32])
+                .fetch_one(pool)
+                .await
+                .expect("derive genuine graph protocol cursor key");
+            sqlx::query(
+                "INSERT INTO chat.protocol_instances(\
+                    singleton,protocol_version,protocol_instance_id,cursor_key_id,created_at\
+                 ) VALUES(TRUE,'1',$1,$2,$3) ON CONFLICT DO NOTHING",
+            )
+            .bind(
+                Uuid::parse_str("51515151-5151-4151-9151-515151515151")
+                    .expect("deterministic G6 protocol instance UUIDv4"),
+            )
+            .bind(&cursor_key)
+            .bind(instant(FULFILLED_AT))
+            .execute(pool)
+            .await
+            .expect("seed genuine graph protocol instance");
 
             GenuinePolicyRoleGraph {
                 entry,
@@ -24136,6 +24375,9 @@ mod historical_control_loader {
             invitee: &AcceptanceInvitee,
             acceptance: &RealAcceptanceEntry,
             state: &ActivePublicState,
+            key_package_not_before: DateTime<Utc>,
+            key_package_not_after: DateTime<Utc>,
+            key_package_created_at: DateTime<Utc>,
         ) {
             let cid = Uuid::from_bytes(entry.cid);
             let at = instant(REQUESTED_AT);
@@ -24259,9 +24501,9 @@ mod historical_control_loader {
             .bind(&invitee.did)
             .bind(invitee.device_id)
             .bind(&invitee.key_id)
-            .bind(instant(KP_NOT_BEFORE))
-            .bind(instant(KP_NOT_AFTER))
-            .bind(at)
+            .bind(key_package_not_before)
+            .bind(key_package_not_after)
+            .bind(key_package_created_at)
             .execute(&mut *tx)
             .await
             .expect("insert genuine reserved package");
@@ -24408,6 +24650,7 @@ mod historical_control_loader {
             fulfillment: &RealLeafRecoveryFulfillmentEntry,
             creation_transition_id: Uuid,
             state: &ActivePublicState,
+            key_package_not_after: DateTime<Utc>,
         ) {
             let cid = Uuid::from_bytes(entry.cid);
             let at = instant(FULFILLED_AT);
@@ -24658,7 +24901,7 @@ mod historical_control_loader {
             .bind(invitee.device_id)
             .bind(request_id)
             .bind(acceptance.key_package_ref.to_vec())
-            .bind(instant(KP_NOT_AFTER))
+            .bind(key_package_not_after)
             .execute(&mut *tx)
             .await
             .expect("insert genuine pending Welcome");
@@ -31181,6 +31424,7 @@ mod historical_control_loader {
                     author_key_id: entry.actor_key_id.clone(),
                     metadata_snapshot_id: Uuid::new_v4(),
                 }),
+                metadata_avatar: None,
                 participant_period_ids,
                 leaf_period_ids: vec![Uuid::new_v4()],
                 entry_recipients: old_leaves

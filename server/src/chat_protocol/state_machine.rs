@@ -9036,8 +9036,25 @@ impl RevocationPackageCasBinding {
         revocation_id: [u8; 16],
         revoked_at: ServerTimestamp,
     ) -> Self {
+        Self::for_test_available_with_transaction_id(
+            String::new(),
+            target,
+            key_package_ref,
+            revocation_id,
+            revoked_at,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_available_with_transaction_id(
+        transaction_id: String,
+        target: DeviceIdentity,
+        key_package_ref: [u8; 32],
+        revocation_id: [u8; 16],
+        revoked_at: ServerTimestamp,
+    ) -> Self {
         Self {
-            transaction_id: String::new(),
+            transaction_id,
             target,
             target_key_id: [0u8; 32],
             target_auth_generation: 1,
