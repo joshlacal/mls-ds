@@ -22,7 +22,10 @@ use sqlx::PgPool;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use crate::chat_protocol::public_state::{verify_recovery_welcome, ActivePublicState};
+use crate::chat_protocol::public_state::{
+    verify_genesis_group_info, verify_recovery_welcome, ActivePublicState,
+    GenesisGroupInfoExpectations,
+};
 use crate::chat_protocol::repository::delivery::WelcomeRejectionReason;
 use crate::chat_protocol::repository::delivery::{
     append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
@@ -427,7 +430,6 @@ mod genuine_creation_fixture {
             .strip_prefix('#')
             .unwrap();
         let mut signing_body = body.into_json_for_schema(&definitions[body_name], definitions);
-        repair_body_digests(&mut signing_body);
         signing_body["keyId"] = json!(ed25519_key_id(&verifying).unwrap().as_str());
         const FROZEN_CID: [u8; 16] = [
             0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x91, 0x11, 0x11, 0x11, 0x11, 0x11,
@@ -491,6 +493,23 @@ mod genuine_creation_fixture {
             json!(actor_device_id.hyphenated().to_string());
         signing_body["manifest"]["participants"] =
             json!([{"userDid": &actor_did, "status": "active", "role": "admin"}]);
+        let transition_id = signing_body["transitionId"].clone();
+        signing_body["metadataSnapshot"]["originTransitionId"] = transition_id.clone();
+        signing_body["metadataSnapshot"]["authorProof"]["authorDid"] = json!(&actor_did);
+        signing_body["metadataSnapshot"]["authorProof"]["authorDeviceId"] =
+            json!(actor_device_id.hyphenated().to_string());
+        signing_body["metadataSnapshot"]["authorProof"]["authorKeyId"] = json!(&actor_key_id);
+        signing_body["metadataSnapshot"]["authorProof"]["signaturePublicKey"] =
+            json!(STANDARD.encode(verifying));
+        signing_body["metadataSnapshot"]["authorProof"]["authGenerationAtOrigin"] = json!(1);
+        signing_body["metadataSnapshot"]["authorProof"]["originTransitionId"] = transition_id;
+        signing_body["metadataSnapshot"]["authorProof"]["originSeq"] = json!(1);
+        signing_body["metadataSnapshot"]["authorProof"]["roleAtOrigin"] = json!("admin");
+        signing_body["metadataSnapshot"]["authorProof"]["deviceStatusAtOrigin"] = json!("active");
+        // All authority-bearing mutations precede digest repair and signing.
+        // This keeps the canonical request, signature, outer entry projection,
+        // and fingerprint downstream of one internally consistent body.
+        repair_body_digests(&mut signing_body);
         let raw_wrapper = resign(json!({"body": signing_body, "signature": ""}), &signing_key);
         let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
         let entry_id = Uuid::new_v4();
@@ -512,9 +531,216 @@ mod genuine_creation_fixture {
             head_next_entry_seq: 2,
         }
     }
+
+    const ALICE_SIGNING_SEED: [u8; 32] = [
+        0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85, 0x55,
+        0xa6, 0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e, 0x8c, 0x6b,
+        0x12, 0x8d,
+    ];
+
+    fn coordinate_json(
+        coordinate: &crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate,
+    ) -> Value {
+        json!({
+            "conversationId": Uuid::from_bytes(*coordinate.conversation_id()),
+            "generation": coordinate.generation(),
+            "stateVersion": coordinate.state_version(),
+            "groupId": STANDARD.encode(coordinate.group_id()),
+            "epoch": coordinate.epoch(),
+            "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+            "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+            "lifecycle": "active",
+        })
+    }
+
+    /// Rebind the structural Creation template to the frozen corpus Alice
+    /// identity. The caller still has to bind the exact GroupInfo and fresh
+    /// outer coordinate before this entry is safe to persist.
+    pub fn build_real_corpus_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
+        let manifest: Value = serde_json::from_slice(&super::corpus_file("manifest.json"))
+            .expect("parse frozen corpus manifest");
+        let alice = &manifest["identity"]["alice"];
+        let actor_did = alice["actorDid"].as_str().expect("Alice DID").to_owned();
+        let actor_device_id = Uuid::parse_str(alice["deviceId"].as_str().expect("Alice device"))
+            .expect("Alice device UUID");
+        let signing_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
+        let public_key = signing_key.verifying_key().to_bytes();
+        assert_eq!(
+            public_key.to_vec(),
+            hex::decode(
+                alice["signaturePublicKeyHex"]
+                    .as_str()
+                    .expect("Alice public key")
+            )
+            .expect("Alice public key hex"),
+            "corpus Alice private seed remains bound to the frozen leaf key"
+        );
+        let actor_key_id = ed25519_key_id(&public_key)
+            .expect("Alice key id")
+            .as_str()
+            .to_owned();
+        assert_eq!(
+            alice["keyId"].as_str(),
+            Some(actor_key_id.as_str()),
+            "corpus Alice private seed remains bound to the manifest key id"
+        );
+
+        let mut entry = build_real_creation_entry(fresh_cid);
+        let mut wrapper: Value =
+            serde_json::from_slice(&entry.raw_wrapper).expect("parse Creation wrapper");
+        rewrite_exact_text(&mut wrapper, &entry.actor_did, &actor_did);
+        rewrite_exact_text(
+            &mut wrapper,
+            &entry.actor_device_id.hyphenated().to_string(),
+            &actor_device_id.hyphenated().to_string(),
+        );
+        rewrite_exact_text(&mut wrapper, &entry.actor_key_id, &actor_key_id);
+        rewrite_exact_text(
+            &mut wrapper,
+            &STANDARD.encode(&entry.public_key),
+            &STANDARD.encode(public_key),
+        );
+        let chain = &manifest["chain"];
+        let corpus_coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
+            fresh_cid,
+            chain["generation"].as_u64().expect("corpus generation"),
+            chain["genesisStateVersion"]
+                .as_u64()
+                .expect("corpus genesis state version"),
+            hex::decode(
+                chain["groupIdHex"]
+                    .as_str()
+                    .expect("corpus genesis group id"),
+            )
+            .expect("corpus genesis group id hex")
+            .try_into()
+            .expect("corpus genesis group id is 32 bytes"),
+            chain["genesisEpoch"]
+                .as_u64()
+                .expect("corpus genesis epoch"),
+            hex::decode(
+                chain["genesisGroupContextHashHex"]
+                    .as_str()
+                    .expect("corpus genesis context hash"),
+            )
+            .expect("corpus genesis context hash hex")
+            .try_into()
+            .expect("corpus genesis context hash is 32 bytes"),
+            hex::decode(
+                chain["genesisConfirmationTagHex"]
+                    .as_str()
+                    .expect("corpus genesis confirmation tag"),
+            )
+            .expect("corpus genesis confirmation tag hex")
+            .try_into()
+            .expect("corpus genesis confirmation tag is 32 bytes"),
+            crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active,
+        );
+        wrapper["body"]["next"] = coordinate_json(&corpus_coordinate);
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["conversationId"] =
+            json!(STANDARD.encode(fresh_cid));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["generation"] =
+            json!(corpus_coordinate.generation());
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
+            json!(STANDARD.encode(corpus_coordinate.group_id()));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["epoch"] =
+            json!(corpus_coordinate.epoch());
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupContextHash"] =
+            json!(STANDARD.encode(corpus_coordinate.group_context_hash()));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
+            json!(STANDARD.encode(corpus_coordinate.confirmation_tag()));
+        wrapper["body"]["signedAt"] = manifest["creation"]["signedAt"].clone();
+        repair_body_digests(&mut wrapper["body"]);
+        entry.actor_did = actor_did;
+        entry.actor_device_id = actor_device_id;
+        entry.actor_key_id = actor_key_id;
+        entry.public_key = public_key.to_vec();
+        entry.signing_seed = ALICE_SIGNING_SEED;
+
+        entry.raw_wrapper = resign(wrapper, &signing_key);
+        let mut row: Value =
+            serde_json::from_slice(&entry.public_row_json).expect("parse Creation row");
+        row["signedRequest"] =
+            serde_json::from_slice(&entry.raw_wrapper).expect("parse rebound Creation wrapper");
+        row["receivedAt"] = manifest["creation"]["receivedAt"].clone();
+        entry.public_row_json = serde_json::to_vec(&row).expect("encode rebound Creation row");
+        entry.outer_entry_fingerprint =
+            *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                .expect("corpus-identity Creation verifies")
+                .outer_control_fingerprint();
+        entry
+    }
+
+    /// Bind a Creation entry to the exact verified genesis coordinate and
+    /// GroupInfo. All metadata provenance is re-derived before the body is
+    /// canonicalized and signed again.
+    pub fn bind_creation_entry_to_group_info(
+        mut entry: RealCreationEntry,
+        group_info: &[u8],
+        coordinate: &crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate,
+        signed_at: &str,
+        received_at: &str,
+    ) -> RealCreationEntry {
+        assert_eq!(
+            coordinate.conversation_id(),
+            &entry.cid,
+            "Creation coordinate remains bound to the fresh conversation"
+        );
+        let mut wrapper: Value =
+            serde_json::from_slice(&entry.raw_wrapper).expect("parse Creation wrapper");
+        wrapper["body"]["signedAt"] = json!(signed_at);
+        wrapper["body"]["conversationKind"] = json!("group");
+        wrapper["body"]["next"] = coordinate_json(coordinate);
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["conversationId"] =
+            json!(STANDARD.encode(entry.cid));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["generation"] =
+            json!(coordinate.generation());
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
+            json!(STANDARD.encode(coordinate.group_id()));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["epoch"] = json!(coordinate.epoch());
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupContextHash"] =
+            json!(STANDARD.encode(coordinate.group_context_hash()));
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
+            json!(STANDARD.encode(coordinate.confirmation_tag()));
+        let transition_id = wrapper["body"]["transitionId"].clone();
+        wrapper["body"]["metadataSnapshot"]["originTransitionId"] = transition_id.clone();
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDid"] = json!(&entry.actor_did);
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDeviceId"] =
+            json!(entry.actor_device_id);
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["authorKeyId"] =
+            json!(&entry.actor_key_id);
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["signaturePublicKey"] =
+            json!(STANDARD.encode(&entry.public_key));
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["authGenerationAtOrigin"] = json!(1);
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["originTransitionId"] = transition_id;
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["originSeq"] = json!(1);
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["roleAtOrigin"] = json!("admin");
+        wrapper["body"]["metadataSnapshot"]["authorProof"]["deviceStatusAtOrigin"] =
+            json!("active");
+        wrapper["body"]["genesisGroupInfo"]["bytes"] = json!(STANDARD.encode(group_info));
+        wrapper["body"]["genesisGroupInfo"]["sha256"] =
+            json!(STANDARD.encode(Sha256::digest(group_info)));
+        repair_body_digests(&mut wrapper["body"]);
+        entry.raw_wrapper = resign(wrapper, &entry.signing_key());
+
+        let mut row: Value =
+            serde_json::from_slice(&entry.public_row_json).expect("parse Creation row");
+        row["signedRequest"] =
+            serde_json::from_slice(&entry.raw_wrapper).expect("parse bound Creation wrapper");
+        row["receivedAt"] = json!(received_at);
+        entry.public_row_json = serde_json::to_vec(&row).expect("encode bound Creation row");
+        entry.outer_entry_fingerprint =
+            *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+                .expect("GroupInfo-bound Creation verifies")
+                .outer_control_fingerprint();
+        entry
+    }
 }
 
-pub use genuine_creation_fixture::{build_real_creation_entry, RealCreationEntry};
+pub use genuine_creation_fixture::{
+    bind_creation_entry_to_group_info, build_real_corpus_creation_entry, build_real_creation_entry,
+    RealCreationEntry,
+};
 
 /// Return the transition id embedded in the genuine signed Creation wrapper.
 /// Keeping this derivation beside the builder prevents a durable graph from
@@ -535,6 +761,7 @@ pub fn signed_creation_transition_id(entry: &RealCreationEntry) -> Uuid {
 /// re-creating the old fabricated execution-context fixture in each consumer.
 pub struct GenuineCreationGraph {
     pub conversation_id: Uuid,
+    pub group_id: [u8; 32],
     pub creator_did: String,
     pub creator_device_id: Uuid,
     pub creator_dpop_jkt: String,
@@ -544,10 +771,10 @@ pub struct GenuineCreationGraph {
 }
 
 /// Seed one active, genesis-only group whose immutable durable rows all derive
-/// from `entry`'s verified Creation bytes. `public_state`, when provided, is
-/// retained byte-for-byte (including its canonical tree summary); otherwise a
-/// structurally valid single-leaf state is used for historical-loader negatives.
-/// The returned id is the signed Creation transition id.
+/// from `entry`'s verified Creation bytes. `Some(public_state)` and
+/// `Some(exact_group_info)` are the production-hydratable path. `None` remains
+/// only for explicit schema and historical-loader negative fixtures that do
+/// not claim to reconstruct a production-valid MLS genesis.
 pub async fn seed_genuine_creation_graph(
     pool: &PgPool,
     entry: &RealCreationEntry,
@@ -638,7 +865,72 @@ pub async fn seed_genuine_creation_graph(
     let entry_payload_sha = Sha256::digest(&entry_payload).to_vec();
     let entry_outer_fingerprint = entry.outer_entry_fingerprint.to_vec();
     let at = verified_entry.received_at().datetime();
-    let metadata_ciphertext = vec![13_u8; 16];
+    let signed_wrapper: serde_json::Value =
+        serde_json::from_slice(&entry.raw_wrapper).expect("parse signed Creation wrapper");
+    let signed_metadata = &signed_wrapper["body"]["metadataSnapshot"];
+    let metadata_version = signed_metadata["metadataVersion"]
+        .as_u64()
+        .expect("signed metadata version");
+    let metadata_nonce = {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        STANDARD
+            .decode(
+                signed_metadata["nonce"]
+                    .as_str()
+                    .expect("signed metadata nonce"),
+            )
+            .expect("decode signed metadata nonce")
+    };
+    let metadata_ciphertext = {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        STANDARD
+            .decode(
+                signed_metadata["ciphertext"]
+                    .as_str()
+                    .expect("signed metadata ciphertext"),
+            )
+            .expect("decode signed metadata ciphertext")
+    };
+    let metadata_ciphertext_sha = Sha256::digest(&metadata_ciphertext).to_vec();
+    assert_eq!(
+        signed_metadata["ciphertextSize"].as_u64(),
+        Some(metadata_ciphertext.len() as u64),
+        "signed metadata size binds the exact ciphertext"
+    );
+    {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        assert_eq!(
+            STANDARD
+                .decode(
+                    signed_metadata["ciphertextSha256"]
+                        .as_str()
+                        .expect("signed metadata digest"),
+                )
+                .expect("decode signed metadata digest"),
+            metadata_ciphertext_sha,
+            "signed metadata digest binds the exact ciphertext"
+        );
+    }
+    let metadata_author = &signed_metadata["authorProof"];
+    assert_eq!(
+        metadata_author["authorDid"].as_str(),
+        Some(actor_did.as_str())
+    );
+    assert_eq!(
+        metadata_author["authorDeviceId"].as_str(),
+        Some(actor_device_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(
+        metadata_author["authorKeyId"].as_str(),
+        Some(actor_key_id.as_str())
+    );
+    assert_eq!(metadata_author["authGenerationAtOrigin"].as_u64(), Some(1));
+    assert_eq!(metadata_author["originSeq"].as_u64(), Some(1));
+    assert_eq!(metadata_author["roleAtOrigin"].as_str(), Some("admin"));
+    assert_eq!(
+        metadata_author["deviceStatusAtOrigin"].as_str(),
+        Some("active")
+    );
 
     let mut tx = pool.begin().await.expect("begin genuine creation");
     // A protocol instance is an independent immutable system root required by
@@ -689,8 +981,8 @@ pub async fn seed_genuine_creation_graph(
         .bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(creation_transition_id).bind(at).bind(actor_device_id).execute(&mut *tx).await.expect("insert participant");
     sqlx::query("INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)")
         .bind(leaf_period_id).bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&basic_credential).bind(&actor_public_key).bind(actor_key_id).bind(creation_transition_id).bind(at).execute(&mut *tx).await.expect("insert leaf");
-    sqlx::query("INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)")
-        .bind(metadata_snapshot_id).bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(vec![14_u8; 12]).bind(&metadata_ciphertext).bind(Sha256::digest(&metadata_ciphertext).to_vec()).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(&actor_public_key).bind(at).execute(&mut *tx).await.expect("insert metadata");
+    sqlx::query("INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,1,'admin','active',$16)")
+        .bind(metadata_snapshot_id).bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(i64::try_from(metadata_version).expect("metadata version fits i64")).bind(&metadata_nonce).bind(&metadata_ciphertext).bind(&metadata_ciphertext_sha).bind(i64::try_from(metadata_ciphertext.len()).expect("metadata size fits i64")).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(&actor_public_key).bind(at).execute(&mut *tx).await.expect("insert metadata");
     sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)")
         .bind(conversation_id).bind(entry.entry_id).bind(&entry_payload).bind(&entry_payload_sha).bind(&signed_request).bind(&request_digest).bind(&signature).bind(&server_fields).bind(&entry_outer_fingerprint).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(creation_transition_id).bind(at).execute(&mut *tx).await.expect("insert creation entry");
     sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) VALUES($1,1,$2,$3,'control')")
@@ -700,6 +992,9 @@ pub async fn seed_genuine_creation_graph(
     tx.commit().await.expect("commit genuine creation");
     GenuineCreationGraph {
         conversation_id,
+        group_id: group_id
+            .try_into()
+            .expect("genuine genesis group id is exactly 32 bytes"),
         creator_did: actor_did.clone(),
         creator_device_id: actor_device_id,
         creator_dpop_jkt: actor_key_id.clone(),
@@ -709,9 +1004,281 @@ pub async fn seed_genuine_creation_graph(
     }
 }
 
+/// Build and seed the one closed, production-hydratable genuine Creation
+/// fixture. Every authority-bearing identity and every MLS artifact is proven
+/// against the pinned corpus before `seed_genuine_creation_graph` begins its
+/// first transaction.
+pub async fn seed_hydratable_genuine_creation_graph(
+    pool: &PgPool,
+    conversation_id: Uuid,
+) -> GenuineCreationGraph {
+    use crate::chat_protocol::transcript::{
+        decode_and_verify_control_entry, decode_and_verify_signed_mutation,
+    };
+    use crate::chat_protocol::wire::MAX_GROUP_INFO_WIRE_BYTES;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let manifest = corpus_manifest();
+    let manifest_value: serde_json::Value = serde_json::from_slice(&corpus_file("manifest.json"))
+        .expect("parse pinned corpus manifest");
+    let alice = &manifest.identity.alice;
+    let alice_device_id = Uuid::parse_str(&alice.device_id).expect("pinned Alice device UUID");
+    let alice_public_key = hex_array::<32>(&alice.signature_public_key_hex);
+    let alice_key_id = ed25519_key_id(&alice_public_key)
+        .expect("derive pinned Alice key id")
+        .as_str()
+        .to_owned();
+    assert_eq!(
+        manifest_value["identity"]["alice"]["keyId"].as_str(),
+        Some(alice_key_id.as_str()),
+        "pinned Alice key id is derived from the pinned signature key"
+    );
+    assert_eq!(
+        alice.credential_identity,
+        format!("{}#{}", alice.actor_did, alice_device_id),
+        "pinned Alice credential is exactly did#device"
+    );
+
+    let group_info = corpus_file("group-info.mls");
+    let group_info_manifest = &manifest_value["files"]["group-info.mls"];
+    assert_eq!(
+        group_info.len(),
+        2_838,
+        "the pinned genuine genesis GroupInfo has its reviewed wire length"
+    );
+    assert_eq!(
+        group_info_manifest["length"].as_u64(),
+        Some(group_info.len() as u64),
+        "manifest length binds the exact GroupInfo"
+    );
+    assert_eq!(
+        hex_array::<32>(
+            group_info_manifest["sha256Hex"]
+                .as_str()
+                .expect("pinned GroupInfo digest")
+        ),
+        <[u8; 32]>::from(Sha256::digest(&group_info)),
+        "manifest digest binds the exact GroupInfo"
+    );
+
+    let coordinate = PublicGroupSnapshotCoordinate::new(
+        *conversation_id.as_bytes(),
+        manifest.chain.generation,
+        manifest.chain.genesis_state_version,
+        hex_array(&manifest.chain.group_id_hex),
+        manifest.chain.genesis_epoch,
+        hex_array(&manifest.chain.genesis_group_context_hash_hex),
+        hex_array(&manifest.chain.genesis_confirmation_tag_hex),
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let public_state = verify_genesis_group_info(
+        &group_info,
+        GenesisGroupInfoExpectations {
+            coordinate,
+            expected_basic_credential: alice.credential_identity.as_bytes(),
+            expected_signature_key: &alice_public_key,
+            now_unix_seconds: manifest.evaluation_unix_seconds,
+            max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_members: 2,
+        },
+    )
+    .expect("production verifies the pinned genesis GroupInfo");
+    let pinned_snapshot = corpus_file("genesis-public-state.bin");
+    assert_eq!(
+        public_state.snapshot(),
+        pinned_snapshot,
+        "production verification reproduces the pinned canonical genesis snapshot"
+    );
+    assert_eq!(
+        public_state.snapshot_sha256(),
+        &<[u8; 32]>::from(Sha256::digest(&pinned_snapshot)),
+        "production verification reproduces the pinned snapshot digest"
+    );
+    assert_eq!(
+        public_state.snapshot(),
+        frozen_public_state::restore_genesis().snapshot(),
+        "production verification and the pinned structural restore agree byte-for-byte"
+    );
+
+    let signed_at = manifest_value["creation"]["signedAt"]
+        .as_str()
+        .expect("pinned Creation signedAt");
+    let received_at = manifest_value["creation"]["receivedAt"]
+        .as_str()
+        .expect("pinned Creation receivedAt");
+    let entry = bind_creation_entry_to_group_info(
+        build_real_corpus_creation_entry(*conversation_id.as_bytes()),
+        &group_info,
+        &coordinate,
+        signed_at,
+        received_at,
+    );
+
+    // Closed fail-fast boundary. Nothing below this block may write until the
+    // signed actor, authenticated leaf, coordinates, GroupInfo, and metadata
+    // provenance all agree exactly.
+    let verified_mutation =
+        decode_and_verify_signed_mutation(&entry.raw_wrapper, &entry.public_key)
+            .expect("corpus-bound Creation signature verifies");
+    let verified_entry = decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
+        .expect("corpus-bound Creation outer entry verifies");
+    assert_eq!(
+        verified_entry.mutation().request_digest(),
+        verified_mutation.request_digest(),
+        "inner and outer Creation verification agree"
+    );
+    assert_eq!(entry.actor_did, alice.actor_did);
+    assert_eq!(entry.actor_device_id, alice_device_id);
+    assert_eq!(entry.actor_key_id, alice_key_id);
+    assert_eq!(entry.public_key, alice_public_key);
+
+    let leaves = public_state.binding().tree_summary().leaves();
+    assert_eq!(
+        leaves.len(),
+        1,
+        "genesis has exactly one authenticated leaf"
+    );
+    let leaf = &leaves[0];
+    assert_eq!(leaf.leaf_index(), 0);
+    assert_eq!(
+        leaf.basic_credential(),
+        alice.credential_identity.as_bytes(),
+        "the sole authenticated leaf is the signed actor credential"
+    );
+    assert_eq!(
+        leaf.signature_key(),
+        entry.public_key,
+        "the sole authenticated leaf is the signed actor key"
+    );
+
+    let wrapper: serde_json::Value =
+        serde_json::from_slice(&entry.raw_wrapper).expect("parse sealed Creation wrapper");
+    assert_eq!(
+        wrapper["body"]["actorDid"].as_str(),
+        Some(entry.actor_did.as_str())
+    );
+    assert_eq!(
+        wrapper["body"]["actorDeviceId"].as_str(),
+        Some(entry.actor_device_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(
+        wrapper["body"]["keyId"].as_str(),
+        Some(entry.actor_key_id.as_str())
+    );
+    assert_eq!(wrapper["body"]["authGeneration"].as_u64(), Some(1));
+    assert_eq!(
+        wrapper["body"]["manifest"]["actorLeaf"]["userDid"].as_str(),
+        Some(entry.actor_did.as_str())
+    );
+    assert_eq!(
+        wrapper["body"]["manifest"]["actorLeaf"]["deviceId"].as_str(),
+        Some(entry.actor_device_id.hyphenated().to_string().as_str())
+    );
+    let participants = wrapper["body"]["manifest"]["participants"]
+        .as_array()
+        .expect("sealed Creation participants");
+    assert_eq!(participants.len(), 1);
+    assert_eq!(
+        participants[0]["userDid"].as_str(),
+        Some(entry.actor_did.as_str())
+    );
+    assert_eq!(participants[0]["status"].as_str(), Some("active"));
+    assert_eq!(participants[0]["role"].as_str(), Some("admin"));
+
+    let next = &wrapper["body"]["next"];
+    assert_eq!(
+        next["conversationId"].as_str(),
+        Some(conversation_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(next["generation"].as_u64(), Some(coordinate.generation()));
+    assert_eq!(
+        next["stateVersion"].as_u64(),
+        Some(coordinate.state_version())
+    );
+    assert_eq!(
+        STANDARD.decode(next["groupId"].as_str().expect("signed next group id")),
+        Ok(coordinate.group_id().to_vec())
+    );
+    assert_eq!(next["epoch"].as_u64(), Some(coordinate.epoch()));
+    assert_eq!(
+        STANDARD.decode(
+            next["groupContextHash"]
+                .as_str()
+                .expect("signed next context hash")
+        ),
+        Ok(coordinate.group_context_hash().to_vec())
+    );
+    assert_eq!(
+        STANDARD.decode(
+            next["confirmationTag"]
+                .as_str()
+                .expect("signed next confirmation tag")
+        ),
+        Ok(coordinate.confirmation_tag().to_vec())
+    );
+    assert_eq!(next["lifecycle"].as_str(), Some("active"));
+
+    let signed_group_info = &wrapper["body"]["genesisGroupInfo"];
+    assert_eq!(
+        STANDARD.decode(
+            signed_group_info["bytes"]
+                .as_str()
+                .expect("signed GroupInfo bytes")
+        ),
+        Ok(group_info.clone()),
+        "signed Creation carries the exact durable GroupInfo bytes"
+    );
+    assert_eq!(
+        STANDARD.decode(
+            signed_group_info["sha256"]
+                .as_str()
+                .expect("signed GroupInfo digest")
+        ),
+        Ok(Sha256::digest(&group_info).to_vec()),
+        "signed Creation carries the exact durable GroupInfo digest"
+    );
+    let metadata = &wrapper["body"]["metadataSnapshot"];
+    let author = &metadata["authorProof"];
+    assert_eq!(author["authorDid"].as_str(), Some(entry.actor_did.as_str()));
+    assert_eq!(
+        author["authorDeviceId"].as_str(),
+        Some(entry.actor_device_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(
+        author["authorKeyId"].as_str(),
+        Some(entry.actor_key_id.as_str())
+    );
+    assert_eq!(
+        STANDARD.decode(
+            author["signaturePublicKey"]
+                .as_str()
+                .expect("signed metadata author key")
+        ),
+        Ok(entry.public_key.clone())
+    );
+    assert_eq!(author["authGenerationAtOrigin"].as_u64(), Some(1));
+    assert_eq!(author["originSeq"].as_u64(), Some(1));
+    assert_eq!(author["roleAtOrigin"].as_str(), Some("admin"));
+    assert_eq!(author["deviceStatusAtOrigin"].as_str(), Some("active"));
+    assert_eq!(
+        metadata["originTransitionId"],
+        wrapper["body"]["transitionId"]
+    );
+    assert_eq!(
+        author["originTransitionId"],
+        wrapper["body"]["transitionId"]
+    );
+
+    seed_genuine_creation_graph(pool, &entry, Some(&public_state), Some(&group_info)).await
+}
+
 #[tokio::test]
 #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
-async fn genuine_creation_graph_returns_the_preexisting_durable_protocol_instance() {
+async fn genuine_creation_graph_rebinds_metadata_author_and_preserves_the_preexisting_durable_protocol_instance(
+) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
     let (pool, _guard) = setup().await;
     let expected_protocol_instance_id = Uuid::new_v4();
     let expected_cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
@@ -732,6 +1299,43 @@ async fn genuine_creation_graph_returns_the_preexisting_durable_protocol_instanc
 
     let conversation_id = Uuid::new_v4();
     let entry = build_real_creation_entry(*conversation_id.as_bytes());
+    let wrapper: serde_json::Value =
+        serde_json::from_slice(&entry.raw_wrapper).expect("parse structural Creation wrapper");
+    let metadata = &wrapper["body"]["metadataSnapshot"];
+    let author = &metadata["authorProof"];
+    assert_eq!(author["authorDid"].as_str(), Some(entry.actor_did.as_str()));
+    assert_eq!(
+        author["authorDeviceId"].as_str(),
+        Some(entry.actor_device_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(
+        author["authorKeyId"].as_str(),
+        Some(entry.actor_key_id.as_str())
+    );
+    assert_eq!(
+        STANDARD
+            .decode(
+                author["signaturePublicKey"]
+                    .as_str()
+                    .expect("metadata author signature key"),
+            )
+            .expect("decode metadata author signature key"),
+        entry.public_key
+    );
+    assert_eq!(
+        metadata["originTransitionId"],
+        wrapper["body"]["transitionId"]
+    );
+    assert_eq!(
+        author["originTransitionId"],
+        wrapper["body"]["transitionId"]
+    );
+    crate::chat_protocol::transcript::decode_and_verify_signed_mutation(
+        &entry.raw_wrapper,
+        &entry.public_key,
+    )
+    .expect("metadata-author-rebound structural Creation remains genuinely signed");
+
     let graph = seed_genuine_creation_graph(&pool, &entry, None, None).await;
 
     assert_eq!(graph.protocol_instance_id, expected_protocol_instance_id);

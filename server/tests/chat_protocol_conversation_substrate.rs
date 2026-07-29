@@ -2539,7 +2539,9 @@ mod historical_control_path {
     // The reusable implementation now lives in `common::executor_seed`, so
     // G7 read fixtures and this historical loader bind to exactly the same
     // independently signed origin bytes.
-    pub(super) use crate::executor_seed::{build_real_creation_entry, RealCreationEntry};
+    pub(super) use crate::executor_seed::{
+        build_real_corpus_creation_entry, build_real_creation_entry, RealCreationEntry,
+    };
 
     pub(super) struct RealCloseEntry {
         pub(super) entry_id: Uuid,
@@ -2553,127 +2555,6 @@ mod historical_control_path {
         pub(super) server_fields_dag_cbor: Vec<u8>,
         pub(super) outer_entry_fingerprint: [u8; 32],
         pub(super) received_at: String,
-    }
-
-    fn rewrite_exact_text(value: &mut Value, from: &str, to: &str) {
-        match value {
-            Value::String(text) if text == from => *text = to.to_owned(),
-            Value::Array(items) => {
-                for child in items {
-                    rewrite_exact_text(child, from, to);
-                }
-            }
-            Value::Object(map) => {
-                for child in map.values_mut() {
-                    rewrite_exact_text(child, from, to);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    pub(super) fn build_real_corpus_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
-        const ALICE_SIGNING_SEED: [u8; 32] = [
-            0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85,
-            0x55, 0xa6, 0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e,
-            0x8c, 0x6b, 0x12, 0x8d,
-        ];
-        let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/manifest.json");
-        let manifest: Value = serde_json::from_slice(
-            &std::fs::read(manifest_path).expect("read frozen corpus manifest"),
-        )
-        .expect("parse frozen corpus manifest");
-        let alice = &manifest["identity"]["alice"];
-        let actor_did = alice["actorDid"].as_str().expect("Alice DID").to_owned();
-        let actor_device_id =
-            Uuid::parse_str(alice["deviceId"].as_str().expect("Alice device")).unwrap();
-        let signing_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
-        let public_key = signing_key.verifying_key().to_bytes();
-        assert_eq!(
-            public_key.to_vec(),
-            hex::decode(
-                alice["signaturePublicKeyHex"]
-                    .as_str()
-                    .expect("Alice public key")
-            )
-            .unwrap(),
-            "corpus Alice private seed remains bound to the frozen leaf key"
-        );
-        let actor_key_id = ed25519_key_id(&public_key).unwrap().as_str().to_owned();
-        let chain = &manifest["chain"];
-
-        let mut entry = build_real_creation_entry(fresh_cid);
-        let mut wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
-        let old_did = entry.actor_did.clone();
-        let old_device = entry.actor_device_id.hyphenated().to_string();
-        let old_key_id = entry.actor_key_id.clone();
-        let old_public_key = STANDARD.encode(&entry.public_key);
-        rewrite_exact_text(&mut wrapper, &old_did, &actor_did);
-        rewrite_exact_text(
-            &mut wrapper,
-            &old_device,
-            &actor_device_id.hyphenated().to_string(),
-        );
-        rewrite_exact_text(&mut wrapper, &old_key_id, &actor_key_id);
-        rewrite_exact_text(&mut wrapper, &old_public_key, &STANDARD.encode(public_key));
-
-        let group_id = STANDARD
-            .encode(hex::decode(chain["groupIdHex"].as_str().unwrap()).expect("corpus group id"));
-        let context_hash = STANDARD.encode(
-            hex::decode(chain["genesisGroupContextHashHex"].as_str().unwrap())
-                .expect("corpus genesis context"),
-        );
-        let confirmation_tag = STANDARD.encode(
-            hex::decode(chain["genesisConfirmationTagHex"].as_str().unwrap())
-                .expect("corpus genesis confirmation"),
-        );
-        wrapper["body"]["next"]["groupId"] = json!(group_id);
-        wrapper["body"]["next"]["epoch"] =
-            json!(chain["genesisEpoch"].as_u64().expect("genesis epoch"));
-        wrapper["body"]["next"]["groupContextHash"] = json!(context_hash);
-        wrapper["body"]["next"]["confirmationTag"] = json!(confirmation_tag);
-        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
-            wrapper["body"]["next"]["groupId"].clone();
-        wrapper["body"]["metadataSnapshot"]["coordinate"]["epoch"] =
-            wrapper["body"]["next"]["epoch"].clone();
-        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupContextHash"] =
-            wrapper["body"]["next"]["groupContextHash"].clone();
-        wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
-            wrapper["body"]["next"]["confirmationTag"].clone();
-        wrapper["body"]["signedAt"] = manifest["creation"]["signedAt"].clone();
-        repair_body_digests(&mut wrapper["body"]);
-        wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
-        let canonical =
-            decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap()).unwrap();
-        wrapper["signature"] = Value::String(
-            STANDARD.encode(signing_key.sign(canonical.transcript_bytes()).to_bytes()),
-        );
-        entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
-        let mut row: Value = serde_json::from_slice(&entry.public_row_json).unwrap();
-        row["signedRequest"] = wrapper;
-        row["receivedAt"] = manifest["creation"]["receivedAt"].clone();
-        entry.public_row_json = serde_json::to_vec(&row).unwrap();
-        entry.outer_entry_fingerprint =
-            *decode_and_verify_control_entry(&entry.public_row_json, &public_key)
-                .expect("corpus-bound creation verifies")
-                .outer_control_fingerprint();
-        entry.public_key = public_key.to_vec();
-        entry.actor_did = actor_did;
-        entry.actor_device_id = actor_device_id;
-        entry.actor_key_id = actor_key_id;
-        entry.signing_seed = ALICE_SIGNING_SEED;
-        HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq)
-            .unwrap()
-            .hydrate_historical_control_from_durable_bytes(
-                entry.public_row_json.clone(),
-                entry.raw_wrapper.clone(),
-                &entry.public_key,
-            )
-            .expect("corpus-bound creation re-enters historical authority")
-            .into_transition()
-            .expect("corpus-bound creation is a transition");
-        entry
     }
 
     #[test]
@@ -3061,6 +2942,7 @@ mod historical_control_path {
 mod historical_control_loader {
     use std::time::Duration;
 
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use chrono::{DateTime, Utc};
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -3407,6 +3289,124 @@ mod historical_control_loader {
         tx.rollback().await.expect("rollback read-only proof");
         assert!(rows.is_empty());
         let _closed_error_type: Option<TerminalProofHydrationError> = None;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
+    async fn corpus_bound_creation_fixture_hydrates_through_the_production_aggregate() {
+        let (pool, _database) = crate::executor_seed::setup().await;
+        let cid = Uuid::new_v4();
+        let graph = crate::executor_seed::seed_hydratable_genuine_creation_graph(&pool, cid).await;
+
+        let locked_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&pool)
+                .await
+                .expect("sample canonical aggregate hydration instant");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin production aggregate hydration");
+        let locked = hydrate_locked_conversation_state(&mut tx, cid, locked_at)
+            .await
+            .expect("corpus-bound genuine Creation hydrates through production");
+
+        assert_eq!(graph.conversation_id, cid);
+        assert_eq!(
+            locked.state().coordinate().conversation_id(),
+            cid.as_bytes()
+        );
+        assert_eq!(
+            locked.state().coordinate().group_id(),
+            graph.group_id.as_slice()
+        );
+        assert_eq!(
+            locked.state().participants().len(),
+            1,
+            "only the corpus creator participates"
+        );
+        let participant = &locked.state().participants()[0];
+        assert_eq!(
+            participant.principal().as_bytes(),
+            graph.creator_did.as_bytes()
+        );
+        assert_eq!(participant.status(), ParticipantStatus::Active);
+        assert_eq!(participant.role(), ParticipantRole::Admin);
+
+        assert_eq!(locked.state().leaves().len(), 1);
+        let leaf = &locked.state().leaves()[0];
+        assert_eq!(
+            leaf.device().principal().as_bytes(),
+            graph.creator_did.as_bytes()
+        );
+        assert_eq!(
+            leaf.device().device_id(),
+            graph.creator_device_id.as_bytes()
+        );
+        assert_eq!(leaf.leaf_index(), 0);
+
+        assert_eq!(locked.state().intervals().len(), 1);
+        let interval = &locked.state().intervals()[0];
+        assert_eq!(interval.recipient(), leaf.device());
+        assert_eq!(interval.opening_kind(), OpeningKind::Creation);
+        assert_eq!(interval.opening_seq(), 1);
+        assert!(interval.end().is_none());
+        assert_ne!(locked.locked_graph_digest(), &[0_u8; 32]);
+        assert_ne!(
+            locked
+                .locked_snapshot_digest()
+                .expect("active aggregate snapshot digest"),
+            &[0_u8; 32]
+        );
+
+        let active = locked
+            .state()
+            .active_public_state()
+            .expect("active corpus public state");
+        assert_eq!(
+            active.snapshot(),
+            crate::executor_seed::corpus_file("genesis-public-state.bin"),
+            "production reload retains the pinned canonical genesis snapshot"
+        );
+        assert_eq!(
+            active.binding().tree_summary().leaves().len(),
+            1,
+            "production reload retains the sole authenticated corpus leaf"
+        );
+
+        let generation_group_info: Vec<u8> = sqlx::query_scalar(
+            "SELECT genesis_group_info_bytes FROM chat.generations \
+             WHERE conversation_id=$1 AND generation=0",
+        )
+        .bind(cid)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("reload durable genesis GroupInfo");
+        let signed_request: Vec<u8> = sqlx::query_scalar(
+            "SELECT signed_request_bytes FROM chat.entries \
+             WHERE conversation_id=$1 AND seq=1",
+        )
+        .bind(cid)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("reload signed Creation request");
+        let wrapper: Value =
+            serde_json::from_slice(&signed_request).expect("parse signed Creation request");
+        let signed_group_info = STANDARD
+            .decode(
+                wrapper["body"]["genesisGroupInfo"]["bytes"]
+                    .as_str()
+                    .expect("signed genesis GroupInfo bytes"),
+            )
+            .expect("decode signed genesis GroupInfo");
+        assert_eq!(
+            generation_group_info, signed_group_info,
+            "durable generation bytes are exactly the signed Creation artifact"
+        );
+
+        tx.rollback()
+            .await
+            .expect("rollback production aggregate hydration");
     }
 
     /// Seed a coherent committed GROUP conversation whose genesis (seq 1) entry
@@ -5600,6 +5600,7 @@ mod historical_control_loader {
             XWING_CIPHERSUITE,
         };
         use crate::common;
+        use crate::executor_seed::bind_creation_entry_to_group_info;
         use crate::random_plc_did;
 
         fn g6_raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -10286,73 +10287,6 @@ mod historical_control_loader {
             invitee: AcceptanceInvitee,
             genesis_group_info: Vec<u8>,
             genesis: ActivePublicState,
-        }
-
-        fn bind_creation_entry_to_group_info(
-            mut entry: RealCreationEntry,
-            group_info: &[u8],
-            coordinate: &PublicGroupSnapshotCoordinate,
-            signed_at: &str,
-            received_at: &str,
-        ) -> RealCreationEntry {
-            let mut wrapper: Value =
-                serde_json::from_slice(&entry.raw_wrapper).expect("parse creation wrapper");
-            wrapper["body"]["signedAt"] = json!(signed_at);
-            wrapper["body"]["next"] = coordinate_json(coordinate);
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["conversationId"] =
-                json!(STANDARD.encode(entry.cid));
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["generation"] =
-                json!(coordinate.generation());
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
-                json!(STANDARD.encode(coordinate.group_id()));
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["epoch"] = json!(coordinate.epoch());
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["groupContextHash"] =
-                json!(STANDARD.encode(coordinate.group_context_hash()));
-            wrapper["body"]["metadataSnapshot"]["coordinate"]["confirmationTag"] =
-                json!(STANDARD.encode(coordinate.confirmation_tag()));
-            let transition_id = wrapper["body"]["transitionId"].clone();
-            wrapper["body"]["metadataSnapshot"]["originTransitionId"] = transition_id.clone();
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDid"] =
-                json!(&entry.actor_did);
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorDeviceId"] =
-                json!(entry.actor_device_id);
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["authorKeyId"] =
-                json!(&entry.actor_key_id);
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["signaturePublicKey"] =
-                json!(STANDARD.encode(&entry.public_key));
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["authGenerationAtOrigin"] = json!(1);
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["originTransitionId"] =
-                transition_id;
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["originSeq"] = json!(1);
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["roleAtOrigin"] = json!("admin");
-            wrapper["body"]["metadataSnapshot"]["authorProof"]["deviceStatusAtOrigin"] =
-                json!("active");
-            wrapper["body"]["genesisGroupInfo"]["bytes"] = json!(STANDARD.encode(group_info));
-            wrapper["body"]["genesisGroupInfo"]["sha256"] =
-                json!(STANDARD.encode(Sha256::digest(group_info)));
-            wrapper["signature"] = Value::String(STANDARD.encode([0_u8; 64]));
-            let canonical =
-                decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap())
-                    .expect("dynamic creation canonicalizes");
-            wrapper["signature"] = Value::String(
-                STANDARD.encode(
-                    entry
-                        .signing_key()
-                        .sign(canonical.transcript_bytes())
-                        .to_bytes(),
-                ),
-            );
-            entry.raw_wrapper = serde_json::to_vec(&wrapper).unwrap();
-            let mut row: Value =
-                serde_json::from_slice(&entry.public_row_json).expect("parse creation row");
-            row["signedRequest"] = wrapper;
-            row["receivedAt"] = json!(received_at);
-            entry.public_row_json = serde_json::to_vec(&row).unwrap();
-            entry.outer_entry_fingerprint =
-                *decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
-                    .expect("dynamic creation verifies")
-                    .outer_control_fingerprint();
-            entry
         }
 
         fn creator_only_entry_from_invited(entry: &RealCreationEntry) -> RealCreationEntry {
