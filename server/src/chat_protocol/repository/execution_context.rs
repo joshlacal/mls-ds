@@ -1375,6 +1375,27 @@ fn primary_event_kind(plan: &ConversationPersistencePlan) -> Option<EventKind> {
     }
 }
 
+/// Classify only the prior-bound Welcome terminalizations owned by a generic
+/// transition context. A `WelcomeExpiry` plan owns its one exact
+/// `Pending -> Expired` event through `WelcomeExpiryContext`; projecting the
+/// same delta here would splice a second, unrelated disposition family into
+/// that terminal context.
+fn prior_bound_welcome_disposition_status(
+    plan_kind: PlanKind,
+    before: WelcomeStatus,
+    after: WelcomeStatus,
+) -> Option<&'static str> {
+    match (before, after) {
+        (WelcomeStatus::Pending, WelcomeStatus::Superseded) => Some("superseded"),
+        (WelcomeStatus::Pending, WelcomeStatus::Expired)
+            if plan_kind != PlanKind::WelcomeExpiry =>
+        {
+            Some("expired")
+        }
+        _ => None,
+    }
+}
+
 fn canonical_recovery_primary_event_payload(
     plan: &ConversationPersistencePlan,
 ) -> Result<Vec<u8>, ExecutionContextHydrationError> {
@@ -1893,22 +1914,12 @@ async fn hydrate_execution_context_inner_with_g6(
         .welcome_changes()
         .iter()
         .filter_map(|change| match (change.before(), change.after()) {
-            (Some(before), Some(after))
-                if before.status() == WelcomeStatus::Pending
-                    && matches!(
-                        after.status(),
-                        WelcomeStatus::Superseded | WelcomeStatus::Expired
-                    ) =>
-            {
-                Some((
-                    after,
-                    if after.status() == WelcomeStatus::Expired {
-                        "expired"
-                    } else {
-                        "superseded"
-                    },
-                ))
-            }
+            (Some(before), Some(after)) => prior_bound_welcome_disposition_status(
+                plan.effects().kind(),
+                before.status(),
+                after.status(),
+            )
+            .map(|status| (after, status)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3000,6 +3011,59 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
             }),
         },
     }
+}
+
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
+pub(in crate::chat_protocol) fn run_welcome_terminal_context_family_semantic_proof(
+) -> Result<(), String> {
+    for (label, kind, before, after, expected) in [
+        (
+            "dedicated Welcome expiry",
+            PlanKind::WelcomeExpiry,
+            WelcomeStatus::Pending,
+            WelcomeStatus::Expired,
+            None,
+        ),
+        (
+            "collateral due expiry",
+            PlanKind::Metadata,
+            WelcomeStatus::Pending,
+            WelcomeStatus::Expired,
+            Some("expired"),
+        ),
+        (
+            "prior-bound supersession",
+            PlanKind::Commit,
+            WelcomeStatus::Pending,
+            WelcomeStatus::Superseded,
+            Some("superseded"),
+        ),
+        (
+            "non-pending expiry",
+            PlanKind::Metadata,
+            WelcomeStatus::Acknowledged,
+            WelcomeStatus::Expired,
+            None,
+        ),
+        (
+            "response terminal",
+            PlanKind::WelcomeAcknowledgement,
+            WelcomeStatus::Pending,
+            WelcomeStatus::Acknowledged,
+            None,
+        ),
+    ] {
+        let actual = prior_bound_welcome_disposition_status(kind, before, after);
+        if actual != expected {
+            return Err(format!(
+                "{label} classified as {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Feature-gated compiler witness for the production-only G6 chain. Integration

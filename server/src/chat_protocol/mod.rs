@@ -114,4 +114,10 @@ pub mod production_proof {
     pub fn run_metadata_executor_semantic_proof() -> Result<(), String> {
         super::state_machine::executor::run_metadata_semantic_proof()
     }
+
+    /// Execute the real Welcome terminal hydrator's pure context-family
+    /// classifier. This is compiled out of every shipping server binary.
+    pub fn run_welcome_terminal_context_family_semantic_proof() -> Result<(), String> {
+        super::repository::execution_context::run_welcome_terminal_context_family_semantic_proof()
+    }
 }

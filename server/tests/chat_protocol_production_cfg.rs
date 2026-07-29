@@ -107,6 +107,13 @@ fn metadata_executor_semantics_run_through_the_real_private_preflight() {
         .expect("real metadata executor semantic proof");
 }
 
+#[test]
+fn welcome_expiry_owns_only_its_dedicated_terminal_context_family() {
+    catbird_server::chat_protocol::production_proof::
+        run_welcome_terminal_context_family_semantic_proof()
+        .expect("Welcome terminal context-family semantic proof");
+}
+
 #[tokio::test]
 #[ignore = "requires the dedicated gate database with one production-valid due Recovery fixture"]
 async fn recovery_scheduler_expiry_runs_through_the_real_production_facade() {
