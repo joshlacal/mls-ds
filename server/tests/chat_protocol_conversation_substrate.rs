@@ -18,6 +18,8 @@
 #![allow(dead_code)]
 
 mod common;
+#[path = "common/executor_seed.rs"]
+mod executor_seed;
 #[path = "common/frozen_public_state.rs"]
 mod frozen_public_state;
 
@@ -2534,19 +2536,10 @@ mod historical_control_path {
     // can re-verify.
     // -----------------------------------------------------------------------
 
-    pub(super) struct RealCreationEntry {
-        pub(super) cid: [u8; 16],
-        pub(super) entry_id: uuid::Uuid,
-        pub(super) public_row_json: Vec<u8>,
-        pub(super) raw_wrapper: Vec<u8>,
-        pub(super) public_key: Vec<u8>,
-        pub(super) outer_entry_fingerprint: [u8; 32],
-        pub(super) actor_did: String,
-        pub(super) actor_device_id: uuid::Uuid,
-        pub(super) actor_key_id: String,
-        pub(super) signing_seed: [u8; 32],
-        pub(super) head_next_entry_seq: u64,
-    }
+    // The reusable implementation now lives in `common::executor_seed`, so
+    // G7 read fixtures and this historical loader bind to exactly the same
+    // independently signed origin bytes.
+    pub(super) use crate::executor_seed::{build_real_creation_entry, RealCreationEntry};
 
     pub(super) struct RealCloseEntry {
         pub(super) entry_id: Uuid,
@@ -2560,41 +2553,6 @@ mod historical_control_path {
         pub(super) server_fields_dag_cbor: Vec<u8>,
         pub(super) outer_entry_fingerprint: [u8; 32],
         pub(super) received_at: String,
-    }
-
-    impl RealCreationEntry {
-        pub(super) fn signing_key(&self) -> SigningKey {
-            SigningKey::from_bytes(&self.signing_seed)
-        }
-    }
-
-    fn rewrite_conversation_id(
-        value: &mut Value,
-        from_uuid: &str,
-        to_uuid: &str,
-        from_b64: &str,
-        to_b64: &str,
-    ) {
-        match value {
-            Value::String(text) => {
-                if text == from_uuid {
-                    *text = to_uuid.to_owned();
-                } else if text == from_b64 {
-                    *text = to_b64.to_owned();
-                }
-            }
-            Value::Array(items) => {
-                for child in items.iter_mut() {
-                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
-                }
-            }
-            Value::Object(map) => {
-                for child in map.values_mut() {
-                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
-                }
-            }
-            _ => {}
-        }
     }
 
     fn rewrite_exact_text(value: &mut Value, from: &str, to: &str) {
@@ -2611,160 +2569,6 @@ mod historical_control_path {
                 }
             }
             _ => {}
-        }
-    }
-
-    pub(super) fn build_real_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
-        let fixture: Value = serde_json::from_str(CONTRACT_VECTORS).unwrap();
-        let contract: Value = serde_json::from_str(LEXICON).unwrap();
-        let definitions = contract["defs"].as_object().unwrap();
-        let cef = &fixture["controlEntryFingerprints"];
-
-        let mut signing_seed_digest = Sha256::new();
-        signing_seed_digest.update(b"CATBIRD-CHAT-REAL-CREATION-FIXTURE\0");
-        signing_seed_digest.update(fresh_cid);
-        let signing_seed: [u8; 32] = signing_seed_digest.finalize().into();
-        let signing_key = SigningKey::from_bytes(&signing_seed);
-        let verifying = signing_key.verifying_key().to_bytes();
-
-        let case = cef["cases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["entryKind"].as_str().unwrap().ends_with("creationEntry"))
-            .expect("creation control vector present");
-
-        let body_cbor = hex::decode(
-            case["unsignedSigningProjectionCanonicalDagCborHex"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        let body: FixtureDagValue = serde_ipld_dagcbor::from_slice(&body_cbor).unwrap();
-        let signed_name = case["signedRequestRef"]
-            .as_str()
-            .unwrap()
-            .strip_prefix("blue.catbird.chat.defs#")
-            .unwrap();
-        let body_name = definitions[signed_name]["properties"]["body"]["refs"][0]
-            .as_str()
-            .unwrap()
-            .strip_prefix('#')
-            .unwrap();
-        let mut signing_body = body.into_json_for_schema(&definitions[body_name], definitions);
-        repair_body_digests(&mut signing_body);
-        signing_body["keyId"] = json!(ed25519_key_id(&verifying).unwrap().as_str());
-
-        // Rewrite the frozen conversationId (UUID-text and, defensively, its
-        // 16-byte base64 form) to the fresh v4 throughout the signed body.
-        const FROZEN_CID: [u8; 16] = [
-            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x91, 0x11, 0x11, 0x11, 0x11, 0x11,
-            0x11, 0x11,
-        ];
-        let from_uuid = Uuid::from_bytes(FROZEN_CID).hyphenated().to_string();
-        let to_uuid = Uuid::from_bytes(fresh_cid).hyphenated().to_string();
-        let from_b64 = STANDARD.encode(FROZEN_CID);
-        let to_b64 = STANDARD.encode(fresh_cid);
-        rewrite_conversation_id(&mut signing_body, &from_uuid, &to_uuid, &from_b64, &to_b64);
-
-        // `chat.transitions.transition_id` is globally unique. Rebind the
-        // frozen creation vector's signed transition id (UUID text and its AAD
-        // byte encoding) so every independently committed fixture remains both
-        // unique and direct-cause exact.
-        let frozen_transition_id =
-            Uuid::parse_str(signing_body["transitionId"].as_str().unwrap()).unwrap();
-        let fresh_transition_id = Uuid::new_v4();
-        rewrite_conversation_id(
-            &mut signing_body,
-            &frozen_transition_id.hyphenated().to_string(),
-            &fresh_transition_id.hyphenated().to_string(),
-            &STANDARD.encode(frozen_transition_id.as_bytes()),
-            &STANDARD.encode(fresh_transition_id.as_bytes()),
-        );
-
-        let frozen_actor_device_id = signing_body["actorDeviceId"].as_str().unwrap().to_owned();
-        let fresh_actor_device_id = Uuid::new_v4().hyphenated().to_string();
-        rewrite_exact_text(
-            &mut signing_body,
-            &frozen_actor_device_id,
-            &fresh_actor_device_id,
-        );
-        const PLC_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-        let fresh_actor_suffix: String = signing_seed
-            .iter()
-            .take(24)
-            .map(|byte| PLC_ALPHABET[usize::from(*byte % 32)] as char)
-            .collect();
-        let fresh_actor_did = format!("did:plc:{fresh_actor_suffix}");
-        let frozen_actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
-        rewrite_exact_text(&mut signing_body, &frozen_actor_did, &fresh_actor_did);
-        let actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
-        let actor_device_id =
-            Uuid::parse_str(signing_body["actorDeviceId"].as_str().unwrap()).unwrap();
-        let actor_key_id = ed25519_key_id(&verifying).unwrap().as_str().to_owned();
-        // The frozen vector intentionally carries placeholder roster/coordinate
-        // values. This helper seeds a live durable genesis, so bind the signed
-        // Creation body to the exact graph the repository rows retain; otherwise
-        // aggregate interval validation correctly rejects the spliced opening.
-        signing_body["conversationKind"] = json!("group");
-        signing_body["next"]["groupId"] = json!(STANDARD.encode([1_u8; 32]));
-        signing_body["next"]["groupContextHash"] = json!(STANDARD.encode([2_u8; 32]));
-        signing_body["next"]["confirmationTag"] = json!(STANDARD.encode([3_u8; 32]));
-        signing_body["metadataSnapshot"]["coordinate"]["conversationId"] =
-            json!(STANDARD.encode(fresh_cid));
-        signing_body["metadataSnapshot"]["coordinate"]["generation"] = json!(0);
-        signing_body["metadataSnapshot"]["coordinate"]["groupId"] =
-            json!(STANDARD.encode([1_u8; 32]));
-        signing_body["metadataSnapshot"]["coordinate"]["epoch"] = json!(0);
-        signing_body["metadataSnapshot"]["coordinate"]["groupContextHash"] =
-            json!(STANDARD.encode([2_u8; 32]));
-        signing_body["metadataSnapshot"]["coordinate"]["confirmationTag"] =
-            json!(STANDARD.encode([3_u8; 32]));
-        signing_body["manifest"]["actorLeaf"]["userDid"] = json!(&actor_did);
-        signing_body["manifest"]["actorLeaf"]["deviceId"] =
-            json!(actor_device_id.hyphenated().to_string());
-        signing_body["manifest"]["participants"] = json!([{
-            "userDid": &actor_did,
-            "status": "active",
-            "role": "admin",
-        }]);
-
-        let raw_wrapper = resign(
-            json!({ "body": signing_body, "signature": "" }),
-            &signing_key,
-        );
-        let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
-
-        let entry_id = Uuid::new_v4();
-        let row = json!({
-            "$type": case["entryKind"],
-            "entryId": entry_id.hyphenated().to_string(),
-            "conversationId": to_uuid,
-            "seq": 1,
-            "signedRequest": signed_request,
-            "receivedAt": case["receivedAt"],
-        });
-        let public_row_json = serde_json::to_vec(&row).unwrap();
-
-        // Fail fast on fixture drift: it must decode + verify under the test key,
-        // and its derived outer fingerprint is the durable column value.
-        let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
-            .expect("rewritten creation entry decodes under the test key");
-        assert_eq!(decoded.conversation_id().as_bytes(), &fresh_cid);
-        let outer_entry_fingerprint = *decoded.outer_control_fingerprint();
-
-        RealCreationEntry {
-            cid: fresh_cid,
-            entry_id,
-            public_row_json,
-            raw_wrapper,
-            public_key: verifying.to_vec(),
-            outer_entry_fingerprint,
-            actor_did,
-            actor_device_id,
-            actor_key_id,
-            signing_seed,
-            head_next_entry_seq: 2,
         }
     }
 
@@ -3621,12 +3425,9 @@ mod historical_control_loader {
     }
 
     async fn seed_real_creation_graph(pool: &PgPool, entry: &RealCreationEntry) -> Uuid {
-        seed_real_creation_graph_with_transition_id(
-            pool,
-            entry,
-            signed_creation_transition_id(entry),
-        )
-        .await
+        crate::executor_seed::seed_genuine_creation_graph(pool, entry, None, None)
+            .await
+            .creation_transition_id
     }
 
     async fn seed_real_creation_graph_with_public_state(
@@ -3634,14 +3435,9 @@ mod historical_control_loader {
         entry: &RealCreationEntry,
         public_state: &ActivePublicState,
     ) -> Uuid {
-        seed_real_creation_graph_with_transition_id_and_public_state(
-            pool,
-            entry,
-            signed_creation_transition_id(entry),
-            Some(public_state),
-            None,
-        )
-        .await
+        crate::executor_seed::seed_genuine_creation_graph(pool, entry, Some(public_state), None)
+            .await
+            .creation_transition_id
     }
 
     async fn seed_real_creation_graph_with_public_state_and_group_info(
@@ -3650,14 +3446,14 @@ mod historical_control_loader {
         public_state: &ActivePublicState,
         group_info: &[u8],
     ) -> Uuid {
-        seed_real_creation_graph_with_transition_id_and_public_state(
+        crate::executor_seed::seed_genuine_creation_graph(
             pool,
             entry,
-            signed_creation_transition_id(entry),
             Some(public_state),
             Some(group_info),
         )
         .await
+        .creation_transition_id
     }
 
     #[allow(dead_code)]

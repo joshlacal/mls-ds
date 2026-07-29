@@ -60,6 +60,695 @@ use crate::chat_protocol::validation::ed25519_key_id;
 #[path = "frozen_public_state.rs"]
 mod frozen_public_state;
 
+// The genuine Creation fixture is deliberately kept here, rather than in a
+// single integration crate: entitlement/read tests need the exact same
+// independently signed origin that the historical-control tests exercise.
+// It is a test-only structural template, never an alternate protocol path.
+mod genuine_creation_fixture {
+    use std::{collections::BTreeMap, fmt};
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    use crate::chat_protocol::transcript::{
+        decode_and_verify_control_entry, decode_canonical_signed_mutation,
+    };
+    use crate::chat_protocol::validation::ed25519_key_id;
+
+    const CONTRACT_VECTORS: &str = include_str!("../fixtures/mls_chat_contract_vectors.json");
+    const LEXICON: &str =
+        include_str!("../../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
+
+    /// A freshly rebound, production-verified signed Creation entry. Every
+    /// durable origin row must be derived from these bytes, rather than from a
+    /// fabricated execution context.
+    #[derive(Clone)]
+    pub struct RealCreationEntry {
+        pub cid: [u8; 16],
+        pub entry_id: Uuid,
+        pub public_row_json: Vec<u8>,
+        pub raw_wrapper: Vec<u8>,
+        pub public_key: Vec<u8>,
+        pub outer_entry_fingerprint: [u8; 32],
+        pub actor_did: String,
+        pub actor_device_id: Uuid,
+        pub actor_key_id: String,
+        pub signing_seed: [u8; 32],
+        pub head_next_entry_seq: u64,
+    }
+
+    impl RealCreationEntry {
+        pub fn signing_key(&self) -> SigningKey {
+            SigningKey::from_bytes(&self.signing_seed)
+        }
+    }
+
+    enum FixtureDagValue {
+        String(String),
+        Integer(u64),
+        Bool(bool),
+        Bytes(Vec<u8>),
+        Array(Vec<Self>),
+        Map(BTreeMap<String, Self>),
+    }
+
+    impl<'de> Deserialize<'de> for FixtureDagValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_any(FixtureDagVisitor)
+        }
+    }
+
+    struct FixtureDagVisitor;
+
+    impl<'de> Visitor<'de> for FixtureDagVisitor {
+        type Value = FixtureDagValue;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("the frozen clean-chat DAG-CBOR value profile")
+        }
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bool(value))
+        }
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Integer(value))
+        }
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            u64::try_from(value)
+                .map(FixtureDagValue::Integer)
+                .map_err(|_| E::custom("negative fixture integer"))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::String(value.to_owned()))
+        }
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::String(value))
+        }
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bytes(value.to_vec()))
+        }
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+            Ok(FixtureDagValue::Bytes(value))
+        }
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(FixtureDagValue::Array(values))
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry()? {
+                values.insert(key, value);
+            }
+            Ok(FixtureDagValue::Map(values))
+        }
+    }
+
+    impl FixtureDagValue {
+        fn into_json_for_schema(
+            self,
+            schema: &Value,
+            definitions: &serde_json::Map<String, Value>,
+        ) -> Value {
+            match schema["type"].as_str().unwrap() {
+                "ref" => {
+                    let name = schema["ref"].as_str().unwrap().strip_prefix('#').unwrap();
+                    if matches!(name, "operationId" | "deviceId") {
+                        let Self::Bytes(value) = self else {
+                            panic!("frozen UUID projection was not DAG-CBOR bytes");
+                        };
+                        Value::String(Uuid::from_slice(&value).unwrap().hyphenated().to_string())
+                    } else {
+                        self.into_json_for_schema(&definitions[name], definitions)
+                    }
+                }
+                "union" => {
+                    let name = {
+                        let Self::Map(values) = &self else {
+                            panic!("frozen union projection was not a DAG-CBOR map");
+                        };
+                        let Some(Self::String(type_id)) = values.get("$type") else {
+                            panic!("frozen union projection omitted its type tag");
+                        };
+                        type_id
+                            .strip_prefix("blue.catbird.chat.defs#")
+                            .unwrap()
+                            .to_owned()
+                    };
+                    assert!(
+                        schema["refs"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|reference| reference.as_str() == Some(&format!("#{name}"))),
+                        "frozen union selected a disallowed type"
+                    );
+                    self.into_json_for_schema(&definitions[&name], definitions)
+                }
+                "object" => {
+                    let Self::Map(values) = self else {
+                        panic!("frozen object projection was not a DAG-CBOR map");
+                    };
+                    let properties = schema["properties"].as_object().unwrap();
+                    Value::Object(
+                        values
+                            .into_iter()
+                            .map(|(name, value)| {
+                                let value = if name == "$type" {
+                                    let Self::String(type_id) = value else {
+                                        panic!("frozen object type tag was not text");
+                                    };
+                                    Value::String(type_id)
+                                } else {
+                                    value.into_json_for_schema(&properties[&name], definitions)
+                                };
+                                (name, value)
+                            })
+                            .collect(),
+                    )
+                }
+                "string" => {
+                    let Self::String(value) = self else {
+                        panic!("frozen string projection was not DAG-CBOR text");
+                    };
+                    Value::String(value)
+                }
+                "bytes" => {
+                    let Self::Bytes(value) = self else {
+                        panic!("frozen byte projection was not DAG-CBOR bytes");
+                    };
+                    Value::String(STANDARD.encode(value))
+                }
+                "integer" => {
+                    let Self::Integer(value) = self else {
+                        panic!("frozen integer projection was not a DAG-CBOR integer");
+                    };
+                    json!(value)
+                }
+                "boolean" => {
+                    let Self::Bool(value) = self else {
+                        panic!("frozen boolean projection was not a DAG-CBOR boolean");
+                    };
+                    json!(value)
+                }
+                "array" => {
+                    let Self::Array(values) = self else {
+                        panic!("frozen array projection was not a DAG-CBOR array");
+                    };
+                    Value::Array(
+                        values
+                            .into_iter()
+                            .map(|value| value.into_json_for_schema(&schema["items"], definitions))
+                            .collect(),
+                    )
+                }
+                other => panic!("unsupported frozen fixture schema type {other}"),
+            }
+        }
+    }
+
+    fn rewrite_conversation_id(
+        value: &mut Value,
+        from_uuid: &str,
+        to_uuid: &str,
+        from_b64: &str,
+        to_b64: &str,
+    ) {
+        match value {
+            Value::String(text) if text == from_uuid => *text = to_uuid.to_owned(),
+            Value::String(text) if text == from_b64 => *text = to_b64.to_owned(),
+            Value::Array(items) => {
+                for child in items {
+                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
+                }
+            }
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    rewrite_conversation_id(child, from_uuid, to_uuid, from_b64, to_b64);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn rewrite_exact_text(value: &mut Value, from: &str, to: &str) {
+        match value {
+            Value::String(text) if text == from => *text = to.to_owned(),
+            Value::Array(items) => {
+                for child in items {
+                    rewrite_exact_text(child, from, to);
+                }
+            }
+            Value::Object(map) => {
+                for child in map.values_mut() {
+                    rewrite_exact_text(child, from, to);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn resign(mut wrapper: Value, signing_key: &SigningKey) -> Vec<u8> {
+        wrapper["signature"] = Value::String(STANDARD.encode([0u8; 64]));
+        let canonical =
+            decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper).unwrap()).unwrap();
+        wrapper["signature"] = Value::String(
+            STANDARD.encode(signing_key.sign(canonical.transcript_bytes()).to_bytes()),
+        );
+        serde_json::to_vec(&wrapper).unwrap()
+    }
+    fn repair_body_digests(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let (Some(Value::String(bytes_b64)), true) =
+                    (map.get("bytes").cloned(), map.contains_key("sha256"))
+                {
+                    if let Ok(bytes) = STANDARD.decode(&bytes_b64) {
+                        map.insert(
+                            "sha256".to_owned(),
+                            json!(STANDARD.encode(Sha256::digest(&bytes))),
+                        );
+                    }
+                }
+                if let (Some(Value::String(cipher_b64)), true) = (
+                    map.get("ciphertext").cloned(),
+                    map.contains_key("ciphertextSha256"),
+                ) {
+                    if let Ok(bytes) = STANDARD.decode(&cipher_b64) {
+                        map.insert(
+                            "ciphertextSha256".to_owned(),
+                            json!(STANDARD.encode(Sha256::digest(&bytes))),
+                        );
+                        map.insert("ciphertextSize".to_owned(), json!(bytes.len()));
+                    }
+                }
+                if let (Some(Value::String(pk_b64)), true) = (
+                    map.get("signaturePublicKey").cloned(),
+                    map.contains_key("authorKeyId"),
+                ) {
+                    if let Ok(pk) = STANDARD.decode(&pk_b64) {
+                        if let Ok(pk) = <[u8; 32]>::try_from(pk.as_slice()) {
+                            map.insert(
+                                "authorKeyId".to_owned(),
+                                json!(ed25519_key_id(&pk).unwrap().as_str()),
+                            );
+                        }
+                    }
+                }
+                if let (Some(origin), true) = (
+                    map.get("originTransitionId").cloned(),
+                    map.get("authorProof")
+                        .map(Value::is_object)
+                        .unwrap_or(false),
+                ) {
+                    if let Some(Value::Object(proof)) = map.get_mut("authorProof") {
+                        proof.insert("originTransitionId".to_owned(), origin);
+                    }
+                }
+                for child in map.values_mut() {
+                    repair_body_digests(child);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    repair_body_digests(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn build_real_creation_entry(fresh_cid: [u8; 16]) -> RealCreationEntry {
+        let fixture: Value = serde_json::from_str(CONTRACT_VECTORS).unwrap();
+        let contract: Value = serde_json::from_str(LEXICON).unwrap();
+        let definitions = contract["defs"].as_object().unwrap();
+        let case = fixture["controlEntryFingerprints"]["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["entryKind"].as_str().unwrap().ends_with("creationEntry"))
+            .expect("creation control vector present");
+        let mut signing_seed_digest = Sha256::new();
+        signing_seed_digest.update(b"CATBIRD-CHAT-REAL-CREATION-FIXTURE\0");
+        signing_seed_digest.update(fresh_cid);
+        let signing_seed: [u8; 32] = signing_seed_digest.finalize().into();
+        let signing_key = SigningKey::from_bytes(&signing_seed);
+        let verifying = signing_key.verifying_key().to_bytes();
+        let body_cbor = hex::decode(
+            case["unsignedSigningProjectionCanonicalDagCborHex"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let body: FixtureDagValue = serde_ipld_dagcbor::from_slice(&body_cbor).unwrap();
+        let signed_name = case["signedRequestRef"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("blue.catbird.chat.defs#")
+            .unwrap();
+        let body_name = definitions[signed_name]["properties"]["body"]["refs"][0]
+            .as_str()
+            .unwrap()
+            .strip_prefix('#')
+            .unwrap();
+        let mut signing_body = body.into_json_for_schema(&definitions[body_name], definitions);
+        repair_body_digests(&mut signing_body);
+        signing_body["keyId"] = json!(ed25519_key_id(&verifying).unwrap().as_str());
+        const FROZEN_CID: [u8; 16] = [
+            0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x91, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11,
+        ];
+        let from_uuid = Uuid::from_bytes(FROZEN_CID).hyphenated().to_string();
+        let to_uuid = Uuid::from_bytes(fresh_cid).hyphenated().to_string();
+        rewrite_conversation_id(
+            &mut signing_body,
+            &from_uuid,
+            &to_uuid,
+            &STANDARD.encode(FROZEN_CID),
+            &STANDARD.encode(fresh_cid),
+        );
+        let frozen_transition_id =
+            Uuid::parse_str(signing_body["transitionId"].as_str().unwrap()).unwrap();
+        let fresh_transition_id = Uuid::new_v4();
+        rewrite_conversation_id(
+            &mut signing_body,
+            &frozen_transition_id.hyphenated().to_string(),
+            &fresh_transition_id.hyphenated().to_string(),
+            &STANDARD.encode(frozen_transition_id.as_bytes()),
+            &STANDARD.encode(fresh_transition_id.as_bytes()),
+        );
+        let frozen_actor_device_id = signing_body["actorDeviceId"].as_str().unwrap().to_owned();
+        let fresh_actor_device_id = Uuid::new_v4().hyphenated().to_string();
+        rewrite_exact_text(
+            &mut signing_body,
+            &frozen_actor_device_id,
+            &fresh_actor_device_id,
+        );
+        const PLC_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let suffix: String = signing_seed
+            .iter()
+            .take(24)
+            .map(|byte| PLC_ALPHABET[usize::from(*byte % 32)] as char)
+            .collect();
+        let fresh_actor_did = format!("did:plc:{suffix}");
+        let frozen_actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
+        rewrite_exact_text(&mut signing_body, &frozen_actor_did, &fresh_actor_did);
+        let actor_did = signing_body["actorDid"].as_str().unwrap().to_owned();
+        let actor_device_id =
+            Uuid::parse_str(signing_body["actorDeviceId"].as_str().unwrap()).unwrap();
+        let actor_key_id = ed25519_key_id(&verifying).unwrap().as_str().to_owned();
+        signing_body["conversationKind"] = json!("group");
+        signing_body["next"]["groupId"] = json!(STANDARD.encode([1_u8; 32]));
+        signing_body["next"]["groupContextHash"] = json!(STANDARD.encode([2_u8; 32]));
+        signing_body["next"]["confirmationTag"] = json!(STANDARD.encode([3_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["conversationId"] =
+            json!(STANDARD.encode(fresh_cid));
+        signing_body["metadataSnapshot"]["coordinate"]["generation"] = json!(0);
+        signing_body["metadataSnapshot"]["coordinate"]["groupId"] =
+            json!(STANDARD.encode([1_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["epoch"] = json!(0);
+        signing_body["metadataSnapshot"]["coordinate"]["groupContextHash"] =
+            json!(STANDARD.encode([2_u8; 32]));
+        signing_body["metadataSnapshot"]["coordinate"]["confirmationTag"] =
+            json!(STANDARD.encode([3_u8; 32]));
+        signing_body["manifest"]["actorLeaf"]["userDid"] = json!(&actor_did);
+        signing_body["manifest"]["actorLeaf"]["deviceId"] =
+            json!(actor_device_id.hyphenated().to_string());
+        signing_body["manifest"]["participants"] =
+            json!([{"userDid": &actor_did, "status": "active", "role": "admin"}]);
+        let raw_wrapper = resign(json!({"body": signing_body, "signature": ""}), &signing_key);
+        let signed_request: Value = serde_json::from_slice(&raw_wrapper).unwrap();
+        let entry_id = Uuid::new_v4();
+        let public_row_json = serde_json::to_vec(&json!({"$type": case["entryKind"], "entryId": entry_id.hyphenated().to_string(), "conversationId": to_uuid, "seq": 1, "signedRequest": signed_request, "receivedAt": case["receivedAt"]})).unwrap();
+        let decoded = decode_and_verify_control_entry(&public_row_json, &verifying)
+            .expect("rewritten creation entry decodes under the test key");
+        assert_eq!(decoded.conversation_id().as_bytes(), &fresh_cid);
+        RealCreationEntry {
+            cid: fresh_cid,
+            entry_id,
+            public_row_json,
+            raw_wrapper,
+            public_key: verifying.to_vec(),
+            outer_entry_fingerprint: *decoded.outer_control_fingerprint(),
+            actor_did,
+            actor_device_id,
+            actor_key_id,
+            signing_seed,
+            head_next_entry_seq: 2,
+        }
+    }
+}
+
+pub use genuine_creation_fixture::{build_real_creation_entry, RealCreationEntry};
+
+/// Return the transition id embedded in the genuine signed Creation wrapper.
+/// Keeping this derivation beside the builder prevents a durable graph from
+/// silently substituting independently generated provenance.
+pub fn signed_creation_transition_id(entry: &RealCreationEntry) -> Uuid {
+    let wrapper: serde_json::Value =
+        serde_json::from_slice(&entry.raw_wrapper).expect("creation wrapper JSON");
+    Uuid::parse_str(
+        wrapper["body"]["transitionId"]
+            .as_str()
+            .expect("creation transitionId"),
+    )
+    .expect("creation transitionId UUID")
+}
+
+/// The authority-bearing identity facts that an entitlement/read test needs
+/// after it seeds the genuine active graph. Keeping this product narrow avoids
+/// re-creating the old fabricated execution-context fixture in each consumer.
+pub struct GenuineCreationGraph {
+    pub conversation_id: Uuid,
+    pub creator_did: String,
+    pub creator_device_id: Uuid,
+    pub creator_dpop_jkt: String,
+    pub creator_auth_generation: u64,
+    pub protocol_instance_id: Uuid,
+    pub creation_transition_id: Uuid,
+}
+
+/// Seed one active, genesis-only group whose immutable durable rows all derive
+/// from `entry`'s verified Creation bytes. `public_state`, when provided, is
+/// retained byte-for-byte (including its canonical tree summary); otherwise a
+/// structurally valid single-leaf state is used for historical-loader negatives.
+/// The returned id is the signed Creation transition id.
+pub async fn seed_genuine_creation_graph(
+    pool: &PgPool,
+    entry: &RealCreationEntry,
+    public_state: Option<&ActivePublicState>,
+    exact_group_info: Option<&[u8]>,
+) -> GenuineCreationGraph {
+    use crate::chat_protocol::public_state::encode_public_tree_summary;
+    use crate::chat_protocol::snapshot::{PublicGroupSnapshotLeaf, PublicGroupSnapshotTreeSummary};
+    use crate::chat_protocol::transcript::{
+        decode_and_verify_control_entry, decode_and_verify_signed_mutation,
+    };
+
+    let creation_transition_id = signed_creation_transition_id(entry);
+    let conversation_id = Uuid::from_bytes(entry.cid);
+    let participant_period_id = Uuid::new_v4();
+    let leaf_period_id = Uuid::new_v4();
+    let metadata_snapshot_id = Uuid::new_v4();
+    let actor_did = &entry.actor_did;
+    let actor_device_id = entry.actor_device_id;
+    let actor_key_id = &entry.actor_key_id;
+    let actor_public_key = entry.public_key.clone();
+    let group_info = if let Some(group_info) = exact_group_info {
+        group_info.to_vec()
+    } else if public_state.is_some() {
+        fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/group-info.mls"),
+        )
+        .expect("read genuine frozen genesis GroupInfo")
+    } else {
+        vec![4_u8; 8]
+    };
+    let verified_mutation =
+        decode_and_verify_signed_mutation(&entry.raw_wrapper, &actor_public_key)
+            .expect("creation wrapper passes production signature validation");
+    let verified_entry = decode_and_verify_control_entry(&entry.public_row_json, &actor_public_key)
+        .expect("creation entry passes production control validation");
+    assert_eq!(
+        verified_entry.mutation().request_digest(),
+        verified_mutation.request_digest()
+    );
+    let basic_credential = format!("{actor_did}#{actor_device_id}").into_bytes();
+    let (group_id, group_context_hash, confirmation_tag, snapshot, snapshot_sha256, tree) =
+        match public_state {
+            Some(public_state) => {
+                assert_eq!(public_state.coordinate().conversation_id(), &entry.cid);
+                (
+                    public_state.coordinate().group_id().to_vec(),
+                    public_state.coordinate().group_context_hash().to_vec(),
+                    public_state.coordinate().confirmation_tag().to_vec(),
+                    public_state.snapshot().to_vec(),
+                    public_state.snapshot_sha256().to_vec(),
+                    public_state.binding().tree_summary().clone(),
+                )
+            }
+            None => {
+                let snapshot = vec![0x5a_u8; 64];
+                (
+                    vec![1_u8; 32],
+                    vec![2_u8; 32],
+                    vec![3_u8; 32],
+                    snapshot.clone(),
+                    Sha256::digest(&snapshot).to_vec(),
+                    PublicGroupSnapshotTreeSummary::new(
+                        [0x63_u8; 32],
+                        vec![PublicGroupSnapshotLeaf::new(
+                            0,
+                            basic_credential.clone(),
+                            actor_public_key.clone(),
+                            vec![0x64_u8; 1_216],
+                        )],
+                    ),
+                )
+            }
+        };
+    let (tree_summary, tree_summary_sha) = encode_public_tree_summary(&tree)
+        .expect("genesis tree summary is canonical")
+        .into_parts();
+    let signed_request = entry.raw_wrapper.clone();
+    let unsigned_projection = verified_mutation.canonical_projection().to_vec();
+    let signing_transcript = verified_mutation.transcript_bytes().to_vec();
+    let request_digest = verified_mutation.request_digest().to_vec();
+    let signature = verified_mutation.signature().to_vec();
+    let server_fields = verified_entry
+        .server_fields_dag_cbor()
+        .expect("canonical server fields");
+    let entry_payload = entry.public_row_json.clone();
+    let entry_payload_sha = Sha256::digest(&entry_payload).to_vec();
+    let entry_outer_fingerprint = entry.outer_entry_fingerprint.to_vec();
+    let at = verified_entry.received_at().datetime();
+    let metadata_ciphertext = vec![13_u8; 16];
+
+    let mut tx = pool.begin().await.expect("begin genuine creation");
+    // A protocol instance is an independent immutable system root required by
+    // the real executor/facade hydrators.  It is intentionally seeded inside
+    // this fixture's transaction so a private fresh DB has no ambient state.
+    let proposed_protocol_instance_id = Uuid::from_bytes(uuid_v4_bytes(0x51));
+    let cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(&mut *tx)
+        .await
+        .expect("derive protocol cursor key");
+    sqlx::query("INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING")
+        .bind(proposed_protocol_instance_id).bind(&cursor_key).execute(&mut *tx).await.expect("seed protocol instance");
+    let (protocol_instance_id, durable_cursor_key): (Uuid, String) = sqlx::query_as(
+        "SELECT protocol_instance_id,cursor_key_id \
+         FROM chat.protocol_instances WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read durable protocol instance");
+    if protocol_instance_id == proposed_protocol_instance_id {
+        assert_eq!(
+            durable_cursor_key, cursor_key,
+            "newly seeded protocol instance retains its derived cursor-key binding"
+        );
+    }
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(actor_did)
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("insert principal");
+    sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'loader-actor','active',$3,1,chat.protocol_capabilities(),$4,$4) ON CONFLICT DO NOTHING")
+        .bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(at).execute(&mut *tx).await.expect("insert device");
+    sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5) ON CONFLICT DO NOTHING")
+        .bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(&actor_public_key).bind(at).execute(&mut *tx).await.expect("insert device key");
+    sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)")
+        .bind(conversation_id).bind(at).execute(&mut *tx).await.expect("insert conversation");
+    sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)")
+        .bind(conversation_id).bind(&group_id).bind(&group_info).bind(Sha256::digest(&group_info).to_vec()).bind(at).execute(&mut *tx).await.expect("insert generation");
+    sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,0,0,$11,1,$12)")
+        .bind(creation_transition_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(&signed_request).bind(&unsigned_projection).bind(&signing_transcript).bind(&request_digest).bind(&signature).bind(metadata_snapshot_id).bind(at).execute(&mut *tx).await.expect("insert creation transition");
+    sqlx::query("INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,0,0,$2,0,$3,$4,'active','creation',$5,$6,$7,$8,$9,1,$10)")
+        .bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(&snapshot).bind(&snapshot_sha256).bind(&tree_summary).bind(&tree_summary_sha).bind(at).execute(&mut *tx).await.expect("insert creation state");
+    sqlx::query("INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)")
+        .bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(creation_transition_id).bind(at).bind(actor_device_id).execute(&mut *tx).await.expect("insert participant");
+    sqlx::query("INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,1,'genesis',0,$9,1,true,$10)")
+        .bind(leaf_period_id).bind(participant_period_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&basic_credential).bind(&actor_public_key).bind(actor_key_id).bind(creation_transition_id).bind(at).execute(&mut *tx).await.expect("insert leaf");
+    sqlx::query("INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,1,1,'admin','active',$14)")
+        .bind(metadata_snapshot_id).bind(conversation_id).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(creation_transition_id).bind(vec![14_u8; 12]).bind(&metadata_ciphertext).bind(Sha256::digest(&metadata_ciphertext).to_vec()).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(&actor_public_key).bind(at).execute(&mut *tx).await.expect("insert metadata");
+    sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,0,$13,$14)")
+        .bind(conversation_id).bind(entry.entry_id).bind(&entry_payload).bind(&entry_payload_sha).bind(&signed_request).bind(&request_digest).bind(&signature).bind(&server_fields).bind(&entry_outer_fingerprint).bind(actor_did).bind(actor_device_id).bind(actor_key_id).bind(creation_transition_id).bind(at).execute(&mut *tx).await.expect("insert creation entry");
+    sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) VALUES($1,1,$2,$3,'control')")
+        .bind(conversation_id).bind(actor_did).bind(actor_device_id).execute(&mut *tx).await.expect("route creation entry to active creator");
+    sqlx::query("INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,1,'creation',$1,$5,0,$6,0,$7,$8,$9,$10)")
+        .bind(creation_transition_id).bind(conversation_id).bind(actor_did).bind(actor_device_id).bind(&entry_outer_fingerprint).bind(&group_id).bind(&group_context_hash).bind(&confirmation_tag).bind(leaf_period_id).bind(at).execute(&mut *tx).await.expect("insert creation interval");
+    tx.commit().await.expect("commit genuine creation");
+    GenuineCreationGraph {
+        conversation_id,
+        creator_did: actor_did.clone(),
+        creator_device_id: actor_device_id,
+        creator_dpop_jkt: actor_key_id.clone(),
+        creator_auth_generation: 1,
+        protocol_instance_id,
+        creation_transition_id,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires loopback PostgreSQL and creates a private executor database"]
+async fn genuine_creation_graph_returns_the_preexisting_durable_protocol_instance() {
+    let (pool, _guard) = setup().await;
+    let expected_protocol_instance_id = Uuid::new_v4();
+    let expected_cursor_key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0xa7_u8; 32])
+        .fetch_one(&pool)
+        .await
+        .expect("derive preexisting cursor key");
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(\
+             singleton,protocol_version,protocol_instance_id,cursor_key_id\
+         ) VALUES(TRUE,'1',$1,$2)",
+    )
+    .bind(expected_protocol_instance_id)
+    .bind(&expected_cursor_key)
+    .execute(&pool)
+    .await
+    .expect("seed a distinct preexisting protocol singleton");
+
+    let conversation_id = Uuid::new_v4();
+    let entry = build_real_creation_entry(*conversation_id.as_bytes());
+    let graph = seed_genuine_creation_graph(&pool, &entry, None, None).await;
+
+    assert_eq!(graph.protocol_instance_id, expected_protocol_instance_id);
+    let durable: (Uuid, String) = sqlx::query_as(
+        "SELECT protocol_instance_id,cursor_key_id \
+         FROM chat.protocol_instances WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read durable singleton after graph seed");
+    assert_eq!(
+        durable,
+        (expected_protocol_instance_id, expected_cursor_key),
+        "fixture must report and preserve the preexisting durable singleton"
+    );
+}
+
 /// Drops a uniquely-named per-run executor database (best-effort) when it falls
 /// out of scope. Every executor test binds this guard so its private DB is torn
 /// down at the end; a leaked `chat_exec_<uuid>` DB from a crashed run is
@@ -539,6 +1228,7 @@ pub async fn build_creation_with_invitee(
             author_key_id: alice_key_id.clone(),
             metadata_snapshot_id: Uuid::new_v4(),
         }),
+        metadata_avatar: None,
         participant_period_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
         leaf_period_ids: vec![Uuid::new_v4()],
         entry_recipients: entry_audience(&alice_id, &alice_did, &bob_id, &bob_did),
@@ -725,6 +1415,7 @@ pub async fn acceptance_ctx(
         },
         opened_leaves: vec![],
         metadata_author: None,
+        metadata_avatar: None,
         participant_period_ids: vec![],
         leaf_period_ids: vec![],
         entry_recipients: entry_audience(&fixture.alice_id, &fixture.alice_did, bob_id, bob_did),
@@ -1087,6 +1778,7 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
             author_key_id: fixture.alice_key_id.clone(),
             metadata_snapshot_id: Uuid::new_v4(),
         }),
+        metadata_avatar: None,
         participant_period_ids,
         leaf_period_ids: vec![Uuid::new_v4()],
         entry_recipients,
