@@ -65,12 +65,12 @@ fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
 
     assert_eq!(
         migration.len(),
-        6_570,
+        6_722,
         "the reviewed 00003 migration changed byte length"
     );
     assert_eq!(
         hex::encode(Sha384::digest(migration)),
-        "67cd6f9033b97d206f478a2baeee31dbd337a4e6d5e3bb5158467afc95064b91a6a81b202e11eae86f8d909de040b467",
+        "d42c64d98f6af2042ecf5d08b925aaadae01efcd7d1f6d1887c5485e0862d80304bb9ba54506a1876eba54b505d4114a",
         "the reviewed 00003 migration changed raw-byte SHA-384"
     );
     assert!(!sql.lines().any(|line| line.trim() == "BEGIN;"));
@@ -116,10 +116,23 @@ fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
     }
 
     let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !compact.contains("FROM pg_constraint constraint "),
+        "CONSTRAINT is a PostgreSQL keyword and cannot be an unquoted relation alias"
+    );
+    assert!(
+        !compact.contains("constraint."),
+        "the reserved relation alias must not reappear in a catalog reference"
+    );
+    assert_eq!(
+        compact.matches("FROM pg_constraint constraint_row").count(),
+        2,
+        "both exact catalog probes must use the non-keyword relation alias"
+    );
     for required in [
-        "constraint.conrelid = 'chat.operation_claims'::regclass",
-        "constraint.connamespace = 'chat'::regnamespace",
-        "constraint.conname = 'operation_claims_principal_fk'",
+        "constraint_row.conrelid = 'chat.operation_claims'::regclass",
+        "constraint_row.connamespace = 'chat'::regnamespace",
+        "constraint_row.conname = 'operation_claims_principal_fk'",
         "actual_type IS DISTINCT FROM 'f'",
         "actual_validated IS DISTINCT FROM TRUE",
         "actual_referenced_table IS DISTINCT FROM 'chat.principals'::regclass",
@@ -129,8 +142,8 @@ fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
         "actual_parent IS DISTINCT FROM 0",
         "actual_source_columns IS DISTINCT FROM ARRAY['principal_did']::TEXT[]",
         "actual_referenced_columns IS DISTINCT FROM ARRAY['user_did']::TEXT[]",
-        "FROM unnest(constraint.conkey) WITH ORDINALITY",
-        "FROM unnest(constraint.confkey) WITH ORDINALITY",
+        "FROM unnest(constraint_row.conkey) WITH ORDINALITY",
+        "FROM unnest(constraint_row.confkey) WITH ORDINALITY",
         "FOREIGN KEY (principal_did) REFERENCES chat.principals(user_did) DEFERRABLE INITIALLY DEFERRED",
     ] {
         assert!(
@@ -207,6 +220,10 @@ fn operation_claim_rollout_inventory_orders_deferral_before_activation() {
     assert!(readme.contains(
         "SET LOCAL chat.operation_claim_activation_approved = \
          'handlers-and-legacy-apis-sealed'"
+    ));
+    assert!(readme.contains("Raw-file size: `6722` bytes."));
+    assert!(readme.contains(
+        "d42c64d98f6af2042ecf5d08b925aaadae01efcd7d1f6d1887c5485e0862d80304bb9ba54506a1876eba54b505d4114a"
     ));
     assert!(readme.contains("normalized live constraint-catalog fingerprint remains pending"));
 }

@@ -22,32 +22,32 @@ DECLARE
     actual_referenced_columns TEXT[];
 BEGIN
     SELECT
-        constraint.oid,
-        pg_get_constraintdef(constraint.oid, false),
-        constraint.contype,
-        constraint.convalidated,
-        constraint.condeferrable,
-        constraint.condeferred,
-        constraint.confrelid,
-        constraint.confmatchtype,
-        constraint.confupdtype,
-        constraint.confdeltype,
-        constraint.conparentid,
+        constraint_row.oid,
+        pg_get_constraintdef(constraint_row.oid, false),
+        constraint_row.contype,
+        constraint_row.convalidated,
+        constraint_row.condeferrable,
+        constraint_row.condeferred,
+        constraint_row.confrelid,
+        constraint_row.confmatchtype,
+        constraint_row.confupdtype,
+        constraint_row.confdeltype,
+        constraint_row.conparentid,
         ARRAY(
             SELECT attribute.attname
-              FROM unnest(constraint.conkey) WITH ORDINALITY
+              FROM unnest(constraint_row.conkey) WITH ORDINALITY
                    AS key(attnum, ordinal)
               JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint.conrelid
+                ON attribute.attrelid = constraint_row.conrelid
                AND attribute.attnum = key.attnum
              ORDER BY key.ordinal
         ),
         ARRAY(
             SELECT attribute.attname
-              FROM unnest(constraint.confkey) WITH ORDINALITY
+              FROM unnest(constraint_row.confkey) WITH ORDINALITY
                    AS key(attnum, ordinal)
               JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint.confrelid
+                ON attribute.attrelid = constraint_row.confrelid
                AND attribute.attnum = key.attnum
              ORDER BY key.ordinal
         )
@@ -65,10 +65,10 @@ BEGIN
         actual_parent,
         actual_source_columns,
         actual_referenced_columns
-      FROM pg_constraint constraint
-     WHERE constraint.conrelid = 'chat.operation_claims'::regclass
-       AND constraint.connamespace = 'chat'::regnamespace
-       AND constraint.conname = 'operation_claims_principal_fk';
+      FROM pg_constraint constraint_row
+     WHERE constraint_row.conrelid = 'chat.operation_claims'::regclass
+       AND constraint_row.connamespace = 'chat'::regnamespace
+       AND constraint_row.conname = 'operation_claims_principal_fk';
 
     IF constraint_oid IS NULL
        OR actual_type IS DISTINCT FROM 'f'
@@ -117,32 +117,32 @@ DECLARE
     actual_referenced_columns TEXT[];
 BEGIN
     SELECT
-        constraint.oid,
-        pg_get_constraintdef(constraint.oid, false),
-        constraint.contype,
-        constraint.convalidated,
-        constraint.condeferrable,
-        constraint.condeferred,
-        constraint.confrelid,
-        constraint.confmatchtype,
-        constraint.confupdtype,
-        constraint.confdeltype,
-        constraint.conparentid,
+        constraint_row.oid,
+        pg_get_constraintdef(constraint_row.oid, false),
+        constraint_row.contype,
+        constraint_row.convalidated,
+        constraint_row.condeferrable,
+        constraint_row.condeferred,
+        constraint_row.confrelid,
+        constraint_row.confmatchtype,
+        constraint_row.confupdtype,
+        constraint_row.confdeltype,
+        constraint_row.conparentid,
         ARRAY(
             SELECT attribute.attname
-              FROM unnest(constraint.conkey) WITH ORDINALITY
+              FROM unnest(constraint_row.conkey) WITH ORDINALITY
                    AS key(attnum, ordinal)
               JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint.conrelid
+                ON attribute.attrelid = constraint_row.conrelid
                AND attribute.attnum = key.attnum
              ORDER BY key.ordinal
         ),
         ARRAY(
             SELECT attribute.attname
-              FROM unnest(constraint.confkey) WITH ORDINALITY
+              FROM unnest(constraint_row.confkey) WITH ORDINALITY
                    AS key(attnum, ordinal)
               JOIN pg_attribute attribute
-                ON attribute.attrelid = constraint.confrelid
+                ON attribute.attrelid = constraint_row.confrelid
                AND attribute.attnum = key.attnum
              ORDER BY key.ordinal
         )
@@ -160,10 +160,10 @@ BEGIN
         actual_parent,
         actual_source_columns,
         actual_referenced_columns
-      FROM pg_constraint constraint
-     WHERE constraint.conrelid = 'chat.operation_claims'::regclass
-       AND constraint.connamespace = 'chat'::regnamespace
-       AND constraint.conname = 'operation_claims_principal_fk';
+      FROM pg_constraint constraint_row
+     WHERE constraint_row.conrelid = 'chat.operation_claims'::regclass
+       AND constraint_row.connamespace = 'chat'::regnamespace
+       AND constraint_row.conname = 'operation_claims_principal_fk';
 
     IF constraint_oid IS NULL
        OR actual_type IS DISTINCT FROM 'f'

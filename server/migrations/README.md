@@ -51,6 +51,14 @@ migrations:
    - Locks the claim table and fails closed unless the installed constraint is
      the exact validated, immediate FK created by `00001`; a postflight proves
      the exact validated deferred replacement.
+   - Before any successful application, PostgreSQL rejected the original source
+     because it used the keyword `constraint` as an unquoted relation alias.
+     The pre-application amendment changes only that alias to `constraint_row`;
+     see
+     [`../docs/20260729-operation-claim-principal-fk-migration-amendment.md`](../docs/20260729-operation-claim-principal-fk-migration-amendment.md).
+   - Raw-file size: `6722` bytes.
+   - SQLx SHA-384:
+     `d42c64d98f6af2042ecf5d08b925aaadae01efcd7d1f6d1887c5485e0862d80304bb9ba54506a1876eba54b505d4114a`.
    - The normalized live constraint-catalog fingerprint remains pending a
      reviewed fresh-database refresh.
 
