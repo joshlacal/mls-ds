@@ -54,11 +54,52 @@ migrations:
    - The normalized live constraint-catalog fingerprint remains pending a
      reviewed fresh-database refresh.
 
-The final completeness cutover is not yet a migration. Its reviewed readiness
-body lives at
-[`../docs/operation_claim_completeness_activation.sql`](../docs/operation_claim_completeness_activation.sql).
-Freeze it into a new forward migration only after its preflight proves that no
-receipt-only writer remains. Never edit `20260728000001` to perform activation.
+4. **20260728000004_activate_operation_claim_completeness.sql**
+   - Activates future-row receipt-to-claim completeness after the production
+     writer drain.
+   - Corrects the endpoint-kind mapping forward-only: `requestLeave` accepts
+     both `leaveRequestBody` and `zeroLeafLeaveBody`, while
+     `submitTransition` excludes `zeroLeafLeaveBody`.
+   - Under exclusive locks on both writer tables, records the exact bounded
+     legacy orphan set as a count plus a domain-separated SHA-256 over the
+     sorted immutable operation IDs, then recomputes both values fail-closed
+     after classification.
+   - Leaves the future-row `CHECK (operation_claim_required)` intentionally
+     `NOT VALID` so bounded retained legacy rows remain representable, while
+     validating the new `MATCH FULL` receipt-to-claim FK.
+   - The normalized live column, constraint, function, and trigger catalog
+     fingerprints remain pending the separately authorized post-`00004`
+     database gate.
+
+The reviewed source at
+[`../docs/operation_claim_completeness_activation.sql`](../docs/operation_claim_completeness_activation.sql)
+must remain byte-for-byte identical to `00004`. Never edit `00001` through
+`00003` to perform activation.
+
+### Authorizing migration `20260728000004`
+
+`00004` fails before taking table locks unless its exact migration connection
+has the custom GUC value
+`chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed`.
+Do not set this globally or weaken the gate.
+
+For `sqlx-cli`, set the value only on the newly opened migration connection:
+
+```bash
+PGOPTIONS="-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed" \
+  sqlx migrate run
+```
+
+For a runner that exposes the exact transaction connection, set the local value
+on that same transaction before invoking the migration:
+
+```sql
+SET LOCAL chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed';
+```
+
+Setting the GUC on some other pooled connection does not authorize the
+migration. Automatic startup migration must likewise inject the value into the
+connection that actually executes `00004`.
 
 ## Running Migrations
 

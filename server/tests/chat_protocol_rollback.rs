@@ -42,6 +42,7 @@
 //! exceptions explicitly.
 //!
 //! Run with:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_rollback -- --include-ignored --test-threads=1
 

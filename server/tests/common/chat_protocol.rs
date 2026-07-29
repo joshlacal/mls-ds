@@ -9,6 +9,17 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use url::Url;
 
 pub const CHAT_PROTOCOL_TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
+pub const CHAT_OPERATION_CLAIM_ACTIVATION_APPROVAL: &str = "handlers-and-legacy-apis-sealed";
+
+pub fn validate_chat_protocol_activation_approval(value: Option<&str>) -> Result<(), &'static str> {
+    match value {
+        Some(CHAT_OPERATION_CLAIM_ACTIVATION_APPROVAL) => Ok(()),
+        _ => Err(
+            "CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED must exactly equal \
+             handlers-and-legacy-apis-sealed",
+        ),
+    }
+}
 
 pub fn validate_chat_protocol_database_url(
     value: Option<&str>,
@@ -42,6 +53,10 @@ pub async fn setup_chat_protocol_db(max_connections: u32) -> PgPool {
         .expect("TEST_DATABASE_URL must explicitly name catbird_chat_protocol_test_20260722");
     validate_chat_protocol_database_url(Some(&database_url))
         .expect("unsafe TEST_DATABASE_URL for clean-chat repository test");
+    let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
+        .expect("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED must authorize migration 00004");
+    validate_chat_protocol_activation_approval(Some(&activation_approval))
+        .expect("invalid operation-claim activation approval");
 
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
@@ -80,9 +95,29 @@ pub async fn setup_chat_protocol_db(max_connections: u32) -> PgPool {
         "refusing a non-local clean-chat database at {server_address:?}",
     );
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    let mut migration_connection = pool
+        .acquire()
         .await
+        .expect("acquire the exact clean-chat migration connection");
+    sqlx::query(
+        "SET chat.operation_claim_activation_approved = \
+         'handlers-and-legacy-apis-sealed'",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("authorize operation-claim activation on the exact migration connection");
+    let migration_result = sqlx::migrate!("./migrations")
+        .run(&mut *migration_connection)
+        .await;
+    sqlx::query("RESET chat.operation_claim_activation_approved")
+        .execute(&mut *migration_connection)
+        .await
+        .expect("reset operation-claim activation approval on the migration connection");
+    migration_connection
+        .close()
+        .await
+        .expect("close the exact clean-chat migration connection");
+    migration_result
         .expect("run the production migration set on the dedicated clean-chat database");
     pool
 }

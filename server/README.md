@@ -217,7 +217,7 @@ make status         # Check service status
 - **[CLAUDE.md](CLAUDE.md)** - Developer guide
 - **[DATABASE_SCHEMA.md](DATABASE_SCHEMA.md)** - Database schema documentation
 - **[migrations/README.md](migrations/README.md)** - Migration ordering, checksums, and staged rollouts
-- **[Operation claim completeness activation](docs/operation_claim_completeness_activation.sql)** - Reviewed cutover body; not yet a migration
+- **[Operation claim completeness activation](docs/operation_claim_completeness_activation.sql)** - Reviewed byte-for-byte mirror of the gated `20260728000004` forward migration
 - **[scripts/README.md](scripts/README.md)** - Scripts documentation
 
 ## 🔒 Security

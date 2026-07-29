@@ -119,6 +119,12 @@ pub fn maintenance_url_from_env() -> String {
         .expect("TEST_DATABASE_URL must name the loopback clean-chat test database");
     crate::common::chat_protocol::validate_chat_protocol_database_url(Some(&database_url))
         .expect("unsafe TEST_DATABASE_URL for the fresh-DB executor harness");
+    let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
+        .expect("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED must authorize migration 00004");
+    crate::common::chat_protocol::validate_chat_protocol_activation_approval(Some(
+        &activation_approval,
+    ))
+    .expect("invalid operation-claim activation approval");
     let mut parsed = url::Url::parse(&database_url).expect("valid TEST_DATABASE_URL");
     parsed.set_path("/postgres");
     parsed.into()
@@ -145,10 +151,29 @@ pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
         .connect(db_url.as_str())
         .await
         .expect("connect to the fresh per-run executor database");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    let mut migration_connection = pool
+        .acquire()
         .await
-        .expect("run the production migration set on the fresh executor database");
+        .expect("acquire the exact fresh-executor migration connection");
+    sqlx::query(
+        "SET chat.operation_claim_activation_approved = \
+         'handlers-and-legacy-apis-sealed'",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("authorize operation-claim activation on the exact migration connection");
+    let migration_result = sqlx::migrate!("./migrations")
+        .run(&mut *migration_connection)
+        .await;
+    sqlx::query("RESET chat.operation_claim_activation_approved")
+        .execute(&mut *migration_connection)
+        .await
+        .expect("reset operation-claim activation approval on the migration connection");
+    migration_connection
+        .close()
+        .await
+        .expect("close the exact fresh-executor migration connection");
+    migration_result.expect("run the production migration set on the fresh executor database");
     (
         pool,
         FreshDbGuard {

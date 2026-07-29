@@ -1,4 +1,9 @@
 //! Focused authority-boundary tests for the clean-chat Reset repository.
+//!
+//! Run live cases against the dedicated clean-chat database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_reset_repository -- --test-threads=1
 
 #![allow(dead_code)]
 

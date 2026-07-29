@@ -18,6 +18,7 @@
 //!
 //! The authenticated (database) cases are `#[ignore]`d like the other clean-chat
 //! live suites; run them explicitly against the dedicated database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_device_handlers -- --ignored --test-threads=1
 

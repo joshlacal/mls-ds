@@ -14,6 +14,7 @@
 //! clean-chat database is never truncated.
 //!
 //! Run against the dedicated clean-chat database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_device_directory -- --test-threads=1
 

@@ -1,13 +1,28 @@
 //! Durable global-operation claim contract for clean chat.
 //!
 //! Run against the dedicated local database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_operation_claims -- --test-threads=1
 
 mod common;
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use sha2::{Digest, Sha256, Sha384};
 use sqlx::{PgPool, Postgres, Row, Transaction};
+
+fn rust_sources_under(directory: &Path, sources: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(directory).expect("read Rust source directory") {
+        let path = entry.expect("read Rust source entry").path();
+        if path.is_dir() {
+            rust_sources_under(&path, sources);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
+    }
+}
 
 #[test]
 fn installed_operation_claim_migration_keeps_its_frozen_raw_bytes() {
@@ -22,6 +37,23 @@ fn installed_operation_claim_migration_keeps_its_frozen_raw_bytes() {
         hex::encode(Sha384::digest(migration)),
         "fd71f2eb5235226371f113b5738b752b27e901b72810e9ec1e1f201e979606e0b09a16be087103e4146b4fb9f8bdff8f",
         "the installed 00001 migration changed raw-byte SHA-384"
+    );
+}
+
+#[test]
+fn exact_kind_migration_keeps_its_frozen_raw_bytes() {
+    let migration =
+        include_bytes!("../migrations/20260728000002_exact_operation_claim_mutation_kind.sql");
+
+    assert_eq!(
+        migration.len(),
+        16_972,
+        "the installed 00002 migration changed byte length"
+    );
+    assert_eq!(
+        hex::encode(Sha384::digest(migration)),
+        "a5c0225818e350415e0ad3a88c5016d621a75bb64563f97023de9d27498cf113d8ef9d95c98621036c15ac3398dbee17",
+        "the installed 00002 migration changed raw-byte SHA-384"
     );
 }
 
@@ -137,6 +169,23 @@ fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
 }
 
 #[test]
+fn operation_claim_completeness_migration_keeps_its_review_bytes() {
+    let migration =
+        include_bytes!("../migrations/20260728000004_activate_operation_claim_completeness.sql");
+
+    assert_eq!(
+        migration.len(),
+        15_837,
+        "the reviewed 00004 migration changed byte length"
+    );
+    assert_eq!(
+        hex::encode(Sha384::digest(migration)),
+        "d7f92b96421a33f0385789f44c0fc2986321e8c7487e79e96c9c4880a1853e4c9d7d32f36bf3dfd22ff07a1cd6fb1674",
+        "the reviewed 00004 migration changed raw-byte SHA-384"
+    );
+}
+
+#[test]
 fn operation_claim_rollout_inventory_orders_deferral_before_activation() {
     let readme = include_str!("../migrations/README.md");
     let claims = readme
@@ -149,12 +198,16 @@ fn operation_claim_rollout_inventory_orders_deferral_before_activation() {
         .find("20260728000003_defer_operation_claim_principal_fk.sql")
         .expect("principal-FK migration docs");
     let activation = readme
-        .find("The final completeness cutover is not yet a migration")
-        .expect("activation remains staged");
+        .find("20260728000004_activate_operation_claim_completeness.sql")
+        .expect("activation migration docs");
 
     assert!(
         claims < exact_kind && exact_kind < deferred_principal && deferred_principal < activation
     );
+    assert!(readme.contains(
+        "SET LOCAL chat.operation_claim_activation_approved = \
+         'handlers-and-legacy-apis-sealed'"
+    ));
     assert!(readme.contains("normalized live constraint-catalog fingerprint remains pending"));
 }
 
@@ -214,7 +267,112 @@ fn exact_kind_migration_is_nul_safe_and_stages_legacy_receipts() {
 
 #[test]
 fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orphans() {
-    let sql = include_str!("../docs/operation_claim_completeness_activation.sql");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_root = manifest.join("src");
+    let mut sources = Vec::new();
+    rust_sources_under(&source_root, &mut sources);
+    let relative_writer_paths = sources
+        .iter()
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(path).expect("read Rust source");
+            let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            (compact.contains("INSERT INTO chat.idempotency_records"))
+                .then(|| path.strip_prefix(manifest).unwrap().to_path_buf())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        relative_writer_paths,
+        [
+            Path::new("src/chat_protocol/repository/auth.rs").to_path_buf(),
+            Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf(),
+        ]
+        .into_iter()
+        .collect(),
+        "only the shared prelude and cfg(test) compatibility fixtures may insert receipts"
+    );
+    let claim_writer_paths = sources
+        .iter()
+        .filter_map(|path| {
+            let source = std::fs::read_to_string(path).expect("read Rust source");
+            let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
+            (compact.contains("INSERT INTO chat.operation_claims"))
+                .then(|| path.strip_prefix(manifest).unwrap().to_path_buf())
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        claim_writer_paths,
+        [Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf()]
+            .into_iter()
+            .collect(),
+        "the shared operation prelude must remain the only claim writer"
+    );
+
+    let auth_source = std::fs::read_to_string(source_root.join("chat_protocol/repository/auth.rs"))
+        .expect("read authentication repository");
+    for test_only_api in [
+        "test_arbitrate_business_idempotency",
+        "test_recheck_business_authority",
+        "test_record_completed_idempotency",
+    ] {
+        let marker = format!("#[cfg(test)]\npub(crate) async fn {test_only_api}");
+        assert!(
+            auth_source.contains(&marker),
+            "{test_only_api} must remain visibly test-only"
+        );
+    }
+    for retired_api in [
+        "pub(crate) async fn arbitrate_business_idempotency",
+        "pub(crate) async fn recheck_business_authority",
+        "pub(crate) async fn record_completed_idempotency",
+    ] {
+        assert!(
+            !auth_source.contains(retired_api),
+            "retired production receipt bypass resurfaced: {retired_api}"
+        );
+    }
+
+    for (handler, prepare, complete) in [
+        (
+            "enroll_device.rs",
+            "prelude::prepare_enrollment_operation",
+            "prelude::complete_enrollment_bootstrap_operation",
+        ),
+        (
+            "rebind_device_authentication.rs",
+            "prelude::prepare_rebind_operation",
+            "prelude::complete_rebind_bootstrap_operation",
+        ),
+        (
+            "replenish_key_packages.rs",
+            "prelude::prepare_replenishment_operation",
+            "prelude::complete_replenishment_operation",
+        ),
+    ] {
+        let source = std::fs::read_to_string(source_root.join("handlers/chat").join(handler))
+            .unwrap_or_else(|error| panic!("read {handler}: {error}"));
+        assert!(
+            source.contains(prepare),
+            "{handler} bypasses claim preparation"
+        );
+        assert!(
+            source.contains(complete),
+            "{handler} bypasses sealed completion"
+        );
+        assert!(
+            !source.contains("INSERT INTO"),
+            "{handler} writes around the repository boundary"
+        );
+    }
+
+    let migration_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260728000004_activate_operation_claim_completeness.sql");
+    let migration = std::fs::read(&migration_path).expect("read activation migration");
+    let sql = std::str::from_utf8(&migration).expect("activation migration is UTF-8");
+    let template = include_bytes!("../docs/operation_claim_completeness_activation.sql");
+    assert_eq!(
+        migration, template,
+        "the reviewed activation template must mirror the forward migration exactly"
+    );
 
     for handler in [
         "blue.catbird.chat.enrollDevice",
@@ -234,6 +392,8 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
     assert!(sql.contains("ACCESS EXCLUSIVE MODE"));
     assert!(sql.contains("operation_claim_completeness_cutover"));
     assert!(sql.contains("cutover_at TIMESTAMPTZ NOT NULL"));
+    assert!(sql.contains("legacy_receipt_set_sha256 BYTEA NOT NULL"));
+    assert!(sql.contains("octet_length(legacy_receipt_set_sha256) = 32"));
     assert!(sql.contains("operation_claim_required BOOLEAN"));
     assert!(sql.contains("ALTER COLUMN operation_claim_required SET DEFAULT TRUE"));
     assert!(sql.contains("MATCH FULL"));
@@ -245,6 +405,60 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
         .unwrap();
     let first_writer_lock = sql.find("LOCK TABLE chat.operation_claims").unwrap();
     assert!(approval_gate < first_writer_lock);
+    assert_eq!(
+        sql.matches("LOCK TABLE chat.operation_claims IN ACCESS EXCLUSIVE MODE")
+            .count(),
+        1
+    );
+    assert_eq!(
+        sql.matches("LOCK TABLE chat.idempotency_records IN ACCESS EXCLUSIVE MODE")
+            .count(),
+        1
+    );
+
+    let corrected_endpoint_mapping = sql
+        .split_once("CREATE OR REPLACE FUNCTION chat.operation_endpoint_accepts_kind")
+        .expect("corrected endpoint-kind mapping")
+        .1
+        .split_once("-- PRE-FK PREFLIGHT 1")
+        .expect("mapping ends before the first preflight")
+        .0
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(corrected_endpoint_mapping.contains(
+        "WHEN 'blue.catbird.chat.requestLeave' THEN kind = ANY (ARRAY[ \
+         'blue.catbird.chat.defs#leaveRequestBody', \
+         'blue.catbird.chat.defs#zeroLeafLeaveBody' ])"
+    ));
+    let submit_transition = corrected_endpoint_mapping
+        .split_once("WHEN 'blue.catbird.chat.submitTransition'")
+        .expect("submitTransition endpoint-kind arm")
+        .1
+        .split_once("ELSE FALSE")
+        .expect("submitTransition arm ends before the fallback")
+        .0;
+    assert!(submit_transition.contains("commitTransitionBody"));
+    assert!(submit_transition.contains("policyTransitionBody"));
+    assert!(submit_transition.contains("metadataTransitionBody"));
+    assert!(submit_transition.contains("leafRecoveryFulfillmentBody"));
+    assert!(submit_transition.contains("leaveCommitFulfillmentBody"));
+    assert!(!submit_transition.contains("zeroLeafLeaveBody"));
+
+    assert_eq!(
+        sql.matches("CATBIRD-CHAT-LEGACY-RECEIPT-SET").count(),
+        2,
+        "baseline and post-classification must use the same domain-separated digest"
+    );
+    assert_eq!(
+        sql.matches("string_agg(receipt.operation_id::text, ',' ORDER BY receipt.operation_id)")
+            .count(),
+        2,
+        "baseline and post-classification must hash the exact sorted legacy set"
+    );
+    assert!(sql.contains("classified_legacy_set_sha256 BYTEA"));
+    assert!(sql.contains("recorded_legacy_set_sha256 BYTEA"));
+    assert!(sql.contains("classified_legacy_set_sha256 <> recorded_legacy_set_sha256"));
 
     let classify_legacy = sql.find("SET operation_claim_required = EXISTS").unwrap();
     let enforce_future_rows = sql
@@ -668,6 +882,65 @@ async fn transcript_classifier_is_exact_nul_safe_and_closed_over_all_kinds() {
 }
 
 #[tokio::test]
+async fn activated_endpoint_kind_mapping_matches_the_frozen_rust_authority() {
+    let pool = operation_claim_pool().await;
+    for (endpoint, kind, expected) in [
+        (
+            "blue.catbird.chat.requestLeave",
+            "blue.catbird.chat.defs#leaveRequestBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.requestLeave",
+            "blue.catbird.chat.defs#zeroLeafLeaveBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#zeroLeafLeaveBody",
+            false,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#commitTransitionBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#policyTransitionBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#metadataTransitionBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+            true,
+        ),
+        (
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.defs#leaveCommitFulfillmentBody",
+            true,
+        ),
+    ] {
+        let accepted: bool =
+            sqlx::query_scalar("SELECT chat.operation_endpoint_accepts_kind($1,$2)")
+                .bind(endpoint)
+                .bind(kind)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            accepted, expected,
+            "wrong live endpoint-kind mapping for {endpoint} / {kind}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn deferred_mapping_rejects_allowed_but_wrong_exact_kind() {
     let pool = operation_claim_pool().await;
     let mut transaction = pool.begin().await.unwrap();
@@ -811,59 +1084,101 @@ async fn claim_without_exactly_one_receipt_is_rejected_and_rollback_releases_the
 }
 
 #[tokio::test]
-async fn staged_rollout_temporarily_allows_legacy_receipt_without_claim() {
+async fn post_cutover_receipts_cannot_bypass_operation_claim_completeness() {
     let pool = operation_claim_pool().await;
-    let operation_id = uuid::Uuid::new_v4();
-    let principal = "did:web:legacy-receipt.example.com";
-    let accepted_request_bytes = serde_json::to_vec(&serde_json::json!({
-        "body": {
-            "$type": "blue.catbird.chat.defs#resetRequestBody",
-            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
-            "idempotencyKey": operation_id,
-        },
-        "signature": "test-only"
-    }))
-    .unwrap();
-    let mut signing_transcript_bytes = b"CATBIRD-CHAT-RESET-REQUEST\0".to_vec();
-    signing_transcript_bytes.extend_from_slice(b"canonical-projection");
-    let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
-    let response_bytes = br#"{"ok":true}"#;
-    let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
-    let mut transaction = pool.begin().await.unwrap();
+    let principal = "did:web:post-cutover-receipt.example.com";
     sqlx::query(
         "INSERT INTO chat.principals(user_did,created_at)
          VALUES($1,clock_timestamp()) ON CONFLICT DO NOTHING",
     )
     .bind(principal)
-    .execute(&mut *transaction)
+    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
-        r#"
-        INSERT INTO chat.idempotency_records(
-            principal_did,endpoint_nsid,operation_id,request_digest,
-            accepted_request_bytes,signing_transcript_bytes,signature,
-            completed_status,response_bytes,response_sha256,completed_at
-        ) VALUES(
-            $1,'blue.catbird.chat.requestReset',$2,$3,$4,$5,$6,
-            200,$7,$8,clock_timestamp()
-        )
-        "#,
-    )
-    .bind(principal)
-    .bind(operation_id)
-    .bind(request_digest.as_slice())
-    .bind(&accepted_request_bytes)
-    .bind(&signing_transcript_bytes)
-    .bind([51_u8; 64].as_slice())
-    .bind(response_bytes.as_slice())
-    .bind(response_sha256.as_slice())
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
-    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
-        .execute(&mut *transaction)
-        .await
-        .expect("legacy receipt-only completion remains staged until handler migration");
-    transaction.rollback().await.unwrap();
+
+    for (label, marker_sql, expected_code) in [
+        ("default TRUE without a claim", "", "23503"),
+        (
+            "explicit FALSE exception forgery",
+            ",operation_claim_required",
+            "23514",
+        ),
+        (
+            "explicit NULL exception bypass",
+            ",operation_claim_required",
+            "23502",
+        ),
+    ] {
+        let operation_id = uuid::Uuid::new_v4();
+        let accepted_request_bytes = serde_json::to_vec(&serde_json::json!({
+            "body": {
+                "$type": "blue.catbird.chat.defs#resetRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+                "idempotencyKey": operation_id,
+            },
+            "signature": "test-only"
+        }))
+        .unwrap();
+        let mut signing_transcript_bytes = b"CATBIRD-CHAT-RESET-REQUEST\0".to_vec();
+        signing_transcript_bytes.extend_from_slice(operation_id.as_bytes());
+        let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
+        let response_bytes = br#"{"ok":true}"#;
+        let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
+        let sql = if marker_sql.is_empty() {
+            r#"
+            INSERT INTO chat.idempotency_records(
+                principal_did,endpoint_nsid,operation_id,request_digest,
+                accepted_request_bytes,signing_transcript_bytes,signature,
+                completed_status,response_bytes,response_sha256,completed_at
+            ) VALUES(
+                $1,'blue.catbird.chat.requestReset',$2,$3,$4,$5,$6,
+                200,$7,$8,clock_timestamp()
+            )
+            "#
+        } else if label.starts_with("explicit FALSE") {
+            r#"
+            INSERT INTO chat.idempotency_records(
+                principal_did,endpoint_nsid,operation_id,request_digest,
+                accepted_request_bytes,signing_transcript_bytes,signature,
+                completed_status,response_bytes,response_sha256,completed_at,
+                operation_claim_required
+            ) VALUES(
+                $1,'blue.catbird.chat.requestReset',$2,$3,$4,$5,$6,
+                200,$7,$8,clock_timestamp(),FALSE
+            )
+            "#
+        } else {
+            r#"
+            INSERT INTO chat.idempotency_records(
+                principal_did,endpoint_nsid,operation_id,request_digest,
+                accepted_request_bytes,signing_transcript_bytes,signature,
+                completed_status,response_bytes,response_sha256,completed_at,
+                operation_claim_required
+            ) VALUES(
+                $1,'blue.catbird.chat.requestReset',$2,$3,$4,$5,$6,
+                200,$7,$8,clock_timestamp(),NULL
+            )
+            "#
+        };
+        let error = sqlx::query(sql)
+            .bind(principal)
+            .bind(operation_id)
+            .bind(request_digest.as_slice())
+            .bind(&accepted_request_bytes)
+            .bind(&signing_transcript_bytes)
+            .bind([51_u8; 64].as_slice())
+            .bind(response_bytes.as_slice())
+            .bind(response_sha256.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref(),
+            Some(expected_code),
+            "{label} must fail closed: {error:?}"
+        );
+    }
 }

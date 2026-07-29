@@ -6,6 +6,7 @@
 //! replay/idempotency rows that collide on a shared, never-truncated database;
 //! they need a pristine schema per run, which the standard harness does not
 //! provide. Run them explicitly against a freshly-migrated dedicated database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
 //!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
 //!   cargo test --test chat_protocol_auth_repository -- --ignored --test-threads=1
 

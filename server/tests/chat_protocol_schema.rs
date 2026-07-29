@@ -4,6 +4,13 @@
 //! database. Every run proves rollback, ordered migration boundaries, the SQLx
 //! ledger path, normalized catalog identity, and representative cross-table
 //! protocol invariants from a fresh `chat` schema.
+//!
+//! Run against the dedicated local database:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_schema -- --test-threads=1
+
+mod common;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,7 +21,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-const MIGRATION_VERSIONS: [i64; 11] = [
+const MIGRATION_VERSIONS: [i64; 12] = [
     20260722000001,
     20260722000002,
     20260722000003,
@@ -26,8 +33,9 @@ const MIGRATION_VERSIONS: [i64; 11] = [
     20260728000001,
     20260728000002,
     20260728000003,
+    20260728000004,
 ];
-const MIGRATION_FILES: [&str; 11] = [
+const MIGRATION_FILES: [&str; 12] = [
     "20260722000001_chat_protocol_core.sql",
     "20260722000002_chat_protocol_delivery.sql",
     "20260722000003_chat_protocol_blobs.sql",
@@ -39,8 +47,9 @@ const MIGRATION_FILES: [&str; 11] = [
     "20260728000001_chat_operation_claims.sql",
     "20260728000002_exact_operation_claim_mutation_kind.sql",
     "20260728000003_defer_operation_claim_principal_fk.sql",
+    "20260728000004_activate_operation_claim_completeness.sql",
 ];
-const MIGRATION_DESCRIPTIONS: [&str; 11] = [
+const MIGRATION_DESCRIPTIONS: [&str; 12] = [
     "chat protocol core",
     "chat protocol delivery",
     "chat protocol blobs",
@@ -52,15 +61,16 @@ const MIGRATION_DESCRIPTIONS: [&str; 11] = [
     "chat operation claims",
     "exact operation claim mutation kind",
     "defer operation claim principal fk",
+    "activate operation claim completeness",
 ];
 
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 //
-// LIVE-DB REFRESH REQUIRED: 20260728000001/00002/00003 require new reviewed
+// LIVE-DB REFRESH REQUIRED: 20260728000001/00002/00003/00004 require new reviewed
 // column, constraint, index, function, and trigger fingerprints. The sequence
 // catalog is structurally unchanged. Preserve these last-reviewed values until
-// the dedicated catalog gate prints the normalized post-00003 catalogs.
+// the dedicated catalog gate prints the normalized post-00004 catalogs.
 const COLUMN_CATALOG_SHA256: &str =
     "dac54118c1335492a399ed735734e557135fe944ed69e9df1bdf9e1d498e2a22";
 const CONSTRAINT_CATALOG_SHA256: &str =
@@ -131,6 +141,7 @@ const BLOB_TABLES: [&str; 4] = [
 ];
 
 const OPERATION_CLAIM_TABLES: [&str; 1] = ["operation_claims"];
+const OPERATION_CLAIM_COMPLETENESS_TABLES: [&str; 1] = ["operation_claim_completeness_cutover"];
 
 fn fixture_uuid(suffix: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(0x11111111111141118111111111111000 + suffix)
@@ -142,6 +153,7 @@ fn expected_tables() -> BTreeSet<String> {
         .chain(DELIVERY_TABLES.iter())
         .chain(BLOB_TABLES.iter())
         .chain(OPERATION_CLAIM_TABLES.iter())
+        .chain(OPERATION_CLAIM_COMPLETENESS_TABLES.iter())
         .map(|name| (*name).to_owned())
         .collect()
 }
@@ -155,7 +167,7 @@ fn migration_path(version: i64, suffix: &str) -> PathBuf {
 }
 
 #[test]
-fn clean_chat_migration_inventory_orders_claim_fk_deferral_last() {
+fn clean_chat_migration_inventory_orders_claim_completeness_last() {
     assert_eq!(
         MIGRATION_VERSIONS.len(),
         MIGRATION_FILES.len(),
@@ -170,14 +182,14 @@ fn clean_chat_migration_inventory_orders_claim_fk_deferral_last() {
         MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
         "migration versions must remain strictly increasing"
     );
-    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260728000003));
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260728000004));
     assert_eq!(
         MIGRATION_FILES.last(),
-        Some(&"20260728000003_defer_operation_claim_principal_fk.sql")
+        Some(&"20260728000004_activate_operation_claim_completeness.sql")
     );
     assert_eq!(
         MIGRATION_DESCRIPTIONS.last(),
-        Some(&"defer operation claim principal fk")
+        Some(&"activate operation claim completeness")
     );
     for file in MIGRATION_FILES {
         assert!(
@@ -185,6 +197,148 @@ fn clean_chat_migration_inventory_orders_claim_fk_deferral_last() {
             "missing migration inventory file: {file}"
         );
     }
+}
+
+#[tokio::test]
+async fn operation_claim_completeness_cutover_preserves_only_the_recorded_legacy_set() {
+    fn receipt_material(operation_id: uuid::Uuid) -> (Vec<u8>, Vec<u8>, [u8; 32], [u8; 32]) {
+        let accepted_request_bytes = serde_json::to_vec(&serde_json::json!({
+            "body": {
+                "$type": "blue.catbird.chat.defs#resetRequestBody",
+                "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\u{0000}",
+                "idempotencyKey": operation_id,
+            },
+            "signature": "test-only",
+        }))
+        .unwrap();
+        let mut signing_transcript_bytes = b"CATBIRD-CHAT-RESET-REQUEST\0".to_vec();
+        signing_transcript_bytes.extend_from_slice(operation_id.as_bytes());
+        let request_digest = Sha256::digest(&signing_transcript_bytes).into();
+        let response_sha256 = Sha256::digest(br#"{"ok":true}"#).into();
+        (
+            accepted_request_bytes,
+            signing_transcript_bytes,
+            request_digest,
+            response_sha256,
+        )
+    }
+
+    async fn insert_receipt_only(
+        pool: &PgPool,
+        principal: &str,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let (accepted_request, signing_transcript, request_digest, response_sha256) =
+            receipt_material(operation_id);
+        sqlx::query(
+            r#"
+            INSERT INTO chat.idempotency_records(
+                principal_did,endpoint_nsid,operation_id,request_digest,
+                accepted_request_bytes,signing_transcript_bytes,signature,
+                completed_status,response_bytes,response_sha256,completed_at
+            ) VALUES(
+                $1,'blue.catbird.chat.requestReset',$2,$3,$4,$5,$6,
+                200,$7,$8,clock_timestamp()
+            )
+            "#,
+        )
+        .bind(principal)
+        .bind(operation_id)
+        .bind(request_digest.as_slice())
+        .bind(accepted_request)
+        .bind(signing_transcript)
+        .bind([91_u8; 64].as_slice())
+        .bind(br#"{"ok":true}"#.as_slice())
+        .bind(response_sha256.as_slice())
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    let pool = fresh_pool().await;
+    reset_chat(&pool).await;
+    for filename in &MIGRATION_FILES[..MIGRATION_FILES.len() - 1] {
+        let sql = std::fs::read_to_string(migration_dir().join(filename))
+            .unwrap_or_else(|error| panic!("read staged migration {filename}: {error}"));
+        let mut transaction = pool.begin().await.expect("begin staged migration");
+        transaction
+            .execute(sql.as_str())
+            .await
+            .unwrap_or_else(|error| panic!("apply staged migration {filename}: {error}"));
+        transaction
+            .commit()
+            .await
+            .unwrap_or_else(|error| panic!("commit staged migration {filename}: {error}"));
+    }
+
+    let principal = "did:web:operation-claim-cutover.example.com";
+    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,clock_timestamp())")
+        .bind(principal)
+        .execute(&pool)
+        .await
+        .expect("insert staged principal");
+    let legacy_operation_id = fixture_uuid(900);
+    insert_receipt_only(&pool, principal, legacy_operation_id)
+        .await
+        .expect("insert the one known pre-cutover orphan");
+
+    let activation_sql = std::fs::read_to_string(
+        migration_dir().join("20260728000004_activate_operation_claim_completeness.sql"),
+    )
+    .expect("read operation-claim completeness migration");
+    let mut activation = pool.begin().await.expect("begin authorized activation");
+    activation
+        .execute(
+            "SET LOCAL chat.operation_claim_activation_approved = \
+             'handlers-and-legacy-apis-sealed'",
+        )
+        .await
+        .expect("authorize the exact activation transaction");
+    activation
+        .execute(activation_sql.as_str())
+        .await
+        .expect("activate operation-claim completeness");
+    activation.commit().await.expect("commit activation");
+
+    let (required, recorded_count, recorded_digest): (bool, i64, Vec<u8>) = sqlx::query_as(
+        r#"
+        SELECT receipt.operation_claim_required,
+               cutover.legacy_receipt_count,
+               cutover.legacy_receipt_set_sha256
+          FROM chat.idempotency_records receipt
+          CROSS JOIN chat.operation_claim_completeness_cutover cutover
+         WHERE receipt.operation_id=$1 AND cutover.singleton
+        "#,
+    )
+    .bind(legacy_operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the retained legacy classification");
+    let mut expected_digest = Sha256::new();
+    expected_digest.update(b"CATBIRD-CHAT-LEGACY-RECEIPT-SET");
+    expected_digest.update([0]);
+    expected_digest.update(legacy_operation_id.to_string().as_bytes());
+    assert!(!required, "the exact staged orphan must remain retained");
+    assert_eq!(recorded_count, 1, "cutover must record exactly one orphan");
+    assert_eq!(
+        recorded_digest,
+        expected_digest.finalize().as_slice(),
+        "cutover must record the exact domain-separated sorted-set digest"
+    );
+
+    let post_cutover_error = insert_receipt_only(&pool, principal, fixture_uuid(901))
+        .await
+        .expect_err("later receipt-only completion must fail closed");
+    assert_eq!(
+        post_cutover_error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("23503"),
+        "later default-TRUE receipt without a claim must fail its exact FK"
+    );
+
+    reset_chat(&pool).await;
 }
 
 fn declared_chat_tables(sql: &str) -> BTreeSet<String> {
@@ -1124,13 +1278,19 @@ async fn reset_chat(pool: &PgPool) {
             .bind(MIGRATION_VERSIONS.as_slice())
             .execute(pool)
             .await
-            .expect("remove only the eleven chat-protocol ledger rows");
+            .expect("remove only the twelve chat-protocol ledger rows");
     }
 }
 
 async fn fresh_pool() -> PgPool {
     let url = std::env::var("TEST_DATABASE_URL")
         .expect("TEST_DATABASE_URL must explicitly name catbird_chat_protocol_test_20260722");
+    let activation_approval = std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED")
+        .expect("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED must explicitly authorize 00004");
+    crate::common::chat_protocol::validate_chat_protocol_activation_approval(Some(
+        &activation_approval,
+    ))
+    .expect("refusing to authorize the operation-claim completeness migration");
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
@@ -1212,6 +1372,14 @@ async fn fresh_pool() -> PgPool {
         let sql = std::fs::read_to_string(migration_dir().join(filename))
             .unwrap_or_else(|error| panic!("read {filename}: {error}"));
         let mut tx = pool.begin().await.expect("begin ordered migration");
+        if *filename == "20260728000004_activate_operation_claim_completeness.sql" {
+            tx.execute(
+                "SET LOCAL chat.operation_claim_activation_approved = \
+                 'handlers-and-legacy-apis-sealed'",
+            )
+            .await
+            .expect("authorize operation-claim completeness on the migration transaction");
+        }
         tx.execute(sql.as_str())
             .await
             .unwrap_or_else(|error| panic!("apply {filename}: {error}"));
@@ -1230,6 +1398,7 @@ async fn fresh_pool() -> PgPool {
             OPERATION_CLAIM_TABLES.as_slice(),
             &[],
             &[],
+            OPERATION_CLAIM_COMPLETENESS_TABLES.as_slice(),
         ][index];
         cumulative.extend(newly_owned_tables.iter().map(|name| (*name).to_owned()));
         assert_eq!(
@@ -1249,15 +1418,44 @@ async fn fresh_pool() -> PgPool {
     assert_eq!(manual_ledger_rows, 0, "manual SQL spoofed the SQLx ledger");
 
     reset_chat(&pool).await;
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    let mut migration_connection = pool
+        .acquire()
         .await
-        .expect("apply production SQLx migrator path");
+        .expect("acquire the exact SQLx migration connection");
+    sqlx::query(
+        "SET chat.operation_claim_activation_approved = \
+         'handlers-and-legacy-apis-sealed'",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("authorize operation-claim completeness on the exact migration connection");
+    let migration_result = sqlx::migrate!("./migrations")
+        .run(&mut *migration_connection)
+        .await;
+    sqlx::query("RESET chat.operation_claim_activation_approved")
+        .execute(&mut *migration_connection)
+        .await
+        .expect("reset operation-claim activation approval on the migration connection");
+    let activation_approval_absent: bool = sqlx::query_scalar(
+        "SELECT NULLIF(current_setting(
+            'chat.operation_claim_activation_approved',
+            true
+        ), '') IS NULL",
+    )
+    .fetch_one(&mut *migration_connection)
+    .await
+    .expect("verify operation-claim activation approval was reset");
+    assert!(
+        activation_approval_absent,
+        "operation-claim activation approval leaked after migration"
+    );
     let sentinel: String = sqlx::query_scalar("SELECT marker FROM task2_unrelated_sentinel")
-        .fetch_one(&pool)
+        .fetch_one(&mut *migration_connection)
         .await
-        .expect("verify reset isolation sentinel");
+        .expect("verify reset isolation sentinel on the migration session");
     assert_eq!(sentinel, "preserve-me");
+    drop(migration_connection);
+    migration_result.expect("apply production SQLx migrator path");
     pool
 }
 
@@ -1521,9 +1719,10 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
         expected_tables(),
         "unexpected chat table set"
     );
-    // Source-deterministic delta: 00001 adds exactly operation_claims.
-    // The normalized post-00003 catalog fingerprint remains a separate live gate.
-    assert_eq!(actual_tables.len(), 48, "clean protocol must own 48 tables");
+    // Source-deterministic delta: 00001 adds operation_claims and 00004 adds
+    // operation_claim_completeness_cutover.
+    // The normalized post-00004 catalog fingerprint remains a separate live gate.
+    assert_eq!(actual_tables.len(), 49, "clean protocol must own 49 tables");
 
     let applied: Vec<(i64, String, bool)> = sqlx::query_as(
         "SELECT version,description,success FROM public._sqlx_migrations WHERE version=ANY($1::bigint[]) ORDER BY version",
@@ -1555,6 +1754,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
                         || name == "20260728000001_chat_operation_claims.sql"
                         || name == "20260728000002_exact_operation_claim_mutation_kind.sql"
                         || name == "20260728000003_defer_operation_claim_principal_fk.sql"
+                        || name == "20260728000004_activate_operation_claim_completeness.sql"
                 })
         })
         .map(|path| {
@@ -1570,7 +1770,7 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             .iter()
             .map(|name| (*name).to_owned())
             .collect(),
-        "clean schema must be exactly eleven ordered files"
+        "clean schema must be exactly twelve ordered files"
     );
 
     for (version, suffix, expected) in [
@@ -1628,6 +1828,11 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
             MIGRATION_VERSIONS[10],
             "defer_operation_claim_principal_fk",
             &[],
+        ),
+        (
+            MIGRATION_VERSIONS[11],
+            "activate_operation_claim_completeness",
+            OPERATION_CLAIM_COMPLETENESS_TABLES.as_slice(),
         ),
     ] {
         let sql = std::fs::read_to_string(migration_path(version, suffix))
@@ -1687,10 +1892,11 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     .fetch_one(&pool)
     .await
     .expect("count chat FKs");
-    // Source-deterministic delta: 00001 adds operation_claims_principal_fk and
-    // 00002 drops the staged receipt->claim FK, an exact expected net +1.
+    // Source-deterministic delta: 00001 adds operation_claims_principal_fk,
+    // 00002 drops the staged receipt->claim FK, and 00004 restores the exact
+    // validated receipt->claim FK, an exact expected net +2.
     // The regenerated constraint catalog fingerprint remains a separate live gate.
-    assert_eq!(foreign_keys, 186, "unexpected FK coverage");
+    assert_eq!(foreign_keys, 187, "unexpected FK coverage");
     assert_eq!(unvalidated_foreign_keys, 0, "all FKs must be validated");
 
     let enum_count: i64 = sqlx::query_scalar(
@@ -1936,10 +2142,11 @@ async fn clean_chat_schema_is_exact_isolated_and_fail_closed() {
     assert_catalog("trigger", &trigger_catalog, TRIGGER_CATALOG_SHA256);
     // Source-deterministic delta: 00001 adds the claim/receipt deferred pair and
     // operation_claims_immutable, an exact expected +3 authored triggers.
+    // 00004 adds operation_claim_completeness_cutover_immutable, exact +1.
     // The regenerated trigger catalog fingerprint remains a separate live gate.
     assert_eq!(
         trigger_catalog.len(),
-        154,
+        155,
         "unexpected authored trigger coverage"
     );
 
