@@ -72,17 +72,86 @@ migrations:
      legacy orphan set as a count plus a domain-separated SHA-256 over the
      sorted immutable operation IDs, then recomputes both values fail-closed
      after classification.
+   - Drains exactly the two preexisting `INITIALLY DEFERRED`
+     `idempotency_records` row-integrity constraints after populated legacy
+     classification, then restores their deferred mode before adding generated
+     columns. This avoids PostgreSQL's pending-trigger-event prohibition
+     without weakening the constraints or widening the drain.
+   - Task-9 migration lineage is explicitly reopened for this populated-upgrade
+     repair. The previously sealed `15837`-byte source had SQLx SHA-384
+     `d7f92b96421a33f0385789f44c0fc2986321e8c7487e79e96c9c4880a1853e4c9d7d32f36bf3dfd22ff07a1cd6fb1674`;
+     the repaired source below is the candidate reseal.
+   - **No deployed reset action:** do not delete or rewrite any deployed
+     `_sqlx_migrations` row, do not reapply `00004`, and do not represent the
+     repaired checksum as already installed. A database carrying the old
+     checksum requires a separately reviewed forward lineage decision. This
+     repair has been exercised only against the explicitly authorized local
+     test database; no remote database was touched.
    - Leaves the future-row `CHECK (operation_claim_required)` intentionally
      `NOT VALID` so bounded retained legacy rows remain representable, while
      validating the new `MATCH FULL` receipt-to-claim FK.
-   - The normalized live column, constraint, function, and trigger catalog
-     fingerprints remain pending the separately authorized post-`00004`
-     database gate.
+   - Raw-file size: `16432` bytes.
+   - SQLx SHA-384:
+     `7de97f6f84a9cfcbf535b990b5aec87930450cf6661c7d8cf11920bdf53fd0fe94623e9ed222a8eeb562c1ee596c5bd6`.
+   - The normalized live column, constraint, index, function, trigger, and
+     sequence fingerprints after the complete G7 migration chain are pinned by
+     `tests/chat_protocol_schema.rs`.
 
 The reviewed source at
 [`../docs/operation_claim_completeness_activation.sql`](../docs/operation_claim_completeness_activation.sql)
 must remain byte-for-byte identical to `00004`. Never edit `00001` through
 `00003` to perform activation.
+
+## G7 Inventory Entitlement Migration
+
+**20260729000001_chat_g7_inventory_entitlement.sql** is the thirteenth
+clean-chat migration. It replaces implicit conversation-inventory entitlement
+with one immutable, typed provenance arm per retained item:
+
+- `blue.catbird.chat.defs#conversationInventoryState` binds the exact
+  participant period selected for current state.
+- `blue.catbird.chat.defs#conversationRemovalTombstone` binds the exact closed
+  application interval and its terminal provenance.
+- `blue.catbird.chat.defs#conversationCloseTombstone` retains the existing
+  exact schedule-terminal proof.
+
+The forward backfill treats each legacy non-close item as an active-leaf
+selection and requires exactly one participant/interval source valid at the
+inventory session's `created_at`. It aborts on absent, ambiguous, incomplete,
+or mismatched provenance. It recomputes provenance-inclusive digests and byte
+sums without rewriting or deleting any retained payload bytes.
+
+Legacy cursor plaintext cannot be re-sealed by SQL, so the migration explicitly
+expires every pre-G7 inventory session and removes plaintext cursor columns.
+New page and event receipt tables retain only lookup hashes plus AEAD-sealed
+successor/cursor ciphertext. Materialization (`*_complete`) remains separate
+from exact-client consumption (`*_consumed`), and ticket eligibility requires
+all three domains to be both complete and consumed.
+
+Source precedence is checked only when an immutable conversation inventory item
+is inserted. Removal provenance must name the latest finite interval at the
+inventory snapshot, ordered by `(start_seq DESC, membership_interval_id DESC)`;
+the UUID coordinate is the deterministic authority tie-break when two retained
+intervals have the same start sequence. Open re-add intervals reject an older
+removal only when they are valid at the same snapshot. Never add an UPDATE-time
+or deferred historical source revalidation: later participant removal or
+interval closure must not invalidate an already retained, otherwise unexpired
+page.
+
+- Raw-file size: `76836` bytes.
+- SQLx SHA-384:
+  `2c00fc11f1d96b79c3c86320e769d70d52fecb477a8a2bc351151fd2d01e3d4c5df19cbf7a3ac482edbe16a33a0dd60e`.
+
+This digest is provisional until the separately reviewed Task 10 addendum is
+amended. The previously approved addendum digest does not authorize these
+round-two fail-closed and catalog-authority repairs.
+
+The fixed-target schema gates never repair, reset, or replay migrations. They
+first require the exact reviewed thirteen-row SQLx ledger, run only that
+reviewed migration set (which is therefore a no-op), and then require the
+ledger to be byte-for-byte unchanged. A0 fingerprint inputs are embedded in
+the test crate with reviewed hashes, so validation does not depend on files
+outside this repository.
 
 ### Authorizing migration `20260728000004`
 

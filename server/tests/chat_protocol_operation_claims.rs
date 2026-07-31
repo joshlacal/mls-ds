@@ -185,16 +185,24 @@ fn enrollment_claim_fk_deferral_migration_is_frozen_fail_closed_and_narrow() {
 fn operation_claim_completeness_migration_keeps_its_review_bytes() {
     let migration =
         include_bytes!("../migrations/20260728000004_activate_operation_claim_completeness.sql");
+    let pre_repair_sha384 =
+        "d7f92b96421a33f0385789f44c0fc2986321e8c7487e79e96c9c4880a1853e4c9d7d32f36bf3dfd22ff07a1cd6fb1674";
+    let repaired_sha384 =
+        "7de97f6f84a9cfcbf535b990b5aec87930450cf6661c7d8cf11920bdf53fd0fe94623e9ed222a8eeb562c1ee596c5bd6";
+    let actual_sha384 = hex::encode(Sha384::digest(migration));
 
     assert_eq!(
         migration.len(),
-        15_837,
+        16_432,
         "the reviewed 00004 migration changed byte length"
     );
     assert_eq!(
-        hex::encode(Sha384::digest(migration)),
-        "d7f92b96421a33f0385789f44c0fc2986321e8c7487e79e96c9c4880a1853e4c9d7d32f36bf3dfd22ff07a1cd6fb1674",
+        actual_sha384, repaired_sha384,
         "the reviewed 00004 migration changed raw-byte SHA-384"
+    );
+    assert_ne!(
+        actual_sha384, pre_repair_sha384,
+        "the repaired 00004 migration unexpectedly reverted to the pre-repair bytes"
     );
 }
 

@@ -183,6 +183,19 @@ UPDATE chat.idempotency_records receipt
         WHERE claim.operation_id = receipt.operation_id
    );
 
+-- A populated classification UPDATE queues both existing INITIALLY DEFERRED
+-- row-integrity triggers. PostgreSQL refuses the generated-column ALTER below
+-- while those events are pending, so drain exactly those two constraints after
+-- classification and then restore their original deferred mode.
+SET CONSTRAINTS
+    chat.idempotency_records_operation_claim_mapping_deferred,
+    chat.idempotency_records_revocation_mapping_deferred
+IMMEDIATE;
+SET CONSTRAINTS
+    chat.idempotency_records_operation_claim_mapping_deferred,
+    chat.idempotency_records_revocation_mapping_deferred
+DEFERRED;
+
 ALTER TABLE chat.idempotency_records
     ALTER COLUMN operation_claim_required SET NOT NULL,
     ALTER COLUMN operation_claim_required SET DEFAULT TRUE,
