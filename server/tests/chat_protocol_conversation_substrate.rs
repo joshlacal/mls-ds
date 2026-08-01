@@ -27,18 +27,15 @@ mod frozen_public_state;
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
-// `cursor.rs` and `dpop.rs` are path-included at this integration crate root,
-// where their production-relative `super::repository` imports still resolve.
-// Re-export the physically nested repository modules here without moving their
-// private visibility boundary out of `crate::chat_protocol::repository`.
+// `cursor.rs` remains path-included at this integration crate root. The actual
+// production `dpop.rs` is included only at `crate::chat_protocol::dpop`; this
+// root non-DPoP shim re-exports physically nested repository modules without
+// moving their private visibility boundary out of `crate::chat_protocol::repository`.
 mod repository {
     pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
 }
@@ -67,7 +64,11 @@ mod chat_protocol {
         pub use crate::transcript::*;
     }
     pub mod dpop {
-        pub use crate::dpop::*;
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
     }
     pub mod snapshot {
         pub use catbird_server::chat_protocol::snapshot::*;
@@ -12151,7 +12152,7 @@ mod historical_control_loader {
             );
             let non_add_policy_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.submitTransition",
@@ -12171,7 +12172,7 @@ mod historical_control_loader {
             };
             let skipped_add_policy_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.submitTransition",
@@ -12194,7 +12195,7 @@ mod historical_control_loader {
 
             let creator_only_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.createConversation",
@@ -12370,15 +12371,16 @@ mod historical_control_loader {
 
             let canonical =
                 decode_canonical_signed_mutation(&entry.raw_wrapper).expect("Creation canonical");
-            let pre_replay = crate::dpop::repository_test_evidence::ordinary_device_with_binding(
-                Uuid::new_v4(),
-                Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
-                "blue.catbird.chat.createConversation",
-                &trusted_text,
-                &entry.actor_did,
-                entry.actor_device_id,
-                &dpop_jkt,
-            );
+            let pre_replay =
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+                    Uuid::new_v4(),
+                    Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
+                    "blue.catbird.chat.createConversation",
+                    &trusted_text,
+                    &entry.actor_did,
+                    entry.actor_device_id,
+                    &dpop_jkt,
+                );
             let verified_request = match authorize_signed_request(&pool, pre_replay, canonical)
                 .await
                 .expect("authorize exact signed Creation request")
@@ -13074,7 +13076,7 @@ mod historical_control_loader {
                 rebind_creation_to_a_different_leaf_key(entry, trusted_at);
             let wrong_leaf_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.createConversation",
@@ -14103,7 +14105,7 @@ mod historical_control_loader {
 
             let creation_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.createConversation",
@@ -14123,7 +14125,7 @@ mod historical_control_loader {
             };
             let policy_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.submitTransition",
@@ -14143,7 +14145,7 @@ mod historical_control_loader {
             };
             let acceptance_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.acceptConversation",
@@ -14163,7 +14165,7 @@ mod historical_control_loader {
             };
             let fulfillment_request = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.submitTransition",
@@ -14192,7 +14194,7 @@ mod historical_control_loader {
                 Some(
                     match authorize_signed_request(
                         &pool,
-                        crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                        crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                             Uuid::new_v4(),
                             Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                             endpoint,
@@ -14250,7 +14252,7 @@ mod historical_control_loader {
                         });
                         let authorized = authorize_signed_request(
                             &pool,
-                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                            crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                                 Uuid::new_v4(),
                                 Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                                 case.endpoint,
@@ -14292,12 +14294,13 @@ mod historical_control_loader {
             } else {
                 Vec::new()
             };
-            let replay_changed_same_kind_authority =
-                if let Some(raw) = replay_changed_same_kind_request.as_ref() {
-                    Some(
+            let replay_changed_same_kind_authority = if let Some(raw) =
+                replay_changed_same_kind_request.as_ref()
+            {
+                Some(
                         match authorize_signed_request(
                             &pool,
-                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                            crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                                 Uuid::new_v4(),
                                 Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                                 "blue.catbird.chat.acknowledgeWelcome",
@@ -14320,15 +14323,16 @@ mod historical_control_loader {
                             }
                         },
                     )
-                } else {
-                    None
-                };
-            let replay_changed_kind_authority =
-                if let Some(raw) = replay_changed_kind_request.as_ref() {
-                    Some(
+            } else {
+                None
+            };
+            let replay_changed_kind_authority = if let Some(raw) =
+                replay_changed_kind_request.as_ref()
+            {
+                Some(
                         match authorize_signed_request(
                             &pool,
-                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                            crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                                 Uuid::new_v4(),
                                 Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                                 "blue.catbird.chat.rejectWelcome",
@@ -14351,15 +14355,16 @@ mod historical_control_loader {
                             }
                         },
                     )
-                } else {
-                    None
-                };
-            let replay_changed_reason_authority =
-                if let Some(raw) = replay_changed_reason_request.as_ref() {
-                    Some(
+            } else {
+                None
+            };
+            let replay_changed_reason_authority = if let Some(raw) =
+                replay_changed_reason_request.as_ref()
+            {
+                Some(
                         match authorize_signed_request(
                             &pool,
-                            crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                            crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                                 Uuid::new_v4(),
                                 Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                                 "blue.catbird.chat.rejectWelcome",
@@ -14382,12 +14387,12 @@ mod historical_control_loader {
                             }
                         },
                     )
-                } else {
-                    None
-                };
+            } else {
+                None
+            };
             let prior_bound_recovery_authority = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.requestLeafRecovery",
@@ -14409,7 +14414,7 @@ mod historical_control_loader {
             };
             let reset_request_authority = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.requestReset",
@@ -14433,7 +14438,7 @@ mod historical_control_loader {
             };
             let reset_activation_authority = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.activateReset",
@@ -14455,7 +14460,7 @@ mod historical_control_loader {
             };
             let non_admin_reset_activation_authority = match authorize_signed_request(
                 &pool,
-                crate::dpop::repository_test_evidence::ordinary_device_with_binding(
+                crate::chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
                     Uuid::new_v4(),
                     Uuid::new_v4().as_bytes()[..12].try_into().unwrap(),
                     "blue.catbird.chat.activateReset",

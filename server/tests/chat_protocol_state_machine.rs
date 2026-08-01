@@ -2,9 +2,6 @@
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -14,28 +11,10 @@ mod relationship_policy_source;
 mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
-#[allow(dead_code)]
+// `cursor.rs` is mounted at this crate root, so its `super::repository::*`
+// references resolve here rather than inside `chat_protocol`.
 mod repository {
-    pub mod auth {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/auth.rs"
-        ));
-    }
-
-    pub mod prelude {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/prelude.rs"
-        ));
-    }
-
-    pub mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
@@ -45,6 +24,10 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
+    pub mod model {
+        pub use crate::model::*;
+    }
+
     pub mod validation {
         pub use crate::validation::*;
     }
@@ -54,7 +37,11 @@ mod chat_protocol {
     }
 
     pub mod dpop {
-        pub use crate::dpop::*;
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
     }
 
     pub mod snapshot {
@@ -75,6 +62,10 @@ mod chat_protocol {
 
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
+    }
+
+    pub mod cursor {
+        pub use crate::cursor::*;
     }
 
     // The E2b-2/E2b-3 transition executor lives in `state_machine.rs` (included
@@ -107,6 +98,35 @@ mod chat_protocol {
                     unreachable!("state-machine tests cannot mint a Recovery witness")
                 }
             }
+
+            #[allow(dead_code)]
+            pub(crate) struct RecoveryExecutorWriteAuthority<'witness> {
+                _witness: &'witness RecoveryPersistenceWitness,
+            }
+
+            impl RecoveryExecutorWriteAuthority<'_> {
+                pub(crate) async fn apply_open(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("state-machine tests cannot mint a Recovery write authority")
+                }
+
+                pub(crate) async fn apply_terminal(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::ExecutorError> {
+                    unreachable!("state-machine tests cannot mint a Recovery write authority")
+                }
+            }
+        }
+
+        pub mod blobs {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/blobs.rs"
+            ));
         }
 
         pub mod execution_context {
@@ -115,11 +135,35 @@ mod chat_protocol {
         }
 
         pub mod auth {
-            pub use crate::repository::auth::*;
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
         }
 
         pub mod prelude {
-            pub use crate::repository::prelude::*;
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/prelude.rs"
+            ));
+        }
+
+        pub mod inventory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/inventory.rs"
+            ));
+        }
+
+        pub mod key_packages {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/key_packages.rs"
+            ));
         }
 
         pub mod relationship {

@@ -2,20 +2,62 @@
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/repository/mod.rs"]
-mod repository;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::inventory;
+}
+
+mod chat_protocol {
+    pub mod cursor {
+        pub use crate::cursor::*;
+    }
+
+    pub mod model {
+        pub use crate::model::*;
+    }
+
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+
+    pub mod repository {
+        pub mod auth {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
+        }
+
+        pub mod inventory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/inventory.rs"
+            ));
+        }
+    }
+
+    pub mod dpop {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
+    }
+}
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +77,7 @@ use serde::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use dpop::{
+use chat_protocol::dpop::{
     verify_enrollment_request_auth, verify_ordinary_request_auth, verify_rebind_request_auth,
     TrustedNestVerifier, MAX_TRUSTED_NEST_AUDIENCE_BYTES, MAX_TRUSTED_NEST_ISSUER_BYTES,
     MAX_TRUSTED_NEST_KEY_ID_BYTES,

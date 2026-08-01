@@ -30,20 +30,72 @@ mod common;
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/repository/mod.rs"]
-mod repository;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
+
+mod chat_protocol {
+    pub mod model {
+        pub use crate::model::*;
+    }
+
+    pub mod transcript {
+        pub use crate::transcript::*;
+    }
+
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+
+    pub mod cursor {
+        pub use crate::cursor::*;
+    }
+
+    // Enumerated per-module rather than including `repository/mod.rs` wholesale:
+    // that file opens with an inner `//!` doc comment, which is not accepted in
+    // `include!` position, and it would additionally declare every sibling module
+    // whose own `super::super::*` references this shim does not carry.
+    pub mod repository {
+        pub mod device_directory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/device_directory.rs"
+            ));
+        }
+        pub mod auth {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/auth.rs"
+            ));
+        }
+        pub mod inventory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/inventory.rs"
+            ));
+        }
+    }
+
+    pub mod dpop {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
+    }
+}
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
 
 use std::sync::{Arc, Once};
 
@@ -305,20 +357,20 @@ async fn revoke_device_stub_is_cutover_required_before_cutover() {
 }
 
 #[tokio::test]
-async fn revoke_device_stub_is_internal_error_after_cutover() {
-    // Post-cutover the still-unimplemented revokeDevice route reaches the internal
-    // invariant violation (no protocol vocabulary), transported as a generic 500.
+async fn revoke_device_requires_dpop_after_cutover() {
+    // revokeDevice IS implemented: `chat_router` registers the real `revoke_device::handle`
+    // under `cfg(not(test))`, which is the arm an integration test links (cargo builds the
+    // library without `--test`), so the shared `not_implemented` stub is never registered
+    // for it. Post-cutover the request therefore runs ordinary signed-operation admission —
+    // the cutover gate opens, then DPoP header extraction rejects a request carrying none
+    // with the declared `InvalidDPoP`, exactly as for every other implemented endpoint.
     let (status, body) = send(
         stateless_router(true),
         post_empty("blue.catbird.chat.revokeDevice"),
     )
     .await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body["error"], "InternalServerError");
-    assert!(
-        body.get("message").is_none(),
-        "no internal detail on the wire"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "InvalidDPoP");
 }
 
 #[tokio::test]

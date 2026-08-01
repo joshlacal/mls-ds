@@ -17,9 +17,6 @@ mod common;
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/dpop.rs"]
-mod dpop;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -53,7 +50,11 @@ mod chat_protocol {
         pub use crate::transcript::*;
     }
     pub mod dpop {
-        pub use crate::dpop::*;
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
     }
     pub mod snapshot {
         pub use catbird_server::chat_protocol::snapshot::*;
