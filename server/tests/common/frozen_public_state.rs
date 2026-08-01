@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::chat_protocol::{
     public_state::{
         encode_public_tree_summary, load_persisted_active_snapshot_from_parts_for_test,
-        ActivePublicState, VerifiedCommitPublicState,
+        ActivePublicState, PublicStateError, VerifiedCommitPublicState,
     },
     snapshot::{
         public_group_snapshot_sha256, PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate,
@@ -44,6 +44,7 @@ struct ManifestIdentifiers {
 
 #[derive(Deserialize)]
 struct ManifestIdentity {
+    alice: ManifestActor,
     bob: ManifestActor,
 }
 
@@ -68,6 +69,16 @@ struct ManifestChain {
     group_id_hex: String,
     inner_key_package_ref_hex: String,
     commit_aad_sha256_hex: String,
+    remove_committed_epoch: u64,
+    remove_committed_group_context_hash_hex: String,
+    remove_committed_confirmation_tag_hex: String,
+    rejoin_prior_state_version: u64,
+    rejoin_state_version: u64,
+    rejoin_epoch: u64,
+    rejoin_group_context_hash_hex: String,
+    rejoin_confirmation_tag_hex: String,
+    rejoin_inner_key_package_ref_hex: String,
+    rejoin_commit_aad_sha256_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -348,10 +359,165 @@ pub fn restore_add_commit(
     .expect("restore strict manifest-bound frozen Add commit")
 }
 
+fn restore_rejoin_prior_from_manifest(manifest: &Manifest) -> ActivePublicState {
+    restore(
+        artifact(manifest, "committed-remove-public-state.bin"),
+        PublicGroupSnapshotCoordinate::new(
+            hex_array(&manifest.identifiers.conversation_id_hex),
+            manifest.chain.generation,
+            manifest.chain.rejoin_prior_state_version,
+            hex_array(&manifest.chain.group_id_hex),
+            manifest.chain.remove_committed_epoch,
+            hex_array(&manifest.chain.remove_committed_group_context_hash_hex),
+            hex_array(&manifest.chain.remove_committed_confirmation_tag_hex),
+            PublicGroupSnapshotLifecycle::Active,
+        ),
+    )
+}
+
+fn restore_rejoin_next_from_manifest(manifest: &Manifest) -> ActivePublicState {
+    restore(
+        artifact(manifest, "committed-rejoin-public-state.bin"),
+        PublicGroupSnapshotCoordinate::new(
+            hex_array(&manifest.identifiers.conversation_id_hex),
+            manifest.chain.generation,
+            manifest.chain.rejoin_state_version,
+            hex_array(&manifest.chain.group_id_hex),
+            manifest.chain.rejoin_epoch,
+            hex_array(&manifest.chain.rejoin_group_context_hash_hex),
+            hex_array(&manifest.chain.rejoin_confirmation_tag_hex),
+            PublicGroupSnapshotLifecycle::Active,
+        ),
+    )
+}
+
+pub fn restore_rejoin_commit(
+    prior: &ActivePublicState,
+) -> Result<VerifiedCommitPublicState, PublicStateError> {
+    const ALICE_CREDENTIAL: &str =
+        "did:plc:alicefixtureaaaaaaaaaaaa#2f93a82d-b061-4c75-8f61-57f23146b910";
+    const ALICE_SIGNATURE_KEY_HEX: &str =
+        "42fc27cde96276aaaddd99907272d7d786d63757cbdd080fcfb8adb595f677f3";
+    const BOB_CREDENTIAL: &str =
+        "did:plc:bobterminalccccccccccccc#b40c12d9-b1ff-4b24-94e5-15742d9ea6cf";
+    const BOB_SIGNATURE_KEY_HEX: &str =
+        "2bf5a667aa32fc2e05db907f7ff503c3c276ab8adbde93df7c80e9306d704d60";
+    const PRIOR_ALICE_ENCRYPTION_KEY_SHA256_HEX: &str =
+        "3a0aa71cc359bccef8a325ae32b5e16d95dcb9b8921cfa68c09d72952593ac29";
+    const NEXT_ALICE_ENCRYPTION_KEY_SHA256_HEX: &str =
+        "f29796db39bc81bad1c3feb782d5b2f243582480981019ae6c5faadb3316c639";
+    const NEXT_BOB_ENCRYPTION_KEY_SHA256_HEX: &str =
+        "41e05313f91466928c50642eb0f0f3eb238f8e2fef00902115b21a7b57e51823";
+    const COMMIT_SHA256_HEX: &str =
+        "c29f43f3232e6204816a8f8901b24c6548eb339ab7a881b95d16348462e788e8";
+    const AAD_SHA256_HEX: &str = "ee8545719e50a4e07182224ae8a6ddb806b3020636e0856b4bbdae394a4d92d5";
+    const KEY_PACKAGE_REF_HEX: &str =
+        "fae8ee21e794dd60ef65a7a47e736fe9d3426be85624c982824db2853433d078";
+
+    let manifest = manifest();
+    if manifest.identity.alice.credential_identity != ALICE_CREDENTIAL
+        || manifest.identity.alice.signature_public_key_hex != ALICE_SIGNATURE_KEY_HEX
+        || manifest.identity.bob.credential_identity != BOB_CREDENTIAL
+        || manifest.identity.bob.signature_public_key_hex != BOB_SIGNATURE_KEY_HEX
+        || manifest.chain.rejoin_inner_key_package_ref_hex != KEY_PACKAGE_REF_HEX
+        || manifest.chain.rejoin_commit_aad_sha256_hex != AAD_SHA256_HEX
+    {
+        return Err(PublicStateError::CoordinateMismatch);
+    }
+
+    let expected_prior = restore_rejoin_prior_from_manifest(&manifest);
+    if prior.snapshot() != expected_prior.snapshot() || prior.binding() != expected_prior.binding()
+    {
+        return Err(PublicStateError::CoordinateMismatch);
+    }
+    let next = restore_rejoin_next_from_manifest(&manifest);
+
+    let prior_alice = expected_prior
+        .binding()
+        .tree_summary()
+        .leaves()
+        .iter()
+        .filter(|leaf| {
+            leaf.basic_credential() == ALICE_CREDENTIAL.as_bytes()
+                && leaf.signature_key() == hex_array::<32>(ALICE_SIGNATURE_KEY_HEX)
+        })
+        .collect::<Vec<_>>();
+    let next_alice = next
+        .binding()
+        .tree_summary()
+        .leaves()
+        .iter()
+        .filter(|leaf| {
+            leaf.basic_credential() == ALICE_CREDENTIAL.as_bytes()
+                && leaf.signature_key() == hex_array::<32>(ALICE_SIGNATURE_KEY_HEX)
+        })
+        .collect::<Vec<_>>();
+    let next_bob = next
+        .binding()
+        .tree_summary()
+        .leaves()
+        .iter()
+        .filter(|leaf| {
+            leaf.basic_credential() == BOB_CREDENTIAL.as_bytes()
+                && leaf.signature_key() == hex_array::<32>(BOB_SIGNATURE_KEY_HEX)
+        })
+        .collect::<Vec<_>>();
+    if prior_alice.len() != 1
+        || next_alice.len() != 1
+        || next_bob.len() != 1
+        || expected_prior.binding().tree_summary().leaves().len() != 1
+        || next.binding().tree_summary().leaves().len() != 2
+        || prior_alice[0].leaf_index() != 0
+        || next_alice[0].leaf_index() != 0
+        || next_bob[0].leaf_index() != 1
+    {
+        return Err(PublicStateError::CoordinateMismatch);
+    }
+
+    let prior_alice_encryption_key = prior_alice[0].encryption_key().to_vec();
+    let next_alice_encryption_key = next_alice[0].encryption_key().to_vec();
+    if <[u8; 32]>::from(Sha256::digest(&prior_alice_encryption_key))
+        != hex_array(PRIOR_ALICE_ENCRYPTION_KEY_SHA256_HEX)
+        || <[u8; 32]>::from(Sha256::digest(&next_alice_encryption_key))
+            != hex_array(NEXT_ALICE_ENCRYPTION_KEY_SHA256_HEX)
+        || <[u8; 32]>::from(Sha256::digest(next_bob[0].encryption_key()))
+            != hex_array(NEXT_BOB_ENCRYPTION_KEY_SHA256_HEX)
+        || prior_alice_encryption_key == next_alice_encryption_key
+    {
+        return Err(PublicStateError::CoordinateMismatch);
+    }
+
+    let commit_bytes = artifact(&manifest, "commit-rejoin-public.mls");
+    let parsed = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+        .map_err(|_| PublicStateError::CoordinateMismatch)?;
+    let commit_sha256 = <[u8; 32]>::from(Sha256::digest(&commit_bytes));
+    let aad_sha256 = <[u8; 32]>::from(Sha256::digest(parsed.aad()));
+    let key_package_ref = hex_array(&manifest.chain.rejoin_inner_key_package_ref_hex);
+    if commit_sha256 != hex_array(COMMIT_SHA256_HEX)
+        || aad_sha256 != hex_array(AAD_SHA256_HEX)
+        || key_package_ref != hex_array(KEY_PACKAGE_REF_HEX)
+    {
+        return Err(PublicStateError::CoordinateMismatch);
+    }
+
+    VerifiedCommitPublicState::for_test_add_from_frozen_snapshot(
+        prior,
+        &expected_prior,
+        next,
+        prior_alice[0].leaf_index(),
+        &prior_alice_encryption_key,
+        &next_alice_encryption_key,
+        BOB_CREDENTIAL.as_bytes(),
+        &hex_array::<32>(BOB_SIGNATURE_KEY_HEX),
+        key_package_ref,
+        commit_sha256,
+        aad_sha256,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_protocol::public_state::PublicStateError;
 
     fn frozen_commit_evidence(manifest: &Manifest) -> ([u8; 32], [u8; 32]) {
         let commit_bytes = artifact(manifest, "commit-public.mls");
@@ -481,6 +647,41 @@ mod tests {
                 commit_sha256,
                 aad_sha256,
             ),
+            Err(PublicStateError::CoordinateMismatch)
+        ));
+    }
+
+    #[test]
+    fn frozen_rejoin_rejects_non_manifest_prior_coordinate() {
+        let manifest = manifest();
+        let exact_prior = restore_rejoin_prior_from_manifest(&manifest);
+        let tampered_coordinate = PublicGroupSnapshotCoordinate::new(
+            [0xc1; 16],
+            exact_prior.coordinate().generation(),
+            exact_prior.coordinate().state_version(),
+            *exact_prior.coordinate().group_id(),
+            exact_prior.coordinate().epoch(),
+            *exact_prior.coordinate().group_context_hash(),
+            *exact_prior.coordinate().confirmation_tag(),
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let tampered_prior = ActivePublicState::for_test(&exact_prior, tampered_coordinate);
+
+        assert!(matches!(
+            restore_rejoin_commit(&tampered_prior),
+            Err(PublicStateError::CoordinateMismatch)
+        ));
+    }
+
+    #[test]
+    fn frozen_rejoin_rejects_non_manifest_prior_snapshot() {
+        let manifest = manifest();
+        let exact_prior = restore_rejoin_prior_from_manifest(&manifest);
+        let genesis = restore_genesis();
+        let spliced_prior = ActivePublicState::for_test(&genesis, *exact_prior.coordinate());
+
+        assert!(matches!(
+            restore_rejoin_commit(&spliced_prior),
             Err(PublicStateError::CoordinateMismatch)
         ));
     }

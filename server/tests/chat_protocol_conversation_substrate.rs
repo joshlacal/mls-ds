@@ -245,14 +245,192 @@ mod welcome_terminal_facade_contract {
 
     #[test]
     fn facade_consumes_exact_claim_and_scope_without_post_head_identity_lock() {
+        fn raw_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+            let mut cursor = start;
+            if bytes.get(cursor) == Some(&b'b') {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'r') {
+                return None;
+            }
+            cursor += 1;
+            let mut hashes = 0;
+            while bytes.get(cursor) == Some(&b'#') {
+                hashes += 1;
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'"') {
+                return None;
+            }
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'"'
+                    && bytes
+                        .get(cursor + 1..cursor + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+                {
+                    return Some(cursor + 1 + hashes);
+                }
+                cursor += 1;
+            }
+            Some(bytes.len())
+        }
+
+        fn quoted_literal_end(bytes: &[u8], quote: usize) -> usize {
+            let mut cursor = quote + 1;
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                    b'"' => return cursor + 1,
+                    _ => cursor += 1,
+                }
+            }
+            bytes.len()
+        }
+
+        fn char_literal_end(source: &str, quote: usize) -> Option<usize> {
+            let bytes = source.as_bytes();
+            let mut cursor = quote + 1;
+            match *bytes.get(cursor)? {
+                b'\\' => {
+                    cursor += 1;
+                    match *bytes.get(cursor)? {
+                        b'x' => cursor += 3,
+                        b'u' if bytes.get(cursor + 1) == Some(&b'{') => {
+                            cursor += 2;
+                            while !matches!(bytes.get(cursor), Some(b'}') | None) {
+                                cursor += 1;
+                            }
+                            cursor += 1;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                b'\n' | b'\r' | b'\'' => return None,
+                _ => {
+                    let character = source[cursor..].chars().next()?;
+                    cursor += character.len_utf8();
+                }
+            }
+            (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
+        }
+
+        fn source_projections(source: &str) -> (String, String) {
+            let bytes = source.as_bytes();
+            let mut code = vec![b' '; bytes.len()];
+            let mut literals = vec![b' '; bytes.len()];
+            let mut cursor = 0;
+            while cursor < bytes.len() {
+                if bytes.get(cursor..cursor + 2) == Some(b"//") {
+                    cursor += 2;
+                    while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                        cursor += 1;
+                    }
+                    if cursor < bytes.len() {
+                        code[cursor] = b'\n';
+                        literals[cursor] = b'\n';
+                        cursor += 1;
+                    }
+                    continue;
+                }
+                if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                    let mut depth = 1_u64;
+                    cursor += 2;
+                    while cursor < bytes.len() && depth > 0 {
+                        if bytes.get(cursor..cursor + 2) == Some(b"/*") {
+                            depth += 1;
+                            cursor += 2;
+                        } else if bytes.get(cursor..cursor + 2) == Some(b"*/") {
+                            depth -= 1;
+                            cursor += 2;
+                        } else {
+                            if bytes[cursor] == b'\n' {
+                                code[cursor] = b'\n';
+                                literals[cursor] = b'\n';
+                            }
+                            cursor += 1;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(end) = raw_literal_end(bytes, cursor) {
+                    literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                    continue;
+                }
+                if bytes[cursor] == b'"'
+                    || (bytes[cursor] == b'b' && bytes.get(cursor + 1) == Some(&b'"'))
+                {
+                    let quote = cursor + usize::from(bytes[cursor] == b'b');
+                    let end = quoted_literal_end(bytes, quote);
+                    literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                    cursor = end;
+                    continue;
+                }
+                let char_quote = if bytes[cursor] == b'\'' {
+                    Some(cursor)
+                } else if bytes[cursor] == b'b' && bytes.get(cursor + 1) == Some(&b'\'') {
+                    Some(cursor + 1)
+                } else {
+                    None
+                };
+                if let Some(quote) = char_quote {
+                    if let Some(end) = char_literal_end(source, quote) {
+                        literals[cursor..end].copy_from_slice(&bytes[cursor..end]);
+                        cursor = end;
+                        continue;
+                    }
+                }
+                code[cursor] = bytes[cursor];
+                cursor += 1;
+            }
+            (
+                String::from_utf8(code).expect("Rust source code projection remains UTF-8"),
+                String::from_utf8(literals).expect("Rust source literal projection remains UTF-8"),
+            )
+        }
+
+        fn source_code(source: &str) -> String {
+            source_projections(source).0
+        }
+
+        fn compact_code(source: &str) -> String {
+            source_code(source)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn source_item<'a>(source: &'a str, marker: &str) -> &'a str {
+            let code = source_code(source);
+            let start = code
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing Welcome source marker: {marker}"));
+            let open = code[start..]
+                .find('{')
+                .map(|offset| start + offset)
+                .unwrap_or_else(|| panic!("missing opening brace for: {marker}"));
+            let mut depth = 0_i64;
+            for (offset, byte) in code.as_bytes()[open..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[start..=open + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unterminated Welcome source item: {marker}");
+        }
+
         let source = include_str!("../src/chat_protocol/repository/welcome_terminal.rs");
-        let prepare = source
-            .split_once("pub(crate) async fn prepare_welcome_terminal(")
-            .expect("missing Welcome terminal facade")
-            .1
-            .split_once("\nstruct ParsedWelcomeRequest")
-            .expect("unterminated Welcome terminal facade")
-            .0;
+        let prepare = source_code(source_item(
+            source,
+            "async fn prepare_first_welcome_terminal(",
+        ));
         let claim = prepare
             .find("verify_welcome_operation(")
             .expect("missing exact Welcome operation claim");
@@ -263,21 +441,81 @@ mod welcome_terminal_facade_contract {
             .find("lock_welcome_terminal(")
             .expect("missing exact Welcome delivery lock");
         assert!(claim < aggregate && aggregate < delivery);
-        assert!(prepare.contains("locked_registration_from_scope_authority("));
-        assert!(prepare.contains("prelude.scope_authority()"));
-        assert!(prepare.contains("prelude.into_execution_parts()"));
-        assert!(prepare.contains("prepare_welcome_terminal_execution"));
+        let compact_prepare = compact_code(&prepare);
+        assert!(compact_prepare.contains(
+            "hydration.locked_registration_from_scope_authority(prelude.scope_authority())?;"
+        ));
+        assert_eq!(
+            prepare
+                .matches("locked_registration_from_scope_authority")
+                .count(),
+            1
+        );
+        let execution_parts = prepare
+            .match_indices("prelude.into_execution_parts()")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert!(!execution_parts.is_empty());
+        assert!(execution_parts.iter().all(|position| *position > delivery));
+        assert_eq!(prepare.matches("plan.into_persistence_plan()?").count(), 2);
+        assert_eq!(
+            compact_prepare
+                .matches(
+                    "PreparedWelcomeMutation { plan: plan.into_persistence_plan()?, completion, response, material, }"
+                )
+                .count(),
+            2
+        );
+        assert!(!prepare.contains("prepare_welcome_terminal_execution"));
+        assert!(!prepare.contains("apply_prepared_welcome_terminal_execution"));
+
+        let apply = source_code(source_item(source, "impl PreparedWelcomeMutation"));
+        let compact_apply = compact_code(&apply);
+        assert!(compact_apply.contains(
+            "pub(crate) async fn apply( self, transaction: &mut Transaction<'_, Postgres>, )"
+        ));
+        assert!(
+            compact_apply.contains("let Self { plan, completion, material, response, } = self;")
+        );
+        let prepare_execution = apply
+            .find("let prepared = prepare_welcome_terminal_execution(transaction, &plan).await?;")
+            .expect("missing exact Welcome executor preparation");
+        let apply_execution = apply
+            .find("let applied = apply_prepared_welcome_terminal_execution(prepared).await?;")
+            .expect("missing exact Welcome executor application");
+        assert!(prepare_execution < apply_execution);
+
+        let applied = compact_code(source_item(
+            source,
+            "pub(crate) struct AppliedWelcomeMutation",
+        ));
+        for retained in [
+            "pub(crate) applied: AppliedTransition",
+            "pub(crate) completion: WelcomeCompletion",
+            "pub(crate) material: WelcomeCanonicalMaterial",
+            "pub(crate) response: WelcomeCanonicalResponse",
+        ] {
+            assert!(
+                applied.contains(retained),
+                "missing applied output: {retained}"
+            );
+        }
+
+        let (complete_code, complete_literals) = source_projections(source);
         for forbidden in [
             "lock_device_and_key",
             "test_recheck_business_authority",
             "locked_registration_from_guard",
-            "FOR UPDATE",
         ] {
             assert!(
-                !source.contains(forbidden),
+                !complete_code.contains(forbidden),
                 "Welcome facade uses forbidden authority seam: {forbidden}"
             );
         }
+        assert!(
+            !complete_code.contains("FOR UPDATE") && !complete_literals.contains("FOR UPDATE"),
+            "Welcome facade uses forbidden post-head SQL lock"
+        );
     }
 }
 
@@ -6105,12 +6343,68 @@ mod historical_control_loader {
                 "LockedG6PreheadScope::seal_fanout",
                 "hydrate_locked_g6_prelude",
                 "HydrationAuthority::plan_device_revocation_batch",
-                "prepare_device_revocation_batch_execution",
+                "prepare_canonical_device_revocation_batch_execution",
                 "apply_device_revocation_batch_sequential",
             ] {
                 assert!(
                     production_witness.contains(stage),
                     "production configuration omitted typed G6 stage: {stage}"
+                );
+            }
+
+            let canonical = g6_source_code(g6_source_item(
+                execution,
+                "pub(crate) async fn prepare_canonical_device_revocation_batch_execution",
+            ));
+            let canonical_signature = canonical
+                .split_once('{')
+                .expect("canonical G6 wrapper has a body")
+                .0;
+            for required_input in [
+                "transaction: &'transaction mut Transaction<'connection, Postgres>",
+                "plan: &'plan DeviceRevocationBatchPersistencePlan",
+                "prelude: LockedG6Prelude",
+            ] {
+                assert!(
+                    canonical_signature.contains(required_input),
+                    "canonical G6 wrapper omitted sealed input: {required_input}"
+                );
+            }
+            for forbidden_input in [
+                "ExecutionContextArtifacts",
+                "ConversationExecutionArtifacts",
+                "artifact_inputs",
+                "event",
+                "disposition",
+                "bytes",
+            ] {
+                assert!(
+                    !canonical_signature.contains(forbidden_input),
+                    "canonical G6 wrapper accepts caller artifact input: {forbidden_input}"
+                );
+            }
+            let canonical_compact = canonical.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                canonical_compact.contains("let artifact_inputs = plan .conversations() .iter()")
+            );
+            assert!(canonical_compact.contains(
+                "ConversationExecutionArtifacts::new( Uuid::from_bytes(*conversation.state().coordinate.conversation_id()), ExecutionContextArtifacts::default(), )"
+            ));
+            assert_eq!(canonical_compact.matches(".collect();").count(), 1);
+            assert_eq!(
+                canonical
+                    .matches("prepare_device_revocation_batch_execution")
+                    .count(),
+                1,
+                "canonical G6 wrapper delegates exactly once"
+            );
+            assert!(canonical_compact.contains(
+                "prepare_device_revocation_batch_execution(transaction, plan, prelude, artifact_inputs).await"
+            ));
+            for forbidden in ["BusinessAuthorityGuard", "G6BusinessAuthorityBinding"] {
+                assert!(
+                    !canonical.contains(forbidden),
+                    "canonical G6 wrapper recovered raw authority: {forbidden}"
                 );
             }
         }
@@ -9769,6 +10063,13 @@ mod historical_control_loader {
                            name: &str,
                            aad_hash: &str,
                            next: PublicGroupSnapshotCoordinate| {
+                assert!(
+                    matches!(
+                        name,
+                        "commit-generic-public.mls" | "commit-remove-public.mls"
+                    ),
+                    "only proposal-free generic and Remove commits use historical processing"
+                );
                 let bytes = corpus_file(name);
                 let parsed = validate_public_commit(&bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
                     .expect("canonical corpus Commit parses");
@@ -9810,17 +10111,29 @@ mod historical_control_loader {
                 ),
             )
             .expect("acceptance coordinate-only edge");
-            let add = process(
-                &add_prior,
-                "commit-public.mls",
-                "commitAadSha256Hex",
-                coordinate(
-                    chain["committedStateVersion"].as_u64().unwrap(),
-                    "committedEpoch",
-                    "committedGroupContextHashHex",
-                    "committedConfirmationTagHex",
-                ),
+            let alice = &manifest["identity"]["alice"];
+            let add_senders = add_prior
+                .binding()
+                .tree_summary()
+                .leaves()
+                .iter()
+                .filter(|leaf| {
+                    leaf.basic_credential()
+                        == alice["credentialIdentity"]
+                            .as_str()
+                            .expect("Alice credential identity")
+                            .as_bytes()
+                        && leaf.signature_key() == corpus_hex::<32>(&alice["signaturePublicKeyHex"])
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                add_senders.len(),
+                1,
+                "frozen Add has one exact Alice sender"
             );
+            let sender_leaf_index = add_senders[0].leaf_index();
+            assert_eq!(sender_leaf_index, 0, "frozen Add sender is Alice leaf zero");
+            let add = crate::frozen_public_state::restore_add_commit(&add_prior, sender_leaf_index);
             assert_eq!(add.adds().len(), 1);
             assert_eq!(
                 add.adds()[0].key_package_ref(),
@@ -9910,17 +10223,8 @@ mod historical_control_loader {
                 ),
             )
             .expect("reacceptance coordinate-only edge");
-            let rejoin = process(
-                &rejoin_prior,
-                "commit-rejoin-public.mls",
-                "rejoinCommitAadSha256Hex",
-                coordinate(
-                    chain["rejoinStateVersion"].as_u64().unwrap(),
-                    "rejoinEpoch",
-                    "rejoinGroupContextHashHex",
-                    "rejoinConfirmationTagHex",
-                ),
-            );
+            let rejoin = crate::frozen_public_state::restore_rejoin_commit(&rejoin_prior)
+                .expect("restore strict manifest-bound frozen rejoin Add");
             assert_eq!(rejoin.adds().len(), 1);
             assert_eq!(
                 rejoin.adds()[0].key_package_ref(),
