@@ -2839,3 +2839,609 @@ pub(crate) struct IntervalSummaryTerminalHint {
     pub(crate) conversation_id: Uuid,
     pub(crate) terminal_seq: u64,
 }
+
+// ===========================================================================
+// B-auth: the two repository-owned existing-device READ facades.
+//
+// `getDevices` and `getOwnDevices` are the only two ordinary-unsigned read
+// endpoints that spend a sealed `VerifiedReadAdmission`. Everything between the
+// opaque admission and the canonical response bytes lives here: the ordered
+// requester locks, the single production `from_repository_lock` callsite, the
+// consuming attempt verification, the generated-DTO projection, the durable
+// item serialization, and the sanitized facade error vocabulary. The two
+// handlers are reduced to admission -> facade -> `context::json_ok`.
+//
+// WHY THIS WHOLE SECTION IS `#[cfg(not(test))]`
+// ---------------------------------------------
+// `inventory.rs` is `include!`d as a module by TEN integration test crates.
+// Three of them provide NO `chat_protocol::dpop` module at all:
+//
+//     tests/chat_protocol_inventory.rs
+//     tests/chat_protocol_cursor.rs
+//     tests/chat_protocol_inventory_repository.rs
+//
+// (two of the three additionally provide no `device_directory`). An
+// unconditional `use super::super::dpop::…` here therefore fails to resolve in
+// those crates and breaks them. None of the three is owned by Stage T or by
+// either B-auth implementer — they sit outside every owner set, so the break
+// would be unfixable from inside this lane.
+//
+// The gate is the same mechanism `repository/mod.rs` already uses for `core`,
+// `execution_context`, `relationship`, `reset`, `revocation`,
+// `submit_transition`, and `welcome_terminal`: `cfg(test)` is set for an
+// integration test crate (it is compiled with `--test`), but NOT for the
+// library those crates link, so the facade is present in the real `catbird_server`
+// lib and absent from every path-included copy. That is precisely the split the
+// checklist's "exactly once IN PRODUCTION" requires.
+//
+// DO NOT "tidy" this gate away. Removing it breaks three unowned crates.
+//
+// Cost, recorded honestly: this section is invisible to `cargo test --lib` and
+// `--all-targets`. Tests over it must go through the REAL library — the
+// `chat_router` built from `catbird_server::handlers::chat` — or over the source
+// text via `include_str!`, never through the path-included `mod inventory`.
+// ===========================================================================
+
+/// Retained own-device snapshot lifetime.
+///
+/// Relocated verbatim from the pre-B-auth `handlers/chat/get_own_devices.rs`
+/// (`SESSION_TTL_MINUTES`), where the handler owned this derivation before the
+/// authority moved the durable-session request inside the facade. The value is
+/// preserved, not chosen: `chat.device_inventory_sessions_expiry_check` bounds
+/// any session to `expires_at <= created_at + INTERVAL '15 minutes'`, so ten
+/// minutes is the existing sealed policy well inside the schema ceiling.
+///
+/// The bound is repository-owned by construction: the admission seam hands the
+/// facade only a base instant and accepts no caller TTL, expiry, or duration,
+/// so no caller can manufacture a snapshot lifetime.
+#[cfg(not(test))]
+const OWN_DEVICE_SNAPSHOT_TTL_MINUTES: i64 = 10;
+
+/// Sanitized facade failure. Every variant is a unit variant, so no `Debug`
+/// rendering can carry requester DID, device, JKT, generation, key material,
+/// replay identity, or transaction identity. Authority drift never appears as a
+/// distinct variant: it collapses into `Invariant` exactly like every other
+/// terminal condition, so the wire cannot distinguish "wrong JKT" from "wrong
+/// generation" from "internal projection fault".
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(crate) enum ExistingDeviceReadFacadeError {
+    /// A database fault. Carries no protocol vocabulary.
+    Storage,
+    /// Any terminal internal condition, including EVERY authority drift.
+    Invariant,
+    /// The caller named too many or zero DIDs (`getDevices` only).
+    RequestTooBroad,
+    /// The fixed three-attempt ceiling was reached (`getOwnDevices` only).
+    /// The handler renders HTTP 503 + `Retry-After: 1`.
+    RetryCeiling,
+}
+
+/// Consuming canonical `getDevices` response bytes. Private field, no item
+/// getter, no cursor, no authority/admission/attempt/row/transaction handle, no
+/// requester marker, and no mutable bytes reference: a handler can only move the
+/// bytes into `context::json_ok`.
+#[cfg(not(test))]
+pub(crate) struct CanonicalGetDevicesResponse {
+    response_bytes: Vec<u8>,
+}
+
+#[cfg(not(test))]
+impl CanonicalGetDevicesResponse {
+    pub(crate) fn into_response_bytes(self) -> Vec<u8> {
+        self.response_bytes
+    }
+}
+
+/// Consuming canonical `getOwnDevices` response bytes. Constructible only after
+/// the durable session commit succeeds, so its mere existence is proof that no
+/// bytes escaped before commit.
+#[cfg(not(test))]
+pub(crate) struct CommittedOwnDeviceSnapshot {
+    response_bytes: Vec<u8>,
+}
+
+#[cfg(not(test))]
+impl CommittedOwnDeviceSnapshot {
+    pub(crate) fn into_response_bytes(self) -> Vec<u8> {
+        self.response_bytes
+    }
+}
+
+/// Lock the EXACT requester `chat.devices` row. Deliberately a single-table
+/// statement: the device barrier must complete before the key statement is even
+/// issued, and a joined `FOR UPDATE OF device, device_key` is not proof of that
+/// order.
+#[cfg(not(test))]
+const LOCK_READ_REQUESTER_DEVICE_SQL: &str = r#"
+    SELECT device.user_did,
+           device.device_id,
+           device.status,
+           device.dpop_jkt,
+           device.auth_generation
+      FROM chat.devices AS device
+     WHERE device.user_did = $1
+       AND device.device_id = $2
+     FOR UPDATE
+"#;
+
+/// Lock the EXACT requester `chat.device_keys` row, in a SEPARATE statement
+/// issued only after the device lock above has already returned.
+#[cfg(not(test))]
+const LOCK_READ_REQUESTER_DEVICE_KEY_SQL: &str = r#"
+    SELECT device_key.key_id,
+           device_key.signing_public_key,
+           device_key.revoked_at
+      FROM chat.device_keys AS device_key
+     WHERE device_key.user_did = $1
+       AND device_key.device_id = $2
+     FOR UPDATE
+"#;
+
+#[cfg(not(test))]
+#[derive(FromRow)]
+struct LockedReadRequesterDeviceRow {
+    user_did: String,
+    device_id: Uuid,
+    status: String,
+    dpop_jkt: String,
+    auth_generation: i64,
+}
+
+#[cfg(not(test))]
+#[derive(FromRow)]
+struct LockedReadRequesterKeyRow {
+    key_id: String,
+    signing_public_key: Vec<u8>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+/// The verified requester lock for one attempt.
+///
+/// `verified` is the private same-transaction proof; it is never returned past
+/// the facade. The remaining fields are ORDINARY SQL ROW VALUES read back from
+/// the two locked rows and kept as facade locals. They are permitted to be bound
+/// into an internal durable write after hidden verification succeeds, and they
+/// are never returned to a handler or placed in a response.
+#[cfg(not(test))]
+struct VerifiedRequesterLock {
+    transaction_id: String,
+    verified: super::super::dpop::VerifiedExistingDeviceReadRow,
+    row_user_did: String,
+    row_device_id: Uuid,
+    row_dpop_jkt: String,
+    row_auth_generation: i64,
+}
+
+/// Begin one attempt: two ORDERED single-table `FOR UPDATE` statements, then the
+/// single production `LockedReadDatabaseRow::from_repository_lock` callsite, then
+/// the consuming attempt verification.
+///
+/// Ordering is structural, not documentary: the device lock is `await`ed and
+/// matched before the key statement is constructed, and the constructor call is
+/// unreachable unless BOTH `Some(..)` arms bind. A missing device row or a
+/// missing key row returns BEFORE construction.
+///
+/// Every failure is terminal. Authority drift — inactive device, revoked key,
+/// drifted JKT/generation/key — surfaces from `consume_verify_locked_row` and is
+/// mapped to `Invariant`, never to a retryable outcome. A failed or foreign
+/// transaction retains no authority: the attempt was consumed by value.
+#[cfg(not(test))]
+async fn lock_and_verify_read_requester(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: super::super::dpop::ReadAdmissionAttempt,
+) -> Result<VerifiedRequesterLock, ExistingDeviceReadFacadeError> {
+    // The borrow of `attempt` is authority-bearing, not merely a lifetime
+    // convenience: the carrier cannot outlive the attempt, so the lock
+    // coordinates cannot escape this operation. Copy the two values out and drop
+    // the borrow immediately so the attempt can still be consumed below.
+    let (lock_did, lock_device_id) = {
+        let coordinates = attempt.lock_coordinates();
+        (coordinates.did.to_owned(), coordinates.device_id)
+    };
+
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+
+    // BARRIER 1 — the exact requester device row.
+    let device: Option<LockedReadRequesterDeviceRow> =
+        sqlx::query_as(LOCK_READ_REQUESTER_DEVICE_SQL)
+            .bind(&lock_did)
+            .bind(lock_device_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    let Some(device) = device else {
+        // Missing device row: return before construction.
+        return Err(ExistingDeviceReadFacadeError::Invariant);
+    };
+
+    // BARRIER 2 — a SEPARATE statement for the exact requester key row, issued
+    // only now that barrier 1 has completed.
+    let key: Option<LockedReadRequesterKeyRow> = sqlx::query_as(LOCK_READ_REQUESTER_DEVICE_KEY_SQL)
+        .bind(&lock_did)
+        .bind(lock_device_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    let Some(key) = key else {
+        // Missing key row: return before construction.
+        return Err(ExistingDeviceReadFacadeError::Invariant);
+    };
+
+    let signing_public_key_sha256: [u8; 32] = Sha256::digest(&key.signing_public_key).into();
+
+    // THE single production `from_repository_lock` callsite. Reachable only
+    // after BOTH ordered locks succeeded, and it carries the row's OWN
+    // `user_did`/`device_id` rather than the coordinates that addressed it.
+    let locked_row = super::super::dpop::LockedReadDatabaseRow::from_repository_lock(
+        transaction_id.clone().into_boxed_str(),
+        device.user_did.clone().into_boxed_str(),
+        device.device_id,
+        device.status.clone().into_boxed_str(),
+        device.dpop_jkt.clone().into_boxed_str(),
+        device.auth_generation,
+        key.key_id.into_boxed_str(),
+        signing_public_key_sha256,
+        key.revoked_at,
+    )
+    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+
+    // Constructing the row proved nothing. Only this consuming verification
+    // mints authority, and it spends the attempt.
+    let verified = attempt
+        .consume_verify_locked_row(locked_row)
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+
+    Ok(VerifiedRequesterLock {
+        transaction_id,
+        verified,
+        row_user_did: device.user_did,
+        row_device_id: device.device_id,
+        row_dpop_jkt: device.dpop_jkt,
+        row_auth_generation: device.auth_generation,
+    })
+}
+
+/// Check the private same-transaction token before a protected query. Every
+/// protected audience/directory/item/session query in this section calls this
+/// immediately before issuing SQL.
+#[cfg(not(test))]
+fn guard_protected_query(
+    lock: &VerifiedRequesterLock,
+) -> Result<(), ExistingDeviceReadFacadeError> {
+    lock.verified
+        .verify_same_transaction(&lock.transaction_id)
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)
+}
+
+/// Map an inventory repository failure into the sanitized facade vocabulary.
+/// Only the device-fence `SnapshotConflict` is retryable, and it is handled by
+/// the caller's own outcome type rather than by an error variant.
+#[cfg(not(test))]
+fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDeviceReadFacadeError {
+    match error {
+        InventoryRepositoryError::RequestTooBroad => ExistingDeviceReadFacadeError::RequestTooBroad,
+        InventoryRepositoryError::Database(_) => ExistingDeviceReadFacadeError::Storage,
+        _ => ExistingDeviceReadFacadeError::Invariant,
+    }
+}
+
+/// Build the exact generated `deviceView` for one durable directory row.
+///
+/// This mirrors the read-only `handlers/chat/device_views.rs` shaping field for
+/// field. It is duplicated rather than called because that helper is
+/// `pub(in crate::handlers::chat)` and the authority places the complete
+/// generated-DTO projection inside this repository module.
+#[cfg(not(test))]
+fn read_facade_device_view(
+    view: &super::device_directory::DeviceDirectoryView,
+) -> catbird_atproto::generated::blue_catbird::chat::DeviceView<jacquard_common::DefaultStr> {
+    use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};
+
+    catbird_atproto::generated::blue_catbird::chat::DeviceView {
+        auth_generation: view.auth_generation,
+        available_package_count: view.available_package_count,
+        created_at: crate::sqlx_jacquard::chrono_to_datetime(view.created_at),
+        device_id: SmolStr::from(view.device_id.to_string()),
+        dpop_jkt: SmolStr::from(view.dpop_jkt.as_str()),
+        key_id: SmolStr::from(view.key_id.as_str()),
+        reserved_package_count: view.reserved_package_count,
+        signature_public_key: Bytes::from(view.signing_public_key.clone()),
+        status: SmolStr::from(view.status.as_str()),
+        updated_at: crate::sqlx_jacquard::chrono_to_datetime(view.updated_at),
+        extra_data: None,
+    }
+}
+
+/// Build the exact generated `addressableDevice` for one enriched directory row.
+///
+/// It contains ONLY the endpoint's declared wire fields: audience DID, device
+/// ID, key ID, decoded pinned capability, live available-package count, and the
+/// generated empty `extra_data`. It deliberately carries no authentication
+/// generation, JKT, signing key, status, timestamp, reserved count, requester
+/// coordinate, or row object.
+#[cfg(not(test))]
+fn read_facade_addressable_device(
+    view: &super::device_directory::DeviceDirectoryView,
+    user_did: &str,
+) -> Result<
+    catbird_atproto::generated::blue_catbird::chat::AddressableDevice<jacquard_common::DefaultStr>,
+    ExistingDeviceReadFacadeError,
+> {
+    use jacquard_common::deps::smol_str::SmolStr;
+
+    let capability = serde_json::from_str::<
+        catbird_atproto::generated::blue_catbird::chat::DeviceCapability<
+            jacquard_common::DefaultStr,
+        >,
+    >(&view.capabilities_json)
+    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    let user_did = jacquard_common::types::string::Did::new_owned(user_did)
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    Ok(
+        catbird_atproto::generated::blue_catbird::chat::AddressableDevice {
+            available_package_count: view.available_package_count,
+            capability,
+            device_id: SmolStr::from(view.device_id.to_string()),
+            key_id: SmolStr::from(view.key_id.as_str()),
+            user_did,
+            extra_data: None,
+        },
+    )
+}
+
+/// `blue.catbird.chat.getDevices` — the complete repository-owned facade.
+///
+/// Consumes the opaque admission into the closed one-attempt budget BEFORE any
+/// SQL, opens one fresh `READ COMMITTED` transaction, spends the single attempt
+/// against the two ordered requester locks, holds those locks through the
+/// bounded audience/directory read, and ends the read-only transaction before
+/// returning consuming canonical JSON bytes.
+#[cfg(not(test))]
+pub(crate) async fn read_addressable_devices_for_admission(
+    pool: &sqlx::PgPool,
+    admission: super::super::dpop::VerifiedReadAdmission,
+    dids: &[String],
+) -> Result<CanonicalGetDevicesResponse, ExistingDeviceReadFacadeError> {
+    // Convert the admission BEFORE SQL. An endpoint or method mismatch fails
+    // here, with no transaction ever opened.
+    let attempt = admission
+        .into_get_devices_read_admission()
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?
+        .into_attempt();
+
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+
+    let outcome = read_addressable_devices_in_transaction(&mut transaction, attempt, dids).await;
+
+    // Read-only: the requester locks are held until exactly here, and releasing
+    // the transaction discards nothing durable.
+    let _ = transaction.rollback().await;
+    outcome
+}
+
+#[cfg(not(test))]
+async fn read_addressable_devices_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: super::super::dpop::ReadAdmissionAttempt,
+    dids: &[String],
+) -> Result<CanonicalGetDevicesResponse, ExistingDeviceReadFacadeError> {
+    let lock = lock_and_verify_read_requester(transaction, attempt).await?;
+
+    // PROTECTED QUERY — bounded audience read.
+    guard_protected_query(&lock)?;
+    let rows = get_devices(transaction, dids)
+        .await
+        .map_err(facade_error_from_inventory)?;
+
+    let mut devices = Vec::with_capacity(rows.len());
+    for row in &rows {
+        // PROTECTED QUERY — per-row directory enrichment.
+        guard_protected_query(&lock)?;
+        // The audience read returns only active devices; a row that vanishes
+        // between the two reads is skipped rather than surfaced as a phantom.
+        let Some(view) =
+            super::device_directory::read_device_view(transaction, &row.user_did, row.device_id)
+                .await
+                .map_err(|_| ExistingDeviceReadFacadeError::Storage)?
+        else {
+            continue;
+        };
+        devices.push(read_facade_addressable_device(&view, &row.user_did)?);
+    }
+
+    let output = catbird_atproto::generated::blue_catbird::chat::get_devices::GetDevicesOutput::<
+        jacquard_common::DefaultStr,
+    > {
+        devices,
+        extra_data: None,
+    };
+    let response_bytes =
+        serde_json::to_vec(&output).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    Ok(CanonicalGetDevicesResponse { response_bytes })
+}
+
+/// One attempt's terminal disposition inside the fixed three-attempt loop.
+#[cfg(not(test))]
+enum OwnDeviceSnapshotOutcome {
+    /// The device fence lost its race. Roll back, drop this attempt's proof, and
+    /// use the next fixed array element.
+    Retry,
+    /// Materialization succeeded. The generated output is complete but NOT yet
+    /// serialized: bytes are produced only after the commit below.
+    Materialized(
+        catbird_atproto::generated::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<
+            jacquard_common::DefaultStr,
+        >,
+    ),
+}
+
+/// `blue.catbird.chat.getOwnDevices` — the complete repository-owned facade.
+///
+/// Owns the fixed three-attempt boundary end to end. No handler drives retries:
+/// the loop is over the fixed `[ReadAdmissionAttempt; 3]` array, a fourth
+/// iteration is unrepresentable, and every retry rolls back the prior
+/// transaction and drops the prior row proof before taking the next element.
+#[cfg(not(test))]
+pub(crate) async fn create_own_device_snapshot_for_admission(
+    pool: &sqlx::PgPool,
+    admission: super::super::dpop::VerifiedReadAdmission,
+) -> Result<CommittedOwnDeviceSnapshot, ExistingDeviceReadFacadeError> {
+    // Convert the admission BEFORE SQL.
+    let attempts = admission
+        .into_get_own_devices_read_admission()
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?
+        .into_attempts();
+
+    for attempt in attempts {
+        // Each attempt starts a FRESH transaction.
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+
+        match materialize_own_device_snapshot(&mut transaction, attempt).await {
+            Ok(OwnDeviceSnapshotOutcome::Materialized(output)) => {
+                // A successful commit is the deferred-constraint proof.
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+                // Only NOW may bytes exist.
+                let response_bytes = serde_json::to_vec(&output)
+                    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+                return Ok(CommittedOwnDeviceSnapshot { response_bytes });
+            }
+            Ok(OwnDeviceSnapshotOutcome::Retry) => {
+                // Drop this attempt's transaction and row proof before the next
+                // fixed array element is used.
+                let _ = transaction.rollback().await;
+                continue;
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+
+    // The fixed ceiling. The handler renders HTTP 503 + `Retry-After: 1`; no
+    // protocol vocabulary is invented.
+    Err(ExistingDeviceReadFacadeError::RetryCeiling)
+}
+
+#[cfg(not(test))]
+async fn materialize_own_device_snapshot(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: super::super::dpop::ReadAdmissionAttempt,
+) -> Result<OwnDeviceSnapshotOutcome, ExistingDeviceReadFacadeError> {
+    let lock = lock_and_verify_read_requester(transaction, attempt).await?;
+
+    // PROTECTED QUERY — own-device directory read.
+    guard_protected_query(&lock)?;
+    let views = super::device_directory::list_own_device_views(transaction, &lock.row_user_did)
+        .await
+        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+
+    // Construct each generated `ownDeviceView` EXACTLY ONCE. The value that is
+    // serialized to durable `payload_bytes` is the SAME value that is appended
+    // to the response item list — it is moved, never rebuilt.
+    let mut items = Vec::with_capacity(views.len());
+    let mut subjects = Vec::with_capacity(views.len());
+    for view in &views {
+        let own = catbird_atproto::generated::blue_catbird::chat::OwnDeviceView {
+            device: read_facade_device_view(view),
+            extra_data: None,
+        };
+        let payload_bytes =
+            serde_json::to_vec(&own).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+        subjects.push(DeviceInventorySubject {
+            subject_device_id: view.device_id,
+            payload_bytes,
+        });
+        items.push(own);
+    }
+
+    // Payload/value divergence FAILS BEFORE COMMIT. Single construction already
+    // makes divergence structurally impossible; this proves it rather than
+    // assuming it, and costs one re-serialization over a set the own-device
+    // directory bounds.
+    if subjects.len() != items.len() {
+        return Err(ExistingDeviceReadFacadeError::Invariant);
+    }
+    for (subject, item) in subjects.iter().zip(items.iter()) {
+        let reserialized =
+            serde_json::to_vec(item).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+        if reserialized != subject.payload_bytes {
+            return Err(ExistingDeviceReadFacadeError::Invariant);
+        }
+    }
+
+    // The repository-owned bounded window. `created_at` is a derivation on the
+    // same-transaction proof — the retained trusted instant never leaves that
+    // type, and it arrives already truncated to a whole second because
+    // `unix_seconds` rejects sub-second precision. The TTL is this module's
+    // constant; the seam accepts none.
+    let created_at = lock
+        .verified
+        .bounded_snapshot_created_at()
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    let expires_at = created_at + chrono::Duration::minutes(OWN_DEVICE_SNAPSHOT_TTL_MINUTES);
+
+    // The session's internal requester columns come from the ALREADY VERIFIED
+    // locked database row, not from the hidden admission. They never cross the
+    // facade interface.
+    let auth_generation = u64::try_from(lock.row_auth_generation)
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    let request = CreateDeviceInventorySessionRequest {
+        device_inventory_session_id: Uuid::new_v4(),
+        user_did: &lock.row_user_did,
+        device_id: lock.row_device_id,
+        jkt: &lock.row_dpop_jkt,
+        auth_generation,
+        fence_revision: 0,
+        created_at,
+        expires_at,
+        subjects,
+    };
+
+    // PROTECTED QUERY — the durable session write.
+    guard_protected_query(&lock)?;
+    match create_device_inventory_session(transaction, request).await {
+        Ok(_) => {}
+        // The ONLY retryable outcome. Authority drift never reaches here: it is
+        // terminal inside `lock_and_verify_read_requester`.
+        Err(InventoryRepositoryError::SnapshotConflict) => {
+            return Ok(OwnDeviceSnapshotOutcome::Retry)
+        }
+        Err(error) => return Err(facade_error_from_inventory(error)),
+    }
+
+    // Single page: the whole own-device set materializes at once, so there is no
+    // further page and no continuation cursor.
+    let output =
+        catbird_atproto::generated::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput::<
+            jacquard_common::DefaultStr,
+        > {
+            has_more: false,
+            items,
+            next_page_cursor: None,
+            snapshot_expires_at: crate::sqlx_jacquard::chrono_to_datetime(expires_at),
+            extra_data: None,
+        };
+    Ok(OwnDeviceSnapshotOutcome::Materialized(output))
+}

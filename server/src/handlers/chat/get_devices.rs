@@ -1,11 +1,15 @@
 //! `blue.catbird.chat.getDevices` — ordinary-unsigned addressable-device query.
 //!
-//! Reuses the certified `inventory::get_devices` VERBATIM for the bounded audience
-//! set (it owns the DID/per-DID/total bounds and canonical ordering), then
-//! enriches each returned device via `read_device_view` to project the wire
-//! `addressableDevice` (key id + decoded pinned capability + live available count).
-//! The per-row enrichment is a deliberate bounded N+1 — the audience is hard-capped
-//! at `MAX_GET_DEVICES_TOTAL` by the reused read.
+//! This handler is deliberately inert. It admits once, transfers the opaque
+//! admission once into the repository-owned facade with the public `userDids`
+//! values, and moves the resulting canonical bytes into `context::json_ok`.
+//!
+//! It contains no authority inspection, SQL, transaction, isolation statement,
+//! retry loop, DTO projection, serializer, row access, direct directory or
+//! inventory call, or discarded admission. Every one of those now lives in
+//! `chat_protocol::repository::inventory`, which owns the ordered requester
+//! locks, the attempt verification, the `addressableDevice` projection, and the
+//! canonical response bytes.
 
 use std::sync::Arc;
 
@@ -15,19 +19,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::DefaultStr;
-
-use crate::chat_protocol::error::ChatEndpoint;
-use crate::chat_protocol::repository::device_directory::read_device_view;
-use crate::chat_protocol::repository::inventory;
+use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
+use crate::chat_protocol::repository::inventory::{
+    read_addressable_devices_for_admission, ExistingDeviceReadFacadeError,
+};
 use crate::chat_protocol::validation::CanonicalHttpMethod;
 use crate::storage::DbPool;
 
 use super::context;
-use super::device_views::{
-    addressable_device_from_directory, directory_failure, inventory_failure, InventoryFailure,
-};
 use super::errors::ChatFailure;
 use super::runtime::ChatRuntime;
 
@@ -52,58 +51,38 @@ async fn get_devices(
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let _authority = context::admit_unsigned(pool, runtime, ENDPOINT, method, headers).await?;
+    let admission = context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers).await?;
 
     let dids = parse_user_dids(query);
-    let mut transaction = pool
-        .begin()
+    let response = read_addressable_devices_for_admission(pool, admission, &dids)
         .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+        .map_err(facade_failure)?;
 
-    let rows = match inventory::get_devices(&mut transaction, &dids).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            return match inventory_failure(ENDPOINT, error) {
-                // getDevices declares no retryable code and `get_devices` has no
-                // SnapshotConflict path, so a retryable classification here is an
-                // internal invariant break.
-                InventoryFailure::Retryable => Err(ChatFailure::invariant(ENDPOINT)),
-                InventoryFailure::Terminal(failure) => Err(failure),
-            };
-        }
-    };
-
-    let mut devices = Vec::with_capacity(rows.len());
-    for row in &rows {
-        // The audience read returns only active devices; a row that vanishes
-        // between the two reads is skipped rather than surfaced as a phantom.
-        if let Some(view) = read_device_view(&mut transaction, &row.user_did, row.device_id)
-            .await
-            .map_err(|error| directory_failure(ENDPOINT, error))?
-        {
-            devices.push(addressable_device_from_directory(
-                &view,
-                &row.user_did,
-                ENDPOINT,
-            )?);
-        }
-    }
-
-    let output = chat_dto::get_devices::GetDevicesOutput::<DefaultStr> {
-        devices,
-        extra_data: None,
-    };
-    let response_bytes =
-        serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-
-    // Read-only; releasing the transaction discards nothing durable.
-    let _ = transaction.rollback().await;
-    Ok(context::json_ok(response_bytes))
+    Ok(context::json_ok(response.into_response_bytes()))
 }
 
-/// Collect the repeated `userDids` query parameter values in wire order. Bounds
-/// enforcement (too many / zero) is delegated to the certified
-/// `inventory::get_devices`, so this only decodes.
+/// Map the already-sanitized facade vocabulary to this endpoint's declared wire
+/// surface. The facade's variants are unit variants carrying no requester,
+/// authority, or row detail, so nothing here can widen what reaches the client.
+///
+/// `RetryCeiling` belongs to the `getOwnDevices` three-attempt boundary and is
+/// unreachable from the single-attempt `getDevices` facade; reaching it would be
+/// an internal invariant break, not a client-visible condition.
+fn facade_failure(error: ExistingDeviceReadFacadeError) -> ChatFailure {
+    match error {
+        ExistingDeviceReadFacadeError::RequestTooBroad => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        }
+        ExistingDeviceReadFacadeError::Storage => ChatFailure::storage(ENDPOINT),
+        ExistingDeviceReadFacadeError::Invariant | ExistingDeviceReadFacadeError::RetryCeiling => {
+            ChatFailure::invariant(ENDPOINT)
+        }
+    }
+}
+
+/// Collect the repeated `userDids` query parameter values in wire order. These
+/// are public request values, not authority: bounds enforcement (too many /
+/// zero) belongs to the facade's bounded audience read, so this only decodes.
 fn parse_user_dids(query: Option<&str>) -> Vec<String> {
     let Some(query) = query else {
         return Vec::new();

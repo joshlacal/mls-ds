@@ -6,6 +6,7 @@
 // and validates stored device state in the same transaction.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Utc};
 use p256::{
     ecdsa::{signature::Verifier, Signature, VerifyingKey},
     EncodedPoint, FieldBytes,
@@ -13,10 +14,12 @@ use p256::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use uuid::Uuid;
 
 use super::{
     model::AuthPrimitiveError,
-    repository::auth::RepositoryAuthorityReceipt,
+    repository::auth::{ReplayAuditIds, RepositoryAuthorityClass, RepositoryAuthorityReceipt},
     transcript::{
         verify_signed_mutation, CanonicalRebindBootstrap, CanonicalSignedMutation,
         VerifiedEnrollmentBody, VerifiedSignedMutation,
@@ -381,6 +384,474 @@ pub(super) fn mint_rebind_repository_authority(
         mutation: Some(mutation),
         repository_receipt,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Opaque existing-device read admission (Stage B).
+//
+// A committed `VerifiedChatDeviceRequest` is the only input. Sealing produces
+// an opaque `VerifiedReadAdmission` whose private binding retains the exact
+// repository-locked coordinates. Handlers can name that value but can read
+// nothing from it: there is no getter, no `Clone`/`Copy`, no `Debug`, no
+// serde, and no constructor other than `seal_read_admission`.
+//
+// Authority is spent through closed per-endpoint budgets. `GetDevices` mints
+// exactly one attempt; `GetOwnDevices` mints exactly three. Each attempt is
+// consumed by verifying one separately locked database row, and only that
+// consuming verification mints `VerifiedExistingDeviceReadRow`.
+// ---------------------------------------------------------------------------
+
+/// Redacted read-admission failure. Every variant is a unit variant, so no
+/// `Debug` rendering can carry requester DID, device, JKT, generation, key,
+/// replay, or transaction material. Deliberately non-`Clone`, non-`Copy`, and
+/// non-serde.
+#[derive(Debug)]
+pub(crate) enum ReadAdmissionBindingError {
+    /// The committed receipt is not an existing-device authority.
+    AuthorityClass,
+    /// The request carries a mutation, enrollment, rebind, auth-transaction,
+    /// or operation shape that no read endpoint accepts.
+    OperationShape,
+    /// The validated endpoint is not the budget's closed endpoint.
+    EndpointBinding,
+    /// The canonical method is not the endpoint-owned method.
+    MethodBinding,
+    /// Repository-locked DID/device coordinates are absent or drifted.
+    RequesterCoordinates,
+    /// The textual JKT is absent, noncanonical, not exactly 32 bytes, or
+    /// drifted from the sealed digest.
+    Thumbprint,
+    /// The authentication generation is absent, not a positive signed `i64`,
+    /// or drifted.
+    Generation,
+    /// The active key ID or locked signing-key digest is absent or drifted.
+    KeyBinding,
+    /// The locked device row is not active.
+    DeviceStatus,
+    /// The locked device key carries a revocation instant.
+    KeyRevoked,
+    /// The locked row failed its structural evidence checks.
+    LockedRowShape,
+    /// A protected operation ran under a transaction other than the one that
+    /// produced the verified row.
+    TransactionIdentity,
+    /// The retained trusted instant could not be reduced to a whole-second
+    /// repository-owned base timestamp.
+    BoundedTimestamp,
+}
+
+/// The two closed read endpoints owned by the conversion methods. They are
+/// module constants, never caller arguments.
+const GET_DEVICES_ENDPOINT_NSID: &str = "blue.catbird.chat.getDevices";
+const GET_OWN_DEVICES_ENDPOINT_NSID: &str = "blue.catbird.chat.getOwnDevices";
+/// Canonical method owned by both closed read endpoints.
+const READ_ENDPOINT_CANONICAL_METHOD: &str = "GET";
+/// The fixed `GetOwnDevices` attempt budget. A fourth element is
+/// unrepresentable because the field is a fixed-size array of exactly this
+/// length and no push/reset/mint operation exists.
+const GET_OWN_DEVICES_ATTEMPT_BUDGET: usize = 3;
+
+/// Private admission binding. Every field is repository-locked evidence taken
+/// from the committed receipt; nothing here is caller-supplied.
+struct ReadAdmissionBinding {
+    endpoint: ValidatedChatNsid,
+    method: CanonicalHttpMethod,
+    locked_did: String,
+    locked_device_id: Uuid,
+    locked_jkt_digest: [u8; 32],
+    locked_auth_generation: i64,
+    locked_key_id: String,
+    locked_signing_key_sha256: [u8; 32],
+    replay_ids: ReplayAuditIds,
+    trusted_instant: TrustedRequestInstant,
+}
+
+/// Opaque committed read authority. Constructible only by
+/// [`seal_read_admission`], readable by nobody.
+pub(crate) struct VerifiedReadAdmission {
+    binding: ReadAdmissionBinding,
+}
+
+/// Closed one-attempt `GetDevices` budget.
+pub(in crate::chat_protocol) struct GetDevicesReadAdmission {
+    attempt: ReadAdmissionAttempt,
+}
+
+/// Closed fixed three-attempt `GetOwnDevices` budget.
+pub(in crate::chat_protocol) struct GetOwnDevicesReadAdmission {
+    attempts: [ReadAdmissionAttempt; GET_OWN_DEVICES_ATTEMPT_BUDGET],
+}
+
+/// One spendable read attempt. It is minted only by a budget conversion and is
+/// destroyed by the single consuming verification below.
+pub(in crate::chat_protocol) struct ReadAdmissionAttempt {
+    binding: Arc<ReadAdmissionBinding>,
+}
+
+/// Borrowed carrier for the two `WHERE` bind parameters of the ordered device
+/// and key `FOR UPDATE` statements, and nothing else.
+///
+/// It is the transfer described by the sealed authority: the lock coordinates
+/// "are transferred only within the private consuming operation from the
+/// attempt to the exact repository lock path". The borrow is what enforces
+/// "within" — this carrier cannot outlive the attempt it came from, so it
+/// cannot escape the facade.
+///
+/// It deliberately carries **no** textual JKT, generation, key evidence,
+/// replay evidence, request object, budget, or transaction identity. That is
+/// load-bearing, not conservatism: if the JKT or the generation reached the
+/// repository through this seam, the repository would hand them straight back
+/// and [`ReadAdmissionAttempt::consume_verify_locked_row`] would be comparing
+/// the hidden binding against itself, making every drift check vacuous. Those
+/// values must reach the facade only as row values read out of the locked
+/// rows themselves. The authority independently states that they have no
+/// getter.
+pub(in crate::chat_protocol) struct ReadLockCoordinates<'a> {
+    pub(in crate::chat_protocol) did: &'a str,
+    pub(in crate::chat_protocol) device_id: Uuid,
+}
+
+/// Structural evidence carried from two separately locked repository rows to
+/// the hidden receipt verifier. Constructing it proves nothing about
+/// authority.
+pub(in crate::chat_protocol) struct LockedReadDatabaseRow {
+    transaction_id: Box<str>,
+    did: Box<str>,
+    device_id: Uuid,
+    device_status: Box<str>,
+    textual_jkt: Box<str>,
+    auth_generation: i64,
+    key_id: Box<str>,
+    signing_public_key_sha256: [u8; 32],
+    key_revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Exact private same-transaction proof. It exposes no raw field or getter;
+/// the only observable behaviour is the same-transaction check and the
+/// whole-second base-timestamp derivation below.
+pub(in crate::chat_protocol) struct VerifiedExistingDeviceReadRow {
+    transaction_id: Box<str>,
+    trusted_instant: TrustedRequestInstant,
+}
+
+/// Decode a canonical textual JWK thumbprint to its exact raw 32-byte digest.
+///
+/// This is a URL-safe, no-padding base64 decode, an exact 32-byte conversion,
+/// and a re-encode equality check. The JKT text is never hashed: SHA-256 of the
+/// text would produce a different value entirely.
+fn decode_canonical_thumbprint_digest(
+    textual_jkt: &str,
+) -> Result<[u8; 32], ReadAdmissionBindingError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(textual_jkt)
+        .map_err(|_| ReadAdmissionBindingError::Thumbprint)?;
+    let digest: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| ReadAdmissionBindingError::Thumbprint)?;
+    if URL_SAFE_NO_PAD.encode(digest) != textual_jkt {
+        return Err(ReadAdmissionBindingError::Thumbprint);
+    }
+    Ok(digest)
+}
+
+/// Seal one committed, successful `VerifiedChatDeviceRequest` into an opaque
+/// read admission.
+///
+/// The request must be an existing-device authority with no mutation and no
+/// operation identifier, and its cryptographic subject/device/JKT must equal
+/// the coordinates the repository actually locked. `context::admit_unsigned_read`
+/// is the sole non-test caller.
+pub(crate) fn seal_read_admission(
+    request: VerifiedChatDeviceRequest,
+) -> Result<VerifiedReadAdmission, ReadAdmissionBindingError> {
+    if request.mutation().is_some() {
+        return Err(ReadAdmissionBindingError::OperationShape);
+    }
+    let pre_replay = request.pre_replay();
+    if pre_replay.enrollment.is_some()
+        || pre_replay.enrollment_body.is_some()
+        || pre_replay.rebind.is_some()
+        || pre_replay.auth_transaction_replay.is_some()
+    {
+        return Err(ReadAdmissionBindingError::OperationShape);
+    }
+
+    let receipt = request.repository_receipt();
+    if receipt.class() != RepositoryAuthorityClass::ExistingDevice {
+        return Err(ReadAdmissionBindingError::AuthorityClass);
+    }
+    if receipt.operation_id().is_some() {
+        return Err(ReadAdmissionBindingError::OperationShape);
+    }
+
+    let endpoint = pre_replay.endpoint().clone();
+    let endpoint_owned_method = endpoint
+        .dpop_method()
+        .map_err(|_| ReadAdmissionBindingError::MethodBinding)?;
+    if pre_replay.method() != &endpoint_owned_method {
+        return Err(ReadAdmissionBindingError::MethodBinding);
+    }
+
+    // Exactly one seam into the receipt. The pre-existing raw mutation getters
+    // (`locked_jkt`, `locked_auth_generation`, `locked_key_id`,
+    // `locked_signing_key_sha256`) are deliberately NOT invoked on the read
+    // path; the coordinate accessor already guarantees an existing-device
+    // class, complete device-then-key evidence, and a positive signed `i64`
+    // generation.
+    let coordinates = receipt
+        .locked_existing_device_read_coordinates()
+        .ok_or(ReadAdmissionBindingError::RequesterCoordinates)?;
+
+    if coordinates.did != pre_replay.subject().as_str()
+        || coordinates.device_id.as_bytes() != pre_replay.device_id().as_bytes()
+    {
+        return Err(ReadAdmissionBindingError::RequesterCoordinates);
+    }
+    if coordinates.textual_jkt != pre_replay.dpop_jkt().as_str() {
+        return Err(ReadAdmissionBindingError::Thumbprint);
+    }
+    let locked_jkt_digest = decode_canonical_thumbprint_digest(coordinates.textual_jkt)?;
+    if coordinates.auth_generation <= 0 {
+        return Err(ReadAdmissionBindingError::Generation);
+    }
+
+    let locked_did = coordinates.did.to_owned();
+    let locked_device_id = coordinates.device_id;
+    let locked_auth_generation = coordinates.auth_generation;
+    let locked_key_id = coordinates.key_id.to_owned();
+    let locked_signing_key_sha256 = *coordinates.signing_key_sha256;
+
+    let replay_ids = receipt.replay_ids();
+    let trusted_instant = pre_replay.trusted_instant().clone();
+
+    Ok(VerifiedReadAdmission {
+        binding: ReadAdmissionBinding {
+            endpoint,
+            method: endpoint_owned_method,
+            locked_did,
+            locked_device_id,
+            locked_jkt_digest,
+            locked_auth_generation,
+            locked_key_id,
+            locked_signing_key_sha256,
+            replay_ids,
+            trusted_instant,
+        },
+    })
+}
+
+impl VerifiedReadAdmission {
+    /// Private endpoint gate shared by both conversions. It is not a seam: the
+    /// closed endpoint/method are module constants supplied by the two public
+    /// conversion methods below, never by a caller.
+    fn into_closed_endpoint_binding(
+        self,
+        endpoint_nsid: &'static str,
+        canonical_method: &'static str,
+    ) -> Result<ReadAdmissionBinding, ReadAdmissionBindingError> {
+        if self.binding.endpoint.as_str() != endpoint_nsid {
+            return Err(ReadAdmissionBindingError::EndpointBinding);
+        }
+        let endpoint_owned_method = self
+            .binding
+            .endpoint
+            .dpop_method()
+            .map_err(|_| ReadAdmissionBindingError::MethodBinding)?;
+        if self.binding.method != endpoint_owned_method
+            || self.binding.method.as_str() != canonical_method
+        {
+            return Err(ReadAdmissionBindingError::MethodBinding);
+        }
+        Ok(self.binding)
+    }
+
+    /// Mint the closed `GetDevices` budget: exactly one attempt.
+    pub(in crate::chat_protocol) fn into_get_devices_read_admission(
+        self,
+    ) -> Result<GetDevicesReadAdmission, ReadAdmissionBindingError> {
+        let binding = self.into_closed_endpoint_binding(
+            GET_DEVICES_ENDPOINT_NSID,
+            READ_ENDPOINT_CANONICAL_METHOD,
+        )?;
+        Ok(GetDevicesReadAdmission {
+            attempt: ReadAdmissionAttempt {
+                binding: Arc::new(binding),
+            },
+        })
+    }
+
+    /// Mint the closed `GetOwnDevices` budget: exactly three attempts.
+    pub(in crate::chat_protocol) fn into_get_own_devices_read_admission(
+        self,
+    ) -> Result<GetOwnDevicesReadAdmission, ReadAdmissionBindingError> {
+        let binding = Arc::new(self.into_closed_endpoint_binding(
+            GET_OWN_DEVICES_ENDPOINT_NSID,
+            READ_ENDPOINT_CANONICAL_METHOD,
+        )?);
+        Ok(GetOwnDevicesReadAdmission {
+            attempts: [
+                ReadAdmissionAttempt {
+                    binding: Arc::clone(&binding),
+                },
+                ReadAdmissionAttempt {
+                    binding: Arc::clone(&binding),
+                },
+                ReadAdmissionAttempt { binding },
+            ],
+        })
+    }
+}
+
+impl GetDevicesReadAdmission {
+    pub(in crate::chat_protocol) fn into_attempt(self) -> ReadAdmissionAttempt {
+        self.attempt
+    }
+}
+
+impl GetOwnDevicesReadAdmission {
+    pub(in crate::chat_protocol) fn into_attempts(
+        self,
+    ) -> [ReadAdmissionAttempt; GET_OWN_DEVICES_ATTEMPT_BUDGET] {
+        self.attempts
+    }
+}
+
+impl LockedReadDatabaseRow {
+    /// Structural evidence only.
+    ///
+    /// Returning `Ok` proves that two separately locked rows produced a
+    /// well-shaped device/key tuple inside one transaction. It proves nothing
+    /// about authority: only [`ReadAdmissionAttempt::consume_verify_locked_row`]
+    /// can turn this into a verified row.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::chat_protocol) fn from_repository_lock(
+        transaction_id: Box<str>,
+        did: Box<str>,
+        device_id: Uuid,
+        device_status: Box<str>,
+        textual_jkt: Box<str>,
+        auth_generation: i64,
+        key_id: Box<str>,
+        signing_public_key_sha256: [u8; 32],
+        key_revoked_at: Option<DateTime<Utc>>,
+    ) -> Result<Self, ReadAdmissionBindingError> {
+        if transaction_id.is_empty()
+            || did.is_empty()
+            || device_status.is_empty()
+            || key_id.is_empty()
+            || device_id.is_nil()
+            || auth_generation <= 0
+        {
+            return Err(ReadAdmissionBindingError::LockedRowShape);
+        }
+        decode_canonical_thumbprint_digest(&textual_jkt)
+            .map_err(|_| ReadAdmissionBindingError::LockedRowShape)?;
+        Ok(Self {
+            transaction_id,
+            did,
+            device_id,
+            device_status,
+            textual_jkt,
+            auth_generation,
+            key_id,
+            signing_public_key_sha256,
+            key_revoked_at,
+        })
+    }
+}
+
+impl ReadAdmissionAttempt {
+    /// The exact repository-locked DID and device UUID to bind into the
+    /// ordered `chat.devices` then `chat.device_keys` `FOR UPDATE` statements.
+    ///
+    /// Deliberately takes `&self` and does **not** consume the attempt: the
+    /// attempt must still be spent by
+    /// [`ReadAdmissionAttempt::consume_verify_locked_row`], or the
+    /// one-attempt-one-verified-row accounting would break and a budget could
+    /// authorize a lock it never verified.
+    pub(in crate::chat_protocol) fn lock_coordinates(&self) -> ReadLockCoordinates<'_> {
+        ReadLockCoordinates {
+            did: self.binding.locked_did.as_str(),
+            device_id: self.binding.locked_device_id,
+        }
+    }
+
+    /// Spend this attempt against one separately locked device/key row.
+    ///
+    /// The attempt is consumed by value, so no attempt can be reused and no
+    /// failed verification leaves spendable authority behind. Device activity
+    /// and key revocation stay separate checks.
+    pub(in crate::chat_protocol) fn consume_verify_locked_row(
+        self,
+        row: LockedReadDatabaseRow,
+    ) -> Result<VerifiedExistingDeviceReadRow, ReadAdmissionBindingError> {
+        let binding = self.binding;
+        if &*row.device_status != "active" {
+            return Err(ReadAdmissionBindingError::DeviceStatus);
+        }
+        if row.key_revoked_at.is_some() {
+            return Err(ReadAdmissionBindingError::KeyRevoked);
+        }
+        if &*row.did != binding.locked_did.as_str() || row.device_id != binding.locked_device_id {
+            return Err(ReadAdmissionBindingError::RequesterCoordinates);
+        }
+        if decode_canonical_thumbprint_digest(&row.textual_jkt)? != binding.locked_jkt_digest {
+            return Err(ReadAdmissionBindingError::Thumbprint);
+        }
+        if row.auth_generation <= 0 || row.auth_generation != binding.locked_auth_generation {
+            return Err(ReadAdmissionBindingError::Generation);
+        }
+        if &*row.key_id != binding.locked_key_id.as_str()
+            || row.signing_public_key_sha256 != binding.locked_signing_key_sha256
+        {
+            return Err(ReadAdmissionBindingError::KeyBinding);
+        }
+        Ok(VerifiedExistingDeviceReadRow {
+            transaction_id: row.transaction_id,
+            trusted_instant: binding.trusted_instant.clone(),
+        })
+    }
+}
+
+impl VerifiedExistingDeviceReadRow {
+    /// Confirm this proof belongs to the transaction that is about to run a
+    /// protected query. A proof minted under transaction A is terminal — never
+    /// a retryable snapshot conflict — under transaction B.
+    ///
+    /// This is a checker, not a getter: the retained identity never leaves.
+    pub(in crate::chat_protocol) fn verify_same_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<(), ReadAdmissionBindingError> {
+        if &*self.transaction_id == transaction_id {
+            Ok(())
+        } else {
+            Err(ReadAdmissionBindingError::TransactionIdentity)
+        }
+    }
+
+    /// The repository-owned base timestamp for a durable session built under
+    /// this proof: the retained trusted request instant truncated to a whole
+    /// second.
+    ///
+    /// This is a **derivation, not a getter**. The retained
+    /// `TrustedRequestInstant` never leaves the type, and no sub-second value
+    /// can cross this boundary: `TrustedRequestInstant::capture` samples at
+    /// millisecond precision, and `inventory::unix_seconds` rejects any
+    /// timestamp whose `timestamp_subsec_nanos()` is nonzero. Truncating here
+    /// makes that a structural property of the boundary rather than a
+    /// convention the repository has to remember.
+    ///
+    /// It deliberately takes **no TTL, duration, or expiry** and computes no
+    /// `expires_at`. The bound is repository-owned: `inventory.rs` owns the
+    /// session TTL constant and derives the expiry from this base itself. A
+    /// session-policy value has no business inside the admission module.
+    pub(in crate::chat_protocol) fn bounded_snapshot_created_at(
+        &self,
+    ) -> Result<DateTime<Utc>, ReadAdmissionBindingError> {
+        DateTime::from_timestamp(self.trusted_instant.datetime().timestamp(), 0)
+            .ok_or(ReadAdmissionBindingError::BoundedTimestamp)
+    }
 }
 
 #[derive(Debug, Deserialize)]

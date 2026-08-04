@@ -96,15 +96,29 @@ impl ReplayAuditIds {
 /// Sealed proof that the repository committed an exact replay set and locked
 /// the database binding used for authorization. Its fields and constructors
 /// are private to this module; sibling modules can inspect but cannot mint it.
-#[derive(Debug)]
 pub(crate) struct RepositoryAuthorityReceipt {
     replay_ids: ReplayAuditIds,
     class: RepositoryAuthorityClass,
     operation_id: Option<Uuid>,
+    locked_did: Option<String>,
+    locked_device_id: Option<Uuid>,
     locked_jkt: Option<String>,
     locked_auth_generation: Option<i64>,
     locked_key_id: Option<String>,
     locked_signing_key_sha256: Option<[u8; 32]>,
+}
+
+/// Hand-written and deliberately empty of content, for the same reason as
+/// [`LockedDeviceAuthority`]: the receipt carries the repository-locked
+/// requester coordinates (DID, device id, DPoP thumbprint, generation, key
+/// id, signing-key digest). Its rendering was transitively reachable — the
+/// `Debug` of `VerifiedChatDeviceRequest` embeds this receipt, and
+/// `AuthorizationOutcome::FirstExecution` formats that request — so a derived
+/// impl here leaked the locked coordinates through a live render path.
+impl ::core::fmt::Debug for RepositoryAuthorityReceipt {
+    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        formatter.write_str("RepositoryAuthorityReceipt(<redacted>)")
+    }
 }
 
 impl RepositoryAuthorityReceipt {
@@ -113,6 +127,8 @@ impl RepositoryAuthorityReceipt {
             replay_ids,
             class: RepositoryAuthorityClass::EnrollmentBootstrap,
             operation_id: Some(operation_id),
+            locked_did: None,
+            locked_device_id: None,
             locked_jkt: None,
             locked_auth_generation: None,
             locked_key_id: None,
@@ -130,6 +146,8 @@ impl RepositoryAuthorityReceipt {
             replay_ids,
             class,
             operation_id,
+            locked_did: Some(state.did.clone()),
+            locked_device_id: Some(state.device_id),
             locked_jkt: Some(state.dpop_jkt.clone()),
             locked_auth_generation: Some(state.auth_generation),
             locked_key_id: Some(state.key_id.clone()),
@@ -149,6 +167,8 @@ impl RepositoryAuthorityReceipt {
             replay_ids,
             class: RepositoryAuthorityClass::RebindBootstrap,
             operation_id: Some(operation_id),
+            locked_did: None,
+            locked_device_id: None,
             locked_jkt: Some(historical_jkt.to_owned()),
             locked_auth_generation: Some(expected_auth_generation),
             locked_key_id: Some(key_id.to_owned()),
@@ -168,6 +188,36 @@ impl RepositoryAuthorityReceipt {
         self.operation_id
     }
 
+    /// The complete repository-locked existing-device coordinate set, or
+    /// `None` when this receipt did not lock a live device row.
+    ///
+    /// This is the **single** seam through which the read path may observe
+    /// locked coordinates. It deliberately reads the private fields directly
+    /// rather than invoking the pre-existing mutation getters, so no read-path
+    /// call reaches [`RepositoryAuthorityReceipt::locked_auth_generation`] or
+    /// any other raw single-field mutation getter. It yields `Some` only for
+    /// an existing-device authority whose complete device-then-key evidence is
+    /// present and whose generation is a positive signed `i64`.
+    pub(in crate::chat_protocol) fn locked_existing_device_read_coordinates(
+        &self,
+    ) -> Option<LockedExistingDeviceReadCoordinates<'_>> {
+        if self.class != RepositoryAuthorityClass::ExistingDevice {
+            return None;
+        }
+        let auth_generation = self.locked_auth_generation?;
+        if auth_generation <= 0 {
+            return None;
+        }
+        Some(LockedExistingDeviceReadCoordinates {
+            did: self.locked_did.as_deref()?,
+            device_id: self.locked_device_id?,
+            textual_jkt: self.locked_jkt.as_deref()?,
+            auth_generation,
+            key_id: self.locked_key_id.as_deref()?,
+            signing_key_sha256: self.locked_signing_key_sha256.as_ref()?,
+        })
+    }
+
     pub(crate) fn locked_jkt(&self) -> Option<&str> {
         self.locked_jkt.as_deref()
     }
@@ -183,6 +233,24 @@ impl RepositoryAuthorityReceipt {
     pub(crate) fn locked_signing_key_sha256(&self) -> Option<&[u8; 32]> {
         self.locked_signing_key_sha256.as_ref()
     }
+}
+
+/// Borrowed, transient carrier for the exact repository-locked existing-device
+/// coordinates. It cannot outlive its receipt, is deliberately non-`Clone`,
+/// non-`Copy`, non-`Debug`, and non-serde, and is minted only by
+/// [`RepositoryAuthorityReceipt::locked_existing_device_read_coordinates`].
+///
+/// This is not a read-authority type: it carries no admission, budget,
+/// attempt, replay, or transaction identity and confers no authority on its
+/// own. It exists so that read admission sealing has exactly one seam into the
+/// receipt instead of four raw mutation getters.
+pub(in crate::chat_protocol) struct LockedExistingDeviceReadCoordinates<'a> {
+    pub(in crate::chat_protocol) did: &'a str,
+    pub(in crate::chat_protocol) device_id: Uuid,
+    pub(in crate::chat_protocol) textual_jkt: &'a str,
+    pub(in crate::chat_protocol) auth_generation: i64,
+    pub(in crate::chat_protocol) key_id: &'a str,
+    pub(in crate::chat_protocol) signing_key_sha256: &'a [u8; 32],
 }
 
 /// Narrow Reset integration fixture. It derives the operation identifier and
@@ -224,6 +292,11 @@ pub(crate) fn reset_existing_device_receipt_for_test(
         },
         class: RepositoryAuthorityClass::ExistingDevice,
         operation_id: Some(operation_id),
+        // Reset-only mutation fixture: it locks no live device row, so it
+        // carries no repository-locked read coordinates and can never seal a
+        // read admission.
+        locked_did: None,
+        locked_device_id: None,
         locked_jkt: Some(dpop_jkt.to_owned()),
         locked_auth_generation: Some(auth_generation),
         locked_key_id: Some(mutation.key_id().as_str().to_owned()),
@@ -909,12 +982,28 @@ struct DeviceKeyRow {
     revoked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug)]
 struct LockedDeviceAuthority {
+    did: String,
+    device_id: Uuid,
     dpop_jkt: String,
     auth_generation: i64,
     key_id: String,
     signing_public_key: Vec<u8>,
+}
+
+/// Hand-written and deliberately empty of content.
+///
+/// Every field of this struct is requester material — the subject DID, the
+/// device id, the DPoP thumbprint, the authentication generation, the device
+/// key id, and the raw signing public key. A derived `Debug` renders all six
+/// into whatever formats the value: a panic message, an `expect`, a trace
+/// line, or the `Debug` of any type that transitively contains it. The trait
+/// stays implemented so `assert_eq!`/`unwrap`-style call sites keep
+/// compiling; the rendering carries nothing.
+impl ::core::fmt::Debug for LockedDeviceAuthority {
+    fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        formatter.write_str("LockedDeviceAuthority(<redacted>)")
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -1230,6 +1319,8 @@ pub(crate) async fn authorize_signed_operation_only(
                 .await?
                 .ok_or(AuthRepositoryError::CorruptIdempotencyRecord)?;
                 LockedDeviceAuthority {
+                    did: pre_replay.subject().as_str().to_owned(),
+                    device_id: canonical_uuid(pre_replay.device_id()),
                     dpop_jkt: pre_replay.dpop_jkt().as_str().to_owned(),
                     auth_generation: generation,
                     key_id: canonical.key_id().as_str().to_owned(),
@@ -3656,6 +3747,8 @@ async fn lock_device_and_key(
         return Err(AuthRepositoryError::DeviceKeyRevoked);
     }
     Ok(LockedDeviceAuthority {
+        did: subject.to_owned(),
+        device_id,
         dpop_jkt: device.dpop_jkt,
         auth_generation: device.auth_generation,
         key_id: key.key_id,
@@ -4438,6 +4531,9 @@ mod tests {
     #[test]
     fn rebind_business_recheck_uses_the_locked_old_binding() {
         let old_state = LockedDeviceAuthority {
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            device_id: Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .expect("fixed test device UUID is canonical"),
             dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             auth_generation: 7,
             key_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA".to_owned(),
@@ -4456,6 +4552,8 @@ mod tests {
         assert!(locked_state_matches_receipt(&receipt, &old_state));
 
         let post_cas_state = LockedDeviceAuthority {
+            did: old_state.did.clone(),
+            device_id: old_state.device_id,
             dpop_jkt: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA".to_owned(),
             auth_generation: 8,
             key_id: old_state.key_id.clone(),

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::chat_protocol::{
-    dpop::{self, TrustedNestVerifier, VerifiedChatDeviceRequest},
+    dpop::{self, TrustedNestVerifier, VerifiedReadAdmission},
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::auth::{
         self, AuthRepositoryError, CompletedIdempotentResponse, EnrollmentOperationAdmission,
@@ -120,15 +120,21 @@ pub(crate) fn signed_request_bytes(
     Ok(envelope.signed_request.get().as_bytes().to_vec())
 }
 
-/// Admit an ordinary unsigned (DPoP) query. Unsigned requests never carry an
-/// idempotency record, so the outcome is always a first-execution authority.
-pub(crate) async fn admit_unsigned(
+/// Admit an ordinary unsigned (DPoP) read query and immediately seal the
+/// committed authority into an opaque [`VerifiedReadAdmission`].
+///
+/// Unsigned requests never carry an idempotency record, so the repository
+/// outcome is always a first-execution authority. That raw authority is
+/// consumed here and never escapes: this is the sole non-test
+/// `dpop::seal_read_admission` callsite, and every seal failure becomes a
+/// redacted endpoint invariant so no binding detail reaches the wire.
+pub(crate) async fn admit_unsigned_read(
     pool: &DbPool,
     runtime: &ChatRuntime,
     endpoint: ChatEndpoint,
     method: CanonicalHttpMethod,
     headers: &HeaderMap,
-) -> Result<VerifiedChatDeviceRequest, ChatFailure> {
+) -> Result<VerifiedReadAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
     let trust = verifier(runtime, endpoint)?;
     let dpop_headers = read_dpop_headers(headers, endpoint)?;
@@ -143,9 +149,10 @@ pub(crate) async fn admit_unsigned(
         &instant,
     )
     .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    auth::authorize_unsigned_request(pool, pre_replay)
+    let authority = auth::authorize_unsigned_request(pool, pre_replay)
         .await
-        .map_err(|error| auth_repository_failure(endpoint, error))
+        .map_err(|error| auth_repository_failure(endpoint, error))?;
+    dpop::seal_read_admission(authority).map_err(|_| ChatFailure::invariant(endpoint))
 }
 
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
