@@ -354,17 +354,28 @@ pub(super) fn mint_enrollment_repository_authority(
     })
 }
 
+/// Mint first-execution rebind authority.
+///
+/// The rebind bootstrap must **survive** into the returned authority: the
+/// repository stage (`lock_rebind_old_state_scope`) reads it back off
+/// `pre_replay` to bind the locked device row. Read it by reference only —
+/// moving it out here is what previously made every first-execution rebind
+/// fail closed with `UnsupportedAuthorizationShape` → `InvalidRequest`.
 pub(super) fn mint_rebind_repository_authority(
-    mut pre_replay: PreReplayCryptographicVerification,
+    pre_replay: PreReplayCryptographicVerification,
     stored_public_key: &[u8],
     repository_receipt: RepositoryAuthorityReceipt,
 ) -> Result<VerifiedChatDeviceRequest, AuthPrimitiveError> {
     pre_replay.validate_rebind_first_execution_signed_at()?;
-    let bootstrap = pre_replay
+    let mutation = pre_replay
         .rebind
-        .take()
-        .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?;
-    let mutation = bootstrap.verify_with_stored_key(stored_public_key)?;
+        .as_ref()
+        .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?
+        .verify_mutation_with_stored_key(stored_public_key)?;
+    debug_assert!(
+        pre_replay.rebind.is_some(),
+        "rebind bootstrap must survive minting: the repository stage reads it back"
+    );
     Ok(VerifiedChatDeviceRequest {
         pre_replay,
         mutation: Some(mutation),

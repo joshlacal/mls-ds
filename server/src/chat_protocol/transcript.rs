@@ -1995,11 +1995,30 @@ impl CanonicalRebindBootstrap {
             self.canonical.signature(),
         )
     }
-    pub fn verify_with_stored_key(
-        self,
+    /// Verify this bootstrap's retained body signature against the stored
+    /// Ed25519 key and yield the elevated mutation **without consuming the
+    /// bootstrap**.
+    ///
+    /// This type is deliberately borrow-only: it must remain readable by the
+    /// repository stage, which still needs `current_dpop_jkt`, `new_dpop_jkt`,
+    /// `key_id`, `expected_auth_generation` and `idempotency_key` to bind the
+    /// locked device row. A by-value verifier previously existed here and was
+    /// the sole reason a caller moved the bootstrap out of
+    /// `PreReplayCryptographicVerification`, which left the repository stage
+    /// with `None` and made every first-execution rebind fail closed. Do not
+    /// reintroduce a `self`-by-value method on this type.
+    ///
+    /// Re-decoding the retained exact wrapper bytes is the same non-consuming
+    /// pattern already used by the rebind *replay* path.
+    pub fn verify_mutation_with_stored_key(
+        &self,
         stored_public_key: &[u8],
     ) -> Result<VerifiedSignedMutation, AuthPrimitiveError> {
-        verify_signed_mutation(self.canonical, stored_public_key)
+        let canonical = decode_canonical_signed_mutation(self.accepted_wrapper_bytes())?;
+        if canonical.kind() != SignedMutationKind::DeviceAuthenticationRebind {
+            return Err(AuthPrimitiveError::invalid("rebind body type"));
+        }
+        verify_signed_mutation(canonical, stored_public_key)
     }
 }
 

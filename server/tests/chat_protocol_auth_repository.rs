@@ -2777,3 +2777,62 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
     );
     rebind_transaction.rollback().await.unwrap();
 }
+
+/// Regression guard for the dead first-execution device-rebind path.
+///
+/// `dpop::mint_rebind_repository_authority` used to move the rebind bootstrap
+/// out of `PreReplayCryptographicVerification` (`pre_replay.rebind.take()`) to
+/// feed a by-value verifier. `auth::lock_rebind_old_state_scope` then reads
+/// that same bootstrap back off the minted authority — it needs
+/// `currentDpopJkt`, `newDpopJkt`, `keyId`, `expectedAuthGeneration` and
+/// `idempotencyKey` to bind the locked device row — found `None`, and returned
+/// `UnsupportedAuthorizationShape`. Every first-execution rebind failed closed
+/// as `InvalidRequest` (HTTP 400), so DPoP key rotation was unavailable.
+///
+/// Failing input for this assertion: reintroduce any move of
+/// `pre_replay.rebind` inside the mint (`.take()`, destructuring, or a
+/// `self`-by-value method on `CanonicalRebindBootstrap`). This test then fails
+/// with `Authorization(UnsupportedAuthorizationShape)` and the panic below
+/// names the cause. Verified by reverting the fix in an isolated copy.
+#[tokio::test]
+#[ignore = "requires the isolated clean-chat PostgreSQL database"]
+async fn first_execution_rebind_carries_its_bootstrap_into_the_old_state_lock() {
+    let pool = setup_auth_repository_db(2).await;
+    let fixture = DeviceFixture::fresh();
+    seed_device(&pool, &fixture).await;
+    let operation_id = uuid::Uuid::new_v4();
+    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
+    let raw = rebind_body(
+        &fixture,
+        operation_id,
+        &fixture.dpop_jkt,
+        &new_jkt,
+        1,
+        FIRST_T,
+    );
+
+    let admission = authorize_rebind_operation_only(
+        &pool,
+        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
+    )
+    .await
+    .expect("an exact old-state rebind must be admitted");
+
+    // Admission has already matched every stored-vs-body binding. The only
+    // remaining step is the mint -> old-state-lock handoff, which is where the
+    // bootstrap must still be readable.
+    let mut transaction = pool.begin().await.unwrap();
+    match prelude::prepare_rebind_operation(&mut transaction, admission).await {
+        Ok(prelude::PreparedRebindOperation::First(_)) => {}
+        Ok(prelude::PreparedRebindOperation::Replay(_)) => {
+            panic!("a freshly minted rebind operation must not resolve as a replay")
+        }
+        Err(error) => panic!(
+            "REGRESSION: first-execution rebind was rejected at the repository stage with \
+             {error:?}. If this is Authorization(UnsupportedAuthorizationShape), the rebind \
+             bootstrap was consumed before lock_rebind_old_state_scope could read it back off \
+             pre_replay, which makes every device rebind return InvalidRequest (HTTP 400)."
+        ),
+    }
+    transaction.rollback().await.unwrap();
+}
