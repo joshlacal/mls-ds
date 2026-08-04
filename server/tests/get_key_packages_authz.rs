@@ -5,6 +5,8 @@
 //! authorization helper directly so the rule is covered without depending on
 //! JWT signing or live PDS block-sync network calls.
 
+mod common;
+
 use catbird_server::handlers::mls_chat::{
     get_key_package_status::authorize_get_key_package_status_target,
     get_key_packages::{
@@ -14,24 +16,26 @@ use catbird_server::handlers::mls_chat::{
 };
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
-use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
-async fn setup_test_db() -> PgPool {
-    let db_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_kpauthz_";
 
-    let config = catbird_server::db::DbConfig {
-        database_url: db_url,
-        max_connections: 8,
-        min_connections: 2,
-        acquire_timeout: StdDuration::from_secs(10),
-        idle_timeout: StdDuration::from_secs(60),
-    };
-
-    catbird_server::db::init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 8, 2).await
 }
 
 async fn ensure_user(pool: &PgPool, did: &str) {
@@ -289,7 +293,7 @@ fn enforce_allows_when_all_targets_authorized() {
 
 #[tokio::test]
 async fn non_member_without_pending_relationship_gets_no_authorized_targets() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");
@@ -307,7 +311,7 @@ async fn non_member_without_pending_relationship_gets_no_authorized_targets() {
 
 #[tokio::test]
 async fn targeted_invite_authorizes_target() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");
@@ -331,7 +335,7 @@ async fn targeted_invite_authorizes_target() {
 
 #[tokio::test]
 async fn shared_conversation_authorizes_target() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");
@@ -362,7 +366,7 @@ async fn shared_conversation_authorizes_target() {
 
 #[tokio::test]
 async fn status_target_authz_logs_in_log_only_but_denies_count_oracle_in_enforce() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");
@@ -402,7 +406,7 @@ async fn status_target_authz_logs_in_log_only_but_denies_count_oracle_in_enforce
 
 #[tokio::test]
 async fn pending_chat_request_authorizes_target() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");
@@ -421,7 +425,7 @@ async fn pending_chat_request_authorizes_target() {
 
 #[tokio::test]
 async fn self_target_is_authorized() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let caller = format!("did:plc:ws1-caller-{}", Uuid::new_v4());
     ensure_user(&pool, &caller).await;
 
@@ -436,7 +440,7 @@ async fn self_target_is_authorized() {
 
 #[tokio::test]
 async fn left_membership_does_not_authorize_target() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let run_id = Uuid::new_v4();
     let caller = format!("did:plc:ws1-caller-{run_id}");
     let target = format!("did:plc:ws1-target-{run_id}");

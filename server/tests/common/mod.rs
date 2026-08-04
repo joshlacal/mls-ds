@@ -9,28 +9,36 @@
 //! test file uses every helper — Rust would otherwise emit per-target
 //! warnings for the unused ones.
 
-use catbird_server::db::{init_db, DbConfig};
 use sqlx::PgPool;
-use std::time::Duration;
 
 pub mod chat_protocol;
+pub mod fresh_db;
 
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// `postgres://localhost/catbird_test` when unset — and hand it straight to
+/// `db::init_db`, which runs `sqlx::migrate!("./migrations")`. That applied the
+/// whole ~56-migration legacy set to whatever database the ambient environment
+/// named. Fourteen targets call this helper, so with the program's standard
+/// environment exported, any one of them silently took the shared clean-chat
+/// database's `_sqlx_migrations` ledger from the reviewed 13 to 69 and disabled
+/// `validate_exact_reviewed_ledger` for every clean-chat suite — while passing.
+///
+/// Each caller now owns a private database that is reaped when the returned
+/// [`fresh_db::DisposableDatabase`] drops, so the guard must stay bound for the
+/// whole test:
+///
+/// ```ignore
+/// let (pool, _database) = common::setup_test_db().await;
+/// ```
+///
+/// There is no fallback: [`fresh_db::maintenance_url_from_env`] validates
+/// `TEST_DATABASE_URL` against the single reviewed literal and panics
+/// otherwise. A test can no longer quietly adopt a database it did not create.
 #[allow(dead_code)]
-pub async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
-
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+pub async fn setup_test_db() -> (PgPool, fresh_db::DisposableDatabase) {
+    fresh_db::fresh_legacy_pool(fresh_db::SHARED_LEGACY_DB_PREFIX, 4, 1).await
 }
 
 #[allow(dead_code)]

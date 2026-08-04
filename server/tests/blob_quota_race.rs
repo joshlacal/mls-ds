@@ -49,7 +49,7 @@ async fn cleanup_blobs(pool: &PgPool, owner_did: &str) {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn sequential_over_quota_insert_is_rejected() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let owner = format!("did:plc:blobquota-seq-{}", uuid::Uuid::new_v4());
     cleanup_blobs(&pool, &owner).await;
 
@@ -96,7 +96,7 @@ async fn sequential_over_quota_insert_is_rejected() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn concurrent_uploads_cannot_exceed_quota() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let owner = format!("did:plc:blobquota-race-{}", uuid::Uuid::new_v4());
     cleanup_blobs(&pool, &owner).await;
 

@@ -182,7 +182,7 @@ async fn seed_stuck_session(
 #[tokio::test]
 #[ignore = "requires TEST_DATABASE_URL"]
 async fn r3_stuck_session_reminder_after_one_hour() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "p2_5-r3-stuck-1h";
     wipe(&pool, convo_id).await;
 

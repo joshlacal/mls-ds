@@ -21,6 +21,8 @@
 //! Requires `TEST_DATABASE_URL` (defaults to localhost:5433/catbird). The
 //! test creates and tears down its own users + key_package rows.
 
+mod common;
+
 use catbird_server::handlers::mls_chat::get_key_packages::claim_available_key_packages_bulk;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -28,21 +30,24 @@ use std::collections::HashMap;
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
-async fn setup_test_db() -> PgPool {
-    let db_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_kpbulk_";
 
-    let config = catbird_server::db::DbConfig {
-        database_url: db_url,
-        max_connections: 8,
-        min_connections: 2,
-        acquire_timeout: StdDuration::from_secs(10),
-        idle_timeout: StdDuration::from_secs(60),
-    };
-
-    catbird_server::db::init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 8, 2).await
 }
 
 async fn ensure_user(pool: &PgPool, did: &str) {
@@ -130,7 +135,7 @@ async fn key_package_state(
 /// packages one at a time.
 #[tokio::test]
 async fn test_bulk_claim_matches_per_did_loop() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 
     // Seed: 5 DIDs.
@@ -305,7 +310,7 @@ async fn test_bulk_claim_matches_per_did_loop() {
 /// transaction count delta will jump to ~N rather than ~1.
 #[tokio::test]
 async fn test_bulk_claim_emits_one_statement_per_call() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 
     let run_id = Uuid::new_v4();
@@ -323,14 +328,14 @@ async fn test_bulk_claim_emits_one_statement_per_call() {
     // Use a dedicated single-connection pool so xact counters at the
     // backend are exclusively driven by THIS test. Otherwise sibling tests
     // sharing the same backend would contaminate the delta.
-    let single_conn_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-    let single_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .min_connections(1)
-        .connect(&single_conn_url)
-        .await
-        .expect("single-conn pool");
+    //
+    // This second pool must target *this test's own* database, not the
+    // ambient `TEST_DATABASE_URL`: reading the environment here would have
+    // reopened the shared database even once the first pool was private, and
+    // the xact-delta assertion below would then be measuring a backend other
+    // tasks are also using. `DisposableDatabase::connect` is the only way to
+    // reach the private database, so the two pools cannot diverge.
+    let single_pool = _database.connect(1).await;
 
     // pg_stat_get_xact_function_calls would only count function calls.
     // `pg_stat_get_backend_xact_start(pg_backend_pid())` returns the start
@@ -403,7 +408,7 @@ async fn test_bulk_claim_emits_one_statement_per_call() {
 /// regression to the broken SQL would be an `Err(...)` here.
 #[tokio::test]
 async fn test_bulk_claim_smoke_distinct_for_update_regression() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 
     let run_id = Uuid::new_v4();
@@ -475,7 +480,7 @@ async fn test_bulk_claim_smoke_distinct_for_update_regression() {
 /// regardless of how many NULL-device rows are seeded.
 #[tokio::test]
 async fn test_bulk_claim_null_device_id_dedupe() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 
     let run_id = Uuid::new_v4();
@@ -511,7 +516,7 @@ async fn test_bulk_claim_null_device_id_dedupe() {
 
 #[tokio::test]
 async fn test_regular_bulk_claim_reserves_without_consuming_until_commit() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
     let did = format!("did:plc:test-reserve-{}", Uuid::new_v4());
     ensure_user(&pool, &did).await;
@@ -563,7 +568,7 @@ async fn test_regular_bulk_claim_reserves_without_consuming_until_commit() {
 
 #[tokio::test]
 async fn test_expired_regular_reservations_are_claimable_again() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
     let did = format!("did:plc:test-stale-reserve-{}", Uuid::new_v4());
     ensure_user(&pool, &did).await;
@@ -612,7 +617,7 @@ async fn test_expired_regular_reservations_are_claimable_again() {
 
 #[tokio::test]
 async fn test_last_resort_bulk_fetch_is_reusable_and_does_not_reserve() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
     let did = format!("did:plc:test-last-resort-{}", Uuid::new_v4());
     ensure_user(&pool, &did).await;

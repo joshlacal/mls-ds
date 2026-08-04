@@ -278,7 +278,7 @@ async fn classify(
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_member_finds_proceed_state() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -296,7 +296,7 @@ async fn bootstrap_member_finds_proceed_state() {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_race_loss_when_session_already_superseded() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -328,7 +328,7 @@ async fn bootstrap_classify_rejects_mismatched_new_group_id() {
     // bug_010 auth gate: when the upstream Request bound an
     // expected_new_mls_group_id, a bootstrap call with a different
     // mls_group_id must fail the auth gate.
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -354,7 +354,7 @@ async fn bootstrap_classify_rejects_mismatched_new_group_id() {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_not_member_rejected() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -372,7 +372,7 @@ async fn bootstrap_not_member_rejected() {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_proceeds_when_legacy_group_id_is_overwritten_but_reset_binding_matches() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE]).await;
 
@@ -439,7 +439,7 @@ fn test_auth_user(did: &str) -> AuthUser {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_updates_row_and_returns_view() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -519,7 +519,7 @@ async fn bootstrap_handle_updates_row_and_returns_view() {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_handle_with_welcome_inserts_per_recipient_envelopes() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup(&pool, ORIGINAL_CONVO_ID).await;
     setup_post_reset_convo(&pool, &[ALICE, BOB]).await;
 
@@ -670,7 +670,7 @@ async fn cleanup_selfheal(pool: &PgPool) {
 #[ignore = "fixture isolation: shared convo/group IDs cause cross-test interference"]
 async fn bootstrap_self_heal_rejects_partial_welcome_fanout() {
     let _fixture_guard = FIXTURE_LOCK.lock().await;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     cleanup_selfheal(&pool).await;
     setup_selfheal_orphan_convo(&pool).await;
 

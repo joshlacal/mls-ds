@@ -1404,9 +1404,9 @@ async fn task7_replay_rejects_registered_jkt_token_and_claim_mismatch() {
 /// operation completion graph committed. These are deliberately ignored: they
 /// create and remove trigger functions in the dedicated owner-controlled DB.
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat gate database"]
+#[ignore = "requires a disposable clean-chat database"]
 async fn task7_injected_claim_effect_and_completion_failures_rollback_the_whole_graph() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _database) = common::fresh_db::fresh_clean_protocol_db("chat_devhandlers_", 4).await;
 
     for (phase, table, function, trigger) in [
         (

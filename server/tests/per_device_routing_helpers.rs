@@ -169,7 +169,7 @@ async fn seed_key_package(pool: &PgPool, owner_did: &str, hash_hex: &str, device
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 3 lands the helper"]
 async fn store_welcomes_per_device_writes_one_row_per_kp_hash() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-welcome-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -258,7 +258,7 @@ async fn store_welcomes_per_device_writes_one_row_per_kp_hash() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 3 lands the helper"]
 async fn store_welcomes_per_device_rolls_back_on_txn_abort() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-rollback-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -311,7 +311,7 @@ async fn store_welcomes_per_device_rolls_back_on_txn_abort() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 3 lands the helper"]
 async fn store_welcomes_per_device_empty_kp_hashes_writes_nothing() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-empty-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -350,7 +350,7 @@ async fn store_welcomes_per_device_empty_kp_hashes_writes_nothing() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn store_welcomes_per_device_binds_recipient_device_id_from_key_package() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-welcome-device-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -403,7 +403,7 @@ async fn store_welcomes_per_device_binds_recipient_device_id_from_key_package() 
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn store_welcomes_per_device_leaves_recipient_device_id_null_when_hash_unmapped() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-welcome-device-null-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -448,7 +448,7 @@ async fn store_welcomes_per_device_leaves_recipient_device_id_null_when_hash_unm
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_device_id() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-welcome-upsert-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -622,7 +622,7 @@ async fn store_welcomes_per_device_upsert_backfills_null_and_preserves_existing_
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
 async fn insert_members_per_device_writes_one_row_per_kp_hash_with_device_id() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-mem-1-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -723,7 +723,7 @@ async fn insert_members_per_device_writes_one_row_per_kp_hash_with_device_id() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
 async fn insert_members_per_device_falls_back_to_user_flat_when_device_id_missing() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-mem-2-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -787,7 +787,7 @@ async fn insert_members_per_device_falls_back_to_user_flat_when_device_id_missin
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
 async fn insert_members_per_device_re_add_clears_left_at() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-mem-3-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -874,7 +874,7 @@ async fn insert_members_per_device_re_add_clears_left_at() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 7 lands the helper"]
 async fn insert_members_per_device_empty_kp_hashes_writes_nothing() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-mem-4-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -942,7 +942,7 @@ async fn per_device_welcome_findable_by_user_form_did() {
     // The MLS Welcome bytes are multi-recipient; LIMIT 1 returning ANY
     // of alice's rows is correct because each device decrypts its own
     // EncryptedGroupSecrets entry locally.
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-lookup-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1016,7 +1016,7 @@ async fn per_device_welcome_findable_by_user_form_did() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn per_device_welcome_findable_by_device_form_did() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devform-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1104,7 +1104,7 @@ async fn per_device_welcome_findable_by_device_form_did() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn device_hint_miss_returns_sole_user_welcome() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1147,7 +1147,7 @@ async fn device_hint_miss_returns_sole_user_welcome() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn device_hint_returns_exact_recipient_device_id_when_multiple_user_welcomes_exist() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-exact-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1196,7 +1196,7 @@ async fn device_hint_returns_exact_recipient_device_id_when_multiple_user_welcom
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn device_hint_miss_does_not_return_other_device_bound_welcome() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-wrong-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1242,7 +1242,7 @@ async fn device_hint_miss_does_not_return_other_device_bound_welcome() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn device_hint_with_hash_returns_stale_device_bound_welcome() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-hash-wrong-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;
@@ -1290,7 +1290,7 @@ async fn device_hint_with_hash_returns_stale_device_bound_welcome() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn device_hint_miss_does_not_return_other_device_bound_null_hash_welcome() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("convo-perdev-devicehint-nullhash-{}", Uuid::new_v4());
     common::cleanup(&pool, &convo_id).await;
     seed_convo(&pool, &convo_id).await;

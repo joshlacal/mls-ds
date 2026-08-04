@@ -88,7 +88,7 @@ async fn cleanup_metadata_blobs(pool: &PgPool, convo_id: &str) {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn metadata_blob_accumulation_is_bounded_per_convo() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = format!("convo-gmb-retention-{}", uuid::Uuid::new_v4());
     cleanup_metadata_blobs(&pool, &convo_id).await;
     cleanup(&pool, &convo_id).await;

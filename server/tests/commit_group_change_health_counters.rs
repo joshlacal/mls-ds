@@ -101,7 +101,7 @@ async fn fetch_health(pool: &PgPool, convo_id: &str) -> HealthRow {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     common::cleanup(&pool, CONVO_SUCCESS).await;
     insert_convo_with_409_count(&pool, CONVO_SUCCESS, 5).await;
 
@@ -155,7 +155,7 @@ async fn successful_commit_sets_last_successful_commit_at_and_zeroes_409_count()
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "convo-health-success-rollback-0001";
     common::cleanup(&pool, convo_id).await;
     insert_convo_with_409_count(&pool, convo_id, 7).await;
@@ -197,7 +197,7 @@ async fn mark_commit_success_rolls_back_when_wrapping_tx_aborts() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     common::cleanup(&pool, CONVO_409).await;
     insert_convo_with_409_count(&pool, CONVO_409, 0).await;
 
@@ -259,7 +259,7 @@ async fn epoch_mismatch_409_increments_counter_and_sets_timestamp() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn record_commit_409_only_touches_target_convo() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_a = "convo-health-409-isolation-a";
     let convo_b = "convo-health-409-isolation-b";
     common::cleanup(&pool, convo_a).await;
@@ -298,7 +298,7 @@ async fn record_commit_409_only_touches_target_convo() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn success_after_409_streak_resets_counter() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "convo-health-success-after-409";
     common::cleanup(&pool, convo_id).await;
     insert_convo_with_409_count(&pool, convo_id, 0).await;
@@ -360,7 +360,7 @@ async fn success_after_409_streak_resets_counter() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn kp_publish_gate_zero_for_unpublished_device() {
     use catbird_server::db::count_available_key_packages_for_device;
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let user_did = "did:plc:layer1kpgate0001";
     let device_id = "device-layer1-001";
     sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")

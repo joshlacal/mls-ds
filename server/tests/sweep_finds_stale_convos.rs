@@ -128,7 +128,7 @@ fn make_registry(pool: &PgPool) -> Arc<ActorRegistry> {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_picks_up_convo_matching_all_conditions() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-sweep-all-conditions";
     let initial_group_id = "sweepall000100001000010000100001000";
     wipe(&pool, convo_id).await;
@@ -168,7 +168,7 @@ async fn sweep_picks_up_convo_matching_all_conditions() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_with_recent_mode_a_report() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-sweep-mode-a-skip";
     let initial_group_id = "sweepmodea0001000010000100001000010";
     wipe(&pool, convo_id).await;
@@ -217,7 +217,7 @@ async fn sweep_skips_convo_with_recent_mode_a_report() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_within_reset_cooldown() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-sweep-cooldown-skip";
     let initial_group_id = "sweepcd00010000100001000010000100001";
     wipe(&pool, convo_id).await;
@@ -252,7 +252,7 @@ async fn sweep_skips_convo_within_reset_cooldown() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn sweep_skips_convo_with_tripped_circuit_breaker() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-sweep-breaker-skip";
     let initial_group_id = "sweepbrk00010000100001000010000100001";
     wipe(&pool, convo_id).await;

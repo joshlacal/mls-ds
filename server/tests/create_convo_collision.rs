@@ -74,7 +74,7 @@ async fn classify_create_convo(
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_idempotent_retry_returns_ok_for_same_caller() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     common::cleanup(&pool, TEST_GROUP_ID).await;
     insert_test_convo(&pool, TEST_GROUP_ID, ALICE).await;
 
@@ -91,7 +91,7 @@ async fn create_convo_idempotent_retry_returns_ok_for_same_caller() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_collision_by_different_caller_returns_already_exists() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     common::cleanup(&pool, TEST_GROUP_ID).await;
     insert_test_convo(&pool, TEST_GROUP_ID, ALICE).await;
 
@@ -108,7 +108,7 @@ async fn create_convo_collision_by_different_caller_returns_already_exists() {
 #[tokio::test]
 #[ignore = "fixture isolation: shared TEST_GROUP_ID causes cross-test interference"]
 async fn create_convo_no_existing_row_proceeds_to_create() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     common::cleanup(&pool, TEST_GROUP_ID).await;
 
     let result = classify_create_convo(&pool, TEST_GROUP_ID, ALICE).await;

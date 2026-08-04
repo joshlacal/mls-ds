@@ -23,7 +23,7 @@ async fn seed_conversation(pool: &PgPool, convo_id: &str, sequencer_ds: &str, te
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn accept_transfer_rejects_owner_change_between_read_and_update() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("ws1-transfer-cas-{}", Uuid::new_v4());
     let from_ds = format!("did:web:sequencer-from-{}.example", Uuid::new_v4());
     let accepting_ds = format!("did:web:sequencer-accept-{}.example", Uuid::new_v4());
@@ -93,7 +93,7 @@ async fn accept_transfer_rejects_owner_change_between_read_and_update() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn initiate_transfer_rejects_owner_change_between_read_and_update() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("ws1-initiate-cas-{}", Uuid::new_v4());
     let initiating_ds = format!("did:web:sequencer-init-{}.example", Uuid::new_v4());
     let new_ds = format!("did:web:sequencer-new-{}.example", Uuid::new_v4());
@@ -172,7 +172,7 @@ async fn initiate_transfer_rejects_owner_change_between_read_and_update() {
 async fn transferred_conversation_reports_new_sequencer_in_convo_view() {
     use catbird_server::models::Conversation;
 
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = format!("ws4-rung2-transfer-view-{}", Uuid::new_v4());
     let from_ds = format!("did:web:sequencer-from-{}.example", Uuid::new_v4());
     let accepting_ds = format!("did:web:sequencer-accept-{}.example", Uuid::new_v4());

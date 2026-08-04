@@ -254,30 +254,26 @@ fn random_proof_jti() -> [u8; 12] {
         .expect("UUID prefix has the fixed proof-JTI length")
 }
 
-async fn setup_auth_repository_db(max_connections: u32) -> sqlx::PgPool {
-    let pool = common::chat_protocol::setup_chat_protocol_db(max_connections).await;
-    sqlx::query(
-        r#"
-        DO $$
-        DECLARE
-            table_list text;
-        BEGIN
-            SELECT string_agg(format('%I.%I', schemaname, tablename), ', ')
-              INTO table_list
-              FROM pg_tables
-             WHERE schemaname = 'chat';
-            IF table_list IS NOT NULL THEN
-                EXECUTE 'TRUNCATE TABLE ' || table_list || ' RESTART IDENTITY CASCADE';
-            END IF;
-        END
-        $$;
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("reset the exclusive clean-chat test schema before an auth repository case");
-    pool
+/// Mint a private, freshly migrated clean-chat database for one test case and
+/// return a pool onto it together with its reaper.
+///
+/// This used to call the shared fixed-target helper and then `TRUNCATE` every
+/// `chat.*` table with `RESTART IDENTITY CASCADE`. That produced isolation by
+/// destroying the one database every concurrent task in this program points
+/// `TEST_DATABASE_URL` at — a cross-task data-loss event, not isolation. The
+/// per-run database gives each case the same pristine schema without any shared
+/// state to reset, so no destructive statement is needed or possible here.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_auth_repository_db(
+    max_connections: u32,
+) -> (sqlx::PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_clean_protocol_db(AUTH_REPOSITORY_DB_PREFIX, max_connections).await
 }
+
+/// Reserved per-run database prefix owned by this target.
+const AUTH_REPOSITORY_DB_PREFIX: &str = "chat_authrepo_";
 
 fn signed_blob_deletion(operation_id: uuid::Uuid, blob_id: uuid::Uuid, signed_at: &str) -> Vec<u8> {
     let body = json!({
@@ -909,7 +905,7 @@ async fn seed_registered_device(pool: &sqlx::PgPool) {
 #[tokio::test]
 #[ignore = "schema-clear gate has not been granted"]
 async fn valid_replay_evidence_is_burned_even_when_device_lookup_fails() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let token_jti = uuid::Uuid::new_v4();
     let proof_jti = random_proof_jti();
     let evidence =
@@ -965,7 +961,7 @@ async fn valid_replay_evidence_is_burned_even_when_device_lookup_fails() {
 #[tokio::test]
 #[ignore = "schema-clear gate has not been granted"]
 async fn replay_audit_commits_independently_of_business_rollback() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     seed_registered_device(&pool).await;
     let token_jti = uuid::Uuid::new_v4();
     let proof_jti = random_proof_jti();
@@ -1037,7 +1033,7 @@ async fn replay_audit_commits_independently_of_business_rollback() {
 #[tokio::test]
 #[ignore = "schema-clear gate has not been granted"]
 async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age() {
-    let pool = setup_auth_repository_db(4).await;
+    let (pool, _database) = setup_auth_repository_db(4).await;
     seed_registered_device(&pool).await;
     let operation_id = uuid::Uuid::new_v4();
     let raw = signed_blob_deletion(operation_id, uuid::Uuid::new_v4(), FIRST_T);
@@ -1208,7 +1204,7 @@ async fn identical_business_racers_converge_and_exact_replay_bypasses_only_age()
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_ordinary_replay_rechecks_current_jkt_and_auth_generation() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1272,7 +1268,7 @@ async fn completed_ordinary_replay_rechecks_current_jkt_and_auth_generation() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_ordinary_replay_rechecks_current_immutable_signing_key() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1317,7 +1313,7 @@ async fn completed_ordinary_replay_rechecks_current_immutable_signing_key() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_ordinary_replay_reverifies_signature_under_the_current_key() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1358,7 +1354,7 @@ async fn completed_ordinary_replay_reverifies_signature_under_the_current_key() 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_ordinary_replay_rejects_a_now_revoked_device() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1387,7 +1383,7 @@ async fn completed_ordinary_replay_rejects_a_now_revoked_device() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_ordinary_replay_survives_a_fresh_pool_but_only_for_active_authority() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1396,7 +1392,7 @@ async fn completed_ordinary_replay_survives_a_fresh_pool_but_only_for_active_aut
     complete_blob_deletion(&pool, &fixture, &raw, response).await;
     pool.close().await;
 
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = _database.connect(2).await;
     let outcome = authorize_signed_request(
         &restarted,
         ordinary_evidence(
@@ -1418,7 +1414,7 @@ async fn completed_ordinary_replay_survives_a_fresh_pool_but_only_for_active_aut
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Fresh enrollment", FIRST_T);
@@ -1475,7 +1471,7 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
     assert_eq!(key.2, 1);
     pool.close().await;
 
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = _database.connect(2).await;
     let replay_admission = authorize_enrollment_operation_only(
         &restarted,
         enrollment_evidence(
@@ -1524,7 +1520,7 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_restart() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -1608,7 +1604,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
     assert_eq!(key.2, 1, "rebind rewrote immutable enrollment provenance");
     pool.close().await;
 
-    let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let restarted = _database.connect(2).await;
     let replay_admission = authorize_rebind_operation_only(
         &restarted,
         rebind_evidence(
@@ -1663,7 +1659,7 @@ async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_re
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no_claim() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     seed_registered_device(&pool).await;
     let operation_id = uuid::Uuid::new_v4();
     let raw = signed_replenishment(operation_id, FIRST_T);
@@ -1770,7 +1766,7 @@ async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn replenishment_replay_rejects_missing_ref_hash_and_owner_manifest_drift() {
-    let pool = setup_auth_repository_db(4).await;
+    let (pool, _database) = setup_auth_repository_db(4).await;
     seed_registered_device(&pool).await;
     let foreign_owner = DeviceFixture::fresh();
     seed_device(&pool, &foreign_owner).await;
@@ -1893,7 +1889,7 @@ async fn replenishment_replay_rejects_missing_ref_hash_and_owner_manifest_drift(
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn stale_enrollment_and_rebind_first_execution_create_no_operation_claim() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     let late = "2026-07-24T14:05:09.123Z";
 
     let enrollment_fixture = DeviceFixture::fresh();
@@ -1964,7 +1960,7 @@ async fn stale_enrollment_and_rebind_first_execution_create_no_operation_claim()
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn enrollment_adapter_rolls_back_business_state_without_unburning_replay() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Rollback enrollment", FIRST_T);
@@ -2021,7 +2017,7 @@ async fn enrollment_adapter_rolls_back_business_state_without_unburning_replay()
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn identical_enrollment_business_racers_converge_on_one_device_and_response() {
-    let pool = setup_auth_repository_db(4).await;
+    let (pool, _database) = setup_auth_repository_db(4).await;
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Racing enrollment", FIRST_T);
@@ -2115,7 +2111,7 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn rebind_adapter_rolls_back_cas_without_unburning_replay() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -2178,7 +2174,7 @@ async fn rebind_adapter_rolls_back_cas_without_unburning_replay() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn identical_rebind_business_racers_converge_on_one_cas_and_response() {
-    let pool = setup_auth_repository_db(4).await;
+    let (pool, _database) = setup_auth_repository_db(4).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();
@@ -2253,7 +2249,7 @@ async fn identical_rebind_business_racers_converge_on_one_cas_and_response() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_rows() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
 
     let enrolled = DeviceFixture::fresh();
     seed_device(&pool, &enrolled).await;
@@ -2400,7 +2396,7 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn enrollment_business_guard_cannot_cross_postgres_transactions() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     let operation_id = uuid::Uuid::new_v4();
     let raw = enrollment_body(&fixture, operation_id, "Transaction bound", FIRST_T);
@@ -2440,7 +2436,7 @@ async fn enrollment_business_guard_cannot_cross_postgres_transactions() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_enrollment_replay_requires_exact_installed_generation_one_authority() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
 
     let orphan = DeviceFixture::fresh();
     let orphan_operation = uuid::Uuid::new_v4();
@@ -2535,7 +2531,7 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature() {
-    let pool = setup_auth_repository_db(3).await;
+    let (pool, _database) = setup_auth_repository_db(3).await;
 
     let orphan = DeviceFixture::fresh();
     seed_device(&pool, &orphan).await;
@@ -2649,7 +2645,7 @@ async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn business_convergence_revalidates_completed_authority_and_post_state() {
-    let pool = setup_auth_repository_db(4).await;
+    let (pool, _database) = setup_auth_repository_db(4).await;
 
     let ordinary = DeviceFixture::fresh();
     seed_device(&pool, &ordinary).await;
@@ -2797,7 +2793,7 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn first_execution_rebind_carries_its_bootstrap_into_the_old_state_lock() {
-    let pool = setup_auth_repository_db(2).await;
+    let (pool, _database) = setup_auth_repository_db(2).await;
     let fixture = DeviceFixture::fresh();
     seed_device(&pool, &fixture).await;
     let operation_id = uuid::Uuid::new_v4();

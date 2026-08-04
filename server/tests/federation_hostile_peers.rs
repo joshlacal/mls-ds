@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,16 +70,37 @@ fn service_token(iss: &str, lxm: &str, jti: &str) -> String {
     .expect("failed to sign test token")
 }
 
-async fn setup_test_db() -> Option<PgPool> {
-    let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+/// Reserved per-run database prefix owned by this target.
+const FEDERATION_DB_PREFIX: &str = "mlsds_fedpeers_";
+
+/// Serializes the fixtures. Each test now owns a private database, so this is
+/// no longer needed for correctness; it bounds resources, because every test
+/// runs the full migration set against a new database and opens a pool of eight
+/// connections.
+static FEDERATION_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to connect to whatever `TEST_DATABASE_URL` named — the one
+/// database every concurrent task in this program shares — and then `TRUNCATE`
+/// `auth_jti_nonce, federation_peers, messages, welcome_messages, key_packages,
+/// members, conversations, devices, users CASCADE` in it. That is cross-task
+/// destruction, not isolation. A private database gives the same pristine start
+/// with nothing shared to destroy.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> Option<(PgPool, common::fresh_db::DisposableDatabase)> {
+    if std::env::var("TEST_DATABASE_URL").is_err() {
         eprintln!("Skipping test: TEST_DATABASE_URL not set");
         return None;
-    };
+    }
 
     configure_security_env();
 
+    let database = common::fresh_db::fresh_fully_migrated_db(FEDERATION_DB_PREFIX).await;
     let config = DbConfig {
-        database_url,
+        database_url: database.url().to_owned(),
         max_connections: 8,
         min_connections: 1,
         acquire_timeout: Duration::from_secs(20),
@@ -85,20 +108,7 @@ async fn setup_test_db() -> Option<PgPool> {
     };
 
     let pool = init_db(config).await.expect("failed to init DB");
-    cleanup_tables(&pool).await;
-    Some(pool)
-}
-
-async fn cleanup_tables(pool: &PgPool) {
-    sqlx::query(
-        "TRUNCATE TABLE \
-            auth_jti_nonce, federation_peers, messages, welcome_messages, key_packages, \
-            members, conversations, devices, users \
-         CASCADE",
-    )
-    .execute(pool)
-    .await
-    .expect("failed to cleanup tables");
+    Some((pool, database))
 }
 
 fn test_router(pool: PgPool) -> Router {
@@ -232,7 +242,8 @@ async fn seed_message(pool: &PgPool, convo_id: &str, msg_id: &str, seq: i64, epo
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn deliver_message_accepts_fragmented_issuer_for_bound_sequencer() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -291,7 +302,8 @@ async fn deliver_message_accepts_fragmented_issuer_for_bound_sequencer() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn replayed_service_token_is_rejected() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -351,7 +363,8 @@ async fn replayed_service_token_is_rejected() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn replayed_service_token_is_rejected_across_app_instances() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app_a = test_router(pool.clone());
@@ -412,7 +425,8 @@ async fn replayed_service_token_is_rejected_across_app_instances() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn ds_rate_limit_applies_across_service_fragments() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -490,7 +504,8 @@ async fn ds_rate_limit_applies_across_service_fragments() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn deliver_message_rejects_sender_issuer_mismatch() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -543,7 +558,8 @@ async fn deliver_message_rejects_sender_issuer_mismatch() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn deliver_message_rejects_non_sequencer_peer() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -591,7 +607,8 @@ async fn deliver_message_rejects_non_sequencer_peer() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn submit_commit_rejects_non_participant_peer_ds() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -634,7 +651,8 @@ async fn submit_commit_rejects_non_participant_peer_ds() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn deliver_message_rejects_stale_sequencer_term() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -686,7 +704,8 @@ async fn deliver_message_rejects_stale_sequencer_term() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn deliver_message_denies_unallowlisted_peer() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -732,7 +751,8 @@ async fn deliver_message_denies_unallowlisted_peer() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -840,7 +860,8 @@ async fn fetch_key_package_requires_convo_id_and_membership_authorization() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn federation_peer_admin_lifecycle_endpoints_work() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool);
@@ -910,7 +931,8 @@ async fn federation_peer_admin_lifecycle_endpoints_work() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn reconciliation_endpoints_require_allowlist_and_return_events() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());
@@ -985,7 +1007,8 @@ async fn reconciliation_endpoints_require_allowlist_and_return_events() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn transfer_accept_increments_term_and_preserves_epoch_state() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
 
@@ -1028,7 +1051,8 @@ async fn transfer_accept_increments_term_and_preserves_epoch_state() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn transfer_accept_rejects_invalid_term_jump() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
 
@@ -1069,7 +1093,8 @@ async fn transfer_accept_rejects_invalid_term_jump() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn failover_rejects_takeover_when_current_lease_is_fresh() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
 
@@ -1100,7 +1125,8 @@ async fn failover_rejects_takeover_when_current_lease_is_fresh() {
 #[tokio::test]
 #[ignore = "fixture rot: federation contract changed (auth/status codes), tests not realigned"]
 async fn failover_fences_old_sequencer_after_term_bump() {
-    let Some(pool) = setup_test_db().await else {
+    let _fixture_guard = FEDERATION_FIXTURE_LOCK.lock().await;
+    let Some((pool, _database)) = setup_test_db().await else {
         return;
     };
     let app = test_router(pool.clone());

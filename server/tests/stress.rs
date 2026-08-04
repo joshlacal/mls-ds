@@ -1,3 +1,5 @@
+mod common;
+
 // Stress tests for load testing the actor system
 // Run manually with: cargo test --test stress -- --ignored
 
@@ -8,22 +10,24 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-/// Test helper to set up a test database with higher connection pool
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_stress_";
 
-    let config = catbird_server::db::DbConfig {
-        database_url,
-        max_connections: 50, // Higher for stress tests
-        min_connections: 10,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    catbird_server::db::init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 50, 10).await
 }
 
 /// Test helper to clean up test data
@@ -100,7 +104,7 @@ fn percentile(sorted_samples: &[u128], p: f64) -> u128 {
 async fn test_1000_conversations_concurrent() {
     println!("\n=== Stress Test: 1000 Conversations, 100 Messages Each ===\n");
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let registry = Arc::new(ActorRegistry::new(
         pool.clone(),
         Arc::new(SseState::new(1000)),
@@ -230,7 +234,7 @@ async fn test_1000_conversations_concurrent() {
 async fn test_sustained_load() {
     println!("\n=== Stress Test: Sustained Load (100 req/sec for 10 minutes) ===\n");
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let registry = Arc::new(ActorRegistry::new(
         pool.clone(),
         Arc::new(SseState::new(1000)),
@@ -382,7 +386,7 @@ async fn test_sustained_load() {
 async fn test_actor_restart_under_load() {
     println!("\n=== Stress Test: Actor Restart Under Load ===\n");
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let registry = Arc::new(ActorRegistry::new(
         pool.clone(),
         Arc::new(SseState::new(1000)),

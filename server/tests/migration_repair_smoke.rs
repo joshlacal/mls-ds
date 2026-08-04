@@ -1,27 +1,35 @@
 //! Smoke test for the chore/ci-cleanup `_sqlx_migrations` version repair
 //! (see `db.rs::repair_2026_04_migration_versions`).
 //!
-//! Requires a Postgres URL in `TEST_DATABASE_URL`. The test pre-populates a
-//! migrated DB with the legacy `YYYYMMDD_NNN_*` version numbers and then
-//! calls `init_db` to confirm the in-binary repair maps them to the new
-//! 14-digit form before sqlx's migrator runs.
+//! The test mints its own private, fully migrated database, rewrites its
+//! `_sqlx_migrations` rows to the legacy `YYYYMMDD_NNN_*` version numbers, and
+//! then calls `init_db` to confirm the in-binary repair maps them back to the
+//! new 14-digit form before sqlx's migrator runs.
 //!
-//! Skipped automatically when no `TEST_DATABASE_URL` is set, so it stays
-//! out of the way of contributors without a local Postgres.
+//! This target used to do all of that against whatever `TEST_DATABASE_URL`
+//! named. It is the sharpest case in the sweep: it does not merely *migrate* a
+//! database it does not own, it deliberately **rewrites that database's
+//! migration ledger** to a legacy shape and then runs the whole ~56-migration
+//! legacy set over it. Pointed at the shared clean-chat database it took the
+//! reviewed 13-row ledger to 69 and disabled every clean-chat suite — while
+//! passing. The ledger surgery below is only sound on a database this test
+//! created, so that is what it now gets.
+
+mod common;
 
 use catbird_server::db::{init_db, DbConfig};
 use std::time::Duration;
 
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_migrepair_";
+
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL pointing at a fully-migrated test DB"]
+#[ignore = "requires the reviewed local Postgres target (TEST_DATABASE_URL)"]
 async fn legacy_migration_versions_are_repaired_in_place() {
-    let database_url = match std::env::var("TEST_DATABASE_URL") {
-        Ok(url) => url,
-        Err(_) => {
-            eprintln!("Skipping: TEST_DATABASE_URL not set");
-            return;
-        }
-    };
+    // Mint and fully migrate a private database. `_database` reaps it on drop,
+    // on the normal path and during panic unwind alike.
+    let _database = common::fresh_db::fresh_fully_migrated_db(TEST_DB_PREFIX).await;
+    let database_url = _database.url().to_owned();
 
     let config = DbConfig {
         database_url: database_url.clone(),
@@ -38,7 +46,7 @@ async fn legacy_migration_versions_are_repaired_in_place() {
         .max_connections(2)
         .connect(&database_url)
         .await
-        .expect("connect to TEST_DATABASE_URL");
+        .expect("connect to the disposable per-test database");
     sqlx::query(
         "UPDATE _sqlx_migrations SET version = 20260403, description = '001 drop read receipts' WHERE version = 20260403100000;"
     ).execute(&pool).await.unwrap();

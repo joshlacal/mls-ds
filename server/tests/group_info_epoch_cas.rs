@@ -63,7 +63,7 @@ async fn fetch_group_info(pool: &PgPool, convo_id: &str) -> (Vec<u8>, i32) {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn stale_epoch_write_cannot_roll_group_info_backward() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = format!("convo-gi-cas-{}", uuid::Uuid::new_v4());
     cleanup(&pool, &convo_id).await;
 

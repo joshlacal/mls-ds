@@ -1,25 +1,29 @@
+mod common;
+
 use catbird_server::realtime::SseState;
 use chrono::Utc;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
-// Test setup helper
-async fn setup_test_db() -> PgPool {
-    let db_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_raceconds_";
 
-    let config = catbird_server::db::DbConfig {
-        database_url: db_url,
-        max_connections: 20, // Higher for concurrent tests
-        min_connections: 5,
-        acquire_timeout: std::time::Duration::from_secs(10),
-        idle_timeout: std::time::Duration::from_secs(60),
-    };
-
-    catbird_server::db::init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 20, 5).await
 }
 
 async fn cleanup_test_data(pool: &PgPool, convo_id: &str) {
@@ -207,7 +211,7 @@ async fn test_concurrent_add_members_no_duplicate_epochs() {
         return;
     };
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = "test-race-1";
     let creator = "did:plc:creator";
 
@@ -321,7 +325,7 @@ async fn test_concurrent_send_and_read_unread_count_consistency() {
         return;
     };
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = "test-race-2";
     let alice = "did:plc:alice";
     let bob = "did:plc:bob";
@@ -433,7 +437,7 @@ async fn test_message_sequence_numbers_sequential() {
         return;
     };
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = "test-race-3";
     let creator = "did:plc:creator";
 
@@ -530,7 +534,7 @@ async fn test_out_of_order_commits_prevented() {
         return;
     };
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = "test-race-4";
     let creator = "did:plc:creator";
 
@@ -628,7 +632,7 @@ async fn test_mixed_operations_no_race_conditions() {
         return;
     };
 
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = "test-race-5";
     let creator = "did:plc:creator";
 

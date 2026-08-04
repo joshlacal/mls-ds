@@ -2605,6 +2605,11 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
             );
         }
     }
+    // Re-derived after the D-lane rebase and trigger-site conversion: the
+    // post-Stage-B tree has 226 setup calls. Four occurrences in this schema
+    // and three in the G7 schema are the authorized Amendment-3 calls, leaving
+    // 219 other fixed-target calls. This inventory catches unreviewed drift in
+    // which tests depend on the shared database.
     assert_eq!(
         caller_occurrences, 226,
         "fixed-target setup caller inventory changed"
@@ -2617,7 +2622,6 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
         "the seven authorized Amendment-3 occurrences must be the only inventory delta"
     );
     let expected_targets: BTreeSet<String> = [
-        "chat_protocol_auth_repository",
         "chat_protocol_blobs",
         "chat_protocol_concurrency",
         "chat_protocol_conversation_substrate",

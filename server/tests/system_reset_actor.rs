@@ -124,7 +124,7 @@ async fn fetch_state(pool: &PgPool, convo_id: &str) -> ConvoState {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_rotates_group_id_and_sets_marker() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-system-reset-rotate";
     let initial_group_id = "sysreset0001000010000100001000010000";
     wipe(&pool, convo_id).await;
@@ -174,7 +174,7 @@ async fn trigger_system_reset_rotates_group_id_and_sets_marker() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_respects_cooldown() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-system-reset-cooldown";
     let initial_group_id = "sysreset0002000020000200002000020000";
     wipe(&pool, convo_id).await;
@@ -226,7 +226,7 @@ async fn trigger_system_reset_respects_cooldown() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL) with A7 + Phase 2 schema"]
 async fn trigger_system_reset_respects_circuit_breaker() {
-    let pool = common::setup_test_db().await;
+    let (pool, _database) = common::setup_test_db().await;
     let convo_id = "test-system-reset-breaker";
     let initial_group_id = "sysreset0003000030000300003000030000";
     wipe(&pool, convo_id).await;

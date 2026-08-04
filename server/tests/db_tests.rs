@@ -5,45 +5,342 @@ use chrono::Utc;
 use sqlx::PgPool;
 use std::time::Duration;
 
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+/// Reserved per-run database prefix owned by this target.
+const DB_TESTS_DB_PREFIX: &str = "mlsds_dbtests_";
+
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to connect to whatever `TEST_DATABASE_URL` named — the one
+/// database every concurrent task in this program shares — and every test then
+/// called `cleanup_test_data`, which `TRUNCATE`d `messages, members,
+/// conversations, key_packages CASCADE` in that shared database. Worse,
+/// `init_db` runs the *whole* migration set, so pointing this target at the
+/// shared clean-chat database also rewrote its `_sqlx_migrations` ledger. Both
+/// are cross-task destruction, not isolation.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    let database = common::fresh_db::fresh_fully_migrated_db(DB_TESTS_DB_PREFIX).await;
 
     let config = DbConfig {
-        database_url,
+        database_url: database.url().to_owned(),
         max_connections: 10,
         min_connections: 2,
         acquire_timeout: Duration::from_secs(30),
         idle_timeout: Duration::from_secs(600),
     };
 
-    init_db(config)
+    let pool = init_db(config)
         .await
-        .expect("Failed to initialize test database")
+        .expect("Failed to initialize test database");
+    (pool, database)
 }
 
-async fn cleanup_test_data(pool: &PgPool) {
-    sqlx::query("TRUNCATE TABLE messages, members, conversations, key_packages CASCADE")
-        .execute(pool)
-        .await
-        .expect("Failed to cleanup test data");
-}
-
-/// The fixture model of this file is a DB-global reset: every test starts by
-/// TRUNCATE-ing the shared tables via `cleanup_test_data`. That makes the
-/// tests mutually exclusive by construction — two tests running concurrently
-/// truncate each other's in-flight rows (this is the "shared IDs" fixture rot
-/// that kept the file `#[ignore]`d). Serialize them with a static lock so the
-/// file is correct under the default parallel test runner instead of relying
-/// on callers remembering `--test-threads=1`.
+/// The fixture model of this file used to be a DB-global reset: every test
+/// began by TRUNCATE-ing shared tables, which made the tests mutually exclusive
+/// by construction (this is the "shared IDs" fixture rot that kept the file
+/// `#[ignore]`d). Each test now owns a private database, so the fixtures no
+/// longer collide at all. The lock is retained as a *resource* bound: each test
+/// runs the full migration set against a new database, and letting eleven of
+/// those run concurrently multiplies both connection count and migration cost
+/// with no correctness benefit.
 static DB_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The disposable-database name guard is the backstop that makes "reset the
+/// shared database" unrepresentable rather than merely unused. These cases live
+/// in this target (rather than beside the guard in `tests/common/fresh_db.rs`)
+/// because `tests/common/` is compiled into ~20 integration targets and adding
+/// tests there would change the reported test counts of targets whose counts
+/// are pinned by this program's gate reports.
+///
+/// Each case names the input that makes the guard fail. Together with
+/// `disposable_name_guard_accepts_a_minted_name`, the guard is proven
+/// falsifiable in both directions.
+#[test]
+fn disposable_name_guard_refuses_the_shared_chat_protocol_database() {
+    let error =
+        common::fresh_db::validate_disposable_database_name("catbird_chat_protocol_test_20260722")
+            .expect_err("the shared clean-chat database must never be disposable");
+    assert!(error.contains("protected"), "unexpected refusal: {error}");
+}
+
+#[test]
+fn disposable_name_guard_refuses_protected_names_and_unreserved_prefixes() {
+    for (name, expected) in [
+        ("catbird", "protected"),
+        ("catbird_test", "protected"),
+        ("postgres", "protected"),
+        ("template1", "protected"),
+        // The executor harness's own namespace is not ours to reap: the 73
+        // leaked `chat_exec_*` databases on this host belong to someone else.
+        (
+            "chat_exec_07622ab680c14b53b8434da37765a381",
+            "reserved prefix",
+        ),
+        (
+            "scratch_0123456789abcdef0123456789abcdef",
+            "reserved prefix",
+        ),
+    ] {
+        let error = common::fresh_db::validate_disposable_database_name(name)
+            .expect_err("name was accepted as disposable");
+        assert!(
+            error.contains(expected),
+            "{name}: expected {expected:?} refusal, got {error}"
+        );
+    }
+}
+
+#[test]
+fn disposable_name_guard_requires_a_32_lowercase_hex_suffix() {
+    for name in [
+        "mlsds_dbtests_short",
+        "mlsds_dbtests_",
+        "mlsds_dbtests_0123456789abcdef0123456789abcdefff",
+        "mlsds_dbtests_0123456789abcdef0123456789abcdeg",
+        "mlsds_dbtests_0123456789ABCDEF0123456789abcdef",
+    ] {
+        assert!(
+            common::fresh_db::validate_disposable_database_name(name).is_err(),
+            "{name} was accepted as disposable"
+        );
+    }
+}
+
+#[test]
+fn disposable_name_guard_accepts_a_minted_name() {
+    for prefix in common::fresh_db::DISPOSABLE_PREFIXES {
+        let name = format!("{prefix}{}", uuid::Uuid::new_v4().simple());
+        common::fresh_db::validate_disposable_database_name(&name)
+            .unwrap_or_else(|error| panic!("minted {name} was refused: {error}"));
+    }
+    assert!(
+        common::fresh_db::validate_disposable_prefix("chat_exec_").is_err(),
+        "an unreserved prefix must not be mintable"
+    );
+    common::fresh_db::validate_disposable_prefix(DB_TESTS_DB_PREFIX)
+        .expect("this target's own prefix must be mintable");
+}
+
+/// Every `.rs` file under `server/tests`, recursively, paired with its source.
+///
+/// Used by the source-authority guards below. Panics rather than returning an
+/// empty vector if the directory cannot be walked, because a guard that silently
+/// sweeps nothing proves nothing.
+fn integration_test_sources() -> Vec<(String, String)> {
+    fn walk(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("read integration-test source directory") {
+            let path = entry.expect("read integration-test source entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(
+        files.len() > 50,
+        "integration-test sweep found only {} files — the corpus is not being walked",
+        files.len()
+    );
+    files
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("test source under tests/")
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", relative));
+            (relative, source)
+        })
+        .collect()
+}
+
+/// True for a line that is entirely a `//`, `///` or `//!` comment.
+///
+/// Deliberately does not model block comments: there are none carrying a
+/// connection literal in this corpus, and a guard that guessed at `/* … */`
+/// nesting would be less trustworthy than one that over-reports.
+fn is_line_comment(line: &str) -> bool {
+    line.trim_start().starts_with("//")
+}
+
+/// `db::init_db` runs `sqlx::migrate!("./migrations")` against whatever URL it
+/// is handed. That is the mechanism that took the shared clean-chat database's
+/// `_sqlx_migrations` ledger from the reviewed 13 to 69 — silently, while the
+/// calling target passed — and it is reachable from any test that reads an
+/// ambient environment variable.
+///
+/// Converting the twenty-one targets that did so removes the *instances*. This
+/// guard removes the *class*: a new caller must come here and justify itself,
+/// and the reviewed callers must keep minting their own database.
+///
+/// Falsifying inputs:
+/// * a new `server/tests/**.rs` file calling `init_db(` → set mismatch, the
+///   offending path is named in the message;
+/// * an approved caller dropping its `fresh_db` mint → second assertion;
+/// * this guard silently sweeping nothing → the corpus assertion in
+///   [`integration_test_sources`].
+#[test]
+fn init_db_is_only_reachable_from_targets_that_mint_their_own_database() {
+    // Assembled at runtime so this guard's own source does not match itself.
+    let init_db_call = ["init_db", "("].concat();
+    let mint_needle = ["fresh_db", "::"].concat();
+
+    /// Files allowed to call `init_db`, each of which must mint the database it
+    /// passes. `common/fresh_db.rs` is the harness itself.
+    const APPROVED_INIT_DB_CALLERS: &[&str] = &[
+        "common/fresh_db.rs",
+        "db_tests.rs",
+        "federation_hostile_peers.rs",
+        "migration_repair_smoke.rs",
+    ];
+
+    let mut callers: Vec<String> = Vec::new();
+    for (relative, source) in integration_test_sources() {
+        let calls = source
+            .lines()
+            .any(|line| !is_line_comment(line) && line.contains(&init_db_call));
+        if calls {
+            let mints = source
+                .lines()
+                .any(|line| !is_line_comment(line) && line.contains(&mint_needle));
+            assert!(
+                mints || relative == "common/fresh_db.rs",
+                "{relative} calls init_db without minting a disposable database"
+            );
+            callers.push(relative);
+        }
+    }
+    callers.sort();
+    let mut approved: Vec<String> = APPROVED_INIT_DB_CALLERS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    approved.sort();
+    assert_eq!(
+        callers, approved,
+        "unreviewed init_db caller under server/tests — it will migrate whatever \
+         TEST_DATABASE_URL names. Mint a disposable database via common::fresh_db instead."
+    );
+}
+
+/// The silent-default-database-name defect, in its exact source shape:
+///
+/// ```ignore
+/// let url = std::env::var("TEST_DATABASE_URL")
+///     .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+/// ```
+///
+/// A test written this way adopts, migrates and mutates whatever database
+/// answers to that name, and it does so *most* eagerly in the environment where
+/// nobody set the variable. This is how `db_tests::test_health_check` escaped
+/// its `#[ignore]` tag, and twenty-one targets carried the same fallback until
+/// this task removed it — three of them not `#[ignore]`d at all.
+///
+/// The guard targets the fallback specifically rather than every connection
+/// literal, because bare literals in this corpus are legitimate: negative
+/// inputs proving `validate_chat_protocol_database_url` rejects them, and
+/// `connect_lazy` targets that exist to prove a router never connects. Corpus
+/// of that classification: every line under `server/tests` whose trimmed start
+/// is not `//` and that contains a connection literal, counted by
+/// `literal_sites` below. The count is derived from the current source corpus
+/// rather than maintained as a prose inventory; the positive control requires
+/// at least ten sites.
+///
+/// Falsifying input: restore any removed fallback — e.g. put
+/// `std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://…")`
+/// back into any test — and the file and line are named in the failure.
+#[test]
+fn no_test_source_defaults_a_database_connection_to_a_hardcoded_name() {
+    // BOTH schemes. `postgresql://` does not contain `postgres://`, and every
+    // fallback this task removed used the longer form — a needle of only
+    // `postgres://` makes this guard unable to fail, which is exactly what a
+    // mutant caught before this line was written.
+    let schemes = [["postgres", "://"].concat(), ["postgresql", "://"].concat()];
+    let fallback = ["unwrap_or", ""].concat();
+
+    let sources = integration_test_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    let mut literal_sites = 0usize;
+    for (relative, source) in &sources {
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if is_line_comment(line) || !schemes.iter().any(|scheme| line.contains(scheme)) {
+                continue;
+            }
+            literal_sites += 1;
+            // The fallback combinator may sit on this line or on either of the
+            // two preceding ones, since rustfmt breaks the chain.
+            let window = lines[index.saturating_sub(2)..=index].join("\n");
+            if window.contains(&fallback) {
+                offenders.push(format!("{relative}:{}", index + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "test sources default a database connection to a hardcoded name: \
+         {offenders:?}. A test must never adopt a database it did not create — \
+         mint one via common::fresh_db instead."
+    );
+
+    // Positive control, so an empty offender list cannot pass vacuously: the
+    // sweep must actually be seeing connection literals to classify.
+    assert!(
+        literal_sites >= 10,
+        "sweep saw only {literal_sites} connection literals — it is not \
+         reading the corpus, so its empty offender list proves nothing"
+    );
+}
+
+/// Prefix hygiene for [`common::fresh_db::DISPOSABLE_PREFIXES`].
+///
+/// Attribution of a leaked database to its owning target is the only thing that
+/// makes the leak-on-SIGKILL behaviour tolerable, and it silently breaks if two
+/// prefixes overlap: a name minted under the longer prefix also validates under
+/// the shorter one, so the wrong target gets blamed. `chat_exec_` must stay
+/// unreserved because those 73 databases are not ours to reap.
+///
+/// Falsifying inputs: a duplicate entry; an entry that is a prefix of another
+/// (e.g. adding `mlsds_`); adding `chat_exec_`; an entry not ending in `_`.
+#[test]
+fn disposable_prefixes_are_disjoint_and_exclude_the_executor_namespace() {
+    let prefixes = common::fresh_db::DISPOSABLE_PREFIXES;
+    assert!(!prefixes.is_empty(), "no disposable prefixes are reserved");
+    for (i, outer) in prefixes.iter().enumerate() {
+        assert!(
+            outer.ends_with('_'),
+            "{outer:?} must end with '_' so a prefix cannot run into a hex suffix"
+        );
+        assert_ne!(
+            *outer, "chat_exec_",
+            "the executor harness namespace must never be reservable here"
+        );
+        for (j, inner) in prefixes.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            assert!(
+                !outer.starts_with(inner),
+                "{outer:?} starts with {inner:?}: a leaked database would be \
+                 attributable to two different targets"
+            );
+        }
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_conversation_crud() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     // Create
     let convo = create_conversation(&pool, "did:plc:creator123")
@@ -89,8 +386,7 @@ async fn test_conversation_crud() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_member_operations() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let convo = create_conversation(&pool, "did:plc:creator")
         .await
@@ -178,8 +474,7 @@ async fn test_member_operations() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_message_operations() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let convo = create_conversation(&pool, "did:plc:creator")
         .await
@@ -269,8 +564,7 @@ async fn test_message_operations() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_key_package_operations() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expires_at = Utc::now() + chrono::Duration::hours(24);
@@ -347,8 +641,7 @@ async fn test_key_package_operations() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_old_unconsumed_sweep_preserves_last_resort() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expires_at = Utc::now() + chrono::Duration::days(30);
@@ -406,8 +699,7 @@ async fn test_old_unconsumed_sweep_preserves_last_resort() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_last_resort_key_package_store_flag_and_replacement() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let did = "did:plc:lastresort-store";
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
@@ -509,8 +801,7 @@ async fn test_last_resort_key_package_store_flag_and_replacement() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_expired_key_package_cleanup() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
     let expired = Utc::now() - chrono::Duration::hours(1);
@@ -561,8 +852,7 @@ async fn test_expired_key_package_cleanup() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_transaction_conversation_with_members() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     // Create conversation with members in transaction
     let convo = create_conversation_with_members(
@@ -594,8 +884,7 @@ async fn test_transaction_conversation_with_members() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_list_conversations_for_user() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     // Create multiple conversations
     let convo1 = create_conversation(&pool, "did:plc:creator")
@@ -641,10 +930,18 @@ async fn test_list_conversations_for_user() {
     assert_eq!(active_convos.len(), 2);
 }
 
+// This case has always required a live PostgreSQL server; it was the only one
+// in the file not marked as such, and it got away with it because
+// `setup_test_db` silently fell back to a hardcoded default database name when
+// `TEST_DATABASE_URL` was unset. That fallback is the shared-state hazard in
+// miniature — a test quietly adopting, migrating and truncating whatever
+// database happened to answer to that name — so it is gone, and the case is now
+// tagged like its ten siblings.
 #[tokio::test]
+#[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_health_check() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
 
     let healthy = health_check(&pool).await.expect("Health check failed");
 
@@ -655,8 +952,7 @@ async fn test_health_check() {
 #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
 async fn test_concurrent_operations() {
     let _fixture_guard = DB_FIXTURE_LOCK.lock().await;
-    let pool = setup_test_db().await;
-    cleanup_test_data(&pool).await;
+    let (pool, _database) = setup_test_db().await;
 
     let convo = create_conversation(&pool, "did:plc:creator")
         .await

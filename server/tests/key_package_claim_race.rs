@@ -8,27 +8,32 @@
 //! Requires `TEST_DATABASE_URL` (defaults to localhost:5433/catbird). The
 //! test creates and tears down its own user + key_package row.
 
+mod common;
+
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-async fn setup_test_db() -> PgPool {
-    let db_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_kprace_";
 
-    let config = catbird_server::db::DbConfig {
-        database_url: db_url,
-        max_connections: 8,
-        min_connections: 2,
-        acquire_timeout: std::time::Duration::from_secs(10),
-        idle_timeout: std::time::Duration::from_secs(60),
-    };
-
-    catbird_server::db::init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 8, 2).await
 }
 
 async fn ensure_user(pool: &PgPool, did: &str) {
@@ -106,7 +111,7 @@ async fn try_claim_one(
 
 #[tokio::test]
 async fn test_concurrent_reserve_exactly_one_winner() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
 
     let owner_did = format!("did:plc:test-claim-race-{}", Uuid::new_v4());
     let cipher_suite = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";

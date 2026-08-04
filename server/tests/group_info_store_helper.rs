@@ -37,7 +37,8 @@
 //! Plan: docs/superpowers/plans/2026-05-03-mls-atomic-groupinfo-upload.md
 //! (Task 1 — RED).
 
-use catbird_server::db::{init_db, DbConfig};
+mod common;
+
 // Task 2 will introduce this symbol. Today the import fails to compile —
 // that's the RED state. If you're staring at a compile error pointing at
 // this `use`, that's the test working as designed.
@@ -45,26 +46,28 @@ use catbird_server::db::store_group_info_in_tx;
 use chrono::Utc;
 use sqlx::PgPool;
 use sqlx::Row;
-use std::time::Duration;
 
 const CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
 const CREATOR: &str = "did:plc:groupinfo1111111111111";
 
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string());
+/// Reserved per-run database prefix owned by this target.
+const TEST_DB_PREFIX: &str = "mlsds_gistore_";
 
-    let config = DbConfig {
-        database_url,
-        max_connections: 4,
-        min_connections: 1,
-        acquire_timeout: Duration::from_secs(30),
-        idle_timeout: Duration::from_secs(600),
-    };
-
-    init_db(config)
-        .await
-        .expect("Failed to initialize test database")
+/// Mint a private, freshly migrated database for one test case.
+///
+/// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded
+/// connection string when unset — and hand it straight to `db::init_db`, which
+/// runs `sqlx::migrate!("./migrations")`. That applied the whole ~56-migration
+/// legacy set to whatever database the ambient environment named. With the
+/// program's standard environment exported, this target silently took the
+/// shared clean-chat database's `_sqlx_migrations` ledger from the reviewed 13
+/// to 69 and disabled `validate_exact_reviewed_ledger` for every clean-chat
+/// suite — while passing.
+///
+/// The returned [`DisposableDatabase`] must stay bound for the whole test: it
+/// reaps its database on drop, on the normal path and during panic unwind.
+async fn setup_test_db() -> (PgPool, common::fresh_db::DisposableDatabase) {
+    common::fresh_db::fresh_legacy_pool(TEST_DB_PREFIX, 4, 1).await
 }
 
 async fn cleanup(pool: &PgPool, convo_id: &str) {
@@ -132,7 +135,7 @@ async fn seed_convo(
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 2 lands the helper"]
 async fn store_group_info_in_tx_replaces_bytes_and_increments_epoch() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = format!("convo-gi-helper-replace-{}", uuid::Uuid::new_v4());
     cleanup(&pool, &convo_id).await;
 
@@ -193,7 +196,7 @@ async fn store_group_info_in_tx_replaces_bytes_and_increments_epoch() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 2 lands the helper"]
 async fn store_group_info_in_tx_rolls_back_on_txn_abort() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = format!("convo-gi-helper-rollback-{}", uuid::Uuid::new_v4());
     cleanup(&pool, &convo_id).await;
 
@@ -249,7 +252,7 @@ async fn store_group_info_in_tx_rolls_back_on_txn_abort() {
 #[tokio::test]
 #[ignore = "requires live Postgres (TEST_DATABASE_URL); RED until Task 2 lands the helper"]
 async fn store_group_info_in_tx_with_none_tag_writes_null() {
-    let pool = setup_test_db().await;
+    let (pool, _database) = setup_test_db().await;
     let convo_id = format!("convo-gi-helper-null-tag-{}", uuid::Uuid::new_v4());
     cleanup(&pool, &convo_id).await;
 
