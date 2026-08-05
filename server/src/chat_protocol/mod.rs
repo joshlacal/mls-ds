@@ -76,6 +76,7 @@ pub mod error;
 pub(crate) mod model;
 pub(crate) mod public_state;
 pub(crate) mod read_authority;
+pub(crate) mod read_projection;
 pub(crate) mod relationship_policy;
 pub(crate) mod repository;
 pub mod snapshot;

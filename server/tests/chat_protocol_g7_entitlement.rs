@@ -42,6 +42,9 @@ mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 #[allow(dead_code)]
+#[path = "../src/chat_protocol/read_projection.rs"]
+mod read_projection;
+#[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
 #[allow(dead_code)]
@@ -73,6 +76,9 @@ mod chat_protocol {
     }
     pub mod error {
         pub use catbird_server::chat_protocol::error::*;
+    }
+    pub mod read_projection {
+        pub use crate::read_projection::*;
     }
     /// Test-crate visibility bridge for the B-auth read authority.
     ///
@@ -6927,4 +6933,1695 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
     pool.close().await;
     drop(guard);
     assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+// ============================================================================
+// C1-1: canonical-JSON v1 encoder — pure fixture-driven tests (no database).
+//
+// Drives the production `read_projection` canonical encoder through the
+// frozen `encode_canonical_generated_chat_json_v1` entry point. The fixture
+// (`server/tests/fixtures/chat_protocol_g7_canonical_json_v1.json`) was
+// written fixture-first and its canonical hex/SHA-256 values were derived by
+// an INDEPENDENT Python JCS reference (RFC 8785) kept at
+// /private/tmp/c1-jcs-reference/ — never from the Rust encoder.
+// ============================================================================
+
+const CANONICAL_JSON_FIXTURE: &str =
+    include_str!("fixtures/chat_protocol_g7_canonical_json_v1.json");
+
+use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use jacquard_common::DefaultStr;
+
+fn canonical_json_fixture() -> serde_json::Value {
+    serde_json::from_str(CANONICAL_JSON_FIXTURE).expect("C1-1 fixture parses as JSON")
+}
+
+fn hex_lowercase(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// The frozen encoder entry takes `&'static str` definition ids; the fixture's
+/// ids are compile-time literals, so a static lookup keeps the fixture
+/// authoritative while satisfying the signature.
+fn static_definition_id(fixture_id: &str) -> &'static str {
+    match fixture_id {
+        "blue.catbird.chat.defs#conversationState" => "blue.catbird.chat.defs#conversationState",
+        "blue.catbird.chat.defs#conversationRemovalTombstone" => {
+            "blue.catbird.chat.defs#conversationRemovalTombstone"
+        }
+        "blue.catbird.chat.defs#conversationCloseTombstone" => {
+            "blue.catbird.chat.defs#conversationCloseTombstone"
+        }
+        "blue.catbird.chat.defs#conversationInventoryItem" => {
+            "blue.catbird.chat.defs#conversationInventoryItem"
+        }
+        "blue.catbird.chat.defs#welcomeView" => "blue.catbird.chat.defs#welcomeView",
+        "blue.catbird.chat.defs#leafRecoveryView" => "blue.catbird.chat.defs#leafRecoveryView",
+        "blue.catbird.chat.defs#recoveryWorkView" => "blue.catbird.chat.defs#recoveryWorkView",
+        "blue.catbird.chat.defs#recoveryWorkPendingView" => {
+            "blue.catbird.chat.defs#recoveryWorkPendingView"
+        }
+        "blue.catbird.chat.defs#leafRecoveryInboxItem" => {
+            "blue.catbird.chat.defs#leafRecoveryInboxItem"
+        }
+        "blue.catbird.chat.defs#metadataContentProjection" => {
+            "blue.catbird.chat.defs#metadataContentProjection"
+        }
+        _ => panic!("fixture definition id is not mapped to a static literal: {fixture_id}"),
+    }
+}
+
+/// `extra_data` injection: generated DTOs carry the flattened
+/// `Option<BTreeMap<SmolStr, Data>>` member, so invalid vectors record the
+/// poison as `extraData` and the harness injects it into the DTO before the
+/// encoder serializes it.
+trait CanonicalExtraDataInjection {
+    fn inject_canonical_extra_data(&mut self, extra: &serde_json::Value) -> Result<(), String>;
+}
+
+macro_rules! impl_extra_data_injection {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl CanonicalExtraDataInjection for $ty {
+                fn inject_canonical_extra_data(
+                    &mut self,
+                    extra: &serde_json::Value,
+                ) -> Result<(), String> {
+                    let map: std::collections::BTreeMap<
+                        jacquard_common::deps::smol_str::SmolStr,
+                        jacquard_common::types::value::Data<DefaultStr>,
+                    > = serde_json::from_value(extra.clone())
+                        .map_err(|error| format!("extra_data decode: {error}"))?;
+                    self.extra_data = Some(map);
+                    Ok(())
+                }
+            }
+        )+
+    };
+}
+
+impl_extra_data_injection!(
+    chat_dto::ConversationState<DefaultStr>,
+    chat_dto::ConversationRemovalTombstone<DefaultStr>,
+    chat_dto::ConversationCloseTombstone<DefaultStr>,
+    chat_dto::WelcomeView<DefaultStr>,
+    chat_dto::LeafRecoveryView<DefaultStr>,
+    chat_dto::MetadataContentProjection<DefaultStr>,
+);
+
+/// Decodes the fixture's typed value into the generated DTO named by the
+/// fixture's `dto` field and encodes it through the frozen entry point. The
+/// fixture value is exactly the generated serializer's JSON shape (camelCase,
+/// `$bytes` objects, bare byte arrays), so this is a genuine generated-DTO
+/// round trip. The DTO is decoded from the re-serialized JSON text because
+/// the generated `serde_bytes_helper` visitors require borrowed string keys
+/// (they do not deserialize from an owned `serde_json::Value`).
+fn encode_fixture_vector(
+    vector: &serde_json::Value,
+) -> Result<
+    chat_protocol::read_projection::CanonicalChatJsonV1,
+    chat_protocol::read_projection::ProjectionError,
+> {
+    let fixture_id = vector["definitionId"].as_str().expect("definitionId");
+    let definition_id = static_definition_id(fixture_id);
+    let dto_kind = vector["dto"].as_str().expect("dto");
+    let value = &vector["value"];
+    let value_text = serde_json::to_string(value).expect("fixture value re-serializes");
+    let extra_data = vector.get("extraData");
+    match dto_kind {
+        "ConversationState" => {
+            let mut dto: chat_dto::ConversationState<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "ConversationRemovalTombstone" => {
+            let mut dto: chat_dto::ConversationRemovalTombstone<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "ConversationCloseTombstone" => {
+            let mut dto: chat_dto::ConversationCloseTombstone<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "ConversationInventoryItem" => {
+            let dto: chat_dto::ConversationInventoryItem<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "WelcomeView" => {
+            let mut dto: chat_dto::WelcomeView<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "LeafRecoveryView" => {
+            let mut dto: chat_dto::LeafRecoveryView<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "RecoveryWorkView" => {
+            let dto: chat_dto::RecoveryWorkView<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "LeafRecoveryInboxItem" => {
+            let dto: chat_dto::LeafRecoveryInboxItem<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        "MetadataContentProjection" => {
+            let mut dto: chat_dto::MetadataContentProjection<DefaultStr> =
+                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            if let Some(extra) = extra_data {
+                dto.inject_canonical_extra_data(extra)
+                    .expect("extra_data injects");
+            }
+            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &dto,
+                definition_id,
+            )
+        }
+        other => panic!("fixture dto kind is not dispatched: {other}"),
+    }
+}
+
+/// Payload probes for the redaction guarantee: every string value longer than
+/// six characters and every large/float number in the fixture vector must not
+/// appear in the redacted error text. Shorter values are single enum tokens
+/// (e.g. "member", "active") that also appear inside static reason text and
+/// member names, so they cannot distinguish a leaked value from structural
+/// text; the payload material that matters (identifiers, base64, datetimes,
+/// unsafe numbers) is always longer. Member names (paths) and static reason
+/// text are structural and are expected to appear, so any probe that is a
+/// substring of a member key is dropped as well.
+fn redaction_probes(vector: &serde_json::Value) -> Vec<String> {
+    let mut probes = Vec::new();
+    let mut keys = Vec::new();
+    fn collect(value: &serde_json::Value, out: &mut Vec<String>, keys: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                if text.len() > 6 {
+                    out.push(text.clone());
+                }
+            }
+            serde_json::Value::Number(number) => {
+                if let Some(float) = number.as_f64() {
+                    if float.fract() != 0.0 {
+                        out.push(number.to_string());
+                    }
+                } else if number.as_i64().is_some_and(|value| value.abs() > 999) {
+                    out.push(number.to_string());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect(item, out, keys);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    keys.push(key.clone());
+                    collect(item, out, keys);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) => {}
+        }
+    }
+    collect(&vector["value"], &mut probes, &mut keys);
+    if let Some(extra) = vector.get("extraData") {
+        collect(extra, &mut probes, &mut keys);
+    }
+    probes.retain(|probe| !keys.iter().any(|key| key.contains(probe)));
+    probes
+}
+
+#[test]
+fn c1_canonical_json_fixture_valid_vectors_encode_to_exact_hex_and_sha256() {
+    let fixture = canonical_json_fixture();
+    let vectors = fixture["vectors"].as_array().expect("fixture vectors");
+    let mut checked = 0;
+    for vector in vectors {
+        if vector.get("failure").is_some() {
+            continue;
+        }
+        let name = vector["name"].as_str().expect("vector name");
+        let encoded = encode_fixture_vector(vector)
+            .unwrap_or_else(|error| panic!("{name} must encode: {error}"));
+        let actual_hex = hex_lowercase(encoded.bytes());
+        assert_eq!(
+            actual_hex,
+            vector["canonicalUtf8Hex"]
+                .as_str()
+                .expect("canonicalUtf8Hex"),
+            "{name} must encode to the fixture's exact canonical UTF-8 hex"
+        );
+        assert_eq!(
+            encoded.sha256_hex(),
+            vector["sha256"].as_str().expect("sha256"),
+            "{name} must match the fixture's exact SHA-256"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 18, "every valid fixture vector was checked");
+}
+
+#[test]
+fn c1_canonical_json_fixture_invalid_vectors_fail_redacted_before_bytes() {
+    let fixture = canonical_json_fixture();
+    let vectors = fixture["vectors"].as_array().expect("fixture vectors");
+    let mut checked = 0;
+    for vector in vectors {
+        let Some(failure) = vector.get("failure") else {
+            continue;
+        };
+        let name = vector["name"].as_str().expect("vector name");
+        let expected_kind = failure["kind"].as_str().expect("failure kind");
+        let error = encode_fixture_vector(vector)
+            .err()
+            .unwrap_or_else(|| panic!("{name} must fail before producing canonical bytes"));
+        let kind_name = format!("{:?}", error.kind());
+        assert_eq!(
+            kind_name, expected_kind,
+            "{name} must fail with the fixture's exact failure kind"
+        );
+        let display = error.to_string();
+        assert!(
+            display.contains(&kind_name),
+            "{name} error must name its redacted kind"
+        );
+        for probe in redaction_probes(vector) {
+            assert!(
+                !display.contains(&probe),
+                "{name} redacted error must not leak payload value {probe:?}"
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 9, "every invalid fixture vector was checked");
+}
+
+// ============================================================================
+// C1-2: checked projection source types and the six projection functions —
+// pure tests (no database).
+//
+// Drives the production `read_projection` checked sources and projection
+// functions. Complete generated DTOs are produced from typed sources for the
+// full frozen case list; constructor negatives prove the checked guards fail
+// BEFORE any DTO materializes; the source guards pin the corrected Step-5
+// text (canonical bytes only from the local canonical writer; the single
+// `serde_json::to_vec` serialize-once step at read_projection.rs:982 is
+// allowed and present; `extra_data` can never be non-empty in produced
+// canonical bytes).
+// ============================================================================
+
+const C1_2_CONVERSATION_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+const C1_2_DEVICE_ID_A: &str = "123e4567-e89b-12d3-a456-426614174001";
+const C1_2_DEVICE_ID_B: &str = "123e4567-e89b-12d3-a456-426614174002";
+const C1_2_RECOVERY_REQUEST_ID: &str = "123e4567-e89b-12d3-a456-426614174003";
+const C1_2_WELCOME_ID: &str = "123e4567-e89b-12d3-a456-426614174004";
+const C1_2_TRANSITION_ID_1: &str = "123e4567-e89b-12d3-a456-426614174005";
+const C1_2_TRANSITION_ID_2: &str = "123e4567-e89b-12d3-a456-426614174006";
+const C1_2_REVOCATION_ID: &str = "123e4567-e89b-12d3-a456-426614174007";
+const C1_2_DID_A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+const C1_2_DID_B: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+const C1_2_KEY_ID: &str = "kJ2O8X9rQmzNpY3fA7sD5gH1vL0cE4uW6tR8bB2nM4q";
+const C1_2_CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+const C1_2_REQUESTED_AT: &str = "2026-08-03T04:05:06.789Z";
+const C1_2_EXPIRES_AT: &str = "2026-08-05T23:59:59.000Z";
+const C1_2_REMOVED_AT: &str = "2026-07-30T12:00:00.000Z";
+const C1_2_CLOSED_AT: &str = "2026-07-31T23:59:59.999Z";
+const C1_2_CREATED_AT: &str = "2026-08-04T10:00:00.000Z";
+const C1_2_TERMINAL_AT_1: &str = "2026-08-04T11:00:00.000Z";
+const C1_2_TERMINAL_AT_2: &str = "2026-08-04T12:00:00.000Z";
+const C1_2_TERMINAL_AT_3: &str = "2026-08-04T13:00:00.000Z";
+
+use chat_protocol::read_projection::{
+    conversation_inventory_item, conversation_state_view, leaf_recovery_inbox_item,
+    leaf_recovery_view, recovery_work, welcome_view,
+};
+use chat_protocol::read_projection::{
+    CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
+    CheckedKeyPackageArtifact, CheckedLeafRecoveryReservation, CheckedMetadataAuthorProof,
+    CheckedMetadataAvatarBinding, CheckedMetadataCryptoContext, CheckedMetadataSnapshot,
+    CheckedParticipantView, CheckedWelcomeProvenance, ConversationProjectionSource,
+    LeafRecoveryInboxInput, ProjectionErrorKind, RetainedLeafRecoveryProjectionSource,
+    RetainedRecoveryWorkProjectionSource, RetainedRecoveryWorkTerminal,
+    RetainedWelcomeProjectionSource,
+};
+use jacquard_common::deps::bytes::Bytes;
+use jacquard_common::deps::smol_str::SmolStr;
+
+fn c1_2_bytes_0_to_32() -> Vec<u8> {
+    (0..32).collect()
+}
+
+fn c1_2_bytes_32_to_64() -> Vec<u8> {
+    (32..64).collect()
+}
+
+fn c1_2_bytes_64_to_96() -> Vec<u8> {
+    (64..96).collect()
+}
+
+fn c1_2_bytes_0_to_16() -> Vec<u8> {
+    (0..16).collect()
+}
+
+fn c1_2_bytes_0_to_64() -> Vec<u8> {
+    (0..64).collect()
+}
+
+fn c1_2_nonce_12() -> Vec<u8> {
+    (0..12).collect()
+}
+
+fn c1_2_welcome_bytes() -> Vec<u8> {
+    (128..160).collect()
+}
+
+fn c1_2_coordinates() -> CheckedConversationCoordinates {
+    CheckedConversationCoordinates::new(
+        C1_2_CONVERSATION_ID,
+        0,
+        3,
+        &c1_2_bytes_0_to_32(),
+        1,
+        &c1_2_bytes_32_to_64(),
+        &c1_2_bytes_64_to_96(),
+        "active",
+    )
+    .expect("fixture coordinates are checked")
+}
+
+fn c1_2_metadata_crypto_context() -> CheckedMetadataCryptoContext {
+    CheckedMetadataCryptoContext::new(
+        &c1_2_bytes_0_to_16(),
+        0,
+        &c1_2_bytes_0_to_32(),
+        1,
+        &c1_2_bytes_32_to_64(),
+        &c1_2_bytes_64_to_96(),
+    )
+    .expect("fixture metadata crypto context is checked")
+}
+
+fn c1_2_metadata_author_proof() -> CheckedMetadataAuthorProof {
+    CheckedMetadataAuthorProof::new(
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        C1_2_KEY_ID,
+        &c1_2_bytes_32_to_64(),
+        1,
+        C1_2_TRANSITION_ID_1,
+        1,
+        "admin",
+        "active",
+    )
+    .expect("fixture author proof is checked")
+}
+
+fn c1_2_metadata_snapshot() -> CheckedMetadataSnapshot {
+    CheckedMetadataSnapshot::new(
+        c1_2_metadata_crypto_context(),
+        C1_2_TRANSITION_ID_1,
+        1,
+        &c1_2_nonce_12(),
+        &c1_2_bytes_0_to_64(),
+        &c1_2_bytes_0_to_32(),
+        64,
+        c1_2_metadata_author_proof(),
+        None,
+    )
+    .expect("fixture metadata snapshot is checked")
+}
+
+fn c1_2_leaf_a() -> CheckedDeviceLeafView {
+    CheckedDeviceLeafView::new(
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "genesis",
+        C1_2_KEY_ID,
+        "active",
+        None,
+    )
+    .expect("fixture leaf A is checked")
+}
+
+fn c1_2_leaf_b() -> CheckedDeviceLeafView {
+    CheckedDeviceLeafView::new(
+        C1_2_DID_B,
+        C1_2_DEVICE_ID_B,
+        "keyPackage",
+        C1_2_KEY_ID,
+        "active",
+        Some(&c1_2_bytes_32_to_64()),
+    )
+    .expect("fixture leaf B is checked")
+}
+
+fn c1_2_participant_a() -> CheckedParticipantView {
+    CheckedParticipantView::new(C1_2_DID_A, "admin", "active", 1, None)
+        .expect("fixture participant A is checked")
+}
+
+fn c1_2_participant_b_pending() -> CheckedParticipantView {
+    let provenance =
+        CheckedInvitationProvenance::new(C1_2_TRANSITION_ID_1, C1_2_DID_A, C1_2_DEVICE_ID_A)
+            .expect("fixture invitation provenance is checked");
+    CheckedParticipantView::new(C1_2_DID_B, "member", "pending", 0, Some(provenance))
+        .expect("fixture pending participant is checked")
+}
+
+fn c1_2_key_package_artifact() -> CheckedKeyPackageArtifact {
+    CheckedKeyPackageArtifact::new(
+        "mlsMessage",
+        "keyPackage",
+        &c1_2_bytes_0_to_32(),
+        &c1_2_bytes_32_to_64(),
+        &c1_2_bytes_64_to_96(),
+    )
+    .expect("fixture key package artifact is checked")
+}
+
+fn c1_2_reservation(status: &str) -> CheckedLeafRecoveryReservation {
+    CheckedLeafRecoveryReservation::new(
+        C1_2_RECOVERY_REQUEST_ID,
+        C1_2_CONVERSATION_ID,
+        c1_2_coordinates(),
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        C1_2_KEY_ID,
+        1,
+        &c1_2_bytes_64_to_96(),
+        C1_2_CIPHER_SUITE,
+        "leafRecovery",
+        status,
+        C1_2_EXPIRES_AT,
+        c1_2_key_package_artifact(),
+    )
+    .expect("fixture reservation is checked")
+}
+
+fn c1_2_reservation_status_for(view_status: &str) -> &'static str {
+    match view_status {
+        "open" => "active",
+        "fulfilled" => "consumed",
+        "cancelled" => "released",
+        "expired" => "expired",
+        "superseded" => "released",
+        other => panic!("unexpected retained leaf-recovery status {other}"),
+    }
+}
+
+fn c1_2_leaf_recovery_source(view_status: &str) -> RetainedLeafRecoveryProjectionSource {
+    let reservation = c1_2_reservation(c1_2_reservation_status_for(view_status));
+    RetainedLeafRecoveryProjectionSource::new(
+        C1_2_RECOVERY_REQUEST_ID,
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "add",
+        c1_2_coordinates(),
+        view_status,
+        C1_2_REQUESTED_AT,
+        C1_2_EXPIRES_AT,
+        reservation,
+    )
+    .expect("fixture leaf-recovery source is checked")
+}
+
+fn c1_2_work_source(
+    terminal: RetainedRecoveryWorkTerminal,
+) -> RetainedRecoveryWorkProjectionSource {
+    RetainedRecoveryWorkProjectionSource::new(
+        C1_2_WELCOME_ID,
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "welcomeExpired",
+        C1_2_WELCOME_ID,
+        c1_2_coordinates(),
+        C1_2_CREATED_AT,
+        terminal,
+    )
+    .expect("fixture recovery-work source is checked")
+}
+
+fn c1_2_welcome_source(status: &str) -> RetainedWelcomeProjectionSource {
+    let provenance =
+        CheckedWelcomeProvenance::new(C1_2_RECOVERY_REQUEST_ID, &c1_2_bytes_64_to_96())
+            .expect("fixture welcome provenance is checked");
+    RetainedWelcomeProjectionSource::new(
+        C1_2_WELCOME_ID,
+        C1_2_CONVERSATION_ID,
+        2,
+        c1_2_coordinates(),
+        status,
+        &c1_2_welcome_bytes(),
+        &c1_2_bytes_0_to_32(),
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        provenance,
+        C1_2_EXPIRES_AT,
+    )
+    .expect("fixture welcome source is checked")
+}
+
+fn c1_2_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[test]
+fn c1_2_active_conversation_state_projects_complete_dto() {
+    let source = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![c1_2_leaf_a()],
+        c1_2_metadata_snapshot(),
+        vec![c1_2_participant_a()],
+        42,
+    )
+    .expect("active checked state source");
+    let dto = conversation_state_view(&source).expect("active state projects");
+    assert_eq!(dto.cipher_suite.as_str(), C1_2_CIPHER_SUITE);
+    assert_eq!(dto.conversation_kind.as_str(), "group");
+    assert_eq!(
+        dto.coordinates.conversation_id.as_str(),
+        C1_2_CONVERSATION_ID
+    );
+    assert_eq!(dto.coordinates.generation, 0);
+    assert_eq!(dto.coordinates.state_version, 3);
+    assert_eq!(dto.coordinates.group_id, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(dto.coordinates.epoch, 1);
+    assert_eq!(
+        dto.coordinates.group_context_hash,
+        Bytes::from(c1_2_bytes_32_to_64())
+    );
+    assert_eq!(
+        dto.coordinates.confirmation_tag,
+        Bytes::from(c1_2_bytes_64_to_96())
+    );
+    assert_eq!(dto.coordinates.lifecycle.as_str(), "active");
+    assert_eq!(dto.leaves.len(), 1);
+    assert_eq!(dto.leaves[0].user_did.as_str(), C1_2_DID_A);
+    assert_eq!(dto.leaves[0].device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(dto.leaves[0].leaf_origin.as_str(), "genesis");
+    assert_eq!(dto.leaves[0].key_id.as_str(), C1_2_KEY_ID);
+    assert_eq!(dto.leaves[0].device_status.as_str(), "active");
+    assert!(dto.leaves[0].join_key_package_ref.is_none());
+    let snapshot = &dto.metadata_snapshot;
+    assert_eq!(
+        snapshot.coordinate.conversation_id,
+        Bytes::from(c1_2_bytes_0_to_16())
+    );
+    assert_eq!(snapshot.coordinate.generation, 0);
+    assert_eq!(
+        snapshot.coordinate.group_id,
+        Bytes::from(c1_2_bytes_0_to_32())
+    );
+    assert_eq!(snapshot.coordinate.epoch, 1);
+    assert_eq!(
+        snapshot.coordinate.group_context_hash,
+        Bytes::from(c1_2_bytes_32_to_64())
+    );
+    assert_eq!(
+        snapshot.coordinate.confirmation_tag,
+        Bytes::from(c1_2_bytes_64_to_96())
+    );
+    assert_eq!(snapshot.origin_transition_id.as_str(), C1_2_TRANSITION_ID_1);
+    assert_eq!(snapshot.metadata_version, 1);
+    assert_eq!(snapshot.nonce, Bytes::from(c1_2_nonce_12()));
+    assert_eq!(snapshot.ciphertext, Bytes::from(c1_2_bytes_0_to_64()));
+    assert_eq!(
+        snapshot.ciphertext_sha256,
+        Bytes::from(c1_2_bytes_0_to_32())
+    );
+    assert_eq!(snapshot.ciphertext_size, 64);
+    assert_eq!(snapshot.author_proof.author_did.as_str(), C1_2_DID_A);
+    assert_eq!(
+        snapshot.author_proof.author_device_id.as_str(),
+        C1_2_DEVICE_ID_A
+    );
+    assert_eq!(snapshot.author_proof.author_key_id.as_str(), C1_2_KEY_ID);
+    assert_eq!(
+        snapshot.author_proof.signature_public_key,
+        Bytes::from(c1_2_bytes_32_to_64())
+    );
+    assert_eq!(snapshot.author_proof.auth_generation_at_origin, 1);
+    assert_eq!(
+        snapshot.author_proof.origin_transition_id.as_str(),
+        C1_2_TRANSITION_ID_1
+    );
+    assert_eq!(snapshot.author_proof.origin_seq, 1);
+    assert_eq!(snapshot.author_proof.role_at_origin.as_str(), "admin");
+    assert_eq!(
+        snapshot.author_proof.device_status_at_origin.as_str(),
+        "active"
+    );
+    assert!(snapshot.avatar_binding.is_none());
+    assert_eq!(dto.participants.len(), 1);
+    assert_eq!(dto.participants[0].user_did.as_str(), C1_2_DID_A);
+    assert_eq!(dto.participants[0].role.as_str(), "admin");
+    assert_eq!(dto.participants[0].status.as_str(), "active");
+    assert_eq!(dto.participants[0].leaf_count, 1);
+    assert!(dto.participants[0].invitation_provenance.is_none());
+    assert_eq!(dto.snapshot_seq, 42);
+    assert!(dto.extra_data.is_none());
+}
+
+#[test]
+fn c1_2_group_pending_and_zero_leaf_states_project_complete_dtos() {
+    let group_pending = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![c1_2_leaf_a()],
+        c1_2_metadata_snapshot(),
+        vec![c1_2_participant_a(), c1_2_participant_b_pending()],
+        5,
+    )
+    .expect("group-pending checked state source");
+    let dto = conversation_state_view(&group_pending).expect("group-pending state projects");
+    assert_eq!(dto.leaves.len(), 1);
+    assert_eq!(dto.participants.len(), 2);
+    assert_eq!(dto.participants[1].user_did.as_str(), C1_2_DID_B);
+    assert_eq!(dto.participants[1].role.as_str(), "member");
+    assert_eq!(dto.participants[1].status.as_str(), "pending");
+    assert_eq!(dto.participants[1].leaf_count, 0);
+    let provenance = dto.participants[1]
+        .invitation_provenance
+        .as_ref()
+        .expect("pending participant carries immutable invitation provenance");
+    assert_eq!(
+        provenance.invitation_transition_id.as_str(),
+        C1_2_TRANSITION_ID_1
+    );
+    assert_eq!(provenance.invited_by_did.as_str(), C1_2_DID_A);
+    assert_eq!(provenance.invited_by_device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(dto.participants[0].leaf_count, 1);
+    assert_eq!(dto.snapshot_seq, 5);
+    assert!(dto.extra_data.is_none());
+
+    let zero_leaf = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![],
+        c1_2_metadata_snapshot(),
+        vec![
+            CheckedParticipantView::new(C1_2_DID_A, "admin", "active", 0, None)
+                .expect("active zero-leaf participant is checked"),
+        ],
+        0,
+    )
+    .expect("zero-leaf checked state source");
+    let dto = conversation_state_view(&zero_leaf).expect("zero-leaf state projects");
+    assert!(
+        dto.leaves.is_empty(),
+        "no leaf is invented for a zero-leaf state"
+    );
+    assert_eq!(dto.participants.len(), 1);
+    assert_eq!(dto.participants[0].leaf_count, 0);
+    assert_eq!(dto.snapshot_seq, 0);
+    assert!(dto.extra_data.is_none());
+}
+
+#[test]
+fn c1_2_removal_tombstone_projects_and_state_view_refuses() {
+    let source = ConversationProjectionSource::removal(
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        C1_2_TRANSITION_ID_1,
+        C1_2_REMOVED_AT,
+        7,
+    )
+    .expect("removal checked source");
+    let item = conversation_inventory_item(&source).expect("removal arm projects a tombstone");
+    let chat_dto::ConversationInventoryItem::ConversationRemovalTombstone(tombstone) = &item else {
+        panic!("the removal arm materializes exactly the removal tombstone");
+    };
+    assert_eq!(tombstone.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+    assert_eq!(tombstone.user_did.as_str(), C1_2_DID_A);
+    assert_eq!(tombstone.device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(
+        tombstone.membership_interval_id.as_str(),
+        C1_2_TRANSITION_ID_1
+    );
+    assert_eq!(tombstone.removed_at.as_str(), C1_2_REMOVED_AT);
+    assert_eq!(tombstone.terminal_seq, 7);
+    assert!(tombstone.extra_data.is_none());
+    let error = conversation_state_view(&source)
+        .expect_err("a removed interval has no historical conversationState projection");
+    assert_eq!(
+        error.kind(),
+        ProjectionErrorKind::NoConversationStateProjection,
+        "the removal arm yields AccessOutsideMembershipInterval-shaped tombstone semantics only"
+    );
+}
+
+#[test]
+fn c1_2_post_reset_removal_tombstone_has_no_historical_state_projection() {
+    let reset_activation_id = C1_2_TRANSITION_ID_2;
+    let source = ConversationProjectionSource::removal(
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        reset_activation_id,
+        C1_2_REMOVED_AT,
+        4,
+    )
+    .expect("post-reset removal checked source");
+    let item =
+        conversation_inventory_item(&source).expect("post-reset removal projects a tombstone");
+    let chat_dto::ConversationInventoryItem::ConversationRemovalTombstone(tombstone) = &item else {
+        panic!("the post-reset removal arm materializes exactly the removal tombstone");
+    };
+    assert_eq!(
+        tombstone.membership_interval_id.as_str(),
+        reset_activation_id,
+        "the interval is opened by the exact reset activation transition"
+    );
+    assert_eq!(tombstone.terminal_seq, 4);
+    assert_eq!(tombstone.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+    assert_eq!(tombstone.user_did.as_str(), C1_2_DID_A);
+    assert_eq!(tombstone.device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(tombstone.removed_at.as_str(), C1_2_REMOVED_AT);
+    assert!(tombstone.extra_data.is_none());
+    let error = conversation_state_view(&source)
+        .expect_err("a post-reset old exact device has no historical conversationState projection");
+    assert_eq!(
+        error.kind(),
+        ProjectionErrorKind::NoConversationStateProjection
+    );
+}
+
+#[test]
+fn c1_2_close_tombstone_projects_and_state_view_refuses() {
+    let source = ConversationProjectionSource::close(
+        C1_2_CLOSED_AT,
+        C1_2_DID_B,
+        C1_2_DEVICE_ID_B,
+        C1_2_CONVERSATION_ID,
+        "direct",
+        c1_2_coordinates(),
+        9,
+    )
+    .expect("close checked source");
+    let item = conversation_inventory_item(&source).expect("close arm projects a tombstone");
+    let chat_dto::ConversationInventoryItem::ConversationCloseTombstone(tombstone) = &item else {
+        panic!("the close arm materializes exactly the close tombstone");
+    };
+    assert_eq!(tombstone.closed_at.as_str(), C1_2_CLOSED_AT);
+    assert_eq!(tombstone.closed_by_did.as_str(), C1_2_DID_B);
+    assert_eq!(tombstone.closed_by_device_id.as_str(), C1_2_DEVICE_ID_B);
+    assert_eq!(tombstone.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+    assert_eq!(tombstone.conversation_kind.as_str(), "direct");
+    assert_eq!(
+        tombstone.retired.conversation_id.as_str(),
+        C1_2_CONVERSATION_ID
+    );
+    assert_eq!(tombstone.retired.generation, 0);
+    assert_eq!(tombstone.retired.state_version, 3);
+    assert_eq!(
+        tombstone.retired.group_id,
+        Bytes::from(c1_2_bytes_0_to_32())
+    );
+    assert_eq!(tombstone.retired.epoch, 1);
+    assert_eq!(
+        tombstone.retired.group_context_hash,
+        Bytes::from(c1_2_bytes_32_to_64())
+    );
+    assert_eq!(
+        tombstone.retired.confirmation_tag,
+        Bytes::from(c1_2_bytes_64_to_96())
+    );
+    assert_eq!(tombstone.retired.lifecycle.as_str(), "active");
+    assert_eq!(tombstone.terminal_seq, 9);
+    assert!(tombstone.extra_data.is_none());
+    let error = conversation_state_view(&source)
+        .expect_err("a closed conversation has no conversationState projection");
+    assert_eq!(
+        error.kind(),
+        ProjectionErrorKind::NoConversationStateProjection
+    );
+}
+
+#[test]
+fn c1_2_pending_welcome_projects_complete_dto() {
+    let source = c1_2_welcome_source("pending");
+    let dto = welcome_view(&source).expect("pending Welcome projects");
+    assert_eq!(dto.welcome_id.as_str(), C1_2_WELCOME_ID);
+    assert_eq!(dto.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+    assert_eq!(dto.transition_seq, 2);
+    assert_eq!(
+        dto.coordinates.conversation_id.as_str(),
+        C1_2_CONVERSATION_ID
+    );
+    assert_eq!(dto.coordinates.generation, 0);
+    assert_eq!(dto.coordinates.state_version, 3);
+    assert_eq!(dto.coordinates.group_id, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(dto.coordinates.epoch, 1);
+    assert_eq!(
+        dto.coordinates.group_context_hash,
+        Bytes::from(c1_2_bytes_32_to_64())
+    );
+    assert_eq!(
+        dto.coordinates.confirmation_tag,
+        Bytes::from(c1_2_bytes_64_to_96())
+    );
+    assert_eq!(dto.coordinates.lifecycle.as_str(), "active");
+    assert_eq!(dto.status.as_str(), "pending");
+    assert_eq!(dto.opaque_welcome, Bytes::from(c1_2_welcome_bytes()));
+    assert_eq!(dto.sha256, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(dto.recipient_did.as_str(), C1_2_DID_A);
+    assert_eq!(dto.recipient_device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(
+        dto.provenance.recovery_request_id.as_str(),
+        C1_2_RECOVERY_REQUEST_ID
+    );
+    assert_eq!(
+        dto.provenance.key_package_ref,
+        Bytes::from(c1_2_bytes_64_to_96())
+    );
+    assert_eq!(dto.expires_at.as_str(), C1_2_EXPIRES_AT);
+    assert!(dto.extra_data.is_none());
+}
+
+#[test]
+fn c1_2_every_retained_leaf_recovery_status_projects_complete_view() {
+    for view_status in ["open", "fulfilled", "cancelled", "expired", "superseded"] {
+        let source = c1_2_leaf_recovery_source(view_status);
+        let dto = leaf_recovery_view(&source)
+            .unwrap_or_else(|error| panic!("{view_status} leaf recovery projects: {error}"));
+        assert_eq!(dto.status.as_str(), view_status);
+        assert_eq!(
+            dto.reservation.status.as_str(),
+            c1_2_reservation_status_for(view_status),
+            "the reservation status is consistent with the retained {view_status} status"
+        );
+        assert_eq!(dto.recovery_request_id.as_str(), C1_2_RECOVERY_REQUEST_ID);
+        assert_eq!(dto.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+        assert_eq!(dto.requester_did.as_str(), C1_2_DID_A);
+        assert_eq!(dto.requester_device_id.as_str(), C1_2_DEVICE_ID_A);
+        assert_eq!(dto.recovery_kind.as_str(), "add");
+        assert_eq!(
+            dto.bound_coordinate.conversation_id.as_str(),
+            C1_2_CONVERSATION_ID
+        );
+        assert_eq!(dto.requested_at.as_str(), C1_2_REQUESTED_AT);
+        assert_eq!(dto.expires_at.as_str(), C1_2_EXPIRES_AT);
+        let reservation = &dto.reservation;
+        assert_eq!(
+            reservation.recovery_request_id.as_str(),
+            C1_2_RECOVERY_REQUEST_ID
+        );
+        assert_eq!(reservation.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+        assert_eq!(reservation.requester_did.as_str(), C1_2_DID_A);
+        assert_eq!(reservation.requester_device_id.as_str(), C1_2_DEVICE_ID_A);
+        assert_eq!(reservation.requester_key_id.as_str(), C1_2_KEY_ID);
+        assert_eq!(reservation.requester_auth_generation, 1);
+        assert_eq!(
+            reservation.key_package_ref,
+            Bytes::from(c1_2_bytes_64_to_96())
+        );
+        assert_eq!(reservation.cipher_suite.as_str(), C1_2_CIPHER_SUITE);
+        assert_eq!(reservation.purpose.as_str(), "leafRecovery");
+        assert_eq!(reservation.expires_at.as_str(), C1_2_EXPIRES_AT);
+        assert_eq!(
+            reservation.bound_coordinate.conversation_id.as_str(),
+            C1_2_CONVERSATION_ID
+        );
+        assert_eq!(reservation.key_package.framing.as_str(), "mlsMessage");
+        assert_eq!(reservation.key_package.content_type.as_str(), "keyPackage");
+        assert_eq!(
+            reservation.key_package.bytes,
+            Bytes::from(c1_2_bytes_0_to_32())
+        );
+        assert_eq!(
+            reservation.key_package.sha256,
+            Bytes::from(c1_2_bytes_32_to_64())
+        );
+        assert_eq!(
+            reservation.key_package.key_package_ref,
+            Bytes::from(c1_2_bytes_64_to_96())
+        );
+        assert!(reservation.extra_data.is_none());
+        assert!(dto.extra_data.is_none());
+    }
+}
+
+#[test]
+fn c1_2_all_recovery_work_variants_project_with_consistent_status() {
+    let pending = c1_2_work_source(RetainedRecoveryWorkTerminal::Pending);
+    let dto = recovery_work(&pending).expect("pending work projects");
+    let chat_dto::RecoveryWorkView::RecoveryWorkPendingView(pending_view) = &dto else {
+        panic!("pending terminal arm projects the pending view");
+    };
+    assert_eq!(pending_view.status.as_str(), "pending");
+    assert_eq!(pending_view.recovery_work_id.as_str(), C1_2_WELCOME_ID);
+    assert_eq!(pending_view.conversation_id.as_str(), C1_2_CONVERSATION_ID);
+    assert_eq!(pending_view.recipient_did.as_str(), C1_2_DID_A);
+    assert_eq!(pending_view.recipient_device_id.as_str(), C1_2_DEVICE_ID_A);
+    assert_eq!(pending_view.source_kind.as_str(), "welcomeExpired");
+    assert_eq!(pending_view.source_id.as_str(), C1_2_WELCOME_ID);
+    assert_eq!(
+        pending_view.source_coordinate.conversation_id.as_str(),
+        C1_2_CONVERSATION_ID
+    );
+    assert_eq!(pending_view.created_at.as_str(), C1_2_CREATED_AT);
+    assert!(pending_view.extra_data.is_none());
+
+    let completed = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
+        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
+        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+    });
+    let dto = recovery_work(&completed).expect("completed work projects");
+    let chat_dto::RecoveryWorkView::RecoveryWorkCompletedByTransitionView(completed_view) = &dto
+    else {
+        panic!("completed terminal arm projects the completed view");
+    };
+    assert_eq!(completed_view.status.as_str(), "completed");
+    assert_eq!(
+        completed_view.terminal_transition_id.as_str(),
+        C1_2_TRANSITION_ID_1
+    );
+    assert_eq!(completed_view.terminal_at.as_str(), C1_2_TERMINAL_AT_1);
+    assert!(completed_view.extra_data.is_none());
+
+    let superseded_by_transition =
+        c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByTransition {
+            terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_2),
+            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_2),
+        });
+    let dto = recovery_work(&superseded_by_transition).expect("superseded-by-transition projects");
+    let chat_dto::RecoveryWorkView::RecoveryWorkSupersededByTransitionView(superseded_view) = &dto
+    else {
+        panic!("superseded-by-transition arm projects its own view");
+    };
+    assert_eq!(superseded_view.status.as_str(), "superseded");
+    assert_eq!(
+        superseded_view.terminal_transition_id.as_str(),
+        C1_2_TRANSITION_ID_2
+    );
+    assert_eq!(superseded_view.terminal_at.as_str(), C1_2_TERMINAL_AT_2);
+    assert!(superseded_view.extra_data.is_none());
+
+    let superseded_by_revocation =
+        c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByRevocation {
+            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
+            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+        });
+    let dto = recovery_work(&superseded_by_revocation).expect("superseded-by-revocation projects");
+    let chat_dto::RecoveryWorkView::RecoveryWorkSupersededByRevocationView(superseded_view) = &dto
+    else {
+        panic!("superseded-by-revocation arm projects its own view");
+    };
+    assert_eq!(superseded_view.status.as_str(), "superseded");
+    assert_eq!(
+        superseded_view.terminal_revocation_id.as_str(),
+        C1_2_REVOCATION_ID
+    );
+    assert_eq!(superseded_view.terminal_at.as_str(), C1_2_TERMINAL_AT_3);
+    assert!(superseded_view.extra_data.is_none());
+}
+
+#[test]
+fn c1_2_leaf_recovery_inbox_input_covers_exactly_five_variants() {
+    let inputs = [
+        LeafRecoveryInboxInput::leaf_recovery(c1_2_leaf_recovery_source("open")),
+        LeafRecoveryInboxInput::recovery_work_pending(c1_2_work_source(
+            RetainedRecoveryWorkTerminal::Pending,
+        ))
+        .expect("pending work inbox input"),
+        LeafRecoveryInboxInput::recovery_work_completed_by_transition(c1_2_work_source(
+            RetainedRecoveryWorkTerminal::CompletedByTransition {
+                terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
+                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+            },
+        ))
+        .expect("completed work inbox input"),
+        LeafRecoveryInboxInput::recovery_work_superseded_by_transition(c1_2_work_source(
+            RetainedRecoveryWorkTerminal::SupersededByTransition {
+                terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_2),
+                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_2),
+            },
+        ))
+        .expect("superseded-by-transition work inbox input"),
+        LeafRecoveryInboxInput::recovery_work_superseded_by_revocation(c1_2_work_source(
+            RetainedRecoveryWorkTerminal::SupersededByRevocation {
+                terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
+                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+            },
+        ))
+        .expect("superseded-by-revocation work inbox input"),
+    ];
+    let expected_tags = [
+        "leafRecoveryView",
+        "recoveryWorkPendingView",
+        "recoveryWorkCompletedByTransitionView",
+        "recoveryWorkSupersededByTransitionView",
+        "recoveryWorkSupersededByRevocationView",
+    ];
+    for (input, expected_tag) in inputs.into_iter().zip(expected_tags) {
+        // Exhaustive closure proof over the input union: a sixth variant
+        // would fail this match at compile time.
+        let input_tag = match &input {
+            LeafRecoveryInboxInput::LeafRecoveryView(_) => "leafRecoveryView",
+            LeafRecoveryInboxInput::RecoveryWorkPendingView(_) => "recoveryWorkPendingView",
+            LeafRecoveryInboxInput::RecoveryWorkCompletedByTransitionView(_) => {
+                "recoveryWorkCompletedByTransitionView"
+            }
+            LeafRecoveryInboxInput::RecoveryWorkSupersededByTransitionView(_) => {
+                "recoveryWorkSupersededByTransitionView"
+            }
+            LeafRecoveryInboxInput::RecoveryWorkSupersededByRevocationView(_) => {
+                "recoveryWorkSupersededByRevocationView"
+            }
+        };
+        assert_eq!(input_tag, expected_tag);
+        let item = leaf_recovery_inbox_item(input).expect("the closed inbox input projects");
+        let item_tag = match &item {
+            chat_dto::LeafRecoveryInboxItem::LeafRecoveryView(_) => "leafRecoveryView",
+            chat_dto::LeafRecoveryInboxItem::RecoveryWorkPendingView(_) => {
+                "recoveryWorkPendingView"
+            }
+            chat_dto::LeafRecoveryInboxItem::RecoveryWorkCompletedByTransitionView(_) => {
+                "recoveryWorkCompletedByTransitionView"
+            }
+            chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByTransitionView(_) => {
+                "recoveryWorkSupersededByTransitionView"
+            }
+            chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByRevocationView(_) => {
+                "recoveryWorkSupersededByRevocationView"
+            }
+        };
+        assert_eq!(item_tag, expected_tag);
+        assert!(
+            item_has_no_extra_data(&item),
+            "{expected_tag} must materialize with no extra_data"
+        );
+    }
+}
+
+fn item_has_no_extra_data(item: &chat_dto::LeafRecoveryInboxItem<DefaultStr>) -> bool {
+    match item {
+        chat_dto::LeafRecoveryInboxItem::LeafRecoveryView(view) => view.extra_data.is_none(),
+        chat_dto::LeafRecoveryInboxItem::RecoveryWorkPendingView(view) => view.extra_data.is_none(),
+        chat_dto::LeafRecoveryInboxItem::RecoveryWorkCompletedByTransitionView(view) => {
+            view.extra_data.is_none()
+        }
+        chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByTransitionView(view) => {
+            view.extra_data.is_none()
+        }
+        chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByRevocationView(view) => {
+            view.extra_data.is_none()
+        }
+    }
+}
+
+#[test]
+fn c1_2_inbox_rejects_wrong_terminal_shape_before_materialization() {
+    let completed_source = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
+        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
+        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+    });
+    let error = LeafRecoveryInboxInput::recovery_work_pending(completed_source)
+        .err()
+        .expect("a pending inbox variant cannot carry a completed terminal");
+    assert_eq!(error.kind(), ProjectionErrorKind::WrongTerminalShape);
+
+    let pending_source = c1_2_work_source(RetainedRecoveryWorkTerminal::Pending);
+    let error = LeafRecoveryInboxInput::recovery_work_completed_by_transition(pending_source)
+        .err()
+        .expect("a completed inbox variant cannot carry a pending terminal");
+    assert_eq!(error.kind(), ProjectionErrorKind::WrongTerminalShape);
+
+    let revocation_source =
+        c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByRevocation {
+            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
+            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+        });
+    let error = LeafRecoveryInboxInput::recovery_work_superseded_by_transition(revocation_source)
+        .err()
+        .expect("a superseded-by-transition inbox variant cannot carry a revocation terminal");
+    assert_eq!(error.kind(), ProjectionErrorKind::WrongTerminalShape);
+
+    // Direct variant construction bypasses the checked constructor; the
+    // projection's own re-check still fails before materialization.
+    let completed_source = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
+        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
+        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+    });
+    let input = LeafRecoveryInboxInput::RecoveryWorkPendingView(completed_source);
+    let error = leaf_recovery_inbox_item(input)
+        .expect_err("the projection re-checks the variant/terminal pair");
+    assert_eq!(error.kind(), ProjectionErrorKind::WrongTerminalShape);
+}
+
+#[test]
+fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
+    // Closed enum vocabulary.
+    let error = ConversationProjectionSource::state(
+        "bogus-suite",
+        "group",
+        c1_2_coordinates(),
+        vec![],
+        c1_2_metadata_snapshot(),
+        vec![],
+        0,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::StringEnumViolation);
+    let error = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "bogus-kind",
+        c1_2_coordinates(),
+        vec![],
+        c1_2_metadata_snapshot(),
+        vec![],
+        0,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::StringEnumViolation);
+    let error =
+        CheckedConversationCoordinates::new(C1_2_CONVERSATION_ID, 0, 0, &[], 0, &[], &[], "bogus")
+            .err()
+            .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::StringEnumViolation);
+    let error = CheckedDeviceLeafView::new(
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "bogus",
+        C1_2_KEY_ID,
+        "active",
+        None,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::StringEnumViolation);
+    let error = CheckedParticipantView::new(C1_2_DID_A, "bogus", "active", 1, None)
+        .err()
+        .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::StringEnumViolation);
+
+    // Negative and zero-bound sequences.
+    let error = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![],
+        c1_2_metadata_snapshot(),
+        vec![],
+        -1,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::IntegerOutOfRange);
+    let error = ConversationProjectionSource::removal(
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        C1_2_TRANSITION_ID_1,
+        C1_2_REMOVED_AT,
+        0,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::IntegerOutOfRange);
+
+    // Noncanonical datetime.
+    let error = ConversationProjectionSource::removal(
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        C1_2_TRANSITION_ID_1,
+        "2026-07-30T12:00:00Z",
+        7,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InvalidDatetime);
+
+    // Invalid DID.
+    let error = CheckedDeviceLeafView::new(
+        "not-a-did",
+        C1_2_DEVICE_ID_A,
+        "genesis",
+        C1_2_KEY_ID,
+        "active",
+        None,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InvalidDid);
+
+    // Exact byte lengths.
+    let error = c1_2_welcome_source_sha256_short()
+        .err()
+        .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InvalidByteLength);
+    let error = CheckedMetadataCryptoContext::new(
+        &c1_2_bytes_0_to_15(),
+        0,
+        &c1_2_bytes_0_to_32(),
+        1,
+        &c1_2_bytes_32_to_64(),
+        &c1_2_bytes_64_to_96(),
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InvalidByteLength);
+
+    // Strict ordering is rejected rather than sorted.
+    let error = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![c1_2_leaf_a()],
+        c1_2_metadata_snapshot(),
+        vec![c1_2_participant_b_pending(), c1_2_participant_a()],
+        1,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![c1_2_leaf_a(), c1_2_leaf_a()],
+        c1_2_metadata_snapshot(),
+        vec![c1_2_participant_a()],
+        1,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = ConversationProjectionSource::state(
+        C1_2_CIPHER_SUITE,
+        "group",
+        c1_2_coordinates(),
+        vec![c1_2_leaf_b(), c1_2_leaf_a()],
+        c1_2_metadata_snapshot(),
+        vec![c1_2_participant_a()],
+        1,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+
+    // Cross-field consistency.
+    let error = CheckedDeviceLeafView::new(
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "genesis",
+        C1_2_KEY_ID,
+        "active",
+        Some(&c1_2_bytes_32_to_64()),
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = CheckedParticipantView::new(C1_2_DID_B, "member", "pending", 1, None)
+        .err()
+        .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = CheckedParticipantView::new(C1_2_DID_B, "member", "pending", 0, None)
+        .err()
+        .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = ConversationProjectionSource::close(
+        C1_2_CLOSED_AT,
+        C1_2_DID_B,
+        C1_2_DEVICE_ID_B,
+        C1_2_CONVERSATION_ID,
+        "direct",
+        CheckedConversationCoordinates::new(
+            C1_2_TRANSITION_ID_1,
+            0,
+            3,
+            &c1_2_bytes_0_to_32(),
+            1,
+            &c1_2_bytes_32_to_64(),
+            &c1_2_bytes_64_to_96(),
+            "active",
+        )
+        .expect("retired coordinates for the negative close case"),
+        9,
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = RetainedLeafRecoveryProjectionSource::new(
+        C1_2_RECOVERY_REQUEST_ID,
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "add",
+        c1_2_coordinates(),
+        "open",
+        C1_2_REQUESTED_AT,
+        C1_2_EXPIRES_AT,
+        c1_2_reservation("consumed"),
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InconsistentSourceFields);
+    let error = RetainedRecoveryWorkProjectionSource::new(
+        C1_2_WELCOME_ID,
+        C1_2_CONVERSATION_ID,
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        "welcomeExpired",
+        C1_2_WELCOME_ID,
+        c1_2_coordinates(),
+        C1_2_CREATED_AT,
+        RetainedRecoveryWorkTerminal::SupersededByRevocation {
+            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
+            terminal_at: SmolStr::from("2026-08-04T13:00:00Z"),
+        },
+    )
+    .err()
+    .expect("checked-source failure");
+    assert_eq!(error.kind(), ProjectionErrorKind::InvalidDatetime);
+}
+
+fn c1_2_welcome_source_sha256_short(
+) -> Result<RetainedWelcomeProjectionSource, chat_protocol::read_projection::ProjectionError> {
+    let provenance =
+        CheckedWelcomeProvenance::new(C1_2_RECOVERY_REQUEST_ID, &c1_2_bytes_64_to_96())
+            .expect("fixture welcome provenance is checked");
+    RetainedWelcomeProjectionSource::new(
+        C1_2_WELCOME_ID,
+        C1_2_CONVERSATION_ID,
+        2,
+        c1_2_coordinates(),
+        "pending",
+        &c1_2_welcome_bytes(),
+        &c1_2_bytes_0_to_16(),
+        C1_2_DID_A,
+        C1_2_DEVICE_ID_A,
+        provenance,
+        C1_2_EXPIRES_AT,
+    )
+}
+
+fn c1_2_bytes_0_to_15() -> Vec<u8> {
+    (0..15).collect()
+}
+
+/// Concrete, dyn-compatible canonical-encode probe (generated `Serialize`
+/// is generic, so a bare `&dyn serde::Serialize` cannot exist).
+trait C1_2CanonicalProbe {
+    fn c1_2_encode(
+        &self,
+    ) -> Result<
+        chat_protocol::read_projection::CanonicalChatJsonV1,
+        chat_protocol::read_projection::ProjectionError,
+    >;
+}
+
+macro_rules! impl_c1_2_canonical_probe {
+    ($($ty:ty => $def:expr),+ $(,)?) => {
+        $(
+            impl C1_2CanonicalProbe for $ty {
+                fn c1_2_encode(
+                    &self,
+                ) -> Result<
+                    chat_protocol::read_projection::CanonicalChatJsonV1,
+                    chat_protocol::read_projection::ProjectionError,
+                > {
+                    chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                        self, $def,
+                    )
+                }
+            }
+        )+
+    };
+}
+
+impl_c1_2_canonical_probe!(
+    chat_dto::ConversationState<DefaultStr> => "blue.catbird.chat.defs#conversationState",
+    chat_dto::ConversationInventoryItem<DefaultStr> => "blue.catbird.chat.defs#conversationInventoryItem",
+    chat_dto::WelcomeView<DefaultStr> => "blue.catbird.chat.defs#welcomeView",
+    chat_dto::LeafRecoveryView<DefaultStr> => "blue.catbird.chat.defs#leafRecoveryView",
+    chat_dto::RecoveryWorkView<DefaultStr> => "blue.catbird.chat.defs#recoveryWorkView",
+    chat_dto::LeafRecoveryInboxItem<DefaultStr> => "blue.catbird.chat.defs#leafRecoveryInboxItem",
+);
+
+#[test]
+fn c1_2_projected_dtos_encode_canonically_without_extra_data() {
+    let state = conversation_state_view(
+        &ConversationProjectionSource::state(
+            C1_2_CIPHER_SUITE,
+            "group",
+            c1_2_coordinates(),
+            vec![c1_2_leaf_a()],
+            c1_2_metadata_snapshot(),
+            vec![c1_2_participant_a()],
+            42,
+        )
+        .expect("active checked state source"),
+    )
+    .expect("active state projects");
+    let removal = conversation_inventory_item(
+        &ConversationProjectionSource::removal(
+            C1_2_CONVERSATION_ID,
+            C1_2_DID_A,
+            C1_2_DEVICE_ID_A,
+            C1_2_TRANSITION_ID_1,
+            C1_2_REMOVED_AT,
+            7,
+        )
+        .expect("removal checked source"),
+    )
+    .expect("removal tombstone projects");
+    let close = conversation_inventory_item(
+        &ConversationProjectionSource::close(
+            C1_2_CLOSED_AT,
+            C1_2_DID_B,
+            C1_2_DEVICE_ID_B,
+            C1_2_CONVERSATION_ID,
+            "direct",
+            c1_2_coordinates(),
+            9,
+        )
+        .expect("close checked source"),
+    )
+    .expect("close tombstone projects");
+    let welcome = welcome_view(&c1_2_welcome_source("pending")).expect("welcome projects");
+    let leaf_recovery =
+        leaf_recovery_view(&c1_2_leaf_recovery_source("open")).expect("leaf recovery projects");
+    let work = recovery_work(&c1_2_work_source(RetainedRecoveryWorkTerminal::Pending))
+        .expect("recovery work projects");
+    let inbox = leaf_recovery_inbox_item(LeafRecoveryInboxInput::leaf_recovery(
+        c1_2_leaf_recovery_source("open"),
+    ))
+    .expect("inbox item projects");
+    let cases: Vec<(&dyn C1_2CanonicalProbe, &'static str)> = vec![
+        (&state, "conversationState"),
+        (&removal, "conversationInventoryItem (removal)"),
+        (&close, "conversationInventoryItem (close)"),
+        (&welcome, "welcomeView"),
+        (&leaf_recovery, "leafRecoveryView"),
+        (&work, "recoveryWorkView"),
+        (&inbox, "leafRecoveryInboxItem"),
+    ];
+    for (dto, label) in cases {
+        let encoded = dto
+            .c1_2_encode()
+            .unwrap_or_else(|error| panic!("{label} encodes canonically: {error}"));
+        assert!(
+            !c1_2_contains_bytes(encoded.bytes(), b"extraData"),
+            "{label} canonical bytes never contain a non-empty extraData member"
+        );
+        assert_eq!(
+            encoded.sha256(),
+            <[u8; 32]>::from(sha2::Sha256::digest(encoded.bytes())),
+            "{label} SHA-256 is the digest of the returned canonical bytes"
+        );
+        let re_encoded = dto
+            .c1_2_encode()
+            .expect("{label} encodes deterministically");
+        assert_eq!(
+            re_encoded.bytes(),
+            encoded.bytes(),
+            "{label} canonical bytes are deterministic"
+        );
+    }
+}
+// ----------------------------------------------------------------------------
+// C1-2 source guards (brief Step 5, corrected text).
+// ----------------------------------------------------------------------------
+
+const C1_2_READ_PROJECTION_SOURCE: &str = include_str!("../src/chat_protocol/read_projection.rs");
+const C1_2_ENTITLEMENT_SOURCE: &str = include_str!("chat_protocol_g7_entitlement.rs");
+
+fn c1_2_assert_no_forbidden_derive(source: &str, declaration: &str) {
+    let start = source
+        .find(declaration)
+        .unwrap_or_else(|| panic!("{declaration} must exist in read_projection.rs"));
+    let preceding = &source[..start];
+    let Some(derive_start) = preceding.rfind("#[derive(") else {
+        return;
+    };
+    let attribute = &preceding[derive_start..start];
+    for token in ["Clone", "Debug", "Serialize", "Deserialize"] {
+        assert!(
+            !attribute.contains(token),
+            "{declaration} must not derive {token}"
+        );
+    }
+}
+
+#[test]
+fn c1_2_source_guards_pin_checked_surface_and_encoder_byte_flow() {
+    let source = C1_2_READ_PROJECTION_SOURCE;
+    // The corrected Step-5 text: canonical bytes come ONLY from the local
+    // canonical writer; the single `serde_json::to_vec` serialize-once step
+    // at read_projection.rs:982 is allowed and present. No path returns or
+    // stores serde's output as canonical bytes.
+    assert_eq!(
+        count_occurrences(source, "serde_json::to_vec("),
+        1,
+        "the encoder serializes the generated DTO exactly once"
+    );
+    assert_eq!(
+        count_occurrences(source, "Ok(CanonicalChatJsonV1 {"),
+        1,
+        "exactly one canonical-result construction exists"
+    );
+    assert!(source.contains("let mut canonical = Vec::with_capacity"));
+    assert!(source.contains("bytes: canonical,"));
+    // No test-only constructor: the file's only `#[cfg(test)]` region is the
+    // encoder's unit-test module, and it never names the checked sources.
+    assert_eq!(
+        count_occurrences(source, "#[cfg(test)]"),
+        1,
+        "no checked-source constructor is test-only"
+    );
+    let test_region = source
+        .split("#[cfg(test)]")
+        .nth(1)
+        .expect("the single test region");
+    for type_name in [
+        "ConversationProjectionSource",
+        "RetainedWelcomeProjectionSource",
+        "RetainedLeafRecoveryProjectionSource",
+        "RetainedRecoveryWorkProjectionSource",
+        "RetainedRecoveryWorkTerminal",
+        "LeafRecoveryInboxInput",
+        "CheckedConversationCoordinates",
+    ] {
+        assert!(
+            !test_region.contains(type_name),
+            "the checked source {type_name} must not be constructed in a test-only region"
+        );
+    }
+    // The six frozen projection signatures exist verbatim.
+    for signature in [
+        "pub(crate) fn conversation_state_view(",
+        "pub(crate) fn conversation_inventory_item(",
+        "pub(crate) fn welcome_view(",
+        "pub(crate) fn leaf_recovery_view(",
+        "pub(crate) fn recovery_work(",
+        "pub(crate) fn leaf_recovery_inbox_item(",
+    ] {
+        assert!(source.contains(signature), "{signature} must be pinned");
+    }
+    // No Clone/Debug/serde derives on the checked source types.
+    for declaration in [
+        "pub(crate) enum ConversationProjectionSource {",
+        "pub(crate) struct RetainedWelcomeProjectionSource {",
+        "pub(crate) struct RetainedLeafRecoveryProjectionSource {",
+        "pub(crate) struct RetainedRecoveryWorkProjectionSource {",
+        "pub(crate) enum RetainedRecoveryWorkTerminal {",
+        "pub(crate) enum LeafRecoveryInboxInput {",
+        "pub(crate) struct CheckedConversationCoordinates {",
+    ] {
+        c1_2_assert_no_forbidden_derive(source, declaration);
+    }
+    // `extra_data` can never be non-empty in produced canonical bytes: the
+    // encoder's unknown-field branch rejects any non-empty `extra_data`
+    // map, and the C1-2 section never sets a non-None `extra_data`.
+    assert!(source.contains("a non-empty extra_data map can never smuggle one"));
+    let c1_2_section = source
+        .split("// C1-2: checked projection source types and the six projection functions.")
+        .nth(1)
+        .expect("the C1-2 section banner");
+    assert_eq!(
+        count_occurrences(c1_2_section, "extra_data: Some("),
+        0,
+        "the projections never populate extra_data"
+    );
+    // Every projection function is pure-test-covered in this file.
+    for function in [
+        "conversation_state_view",
+        "conversation_inventory_item",
+        "welcome_view",
+        "leaf_recovery_view",
+        "recovery_work",
+        "leaf_recovery_inbox_item",
+    ] {
+        assert!(
+            count_occurrences(C1_2_ENTITLEMENT_SOURCE, function) >= 3,
+            "{function} must be pure-test-covered in the entitlement suite"
+        );
+    }
+    // The guarded fixtures' byte helpers are all exercised by the tests.
+    assert!(C1_2_ENTITLEMENT_SOURCE.contains("c1_2_contains_bytes"));
 }
