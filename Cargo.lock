@@ -1007,6 +1007,7 @@ name = "catbird-server"
 version = "0.1.0"
 dependencies = [
  "a2",
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "aws-config",

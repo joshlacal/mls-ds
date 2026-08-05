@@ -43,6 +43,7 @@ libcrux-kem = "=0.0.7"
 x25519-dalek = "=2.0.1"
 
 # Crypto
+aes-gcm = "0.10"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 rand = "0.8"

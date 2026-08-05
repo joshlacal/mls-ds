@@ -2,8 +2,12 @@
 
 use std::{error::Error, fmt};
 
+use aes_gcm::aead::{Aead, Nonce, Payload};
+use aes_gcm::{Aes256Gcm, Key};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac as _};
+use rand::rngs::OsRng;
+use rand::RngCore as _;
 use sha2::{Digest as _, Sha256};
 use uuid::{Uuid, Variant, Version};
 use zeroize::Zeroizing;
@@ -28,7 +32,7 @@ const HEADER_BYTES: usize = MAGIC.len() + 1 + 1 + 16 + 32 + 8 + 8;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum CursorCodecError {
+pub(crate) enum CursorCodecError {
     InvalidConfiguration,
     InvalidEncoding,
     InvalidField,
@@ -1499,4 +1503,646 @@ fn parse_uuid_v4(bytes: [u8; 16]) -> Result<Uuid, CursorCodecError> {
     let value = Uuid::from_bytes(bytes);
     require_uuid_v4(value)?;
     Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// Opaque capability core (Checkpoint D / lane D-1). AES-256-GCM successor
+// sealing, domain-separated receipt bindings, and SHA-256-only capability
+// lookup. `OsSecureRandom` is the only production source of capability bytes;
+// no plaintext capability ever reaches a log, error, panic, `Debug` path, or
+// database column.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub(crate) const MAX_SEALED_CIPHERTEXT_BYTES: usize = 512;
+#[allow(dead_code)]
+const MAX_SEALED_PLAINTEXT_BYTES: usize = MAX_SEALED_CIPHERTEXT_BYTES - 16;
+#[allow(dead_code)]
+const CAPABILITY_NONCE_BYTES: usize = 12;
+#[allow(dead_code)]
+const MAX_PAGE_LIMIT: u16 = 100;
+#[allow(dead_code)]
+const PAGE_RECEIPT_AAD_LABEL: &[u8] = b"CBCC-SEALER-PAGE-RECEIPT\0";
+#[allow(dead_code)]
+const EVENT_CURSOR_RECEIPT_AAD_LABEL: &[u8] = b"CBCC-SEALER-EVENT-CURSOR\0";
+
+/// Source of capability and sealing randomness.
+///
+/// The production implementation is `OsSecureRandom`. Capability bytes exist
+/// only in the request/response stack frame; they are never persisted,
+/// logged, or formatted.
+#[allow(dead_code)]
+pub(crate) trait SecureRandom {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), SecureRandomError>;
+}
+
+/// Opaque randomness-source failure. Deliberately carries no information
+/// about the source or the amount requested.
+#[allow(dead_code)]
+pub(crate) struct SecureRandomError;
+
+impl fmt::Debug for SecureRandomError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecureRandomError")
+    }
+}
+
+impl fmt::Display for SecureRandomError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("clean-chat capability randomness source failed")
+    }
+}
+
+impl Error for SecureRandomError {}
+
+/// Production `SecureRandom` over the operating-system entropy source.
+#[allow(dead_code)]
+pub(crate) struct OsSecureRandom(OsRng);
+
+#[allow(dead_code)]
+impl OsSecureRandom {
+    pub(crate) fn new() -> Self {
+        Self(OsRng)
+    }
+}
+
+impl Default for OsSecureRandom {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for OsSecureRandom {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OsSecureRandom")
+    }
+}
+
+impl SecureRandom for OsSecureRandom {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), SecureRandomError> {
+        self.0.try_fill_bytes(out).map_err(|_| SecureRandomError)
+    }
+}
+
+/// A random capability plaintext.
+///
+/// The bytes are zeroized on drop and never formatted. The public
+/// presentation is the 43-character base64url encoding without padding and
+/// the durable lookup key is the SHA-256 of the raw bytes.
+#[allow(dead_code)]
+pub(crate) struct CapabilityToken {
+    bytes: Zeroizing<[u8; 32]>,
+}
+
+#[allow(dead_code)]
+impl CapabilityToken {
+    /// Raw capability bytes for in-stack use (sealing, encoding, hashing).
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
+    }
+
+    /// 43-character base64url without padding.
+    pub(crate) fn encode(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.bytes.as_slice())
+    }
+
+    /// SHA-256 lookup hash of the raw capability bytes. This is the only
+    /// form persisted for a presented session/page/event capability.
+    pub(crate) fn lookup_hash(&self) -> [u8; 32] {
+        Sha256::digest(self.bytes.as_slice()).into()
+    }
+}
+
+impl fmt::Debug for CapabilityToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilityToken(REDACTED)")
+    }
+}
+
+/// Mints exactly 32 random capability bytes. This is the only capability
+/// minting entry point; production callers must pass `OsSecureRandom`.
+#[allow(dead_code)]
+pub(crate) fn mint_capability_token(
+    random: &mut dyn SecureRandom,
+) -> Result<CapabilityToken, SecureRandomError> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    random.fill(bytes.as_mut_slice())?;
+    Ok(CapabilityToken { bytes })
+}
+
+/// Decodes a presented capability token, requiring canonical base64url and an
+/// exact 32-byte plaintext. The decoded plaintext exists only in the returned
+/// value; lookup must use `CapabilityToken::lookup_hash`.
+#[allow(dead_code)]
+pub(crate) fn decode_capability_token(encoded: &str) -> Result<CapabilityToken, CursorCodecError> {
+    if encoded.len() > MAX_OPAQUE_CURSOR_ASCII_BYTES {
+        return Err(CursorCodecError::TooLong);
+    }
+    let decoded = decode_canonical_base64url(encoded)?;
+    let bytes: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| CursorCodecError::InvalidEncoding)?;
+    Ok(CapabilityToken {
+        bytes: Zeroizing::new(bytes),
+    })
+}
+
+/// Fail-closed errors for the capability sealer.
+///
+/// Every variant formats to a redacted, static message; no plaintext, key,
+/// nonce, or ciphertext material is ever included.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum SealerError {
+    InvalidBinding,
+    InvalidField,
+    TooLong,
+    RandomnessFailure,
+    WrongKey,
+    AuthenticationFailed,
+    SuccessorHashMismatch,
+}
+
+impl fmt::Display for SealerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidBinding => "invalid clean-chat capability binding",
+            Self::InvalidField => "invalid clean-chat capability field",
+            Self::TooLong => "clean-chat capability exceeds its size limit",
+            Self::RandomnessFailure => "clean-chat capability randomness source failed",
+            Self::WrongKey => "clean-chat capability was sealed under a different key",
+            Self::AuthenticationFailed => "clean-chat capability authentication failed",
+            Self::SuccessorHashMismatch => "clean-chat capability successor hash mismatch",
+        })
+    }
+}
+
+impl Error for SealerError {}
+
+/// Domain-separated, canonical AEAD additional data for the capability
+/// sealer.
+///
+/// Every field derives from a receipt row's own columns so the binding is
+/// verifiable without inference. The canonical encoding is length-prefixed
+/// for variable-length fields and fixed-width for fixed-size fields,
+/// following the `bounded_domain_hash`/`bounded_hash` precedent, and carries
+/// a shape-specific label for domain separation.
+#[allow(dead_code)]
+pub(crate) struct SealerBinding {
+    shape: SealerBindingShape,
+}
+
+#[allow(dead_code)]
+enum SealerBindingShape {
+    PageReceipt(PageReceiptBinding),
+    EventCursor(EventCursorBinding),
+}
+
+/// AAD fields for an `inventory_page_receipts` row: the amendment's exact
+/// field list (domain, endpoint NSID, format version, session, device,
+/// JKT/generation, protocol/key, snapshot/floor, filter/limit, ordinal,
+/// successor hash, issue/expiry).
+#[allow(dead_code)]
+struct PageReceiptBinding {
+    domain: Vec<u8>,
+    endpoint_nsid: Vec<u8>,
+    cursor_format_version: u16,
+    inventory_session_id: Uuid,
+    user_did: Vec<u8>,
+    device_id: Uuid,
+    jkt: Vec<u8>,
+    auth_generation: u64,
+    protocol_instance_id: Uuid,
+    cursor_key_id: Vec<u8>,
+    snapshot_event_position: u64,
+    snapshot_event_cursor_sha256: [u8; 32],
+    snapshot_retained_floor: u64,
+    canonical_filter_sha256: [u8; 32],
+    page_limit: u16,
+    after_ordinal: Option<u64>,
+    successor_cursor_hash: Option<[u8; 32]>,
+    created_at: u64,
+    expires_at: u64,
+}
+
+/// AAD fields for an `event_cursor_receipts` row.
+#[allow(dead_code)]
+struct EventCursorBinding {
+    inventory_session_id: Uuid,
+    user_did: Vec<u8>,
+    device_id: Uuid,
+    jkt: Vec<u8>,
+    auth_generation: u64,
+    protocol_instance_id: Uuid,
+    cursor_key_id: Vec<u8>,
+    event_position: u64,
+    predecessor_cursor_hash: Option<[u8; 32]>,
+    retained_floor_at_issue: u64,
+    created_at: u64,
+    expires_at: u64,
+}
+
+#[allow(dead_code)]
+impl SealerBinding {
+    /// Binding for an `inventory_page_receipts` row. Every argument is a
+    /// column of that row; validation is fail-closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_page_receipt(
+        domain: &[u8],
+        endpoint_nsid: &[u8],
+        cursor_format_version: u16,
+        inventory_session_id: Uuid,
+        user_did: &[u8],
+        device_id: Uuid,
+        jkt: &[u8],
+        auth_generation: u64,
+        protocol_instance_id: Uuid,
+        cursor_key_id: &[u8],
+        snapshot_event_position: u64,
+        snapshot_event_cursor_sha256: [u8; 32],
+        snapshot_retained_floor: u64,
+        canonical_filter_sha256: [u8; 32],
+        page_limit: u16,
+        after_ordinal: Option<u64>,
+        successor_cursor_hash: Option<[u8; 32]>,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<Self, SealerError> {
+        validate_binding_bytes(domain, 1, 64)?;
+        validate_binding_bytes(endpoint_nsid, 1, 256)?;
+        validate_binding_bytes(user_did, 1, 512)?;
+        validate_binding_bytes(jkt, 1, 256)?;
+        validate_binding_bytes(cursor_key_id, 1, 256)?;
+        if cursor_format_version == 0 {
+            return Err(SealerError::InvalidBinding);
+        }
+        require_binding_uuid_v4(inventory_session_id)?;
+        require_binding_uuid_v4(device_id)?;
+        require_binding_uuid_v4(protocol_instance_id)?;
+        require_binding_safe_integer(auth_generation)?;
+        if auth_generation == 0 {
+            return Err(SealerError::InvalidBinding);
+        }
+        require_binding_safe_integer(snapshot_event_position)?;
+        require_binding_safe_integer(snapshot_retained_floor)?;
+        if snapshot_event_position < snapshot_retained_floor {
+            return Err(SealerError::InvalidBinding);
+        }
+        if !(1..=MAX_PAGE_LIMIT).contains(&page_limit) {
+            return Err(SealerError::InvalidBinding);
+        }
+        if let Some(ordinal) = after_ordinal {
+            require_binding_safe_integer(ordinal)?;
+        }
+        require_binding_lifetime(created_at, expires_at)?;
+        Ok(Self {
+            shape: SealerBindingShape::PageReceipt(PageReceiptBinding {
+                domain: domain.to_vec(),
+                endpoint_nsid: endpoint_nsid.to_vec(),
+                cursor_format_version,
+                inventory_session_id,
+                user_did: user_did.to_vec(),
+                device_id,
+                jkt: jkt.to_vec(),
+                auth_generation,
+                protocol_instance_id,
+                cursor_key_id: cursor_key_id.to_vec(),
+                snapshot_event_position,
+                snapshot_event_cursor_sha256,
+                snapshot_retained_floor,
+                canonical_filter_sha256,
+                page_limit,
+                after_ordinal,
+                successor_cursor_hash,
+                created_at,
+                expires_at,
+            }),
+        })
+    }
+
+    /// Binding for an `event_cursor_receipts` row. Every argument is a
+    /// column of that row; validation is fail-closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_event_cursor_receipt(
+        inventory_session_id: Uuid,
+        user_did: &[u8],
+        device_id: Uuid,
+        jkt: &[u8],
+        auth_generation: u64,
+        protocol_instance_id: Uuid,
+        cursor_key_id: &[u8],
+        event_position: u64,
+        predecessor_cursor_hash: Option<[u8; 32]>,
+        retained_floor_at_issue: u64,
+        created_at: u64,
+        expires_at: u64,
+    ) -> Result<Self, SealerError> {
+        validate_binding_bytes(user_did, 1, 512)?;
+        validate_binding_bytes(jkt, 1, 256)?;
+        validate_binding_bytes(cursor_key_id, 1, 256)?;
+        require_binding_uuid_v4(inventory_session_id)?;
+        require_binding_uuid_v4(device_id)?;
+        require_binding_uuid_v4(protocol_instance_id)?;
+        require_binding_safe_integer(auth_generation)?;
+        if auth_generation == 0 {
+            return Err(SealerError::InvalidBinding);
+        }
+        require_binding_safe_integer(event_position)?;
+        require_binding_safe_integer(retained_floor_at_issue)?;
+        if event_position < retained_floor_at_issue {
+            return Err(SealerError::InvalidBinding);
+        }
+        require_binding_lifetime(created_at, expires_at)?;
+        Ok(Self {
+            shape: SealerBindingShape::EventCursor(EventCursorBinding {
+                inventory_session_id,
+                user_did: user_did.to_vec(),
+                device_id,
+                jkt: jkt.to_vec(),
+                auth_generation,
+                protocol_instance_id,
+                cursor_key_id: cursor_key_id.to_vec(),
+                event_position,
+                predecessor_cursor_hash,
+                retained_floor_at_issue,
+                created_at,
+                expires_at,
+            }),
+        })
+    }
+
+    fn aad(&self) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(256);
+        match &self.shape {
+            SealerBindingShape::PageReceipt(fields) => {
+                aad.extend_from_slice(PAGE_RECEIPT_AAD_LABEL);
+                append_binding_field(&mut aad, &fields.domain);
+                append_binding_field(&mut aad, &fields.endpoint_nsid);
+                aad.extend_from_slice(&fields.cursor_format_version.to_be_bytes());
+                aad.extend_from_slice(fields.inventory_session_id.as_bytes());
+                append_binding_field(&mut aad, &fields.user_did);
+                aad.extend_from_slice(fields.device_id.as_bytes());
+                append_binding_field(&mut aad, &fields.jkt);
+                aad.extend_from_slice(&fields.auth_generation.to_be_bytes());
+                aad.extend_from_slice(fields.protocol_instance_id.as_bytes());
+                append_binding_field(&mut aad, &fields.cursor_key_id);
+                aad.extend_from_slice(&fields.snapshot_event_position.to_be_bytes());
+                aad.extend_from_slice(&fields.snapshot_event_cursor_sha256);
+                aad.extend_from_slice(&fields.snapshot_retained_floor.to_be_bytes());
+                aad.extend_from_slice(&fields.canonical_filter_sha256);
+                aad.extend_from_slice(&fields.page_limit.to_be_bytes());
+                append_binding_optional_u64(&mut aad, fields.after_ordinal);
+                append_binding_optional_hash(&mut aad, fields.successor_cursor_hash);
+                aad.extend_from_slice(&fields.created_at.to_be_bytes());
+                aad.extend_from_slice(&fields.expires_at.to_be_bytes());
+            }
+            SealerBindingShape::EventCursor(fields) => {
+                aad.extend_from_slice(EVENT_CURSOR_RECEIPT_AAD_LABEL);
+                aad.extend_from_slice(fields.inventory_session_id.as_bytes());
+                append_binding_field(&mut aad, &fields.user_did);
+                aad.extend_from_slice(fields.device_id.as_bytes());
+                append_binding_field(&mut aad, &fields.jkt);
+                aad.extend_from_slice(&fields.auth_generation.to_be_bytes());
+                aad.extend_from_slice(fields.protocol_instance_id.as_bytes());
+                append_binding_field(&mut aad, &fields.cursor_key_id);
+                aad.extend_from_slice(&fields.event_position.to_be_bytes());
+                append_binding_optional_hash(&mut aad, fields.predecessor_cursor_hash);
+                aad.extend_from_slice(&fields.retained_floor_at_issue.to_be_bytes());
+                aad.extend_from_slice(&fields.created_at.to_be_bytes());
+                aad.extend_from_slice(&fields.expires_at.to_be_bytes());
+            }
+        }
+        aad
+    }
+
+    fn cursor_key_id(&self) -> &[u8] {
+        match &self.shape {
+            SealerBindingShape::PageReceipt(fields) => &fields.cursor_key_id,
+            SealerBindingShape::EventCursor(fields) => &fields.cursor_key_id,
+        }
+    }
+
+    fn successor_cursor_hash(&self) -> Option<[u8; 32]> {
+        match &self.shape {
+            SealerBindingShape::PageReceipt(fields) => fields.successor_cursor_hash,
+            SealerBindingShape::EventCursor(_) => None,
+        }
+    }
+
+    fn expects_successor_hash(&self) -> bool {
+        matches!(self.shape, SealerBindingShape::PageReceipt(_))
+    }
+}
+
+impl fmt::Debug for SealerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SealerBinding(REDACTED)")
+    }
+}
+
+#[allow(dead_code)]
+fn validate_binding_bytes(value: &[u8], minimum: usize, maximum: usize) -> Result<(), SealerError> {
+    if (minimum..=maximum).contains(&value.len()) {
+        Ok(())
+    } else {
+        Err(SealerError::InvalidBinding)
+    }
+}
+
+#[allow(dead_code)]
+fn require_binding_safe_integer(value: u64) -> Result<(), SealerError> {
+    if value <= MAX_SAFE_INTEGER {
+        Ok(())
+    } else {
+        Err(SealerError::InvalidBinding)
+    }
+}
+
+#[allow(dead_code)]
+fn require_binding_uuid_v4(value: Uuid) -> Result<(), SealerError> {
+    if value.get_variant() == Variant::RFC4122 && value.get_version() == Some(Version::Random) {
+        Ok(())
+    } else {
+        Err(SealerError::InvalidBinding)
+    }
+}
+
+#[allow(dead_code)]
+fn require_binding_lifetime(created_at: u64, expires_at: u64) -> Result<(), SealerError> {
+    require_binding_safe_integer(created_at)?;
+    require_binding_safe_integer(expires_at)?;
+    if created_at >= expires_at {
+        return Err(SealerError::InvalidBinding);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn append_binding_field(aad: &mut Vec<u8>, value: &[u8]) {
+    let length = u16::try_from(value.len()).expect("binding fields are validated to fit u16");
+    aad.extend_from_slice(&length.to_be_bytes());
+    aad.extend_from_slice(value);
+}
+
+#[allow(dead_code)]
+fn append_binding_optional_u64(aad: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => aad.push(0),
+        Some(value) => {
+            aad.push(1);
+            aad.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn append_binding_optional_hash(aad: &mut Vec<u8>, value: Option<[u8; 32]>) {
+    match value {
+        None => aad.push(0),
+        Some(value) => {
+            aad.push(1);
+            aad.extend_from_slice(&value);
+        }
+    }
+}
+
+/// Seals and verifies opaque successor capabilities for durable replay.
+///
+/// AES-256-GCM with 12-byte nonces; the AAD is the domain-separated canonical
+/// encoding of the receipt-derived `SealerBinding`. The secret is zeroized on
+/// drop and never formatted.
+#[allow(dead_code)]
+pub(crate) struct CursorSealer {
+    key_id: [u8; 32],
+    secret: Zeroizing<[u8; 32]>,
+}
+
+#[allow(dead_code)]
+impl CursorSealer {
+    /// Fails closed on an all-zero secret with the same static
+    /// `InvalidConfiguration` failure mode as `CursorCodec::new` (no panic;
+    /// neither failure mode carries key material).
+    pub(crate) fn new(
+        key_id: [u8; 32],
+        secret: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, CursorCodecError> {
+        if secret.iter().all(|byte| *byte == 0) {
+            return Err(CursorCodecError::InvalidConfiguration);
+        }
+        Ok(Self { key_id, secret })
+    }
+
+    /// Seals a successor capability for lost-response replay.
+    ///
+    /// The binding must carry the exact successor hash of `plaintext` (the
+    /// page-receipt shape); sealing fails closed otherwise. The nonce comes
+    /// from the passed `SecureRandom`, never from a predictable source.
+    pub(crate) fn seal_successor(
+        &self,
+        plaintext: &[u8],
+        binding: &SealerBinding,
+        random: &mut dyn SecureRandom,
+    ) -> Result<SealedCapability, SealerError> {
+        if plaintext.is_empty() {
+            return Err(SealerError::InvalidField);
+        }
+        if plaintext.len() > MAX_SEALED_PLAINTEXT_BYTES {
+            return Err(SealerError::TooLong);
+        }
+        if !self.matches_binding_key(binding) {
+            return Err(SealerError::WrongKey);
+        }
+        let plaintext_digest: [u8; 32] = Sha256::digest(plaintext).into();
+        if binding.expects_successor_hash()
+            && binding.successor_cursor_hash() != Some(plaintext_digest)
+        {
+            return Err(SealerError::SuccessorHashMismatch);
+        }
+        let mut nonce = [0u8; CAPABILITY_NONCE_BYTES];
+        random
+            .fill(&mut nonce)
+            .map_err(|_| SealerError::RandomnessFailure)?;
+        let cipher = <Aes256Gcm as aes_gcm::aead::KeyInit>::new(Key::<Aes256Gcm>::from_slice(
+            self.secret.as_slice(),
+        ));
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::<Aes256Gcm>::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &binding.aad(),
+                },
+            )
+            .map_err(|_| SealerError::AuthenticationFailed)?;
+        Ok(SealedCapability { nonce, ciphertext })
+    }
+
+    /// Verifies and returns the sealed successor plaintext.
+    ///
+    /// The binding must carry the exact successor hash (page-receipt shape)
+    /// and the decrypted plaintext must hash to it; both the AEAD tag and the
+    /// hash comparison fail closed.
+    pub(crate) fn verify_successor(
+        &self,
+        sealed: &SealedCapability,
+        binding: &SealerBinding,
+    ) -> Result<Zeroizing<Vec<u8>>, SealerError> {
+        if sealed.ciphertext.len() > MAX_SEALED_CIPHERTEXT_BYTES {
+            return Err(SealerError::TooLong);
+        }
+        if sealed.ciphertext.len() < 17 {
+            return Err(SealerError::InvalidField);
+        }
+        if !self.matches_binding_key(binding) {
+            return Err(SealerError::WrongKey);
+        }
+        let cipher = <Aes256Gcm as aes_gcm::aead::KeyInit>::new(Key::<Aes256Gcm>::from_slice(
+            self.secret.as_slice(),
+        ));
+        let plaintext = cipher
+            .decrypt(
+                Nonce::<Aes256Gcm>::from_slice(&sealed.nonce),
+                Payload {
+                    msg: &sealed.ciphertext,
+                    aad: &binding.aad(),
+                },
+            )
+            .map_err(|_| SealerError::AuthenticationFailed)?;
+        if let Some(expected) = binding.successor_cursor_hash() {
+            let verified_digest: [u8; 32] = Sha256::digest(&plaintext).into();
+            if expected != verified_digest {
+                return Err(SealerError::SuccessorHashMismatch);
+            }
+        }
+        Ok(Zeroizing::new(plaintext))
+    }
+
+    fn matches_binding_key(&self, binding: &SealerBinding) -> bool {
+        std::str::from_utf8(binding.cursor_key_id())
+            .ok()
+            .and_then(|encoded| decode_canonical_base64url(encoded).ok())
+            .is_some_and(|decoded| decoded.as_slice() == self.key_id)
+    }
+}
+
+impl fmt::Debug for CursorSealer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CursorSealer(REDACTED)")
+    }
+}
+
+/// A sealed successor capability: a 12-byte nonce plus ciphertext
+/// (1..=512 bytes). Public by design — the plaintext is recoverable only
+/// with the sealer key and the exact receipt-derived binding.
+#[derive(Clone, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct SealedCapability {
+    pub(crate) nonce: [u8; 12],
+    pub(crate) ciphertext: Vec<u8>,
+}
+
+impl fmt::Debug for SealedCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SealedCapability(REDACTED)")
+    }
 }

@@ -6,21 +6,37 @@
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
+use sqlx::{FromRow, Postgres, Transaction};
 use thiserror::Error;
 use uuid::{Uuid, Variant, Version};
 
 use super::super::{
     cursor::{
-        inventory_item_key_hash, opaque_binding_hash, CursorCodec, CursorCodecError,
-        DeviceCursorBinding, EventCursor, InventoryPageBinding, InventoryPageCursor,
+        inventory_item_key_hash, CursorCodec, CursorCodecError, EventCursor, InventoryPageBinding,
         InventoryPageDomain, InventoryPageLocator, InventorySessionBinding, InventorySessionToken,
-        LockedInventoryPageVerification,
+        SealerError, SecureRandomError,
     },
     validation::{ed25519_key_id, BareDid, KeyThumbprint},
 };
 
+use super::super::cursor::{
+    decode_capability_token, mint_capability_token, CapabilityToken, CursorSealer, OsSecureRandom,
+    SealedCapability, SealerBinding, SecureRandom,
+};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[cfg(not(test))]
+use jacquard_common::deps::smol_str::SmolStr;
+use zeroize::Zeroizing;
+
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
+/// The exact inventory page limit ceiling (schema `page_limit BETWEEN 1 AND
+/// 100` and the retained-item page ceiling).
+///
+/// Purpose-staged: used by the (still handler-less) D-2 page paths and by the
+/// byte-identical `read_inventory_page` legacy surface, so the dead-code lint
+/// is documented rather than papered over.
+#[allow(dead_code)]
 pub(crate) const MAX_INVENTORY_PAGE_ITEMS: u64 = 100;
 
 #[derive(Debug, Error)]
@@ -61,6 +77,21 @@ pub(crate) enum InventoryRepositoryError {
     RequestTooBroad,
     #[error(transparent)]
     Cursor(#[from] CursorCodecError),
+    #[error("capability randomness source failed")]
+    SecureRandom(#[from] SecureRandomError),
+    #[error(transparent)]
+    Sealer(#[from] SealerError),
+    #[error("inventory snapshot creation exhausted its three-attempt retry ceiling")]
+    RetryCeiling,
+    #[cfg(not(test))]
+    #[error(transparent)]
+    Projection(#[from] super::super::read_projection::ProjectionError),
+    #[cfg(not(test))]
+    #[error("clean-chat inventory read authority failed")]
+    ReadAuthority(super::super::read_authority::ReadAuthorityError),
+    #[cfg(not(test))]
+    #[error("clean-chat inventory read admission failed")]
+    ReadAdmission(super::super::dpop::ReadAdmissionBindingError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -71,8 +102,8 @@ impl PartialEq for InventoryRepositoryError {
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
             DurableRowInvalid, InconsistentConversationSelection, InconsistentRecoverySelection,
             InconsistentWelcomeSelection, InvalidMaterialization, ProtocolFenceMismatch,
-            RaceOrReuse, RequestTooBroad, SessionNotFound, SessionPresentationMismatch,
-            SnapshotConflict, TransactionMismatch,
+            RaceOrReuse, RequestTooBroad, RetryCeiling, Sealer, SecureRandom, SessionNotFound,
+            SessionPresentationMismatch, SnapshotConflict, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -89,8 +120,11 @@ impl PartialEq for InventoryRepositoryError {
             | (InconsistentWelcomeSelection, InconsistentWelcomeSelection)
             | (InconsistentRecoverySelection, InconsistentRecoverySelection)
             | (SnapshotConflict, SnapshotConflict)
-            | (InvalidMaterialization, InvalidMaterialization) => true,
+            | (RetryCeiling, RetryCeiling)
+            | (InvalidMaterialization, InvalidMaterialization)
+            | (SecureRandom(..), SecureRandom(..)) => true,
             (Cursor(left), Cursor(right)) => left == right,
+            (Sealer(left), Sealer(right)) => left == right,
             _ => false,
         }
     }
@@ -221,6 +255,11 @@ pub(crate) struct LockedInventoryCursorEvidence {
 }
 
 impl LockedInventoryCursorEvidence {
+    /// Purpose-staged: consumed by the D-1 `CursorCodec` surface in cursor.rs
+    /// (`verify_located_inventory_page_cursor`), which the D-2 rewiring left
+    /// without production callers; the F-lane retires the codec surface and
+    /// this helper together.
+    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     pub(crate) fn into_cursor_parts(
         self,
@@ -451,85 +490,6 @@ impl LockedInventorySessionGuard {
             InventoryPageDomain::LeafRecovery => self.recovery,
         }
     }
-
-    fn cursor_evidence(
-        &self,
-        codec: &CursorCodec,
-        domain: InventoryPageDomain,
-        raw_inventory_session: Option<&str>,
-        canonical_filter: &[u8],
-    ) -> Result<LockedInventoryCursorEvidence, InventoryRepositoryError> {
-        let did = BareDid::parse(&self.user_did)
-            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-        let jkt = KeyThumbprint::parse(&self.jkt)
-            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-        let device = DeviceCursorBinding::new(&did, self.device_id, self.auth_generation, &jkt)?;
-        let now =
-            unix_seconds(self.locked_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-        let expires_at =
-            unix_seconds(self.expires_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-        let created_at =
-            unix_seconds(self.created_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-        let event_cursor = codec.hydrate_event_cursor(
-            &self.snapshot_event_cursor_bytes,
-            self.snapshot_event_cursor_sha256,
-            &device,
-            self.snapshot_event_position,
-            expires_at,
-            now,
-            self.retained_floor,
-            self.head_event_position,
-        )?;
-        let session_binding = codec.bind_inventory_session(
-            device,
-            self.inventory_session_id,
-            &event_cursor,
-            self.snapshot_event_position,
-            expires_at,
-            now,
-            self.retained_floor,
-            self.head_event_position,
-        )?;
-        let inventory_session = if let Some(encoded) = raw_inventory_session {
-            if !opaque_binding_hash(encoded.as_bytes())
-                .is_ok_and(|presented| presented == self.token_hash)
-            {
-                return Err(InventoryRepositoryError::SessionPresentationMismatch);
-            }
-            codec
-                .hydrate_inventory_session_token(
-                    encoded.as_bytes(),
-                    self.token_hash,
-                    &session_binding,
-                    now,
-                    self.retained_floor,
-                    self.head_event_position,
-                )
-                .map_err(|_| InventoryRepositoryError::SessionPresentationMismatch)?
-        } else {
-            let reconstructed = codec.issue_inventory_session_id(
-                &session_binding,
-                created_at,
-                self.retained_floor,
-                self.head_event_position,
-            )?;
-            if reconstructed.binding_hash() != self.token_hash {
-                return Err(InventoryRepositoryError::SessionPresentationMismatch);
-            }
-            reconstructed
-        };
-
-        Ok(LockedInventoryCursorEvidence {
-            session_binding,
-            inventory_session,
-            snapshot_event_cursor: event_cursor,
-            domain,
-            canonical_filter: canonical_filter.to_vec(),
-            now,
-            retained_floor: self.retained_floor,
-            maximum_event_position: self.head_event_position,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -639,92 +599,6 @@ impl InventoryPageCompletionAuthority {
             Err(InventoryRepositoryError::TransactionMismatch)
         }
     }
-}
-
-pub(crate) fn seal_conversation_inventory_page(
-    codec: &CursorCodec,
-    encoded: &str,
-    locator: InventoryPageLocator,
-    guard: LockedInventorySessionGuard,
-    canonical_filter: &[u8],
-) -> Result<InventoryPageReadAuthority, InventoryRepositoryError> {
-    seal_inventory_page(
-        codec,
-        encoded,
-        locator,
-        guard,
-        InventoryPageDomain::Conversations,
-        None,
-        canonical_filter,
-    )
-}
-
-pub(crate) fn seal_pending_welcome_inventory_page(
-    codec: &CursorCodec,
-    encoded: &str,
-    locator: InventoryPageLocator,
-    guard: LockedInventorySessionGuard,
-    raw_inventory_session_id: &str,
-    canonical_filter: &[u8],
-) -> Result<InventoryPageReadAuthority, InventoryRepositoryError> {
-    seal_inventory_page(
-        codec,
-        encoded,
-        locator,
-        guard,
-        InventoryPageDomain::PendingWelcomes,
-        Some(raw_inventory_session_id),
-        canonical_filter,
-    )
-}
-
-pub(crate) fn seal_recovery_inventory_page(
-    codec: &CursorCodec,
-    encoded: &str,
-    locator: InventoryPageLocator,
-    guard: LockedInventorySessionGuard,
-    raw_inventory_session_id: &str,
-    canonical_filter: &[u8],
-) -> Result<InventoryPageReadAuthority, InventoryRepositoryError> {
-    seal_inventory_page(
-        codec,
-        encoded,
-        locator,
-        guard,
-        InventoryPageDomain::LeafRecovery,
-        Some(raw_inventory_session_id),
-        canonical_filter,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn seal_inventory_page(
-    codec: &CursorCodec,
-    encoded: &str,
-    locator: InventoryPageLocator,
-    guard: LockedInventorySessionGuard,
-    domain: InventoryPageDomain,
-    raw_inventory_session_id: Option<&str>,
-    canonical_filter: &[u8],
-) -> Result<InventoryPageReadAuthority, InventoryRepositoryError> {
-    if guard.completion(domain).is_complete() {
-        return Err(InventoryRepositoryError::DomainAlreadyComplete);
-    }
-    let evidence =
-        guard.cursor_evidence(codec, domain, raw_inventory_session_id, canonical_filter)?;
-    let LockedInventoryPageVerification {
-        verified,
-        binding: page_binding,
-    } = codec.verify_located_inventory_page_cursor(encoded, locator, evidence)?;
-    let verified_cursor_hash = opaque_binding_hash(encoded.as_bytes())?;
-    Ok(InventoryPageReadAuthority {
-        session: guard,
-        domain: verified.domain(),
-        verified_cursor_hash,
-        last_ordinal: verified.last_ordinal(),
-        item_key_hash: verified.item_key_hash(),
-        page_binding,
-    })
 }
 
 #[derive(Debug, FromRow)]
@@ -1001,6 +875,10 @@ impl InventoryPageItem {
         &self.payload_sha256
     }
 
+    fn into_payload_bytes(self) -> Vec<u8> {
+        self.payload_bytes
+    }
+
     fn from_database(row: InventoryItemRow) -> Result<Self, InventoryRepositoryError> {
         let ordinal = database_protocol_integer(row.ordinal)
             .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
@@ -1158,160 +1036,6 @@ pub(crate) async fn read_inventory_page(
     }
 }
 
-/// Issues the next page cursor only while the transaction that read the page
-/// still owns the exact session/fence guard.
-pub(crate) async fn issue_next_inventory_page_cursor(
-    transaction: &mut Transaction<'_, Postgres>,
-    codec: &CursorCodec,
-    authority: InventoryPageContinuationAuthority,
-) -> Result<InventoryPageCursor, InventoryRepositoryError> {
-    let transaction_id = current_transaction_id(transaction).await?;
-    if transaction_id != authority.session.transaction_id {
-        return Err(InventoryRepositoryError::TransactionMismatch);
-    }
-    let issued_at = unix_seconds(authority.session.locked_at)
-        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    let cursor = codec.issue_inventory_page_cursor(
-        &authority.page_binding,
-        authority.last_ordinal,
-        &authority.item_key_bytes,
-        issued_at,
-        authority.session.retained_floor,
-        authority.session.head_event_position,
-    )?;
-    let _consumed_prior_cursor_hash = authority.verified_cursor_hash;
-    Ok(cursor)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct InventoryCompletionReceipt {
-    inventory_session_id: Uuid,
-    domain: InventoryPageDomain,
-    item_count: u64,
-    items_sha256: [u8; 32],
-}
-
-impl InventoryCompletionReceipt {
-    pub(crate) fn inventory_session_id(self) -> Uuid {
-        self.inventory_session_id
-    }
-
-    pub(crate) fn domain(self) -> InventoryPageDomain {
-        self.domain
-    }
-
-    pub(crate) fn item_count(self) -> u64 {
-        self.item_count
-    }
-
-    pub(crate) fn items_sha256(self) -> [u8; 32] {
-        self.items_sha256
-    }
-}
-
-/// Performs the exact one-way completion CAS. A second consumer, a detached
-/// transaction, or any changed durable session field affects zero rows.
-pub(crate) async fn complete_inventory_page(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: InventoryPageCompletionAuthority,
-) -> Result<InventoryCompletionReceipt, InventoryRepositoryError> {
-    let transaction_id = current_transaction_id(transaction).await?;
-    if transaction_id != authority.session.transaction_id {
-        return Err(InventoryRepositoryError::TransactionMismatch);
-    }
-    if authority.session.completion(authority.domain).is_complete() {
-        return Err(InventoryRepositoryError::DomainAlreadyComplete);
-    }
-
-    let mut query = QueryBuilder::<Postgres>::new(match authority.domain {
-        InventoryPageDomain::Conversations => {
-            "UPDATE chat.inventory_sessions SET conversations_complete = TRUE, conversation_item_count = "
-        }
-        InventoryPageDomain::PendingWelcomes => {
-            "UPDATE chat.inventory_sessions SET welcomes_complete = TRUE, welcome_item_count = "
-        }
-        InventoryPageDomain::LeafRecovery => {
-            "UPDATE chat.inventory_sessions SET recovery_complete = TRUE, recovery_item_count = "
-        }
-    });
-    query
-        .push_bind(
-            i64::try_from(authority.item_count)
-                .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
-        )
-        .push(match authority.domain {
-            InventoryPageDomain::Conversations => ", conversation_items_sha256 = ",
-            InventoryPageDomain::PendingWelcomes => ", welcome_items_sha256 = ",
-            InventoryPageDomain::LeafRecovery => ", recovery_items_sha256 = ",
-        })
-        .push_bind(authority.items_sha256.to_vec())
-        .push(" WHERE inventory_session_id = ")
-        .push_bind(authority.session.inventory_session_id)
-        .push(" AND token_hash = ")
-        .push_bind(authority.session.token_hash.to_vec())
-        .push(" AND user_did = ")
-        .push_bind(&authority.session.user_did)
-        .push(" AND device_id = ")
-        .push_bind(authority.session.device_id)
-        .push(" AND jkt = ")
-        .push_bind(&authority.session.jkt)
-        .push(" AND auth_generation = ")
-        .push_bind(
-            i64::try_from(authority.session.auth_generation)
-                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
-        )
-        .push(" AND snapshot_event_position = ")
-        .push_bind(
-            i64::try_from(authority.session.snapshot_event_position)
-                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
-        )
-        .push(" AND snapshot_event_cursor_bytes = ")
-        .push_bind(&authority.session.snapshot_event_cursor_bytes)
-        .push(" AND snapshot_event_cursor_sha256 = ")
-        .push_bind(authority.session.snapshot_event_cursor_sha256.to_vec())
-        .push(" AND created_at = ")
-        .push_bind(authority.session.created_at)
-        .push(" AND expires_at = ")
-        .push_bind(authority.session.expires_at);
-    push_completion_predicate(
-        &mut query,
-        "conversations_complete",
-        "conversation_item_count",
-        "conversation_items_sha256",
-        authority.session.conversations,
-    );
-    push_completion_predicate(
-        &mut query,
-        "welcomes_complete",
-        "welcome_item_count",
-        "welcome_items_sha256",
-        authority.session.welcomes,
-    );
-    push_completion_predicate(
-        &mut query,
-        "recovery_complete",
-        "recovery_item_count",
-        "recovery_items_sha256",
-        authority.session.recovery,
-    );
-
-    let result = query.build().execute(&mut **transaction).await?;
-    if result.rows_affected() != 1 {
-        return Err(InventoryRepositoryError::RaceOrReuse);
-    }
-    sqlx::query("SET CONSTRAINTS chat.inventory_sessions_materialization_deferred IMMEDIATE")
-        .execute(&mut **transaction)
-        .await?;
-
-    let _consumed_cursor_hash = authority.verified_cursor_hash;
-    Ok(InventoryCompletionReceipt {
-        inventory_session_id: authority.session.inventory_session_id,
-        domain: authority.domain,
-        item_count: authority.item_count,
-        items_sha256: authority.items_sha256,
-    })
-}
-
 async fn current_transaction_id(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<String, InventoryRepositoryError> {
@@ -1448,45 +1172,6 @@ fn validate_materialization_digest(
         return Err(InventoryRepositoryError::InvalidMaterialization);
     }
     Ok((item_count, items_sha256))
-}
-
-fn push_completion_predicate(
-    query: &mut QueryBuilder<'_, Postgres>,
-    complete_column: &'static str,
-    count_column: &'static str,
-    digest_column: &'static str,
-    evidence: InventoryCompletionEvidence,
-) {
-    if evidence.complete {
-        query
-            .push(" AND ")
-            .push(complete_column)
-            .push(" = TRUE AND ")
-            .push(count_column)
-            .push(" = ")
-            .push_bind(
-                i64::try_from(evidence.item_count.expect("validated complete evidence"))
-                    .expect("protocol integer fits i64"),
-            )
-            .push(" AND ")
-            .push(digest_column)
-            .push(" = ")
-            .push_bind(
-                evidence
-                    .items_sha256
-                    .expect("validated complete evidence")
-                    .to_vec(),
-            );
-    } else {
-        query
-            .push(" AND ")
-            .push(complete_column)
-            .push(" = FALSE AND ")
-            .push(count_column)
-            .push(" IS NULL AND ")
-            .push(digest_column)
-            .push(" IS NULL");
-    }
 }
 
 #[cfg(test)]
@@ -1812,134 +1497,38 @@ pub(crate) async fn get_devices(
 }
 
 // ===========================================================================
-// getConversations session CREATE + materialize (the first-page half).
+// getConversations session CREATE + materialize (D-2: opaque capability core).
 //
 // The first `getConversations` call creates ONE retained inventory session under
 // ONE captured event fence (the `chat.protocol_instances` singleton position, the
 // current `chat.events` head, and the `chat.event_retention` floor) and
 // materializes the three shared audience domains (conversations, pending
 // Welcomes, recovery) into their per-session item tables with canonical ordinals
-// `0..count-1`, then records per-domain completion evidence (`count` + the exact
-// `SHA256` projection the deferred `assert_inventory_materialization` trigger
-// recomputes). Page reads (`read_inventory_page`/`complete_inventory_page`) and
-// ticket mint (`repository::ticket`) consume the session this function produces.
+// `0..count-1`, then records per-domain completion evidence (count + digest +
+// payload bytes exactly as the deferred `assert_inventory_materialization`
+// trigger recomputes). Page reads and ticket mint consume the session this
+// function produces.
 //
-// This is the closed TRANSACTION surface: it owns the fence capture, the codec
-// token derivation, the session/item inserts, ordinal assignment, digest
-// computation, and satisfying the deferred materialization + auth-identity
-// triggers. It does NOT run the source read-model SELECTs that choose WHICH
-// conversations/Welcomes/recovery rows a device sees or how each is encoded on
-// the wire — those (the generated-DTO projection) are the Task 4 handler's job.
-// The caller supplies the already-selected, already-encoded per-domain items; the
-// item source rows (conversations, welcome_deliveries, recovery rows, schedule
-// proofs) must already exist and target this exact recipient device, which the
-// composite recipient/source FKs and the materialization trigger enforce.
+// The caller supplies NO payload bytes, NO echoed ids, and NO raw identity: the
+// verified `LockedReadDeviceAuthority` from the B-read guard is the identity,
+// the C1 typed loaders derive every durable source row under the captured
+// fence, the C1 projections build the generated DTOs, and the canonical v1
+// encoder produces the retained payload bytes exactly once per item. The
+// session capability is a single 32-byte random capability (43-character
+// base64url) that is BOTH the presented `inventory_session_id` and the
+// presented snapshot event cursor; only its SHA-256 is persisted (`token_hash`
+// and `snapshot_event_cursor_sha256`), and the plaintext is sealed at rest as a
+// 12-byte nonce + ciphertext pair under the active database-pinned cursor key.
 // ===========================================================================
 
-/// One conversation-domain snapshot item. `payload_bytes` is the caller's
-/// canonical encoding of the conversation view (opaque to this transaction; only
-/// its length and SHA-256 are checked). `schedule_terminal` carries at most one
-/// schedule-terminal proof tuple for the conversation; when present it must name
-/// an existing `application_schedule_terminal_proofs` row for this recipient.
-#[derive(Clone, Debug)]
-pub(crate) struct ConversationInventoryItem {
-    pub(crate) conversation_id: Uuid,
-    pub(crate) payload_bytes: Vec<u8>,
-    pub(crate) schedule_terminal: Option<ScheduleTerminalProofRef>,
-}
-
-/// The single schedule-terminal proof coordinate a conversation item may carry.
-#[derive(Clone, Debug)]
-pub(crate) struct ScheduleTerminalProofRef {
-    pub(crate) transition_id: Uuid,
-    pub(crate) outer_entry_fingerprint: [u8; 32],
-    pub(crate) terminal_seq: i64,
-}
-
-/// One pending-Welcome snapshot item, keyed by its `welcome_deliveries` row. The
-/// caller echoes only the `welcome_id`; the repository selects the device's
-/// pending deliveries itself and derives the payload from the persisted
-/// `welcome_bundles.wrapper_bytes` (server-derived — the caller never supplies
-/// Welcome wire bytes).
-#[derive(Clone, Debug)]
-pub(crate) struct WelcomeInventoryItem {
-    pub(crate) welcome_id: Uuid,
-}
-
-/// One recovery-domain snapshot item: either an open leaf-recovery request the
-/// device signed, or a recovery-work item addressed to the device. The
-/// `item_kind` discriminant and 17-byte prefixed item key are derived here.
-///
-/// Payload sourcing is per-arm (per the ratified per-arm contract): the
-/// `LeafRecoveryRequest` arm's payload is server-derived from the persisted
-/// `leaf_recovery_requests.signed_request_bytes`, so the caller echoes only the
-/// request id; the `RecoveryWork` arm has no persisted wire source, so the caller
-/// supplies the payload bytes (bijection-bound like the conversation arm).
-#[derive(Clone, Debug)]
-pub(crate) enum RecoveryInventoryItem {
-    LeafRecoveryRequest {
-        recovery_request_id: Uuid,
-    },
-    RecoveryWork {
-        recovery_work_id: Uuid,
-        payload_bytes: Vec<u8>,
-    },
-}
-
-/// The authenticated identity + session window + domain contents for a
-/// `create_inventory_session` call. Every item's recipient is the session's exact
-/// `(user_did, device_id)`; the function binds them so.
-///
-/// Selection-owning contract (ratified 2026-07-24; welcome/recovery arms landed
-/// 4c): the repository SELECTS every shared domain's authoritative, status-current,
-/// device-scoped row set itself under the captured fence, and binds the caller's
-/// echoed items to that set by exact BIJECTION — the caller can never add, omit, or
-/// substitute a row. Per-arm payload sourcing:
-/// - conversation: repo selects active `member_devices`; caller supplies the Task-4
-///   wire payload per selected id (no persisted source). Bijection failure →
-///   `InconsistentConversationSelection`.
-/// - Welcome: repo selects `status='pending'` `welcome_deliveries`; the payload is
-///   server-derived from `welcome_bundles.wrapper_bytes`. The caller echoes only the
-///   `welcome_id` set. Bijection failure → `InconsistentWelcomeSelection`.
-/// - recovery / leafRecoveryRequest: repo selects `status='open'`
-///   `leaf_recovery_requests`; payload server-derived from `signed_request_bytes`.
-/// - recovery / recoveryWork: repo selects `status='pending'` `recovery_work_items`;
-///   caller supplies the payload per selected id (no persisted wire). Either recovery
-///   arm's bijection failure → `InconsistentRecoverySelection`.
-///
-/// Terminal rows (acknowledged/expired Welcomes, fulfilled/cancelled requests,
-/// completed/superseded work) are history — served only by the read/log paths, never
-/// materialized into this bootstrap snapshot. Ordinals + `payload_sha256` are
-/// repository-owned for every arm.
-#[derive(Clone, Debug)]
-pub(crate) struct CreateInventorySessionRequest<'a> {
-    pub(crate) inventory_session_id: Uuid,
-    pub(crate) user_did: &'a str,
-    pub(crate) device_id: Uuid,
-    pub(crate) jkt: &'a str,
-    pub(crate) auth_generation: u64,
-    pub(crate) created_at: DateTime<Utc>,
-    pub(crate) expires_at: DateTime<Utc>,
-    /// One payload per conversation the device is a current member of. The set of
-    /// ids MUST equal the repository's membership selection exactly (bijection),
-    /// or the call fails with `InconsistentConversationSelection`. Ordinals are
-    /// repository-assigned (`conversation_id` ascending), not this vec's order.
-    pub(crate) conversations: Vec<ConversationInventoryItem>,
-    /// The echoed `welcome_id` set; MUST equal the device's pending-delivery
-    /// selection exactly (bijection). Payload is server-derived, not carried here.
-    pub(crate) welcomes: Vec<WelcomeInventoryItem>,
-    /// The echoed recovery items; the leafRecoveryRequest ids MUST equal the open
-    /// request selection and the recoveryWork ids MUST equal the pending work
-    /// selection (bijection across both arms). Request payload is server-derived;
-    /// work payload is carried here.
-    pub(crate) recovery: Vec<RecoveryInventoryItem>,
-}
-
-/// The identity of a freshly created inventory session, echoing the captured
-/// fence. `inventory_session_token` is the opaque retained session id the client
-/// re-presents on every page and to the ticket mint; the raw token is never
-/// persisted (only its `token_hash`).
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The durable identity of a freshly created inventory session, echoing the
+/// captured fence and the capability stack. `inventory_session_token` is the
+/// 43-character base64url session/event-cursor capability the client re-presents
+/// on every page and to the ticket mint; `snapshot_event_cursor_bytes` is the
+/// same capability's raw 32 bytes. Neither is persisted (only the SHA-256
+/// lookup hash and the sealed nonce/ciphertext pair live at rest).
+#[cfg(not(test))]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CreatedInventorySession {
     pub(crate) inventory_session_id: Uuid,
     pub(crate) inventory_session_token: String,
@@ -1952,58 +1541,99 @@ pub(crate) struct CreatedInventorySession {
     pub(crate) recovery_item_count: u64,
 }
 
+/// Redacted `Debug`: the capability plaintext (`inventory_session_token` and
+/// `snapshot_event_cursor_bytes`) never appears in `Debug` output.
+#[cfg(not(test))]
+impl std::fmt::Debug for CreatedInventorySession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreatedInventorySession")
+            .field("inventory_session_id", &self.inventory_session_id)
+            .field("inventory_session_token", &"REDACTED")
+            .field("snapshot_event_position", &self.snapshot_event_position)
+            .field("snapshot_event_cursor_bytes", &"REDACTED")
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("conversation_item_count", &self.conversation_item_count)
+            .field("welcome_item_count", &self.welcome_item_count)
+            .field("recovery_item_count", &self.recovery_item_count)
+            .finish()
+    }
+}
+
+/// The creation-time request: the deterministic session identity (the facade
+/// derives it from the verified device coordinates) plus the repository-owned
+/// whole-second lifetime window. No caller identity, generation, or payload
+/// bytes cross this boundary.
+#[cfg(not(test))]
+#[derive(Clone, Debug)]
+pub(crate) struct CreateInventorySessionRequest {
+    pub(crate) inventory_session_id: Uuid,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
 /// Create one retained inventory session under one captured event fence and
 /// materialize + complete its three shared domains in the same transaction.
 ///
 /// The event fence is snapshotted at the current `chat.events` head (an empty log
-/// snapshots at position 0). The session token binds the exact
-/// DID/device/JKT/auth-generation + snapshot cursor via the same codec the page
-/// reads verify against, so the durable `token_hash` this function stores is the
-/// one `lock_inventory_session` reconstructs. After inserting the item rows with
+/// snapshots at position 0). The session capability is a single random 32-byte
+/// capability minted here and sealed at rest (12-byte nonce + ciphertext) with
+/// `SealerBinding::for_event_cursor_receipt` under the active database-pinned
+/// cursor key; only its SHA-256 is persisted (`token_hash` and
+/// `snapshot_event_cursor_sha256`). `legacy_cursor_invalidated_at` stays NULL,
+/// all three materialization `*_complete` proofs are proven true, and all three
+/// client `*_consumed` proofs start false. After inserting the item rows with
 /// canonical ordinals `0..count-1` and recording each domain's completion
 /// evidence, the deferred `assert_inventory_materialization` and
 /// `assert_inventory_session_identity` triggers are forced IMMEDIATE so a
 /// malformed materialization or a stale device authority fails here rather than
 /// at COMMIT.
 ///
-/// Retry contract: the device-scoped domain selections run without `FOR UPDATE` on
-/// their source rows; the captured event fence is re-validated immediately before
-/// the materialization inserts, and a fence that advanced returns the retryable
-/// `SnapshotConflict` with zero durable residue (only the still-incomplete session
-/// row was written; it rolls back). A caller that receives `SnapshotConflict`
-/// re-runs the whole call. See the coverage-proof comment at the re-validation.
+/// The identity comes from the consumed `LockedReadDeviceAuthority` (the B-read
+/// guard), never from caller bytes; the materialization is selected by the
+/// loader seam -> `verify_inventory_fence` -> `inventory_authorities` chain and
+/// produced by the C1 typed loaders -> projections -> canonical encoder.
 ///
-/// This retry contract assumes the enclosing transaction runs under READ
-/// COMMITTED isolation (PostgreSQL's default). The re-validation is load-bearing
-/// precisely because a later statement observes a concurrently-committed fence
-/// advance; under REPEATABLE READ or SERIALIZABLE the re-read is a frozen-snapshot
-/// tautology (always equal to the step-1 capture) and would NOT catch a concurrent
-/// commit — a future handler must not wire this call under snapshot isolation
-/// believing the re-read guards against concurrent selection-affecting commits.
+/// Retry contract: the device-scoped domain selections run through
+/// `inventory_authorities` (conversation heads locked in ascending UUID order,
+/// final protocol/key/head/floor revalidation inside the authorities), and the
+/// captured event fence is re-validated immediately before the materialization
+/// inserts. A fence that advanced returns the retryable `SnapshotConflict` with
+/// zero durable residue (only the still-incomplete session row was written; it
+/// rolls back). A caller that receives `SnapshotConflict` re-runs the whole
+/// call.
 ///
 /// Note (r12 minor #4): `SET CONSTRAINTS … IMMEDIATE` changes the named deferred
 /// constraints to immediate for the REMAINDER of the enclosing transaction, not
-/// just for the statements this function issues. That is correct for the terminal
-/// create handlers (they are the last mutation in their transaction), but any
-/// future caller that composes further deferred work after `create_inventory_session`
-/// in the same transaction must account for the constraints already being immediate
-/// (or re-defer them explicitly).
+/// just for the statements this function issues. That is correct for the
+/// terminal create path (it is the last mutation in its transaction), but any
+/// future caller that composes further deferred work after
+/// `create_inventory_session` in the same transaction must account for the
+/// constraints already being immediate (or re-defer them explicitly).
+#[cfg(not(test))]
 pub(crate) async fn create_inventory_session(
     transaction: &mut Transaction<'_, Postgres>,
-    codec: &CursorCodec,
-    request: CreateInventorySessionRequest<'_>,
+    device: super::super::read_authority::LockedReadDeviceAuthority,
+    request: CreateInventorySessionRequest,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
 ) -> Result<CreatedInventorySession, InventoryRepositoryError> {
-    let issued_at =
-        unix_seconds(request.created_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    let expires_at =
-        unix_seconds(request.expires_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    if issued_at >= expires_at
-        || !(1..=MAX_PROTOCOL_INTEGER).contains(&request.auth_generation)
+    let created_at = request.created_at;
+    let expires_at = request.expires_at;
+    if unix_seconds(created_at).is_none()
+        || unix_seconds(expires_at).is_none()
+        || created_at >= expires_at
         || !uuid_is_canonical_v4(request.inventory_session_id)
-        || !uuid_is_canonical_v4(request.device_id)
     {
         return Err(InventoryRepositoryError::DurableRowInvalid);
     }
+    // The verified device coordinates are the identity; copy them out before the
+    // device is consumed by the fence verification below.
+    let user_did = device.user_did().to_owned();
+    let device_id = device.device_id();
+    let jkt = device.jkt().to_owned();
+    let auth_generation = device.auth_generation();
 
     // 1. Capture + lock the event fence: the protocol singleton, the retention
     //    floor, and the current events head. Snapshot the session at the head.
@@ -2018,11 +1648,6 @@ pub(crate) async fn create_inventory_session(
     .fetch_optional(&mut **transaction)
     .await?
     .ok_or(InventoryRepositoryError::ProtocolFenceMismatch)?;
-
-    if !codec.matches_protocol_configuration(protocol.protocol_instance_id, &protocol.cursor_key_id)
-    {
-        return Err(InventoryRepositoryError::ProtocolFenceMismatch);
-    }
 
     let retention: EventRetentionRow = sqlx::query_as(
         r#"
@@ -2066,303 +1691,91 @@ pub(crate) async fn create_inventory_session(
     }
     let snapshot_event_position = head_event_position;
 
-    // 2. Lock + validate the current device authority. The deferred identity
-    //    trigger re-checks this at the end; validating up-front returns a typed
-    //    error instead of a commit-time 23514.
-    let device: ActiveDeviceKeyRow = sqlx::query_as(
-        r#"
-        SELECT device.status AS device_status,
-               device.dpop_jkt AS current_dpop_jkt,
-               device.auth_generation AS current_auth_generation,
-               device.revoked_at AS device_revoked_at,
-               device_key.key_id,
-               device_key.signing_public_key,
-               device_key.enrollment_auth_generation AS key_enrollment_auth_generation,
-               device_key.revoked_at AS key_revoked_at
-          FROM chat.devices AS device
-          JOIN chat.device_keys AS device_key
-            ON device_key.user_did = device.user_did
-           AND device_key.device_id = device.device_id
-         WHERE device.user_did = $1
-           AND device.device_id = $2
-         FOR UPDATE OF device, device_key
-        "#,
-    )
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(InventoryRepositoryError::DeviceAuthorityMismatch)?;
-
-    if device.device_status != "active"
-        || device.device_revoked_at.is_some()
-        || device.key_revoked_at.is_some()
-        || device.current_dpop_jkt != request.jkt
-        || database_protocol_integer(device.current_auth_generation)
-            .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?
-            != request.auth_generation
-    {
-        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
-    }
-
-    // 3. Derive the snapshot event cursor and the retained session token. The
-    //    token binds the exact device + fence; its binding hash is the durable
-    //    `token_hash` `lock_inventory_session` later reconstructs.
-    let did = BareDid::parse(request.user_did)
-        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let jkt = KeyThumbprint::parse(request.jkt)
-        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
-    let device_binding =
-        DeviceCursorBinding::new(&did, request.device_id, request.auth_generation, &jkt)?;
-    let event_cursor = codec.issue_event_cursor(
-        &device_binding,
-        snapshot_event_position,
-        retained_floor,
-        issued_at,
-        expires_at,
-    )?;
-    let session_binding = codec.bind_inventory_session(
-        device_binding,
+    // 2. Mint the random session/event-cursor capability and seal it at rest.
+    //    The plaintext exists only in this stack frame; the durable lookup hash
+    //    is its SHA-256 and the durable seal is the nonce/ciphertext pair. The
+    //    binding is the event-cursor-receipt shape (no predecessor, no envelope
+    //    hash) derived from the session row's own columns.
+    let capability =
+        mint_capability_token(random).map_err(InventoryRepositoryError::SecureRandom)?;
+    let capability_hash = capability.lookup_hash();
+    let event_cursor_binding = SealerBinding::for_event_cursor_receipt(
         request.inventory_session_id,
-        &event_cursor,
+        user_did.as_bytes(),
+        device_id,
+        jkt.as_bytes(),
+        auth_generation,
+        protocol.protocol_instance_id,
+        protocol.cursor_key_id.as_bytes(),
         snapshot_event_position,
-        expires_at,
-        issued_at,
+        None,
         retained_floor,
-        head_event_position,
-    )?;
-    let token = codec.issue_inventory_session_id(
-        &session_binding,
-        issued_at,
-        retained_floor,
-        head_event_position,
-    )?;
-    let token_hash = token.binding_hash();
-    let snapshot_event_cursor_bytes = event_cursor.as_str().as_bytes().to_vec();
-    let snapshot_event_cursor_sha256: [u8; 32] =
-        Sha256::digest(&snapshot_event_cursor_bytes).into();
+        unix_seconds(created_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        unix_seconds(expires_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+    )
+    .map_err(InventoryRepositoryError::Sealer)?;
+    let sealed_cursor = sealer
+        .seal_successor(capability.as_bytes(), &event_cursor_binding, random)
+        .map_err(InventoryRepositoryError::Sealer)?;
 
-    // 4. Insert the session with all domains INCOMPLETE first, so every item
-    //    FK (including the recipient composite FK on the owner identity) resolves
-    //    before completion evidence is recorded.
+    // 3. Insert the session with all domains INCOMPLETE and all *_consumed
+    //    FALSE first, so every item FK (including the recipient composite FK on
+    //    the owner identity) resolves before completion evidence is recorded.
+    //    `legacy_cursor_invalidated_at` stays NULL: the G7 binding check
+    //    requires the sealed-cursor arm for a live session.
     sqlx::query(
         r#"
         INSERT INTO chat.inventory_sessions(
             inventory_session_id, token_hash, user_did, device_id, jkt,
-            auth_generation, snapshot_event_position, snapshot_event_cursor_bytes,
-            snapshot_event_cursor_sha256, created_at, expires_at,
-            conversations_complete, welcomes_complete, recovery_complete
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,FALSE,FALSE)
+            auth_generation, snapshot_event_position, snapshot_event_cursor_sha256,
+            created_at, expires_at, protocol_instance_id, cursor_key_id,
+            cursor_format_version, snapshot_retained_floor,
+            snapshot_event_cursor_nonce, snapshot_event_cursor_ciphertext,
+            conversations_complete, welcomes_complete, recovery_complete,
+            conversations_consumed, welcomes_consumed, recovery_consumed
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,$13,$14,$15,
+                  FALSE,FALSE,FALSE,FALSE,FALSE,FALSE)
         "#,
     )
     .bind(request.inventory_session_id)
-    .bind(token_hash.as_slice())
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .bind(request.jkt)
-    .bind(
-        i64::try_from(request.auth_generation)
-            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
-    )
+    .bind(capability_hash.as_slice())
+    .bind(&user_did)
+    .bind(device_id)
+    .bind(&jkt)
+    .bind(i64::try_from(auth_generation).map_err(|_| InventoryRepositoryError::DurableRowInvalid)?)
     .bind(
         i64::try_from(snapshot_event_position)
             .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
     )
-    .bind(&snapshot_event_cursor_bytes)
-    .bind(snapshot_event_cursor_sha256.as_slice())
-    .bind(request.created_at)
-    .bind(request.expires_at)
+    .bind(capability_hash.as_slice())
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(protocol.protocol_instance_id)
+    .bind(&protocol.cursor_key_id)
+    .bind(i64::try_from(retained_floor).map_err(|_| InventoryRepositoryError::DurableRowInvalid)?)
+    .bind(&sealed_cursor.nonce)
+    .bind(&sealed_cursor.ciphertext)
     .execute(&mut **transaction)
     .await?;
 
-    // 5. Repository-owned SELECTION for every shared domain under the captured
-    //    fence, a SINGLE fence re-validation covering all of them, then
-    //    materialization with canonical ordinals 0..count-1. The repository owns
-    //    WHICH rows (device-scoped, status-current) each domain contains and the
-    //    ordinals + payload_sha256; payload BYTES are per-arm (conversation/work =
-    //    caller Task-4 wire; Welcome/request = server-derived persisted source).
-    //
-    // 5a. Conversation domain — select the conversations this device is a CURRENT
-    //     member of (an active `chat.member_devices` leaf), and bind the caller's
-    //     supplied payloads to that set by exact bijection: a selected conversation
-    //     with no supplied payload, a supplied payload for a non-member conversation,
-    //     or a duplicate id, is a hard error. Ordinals ascend by `conversation_id`.
-    let selected_conversation_ids: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT DISTINCT conversation_id
-          FROM chat.member_devices
-         WHERE user_did = $1 AND device_id = $2 AND active
-         ORDER BY conversation_id
-        "#,
-    )
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .fetch_all(&mut **transaction)
-    .await?;
+    // 4. The durable-row loader seam over the just-inserted row, then the fence
+    //    verification (which consumes the device) and the conversation
+    //    authorities that select the materialization.
+    let locked_row = lock_inventory_session_row(transaction, request.inventory_session_id)
+        .await?
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let fence = verify_locked_inventory_fence(transaction, device, &locked_row).await?;
+    let authorities = super::super::read_authority::inventory_authorities(transaction, fence)
+        .await
+        .map_err(InventoryRepositoryError::ReadAuthority)?;
 
-    let mut supplied_conversations: std::collections::BTreeMap<Uuid, &ConversationInventoryItem> =
-        std::collections::BTreeMap::new();
-    for item in &request.conversations {
-        if supplied_conversations
-            .insert(item.conversation_id, item)
-            .is_some()
-        {
-            // A duplicate conversation id in the caller's set.
-            return Err(InventoryRepositoryError::InconsistentConversationSelection);
-        }
-    }
-    if supplied_conversations.len() != selected_conversation_ids.len()
-        || !selected_conversation_ids
-            .iter()
-            .all(|id| supplied_conversations.contains_key(id))
-    {
-        return Err(InventoryRepositoryError::InconsistentConversationSelection);
-    }
-
-    // 5b. Welcome domain — select the device's `status='pending'` deliveries and
-    //     derive each payload from the persisted `welcome_bundles.wrapper_bytes`
-    //     (server-derived; the caller echoes only the `welcome_id` set). Terminal
-    //     deliveries (acknowledged/rejected/expired/superseded) are history and are
-    //     excluded here. Ordinals ascend by `welcome_id`.
-    let selected_welcomes: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
-        r#"
-        SELECT wd.welcome_id, wb.wrapper_bytes
-          FROM chat.welcome_deliveries wd
-          JOIN chat.welcome_bundles wb ON wb.welcome_id = wd.welcome_id
-         WHERE wd.recipient_did = $1
-           AND wd.recipient_device_id = $2
-           AND wd.status = 'pending'
-         ORDER BY wd.welcome_id
-        "#,
-    )
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-
-    let mut echoed_welcomes: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
-    for item in &request.welcomes {
-        if !echoed_welcomes.insert(item.welcome_id) {
-            return Err(InventoryRepositoryError::InconsistentWelcomeSelection);
-        }
-    }
-    if echoed_welcomes.len() != selected_welcomes.len()
-        || !selected_welcomes
-            .iter()
-            .all(|(welcome_id, _)| echoed_welcomes.contains(welcome_id))
-    {
-        return Err(InventoryRepositoryError::InconsistentWelcomeSelection);
-    }
-
-    // 5c. Recovery domain, leafRecoveryRequest arm — select the device's
-    //     `status='open'` requests and derive each payload from the persisted
-    //     `leaf_recovery_requests.signed_request_bytes` (server-derived; the caller
-    //     echoes only the request id). Terminal requests (fulfilled/cancelled/
-    //     expired/superseded) are excluded. Ordinals ascend by `recovery_request_id`.
-    let selected_requests: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
-        r#"
-        SELECT recovery_request_id, signed_request_bytes
-          FROM chat.leaf_recovery_requests
-         WHERE requester_did = $1
-           AND requester_device_id = $2
-           AND status = 'open'
-         ORDER BY recovery_request_id
-        "#,
-    )
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-
-    // 5d. Recovery domain, recoveryWork arm — select the device's `status='pending'`
-    //     work items; the caller supplies the payload per selected id (no persisted
-    //     wire, so bijection-bound like the conversation arm). Terminal work
-    //     (completed/superseded) is excluded. Ordinals ascend by `recovery_work_id`.
-    let selected_work_ids: Vec<Uuid> = sqlx::query_scalar(
-        r#"
-        SELECT recovery_work_id
-          FROM chat.recovery_work_items
-         WHERE recipient_did = $1
-           AND recipient_device_id = $2
-           AND status = 'pending'
-         ORDER BY recovery_work_id
-        "#,
-    )
-    .bind(request.user_did)
-    .bind(request.device_id)
-    .fetch_all(&mut **transaction)
-    .await?;
-
-    let mut echoed_requests: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
-    let mut supplied_work: std::collections::BTreeMap<Uuid, &Vec<u8>> =
-        std::collections::BTreeMap::new();
-    for item in &request.recovery {
-        match item {
-            RecoveryInventoryItem::LeafRecoveryRequest {
-                recovery_request_id,
-            } => {
-                if !echoed_requests.insert(*recovery_request_id) {
-                    return Err(InventoryRepositoryError::InconsistentRecoverySelection);
-                }
-            }
-            RecoveryInventoryItem::RecoveryWork {
-                recovery_work_id,
-                payload_bytes,
-            } => {
-                if supplied_work
-                    .insert(*recovery_work_id, payload_bytes)
-                    .is_some()
-                {
-                    return Err(InventoryRepositoryError::InconsistentRecoverySelection);
-                }
-            }
-        }
-    }
-    if echoed_requests.len() != selected_requests.len()
-        || !selected_requests
-            .iter()
-            .all(|(id, _)| echoed_requests.contains(id))
-        || supplied_work.len() != selected_work_ids.len()
-        || !selected_work_ids
-            .iter()
-            .all(|id| supplied_work.contains_key(id))
-    {
-        return Err(InventoryRepositoryError::InconsistentRecoverySelection);
-    }
-
-    // 5e. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
-    //     extended 4c to run ONCE after ALL domain selections. The device-scoped
-    //     selections above (conversation membership, pending Welcome deliveries, open
-    //     leaf-recovery requests, pending recovery work) run WITHOUT `FOR UPDATE` on
-    //     their source rows — locking them would span every conversation/delivery of
-    //     the device and invert the transition executor's head->family lock order (a
-    //     deadlock surface). Instead, re-read the fence anchors captured in step 1
-    //     and require them UNCHANGED immediately before the materialization inserts;
-    //     if any moved, a selection-affecting mutation may have interleaved, so fail
-    //     with the retryable `SnapshotConflict` (the transaction has written only the
-    //     still-incomplete session row, which rolls back with zero residue — the
-    //     caller re-runs `create_inventory_session`).
-    //
-    //     COVERAGE PROOF (the single re-validated anchor set covers EVERY domain's
-    //     selection read set). Every mutation class that can change any selection
-    //     result is visible through a re-validated anchor:
-    //       * Welcome-delivery status change, leaf-recovery request/work
-    //         terminalization via a transition, membership/participant change, and
-    //         conversation lifecycle each append a `chat.events` row
-    //         (`welcomeDisposition` / `leafRecovery` / `leaveRequest` /
-    //         `conversationChanged` / `conversationClosed`), advancing the global
-    //         head — caught here. This is exactly the write path for the pending->
-    //         terminal transitions the welcome/recovery selections filter on.
-    //       * device revocation (auth domain, no `chat.events` kind) revokes the
-    //         target via `UPDATE chat.devices` (transition.rs / auth.rs), which
-    //         takes the row lock this function already holds `FOR UPDATE` on the
-    //         SESSION device (step 2). Every selection is device-scoped to that one
-    //         device, so a revocation able to change any selection must lock that row
-    //         and therefore blocks until this transaction ends — covered by the lock,
-    //         not the head. No selection reads another device's revocation state.
-    //     The retention floor is pinned `FOR UPDATE` in step 1 (cannot move); the
-    //     head is the only anchor a concurrent committer can advance, so re-reading
-    //     it is the load-bearing check.
+    // 5. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
+    //    extended to run ONCE after the authorities derivation and immediately
+    //    before the materialization inserts. If the head moved, a
+    //    selection-affecting mutation may have interleaved, so fail with the
+    //    retryable `SnapshotConflict` (the transaction has written only the
+    //    still-incomplete session row, which rolls back with zero residue — the
+    //    caller re-runs the whole create).
     let revalidated_head: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT max(event_position)
@@ -2382,49 +1795,80 @@ pub(crate) async fn create_inventory_session(
         return Err(InventoryRepositoryError::SnapshotConflict);
     }
 
-    // 5f. Materialize the conversation domain (caller payload).
-    for (ordinal, conversation_id) in selected_conversation_ids.iter().enumerate() {
-        let ordinal =
-            i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
-        let item = supplied_conversations[conversation_id];
-        let payload_sha256: [u8; 32] = Sha256::digest(&item.payload_bytes).into();
-        let (transition_id, fingerprint, terminal_seq) = match &item.schedule_terminal {
-            Some(proof) => (
-                Some(proof.transition_id),
-                Some(proof.outer_entry_fingerprint.to_vec()),
-                Some(proof.terminal_seq),
-            ),
-            None => (None, None, None),
-        };
+    // 6. Materialize each domain from the C1 typed loaders -> projections ->
+    //    canonical encoder, encoding every item EXACTLY ONCE and retaining the
+    //    canonical bytes as the item payloads.
+    //
+    // 6a. Conversation domain: one item per authority, in ascending
+    //     conversation_id order, with the exact arm-provenance columns the
+    //     source-precedence trigger and the materialization digest transcript
+    //     require.
+    let mut conversation_ordinal: i64 = 0;
+    for authority in authorities.iter() {
+        let source =
+            conversation_projection_source(transaction, authority, &user_did, device_id).await?;
+        let dto = super::super::read_projection::conversation_inventory_item(&source)
+            .map_err(InventoryRepositoryError::Projection)?;
+        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+            &dto,
+            "blue.catbird.chat.defs#conversationInventoryItem",
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let payload_sha256 = canonical.sha256();
+        let arm_columns =
+            conversation_arm_columns(transaction, authority, &user_did, device_id).await?;
         sqlx::query(
             r#"
             INSERT INTO chat.inventory_conversation_items(
                 inventory_session_id, ordinal, conversation_id, recipient_did,
-                recipient_device_id, schedule_terminal_transition_id,
-                schedule_terminal_outer_entry_fingerprint, schedule_terminal_seq,
+                recipient_device_id, item_kind, participant_period_id,
+                membership_interval_id, interval_terminal_seq,
+                interval_closing_transition_id,
+                interval_closing_outer_entry_fingerprint, interval_removed_at,
+                schedule_terminal_seq, schedule_terminal_transition_id,
+                schedule_terminal_outer_entry_fingerprint,
                 item_key_bytes, payload_bytes, payload_sha256
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,uuid_send($3),$9,$10)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                      uuid_send($3),$16,$17)
             "#,
         )
         .bind(request.inventory_session_id)
-        .bind(ordinal)
-        .bind(*conversation_id)
-        .bind(request.user_did)
-        .bind(request.device_id)
-        .bind(transition_id)
-        .bind(fingerprint)
-        .bind(terminal_seq)
-        .bind(&item.payload_bytes)
+        .bind(conversation_ordinal)
+        .bind(authority.conversation_id())
+        .bind(&user_did)
+        .bind(device_id)
+        .bind(arm_columns.item_kind)
+        .bind(arm_columns.participant_period_id)
+        .bind(arm_columns.membership_interval_id)
+        .bind(arm_columns.interval_terminal_seq)
+        .bind(arm_columns.interval_closing_transition_id)
+        .bind(arm_columns.interval_closing_outer_entry_fingerprint)
+        .bind(arm_columns.interval_removed_at)
+        .bind(arm_columns.schedule_terminal_seq)
+        .bind(arm_columns.schedule_terminal_transition_id)
+        .bind(arm_columns.schedule_terminal_outer_entry_fingerprint)
+        .bind(canonical.bytes())
         .bind(payload_sha256.as_slice())
         .execute(&mut **transaction)
         .await?;
+        conversation_ordinal += 1;
     }
 
-    // 5g. Materialize the Welcome domain (server-derived payload = wrapper_bytes).
-    for (ordinal, (welcome_id, wrapper_bytes)) in selected_welcomes.iter().enumerate() {
+    // 6b. Welcome domain — the exact device's `status='pending'` deliveries,
+    //     payload server-derived from `welcome_bundles.wrapper_bytes`. Ordinals
+    //     ascend by `welcome_id`.
+    let welcome_sources = retained_welcome_sources(transaction, &user_did, device_id).await?;
+    for (ordinal, (welcome_id, source)) in welcome_sources.iter().enumerate() {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
-        let payload_sha256: [u8; 32] = Sha256::digest(wrapper_bytes).into();
+        let dto = super::super::read_projection::welcome_view(source)
+            .map_err(InventoryRepositoryError::Projection)?;
+        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+            &dto,
+            "blue.catbird.chat.defs#welcomeView",
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let payload_sha256 = canonical.sha256();
         sqlx::query(
             r#"
             INSERT INTO chat.inventory_welcome_items(
@@ -2436,23 +1880,29 @@ pub(crate) async fn create_inventory_session(
         .bind(request.inventory_session_id)
         .bind(ordinal)
         .bind(*welcome_id)
-        .bind(request.user_did)
-        .bind(request.device_id)
-        .bind(wrapper_bytes)
+        .bind(&user_did)
+        .bind(device_id)
+        .bind(canonical.bytes())
         .bind(payload_sha256.as_slice())
         .execute(&mut **transaction)
         .await?;
     }
 
-    // 5h. Materialize the recovery domain into one canonical ordinal sequence: the
-    //     leafRecoveryRequest arm first (0x00-prefixed item keys, server-derived
-    //     `signed_request_bytes`), then the recoveryWork arm (0x01-prefixed keys,
-    //     caller payload). This yields ordinals ascending in item-key order.
+    // 6c. Recovery domain — every retained leaf-recovery request (all five
+    //     statuses) then every retained recovery-work item (all three statuses),
+    //     one canonical ordinal sequence with 0x00/0x01-prefixed item keys.
+    let recovery_entries =
+        retained_recovery_inbox_entries(transaction, &user_did, device_id).await?;
     let mut recovery_ordinal: i64 = 0;
-    for (recovery_request_id, signed_request_bytes) in &selected_requests {
-        let mut item_key = vec![0x00u8];
-        item_key.extend_from_slice(recovery_request_id.as_bytes());
-        let payload_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
+    for entry in recovery_entries {
+        let dto = super::super::read_projection::leaf_recovery_inbox_item(entry.input)
+            .map_err(InventoryRepositoryError::Projection)?;
+        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+            &dto,
+            "blue.catbird.chat.defs#leafRecoveryInboxItem",
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let payload_sha256 = canonical.sha256();
         sqlx::query(
             r#"
             INSERT INTO chat.inventory_recovery_items(
@@ -2464,85 +1914,57 @@ pub(crate) async fn create_inventory_session(
         )
         .bind(request.inventory_session_id)
         .bind(recovery_ordinal)
-        .bind("leafRecoveryRequest")
-        .bind(Some(*recovery_request_id))
-        .bind(Option::<Uuid>::None)
-        .bind(request.user_did)
-        .bind(request.device_id)
-        .bind(&item_key)
-        .bind(signed_request_bytes)
-        .bind(payload_sha256.as_slice())
-        .execute(&mut **transaction)
-        .await?;
-        recovery_ordinal += 1;
-    }
-    for recovery_work_id in &selected_work_ids {
-        let payload = supplied_work[recovery_work_id];
-        let mut item_key = vec![0x01u8];
-        item_key.extend_from_slice(recovery_work_id.as_bytes());
-        let payload_sha256: [u8; 32] = Sha256::digest(payload).into();
-        sqlx::query(
-            r#"
-            INSERT INTO chat.inventory_recovery_items(
-                inventory_session_id, ordinal, item_kind, leaf_recovery_request_id,
-                recovery_work_id, recipient_did, recipient_device_id,
-                item_key_bytes, payload_bytes, payload_sha256
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            "#,
-        )
-        .bind(request.inventory_session_id)
-        .bind(recovery_ordinal)
-        .bind("recoveryWork")
-        .bind(Option::<Uuid>::None)
-        .bind(Some(*recovery_work_id))
-        .bind(request.user_did)
-        .bind(request.device_id)
-        .bind(&item_key)
-        .bind(payload)
+        .bind(entry.item_kind)
+        .bind(entry.leaf_recovery_request_id)
+        .bind(entry.recovery_work_id)
+        .bind(&user_did)
+        .bind(device_id)
+        .bind(&entry.item_key_bytes)
+        .bind(canonical.bytes())
         .bind(payload_sha256.as_slice())
         .execute(&mut **transaction)
         .await?;
         recovery_ordinal += 1;
     }
 
-    // 6. Record per-domain completion evidence from the exact projection the
-    //    materialization trigger recomputes (via the existing digest reader), then
+    // 7. Record per-domain completion evidence from the exact projection the
+    //    materialization trigger recomputes (the G7 aggregate transcript
+    //    including item kind, arm provenance, and payload byte length), then
     //    mark each domain complete. A single-transaction full snapshot completes
-    //    every domain here; the paged path would instead complete incrementally.
-    let (conversation_item_count, conversation_hash) = validate_materialization_digest(
-        read_materialization_digest(
+    //    every domain here.
+    let (conversation_item_count, conversation_hash, conversation_payload_bytes) =
+        read_g7_materialization_digest(
             transaction,
             InventoryPageDomain::Conversations,
             request.inventory_session_id,
         )
-        .await?,
-    )?;
-    let (welcome_item_count, welcome_hash) = validate_materialization_digest(
-        read_materialization_digest(
-            transaction,
-            InventoryPageDomain::PendingWelcomes,
-            request.inventory_session_id,
-        )
-        .await?,
-    )?;
-    let (recovery_item_count, recovery_hash) = validate_materialization_digest(
-        read_materialization_digest(
+        .await?;
+    let (welcome_item_count, welcome_hash, welcome_payload_bytes) = read_g7_materialization_digest(
+        transaction,
+        InventoryPageDomain::PendingWelcomes,
+        request.inventory_session_id,
+    )
+    .await?;
+    let (recovery_item_count, recovery_hash, recovery_payload_bytes) =
+        read_g7_materialization_digest(
             transaction,
             InventoryPageDomain::LeafRecovery,
             request.inventory_session_id,
         )
-        .await?,
-    )?;
+        .await?;
 
     sqlx::query(
         r#"
         UPDATE chat.inventory_sessions
            SET conversations_complete = TRUE,
                conversation_item_count = $2, conversation_items_sha256 = $3,
+               conversation_payload_bytes = $4,
                welcomes_complete = TRUE,
-               welcome_item_count = $4, welcome_items_sha256 = $5,
+               welcome_item_count = $5, welcome_items_sha256 = $6,
+               welcome_payload_bytes = $7,
                recovery_complete = TRUE,
-               recovery_item_count = $6, recovery_items_sha256 = $7
+               recovery_item_count = $8, recovery_items_sha256 = $9,
+               recovery_payload_bytes = $10
          WHERE inventory_session_id = $1
         "#,
     )
@@ -2551,21 +1973,33 @@ pub(crate) async fn create_inventory_session(
         i64::try_from(conversation_item_count)
             .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
     )
-    .bind(conversation_hash.to_vec())
+    .bind(conversation_hash.as_slice())
+    .bind(
+        i64::try_from(conversation_payload_bytes)
+            .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+    )
     .bind(
         i64::try_from(welcome_item_count)
             .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
     )
-    .bind(welcome_hash.to_vec())
+    .bind(welcome_hash.as_slice())
+    .bind(
+        i64::try_from(welcome_payload_bytes)
+            .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+    )
     .bind(
         i64::try_from(recovery_item_count)
             .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
     )
-    .bind(recovery_hash.to_vec())
+    .bind(recovery_hash.as_slice())
+    .bind(
+        i64::try_from(recovery_payload_bytes)
+            .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+    )
     .execute(&mut **transaction)
     .await?;
 
-    // 7. Force the deferred session-level triggers IMMEDIATE so a materialization
+    // 8. Force the deferred session-level triggers IMMEDIATE so a materialization
     //    or authentication-identity mismatch surfaces as this call's error, not a
     //    detached COMMIT failure. (Item-level deferred source FKs still resolve at
     //    COMMIT; the materialization trigger already re-checks recipient + proof
@@ -2579,11 +2013,11 @@ pub(crate) async fn create_inventory_session(
 
     Ok(CreatedInventorySession {
         inventory_session_id: request.inventory_session_id,
-        inventory_session_token: token.as_str().to_owned(),
+        inventory_session_token: capability.encode(),
         snapshot_event_position,
-        snapshot_event_cursor_bytes,
-        created_at: request.created_at,
-        expires_at: request.expires_at,
+        snapshot_event_cursor_bytes: capability.as_bytes().to_vec(),
+        created_at,
+        expires_at,
         conversation_item_count,
         welcome_item_count,
         recovery_item_count,
@@ -3444,4 +2878,2850 @@ async fn materialize_own_device_snapshot(
             extra_data: None,
         };
     Ok(OwnDeviceSnapshotOutcome::Materialized(output))
+}
+// ===========================================================================
+// D-2: the production inventory facade, typed loaders, and receipt wiring.
+//
+// `create_inventory_snapshot_and_first_page` is the ONE production facade for
+// the clean-chat inventory endpoints (blue.catbird.chat.getConversations /
+// getPendingWelcomes / getLeafRecoveryInbox). It owns exactly three whole-call
+// READ COMMITTED attempts, uses a fresh B-read guard per attempt, and serves
+// the first page of the requested domain from a retained session.
+//
+// Session identity is DETERMINISTIC per verified device: the v4-masked SHA-256
+// over (user_did, device_id, jkt, auth_generation) is the retained row key, so
+// a repeated call — a lost-response retry, a no-cursor Welcome/recovery read,
+// or a concurrent second initial creator — deterministically selects the SAME
+// session and its initial receipts. The session CAPABILITY is a single random
+// 32-byte capability (43-character base64url) that is BOTH the presented
+// `inventorySessionId` and the presented `snapshotEventCursor`; only its
+// SHA-256 is persisted (token_hash + snapshot_event_cursor_sha256) and the
+// plaintext is sealed at rest (12-byte nonce + ciphertext) under the active
+// database-pinned cursor key, so every replay decrypts the IDENTICAL
+// capability and the complete response bytes match the stored SHA-256
+// byte-for-byte. Page successor capabilities are likewise random, sealed in
+// the served receipt, and decrypted identically on replay.
+//
+// Receipts are hash-located: the continuation/final paths select by
+// `request_cursor_hash` (the SHA-256 of the presented successor plaintext) and
+// never decode authority fields from the public cursor. Materialization
+// `*_complete` is proven at creation and never mutated by a page call; the
+// first-final-page `*_consumed` compare-and-set is separate and monotonic.
+// ===========================================================================
+
+/// The three clean-chat inventory domains served by the facade and the receipt
+/// layer. Each maps to one closed endpoint NSID, one receipt `domain` text,
+/// and one per-session item table.
+///
+/// Purpose-staged: constructed by the G/H handler lanes (and the D-3 tests);
+/// in the library the variants and derived helpers are not yet exercised, so
+/// the dead-code lint is documented rather than papered over.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InventoryDomain {
+    Conversations,
+    Welcomes,
+    Recovery,
+}
+
+/// Purpose-staged (see the enum): the derived helpers are exercised by the
+/// G/H handler lanes and the D-3 tests.
+#[allow(dead_code)]
+impl InventoryDomain {
+    /// The receipt `domain` column value for this domain.
+    pub(crate) const fn receipt_domain_text(self) -> &'static str {
+        match self {
+            Self::Conversations => "conversations",
+            Self::Welcomes => "welcomes",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    /// The closed endpoint NSID bound to this domain.
+    pub(crate) const fn endpoint_nsid(self) -> &'static str {
+        match self {
+            Self::Conversations => INVENTORY_CONVERSATIONS_NSID,
+            Self::Welcomes => INVENTORY_WELCOMES_NSID,
+            Self::Recovery => INVENTORY_RECOVERY_NSID,
+        }
+    }
+
+    /// The per-session item table for this domain.
+    pub(crate) const fn item_table(self) -> &'static str {
+        match self {
+            Self::Conversations => "chat.inventory_conversation_items",
+            Self::Welcomes => "chat.inventory_welcome_items",
+            Self::Recovery => "chat.inventory_recovery_items",
+        }
+    }
+
+    /// The corresponding cursor-codec page domain (receipt/item-table domain).
+    pub(crate) const fn page_domain(self) -> InventoryPageDomain {
+        match self {
+            Self::Conversations => InventoryPageDomain::Conversations,
+            Self::Welcomes => InventoryPageDomain::PendingWelcomes,
+            Self::Recovery => InventoryPageDomain::LeafRecovery,
+        }
+    }
+}
+
+/// `blue.catbird.chat.getConversations`
+pub(crate) const INVENTORY_CONVERSATIONS_NSID: &str = "blue.catbird.chat.getConversations";
+/// `blue.catbird.chat.getPendingWelcomes`
+pub(crate) const INVENTORY_WELCOMES_NSID: &str = "blue.catbird.chat.getPendingWelcomes";
+/// `blue.catbird.chat.getLeafRecoveryInbox`
+pub(crate) const INVENTORY_RECOVERY_NSID: &str = "blue.catbird.chat.getLeafRecoveryInbox";
+
+/// The frozen internal inventory request fields: endpoint NSID, cursor format
+/// version (exactly 1), domain, exact public limit (1..=100), and the canonical
+/// filter SHA-256 (the SHA-256 of the canonical `[]` when the endpoint has no
+/// public filter). It never carries raw caller identity, generation, or payload
+/// bytes — the identity comes from the admission's B-read guard.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InventoryPublicRequestBinding {
+    endpoint_nsid: &'static str,
+    cursor_format_version: u16,
+    domain: InventoryDomain,
+    limit: u16,
+    canonical_filter_sha256: [u8; 32],
+}
+
+/// Purpose-staged: the validating constructor is exercised by the G/H handler
+/// lanes and the D-3 tests; the library only receives already-built bindings.
+#[allow(dead_code)]
+impl InventoryPublicRequestBinding {
+    /// Validating constructor: the format version must be exactly 1, the limit
+    /// must be within 1..=100, the filter digest must be nonzero, and the
+    /// endpoint NSID must be the closed NSID of the domain.
+    pub(crate) fn new(
+        endpoint_nsid: &'static str,
+        cursor_format_version: u16,
+        domain: InventoryDomain,
+        limit: u16,
+        canonical_filter_sha256: [u8; 32],
+    ) -> Result<Self, InventoryRepositoryError> {
+        if cursor_format_version != 1
+            || !(1..=MAX_INVENTORY_PAGE_ITEMS).contains(&u64::from(limit))
+            || canonical_filter_sha256 == [0; 32]
+            || endpoint_nsid != domain.endpoint_nsid()
+        {
+            return Err(InventoryRepositoryError::InvalidMaterialization);
+        }
+        Ok(Self {
+            endpoint_nsid,
+            cursor_format_version,
+            domain,
+            limit,
+            canonical_filter_sha256,
+        })
+    }
+
+    pub(crate) fn endpoint_nsid(&self) -> &'static str {
+        self.endpoint_nsid
+    }
+
+    pub(crate) const fn cursor_format_version(&self) -> u16 {
+        self.cursor_format_version
+    }
+
+    pub(crate) const fn domain(&self) -> InventoryDomain {
+        self.domain
+    }
+
+    pub(crate) const fn limit(&self) -> u16 {
+        self.limit
+    }
+
+    pub(crate) const fn canonical_filter_sha256(&self) -> [u8; 32] {
+        self.canonical_filter_sha256
+    }
+}
+
+/// Consuming canonical inventory page response: the checked canonical bytes
+/// plus their SHA-256. Both fields are private; consumers receive them through
+/// accessors only.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct CanonicalInventoryResponse {
+    bytes: Vec<u8>,
+    sha256: [u8; 32],
+}
+
+/// Redacted `Debug`: the response bytes embed the session capability text
+/// (`inventorySessionId`, `snapshotEventCursor`) and, when present, the
+/// successor capability (`nextPageCursor`), so no `Debug` rendering may carry
+/// them (binding constraint: capability plaintexts never appear in `Debug`
+/// output). Only the non-secret response SHA-256 is printed.
+impl std::fmt::Debug for CanonicalInventoryResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CanonicalInventoryResponse")
+            .field("bytes", &"REDACTED")
+            .field("sha256", &self.sha256)
+            .finish()
+    }
+}
+
+/// Purpose-staged: the accessors are exercised by the G/H handler lanes and
+/// the D-3 tests; the library only moves the response out of the facade.
+#[allow(dead_code)]
+impl CanonicalInventoryResponse {
+    /// Validating constructor: the SHA-256 must be the digest of the bytes and
+    /// the bytes must respect the 16 MiB + 64 KiB response ceiling.
+    pub(crate) fn checked(
+        bytes: Vec<u8>,
+        sha256: [u8; 32],
+    ) -> Result<Self, InventoryRepositoryError> {
+        if bytes.len() > MAX_RESPONSE_BYTES || <[u8; 32]>::from(Sha256::digest(&bytes)) != sha256 {
+            return Err(InventoryRepositoryError::InvalidMaterialization);
+        }
+        Ok(Self { bytes, sha256 })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// The 16 MiB + 64 KiB response ceiling (read-semantics plan line 24). Shared
+/// by the unconditional validating response constructor and the page
+/// accumulation, so it is unconditional.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024 + 64 * 1024;
+/// Envelope headroom reserved for the response wrapper (hasMore,
+/// inventorySessionId, nextPageCursor, snapshotEventCursor, snapshotExpiresAt)
+/// while the page accumulation respects the 16 MiB + 64 KiB response ceiling.
+const PAGE_ENVELOPE_HEADROOM: usize = 1024;
+
+/// The only production source of the retained session identity: the v4-masked
+/// SHA-256 over the verified (DID, device, JKT, auth generation) coordinates.
+/// The schema's `chat.is_uuid_v4` check validates only the variant/version
+/// nibbles, so the deterministic identity is masked to the v4 shape. The value
+/// is a row handle, never a bearer: every page call still requires the DPoP
+/// admission for the exact device, and the bearer is the random sealed
+/// capability.
+fn derive_inventory_session_uuid(
+    user_did: &str,
+    device_id: Uuid,
+    jkt: &str,
+    auth_generation: u64,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+    digest.update((user_did.len() as u64).to_be_bytes());
+    digest.update(user_did.as_bytes());
+    digest.update(device_id.as_bytes());
+    digest.update((jkt.len() as u64).to_be_bytes());
+    digest.update(jkt.as_bytes());
+    digest.update(auth_generation.to_be_bytes());
+    let bytes: [u8; 32] = digest.finalize().into();
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&bytes[..16]);
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
+    Uuid::from_bytes(uuid_bytes)
+}
+
+/// The repository-owned whole-second base instant for a session/receipt:
+/// `transaction_timestamp()` truncated to a whole second by the database. This
+/// is the ONLY clock the D-2 facade uses; it never samples a wall clock in
+/// process.
+async fn current_whole_second(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<DateTime<Utc>, InventoryRepositoryError> {
+    Ok(
+        sqlx::query_scalar("SELECT date_trunc('second', transaction_timestamp())")
+            .fetch_one(&mut **transaction)
+            .await?,
+    )
+}
+
+/// The checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`) the C1 checked
+/// sources and the canonical response require.
+fn canonical_datetime(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// The checked cipher-suite constant of the sealed protocol (single value).
+#[cfg(not(test))]
+const INVENTORY_CIPHER_SUITE_V1: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
+/// The generated key-package artifact framing/content-type constants (single
+/// value; no durable columns carry them).
+#[cfg(not(test))]
+const INVENTORY_KEY_PACKAGE_FRAMING: &str = "mlsMessage";
+#[cfg(not(test))]
+const INVENTORY_KEY_PACKAGE_CONTENT_TYPE: &str = "keyPackage";
+
+/// The locked durable session row consumed by the loader seam. Everything the
+/// page serve, the receipts, and the fence verification need comes from this
+/// row; no plaintext capability column exists (only the seal + lookup hash).
+#[derive(Debug, FromRow)]
+struct InventorySessionFenceLockRow {
+    inventory_session_id: Uuid,
+    user_did: String,
+    device_id: Uuid,
+    jkt: String,
+    auth_generation: i64,
+    snapshot_event_position: i64,
+    snapshot_event_cursor_sha256: Vec<u8>,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    protocol_instance_id: Uuid,
+    cursor_key_id: String,
+    cursor_format_version: i16,
+    snapshot_retained_floor: i64,
+    snapshot_event_cursor_nonce: Vec<u8>,
+    snapshot_event_cursor_ciphertext: Vec<u8>,
+    legacy_cursor_invalidated_at: Option<DateTime<Utc>>,
+}
+
+/// The loader seam: the unchanged `SELECT ... FOR UPDATE` contract over the
+/// retained session row, keyed by the deterministic session identity.
+async fn lock_inventory_session_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    inventory_session_id: Uuid,
+) -> Result<Option<InventorySessionFenceLockRow>, InventoryRepositoryError> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT inventory_session_id, user_did, device_id, jkt, auth_generation,
+               snapshot_event_position, snapshot_event_cursor_sha256,
+               created_at, expires_at, protocol_instance_id, cursor_key_id,
+               cursor_format_version, snapshot_retained_floor,
+               snapshot_event_cursor_nonce, snapshot_event_cursor_ciphertext,
+               legacy_cursor_invalidated_at
+          FROM chat.inventory_sessions
+         WHERE inventory_session_id = $1
+         FOR UPDATE
+        "#,
+    )
+    .bind(inventory_session_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+/// The sole production caller of
+/// `LockedInventoryFenceRecord::from_lock_material` and
+/// `from_locked_inventory_fence_record` (BREAD-03 seam): extract the six
+/// durable fence material fields from the locked row and verify the fence
+/// against the live protocol instance, active cursor key, retention floor, and
+/// temporal bounds. The row must belong to the presenting device.
+#[cfg(not(test))]
+async fn verify_locked_inventory_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: super::super::read_authority::LockedReadDeviceAuthority,
+    row: &InventorySessionFenceLockRow,
+) -> Result<super::super::read_authority::VerifiedInventoryFence, InventoryRepositoryError> {
+    if row.user_did != device.user_did()
+        || row.device_id != device.device_id()
+        || row.jkt != device.jkt()
+        || row.auth_generation
+            != i64::try_from(device.auth_generation())
+                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?
+        || row.legacy_cursor_invalidated_at.is_some()
+        || row.cursor_format_version != 1
+    {
+        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
+    }
+    let event_position = database_protocol_integer(row.snapshot_event_position)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let event_cursor_sha256 = fixed_hash(row.snapshot_event_cursor_sha256.clone())
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let retained_floor = database_protocol_integer(row.snapshot_retained_floor)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let record = super::super::read_authority::LockedInventoryFenceRecord::from_lock_material(
+        row.protocol_instance_id,
+        row.cursor_key_id.clone(),
+        event_position,
+        event_cursor_sha256,
+        retained_floor,
+        row.created_at,
+    )
+    .map_err(InventoryRepositoryError::ReadAuthority)?;
+    let durable_row = super::super::read_authority::from_locked_inventory_fence_record(record);
+    super::super::read_authority::verify_inventory_fence(transaction, device, durable_row)
+        .await
+        .map_err(InventoryRepositoryError::ReadAuthority)
+}
+
+/// The consuming device-authority type of the paging entrypoints
+/// (`serve_initial_inventory_page`, `issue_next_inventory_page_cursor`,
+/// `complete_inventory_page`).
+///
+/// In the production library (`cfg(not(test))`) this IS the B-read
+/// `LockedReadDeviceAuthority`, so the paging entrypoints keep their exact
+/// device-consuming signatures. Under `cfg(test)` — i.e. inside the ten
+/// path-include test harnesses, most of which mount no `read_authority`
+/// module — it is a harness-only identity record. This split is the
+/// final-review fix mandate: the production serve/replay/continuation bodies
+/// must stay compiled and executable in the test harnesses (no test-local
+/// replicas), while nothing referencing `read_authority` may leak into the
+/// partial include trees. The REAL B-read fence chain is driven separately by
+/// the DB suite through its admission bridge.
+#[cfg(not(test))]
+pub(crate) type PagingDeviceAuthority = super::super::read_authority::LockedReadDeviceAuthority;
+
+/// Harness-only device identity for the paging entrypoints (see
+/// `PagingDeviceAuthority`). Carries exactly the identity tuple the fence
+/// binds; it grants nothing on its own.
+#[cfg(test)]
+pub(crate) struct PagingDeviceAuthority {
+    pub(crate) user_did: String,
+    pub(crate) device_id: Uuid,
+    pub(crate) jkt: String,
+    pub(crate) auth_generation: i64,
+}
+
+/// The paging entrypoints' device fence. In production this is the full
+/// consuming B-read fence (`verify_locked_inventory_fence`); under
+/// `cfg(test)` it is the identity/format half of the same check, so a
+/// harness caller can never serve another device's session (the
+/// temporal/protocol half is `revalidate_session_fence`, which runs
+/// unconditionally on every serve, plus the DB suite's real fence-chain
+/// tests through the admission bridge).
+#[cfg(not(test))]
+async fn verify_paging_device_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: PagingDeviceAuthority,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    verify_locked_inventory_fence(transaction, device, row)
+        .await
+        .map(|_| ())
+}
+
+#[cfg(test)]
+async fn verify_paging_device_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: PagingDeviceAuthority,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    let _ = transaction;
+    if row.user_did != device.user_did
+        || row.device_id != device.device_id
+        || row.jkt != device.jkt
+        || row.auth_generation != device.auth_generation
+        || row.legacy_cursor_invalidated_at.is_some()
+        || row.cursor_format_version != 1
+    {
+        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
+    }
+    Ok(())
+}
+
+/// The G6-compatible final fence/source revalidation, run immediately before
+/// the page sealing: the live protocol instance must still own the active
+/// cursor key, the live retention floor must never sit above the snapshot
+/// event position, and the snapshot position must never sit beyond the current
+/// maximum event position. The `FOR UPDATE` protocol re-read is the
+/// deterministic barrier that makes concurrent key drift fail closed.
+async fn revalidate_session_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    let live: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances \
+         WHERE protocol_instance_id=$1 FOR UPDATE",
+    )
+    .bind(row.protocol_instance_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((_, live_cursor_key)) = live else {
+        return Err(InventoryRepositoryError::ProtocolFenceMismatch);
+    };
+    if live_cursor_key != row.cursor_key_id {
+        return Err(InventoryRepositoryError::ProtocolFenceMismatch);
+    }
+    let live_floor: Option<i64> = sqlx::query_scalar(
+        "SELECT retained_floor FROM chat.event_retention \
+         WHERE protocol_instance_id=$1 FOR UPDATE",
+    )
+    .bind(row.protocol_instance_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let snapshot_event_position = u64::try_from(row.snapshot_event_position)
+        .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?;
+    if let Some(floor) = live_floor {
+        if u64::try_from(floor).map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?
+            > snapshot_event_position
+        {
+            return Err(InventoryRepositoryError::ProtocolFenceMismatch);
+        }
+    }
+    let maximum_event_position: i64 =
+        sqlx::query_scalar("SELECT coalesce(max(event_position),0)::bigint FROM chat.events")
+            .fetch_one(&mut **transaction)
+            .await?;
+    if snapshot_event_position
+        > u64::try_from(maximum_event_position)
+            .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?
+    {
+        return Err(InventoryRepositoryError::ProtocolFenceMismatch);
+    }
+    Ok(())
+}
+
+/// Recover the session's opaque capability (the presented `inventorySessionId`
+/// AND `snapshotEventCursor`) by decrypting the sealed snapshot event cursor.
+/// Every replay decrypts the identical plaintext.
+fn verify_successor_capability(
+    sealer: &CursorSealer,
+    row: &InventorySessionFenceLockRow,
+) -> Result<Zeroizing<Vec<u8>>, InventoryRepositoryError> {
+    let binding = SealerBinding::for_event_cursor_receipt(
+        row.inventory_session_id,
+        row.user_did.as_bytes(),
+        row.device_id,
+        row.jkt.as_bytes(),
+        u64::try_from(row.auth_generation)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        row.protocol_instance_id,
+        row.cursor_key_id.as_bytes(),
+        u64::try_from(row.snapshot_event_position)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        None,
+        u64::try_from(row.snapshot_retained_floor)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        unix_seconds(row.created_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+        unix_seconds(row.expires_at).ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+    )
+    .map_err(InventoryRepositoryError::Sealer)?;
+    let nonce: [u8; 12] = row
+        .snapshot_event_cursor_nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let sealed = SealedCapability {
+        nonce,
+        ciphertext: row.snapshot_event_cursor_ciphertext.clone(),
+    };
+    sealer
+        .verify_successor(&sealed, &binding)
+        .map_err(InventoryRepositoryError::Sealer)
+}
+
+/// The `SealerBinding` for one served page receipt, derived from the receipt
+/// row's own columns (the session row + the request + the receipt's own
+/// created/expires instants).
+fn page_receipt_binding(
+    request: &InventoryPublicRequestBinding,
+    row: &InventorySessionFenceLockRow,
+    receipt_created_at: u64,
+    receipt_expires_at: u64,
+    after_ordinal: Option<u64>,
+    successor_cursor_hash: Option<[u8; 32]>,
+) -> Result<SealerBinding, SealerError> {
+    SealerBinding::for_page_receipt(
+        request.domain().receipt_domain_text().as_bytes(),
+        request.endpoint_nsid().as_bytes(),
+        request.cursor_format_version(),
+        row.inventory_session_id,
+        row.user_did.as_bytes(),
+        row.device_id,
+        row.jkt.as_bytes(),
+        u64::try_from(row.auth_generation).map_err(|_| SealerError::InvalidField)?,
+        row.protocol_instance_id,
+        row.cursor_key_id.as_bytes(),
+        u64::try_from(row.snapshot_event_position).map_err(|_| SealerError::InvalidField)?,
+        fixed_hash(row.snapshot_event_cursor_sha256.clone())
+            .map_err(|_| SealerError::InvalidField)?,
+        u64::try_from(row.snapshot_retained_floor).map_err(|_| SealerError::InvalidField)?,
+        request.canonical_filter_sha256(),
+        request.limit(),
+        after_ordinal,
+        successor_cursor_hash,
+        receipt_created_at,
+        receipt_expires_at,
+    )
+}
+
+/// Deterministic response assembly: the generated `*Output` wrapper shape
+/// (`hasMore`, `inventorySessionId`, `items`, optional `nextPageCursor`,
+/// `snapshotEventCursor`, `snapshotExpiresAt`) with the retained canonical item
+/// bytes spliced verbatim. The field order matches the generated serializer and
+/// coincides with the JCS-sorted order; every value is ASCII-safe and the item
+/// bytes are already canonical, so the bytes are fully deterministic and the
+/// stored SHA-256 is reproducible on every replay.
+fn assemble_inventory_page_response(
+    has_more: bool,
+    capability_text: &str,
+    items: &[Vec<u8>],
+    next_page_cursor: Option<&str>,
+    expires_at: DateTime<Utc>,
+) -> Result<Vec<u8>, InventoryRepositoryError> {
+    let mut out = Vec::with_capacity(
+        256 + items.iter().map(Vec::len).sum::<usize>() + 2 * capability_text.len(),
+    );
+    out.extend_from_slice(b"{\"hasMore\":");
+    out.extend_from_slice(if has_more { b"true" } else { b"false" });
+    out.extend_from_slice(b",\"inventorySessionId\":\"");
+    append_json_string(&mut out, capability_text);
+    out.extend_from_slice(b"\",\"items\":[");
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(item);
+    }
+    out.extend_from_slice(b"]");
+    if let Some(cursor) = next_page_cursor {
+        out.extend_from_slice(b",\"nextPageCursor\":\"");
+        append_json_string(&mut out, cursor);
+        out.push(b'"');
+    }
+    out.extend_from_slice(b",\"snapshotEventCursor\":\"");
+    append_json_string(&mut out, capability_text);
+    out.extend_from_slice(b"\",\"snapshotExpiresAt\":\"");
+    append_json_string(&mut out, &canonical_datetime(expires_at));
+    out.extend_from_slice(b"\"}");
+    if out.len() > MAX_RESPONSE_BYTES {
+        return Err(InventoryRepositoryError::InvalidMaterialization);
+    }
+    Ok(out)
+}
+
+fn append_json_string(out: &mut Vec<u8>, value: &str) {
+    for byte in value.bytes() {
+        match byte {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x09 => out.extend_from_slice(b"\\t"),
+            0x0A => out.extend_from_slice(b"\\n"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            0x0D => out.extend_from_slice(b"\\r"),
+            0x00..=0x1F => {
+                out.extend_from_slice(format!("\\u{byte:04x}").as_bytes());
+            }
+            _ => out.push(byte),
+        }
+    }
+}
+
+/// One page of retained canonical item bytes, bounded by the exact limit and
+/// the 16 MiB + 64 KiB response ceiling, plus the has-more verdict.
+struct RetainedPage {
+    items: Vec<Vec<u8>>,
+    first_ordinal: Option<i64>,
+    item_count: i64,
+    items_sha256: [u8; 32],
+    has_more: bool,
+}
+
+/// Read the page of retained items after `after_ordinal` (the initial page
+/// uses -1), probing one row past the limit and accumulating at most
+/// `limit` items while respecting the response ceiling.
+async fn read_retained_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+    after_ordinal: i64,
+) -> Result<RetainedPage, InventoryRepositoryError> {
+    let limit = i64::from(request.limit());
+    let rows = fetch_page_items(
+        transaction,
+        request.domain().page_domain(),
+        row.inventory_session_id,
+        after_ordinal,
+        limit + 1,
+    )
+    .await?;
+    let total_rows = rows.len();
+    let mut items = Vec::with_capacity(total_rows.min(limit as usize));
+    let mut accumulated = 0usize;
+    for item_row in rows {
+        if items.len() as i64 >= limit {
+            break;
+        }
+        let item_size = item_row.payload_bytes.len();
+        if accumulated + item_size > MAX_RESPONSE_BYTES - PAGE_ENVELOPE_HEADROOM {
+            break;
+        }
+        // Every served item passes the checked per-item constructor (the
+        // 16 MiB per-item ceiling + the stored payload SHA-256 verification),
+        // the same validation the legacy read path applies.
+        let checked = InventoryPageItem::from_database(item_row)?;
+        accumulated += item_size;
+        items.push(checked.into_payload_bytes());
+    }
+    let has_more = total_rows > items.len();
+    let item_count =
+        i64::try_from(items.len()).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let first_ordinal = if item_count == 0 {
+        None
+    } else {
+        Some(
+            after_ordinal
+                .checked_add(1)
+                .ok_or(InventoryRepositoryError::InvalidMaterialization)?,
+        )
+    };
+    let items_sha256 = page_items_digest(
+        transaction,
+        request.domain().page_domain(),
+        row.inventory_session_id,
+        first_ordinal,
+        item_count,
+    )
+    .await?;
+    Ok(RetainedPage {
+        items,
+        first_ordinal,
+        item_count,
+        items_sha256,
+        has_more,
+    })
+}
+
+async fn fetch_page_items(
+    transaction: &mut Transaction<'_, Postgres>,
+    domain: InventoryPageDomain,
+    inventory_session_id: Uuid,
+    after_ordinal: i64,
+    limit: i64,
+) -> Result<Vec<InventoryItemRow>, InventoryRepositoryError> {
+    let sql = match domain {
+        InventoryPageDomain::Conversations => {
+            "SELECT ordinal,item_key_bytes,payload_bytes,payload_sha256 FROM chat.inventory_conversation_items WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
+        }
+        InventoryPageDomain::PendingWelcomes => {
+            "SELECT ordinal,item_key_bytes,payload_bytes,payload_sha256 FROM chat.inventory_welcome_items WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
+        }
+        InventoryPageDomain::LeafRecovery => {
+            "SELECT ordinal,item_key_bytes,payload_bytes,payload_sha256 FROM chat.inventory_recovery_items WHERE inventory_session_id = $1 AND ordinal > $2 ORDER BY ordinal LIMIT $3"
+        }
+    };
+    Ok(sqlx::query_as(sql)
+        .bind(inventory_session_id)
+        .bind(after_ordinal)
+        .bind(limit)
+        .fetch_all(&mut **transaction)
+        .await?)
+}
+
+/// The page-level digest recorded on the served receipt, mirroring the legacy
+/// per-domain materialization transcripts over the page's ordinal window.
+async fn page_items_digest(
+    transaction: &mut Transaction<'_, Postgres>,
+    domain: InventoryPageDomain,
+    inventory_session_id: Uuid,
+    first_ordinal: Option<i64>,
+    item_count: i64,
+) -> Result<[u8; 32], InventoryRepositoryError> {
+    let sql = match domain {
+        InventoryPageDomain::Conversations => {
+            r#"
+            SELECT digest(COALESCE(string_agg(
+                int8send(ordinal) || uuid_send(conversation_id)
+                || item_key_bytes || payload_sha256,
+                decode('', 'hex') ORDER BY ordinal
+            ), decode('', 'hex')), 'sha256')
+              FROM chat.inventory_conversation_items
+             WHERE inventory_session_id = $1
+               AND ordinal >= $2 AND ordinal < $2 + $3
+            "#
+        }
+        InventoryPageDomain::PendingWelcomes => {
+            r#"
+            SELECT digest(COALESCE(string_agg(
+                int8send(ordinal) || uuid_send(welcome_id)
+                || item_key_bytes || payload_sha256,
+                decode('', 'hex') ORDER BY ordinal
+            ), decode('', 'hex')), 'sha256')
+              FROM chat.inventory_welcome_items
+             WHERE inventory_session_id = $1
+               AND ordinal >= $2 AND ordinal < $2 + $3
+            "#
+        }
+        InventoryPageDomain::LeafRecovery => {
+            r#"
+            SELECT digest(COALESCE(string_agg(
+                int8send(ordinal) || item_key_bytes || payload_sha256,
+                decode('', 'hex') ORDER BY ordinal
+            ), decode('', 'hex')), 'sha256')
+              FROM chat.inventory_recovery_items
+             WHERE inventory_session_id = $1
+               AND ordinal >= $2 AND ordinal < $2 + $3
+            "#
+        }
+    };
+    let digest: Vec<u8> = sqlx::query_scalar(sql)
+        .bind(inventory_session_id)
+        .bind(first_ordinal.unwrap_or(0))
+        .bind(item_count)
+        .fetch_one(&mut **transaction)
+        .await?;
+    fixed_hash(digest).map_err(|_| InventoryRepositoryError::InvalidMaterialization)
+}
+
+/// The served page receipt row (all columns), used by the boundary lookups and
+/// the deterministic replay path.
+#[derive(Debug, FromRow)]
+struct ServedPageReceiptRow {
+    page_receipt_id: Uuid,
+    request_cursor_hash: Option<Vec<u8>>,
+    inventory_session_id: Uuid,
+    domain: String,
+    endpoint_nsid: String,
+    cursor_format_version: i16,
+    page_limit: i16,
+    canonical_filter_sha256: Vec<u8>,
+    user_did: String,
+    device_id: Uuid,
+    jkt: String,
+    auth_generation: i64,
+    protocol_instance_id: Uuid,
+    cursor_key_id: String,
+    snapshot_event_position: i64,
+    snapshot_event_cursor_sha256: Vec<u8>,
+    snapshot_retained_floor: i64,
+    after_ordinal: Option<i64>,
+    first_ordinal: Option<i64>,
+    item_count: Option<i64>,
+    items_sha256: Option<Vec<u8>>,
+    has_more: Option<bool>,
+    successor_cursor_hash: Option<Vec<u8>>,
+    successor_cursor_nonce: Option<Vec<u8>>,
+    successor_cursor_ciphertext: Option<Vec<u8>>,
+    canonical_response_sha256: Option<Vec<u8>>,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    served_at: Option<DateTime<Utc>>,
+}
+
+/// The initial-receipt arm: `request_cursor_hash IS NULL`, one deterministic
+/// unserved-then-served receipt per `(session, domain, limit, filter)`.
+async fn select_initial_page_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+) -> Result<Option<ServedPageReceiptRow>, InventoryRepositoryError> {
+    let sql = format!(
+        "{SERVED_PAGE_RECEIPT_COLUMNS} WHERE inventory_session_id = $1 AND domain = $2 \
+         AND page_limit = $3 AND canonical_filter_sha256 = $4 AND request_cursor_hash IS NULL"
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(row.inventory_session_id)
+        .bind(request.domain().receipt_domain_text())
+        .bind(
+            i16::try_from(request.limit())
+                .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+        )
+        .bind(request.canonical_filter_sha256().as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?)
+}
+
+/// The replay arm: the receipt a presented capability was ALREADY redeemed
+/// for, keyed by `request_cursor_hash` — the SHA-256 of the presented
+/// successor capability. Such a receipt exists only after the continuation
+/// was first served; locating the PREDECESSOR is the other direction
+/// (`select_predecessor_receipt_by_successor_hash`). Authority fields are
+/// never decoded from the public cursor.
+async fn select_page_receipt_by_request_hash(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_cursor_hash: [u8; 32],
+) -> Result<Option<ServedPageReceiptRow>, InventoryRepositoryError> {
+    let sql = format!("{SERVED_PAGE_RECEIPT_COLUMNS} WHERE request_cursor_hash = $1");
+    Ok(sqlx::query_as(&sql)
+        .bind(request_cursor_hash.as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?)
+}
+
+/// The predecessor arm of the hash-located boundary: the sealed boundary
+/// trigger (`chat.validate_inventory_page_receipt_boundary`) defines the
+/// predecessor as the served receipt whose MINTED successor is the presented
+/// capability — `WHERE receipt.successor_cursor_hash =
+/// <SHA-256 of the presented capability>`. Authority fields are never decoded
+/// from the public cursor.
+async fn select_predecessor_receipt_by_successor_hash(
+    transaction: &mut Transaction<'_, Postgres>,
+    successor_cursor_hash: [u8; 32],
+) -> Result<Option<ServedPageReceiptRow>, InventoryRepositoryError> {
+    let sql = format!("{SERVED_PAGE_RECEIPT_COLUMNS} WHERE successor_cursor_hash = $1");
+    Ok(sqlx::query_as(&sql)
+        .bind(successor_cursor_hash.as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?)
+}
+
+/// The last served ordinal of a page beginning at `first_ordinal` with
+/// `item_count` items: `first_ordinal + item_count - 1` — equivalently
+/// `after_ordinal + item_count`, since a page always starts one past its
+/// pre-page boundary (the NULL/initial arm starts at `first_ordinal`
+/// directly). This is the sealed boundary trigger's `NEW.after_ordinal`
+/// requirement for the successor page and the replay integrity boundary for
+/// the served page itself. `None` for an empty or invalid shape (a negative
+/// ordinal, a non-positive count, or overflow) — callers fail closed.
+pub(crate) fn page_last_ordinal(first_ordinal: i64, item_count: i64) -> Option<i64> {
+    if first_ordinal < 0 || item_count < 1 {
+        return None;
+    }
+    first_ordinal.checked_add(item_count - 1)
+}
+
+/// The `after_ordinal` forwarded to the page served against a located
+/// predecessor: the predecessor's LAST SERVED ordinal (the sealed boundary
+/// trigger requires `NEW.after_ordinal = predecessor.first_ordinal +
+/// predecessor.item_count - 1`). The predecessor is verified served and
+/// nonfinal before this runs, so an incoherent shape is durable-row
+/// corruption, not a presentation problem.
+fn predecessor_forward_after_ordinal(
+    predecessor: &ServedPageReceiptRow,
+) -> Result<i64, InventoryRepositoryError> {
+    let first = predecessor
+        .first_ordinal
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    let count = predecessor
+        .item_count
+        .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+    if let Some(after) = predecessor.after_ordinal {
+        if after.checked_add(1) != Some(first) {
+            return Err(InventoryRepositoryError::DurableRowInvalid);
+        }
+    }
+    page_last_ordinal(first, count).ok_or(InventoryRepositoryError::DurableRowInvalid)
+}
+
+const SERVED_PAGE_RECEIPT_COLUMNS: &str = r#"
+    SELECT page_receipt_id, request_cursor_hash, inventory_session_id, domain,
+           endpoint_nsid, cursor_format_version, page_limit,
+           canonical_filter_sha256, user_did, device_id, jkt, auth_generation,
+           protocol_instance_id, cursor_key_id, snapshot_event_position,
+           snapshot_event_cursor_sha256, snapshot_retained_floor, after_ordinal,
+           first_ordinal, item_count, items_sha256, has_more,
+           successor_cursor_hash, successor_cursor_nonce,
+           successor_cursor_ciphertext, canonical_response_sha256, created_at,
+           expires_at, served_at
+      FROM chat.inventory_page_receipts
+"#;
+
+/// Insert the unserved receipt (all response columns NULL). The boundary
+/// trigger validates the continuation arm; the partial unique index on
+/// `(inventory_session_id, domain, page_limit, canonical_filter_sha256) WHERE
+/// request_cursor_hash IS NULL` (and the unique request hash) is the
+/// deterministic one-winner barrier.
+#[allow(clippy::too_many_arguments)]
+async fn insert_page_receipt_unserved(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+    request_cursor_hash: Option<[u8; 32]>,
+    after_ordinal: Option<i64>,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<Uuid, InventoryRepositoryError> {
+    let receipt_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.inventory_page_receipts(
+            page_receipt_id, request_cursor_hash, inventory_session_id, domain,
+            endpoint_nsid, cursor_format_version, page_limit,
+            canonical_filter_sha256, user_did, device_id, jkt, auth_generation,
+            protocol_instance_id, cursor_key_id, snapshot_event_position,
+            snapshot_event_cursor_sha256, snapshot_retained_floor, after_ordinal,
+            created_at, expires_at
+        ) VALUES ($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        "#,
+    )
+    .bind(receipt_id)
+    .bind(request_cursor_hash.map(|hash| hash.to_vec()))
+    .bind(row.inventory_session_id)
+    .bind(request.domain().receipt_domain_text())
+    .bind(request.endpoint_nsid())
+    .bind(
+        i16::try_from(request.limit())
+            .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+    )
+    .bind(request.canonical_filter_sha256().as_slice())
+    .bind(&row.user_did)
+    .bind(row.device_id)
+    .bind(&row.jkt)
+    .bind(row.auth_generation)
+    .bind(row.protocol_instance_id)
+    .bind(&row.cursor_key_id)
+    .bind(row.snapshot_event_position)
+    .bind(row.snapshot_event_cursor_sha256.as_slice())
+    .bind(row.snapshot_retained_floor)
+    .bind(after_ordinal)
+    .bind(created_at)
+    .bind(expires_at)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(receipt_id)
+}
+
+/// Mark the unserved receipt served with the exact page evidence and the
+/// successor seal (only when `has_more`). The lifecycle trigger permits exactly
+/// the unserved -> served transition.
+#[allow(clippy::too_many_arguments)]
+async fn serve_page_receipt_row(
+    transaction: &mut Transaction<'_, Postgres>,
+    receipt_id: Uuid,
+    served_at: DateTime<Utc>,
+    page: &RetainedPage,
+    successor: Option<&SealedSuccessor>,
+    canonical_response_sha256: [u8; 32],
+) -> Result<(), InventoryRepositoryError> {
+    sqlx::query(
+        r#"
+        UPDATE chat.inventory_page_receipts
+           SET served_at = $2, first_ordinal = $3, item_count = $4,
+               items_sha256 = $5, has_more = $6,
+               successor_cursor_hash = $7, successor_cursor_nonce = $8,
+               successor_cursor_ciphertext = $9, canonical_response_sha256 = $10
+         WHERE page_receipt_id = $1
+        "#,
+    )
+    .bind(receipt_id)
+    .bind(served_at)
+    .bind(page.first_ordinal)
+    .bind(page.item_count)
+    .bind(page.items_sha256.as_slice())
+    .bind(page.has_more)
+    .bind(successor.map(|successor| successor.hash.as_slice()))
+    .bind(successor.map(|successor| successor.sealed.nonce.as_slice()))
+    .bind(successor.map(|successor| successor.sealed.ciphertext.as_slice()))
+    .bind(canonical_response_sha256.as_slice())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// One minted + sealed successor page capability (only for `has_more=true`).
+struct SealedSuccessor {
+    hash: [u8; 32],
+    sealed: SealedCapability,
+    text: String,
+}
+
+/// Mint and seal the next page capability under the page-receipt binding. The
+/// binding carries the RECEIPT's own created/expires instants (for a
+/// continuation receipt these differ from the session's creation instant).
+fn mint_and_seal_successor(
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+    request: &InventoryPublicRequestBinding,
+    row: &InventorySessionFenceLockRow,
+    receipt_created_at: u64,
+    receipt_expires_at: u64,
+    after_ordinal: Option<i64>,
+) -> Result<SealedSuccessor, InventoryRepositoryError> {
+    let token = mint_capability_token(random).map_err(InventoryRepositoryError::SecureRandom)?;
+    let hash = token.lookup_hash();
+    let after_ordinal = after_ordinal
+        .map(|ordinal| u64::try_from(ordinal))
+        .transpose()
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let binding = page_receipt_binding(
+        request,
+        row,
+        receipt_created_at,
+        receipt_expires_at,
+        after_ordinal,
+        Some(hash),
+    )
+    .map_err(InventoryRepositoryError::Sealer)?;
+    let sealed = sealer
+        .seal_successor(token.as_bytes(), &binding, random)
+        .map_err(InventoryRepositoryError::Sealer)?;
+    Ok(SealedSuccessor {
+        hash,
+        sealed,
+        text: token.encode(),
+    })
+}
+
+/// Verify a presented successor capability against a served receipt's sealed
+/// value and binding; the decrypted plaintext must hash to the request hash.
+fn verify_presented_successor(
+    sealer: &CursorSealer,
+    presented: &CapabilityToken,
+    receipt: &ServedPageReceiptRow,
+    request: &InventoryPublicRequestBinding,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    let (nonce, ciphertext, successor_hash) = match (
+        &receipt.successor_cursor_nonce,
+        &receipt.successor_cursor_ciphertext,
+        &receipt.successor_cursor_hash,
+    ) {
+        (Some(nonce), Some(ciphertext), Some(hash)) => (nonce, ciphertext, hash),
+        _ => return Err(InventoryRepositoryError::SessionPresentationMismatch),
+    };
+    let nonce: [u8; 12] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let successor_hash: [u8; 32] = successor_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let binding = page_receipt_binding(
+        request,
+        row,
+        unix_seconds(receipt.created_at).ok_or(SealerError::InvalidField)?,
+        unix_seconds(receipt.expires_at).ok_or(SealerError::InvalidField)?,
+        receipt
+            .after_ordinal
+            .map(|ordinal| u64::try_from(ordinal).ok())
+            .flatten(),
+        Some(successor_hash),
+    )
+    .map_err(InventoryRepositoryError::Sealer)?;
+    let sealed = SealedCapability {
+        nonce,
+        ciphertext: ciphertext.clone(),
+    };
+    let plaintext = sealer
+        .verify_successor(&sealed, &binding)
+        .map_err(InventoryRepositoryError::Sealer)?;
+    if <[u8; 32]>::from(Sha256::digest(plaintext.as_slice())) != presented.lookup_hash() {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    Ok(())
+}
+
+/// One fresh serve vs. deterministic replay outcome, with the served page's
+/// has-more verdict (the final-page CAS depends on it).
+enum ServedPageOutcome {
+    Fresh {
+        response: CanonicalInventoryResponse,
+        has_more: bool,
+    },
+    Replayed {
+        response: CanonicalInventoryResponse,
+        has_more: bool,
+    },
+}
+
+impl ServedPageOutcome {
+    fn into_response(self) -> CanonicalInventoryResponse {
+        match self {
+            Self::Fresh { response, .. } | Self::Replayed { response, .. } => response,
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
+
+    fn has_more(&self) -> bool {
+        match self {
+            Self::Fresh { has_more, .. } | Self::Replayed { has_more, .. } => *has_more,
+        }
+    }
+}
+
+/// Serve one page receipt for the exact `(session, domain, limit, filter)`
+/// binding: unserved-then-served in one transaction, with the deterministic
+/// one-winner barrier on the receipt identity and byte-for-byte replay for the
+/// loser (including the identical decrypted successor).
+async fn serve_page_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+    request_cursor_hash: Option<[u8; 32]>,
+    after_ordinal: Option<i64>,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<ServedPageOutcome, InventoryRepositoryError> {
+    let page = read_retained_page(transaction, row, request, after_ordinal.unwrap_or(-1)).await?;
+    // The receipt's OWN created/expires instants: the whole-second serve
+    // instant (>= the predecessor's served_at for the continuation arm) and
+    // the session's expiry ceiling.
+    let served_at = current_whole_second(transaction).await?;
+    let receipt_created_at = served_at;
+    let receipt_expires_at = row.expires_at;
+    // The one-winner barrier is a UNIQUE VIOLATION on the receipt identity —
+    // and on PostgreSQL any statement error ABORTS the enclosing transaction
+    // (every later statement fails 25P02). The replay arm must therefore run
+    // on a transaction restored to a savepoint taken BEFORE the contended
+    // INSERT; the savepoint keeps the whole attempt inside ONE transaction
+    // (fresh B-read guard + fence + serve share it) as the read-semantics
+    // contract requires. Rolling back to the savepoint discards the failed
+    // insert's effects and its queued trigger events; the loser's replay
+    // reads then see the winner's committed receipt under READ COMMITTED.
+    sqlx::query("SAVEPOINT serve_page_receipt_insert")
+        .execute(&mut **transaction)
+        .await?;
+    let receipt_id = insert_page_receipt_unserved(
+        transaction,
+        row,
+        request,
+        request_cursor_hash,
+        after_ordinal,
+        receipt_created_at,
+        receipt_expires_at,
+    )
+    .await;
+
+    match receipt_id {
+        Ok(receipt_id) => {
+            sqlx::query("RELEASE SAVEPOINT serve_page_receipt_insert")
+                .execute(&mut **transaction)
+                .await?;
+            let successor = if page.has_more {
+                Some(mint_and_seal_successor(
+                    sealer,
+                    random,
+                    request,
+                    row,
+                    unix_seconds(receipt_created_at)
+                        .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+                    unix_seconds(receipt_expires_at)
+                        .ok_or(InventoryRepositoryError::DurableRowInvalid)?,
+                    after_ordinal,
+                )?)
+            } else {
+                None
+            };
+            let capability_plaintext = verify_successor_capability(sealer, row)?;
+            let capability_text = URL_SAFE_NO_PAD.encode(capability_plaintext.as_slice());
+            let response_bytes = assemble_inventory_page_response(
+                page.has_more,
+                &capability_text,
+                &page.items,
+                successor.as_ref().map(|successor| successor.text.as_str()),
+                row.expires_at,
+            )?;
+            let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
+            serve_page_receipt_row(
+                transaction,
+                receipt_id,
+                served_at,
+                &page,
+                successor.as_ref(),
+                response_sha256,
+            )
+            .await?;
+            let response = CanonicalInventoryResponse::checked(response_bytes, response_sha256)?;
+            Ok(ServedPageOutcome::Fresh {
+                response,
+                has_more: page.has_more,
+            })
+        }
+        Err(InventoryRepositoryError::Database(ref error)) if is_unique_violation(error) => {
+            // Un-abort the transaction before the replay reads (25P02
+            // otherwise), then deterministic replay: the winner's served
+            // receipt is re-read by the SAME boundary key (initial arm or
+            // request hash), the identical decrypted successor is recovered
+            // from ITS seal, and the response is reassembled from the
+            // retained bytes and verified against the stored canonical
+            // response SHA-256.
+            sqlx::query("ROLLBACK TO SAVEPOINT serve_page_receipt_insert")
+                .execute(&mut **transaction)
+                .await?;
+            let receipt = match request_cursor_hash {
+                Some(request_cursor_hash) => {
+                    select_page_receipt_by_request_hash(transaction, request_cursor_hash).await?
+                }
+                None => select_initial_page_receipt(transaction, row, request).await?,
+            }
+            .ok_or(InventoryRepositoryError::RaceOrReuse)?;
+            replay_served_receipt(transaction, row, request, &receipt, sealer).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Reassemble and verify one already-served receipt's canonical response
+/// byte-for-byte.
+async fn replay_served_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+    receipt: &ServedPageReceiptRow,
+    sealer: &CursorSealer,
+) -> Result<ServedPageOutcome, InventoryRepositoryError> {
+    let served_at = receipt
+        .served_at
+        .ok_or(InventoryRepositoryError::RaceOrReuse)?;
+    let has_more = receipt
+        .has_more
+        .ok_or(InventoryRepositoryError::RaceOrReuse)?;
+    let item_count = receipt
+        .item_count
+        .ok_or(InventoryRepositoryError::RaceOrReuse)?;
+    let first_ordinal = receipt.first_ordinal;
+    let canonical_response_sha256 = fixed_hash(
+        receipt
+            .canonical_response_sha256
+            .clone()
+            .ok_or(InventoryRepositoryError::RaceOrReuse)?,
+    )
+    .map_err(|_| InventoryRepositoryError::RaceOrReuse)?;
+    // The fetch boundary BEFORE the page: the stored `after_ordinal` (NULL on
+    // the initial arm, where the page starts at `first_ordinal` directly).
+    let fetch_after = match (receipt.after_ordinal, first_ordinal) {
+        (Some(after), _) => after,
+        (None, Some(first)) => first
+            .checked_sub(1)
+            .ok_or(InventoryRepositoryError::RaceOrReuse)?,
+        (None, None) => -1,
+    };
+    let rows = fetch_page_items(
+        transaction,
+        request.domain().page_domain(),
+        row.inventory_session_id,
+        fetch_after,
+        item_count + 1,
+    )
+    .await?;
+    if rows.len() < item_count as usize {
+        return Err(InventoryRepositoryError::RaceOrReuse);
+    }
+    if item_count == 0 {
+        if !rows.is_empty() {
+            return Err(InventoryRepositoryError::RaceOrReuse);
+        }
+    } else {
+        let first = first_ordinal.ok_or(InventoryRepositoryError::RaceOrReuse)?;
+        // A page always begins one past its pre-page boundary.
+        if let Some(after) = receipt.after_ordinal {
+            if after.checked_add(1) != Some(first) {
+                return Err(InventoryRepositoryError::RaceOrReuse);
+            }
+        }
+        // The page's LAST item ordinal is `first_ordinal + item_count - 1`
+        // (equivalently `after_ordinal + item_count`) — never the pre-page
+        // boundary itself.
+        let expected_last =
+            page_last_ordinal(first, item_count).ok_or(InventoryRepositoryError::RaceOrReuse)?;
+        if rows.first().map(|item| item.ordinal) != Some(first)
+            || rows.get(item_count as usize - 1).map(|item| item.ordinal) != Some(expected_last)
+        {
+            return Err(InventoryRepositoryError::RaceOrReuse);
+        }
+    }
+    // Replayed items pass the same checked per-item constructor as a fresh
+    // serve (16 MiB per-item ceiling + stored payload SHA-256 verification).
+    let mut items: Vec<Vec<u8>> = Vec::with_capacity(item_count as usize);
+    for item_row in rows.into_iter().take(item_count as usize) {
+        items.push(InventoryPageItem::from_database(item_row)?.into_payload_bytes());
+    }
+    if items.len() as i64 != item_count {
+        return Err(InventoryRepositoryError::RaceOrReuse);
+    }
+    let successor_text = match (
+        &receipt.successor_cursor_hash,
+        &receipt.successor_cursor_nonce,
+        &receipt.successor_cursor_ciphertext,
+    ) {
+        (Some(hash), Some(nonce), Some(ciphertext)) => {
+            let nonce: [u8; 12] = nonce
+                .as_slice()
+                .try_into()
+                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+            let successor_hash: [u8; 32] = hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+            let binding = page_receipt_binding(
+                request,
+                row,
+                unix_seconds(receipt.created_at).ok_or(SealerError::InvalidField)?,
+                unix_seconds(receipt.expires_at).ok_or(SealerError::InvalidField)?,
+                receipt
+                    .after_ordinal
+                    .map(|ordinal| u64::try_from(ordinal).ok())
+                    .flatten(),
+                Some(successor_hash),
+            )
+            .map_err(InventoryRepositoryError::Sealer)?;
+            let sealed = SealedCapability {
+                nonce,
+                ciphertext: ciphertext.clone(),
+            };
+            let plaintext = sealer
+                .verify_successor(&sealed, &binding)
+                .map_err(InventoryRepositoryError::Sealer)?;
+            Some(URL_SAFE_NO_PAD.encode(plaintext.as_slice()))
+        }
+        (None, None, None) => None,
+        _ => return Err(InventoryRepositoryError::DurableRowInvalid),
+    };
+    let capability_plaintext = verify_successor_capability(sealer, row)?;
+    let capability_text = URL_SAFE_NO_PAD.encode(capability_plaintext.as_slice());
+    let response_bytes = assemble_inventory_page_response(
+        has_more,
+        &capability_text,
+        &items,
+        successor_text.as_deref(),
+        row.expires_at,
+    )?;
+    let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
+    if response_sha256 != canonical_response_sha256 {
+        return Err(InventoryRepositoryError::RaceOrReuse);
+    }
+    let _ = served_at;
+    let response = CanonicalInventoryResponse::checked(response_bytes, response_sha256)?;
+    Ok(ServedPageOutcome::Replayed { response, has_more })
+}
+
+/// The initial-page arm of the facade: serve the deterministic initial receipt
+/// for `(session, domain, limit, filter)`. `pub(crate)` so the DB harness can
+/// drive the production initial serve/replay/CAS body directly (the facade's
+/// create path owns the `None`-device replay arm).
+pub(crate) async fn serve_initial_inventory_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: Option<PagingDeviceAuthority>,
+    inventory_session_id: Uuid,
+    request: &InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    let row = lock_inventory_session_row(transaction, inventory_session_id)
+        .await?
+        .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    if let Some(device) = device {
+        verify_paging_device_fence(transaction, device, &row).await?;
+    }
+    revalidate_session_fence(transaction, &row).await?;
+    let outcome =
+        serve_page_receipt(transaction, &row, request, None, None, sealer, random).await?;
+    // A single-page domain's initial receipt IS the final receipt: the
+    // first-final-page `*_consumed` compare-and-set fires here (a replay never
+    // repeats it). Multi-page domains reach the CAS through
+    // `complete_inventory_page`.
+    if outcome.is_fresh() && !outcome.has_more() {
+        let served_at = current_whole_second(transaction).await?;
+        consume_final_page(transaction, &row, served_at, request.domain().page_domain()).await?;
+    }
+    Ok(outcome.into_response())
+}
+
+/// One per-attempt create-or-lock + first-page flow.
+#[cfg(not(test))]
+async fn create_inventory_snapshot_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: super::super::dpop::ReadAdmissionAttempt,
+    request: &InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    // Fresh B-read guard per attempt: two ordered FOR UPDATE statements, the
+    // single locked-row constructor callsite, and the consuming verification.
+    let device =
+        super::super::read_authority::lock_read_device_authority_once(transaction, attempt)
+            .await
+            .map_err(InventoryRepositoryError::ReadAuthority)?;
+
+    // Deterministic session identity: one retained session per verified
+    // (DID, device, JKT, auth generation), so repeated calls and the no-cursor
+    // Welcomes/recovery reads deterministically select the same session and
+    // its initial receipts.
+    let inventory_session_id = derive_inventory_session_uuid(
+        device.user_did(),
+        device.device_id(),
+        device.jkt(),
+        device.auth_generation(),
+    );
+
+    // Create-or-lock. On first sight the session row is created and fully
+    // materialized; a concurrent winner's committed row (unique violation on
+    // the session identity) and every later call take the replay path over the
+    // retained bytes. The device is consumed by the create path's fence
+    // verification; the replay path consumes it in the serve verification.
+    let existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
+    let device = if existing.is_none() {
+        let created_at = current_whole_second(transaction).await?;
+        let expires_at = created_at + chrono::Duration::minutes(15);
+        // The concurrent-create loser is detected by a UNIQUE VIOLATION on
+        // the session identity — which aborts the PostgreSQL transaction
+        // (25P02 for every later statement). The create arm therefore runs
+        // under a savepoint so the replay serve below can proceed on the
+        // SAME attempt transaction, as the read-semantics contract requires.
+        sqlx::query("SAVEPOINT create_inventory_session_arm")
+            .execute(&mut **transaction)
+            .await?;
+        match create_inventory_session(
+            transaction,
+            device,
+            CreateInventorySessionRequest {
+                inventory_session_id,
+                created_at,
+                expires_at,
+            },
+            sealer,
+            random,
+        )
+        .await
+        {
+            Ok(_) => {
+                sqlx::query("RELEASE SAVEPOINT create_inventory_session_arm")
+                    .execute(&mut **transaction)
+                    .await?;
+                None
+            }
+            Err(InventoryRepositoryError::Database(ref error)) if is_unique_violation(error) => {
+                // The concurrent winner committed (the create consumed this
+                // attempt's device). Un-abort the transaction, then the
+                // deterministic session identity means the replay serve locks
+                // the winner's row by construction; the final fence re-read
+                // covers any concurrent drift.
+                sqlx::query("ROLLBACK TO SAVEPOINT create_inventory_session_arm")
+                    .execute(&mut **transaction)
+                    .await?;
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        Some(device)
+    };
+
+    serve_initial_inventory_page(
+        transaction,
+        device,
+        inventory_session_id,
+        request,
+        sealer,
+        random,
+    )
+    .await
+}
+
+/// `blue.catbird.chat.getConversations` (and the no-cursor Welcomes/recovery
+/// reads) — the ONE production inventory facade.
+///
+/// Owns exactly three whole-call READ COMMITTED attempts with a fresh B-read
+/// guard per attempt; no handler retry exists. The composition is: admission ->
+/// fresh guard -> loader seam -> `verify_inventory_fence` ->
+/// `inventory_authorities` -> C1 typed loaders -> C1 projections ->
+/// `encode_canonical_generated_chat_json_v1` exactly once per item -> retain
+/// the canonical bytes + response SHA-256 -> page read (exact limit) ->
+/// initial receipt (one deterministic unserved-then-served receipt per
+/// `(session, domain, limit, filter)`) -> `CanonicalInventoryResponse`.
+///
+/// Purpose-staged: the G/H handler lanes wire this facade to the three
+/// endpoints; until then it has no production caller and the dead-code lint
+/// is documented rather than papered over.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) async fn create_inventory_snapshot_and_first_page(
+    pool: &sqlx::PgPool,
+    admission: super::super::dpop::VerifiedReadAdmission,
+    request: InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    let attempts = admission
+        .into_inventory_read_attempts(request.endpoint_nsid(), "GET")
+        .map_err(InventoryRepositoryError::ReadAdmission)?;
+    for attempt in attempts {
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(InventoryRepositoryError::Database)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *transaction)
+            .await
+            .map_err(InventoryRepositoryError::Database)?;
+        match create_inventory_snapshot_attempt(&mut transaction, attempt, &request, sealer, random)
+            .await
+        {
+            Ok(response) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(InventoryRepositoryError::Database)?;
+                return Ok(response);
+            }
+            Err(InventoryRepositoryError::SnapshotConflict) => {
+                let _ = transaction.rollback().await;
+                continue;
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+    Err(InventoryRepositoryError::RetryCeiling)
+}
+
+/// One continuation or final page serve, given the already-verified session
+/// row and the hash-located predecessor receipt.
+async fn serve_continuation_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    request: &InventoryPublicRequestBinding,
+    request_cursor_hash: [u8; 32],
+    after_ordinal: i64,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<ServedPageOutcome, InventoryRepositoryError> {
+    revalidate_session_fence(transaction, row).await?;
+    serve_page_receipt(
+        transaction,
+        row,
+        request,
+        Some(request_cursor_hash),
+        Some(after_ordinal),
+        sealer,
+        random,
+    )
+    .await
+}
+
+/// The hash-located boundary continuation: `issue_next_inventory_page_cursor`
+/// locates the PREDECESSOR receipt by `successor_cursor_hash` (the SHA-256 of
+/// the presented successor capability — the sealed boundary trigger's
+/// direction), never decoding authority fields from the public cursor. It
+/// locks the session, revalidates every binding, verifies the presented
+/// capability against the predecessor's own seal, forwards the predecessor's
+/// LAST SERVED ordinal as the next page boundary, and serves the next page
+/// receipt (sealing the next successor under
+/// `SealerBinding::for_page_receipt`). An already-served continuation replays
+/// byte-for-byte through the `request_cursor_hash` replay arm after the
+/// one-winner unique violation.
+///
+/// Purpose-staged: the G/H continuation handlers wire this (and the D DB
+/// suite drives this exact production body through the include harness);
+/// until then it has no production caller and the dead-code lint is
+/// documented rather than papered over.
+#[allow(dead_code)]
+pub(crate) async fn issue_next_inventory_page_cursor(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: PagingDeviceAuthority,
+    presented_page_cursor: &str,
+    request: &InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+    random: &mut dyn SecureRandom,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    let presented = decode_capability_token(presented_page_cursor)?;
+    let request_cursor_hash = presented.lookup_hash();
+    let predecessor =
+        select_predecessor_receipt_by_successor_hash(transaction, request_cursor_hash)
+            .await?
+            .ok_or(InventoryRepositoryError::SessionPresentationMismatch)?;
+    let row = lock_inventory_session_row(transaction, predecessor.inventory_session_id)
+        .await?
+        .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    verify_paging_device_fence(transaction, device, &row).await?;
+    verify_continuation_binding(request, &predecessor, &row)?;
+    verify_presented_successor(sealer, &presented, &predecessor, request, &row)?;
+    let after_ordinal = predecessor_forward_after_ordinal(&predecessor)?;
+    let outcome = serve_continuation_page(
+        transaction,
+        &row,
+        request,
+        request_cursor_hash,
+        after_ordinal,
+        sealer,
+        random,
+    )
+    .await?;
+    Ok(outcome.into_response())
+}
+
+/// The first-final-page `*_consumed` compare-and-set. The final receipt is
+/// served first (the consumption trigger requires it), then the CAS flips this
+/// domain's `*_consumed` false -> true exactly once; a later replay skips the
+/// CAS. Materialization `*_complete` is never mutated here.
+///
+/// Purpose-staged: the G/H continuation handlers wire this (and the D DB
+/// suite drives this exact production body through the include harness);
+/// until then it has no production caller and the dead-code lint is
+/// documented rather than papered over.
+#[allow(dead_code)]
+pub(crate) async fn complete_inventory_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: PagingDeviceAuthority,
+    presented_page_cursor: &str,
+    request: &InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    let presented = decode_capability_token(presented_page_cursor)?;
+    let request_cursor_hash = presented.lookup_hash();
+    let predecessor =
+        select_predecessor_receipt_by_successor_hash(transaction, request_cursor_hash)
+            .await?
+            .ok_or(InventoryRepositoryError::SessionPresentationMismatch)?;
+    let row = lock_inventory_session_row(transaction, predecessor.inventory_session_id)
+        .await?
+        .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    verify_paging_device_fence(transaction, device, &row).await?;
+    verify_continuation_binding(request, &predecessor, &row)?;
+    verify_presented_successor(sealer, &presented, &predecessor, request, &row)?;
+    let after_ordinal = predecessor_forward_after_ordinal(&predecessor)?;
+    let outcome = serve_continuation_page(
+        transaction,
+        &row,
+        request,
+        request_cursor_hash,
+        after_ordinal,
+        sealer,
+        &mut OsSecureRandom::new(),
+    )
+    .await?;
+    // The first-final-page CAS runs only when THIS transaction served the
+    // final receipt (has_more = false); a replay never repeats the CAS.
+    if outcome.is_fresh() && !outcome.has_more() {
+        // The final receipt was served by THIS transaction: perform the exact
+        // one-way consumption CAS (a second consumer or a changed durable
+        // session field affects zero rows and replays instead).
+        let served_at = current_whole_second(transaction).await?;
+        consume_final_page(transaction, &row, served_at, request.domain().page_domain()).await?;
+    }
+    Ok(outcome.into_response())
+}
+
+fn verify_continuation_binding(
+    request: &InventoryPublicRequestBinding,
+    predecessor: &ServedPageReceiptRow,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    if predecessor.domain != request.domain().receipt_domain_text()
+        || predecessor.endpoint_nsid != request.endpoint_nsid()
+        || predecessor.cursor_format_version != 1
+        || predecessor.page_limit
+            != i16::try_from(request.limit())
+                .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?
+        || predecessor.canonical_filter_sha256 != request.canonical_filter_sha256().to_vec()
+        || predecessor.inventory_session_id != row.inventory_session_id
+        || predecessor.user_did != row.user_did
+        || predecessor.device_id != row.device_id
+        || predecessor.jkt != row.jkt
+        || predecessor.auth_generation != row.auth_generation
+        || predecessor.protocol_instance_id != row.protocol_instance_id
+        || predecessor.cursor_key_id != row.cursor_key_id
+        || predecessor.snapshot_event_position != row.snapshot_event_position
+        || predecessor.snapshot_event_cursor_sha256 != row.snapshot_event_cursor_sha256
+        || predecessor.snapshot_retained_floor != row.snapshot_retained_floor
+        || predecessor.expires_at != row.expires_at
+        || predecessor.has_more != Some(true)
+        || predecessor.served_at.is_none()
+    {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    Ok(())
+}
+
+/// The exact one-way `*_consumed` compare-and-set for the served final page.
+async fn consume_final_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    row: &InventorySessionFenceLockRow,
+    served_at: DateTime<Utc>,
+    domain: InventoryPageDomain,
+) -> Result<(), InventoryRepositoryError> {
+    let (consumed_column, consumed_at_column) = match domain {
+        InventoryPageDomain::Conversations => {
+            ("conversations_consumed", "conversations_consumed_at")
+        }
+        InventoryPageDomain::PendingWelcomes => ("welcomes_consumed", "welcomes_consumed_at"),
+        InventoryPageDomain::LeafRecovery => ("recovery_consumed", "recovery_consumed_at"),
+    };
+    let sql = format!(
+        "UPDATE chat.inventory_sessions SET {consumed_column} = TRUE, \
+         {consumed_at_column} = $2 WHERE inventory_session_id = $1 \
+         AND {consumed_column} = FALSE"
+    );
+    let result = sqlx::query(&sql)
+        .bind(row.inventory_session_id)
+        .bind(served_at)
+        .execute(&mut **transaction)
+        .await?;
+    if result.rows_affected() != 1 {
+        return Err(InventoryRepositoryError::RaceOrReuse);
+    }
+    Ok(())
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("23505")
+    )
+}
+
+// ===========================================================================
+// D-2 typed loaders: durable rows -> C1 checked projection sources.
+//
+// These loaders are the ONLY path from the durable source rows to the C1
+// checked source types. The C1 checked field structs are the definitive field
+// checklist: an unknown `$type`, a missing/extra field, or a wrong terminal
+// shape fails before any DTO is materialized. The conversation domain covers
+// every authority arm (state/removal/close), the Welcome domain the complete
+// pending-delivery source, and the recovery domain every retained
+// leaf-recovery status and every recovery-work terminal variant.
+// ===========================================================================
+
+/// The per-arm provenance columns a conversation item row carries (the exact
+/// columns the arm-shape check, the source-precedence trigger, and the
+/// materialization digest transcript require).
+#[cfg(not(test))]
+struct ConversationArmColumns {
+    item_kind: &'static str,
+    participant_period_id: Option<Uuid>,
+    membership_interval_id: Option<Uuid>,
+    interval_terminal_seq: Option<i64>,
+    interval_closing_transition_id: Option<Uuid>,
+    interval_closing_outer_entry_fingerprint: Option<Vec<u8>>,
+    interval_removed_at: Option<DateTime<Utc>>,
+    schedule_terminal_seq: Option<i64>,
+    schedule_terminal_transition_id: Option<Uuid>,
+    schedule_terminal_outer_entry_fingerprint: Option<Vec<u8>>,
+}
+
+/// One typed loader per `ConversationInventoryAuthority` arm.
+#[cfg(not(test))]
+async fn conversation_projection_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &super::super::read_authority::ConversationInventoryAuthority,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<super::super::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
+    use super::super::read_projection::ConversationProjectionSource;
+    let conversation_id = authority.conversation_id();
+    match authority.arm() {
+        super::super::read_authority::ConversationInventoryArm::State { .. } => {
+            load_conversation_state_source(transaction, conversation_id).await
+        }
+        super::super::read_authority::ConversationInventoryArm::Removal {
+            membership_interval_id,
+            terminal_seq,
+            removed_at,
+            ..
+        } => ConversationProjectionSource::removal(
+            &conversation_id.to_string(),
+            user_did,
+            &device_id.to_string(),
+            &membership_interval_id.to_string(),
+            &canonical_datetime(*removed_at),
+            i64::try_from(*terminal_seq)
+                .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+        )
+        .map_err(InventoryRepositoryError::Projection),
+        super::super::read_authority::ConversationInventoryArm::Close {
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+        } => {
+            let row = load_conversation_close_source(transaction, conversation_id).await?;
+            ConversationProjectionSource::close(
+                &canonical_datetime(row.closed_at),
+                &row.closed_by_did,
+                &row.closed_by_device_id.to_string(),
+                &conversation_id.to_string(),
+                &row.kind,
+                super::super::read_projection::CheckedConversationCoordinates::new(
+                    &conversation_id.to_string(),
+                    row.close_generation,
+                    row.close_state_version,
+                    &row.close_group_id,
+                    row.close_epoch,
+                    &row.close_group_context_hash,
+                    &row.close_confirmation_tag,
+                    &row.lifecycle,
+                )
+                .map_err(InventoryRepositoryError::Projection)?,
+                row.close_seq,
+            )
+            .map_err(InventoryRepositoryError::Projection)
+            .and_then(|source| {
+                // The schedule-terminal proof must match the arm's terminal
+                // coordinates exactly; a mismatch is a spliced close.
+                if row.close_seq
+                    != i64::try_from(*terminal_seq)
+                        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?
+                    || row.close_transition_id != *closing_transition_id
+                    || row.close_outer_entry_fingerprint != *closing_outer_entry_fingerprint
+                {
+                    return Err(InventoryRepositoryError::DurableRowInvalid);
+                }
+                Ok(source)
+            })
+        }
+    }
+}
+
+/// The item-row provenance columns for one authority.
+#[cfg(not(test))]
+async fn conversation_arm_columns(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &super::super::read_authority::ConversationInventoryAuthority,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<ConversationArmColumns, InventoryRepositoryError> {
+    let arm = authority.arm();
+    Ok(match arm {
+        super::super::read_authority::ConversationInventoryArm::State {
+            participant_period_id,
+        } => ConversationArmColumns {
+            item_kind: "blue.catbird.chat.defs#conversationInventoryState",
+            participant_period_id: Some(*participant_period_id),
+            membership_interval_id: None,
+            interval_terminal_seq: None,
+            interval_closing_transition_id: None,
+            interval_closing_outer_entry_fingerprint: None,
+            interval_removed_at: None,
+            schedule_terminal_seq: None,
+            schedule_terminal_transition_id: None,
+            schedule_terminal_outer_entry_fingerprint: None,
+        },
+        super::super::read_authority::ConversationInventoryArm::Removal {
+            membership_interval_id,
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+            removed_at,
+        } => ConversationArmColumns {
+            item_kind: "blue.catbird.chat.defs#conversationRemovalTombstone",
+            participant_period_id: None,
+            membership_interval_id: Some(*membership_interval_id),
+            interval_terminal_seq: Some(
+                i64::try_from(*terminal_seq)
+                    .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
+            ),
+            interval_closing_transition_id: Some(*closing_transition_id),
+            interval_closing_outer_entry_fingerprint: Some(closing_outer_entry_fingerprint.clone()),
+            interval_removed_at: Some(*removed_at),
+            schedule_terminal_seq: None,
+            schedule_terminal_transition_id: None,
+            schedule_terminal_outer_entry_fingerprint: None,
+        },
+        super::super::read_authority::ConversationInventoryArm::Close {
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+        } => {
+            let proof = load_schedule_terminal_proof(
+                transaction,
+                authority.conversation_id(),
+                user_did,
+                device_id,
+            )
+            .await?
+            .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+            if proof.terminal_seq
+                != i64::try_from(*terminal_seq)
+                    .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?
+                || proof.transition_id != *closing_transition_id
+                || proof.outer_entry_fingerprint != *closing_outer_entry_fingerprint
+            {
+                return Err(InventoryRepositoryError::DurableRowInvalid);
+            }
+            ConversationArmColumns {
+                item_kind: "blue.catbird.chat.defs#conversationCloseTombstone",
+                participant_period_id: None,
+                membership_interval_id: None,
+                interval_terminal_seq: None,
+                interval_closing_transition_id: None,
+                interval_closing_outer_entry_fingerprint: None,
+                interval_removed_at: None,
+                schedule_terminal_seq: Some(proof.terminal_seq),
+                schedule_terminal_transition_id: Some(proof.transition_id),
+                schedule_terminal_outer_entry_fingerprint: Some(proof.outer_entry_fingerprint),
+            }
+        }
+    })
+}
+
+/// The full checked conversation-state source: conversations row, current
+/// generation state + producing transition seq, current participants, active
+/// leaves, and the current metadata snapshot. Any missing/extra field or a
+/// state without its metadata snapshot fails before materialization.
+#[cfg(not(test))]
+async fn load_conversation_state_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+) -> Result<super::super::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
+    use super::super::read_projection::{
+        CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
+        CheckedMetadataAuthorProof, CheckedMetadataAvatarBinding, CheckedMetadataCryptoContext,
+        CheckedMetadataSnapshot, CheckedParticipantView, ConversationProjectionSource,
+    };
+    let state: ConversationStateSourceRow = sqlx::query_as(
+        r#"
+        SELECT conversation.kind, conversation.lifecycle,
+               conversation.current_generation, conversation.current_state_version,
+               state.group_id AS state_group_id, state.epoch AS state_epoch,
+               state.group_context_hash AS state_group_context_hash,
+               state.confirmation_tag AS state_confirmation_tag,
+               state.producing_transition_id, transition.entry_seq AS snapshot_seq
+          FROM chat.conversations AS conversation
+          JOIN chat.generation_states AS state
+            ON state.conversation_id = conversation.conversation_id
+           AND state.generation = conversation.current_generation
+           AND state.state_version = conversation.current_state_version
+          JOIN chat.transitions AS transition
+            ON transition.transition_id = state.producing_transition_id
+         WHERE conversation.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+
+    let coordinates = CheckedConversationCoordinates::new(
+        &conversation_id.to_string(),
+        state.current_generation,
+        state.current_state_version,
+        &state.state_group_id,
+        state.state_epoch,
+        &state.state_group_context_hash,
+        &state.state_confirmation_tag,
+        &state.lifecycle,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    let participant_rows: Vec<ConversationParticipantRow> = sqlx::query_as(
+        r#"
+        SELECT participant.user_did, participant.status, participant.role,
+               (SELECT count(*) FROM chat.member_devices leaf
+                 WHERE leaf.participant_period_id = participant.participant_period_id
+                   AND leaf.active) AS leaf_count,
+               participant.invitation_transition_id,
+               participant.created_by_did, participant.created_by_device_id
+          FROM chat.participants AS participant
+         WHERE participant.conversation_id = $1
+           AND participant.current_membership
+         ORDER BY participant.user_did
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut participants = Vec::with_capacity(participant_rows.len());
+    for row in participant_rows {
+        let invitation_provenance = match row.invitation_transition_id {
+            Some(transition_id) => Some(
+                CheckedInvitationProvenance::new(
+                    &transition_id.to_string(),
+                    &row.created_by_did,
+                    &row.created_by_device_id.to_string(),
+                )
+                .map_err(InventoryRepositoryError::Projection)?,
+            ),
+            None => None,
+        };
+        participants.push(
+            CheckedParticipantView::new(
+                &row.user_did,
+                &row.role,
+                &row.status,
+                row.leaf_count,
+                invitation_provenance,
+            )
+            .map_err(InventoryRepositoryError::Projection)?,
+        );
+    }
+
+    let leaf_rows: Vec<ConversationLeafRow> = sqlx::query_as(
+        r#"
+        SELECT leaf.user_did, leaf.device_id, leaf.origin, leaf.leaf_key_id,
+               device.status AS device_status, leaf.join_key_package_ref
+          FROM chat.member_devices AS leaf
+          JOIN chat.devices AS device
+            ON device.user_did = leaf.user_did
+           AND device.device_id = leaf.device_id
+         WHERE leaf.conversation_id = $1
+           AND leaf.active
+         ORDER BY leaf.user_did, leaf.device_id
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut leaves = Vec::with_capacity(leaf_rows.len());
+    for row in leaf_rows {
+        leaves.push(
+            CheckedDeviceLeafView::new(
+                &row.user_did,
+                &row.device_id.to_string(),
+                &row.origin,
+                &row.leaf_key_id,
+                &row.device_status,
+                row.join_key_package_ref.as_deref(),
+            )
+            .map_err(InventoryRepositoryError::Projection)?,
+        );
+    }
+
+    let metadata: ConversationMetadataRow = sqlx::query_as(
+        r#"
+        SELECT origin_transition_id, metadata_version, nonce, ciphertext,
+               ciphertext_sha256, ciphertext_size, avatar_blob_id,
+               avatar_ciphertext_sha256, avatar_ciphertext_size,
+               author_did, author_device_id, author_key_id, author_public_key,
+               author_auth_generation, author_origin_seq, author_role,
+               author_device_status
+          FROM chat.metadata_snapshots
+         WHERE conversation_id = $1 AND generation = $2 AND state_version = $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(state.current_generation)
+    .bind(state.current_state_version)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+
+    let metadata_coordinate = CheckedMetadataCryptoContext::new(
+        conversation_id.as_bytes(),
+        state.current_generation,
+        &state.state_group_id,
+        state.state_epoch,
+        &state.state_group_context_hash,
+        &state.state_confirmation_tag,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+    let author_proof = CheckedMetadataAuthorProof::new(
+        &metadata.author_did,
+        &metadata.author_device_id.to_string(),
+        &metadata.author_key_id,
+        &metadata.author_public_key,
+        metadata.author_auth_generation,
+        &metadata.origin_transition_id.to_string(),
+        metadata.author_origin_seq,
+        &metadata.author_role,
+        &metadata.author_device_status,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+    let avatar_binding = match (
+        &metadata.avatar_blob_id,
+        &metadata.avatar_ciphertext_sha256,
+        metadata.avatar_ciphertext_size,
+    ) {
+        (Some(blob_id), Some(sha256), Some(size)) => Some(
+            CheckedMetadataAvatarBinding::new(&blob_id.to_string(), sha256, size, "metadata")
+                .map_err(InventoryRepositoryError::Projection)?,
+        ),
+        (None, None, None) => None,
+        _ => return Err(InventoryRepositoryError::DurableRowInvalid),
+    };
+    let metadata_snapshot = CheckedMetadataSnapshot::new(
+        metadata_coordinate,
+        &metadata.origin_transition_id.to_string(),
+        metadata.metadata_version,
+        &metadata.nonce,
+        &metadata.ciphertext,
+        &metadata.ciphertext_sha256,
+        metadata.ciphertext_size,
+        author_proof,
+        avatar_binding,
+    )
+    .map_err(InventoryRepositoryError::Projection)?;
+
+    ConversationProjectionSource::state(
+        INVENTORY_CIPHER_SUITE_V1,
+        &state.kind,
+        coordinates,
+        leaves,
+        metadata_snapshot,
+        participants,
+        state.snapshot_seq,
+    )
+    .map_err(InventoryRepositoryError::Projection)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ConversationStateSourceRow {
+    kind: String,
+    lifecycle: String,
+    current_generation: i64,
+    current_state_version: i64,
+    state_group_id: Vec<u8>,
+    state_epoch: i64,
+    state_group_context_hash: Vec<u8>,
+    state_confirmation_tag: Vec<u8>,
+    producing_transition_id: Uuid,
+    snapshot_seq: i64,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ConversationParticipantRow {
+    user_did: String,
+    status: String,
+    role: String,
+    leaf_count: i64,
+    invitation_transition_id: Option<Uuid>,
+    created_by_did: String,
+    created_by_device_id: Uuid,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ConversationLeafRow {
+    user_did: String,
+    device_id: Uuid,
+    origin: String,
+    leaf_key_id: String,
+    device_status: String,
+    join_key_package_ref: Option<Vec<u8>>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ConversationMetadataRow {
+    origin_transition_id: Uuid,
+    metadata_version: i64,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+    ciphertext_sha256: Vec<u8>,
+    ciphertext_size: i64,
+    avatar_blob_id: Option<Uuid>,
+    avatar_ciphertext_sha256: Option<Vec<u8>>,
+    avatar_ciphertext_size: Option<i64>,
+    author_did: String,
+    author_device_id: Uuid,
+    author_key_id: String,
+    author_public_key: Vec<u8>,
+    author_auth_generation: i64,
+    author_origin_seq: i64,
+    author_role: String,
+    author_device_status: String,
+}
+
+/// The close-arm source: the conversation's close coordinate, the closing
+/// transition actor, and the retired state's crypto coordinate.
+#[cfg(not(test))]
+async fn load_conversation_close_source(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+) -> Result<ConversationCloseSourceRow, InventoryRepositoryError> {
+    sqlx::query_as(
+        r#"
+        SELECT conversation.kind, conversation.lifecycle, conversation.closed_at,
+               conversation.close_transition_id, conversation.close_generation,
+               conversation.close_state_version, conversation.close_seq,
+               transition.actor_did AS closed_by_did,
+               transition.actor_device_id AS closed_by_device_id,
+               entry.outer_entry_fingerprint AS close_outer_entry_fingerprint,
+               state.group_id AS close_group_id, state.epoch AS close_epoch,
+               state.group_context_hash AS close_group_context_hash,
+               state.confirmation_tag AS close_confirmation_tag
+          FROM chat.conversations AS conversation
+          JOIN chat.transitions AS transition
+            ON transition.transition_id = conversation.close_transition_id
+          JOIN chat.entries AS entry
+            ON entry.conversation_id = conversation.conversation_id
+           AND entry.seq = conversation.close_seq
+          JOIN chat.generation_states AS state
+            ON state.conversation_id = conversation.conversation_id
+           AND state.generation = conversation.close_generation
+           AND state.state_version = conversation.close_state_version
+         WHERE conversation.conversation_id = $1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::DurableRowInvalid)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ConversationCloseSourceRow {
+    kind: String,
+    lifecycle: String,
+    closed_at: DateTime<Utc>,
+    close_transition_id: Uuid,
+    close_generation: i64,
+    close_state_version: i64,
+    close_seq: i64,
+    closed_by_did: String,
+    closed_by_device_id: Uuid,
+    close_outer_entry_fingerprint: Vec<u8>,
+    close_group_id: Vec<u8>,
+    close_epoch: i64,
+    close_group_context_hash: Vec<u8>,
+    close_confirmation_tag: Vec<u8>,
+}
+
+/// The exact schedule-terminal proof row for one recipient/conversation.
+#[cfg(not(test))]
+async fn load_schedule_terminal_proof(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<Option<ScheduleTerminalProofRow>, InventoryRepositoryError> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT terminal_seq, transition_id, outer_entry_fingerprint
+          FROM chat.application_schedule_terminal_proofs
+         WHERE conversation_id = $1 AND recipient_did = $2 AND recipient_device_id = $3
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct ScheduleTerminalProofRow {
+    terminal_seq: i64,
+    transition_id: Uuid,
+    outer_entry_fingerprint: Vec<u8>,
+}
+
+/// The complete retained Welcome source for the exact device's pending
+/// deliveries: every checked field of `RetainedWelcomeProjectionSource`,
+/// derived from the delivery, bundle, and conversation rows.
+#[cfg(not(test))]
+async fn retained_welcome_sources(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<
+    Vec<(
+        Uuid,
+        super::super::read_projection::RetainedWelcomeProjectionSource,
+    )>,
+    InventoryRepositoryError,
+> {
+    use super::super::read_projection::{
+        CheckedConversationCoordinates, CheckedWelcomeProvenance, RetainedWelcomeProjectionSource,
+    };
+    let rows: Vec<WelcomeSourceRow> = sqlx::query_as(
+        r#"
+        SELECT wd.welcome_id, wb.conversation_id, wb.entry_seq, wb.generation,
+               wb.state_version, wb.group_id, wb.epoch, wb.group_context_hash,
+               wb.confirmation_tag, conversation.lifecycle, wd.status,
+               wb.wrapper_bytes, wb.wrapper_sha256,
+               wd.recipient_did, wd.recipient_device_id,
+               wd.recovery_request_id, wd.key_package_ref, wd.expires_at
+          FROM chat.welcome_deliveries AS wd
+          JOIN chat.welcome_bundles AS wb ON wb.welcome_id = wd.welcome_id
+          JOIN chat.conversations AS conversation
+            ON conversation.conversation_id = wb.conversation_id
+         WHERE wd.recipient_did = $1
+           AND wd.recipient_device_id = $2
+           AND wd.status = 'pending'
+         ORDER BY wd.welcome_id
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let coordinates = CheckedConversationCoordinates::new(
+            &row.conversation_id.to_string(),
+            row.generation,
+            row.state_version,
+            &row.group_id,
+            row.epoch,
+            &row.group_context_hash,
+            &row.confirmation_tag,
+            &row.lifecycle,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let provenance = CheckedWelcomeProvenance::new(
+            &row.recovery_request_id.to_string(),
+            &row.key_package_ref,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let source = RetainedWelcomeProjectionSource::new(
+            &row.welcome_id.to_string(),
+            &row.conversation_id.to_string(),
+            row.entry_seq,
+            coordinates,
+            &row.status,
+            &row.wrapper_bytes,
+            &row.wrapper_sha256,
+            &row.recipient_did,
+            &row.recipient_device_id.to_string(),
+            provenance,
+            &canonical_datetime(row.expires_at),
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        sources.push((row.welcome_id, source));
+    }
+    Ok(sources)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct WelcomeSourceRow {
+    welcome_id: Uuid,
+    conversation_id: Uuid,
+    entry_seq: i64,
+    generation: i64,
+    state_version: i64,
+    group_id: Vec<u8>,
+    epoch: i64,
+    group_context_hash: Vec<u8>,
+    confirmation_tag: Vec<u8>,
+    lifecycle: String,
+    status: String,
+    wrapper_bytes: Vec<u8>,
+    wrapper_sha256: Vec<u8>,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: Vec<u8>,
+    expires_at: DateTime<Utc>,
+}
+
+/// One retained recovery inbox entry: the closed `LeafRecoveryInboxInput`
+/// plus the durable item identity the materialization row needs.
+#[cfg(not(test))]
+struct RetainedRecoveryInboxEntry {
+    item_kind: &'static str,
+    leaf_recovery_request_id: Option<Uuid>,
+    recovery_work_id: Option<Uuid>,
+    item_key_bytes: Vec<u8>,
+    input: super::super::read_projection::LeafRecoveryInboxInput,
+}
+
+/// Every retained leaf-recovery request (all five statuses) and every retained
+/// recovery-work item (all three statuses) for the exact device, in the
+/// canonical 0x00-requests-then-0x01-work ordinal order.
+#[cfg(not(test))]
+async fn retained_recovery_inbox_entries(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<Vec<RetainedRecoveryInboxEntry>, InventoryRepositoryError> {
+    use super::super::read_projection::{
+        CheckedConversationCoordinates, CheckedKeyPackageArtifact, CheckedLeafRecoveryReservation,
+        LeafRecoveryInboxInput, RetainedLeafRecoveryProjectionSource,
+        RetainedRecoveryWorkProjectionSource, RetainedRecoveryWorkTerminal,
+    };
+    let mut entries = Vec::new();
+
+    let request_rows: Vec<LeafRecoverySourceRow> = sqlx::query_as(
+        r#"
+        SELECT request.recovery_request_id, request.conversation_id,
+               request.generation, request.requester_did,
+               request.requester_device_id, request.requester_key_id,
+               request.requester_auth_generation, request.recovery_kind,
+               request.bound_state_version, request.bound_group_id,
+               request.bound_epoch, request.bound_group_context_hash,
+               request.bound_confirmation_tag, request.status,
+               request.requested_at, request.expires_at,
+               conversation.lifecycle AS conversation_lifecycle,
+               reservation.conversation_id AS reservation_conversation_id,
+               reservation.generation AS reservation_generation,
+               reservation.requester_did AS reservation_requester_did,
+               reservation.requester_device_id AS reservation_requester_device_id,
+               reservation.requester_key_id AS reservation_requester_key_id,
+               reservation.requester_auth_generation
+                   AS reservation_requester_auth_generation,
+               reservation.key_package_ref AS reservation_key_package_ref,
+               reservation.bound_state_version AS reservation_bound_state_version,
+               reservation.bound_group_id AS reservation_bound_group_id,
+               reservation.bound_epoch AS reservation_bound_epoch,
+               reservation.bound_group_context_hash
+                   AS reservation_bound_group_context_hash,
+               reservation.bound_confirmation_tag AS reservation_bound_confirmation_tag,
+               reservation.status AS reservation_status,
+               reservation.expires_at AS reservation_expires_at,
+               package.wrapper_bytes AS package_wrapper_bytes,
+               package.wrapper_sha256 AS package_wrapper_sha256
+          FROM chat.leaf_recovery_requests AS request
+          JOIN chat.key_package_reservations AS reservation
+            ON reservation.recovery_request_id = request.recovery_request_id
+          JOIN chat.key_packages AS package
+            ON package.key_package_ref = reservation.key_package_ref
+          JOIN chat.conversations AS conversation
+            ON conversation.conversation_id = request.conversation_id
+         WHERE request.requester_did = $1
+           AND request.requester_device_id = $2
+         ORDER BY request.recovery_request_id
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for row in request_rows {
+        // The reservation's coordinate, identity, and status come from the
+        // RESERVATION row's OWN columns; the view's coordinate comes from the
+        // REQUEST row's own bound columns. The C1 checked constructors then
+        // cross-check the two durable sources (request row vs reservation
+        // row), so a durable drift fails closed instead of being normalized
+        // into canonical bytes.
+        let reservation_bound_coordinate = CheckedConversationCoordinates::new(
+            &row.reservation_conversation_id.to_string(),
+            row.reservation_generation,
+            row.reservation_bound_state_version,
+            &row.reservation_bound_group_id,
+            row.reservation_bound_epoch,
+            &row.reservation_bound_group_context_hash,
+            &row.reservation_bound_confirmation_tag,
+            &row.conversation_lifecycle,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let key_package = CheckedKeyPackageArtifact::new(
+            INVENTORY_KEY_PACKAGE_FRAMING,
+            INVENTORY_KEY_PACKAGE_CONTENT_TYPE,
+            &row.package_wrapper_bytes,
+            &row.package_wrapper_sha256,
+            &row.reservation_key_package_ref,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let reservation = CheckedLeafRecoveryReservation::new(
+            &row.recovery_request_id.to_string(),
+            &row.reservation_conversation_id.to_string(),
+            reservation_bound_coordinate,
+            &row.reservation_requester_did,
+            &row.reservation_requester_device_id.to_string(),
+            &row.reservation_requester_key_id,
+            row.reservation_requester_auth_generation,
+            &row.reservation_key_package_ref,
+            INVENTORY_CIPHER_SUITE_V1,
+            "leafRecovery",
+            &row.reservation_status,
+            &canonical_datetime(row.reservation_expires_at),
+            key_package,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        // The view's bound coordinate is re-derived from the REQUEST row; the
+        // C1 constructor cross-checks the reservation's coordinate against it
+        // and fails closed on any divergence.
+        let bound_coordinate = CheckedConversationCoordinates::new(
+            &row.conversation_id.to_string(),
+            row.generation,
+            row.bound_state_version,
+            &row.bound_group_id,
+            row.bound_epoch,
+            &row.bound_group_context_hash,
+            &row.bound_confirmation_tag,
+            &row.conversation_lifecycle,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let source = RetainedLeafRecoveryProjectionSource::new(
+            &row.recovery_request_id.to_string(),
+            &row.conversation_id.to_string(),
+            &row.requester_did,
+            &row.requester_device_id.to_string(),
+            &row.recovery_kind,
+            bound_coordinate,
+            &row.status,
+            &canonical_datetime(row.requested_at),
+            &canonical_datetime(row.expires_at),
+            reservation,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let input = LeafRecoveryInboxInput::leaf_recovery(source);
+        let mut item_key_bytes = vec![0x00u8];
+        item_key_bytes.extend_from_slice(row.recovery_request_id.as_bytes());
+        entries.push(RetainedRecoveryInboxEntry {
+            item_kind: "leafRecoveryRequest",
+            leaf_recovery_request_id: Some(row.recovery_request_id),
+            recovery_work_id: None,
+            item_key_bytes,
+            input,
+        });
+    }
+
+    let work_rows: Vec<RecoveryWorkSourceRow> = sqlx::query_as(
+        r#"
+        SELECT work.recovery_work_id, work.conversation_id,
+               work.recipient_did, work.recipient_device_id,
+               work.source_kind, work.source_id, work.status,
+               work.terminal_transition_id, work.terminal_revocation_id,
+               work.created_at, work.terminal_at,
+               conversation.lifecycle AS conversation_lifecycle,
+               state.group_id AS state_group_id, state.epoch AS state_epoch,
+               state.group_context_hash AS state_group_context_hash,
+               state.confirmation_tag AS state_confirmation_tag
+          FROM chat.recovery_work_items AS work
+          JOIN chat.conversations AS conversation
+            ON conversation.conversation_id = work.conversation_id
+          JOIN chat.generation_states AS state
+            ON state.conversation_id = work.conversation_id
+           AND state.generation = work.generation
+           AND state.state_version = work.state_version
+         WHERE work.recipient_did = $1
+           AND work.recipient_device_id = $2
+         ORDER BY work.recovery_work_id
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for row in work_rows {
+        let source_coordinate = CheckedConversationCoordinates::new(
+            &row.conversation_id.to_string(),
+            row.generation,
+            row.state_version,
+            &row.state_group_id,
+            row.state_epoch,
+            &row.state_group_context_hash,
+            &row.state_confirmation_tag,
+            &row.conversation_lifecycle,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        let terminal = match row.status.as_str() {
+            "pending" => RetainedRecoveryWorkTerminal::Pending,
+            "completed" => {
+                let terminal_transition_id = row
+                    .terminal_transition_id
+                    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+                let terminal_at = row
+                    .terminal_at
+                    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+                RetainedRecoveryWorkTerminal::CompletedByTransition {
+                    terminal_transition_id: SmolStr::from(terminal_transition_id.to_string()),
+                    terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                }
+            }
+            "superseded" => {
+                let terminal_at = row
+                    .terminal_at
+                    .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
+                match row.terminal_revocation_id {
+                    Some(terminal_revocation_id) => {
+                        RetainedRecoveryWorkTerminal::SupersededByRevocation {
+                            terminal_revocation_id: SmolStr::from(
+                                terminal_revocation_id.to_string(),
+                            ),
+                            terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                        }
+                    }
+                    None => RetainedRecoveryWorkTerminal::SupersededByTransition {
+                        terminal_transition_id: SmolStr::from(
+                            row.terminal_transition_id
+                                .ok_or(InventoryRepositoryError::DurableRowInvalid)?
+                                .to_string(),
+                        ),
+                        terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                    },
+                }
+            }
+            _ => return Err(InventoryRepositoryError::DurableRowInvalid),
+        };
+        let source = RetainedRecoveryWorkProjectionSource::new(
+            &row.recovery_work_id.to_string(),
+            &row.conversation_id.to_string(),
+            &row.recipient_did,
+            &row.recipient_device_id.to_string(),
+            &row.source_kind,
+            &row.source_id.to_string(),
+            source_coordinate,
+            &canonical_datetime(row.created_at),
+            terminal,
+        )
+        .map_err(InventoryRepositoryError::Projection)?;
+        // The closed terminal-shape constructors fail on a wrong arm.
+        let input = match row.status.as_str() {
+            "pending" => LeafRecoveryInboxInput::recovery_work_pending(source),
+            "completed" => LeafRecoveryInboxInput::recovery_work_completed_by_transition(source),
+            "superseded" if row.terminal_revocation_id.is_some() => {
+                LeafRecoveryInboxInput::recovery_work_superseded_by_revocation(source)
+            }
+            "superseded" => LeafRecoveryInboxInput::recovery_work_superseded_by_transition(source),
+            _ => return Err(InventoryRepositoryError::DurableRowInvalid),
+        }
+        .map_err(InventoryRepositoryError::Projection)?;
+        let mut item_key_bytes = vec![0x01u8];
+        item_key_bytes.extend_from_slice(row.recovery_work_id.as_bytes());
+        entries.push(RetainedRecoveryInboxEntry {
+            item_kind: "recoveryWork",
+            leaf_recovery_request_id: None,
+            recovery_work_id: Some(row.recovery_work_id),
+            item_key_bytes,
+            input,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct LeafRecoverySourceRow {
+    recovery_request_id: Uuid,
+    conversation_id: Uuid,
+    generation: i64,
+    requester_did: String,
+    requester_device_id: Uuid,
+    requester_key_id: String,
+    requester_auth_generation: i64,
+    recovery_kind: String,
+    bound_state_version: i64,
+    bound_group_id: Vec<u8>,
+    bound_epoch: i64,
+    bound_group_context_hash: Vec<u8>,
+    bound_confirmation_tag: Vec<u8>,
+    status: String,
+    requested_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    conversation_lifecycle: String,
+    reservation_conversation_id: Uuid,
+    reservation_generation: i64,
+    reservation_requester_did: String,
+    reservation_requester_device_id: Uuid,
+    reservation_requester_key_id: String,
+    reservation_requester_auth_generation: i64,
+    reservation_key_package_ref: Vec<u8>,
+    reservation_bound_state_version: i64,
+    reservation_bound_group_id: Vec<u8>,
+    reservation_bound_epoch: i64,
+    reservation_bound_group_context_hash: Vec<u8>,
+    reservation_bound_confirmation_tag: Vec<u8>,
+    reservation_status: String,
+    reservation_expires_at: DateTime<Utc>,
+    package_wrapper_bytes: Vec<u8>,
+    package_wrapper_sha256: Vec<u8>,
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct RecoveryWorkSourceRow {
+    recovery_work_id: Uuid,
+    conversation_id: Uuid,
+    generation: i64,
+    state_version: i64,
+    recipient_did: String,
+    recipient_device_id: Uuid,
+    source_kind: String,
+    source_id: Uuid,
+    status: String,
+    terminal_transition_id: Option<Uuid>,
+    terminal_revocation_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    terminal_at: Option<DateTime<Utc>>,
+    conversation_lifecycle: String,
+    state_group_id: Vec<u8>,
+    state_epoch: i64,
+    state_group_context_hash: Vec<u8>,
+    state_confirmation_tag: Vec<u8>,
+}
+
+/// The G7 materialization aggregate transcript reader: count, min/max ordinal,
+/// payload-byte sum, and the digest EXACTLY as
+/// `chat.assert_inventory_materialization` recomputes it (item kind + tagged
+/// arm provenance + payload length included for the conversation domain).
+#[cfg(not(test))]
+async fn read_g7_materialization_digest(
+    transaction: &mut Transaction<'_, Postgres>,
+    domain: InventoryPageDomain,
+    inventory_session_id: Uuid,
+) -> Result<(u64, [u8; 32], u64), InventoryRepositoryError> {
+    let sql = match domain {
+        InventoryPageDomain::Conversations => {
+            r#"
+            SELECT count(*) AS item_count, min(ordinal) AS minimum_ordinal,
+                   max(ordinal) AS maximum_ordinal,
+                   COALESCE(sum(octet_length(payload_bytes))::BIGINT, 0) AS payload_bytes,
+                   digest(COALESCE(string_agg(
+                       int8send(ordinal)
+                       || item_key_bytes
+                       || int4send(octet_length(convert_to(item_kind, 'UTF8')))
+                       || convert_to(item_kind, 'UTF8')
+                       || CASE WHEN participant_period_id IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || uuid_send(participant_period_id) END
+                       || CASE WHEN membership_interval_id IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || uuid_send(membership_interval_id) END
+                       || CASE WHEN interval_terminal_seq IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || int8send(interval_terminal_seq) END
+                       || CASE WHEN interval_closing_transition_id IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || uuid_send(interval_closing_transition_id) END
+                       || CASE WHEN interval_closing_outer_entry_fingerprint IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex')
+                                    || interval_closing_outer_entry_fingerprint END
+                       || CASE WHEN interval_removed_at IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || timestamptz_send(interval_removed_at) END
+                       || CASE WHEN schedule_terminal_seq IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex') || int8send(schedule_terminal_seq) END
+                       || CASE WHEN schedule_terminal_transition_id IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex')
+                                    || uuid_send(schedule_terminal_transition_id) END
+                       || CASE WHEN schedule_terminal_outer_entry_fingerprint IS NULL
+                               THEN decode('00', 'hex')
+                               ELSE decode('01', 'hex')
+                                    || schedule_terminal_outer_entry_fingerprint END
+                       || payload_sha256
+                       || int8send(octet_length(payload_bytes)::BIGINT),
+                       decode('', 'hex') ORDER BY ordinal
+                   ), decode('', 'hex')), 'sha256') AS items_sha256
+              FROM chat.inventory_conversation_items
+             WHERE inventory_session_id = $1
+            "#
+        }
+        InventoryPageDomain::PendingWelcomes => {
+            r#"
+            SELECT count(*) AS item_count, min(ordinal) AS minimum_ordinal,
+                   max(ordinal) AS maximum_ordinal,
+                   COALESCE(sum(octet_length(payload_bytes))::BIGINT, 0) AS payload_bytes,
+                   digest(COALESCE(string_agg(
+                       int8send(ordinal)
+                       || item_key_bytes
+                       || payload_sha256
+                       || int8send(octet_length(payload_bytes)::BIGINT),
+                       decode('', 'hex') ORDER BY ordinal
+                   ), decode('', 'hex')), 'sha256') AS items_sha256
+              FROM chat.inventory_welcome_items
+             WHERE inventory_session_id = $1
+            "#
+        }
+        InventoryPageDomain::LeafRecovery => {
+            r#"
+            SELECT count(*) AS item_count, min(ordinal) AS minimum_ordinal,
+                   max(ordinal) AS maximum_ordinal,
+                   COALESCE(sum(octet_length(payload_bytes))::BIGINT, 0) AS payload_bytes,
+                   digest(COALESCE(string_agg(
+                       int8send(ordinal)
+                       || item_key_bytes
+                       || payload_sha256
+                       || int8send(octet_length(payload_bytes)::BIGINT),
+                       decode('', 'hex') ORDER BY ordinal
+                   ), decode('', 'hex')), 'sha256') AS items_sha256
+              FROM chat.inventory_recovery_items
+             WHERE inventory_session_id = $1
+            "#
+        }
+    };
+    let row: G7MaterializationDigestRow = sqlx::query_as(sql)
+        .bind(inventory_session_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    let item_count = database_protocol_integer(row.item_count)
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let items_sha256 = fixed_hash(row.items_sha256)
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let payload_bytes = database_protocol_integer(row.payload_bytes)
+        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
+    let shape_valid = if item_count == 0 {
+        row.minimum_ordinal.is_none() && row.maximum_ordinal.is_none()
+    } else {
+        row.minimum_ordinal == Some(0)
+            && row.maximum_ordinal
+                == Some(
+                    i64::try_from(item_count - 1)
+                        .map_err(|_| InventoryRepositoryError::InvalidMaterialization)?,
+                )
+    };
+    if !shape_valid || items_sha256 == [0; 32] {
+        return Err(InventoryRepositoryError::InvalidMaterialization);
+    }
+    Ok((item_count, items_sha256, payload_bytes))
+}
+
+#[cfg(not(test))]
+#[derive(Debug, FromRow)]
+struct G7MaterializationDigestRow {
+    item_count: i64,
+    minimum_ordinal: Option<i64>,
+    maximum_ordinal: Option<i64>,
+    payload_bytes: i64,
+    items_sha256: Vec<u8>,
 }

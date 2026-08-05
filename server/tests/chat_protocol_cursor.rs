@@ -15,6 +15,9 @@ mod repository {
     }
 }
 
+// The HMAC codec surface is retained byte-stable for the lane D-2 rewiring
+// and the own-device codec for lane F; this test crate exercises it only
+// through the kept own-device and hash tests.
 #[allow(dead_code)]
 mod cursor {
     include!("../src/chat_protocol/cursor.rs");
@@ -22,20 +25,22 @@ mod cursor {
 
 mod cursor_tests {
     use super::cursor::{
-        self, CursorCodec, CursorCodecError, DeviceCursorBinding, EventCursor,
-        InventoryPageBinding, InventoryPageDomain, InventorySessionBinding, InventorySessionId,
-        OwnDeviceCursorBinding,
+        self, decode_capability_token, mint_capability_token, CapabilityToken, CursorCodec,
+        CursorCodecError, CursorSealer, DeviceCursorBinding, EventCursor, InventoryPageDomain,
+        InventorySessionBinding, OsSecureRandom, OwnDeviceCursorBinding, SealedCapability,
+        SealerBinding, SealerError, SecureRandom, SecureRandomError,
     };
     use super::validation::{BareDid, KeyThumbprint};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use hmac::{Hmac, Mac as _};
-    use sha2::Sha256;
+    use sha2::{Digest as _, Sha256};
     use uuid::Uuid;
     use zeroize::Zeroizing;
 
     const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
     const DEVICE_ID: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
     const PROTOCOL_INSTANCE: &str = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+    const SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
+    const ENDPOINT_NSID: &str = "blue.catbird.mls.getInventoryConversations";
 
     fn codec() -> CursorCodec {
         CursorCodec::new(
@@ -77,29 +82,6 @@ mod cursor_tests {
             .unwrap()
     }
 
-    fn inventory_page_binding(
-        codec: &CursorCodec,
-        domain: InventoryPageDomain,
-    ) -> InventoryPageBinding {
-        let snapshot_event_cursor = snapshot_event_cursor(codec);
-        let session_binding = inventory_session_binding(codec, &snapshot_event_cursor);
-        let inventory_session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 42)
-            .unwrap();
-        codec
-            .bind_inventory_page(
-                &session_binding,
-                &inventory_session,
-                &snapshot_event_cursor,
-                domain,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap()
-    }
-
     fn inventory_session_binding(
         codec: &CursorCodec,
         snapshot_event_cursor: &EventCursor,
@@ -107,7 +89,7 @@ mod cursor_tests {
         codec
             .bind_inventory_session(
                 device(),
-                Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+                Uuid::parse_str(SESSION_ID).unwrap(),
                 snapshot_event_cursor,
                 42,
                 1_700_000_300,
@@ -116,6 +98,171 @@ mod cursor_tests {
                 42,
             )
             .unwrap()
+    }
+
+    fn own_device_binding() -> OwnDeviceCursorBinding {
+        OwnDeviceCursorBinding::new(
+            device(),
+            Uuid::parse_str("66666666-6666-4666-a666-666666666666").unwrap(),
+            17,
+            b"include-revoked=true",
+            1_700_000_300,
+        )
+        .unwrap()
+    }
+
+    fn sealer() -> CursorSealer {
+        CursorSealer::new([0x41; 32], Zeroizing::new([0xA5; 32]))
+            .expect("a non-zero sealing secret is a valid configuration")
+    }
+
+    /// Deterministic `SecureRandom` for reproducible tests. xorshift64* is
+    /// bijective, so every fill starts from a distinct state and consecutive
+    /// 12-byte nonce windows are distinct.
+    struct DeterministicRandom {
+        state: u64,
+    }
+
+    impl DeterministicRandom {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+    }
+
+    impl SecureRandom for DeterministicRandom {
+        fn fill(&mut self, out: &mut [u8]) -> Result<(), SecureRandomError> {
+            for chunk in out.chunks_mut(8) {
+                self.state ^= self.state >> 12;
+                self.state ^= self.state << 25;
+                self.state ^= self.state >> 27;
+                self.state = self.state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let bytes = self.state.to_be_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            Ok(())
+        }
+    }
+
+    /// Receipt-row-shaped page binding with every AAD field, mirroring an
+    /// `inventory_page_receipts` row; individual fields are mutable so a test
+    /// can vary exactly one AAD field at a time.
+    #[allow(dead_code)]
+    struct PageSpec {
+        domain: Vec<u8>,
+        endpoint_nsid: Vec<u8>,
+        cursor_format_version: u16,
+        inventory_session_id: Uuid,
+        user_did: Vec<u8>,
+        device_id: Uuid,
+        jkt: Vec<u8>,
+        auth_generation: u64,
+        protocol_instance_id: Uuid,
+        cursor_key_id: Vec<u8>,
+        snapshot_event_position: u64,
+        snapshot_event_cursor_sha256: [u8; 32],
+        snapshot_retained_floor: u64,
+        canonical_filter_sha256: [u8; 32],
+        page_limit: u16,
+        after_ordinal: Option<u64>,
+        successor_cursor_hash: Option<[u8; 32]>,
+        created_at: u64,
+        expires_at: u64,
+    }
+
+    impl PageSpec {
+        fn default() -> Self {
+            Self {
+                domain: b"conversations".to_vec(),
+                endpoint_nsid: ENDPOINT_NSID.as_bytes().to_vec(),
+                cursor_format_version: 1,
+                inventory_session_id: Uuid::parse_str(SESSION_ID).unwrap(),
+                user_did: DID.as_bytes().to_vec(),
+                device_id: Uuid::parse_str(DEVICE_ID).unwrap(),
+                jkt: URL_SAFE_NO_PAD.encode([0x61; 32]).into_bytes(),
+                auth_generation: 7,
+                protocol_instance_id: Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+                cursor_key_id: URL_SAFE_NO_PAD.encode([0x41; 32]).into_bytes(),
+                snapshot_event_position: 42,
+                snapshot_event_cursor_sha256: [0x11; 32],
+                snapshot_retained_floor: 10,
+                canonical_filter_sha256: [0x22; 32],
+                page_limit: 100,
+                after_ordinal: Some(9),
+                successor_cursor_hash: None,
+                created_at: 1_700_000_000,
+                expires_at: 1_700_000_300,
+            }
+        }
+
+        fn try_to_binding(&self) -> Result<SealerBinding, SealerError> {
+            SealerBinding::for_page_receipt(
+                &self.domain,
+                &self.endpoint_nsid,
+                self.cursor_format_version,
+                self.inventory_session_id,
+                &self.user_did,
+                self.device_id,
+                &self.jkt,
+                self.auth_generation,
+                self.protocol_instance_id,
+                &self.cursor_key_id,
+                self.snapshot_event_position,
+                self.snapshot_event_cursor_sha256,
+                self.snapshot_retained_floor,
+                self.canonical_filter_sha256,
+                self.page_limit,
+                self.after_ordinal,
+                self.successor_cursor_hash,
+                self.created_at,
+                self.expires_at,
+            )
+        }
+
+        fn to_binding(&self) -> SealerBinding {
+            self.try_to_binding().unwrap()
+        }
+    }
+
+    fn page_binding(successor_hash: Option<[u8; 32]>) -> SealerBinding {
+        let mut spec = PageSpec::default();
+        spec.successor_cursor_hash = successor_hash;
+        spec.to_binding()
+    }
+
+    fn event_binding() -> SealerBinding {
+        SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            None,
+            10,
+            1_700_000_000,
+            1_700_000_300,
+        )
+        .unwrap()
+    }
+
+    fn noncanonical_trailing_bits(encoded: &str) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let mut bytes = encoded.as_bytes().to_vec();
+        let last = bytes.last_mut().unwrap();
+        let index = ALPHABET
+            .iter()
+            .position(|candidate| candidate == last)
+            .unwrap();
+        let replacement = match encoded.len() % 4 {
+            2 | 3 => index | 1,
+            remainder => panic!("encoded value has no unused trailing bits: {remainder}"),
+        };
+        *last = ALPHABET[replacement];
+        String::from_utf8(bytes).unwrap()
     }
 
     #[test]
@@ -137,173 +284,6 @@ mod cursor_tests {
             !phase_two.contains("expected: &InventoryPageBinding"),
             "a caller-assembled binding must not authorize inventory paging"
         );
-    }
-
-    fn own_device_binding() -> OwnDeviceCursorBinding {
-        OwnDeviceCursorBinding::new(
-            device(),
-            Uuid::parse_str("66666666-6666-4666-a666-666666666666").unwrap(),
-            17,
-            b"include-revoked=true",
-            1_700_000_300,
-        )
-        .unwrap()
-    }
-
-    fn signed_body_mutation(encoded: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> String {
-        let mut authenticated = URL_SAFE_NO_PAD.decode(encoded).unwrap();
-        authenticated.truncate(authenticated.len() - 32);
-        mutate(&mut authenticated);
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(&[0xA5; 32]).unwrap();
-        mac.update(&authenticated);
-        authenticated.extend_from_slice(&mac.finalize().into_bytes());
-        URL_SAFE_NO_PAD.encode(authenticated)
-    }
-
-    fn unauthenticated_body_mutation(encoded: &str, offset: usize) -> String {
-        let mut authenticated = URL_SAFE_NO_PAD.decode(encoded).unwrap();
-        authenticated[offset] ^= 1;
-        URL_SAFE_NO_PAD.encode(authenticated)
-    }
-
-    fn noncanonical_base64url(encoded: &str) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-        let mut bytes = encoded.as_bytes().to_vec();
-        let last = bytes.last_mut().unwrap();
-        let index = ALPHABET
-            .iter()
-            .position(|candidate| candidate == last)
-            .unwrap();
-        let replacement = match encoded.len() % 4 {
-            2 => index | 1,
-            3 => index | 1,
-            remainder => panic!("encoded value has no unused trailing bits: {remainder}"),
-        };
-        *last = ALPHABET[replacement];
-        String::from_utf8(bytes).unwrap()
-    }
-
-    #[test]
-    fn event_cursor_round_trips_exact_device_stream_position() {
-        let codec = codec();
-        let device = device();
-        let cursor = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-
-        assert!(cursor.as_str().is_ascii());
-        assert!(!cursor.as_str().contains('='));
-        assert!(cursor.as_str().len() <= cursor::MAX_OPAQUE_CURSOR_ASCII_BYTES);
-
-        let verified = codec
-            .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 10, 42)
-            .unwrap();
-        assert_eq!(verified.position(), 42);
-        assert_eq!(verified.retained_floor(), 10);
-        assert_eq!(verified.expires_at(), 1_700_000_300);
-    }
-
-    #[test]
-    fn event_cursor_allows_floor_advancement_until_the_position_is_expired() {
-        let codec = codec();
-        let device = device();
-        let cursor = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-
-        let still_retained = codec
-            .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 11, 42)
-            .unwrap();
-        assert_eq!(still_retained.position(), 42);
-        assert_eq!(still_retained.retained_floor(), 10);
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 43, 43)
-                .unwrap_err(),
-            CursorCodecError::BelowRetentionFloor
-        );
-    }
-
-    #[test]
-    fn inventory_session_id_round_trips_exact_fence_and_has_db_hash() {
-        let codec = codec();
-        let device = device();
-        let snapshot_cursor = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let binding = codec
-            .bind_inventory_session(
-                device,
-                Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                &snapshot_cursor,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-        let session = codec
-            .issue_inventory_session_id(&binding, 1_700_000_000, 10, 42)
-            .unwrap();
-
-        fn requires_inventory_session_id(_: &InventorySessionId) {}
-        requires_inventory_session_id(&session);
-        assert!((32..=cursor::MAX_OPAQUE_CURSOR_ASCII_BYTES).contains(&session.as_str().len()));
-        assert_eq!(
-            session.binding_hash(),
-            cursor::opaque_binding_hash(session.as_str().as_bytes()).unwrap()
-        );
-
-        let verified = codec
-            .verify_inventory_session_id(session.as_str(), &binding, 1_700_000_001, 10, 42)
-            .unwrap();
-        assert_eq!(verified.session_id(), binding.session_id());
-        assert_eq!(verified.snapshot_event_position(), 42);
-        assert_eq!(
-            verified.snapshot_event_cursor_hash(),
-            binding.snapshot_event_cursor_hash()
-        );
-        assert_eq!(verified.expires_at(), 1_700_000_300);
-    }
-
-    #[test]
-    fn inventory_page_cursor_round_trips_each_exact_session_domain() {
-        for domain in [
-            InventoryPageDomain::Conversations,
-            InventoryPageDomain::PendingWelcomes,
-            InventoryPageDomain::LeafRecovery,
-        ] {
-            let codec = codec();
-            let binding = inventory_page_binding(&codec, domain);
-            let item_key = *Uuid::parse_str("55555555-5555-4555-8555-555555555555")
-                .unwrap()
-                .as_bytes();
-            let page = codec
-                .issue_inventory_page_cursor(&binding, 9, &item_key, 1_700_000_010, 10, 42)
-                .unwrap();
-
-            assert!(page.as_str().len() <= cursor::MAX_OPAQUE_CURSOR_ASCII_BYTES);
-            let verified = codec
-                .verify_inventory_page_cursor_for_test(
-                    page.as_str(),
-                    &binding,
-                    1_700_000_011,
-                    10,
-                    42,
-                )
-                .unwrap();
-            assert_eq!(verified.domain(), domain);
-            assert_eq!(verified.last_ordinal(), 9);
-            assert_eq!(
-                verified.item_key_hash(),
-                cursor::inventory_item_key_hash(domain, &item_key).unwrap()
-            );
-            assert_eq!(verified.expires_at(), 1_700_000_300);
-        }
     }
 
     #[test]
@@ -335,807 +315,6 @@ mod cursor_tests {
             cursor::own_device_item_key_hash(&subject_device).unwrap()
         );
         assert_eq!(verified.expires_at(), 1_700_000_300);
-    }
-
-    #[test]
-    fn event_cursor_rejects_tampering_noncanonical_encoding_and_signed_wire_changes() {
-        let codec = codec();
-        let device = device();
-        let cursor = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let verify =
-            |encoded: &str| codec.verify_event_cursor(encoded, &device, 1_700_000_001, 10, 42);
-
-        assert_eq!(
-            verify(&unauthenticated_body_mutation(cursor.as_str(), 70)).unwrap_err(),
-            CursorCodecError::AuthenticationFailed
-        );
-        assert_eq!(
-            verify(&format!("{}=", cursor.as_str())).unwrap_err(),
-            CursorCodecError::InvalidEncoding
-        );
-        assert_eq!(
-            verify(&noncanonical_base64url(cursor.as_str())).unwrap_err(),
-            CursorCodecError::InvalidEncoding
-        );
-        assert_eq!(
-            verify(&"A".repeat(cursor::MAX_OPAQUE_CURSOR_ASCII_BYTES + 1)).unwrap_err(),
-            CursorCodecError::TooLong
-        );
-        assert_eq!(verify("").unwrap_err(), CursorCodecError::InvalidEncoding);
-        assert_eq!(
-            verify("not+a-token").unwrap_err(),
-            CursorCodecError::InvalidEncoding
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| body.push(0))).unwrap_err(),
-            CursorCodecError::InvalidEncoding
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| body[0] ^= 1)).unwrap_err(),
-            CursorCodecError::InvalidEncoding
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| body[4] = 2)).unwrap_err(),
-            CursorCodecError::UnsupportedVersion
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| body[5] = 99)).unwrap_err(),
-            CursorCodecError::WrongDomain
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| body[22] ^= 1)).unwrap_err(),
-            CursorCodecError::WrongKey
-        );
-        assert_eq!(
-            verify(&signed_body_mutation(cursor.as_str(), |body| {
-                body[6..22].copy_from_slice(
-                    Uuid::parse_str("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa")
-                        .unwrap()
-                        .as_bytes(),
-                );
-            }))
-            .unwrap_err(),
-            CursorCodecError::WrongProtocolInstance
-        );
-    }
-
-    #[test]
-    fn cursor_types_and_all_inventory_subdomains_are_noninterchangeable() {
-        let codec = codec();
-        let device = device();
-        let event = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let session_binding = inventory_session_binding(&codec, &event);
-        let session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 42)
-            .unwrap();
-        let conversations_binding =
-            inventory_page_binding(&codec, InventoryPageDomain::Conversations);
-        let welcomes_binding = inventory_page_binding(&codec, InventoryPageDomain::PendingWelcomes);
-        let recovery_binding = inventory_page_binding(&codec, InventoryPageDomain::LeafRecovery);
-        let conversations = codec
-            .issue_inventory_page_cursor(
-                &conversations_binding,
-                1,
-                b"conversation-key",
-                1_700_000_000,
-                10,
-                42,
-            )
-            .unwrap();
-        let welcomes = codec
-            .issue_inventory_page_cursor(
-                &welcomes_binding,
-                1,
-                b"welcome-key",
-                1_700_000_000,
-                10,
-                42,
-            )
-            .unwrap();
-        let recovery = codec
-            .issue_inventory_page_cursor(
-                &recovery_binding,
-                1,
-                b"recovery-key",
-                1_700_000_000,
-                10,
-                42,
-            )
-            .unwrap();
-        let own_binding = own_device_binding();
-        let own = codec
-            .issue_own_device_cursor(&own_binding, 1, b"own-device-key", 1_700_000_000)
-            .unwrap();
-
-        for foreign in [
-            session.as_str(),
-            conversations.as_str(),
-            welcomes.as_str(),
-            recovery.as_str(),
-            own.as_str(),
-        ] {
-            assert_eq!(
-                codec
-                    .verify_event_cursor(foreign, &device, 1_700_000_001, 10, 42)
-                    .unwrap_err(),
-                CursorCodecError::WrongDomain
-            );
-        }
-
-        for (foreign, expected) in [
-            (event.as_str(), &conversations_binding),
-            (welcomes.as_str(), &conversations_binding),
-            (recovery.as_str(), &conversations_binding),
-            (conversations.as_str(), &welcomes_binding),
-            (conversations.as_str(), &recovery_binding),
-        ] {
-            assert_eq!(
-                codec
-                    .verify_inventory_page_cursor_for_test(
-                        foreign,
-                        expected,
-                        1_700_000_001,
-                        10,
-                        42,
-                    )
-                    .unwrap_err(),
-                CursorCodecError::WrongDomain
-            );
-        }
-
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(
-                    event.as_str(),
-                    &session_binding,
-                    1_700_000_001,
-                    10,
-                    42
-                )
-                .unwrap_err(),
-            CursorCodecError::WrongDomain
-        );
-        assert_eq!(
-            codec
-                .verify_own_device_cursor(event.as_str(), &own_binding, 1_700_000_001, 17)
-                .unwrap_err(),
-            CursorCodecError::WrongDomain
-        );
-    }
-
-    #[test]
-    fn event_cursor_enforces_time_safe_integer_floor_and_future_bounds() {
-        const ABOVE_SAFE_INTEGER: u64 = 9_007_199_254_740_992;
-
-        let codec = codec();
-        let device = device();
-        let cursor = codec
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, 1_699_999_999, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::IssuedInFuture
-        );
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_300, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::Expired
-        );
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 10, 41)
-                .unwrap_err(),
-            CursorCodecError::PositionInFuture
-        );
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 43, 42)
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-
-        let future_floor = codec
-            .issue_event_cursor(&device, 42, 11, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        assert_eq!(
-            codec
-                .verify_event_cursor(future_floor.as_str(), &device, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::PositionInFuture
-        );
-        assert_eq!(
-            codec
-                .issue_event_cursor(&device, 9, 10, 1_700_000_000, 1_700_000_300)
-                .unwrap_err(),
-            CursorCodecError::BelowRetentionFloor
-        );
-        assert_eq!(
-            codec
-                .issue_event_cursor(
-                    &device,
-                    ABOVE_SAFE_INTEGER,
-                    10,
-                    1_700_000_000,
-                    1_700_000_300,
-                )
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-        assert_eq!(
-            codec
-                .verify_event_cursor(cursor.as_str(), &device, ABOVE_SAFE_INTEGER, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-    }
-
-    #[test]
-    fn event_cursor_recomputes_exact_did_and_jkt_bindings_and_checks_every_device_field() {
-        let codec = codec();
-        let original = device();
-        let cursor = codec
-            .issue_event_cursor(&original, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let alternatives = [
-            bound_device("did:plc:dwvi7nxzyoun6zhxrhs64oiz", DEVICE_ID, 7, 0x61),
-            bound_device(DID, "88888888-8888-4888-a888-888888888888", 7, 0x61),
-            bound_device(DID, DEVICE_ID, 8, 0x61),
-            bound_device(DID, DEVICE_ID, 7, 0x62),
-        ];
-
-        for expected in alternatives {
-            assert_eq!(
-                codec
-                    .verify_event_cursor(cursor.as_str(), &expected, 1_700_000_001, 10, 42)
-                    .unwrap_err(),
-                CursorCodecError::BindingMismatch
-            );
-        }
-
-        for invalid in [
-            "d".repeat(11),
-            "d".repeat(262),
-            "did:plc:invalid-é".to_owned(),
-        ] {
-            assert!(BareDid::parse(&invalid).is_err());
-        }
-        assert!(KeyThumbprint::parse("not-a-canonical-thumbprint").is_err());
-
-        let did = BareDid::parse(DID).unwrap();
-        let jkt = thumbprint(0x61);
-        assert_eq!(
-            DeviceCursorBinding::new(&did, Uuid::nil(), 1, &jkt).unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-        assert_eq!(
-            DeviceCursorBinding::new(&did, Uuid::parse_str(DEVICE_ID).unwrap(), 0, &jkt)
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-    }
-
-    #[test]
-    fn inventory_session_id_enforces_exact_binding_time_and_snapshot_bounds() {
-        let codec = codec();
-        let snapshot_event_cursor = snapshot_event_cursor(&codec);
-        let alternate_snapshot_event_cursor = codec
-            .issue_event_cursor(&device(), 42, 10, 1_700_000_001, 1_700_000_300)
-            .unwrap();
-        let binding = inventory_session_binding(&codec, &snapshot_event_cursor);
-        let session = codec
-            .issue_inventory_session_id(&binding, 1_700_000_000, 10, 42)
-            .unwrap();
-        let other_device = bound_device("did:plc:dwvi7nxzyoun6zhxrhs64oiz", DEVICE_ID, 7, 0x61);
-        let other_device_snapshot = codec
-            .issue_event_cursor(&other_device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let future_snapshot = codec
-            .issue_event_cursor(&device(), 43, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let later_expiry_snapshot = codec
-            .issue_event_cursor(&device(), 42, 10, 1_700_000_000, 1_700_000_301)
-            .unwrap();
-        let alternatives = [
-            codec
-                .bind_inventory_session(
-                    other_device,
-                    Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                    &other_device_snapshot,
-                    42,
-                    1_700_000_300,
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap(),
-            codec
-                .bind_inventory_session(
-                    device(),
-                    Uuid::parse_str("99999999-9999-4999-a999-999999999999").unwrap(),
-                    &snapshot_event_cursor,
-                    42,
-                    1_700_000_300,
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap(),
-            codec
-                .bind_inventory_session(
-                    device(),
-                    Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                    &future_snapshot,
-                    43,
-                    1_700_000_300,
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap(),
-            codec
-                .bind_inventory_session(
-                    device(),
-                    Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                    &alternate_snapshot_event_cursor,
-                    42,
-                    1_700_000_300,
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap(),
-            codec
-                .bind_inventory_session(
-                    device(),
-                    Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                    &later_expiry_snapshot,
-                    42,
-                    1_700_000_301,
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap(),
-        ];
-        for expected in alternatives {
-            assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &expected, 1_700_000_001, 10, 43,)
-                .unwrap_err(),
-            CursorCodecError::BindingMismatch
-        );
-        }
-
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &binding, 1_699_999_999, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::IssuedInFuture
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &binding, 1_700_000_300, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::Expired
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &binding, 1_700_000_001, 43, 43)
-                .unwrap_err(),
-            CursorCodecError::BelowRetentionFloor
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &binding, 1_700_000_001, 10, 41)
-                .unwrap_err(),
-            CursorCodecError::PositionInFuture
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_session_id(session.as_str(), &binding, 1_700_000_001, 43, 42)
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-
-        let expiring_snapshot = codec
-            .issue_event_cursor(&device(), 42, 10, 1_699_999_999, 1_700_000_000)
-            .unwrap();
-        let expired_at_issue = codec
-            .bind_inventory_session(
-                device(),
-                Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
-                &expiring_snapshot,
-                42,
-                1_700_000_000,
-                1_699_999_999,
-                10,
-                42,
-            )
-            .unwrap();
-        assert_eq!(
-            codec
-                .issue_inventory_session_id(&expired_at_issue, 1_700_000_000, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
-    }
-
-    #[test]
-    fn inventory_page_locator_only_selects_the_hash_bound_session_before_full_verification() {
-        let codec = codec();
-        let snapshot_event_cursor = snapshot_event_cursor(&codec);
-        let session_binding = inventory_session_binding(&codec, &snapshot_event_cursor);
-        let session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 43)
-            .unwrap();
-        let binding = codec
-            .bind_inventory_page(
-                &session_binding,
-                &session,
-                &snapshot_event_cursor,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let page = codec
-            .issue_inventory_page_cursor(&binding, 9, b"conversation-key", 1_700_000_001, 10, 43)
-            .unwrap();
-
-        let locator = codec
-            .locate_inventory_page_cursor(
-                page.as_str(),
-                InventoryPageDomain::Conversations,
-                1_700_000_001,
-            )
-            .unwrap();
-        assert_eq!(locator.session_token_hash(), session.binding_hash());
-        assert_eq!(
-            locator.authenticated_cursor_hash(),
-            cursor::opaque_binding_hash(page.as_str().as_bytes()).unwrap()
-        );
-
-        let later_page = codec
-            .issue_inventory_page_cursor(
-                &binding,
-                10,
-                b"later-conversation-key",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let first_locator = codec
-            .locate_inventory_page_cursor(
-                page.as_str(),
-                InventoryPageDomain::Conversations,
-                1_700_000_001,
-            )
-            .unwrap();
-        assert_ne!(
-            first_locator.authenticated_cursor_hash(),
-            cursor::opaque_binding_hash(later_page.as_str().as_bytes()).unwrap(),
-            "the locator is bound to one exact page-cursor spelling"
-        );
-
-        assert_eq!(
-            codec
-                .locate_inventory_page_cursor(
-                    page.as_str(),
-                    InventoryPageDomain::PendingWelcomes,
-                    1_700_000_001,
-                )
-                .unwrap_err(),
-            CursorCodecError::WrongDomain
-        );
-        assert_eq!(
-            codec
-                .locate_inventory_page_cursor(
-                    page.as_str(),
-                    InventoryPageDomain::Conversations,
-                    1_700_000_300,
-                )
-                .unwrap_err(),
-            CursorCodecError::Expired
-        );
-
-        let tampered = unauthenticated_body_mutation(page.as_str(), 96);
-        assert_eq!(
-            codec
-                .locate_inventory_page_cursor(
-                    &tampered,
-                    InventoryPageDomain::Conversations,
-                    1_700_000_001,
-                )
-                .unwrap_err(),
-            CursorCodecError::AuthenticationFailed
-        );
-    }
-
-    #[test]
-    fn inventory_page_cursor_enforces_exact_session_fence_filter_and_expiry() {
-        let codec = codec();
-        let snapshot_event_cursor = snapshot_event_cursor(&codec);
-        let session_binding = inventory_session_binding(&codec, &snapshot_event_cursor);
-        let session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 43)
-            .unwrap();
-        let binding = codec
-            .bind_inventory_page(
-                &session_binding,
-                &session,
-                &snapshot_event_cursor,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let page = codec
-            .issue_inventory_page_cursor(&binding, 9, b"conversation-key", 1_700_000_001, 10, 43)
-            .unwrap();
-
-        let other_device = bound_device("did:plc:dwvi7nxzyoun6zhxrhs64oiz", DEVICE_ID, 7, 0x61);
-        let other_device_snapshot = codec
-            .issue_event_cursor(&other_device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let other_device_session_binding = codec
-            .bind_inventory_session(
-                other_device,
-                session_binding.session_id(),
-                &other_device_snapshot,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let other_device_session = codec
-            .issue_inventory_session_id(&other_device_session_binding, 1_700_000_001, 10, 43)
-            .unwrap();
-        let other_device_binding = codec
-            .bind_inventory_page(
-                &other_device_session_binding,
-                &other_device_session,
-                &other_device_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let alternate_session_binding = codec
-            .bind_inventory_session(
-                device(),
-                Uuid::parse_str("99999999-9999-4999-a999-999999999999").unwrap(),
-                &snapshot_event_cursor,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let alternate_session = codec
-            .issue_inventory_session_id(&alternate_session_binding, 1_700_000_001, 10, 43)
-            .unwrap();
-        let alternate_session_page_binding = codec
-            .bind_inventory_page(
-                &alternate_session_binding,
-                &alternate_session,
-                &snapshot_event_cursor,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let future_snapshot = codec
-            .issue_event_cursor(&device(), 43, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let future_session_binding = codec
-            .bind_inventory_session(
-                device(),
-                session_binding.session_id(),
-                &future_snapshot,
-                43,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let future_session = codec
-            .issue_inventory_session_id(&future_session_binding, 1_700_000_001, 10, 43)
-            .unwrap();
-        let future_binding = codec
-            .bind_inventory_page(
-                &future_session_binding,
-                &future_session,
-                &future_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let alternate_snapshot_event_cursor = codec
-            .issue_event_cursor(&device(), 42, 10, 1_700_000_001, 1_700_000_300)
-            .unwrap();
-        let alternate_snapshot_session_binding = codec
-            .bind_inventory_session(
-                device(),
-                session_binding.session_id(),
-                &alternate_snapshot_event_cursor,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let alternate_snapshot_session = codec
-            .issue_inventory_session_id(&alternate_snapshot_session_binding, 1_700_000_001, 10, 43)
-            .unwrap();
-        let alternate_snapshot_binding = codec
-            .bind_inventory_page(
-                &alternate_snapshot_session_binding,
-                &alternate_snapshot_session,
-                &alternate_snapshot_event_cursor,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let later_expiry_snapshot = codec
-            .issue_event_cursor(&device(), 42, 10, 1_700_000_000, 1_700_000_301)
-            .unwrap();
-        let later_expiry_session_binding = codec
-            .bind_inventory_session(
-                device(),
-                session_binding.session_id(),
-                &later_expiry_snapshot,
-                42,
-                1_700_000_301,
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-        let later_expiry_session = codec
-            .issue_inventory_session_id(&later_expiry_session_binding, 1_700_000_001, 10, 43)
-            .unwrap();
-        let later_expiry_binding = codec
-            .bind_inventory_page(
-                &later_expiry_session_binding,
-                &later_expiry_session,
-                &later_expiry_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let alternate_filter_binding = codec
-            .bind_inventory_page(
-                &session_binding,
-                &session,
-                &snapshot_event_cursor,
-                InventoryPageDomain::Conversations,
-                b"open-filter-v1",
-                1_700_000_001,
-                10,
-                43,
-            )
-            .unwrap();
-
-        let alternatives = [
-            other_device_binding,
-            alternate_session_page_binding,
-            future_binding,
-            alternate_snapshot_binding,
-            alternate_filter_binding,
-            later_expiry_binding,
-        ];
-        for expected in alternatives {
-            assert_eq!(
-                codec
-                    .verify_inventory_page_cursor_for_test(
-                        page.as_str(),
-                        &expected,
-                        1_700_000_001,
-                        10,
-                        43,
-                    )
-                    .unwrap_err(),
-                CursorCodecError::BindingMismatch
-            );
-        }
-
-        assert_eq!(
-            codec
-                .verify_inventory_page_cursor_for_test(
-                    page.as_str(),
-                    &binding,
-                    1_699_999_999,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::IssuedInFuture
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_page_cursor_for_test(
-                    page.as_str(),
-                    &binding,
-                    1_700_000_300,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::Expired
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_page_cursor_for_test(
-                    page.as_str(),
-                    &binding,
-                    1_700_000_001,
-                    43,
-                    43,
-                )
-                .unwrap_err(),
-            CursorCodecError::BelowRetentionFloor
-        );
-        assert_eq!(
-            codec
-                .verify_inventory_page_cursor_for_test(
-                    page.as_str(),
-                    &binding,
-                    1_700_000_001,
-                    10,
-                    41,
-                )
-                .unwrap_err(),
-            CursorCodecError::PositionInFuture
-        );
-        assert_eq!(
-            codec
-                .issue_inventory_page_cursor(
-                    &binding,
-                    9_007_199_254_740_992,
-                    b"conversation-key",
-                    1_700_000_001,
-                    10,
-                    43,
-                )
-                .unwrap_err(),
-            CursorCodecError::InvalidField
-        );
     }
 
     #[test]
@@ -1224,78 +403,6 @@ mod cursor_tests {
                 )
                 .unwrap_err(),
             CursorCodecError::InvalidField
-        );
-    }
-
-    #[test]
-    fn codec_configuration_is_exact_and_key_and_instance_fail_closed() {
-        let good_key_id = URL_SAFE_NO_PAD.encode([0x41; 32]);
-        let protocol_instance = Uuid::parse_str(PROTOCOL_INSTANCE).unwrap();
-        assert_eq!(
-            CursorCodec::new(protocol_instance, &good_key_id, Zeroizing::new([0; 32]))
-                .err()
-                .unwrap(),
-            CursorCodecError::InvalidConfiguration
-        );
-        assert_eq!(
-            CursorCodec::new(Uuid::nil(), &good_key_id, Zeroizing::new([0xA5; 32]),)
-                .err()
-                .unwrap(),
-            CursorCodecError::InvalidConfiguration
-        );
-        for invalid_key_id in [
-            format!("{good_key_id}="),
-            URL_SAFE_NO_PAD.encode([0x41; 31]),
-            noncanonical_base64url(&good_key_id),
-        ] {
-            assert_eq!(
-                CursorCodec::new(
-                    protocol_instance,
-                    &invalid_key_id,
-                    Zeroizing::new([0xA5; 32]),
-                )
-                .err()
-                .unwrap(),
-                CursorCodecError::InvalidConfiguration
-            );
-        }
-
-        let issuer = codec();
-        let device = device();
-        let cursor = issuer
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let wrong_key = CursorCodec::new(
-            protocol_instance,
-            &URL_SAFE_NO_PAD.encode([0x42; 32]),
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_key
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::WrongKey
-        );
-        let wrong_instance = CursorCodec::new(
-            Uuid::parse_str("bbbbbbbb-bbbb-4bbb-abbb-bbbbbbbbbbbb").unwrap(),
-            &good_key_id,
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_instance
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::WrongProtocolInstance
-        );
-        let wrong_secret =
-            CursorCodec::new(protocol_instance, &good_key_id, Zeroizing::new([0xA6; 32])).unwrap();
-        assert_eq!(
-            wrong_secret
-                .verify_event_cursor(cursor.as_str(), &device, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::AuthenticationFailed
         );
     }
 
@@ -1405,485 +512,663 @@ mod cursor_tests {
     }
 
     #[test]
-    fn opaque_values_have_redacted_debug_and_remain_within_the_public_limit() {
-        let codec = codec();
-        let event = codec
-            .issue_event_cursor(&device(), 42, 10, 1_700_000_000, 1_700_000_300)
+    fn capability_minting_uses_exactly_32_csprng_bytes_and_43_char_base64url() {
+        let mut os = OsSecureRandom::new();
+        let mut deterministic = DeterministicRandom::new(0x5EED);
+        for random in [&mut os as &mut dyn SecureRandom, &mut deterministic] {
+            let token = mint_capability_token(random).unwrap();
+            assert_eq!(token.as_bytes().len(), 32);
+            let encoded = token.encode();
+            assert_eq!(encoded.len(), 43);
+            assert!(encoded.is_ascii());
+            assert!(!encoded.contains('='));
+            assert_eq!(URL_SAFE_NO_PAD.decode(&encoded).unwrap().len(), 32);
+            let decoded = decode_capability_token(&encoded).unwrap();
+            assert_eq!(decoded.as_bytes(), token.as_bytes());
+        }
+    }
+
+    #[test]
+    fn capability_lookup_is_sha256_only_and_public_token_leaks_no_binding_fields() {
+        let mut random = DeterministicRandom::new(0xCAFE);
+        let token = mint_capability_token(&mut random).unwrap();
+        let encoded = token.encode();
+        let lookup = token.lookup_hash();
+
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        assert_eq!(lookup, digest);
+
+        let fields = [
+            b"conversations".as_slice(),
+            ENDPOINT_NSID.as_bytes(),
+            SESSION_ID.as_bytes(),
+            DID.as_bytes(),
+            DEVICE_ID.as_bytes(),
+            PROTOCOL_INSTANCE.as_bytes(),
+        ];
+        for field in fields {
+            assert!(
+                !encoded
+                    .as_bytes()
+                    .windows(field.len())
+                    .any(|window| window == field),
+                "the public token must not carry binding material"
+            );
+        }
+
+        let decoded = decode_capability_token(&encoded).unwrap();
+        assert_eq!(decoded.as_bytes(), token.as_bytes());
+        assert_eq!(decoded.lookup_hash(), lookup);
+        let unrelated: [u8; 32] = Sha256::digest(b"conversations").into();
+        assert_ne!(lookup, unrelated);
+    }
+
+    #[test]
+    fn sealed_successors_verify_round_trip_byte_exact() {
+        let mut random = DeterministicRandom::new(0x0123);
+        let sealer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(successor.lookup_hash()));
+        let sealed = sealer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
             .unwrap();
-        let session_binding = inventory_session_binding(&codec, &event);
-        let session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 42)
+
+        let verified = sealer.verify_successor(&sealed, &binding).unwrap();
+        assert_eq!(verified.as_slice(), successor.as_bytes());
+
+        let replayed = sealer.verify_successor(&sealed, &binding).unwrap();
+        assert_eq!(replayed.as_slice(), verified.as_slice());
+        assert_eq!(replayed.as_slice(), successor.as_bytes());
+    }
+
+    #[test]
+    fn seal_generates_a_fresh_unique_nonce_per_successor() {
+        let mut deterministic = DeterministicRandom::new(0xBEAD);
+        let sealer = sealer();
+        let mut nonces = std::collections::HashSet::new();
+        for _ in 0..128 {
+            let successor = mint_capability_token(&mut deterministic).unwrap();
+            let binding = page_binding(Some(successor.lookup_hash()));
+            let sealed = sealer
+                .seal_successor(successor.as_bytes(), &binding, &mut deterministic)
+                .unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce must be unique per seal");
+            assert!((17..=cursor::MAX_SEALED_CIPHERTEXT_BYTES).contains(&sealed.ciphertext.len()));
+        }
+
+        let mut os = OsSecureRandom::new();
+        let mut os_nonces = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let successor = mint_capability_token(&mut os).unwrap();
+            let binding = page_binding(Some(successor.lookup_hash()));
+            let sealed = sealer
+                .seal_successor(successor.as_bytes(), &binding, &mut os)
+                .unwrap();
+            assert!(
+                os_nonces.insert(sealed.nonce),
+                "nonce must be unique per seal"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_rejects_wrong_secret_key() {
+        let mut random = DeterministicRandom::new(0x1111);
+        let issuer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(successor.lookup_hash()));
+        let sealed = issuer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
             .unwrap();
-        let page = codec
-            .issue_inventory_page_cursor(
-                &inventory_page_binding(&codec, InventoryPageDomain::Conversations),
-                9,
-                &[0x66; 512],
+
+        let wrong_secret = CursorSealer::new([0x41; 32], Zeroizing::new([0xA6; 32]))
+            .expect("a non-zero sealing secret is a valid configuration");
+        assert_eq!(
+            wrong_secret
+                .verify_successor(&sealed, &binding)
+                .unwrap_err(),
+            SealerError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn seal_and_verify_reject_wrong_key_id() {
+        let mut random = DeterministicRandom::new(0x2222);
+        let issuer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(successor.lookup_hash()));
+        let sealed = issuer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
+            .unwrap();
+
+        let wrong_key_id = CursorSealer::new([0x42; 32], Zeroizing::new([0xA5; 32]))
+            .expect("a non-zero sealing secret is a valid configuration");
+        assert_eq!(
+            wrong_key_id
+                .verify_successor(&sealed, &binding)
+                .unwrap_err(),
+            SealerError::WrongKey
+        );
+        assert_eq!(
+            wrong_key_id
+                .seal_successor(successor.as_bytes(), &binding, &mut random)
+                .unwrap_err(),
+            SealerError::WrongKey
+        );
+    }
+
+    #[test]
+    fn verify_rejects_wrong_domain_binding() {
+        let mut random = DeterministicRandom::new(0x3333);
+        let sealer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(successor.lookup_hash()));
+        let sealed = sealer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
+            .unwrap();
+
+        let mut spec = PageSpec::default();
+        spec.domain = b"recovery".to_vec();
+        spec.successor_cursor_hash = Some(successor.lookup_hash());
+        assert_eq!(
+            sealer
+                .verify_successor(&sealed, &spec.to_binding())
+                .unwrap_err(),
+            SealerError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn verify_rejects_every_wrong_aad_field() {
+        let mut random = DeterministicRandom::new(0x4444);
+        let sealer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let mut reference = PageSpec::default();
+        reference.successor_cursor_hash = Some(successor.lookup_hash());
+        let binding = reference.to_binding();
+        let sealed = sealer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
+            .unwrap();
+
+        let variants: Vec<Box<dyn FnOnce(&mut PageSpec)>> = vec![
+            Box::new(|spec| spec.domain = b"welcomes".to_vec()),
+            Box::new(|spec| spec.endpoint_nsid = b"blue.catbird.mls.getInventoryRecovery".to_vec()),
+            Box::new(|spec| spec.cursor_format_version = 2),
+            Box::new(|spec| {
+                spec.inventory_session_id =
+                    Uuid::parse_str("99999999-9999-4999-a999-999999999999").unwrap()
+            }),
+            Box::new(|spec| spec.user_did = b"did:plc:dwvi7nxzyoun6zhxrhs64oiz".to_vec()),
+            Box::new(|spec| {
+                spec.device_id = Uuid::parse_str("88888888-8888-4888-a888-888888888888").unwrap()
+            }),
+            Box::new(|spec| spec.jkt = URL_SAFE_NO_PAD.encode([0x62; 32]).into_bytes()),
+            Box::new(|spec| spec.auth_generation = 8),
+            Box::new(|spec| {
+                spec.protocol_instance_id =
+                    Uuid::parse_str("bbbbbbbb-bbbb-4bbb-abbb-bbbbbbbbbbbb").unwrap()
+            }),
+            Box::new(|spec| spec.snapshot_event_position = 43),
+            Box::new(|spec| spec.snapshot_event_cursor_sha256 = [0x12; 32]),
+            Box::new(|spec| spec.snapshot_retained_floor = 11),
+            Box::new(|spec| spec.canonical_filter_sha256 = [0x23; 32]),
+            Box::new(|spec| spec.page_limit = 50),
+            Box::new(|spec| spec.after_ordinal = Some(10)),
+            Box::new(|spec| spec.after_ordinal = None),
+            Box::new(|spec| spec.created_at = 1_700_000_001),
+            Box::new(|spec| spec.expires_at = 1_700_000_301),
+        ];
+        for mutate in variants {
+            let mut spec = PageSpec::default();
+            spec.successor_cursor_hash = Some(successor.lookup_hash());
+            mutate(&mut spec);
+            assert_eq!(
+                sealer
+                    .verify_successor(&sealed, &spec.to_binding())
+                    .unwrap_err(),
+                SealerError::AuthenticationFailed,
+                "every AAD field must be exact; one-field drift must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_rejects_tag_corruption_and_ciphertext_and_nonce_mutation() {
+        let mut random = DeterministicRandom::new(0x5555);
+        let sealer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(successor.lookup_hash()));
+        let sealed = sealer
+            .seal_successor(successor.as_bytes(), &binding, &mut random)
+            .unwrap();
+
+        let mut tag_corrupt = sealed.clone();
+        let last = tag_corrupt.ciphertext.last_mut().unwrap();
+        *last ^= 1;
+        assert_eq!(
+            sealer.verify_successor(&tag_corrupt, &binding).unwrap_err(),
+            SealerError::AuthenticationFailed
+        );
+
+        let mut ciphertext_corrupt = sealed.clone();
+        ciphertext_corrupt.ciphertext[0] ^= 1;
+        assert_eq!(
+            sealer
+                .verify_successor(&ciphertext_corrupt, &binding)
+                .unwrap_err(),
+            SealerError::AuthenticationFailed
+        );
+
+        let mut nonce_corrupt = sealed.clone();
+        nonce_corrupt.nonce[0] ^= 1;
+        assert_eq!(
+            sealer
+                .verify_successor(&nonce_corrupt, &binding)
+                .unwrap_err(),
+            SealerError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn seal_rejects_successor_hash_mismatch_and_missing_hash() {
+        let mut random = DeterministicRandom::new(0x6666);
+        let sealer = sealer();
+        let successor = mint_capability_token(&mut random).unwrap();
+
+        let mut flipped = PageSpec::default();
+        let mut wrong_hash = successor.lookup_hash();
+        wrong_hash[0] ^= 1;
+        flipped.successor_cursor_hash = Some(wrong_hash);
+        assert_eq!(
+            sealer
+                .seal_successor(successor.as_bytes(), &flipped.to_binding(), &mut random)
+                .unwrap_err(),
+            SealerError::SuccessorHashMismatch
+        );
+
+        let missing = page_binding(None);
+        assert_eq!(
+            sealer
+                .seal_successor(successor.as_bytes(), &missing, &mut random)
+                .unwrap_err(),
+            SealerError::SuccessorHashMismatch
+        );
+    }
+
+    #[test]
+    fn noncanonical_public_capability_tokens_fail_decode() {
+        let mut random = DeterministicRandom::new(0x7777);
+        let token = mint_capability_token(&mut random).unwrap();
+        let encoded = token.encode();
+
+        assert_eq!(
+            decode_capability_token(&format!("{encoded}=")).unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+        assert_eq!(
+            decode_capability_token(&noncanonical_trailing_bits(&encoded)).unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+        assert_eq!(
+            decode_capability_token("").unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+        assert_eq!(
+            decode_capability_token("not+a-token").unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+        assert_eq!(
+            decode_capability_token("A".repeat(512).as_str()).unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+        assert_eq!(
+            decode_capability_token("A".repeat(513).as_str()).unwrap_err(),
+            CursorCodecError::TooLong
+        );
+        assert_eq!(
+            decode_capability_token(&format!("{encoded}{encoded}")).unwrap_err(),
+            CursorCodecError::InvalidEncoding
+        );
+    }
+
+    #[test]
+    fn event_cursor_binding_seals_verifies_and_fails_closed_on_every_field() {
+        let mut random = DeterministicRandom::new(0x8888);
+        let sealer = sealer();
+        let capability = mint_capability_token(&mut random).unwrap();
+        let binding = event_binding();
+        let sealed = sealer
+            .seal_successor(capability.as_bytes(), &binding, &mut random)
+            .unwrap();
+
+        let verified = sealer.verify_successor(&sealed, &binding).unwrap();
+        assert_eq!(verified.as_slice(), capability.as_bytes());
+
+        let wrong_position = SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            43,
+            None,
+            10,
+            1_700_000_000,
+            1_700_000_300,
+        )
+        .unwrap();
+        let wrong_device = SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str("88888888-8888-4888-a888-888888888888").unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            None,
+            10,
+            1_700_000_000,
+            1_700_000_300,
+        )
+        .unwrap();
+        let wrong_floor = SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            None,
+            11,
+            1_700_000_000,
+            1_700_000_300,
+        )
+        .unwrap();
+        let with_predecessor = SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            Some([0xAB; 32]),
+            10,
+            1_700_000_000,
+            1_700_000_300,
+        )
+        .unwrap();
+        let wrong_expiry = SealerBinding::for_event_cursor_receipt(
+            Uuid::parse_str(SESSION_ID).unwrap(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            None,
+            10,
+            1_700_000_000,
+            1_700_000_301,
+        )
+        .unwrap();
+        for wrong in [
+            wrong_position,
+            wrong_device,
+            wrong_floor,
+            with_predecessor,
+            wrong_expiry,
+        ] {
+            assert_eq!(
+                sealer.verify_successor(&sealed, &wrong).unwrap_err(),
+                SealerError::AuthenticationFailed
+            );
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn sealer_binding_validation_is_fail_closed() {
+        let binding = PageSpec::default().to_binding();
+        assert_eq!(
+            sealer()
+                .seal_successor(
+                    b"capability-bytes",
+                    &binding,
+                    &mut DeterministicRandom::new(1)
+                )
+                .unwrap_err(),
+            SealerError::SuccessorHashMismatch,
+            "a page binding without the exact successor hash must not seal"
+        );
+
+        let invalid_limits: Vec<(&str, Box<dyn FnOnce(&mut PageSpec)>)> = vec![
+            ("page_limit=0", Box::new(|s| s.page_limit = 0)),
+            ("page_limit=101", Box::new(|s| s.page_limit = 101)),
+            ("empty domain", Box::new(|s| s.domain.clear())),
+            ("domain too long", Box::new(|s| s.domain = vec![0x41; 65])),
+            ("empty endpoint", Box::new(|s| s.endpoint_nsid.clear())),
+            (
+                "endpoint too long",
+                Box::new(|s| s.endpoint_nsid = vec![0x41; 257]),
+            ),
+            (
+                "zero format version",
+                Box::new(|s| s.cursor_format_version = 0),
+            ),
+            (
+                "nil session",
+                Box::new(|s| s.inventory_session_id = Uuid::nil()),
+            ),
+            ("nil device", Box::new(|s| s.device_id = Uuid::nil())),
+            ("empty user did", Box::new(|s| s.user_did.clear())),
+            ("empty jkt", Box::new(|s| s.jkt.clear())),
+            ("zero auth generation", Box::new(|s| s.auth_generation = 0)),
+            (
+                "nil protocol instance",
+                Box::new(|s| s.protocol_instance_id = Uuid::nil()),
+            ),
+            ("empty cursor key id", Box::new(|s| s.cursor_key_id.clear())),
+            (
+                "position below floor",
+                Box::new(|s| s.snapshot_event_position = 9),
+            ),
+            (
+                "position above safe integer",
+                Box::new(|s| s.snapshot_event_position = 9_007_199_254_740_992),
+            ),
+            (
+                "floor above safe integer",
+                Box::new(|s| s.snapshot_retained_floor = 9_007_199_254_740_992),
+            ),
+            (
+                "created at equals expires at",
+                Box::new(|s| s.expires_at = s.created_at),
+            ),
+            (
+                "created at after expires at",
+                Box::new(|s| s.created_at = s.expires_at + 1),
+            ),
+            (
+                "after ordinal above safe integer",
+                Box::new(|s| s.after_ordinal = Some(9_007_199_254_740_992)),
+            ),
+        ];
+        for (name, mutate) in invalid_limits {
+            let mut spec = PageSpec::default();
+            mutate(&mut spec);
+            assert!(
+                matches!(spec.try_to_binding(), Err(SealerError::InvalidBinding)),
+                "{name} must be rejected"
+            );
+        }
+
+        let mut event = DeterministicRandom::new(1);
+        let bad_event = SealerBinding::for_event_cursor_receipt(
+            Uuid::nil(),
+            DID.as_bytes(),
+            Uuid::parse_str(DEVICE_ID).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+            7,
+            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+            URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+            42,
+            None,
+            10,
+            1_700_000_000,
+            1_700_000_300,
+        );
+        assert_eq!(bad_event.unwrap_err(), SealerError::InvalidBinding);
+        assert_eq!(
+            SealerBinding::for_event_cursor_receipt(
+                Uuid::parse_str(SESSION_ID).unwrap(),
+                DID.as_bytes(),
+                Uuid::parse_str(DEVICE_ID).unwrap(),
+                URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+                0,
+                Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+                URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+                42,
+                None,
+                10,
                 1_700_000_000,
-                10,
-                42,
+                1_700_000_300,
             )
-            .unwrap();
-        let own = codec
-            .issue_own_device_cursor(&own_device_binding(), 3, &[0x77; 512], 1_700_000_000)
-            .unwrap();
-
-        for (encoded, debugged) in [
-            (event.as_str(), format!("{event:?}")),
-            (session.as_str(), format!("{session:?}")),
-            (page.as_str(), format!("{page:?}")),
-            (own.as_str(), format!("{own:?}")),
-        ] {
-            assert!(encoded.len() <= cursor::MAX_OPAQUE_CURSOR_ASCII_BYTES);
-            assert!(!debugged.contains(encoded));
-            assert!(debugged.contains("REDACTED"));
-        }
+            .unwrap_err(),
+            SealerError::InvalidBinding
+        );
+        assert_eq!(
+            SealerBinding::for_event_cursor_receipt(
+                Uuid::parse_str(SESSION_ID).unwrap(),
+                DID.as_bytes(),
+                Uuid::parse_str(DEVICE_ID).unwrap(),
+                URL_SAFE_NO_PAD.encode([0x61; 32]).as_bytes(),
+                7,
+                Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
+                URL_SAFE_NO_PAD.encode([0x41; 32]).as_bytes(),
+                9,
+                None,
+                10,
+                1_700_000_000,
+                1_700_000_300,
+            )
+            .unwrap_err(),
+            SealerError::InvalidBinding
+        );
+        let _ = event;
     }
 
     #[test]
-    fn inventory_session_issuance_rejects_mismatched_nested_event_evidence() {
-        let codec = codec();
-        let snapshot = snapshot_event_cursor(&codec);
-        let other_device = bound_device(DID, "88888888-8888-4888-a888-888888888888", 7, 0x61);
-        let session_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
+    fn new_security_types_have_redacted_debug() {
+        let mut random = DeterministicRandom::new(0x9999);
+        let sealer = sealer();
+        let token = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(token.lookup_hash()));
+        let sealed = sealer
+            .seal_successor(token.as_bytes(), &binding, &mut random)
+            .unwrap();
+        let event_binding = event_binding();
+        let error = SealerError::AuthenticationFailed;
+        let random_error = SecureRandomError;
+        let os = OsSecureRandom::new();
 
-        for (expected_device, expected_position, expected_expiry) in [
-            (other_device, 42, 1_700_000_300),
-            (device(), 41, 1_700_000_300),
-            (device(), 42, 1_700_000_299),
-        ] {
-            assert_eq!(
-                codec
-                    .bind_inventory_session(
-                        expected_device,
-                        session_id,
-                        &snapshot,
-                        expected_position,
-                        expected_expiry,
-                        1_700_000_001,
-                        10,
-                        42,
-                    )
-                    .unwrap_err(),
-                CursorCodecError::BindingMismatch
+        let capability_hex = hex(token.as_bytes());
+        let ciphertext_hex = hex(&sealed.ciphertext);
+        let debugged = [
+            format!("{sealer:?}"),
+            format!("{binding:?}"),
+            format!("{event_binding:?}"),
+            format!("{sealed:?}"),
+            format!("{token:?}"),
+            format!("{os:?}"),
+            format!("{error:?}"),
+            format!("{random_error:?}"),
+        ];
+        for value in &debugged {
+            assert!(
+                !value.contains(&capability_hex),
+                "capability bytes must never print"
+            );
+            assert!(
+                !value.contains(&ciphertext_hex),
+                "sealed ciphertext must never print"
             );
         }
-
-        let binding = inventory_session_binding(&codec, &snapshot);
-        let key_id = URL_SAFE_NO_PAD.encode([0x41; 32]);
-        let wrong_secret = CursorCodec::new(
-            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
-            &key_id,
-            Zeroizing::new([0xA6; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_secret
-                .issue_inventory_session_id(&binding, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::AuthenticationFailed
-        );
-        let wrong_key = CursorCodec::new(
-            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
-            &URL_SAFE_NO_PAD.encode([0x42; 32]),
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_key
-                .issue_inventory_session_id(&binding, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::WrongKey
-        );
-        let wrong_instance = CursorCodec::new(
-            Uuid::parse_str("bbbbbbbb-bbbb-4bbb-abbb-bbbbbbbbbbbb").unwrap(),
-            &key_id,
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_instance
-                .issue_inventory_session_id(&binding, 1_700_000_001, 10, 42)
-                .unwrap_err(),
-            CursorCodecError::WrongProtocolInstance
-        );
-    }
-
-    #[test]
-    fn inventory_page_issuance_rejects_mismatched_nested_session_and_event_evidence() {
-        let codec = codec();
-        let snapshot = snapshot_event_cursor(&codec);
-        let session_binding = inventory_session_binding(&codec, &snapshot);
-        let session = codec
-            .issue_inventory_session_id(&session_binding, 1_700_000_000, 10, 42)
-            .unwrap();
-        let other_snapshot = codec
-            .issue_event_cursor(&device(), 41, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let other_session_binding = codec
-            .bind_inventory_session(
-                device(),
-                Uuid::parse_str("99999999-9999-4999-a999-999999999999").unwrap(),
-                &other_snapshot,
-                41,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-        let other_session = codec
-            .issue_inventory_session_id(&other_session_binding, 1_700_000_001, 10, 42)
-            .unwrap();
-        let other_device = bound_device(DID, "88888888-8888-4888-a888-888888888888", 7, 0x61);
-        let other_device_snapshot = codec
-            .issue_event_cursor(&other_device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let other_device_session_binding = codec
-            .bind_inventory_session(
-                other_device,
-                session_binding.session_id(),
-                &other_device_snapshot,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-
-        for result in [
-            codec.bind_inventory_page(
-                &session_binding,
-                &session,
-                &other_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            ),
-            codec.bind_inventory_page(
-                &session_binding,
-                &other_session,
-                &snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            ),
-            codec.bind_inventory_page(
-                &other_session_binding,
-                &session,
-                &other_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            ),
-            codec.bind_inventory_page(
-                &other_device_session_binding,
-                &other_session,
-                &other_device_snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            ),
+        for (value, redacted) in [
+            (format!("{sealer:?}"), "REDACTED"),
+            (format!("{binding:?}"), "REDACTED"),
+            (format!("{event_binding:?}"), "REDACTED"),
+            (format!("{sealed:?}"), "REDACTED"),
+            (format!("{token:?}"), "REDACTED"),
         ] {
-            assert_eq!(result.unwrap_err(), CursorCodecError::BindingMismatch);
-        }
-
-        let binding = codec
-            .bind_inventory_page(
-                &session_binding,
-                &session,
-                &snapshot,
-                InventoryPageDomain::Conversations,
-                b"closed-filter-v1",
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-        let key_id = URL_SAFE_NO_PAD.encode([0x41; 32]);
-        let wrong_secret = CursorCodec::new(
-            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
-            &key_id,
-            Zeroizing::new([0xA6; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_secret
-                .issue_inventory_page_cursor(
-                    &binding,
-                    9,
-                    b"conversation-key",
-                    1_700_000_001,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::AuthenticationFailed
-        );
-        let wrong_key = CursorCodec::new(
-            Uuid::parse_str(PROTOCOL_INSTANCE).unwrap(),
-            &URL_SAFE_NO_PAD.encode([0x42; 32]),
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_key
-                .issue_inventory_page_cursor(
-                    &binding,
-                    9,
-                    b"conversation-key",
-                    1_700_000_001,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::WrongKey
-        );
-        let wrong_instance = CursorCodec::new(
-            Uuid::parse_str("bbbbbbbb-bbbb-4bbb-abbb-bbbbbbbbbbbb").unwrap(),
-            &key_id,
-            Zeroizing::new([0xA5; 32]),
-        )
-        .unwrap();
-        assert_eq!(
-            wrong_instance
-                .issue_inventory_page_cursor(
-                    &binding,
-                    9,
-                    b"conversation-key",
-                    1_700_000_001,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::WrongProtocolInstance
-        );
-    }
-
-    #[test]
-    fn event_cursor_rehydrates_after_restart_from_exact_bytes_digest_and_binding() {
-        let issuer = codec();
-        let device = device();
-        let issued = issuer
-            .issue_event_cursor(&device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let persisted_bytes = issued.as_str().as_bytes().to_vec();
-        let persisted_sha256 = issued.binding_hash();
-        drop(issuer);
-        drop(issued);
-
-        let restarted = codec();
-        let hydrated = restarted
-            .hydrate_event_cursor(
-                &persisted_bytes,
-                persisted_sha256,
-                &device,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-
-        assert_eq!(hydrated.as_str().as_bytes(), persisted_bytes);
-        assert_eq!(hydrated.binding_hash(), persisted_sha256);
-    }
-
-    #[test]
-    fn event_cursor_restart_hydration_rejects_digest_device_position_and_expiry_mismatches() {
-        let issuer = codec();
-        let expected_device = device();
-        let issued = issuer
-            .issue_event_cursor(&expected_device, 42, 10, 1_700_000_000, 1_700_000_300)
-            .unwrap();
-        let persisted_bytes = issued.as_str().as_bytes().to_vec();
-        let persisted_sha256 = issued.binding_hash();
-        let restarted = codec();
-        let wrong_device = bound_device(DID, "88888888-8888-4888-a888-888888888888", 7, 0x61);
-        let mut wrong_sha256 = persisted_sha256;
-        wrong_sha256[0] ^= 1;
-
-        assert_eq!(
-            restarted
-                .hydrate_event_cursor(
-                    &persisted_bytes,
-                    wrong_sha256,
-                    &expected_device,
-                    42,
-                    1_700_000_300,
-                    1_700_000_001,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::DigestMismatch
-        );
-        for (device, position, expires_at) in [
-            (&wrong_device, 42, 1_700_000_300),
-            (&expected_device, 41, 1_700_000_300),
-            (&expected_device, 42, 1_700_000_299),
-        ] {
-            assert_eq!(
-                restarted
-                    .hydrate_event_cursor(
-                        &persisted_bytes,
-                        persisted_sha256,
-                        device,
-                        position,
-                        expires_at,
-                        1_700_000_001,
-                        10,
-                        42,
-                    )
-                    .unwrap_err(),
-                CursorCodecError::BindingMismatch
+            assert!(
+                value.contains(redacted),
+                "opaque types must be redacted in Debug"
             );
         }
+        assert_eq!(format!("{error:?}"), "AuthenticationFailed");
+        assert_eq!(format!("{random_error:?}"), "SecureRandomError");
+        assert!(!format!("{error}").contains("secret"));
+        assert!(!format!("{random_error}").contains("secret"));
     }
 
     #[test]
-    fn inventory_session_token_rehydrates_after_restart_only_from_exact_nested_evidence() {
-        let issuer = codec();
-        let device = device();
-        let snapshot = snapshot_event_cursor(&issuer);
-        let session_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
-        let binding = issuer
-            .bind_inventory_session(
-                device.clone(),
-                session_id,
-                &snapshot,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-        let issued = issuer
-            .issue_inventory_session_id(&binding, 1_700_000_001, 10, 42)
-            .unwrap();
-        let event_bytes = snapshot.as_str().as_bytes().to_vec();
-        let event_sha256 = snapshot.binding_hash();
-        let session_bytes = issued.as_str().as_bytes().to_vec();
-        let session_sha256 = issued.binding_hash();
-        drop(issuer);
-        drop(binding);
-        drop(snapshot);
-        drop(issued);
-
-        let restarted = codec();
-        let hydrated_event = restarted
-            .hydrate_event_cursor(
-                &event_bytes,
-                event_sha256,
-                &device,
-                42,
-                1_700_000_300,
-                1_700_000_002,
-                10,
-                42,
-            )
-            .unwrap();
-        let hydrated_binding = restarted
-            .bind_inventory_session(
-                device,
-                session_id,
-                &hydrated_event,
-                42,
-                1_700_000_300,
-                1_700_000_002,
-                10,
-                42,
-            )
-            .unwrap();
-        let hydrated_session = restarted
-            .hydrate_inventory_session_token(
-                &session_bytes,
-                session_sha256,
-                &hydrated_binding,
-                1_700_000_002,
-                10,
-                42,
-            )
-            .unwrap();
-
-        assert_eq!(hydrated_session.as_str().as_bytes(), session_bytes);
-        assert_eq!(hydrated_session.binding_hash(), session_sha256);
+    fn sealer_rejects_an_all_zero_secret() {
+        // The failure mode is the same static `InvalidConfiguration` error as
+        // `CursorCodec::new` — fail closed, no panic, no key material.
+        assert!(matches!(
+            CursorSealer::new([0x41; 32], Zeroizing::new([0; 32])),
+            Err(CursorCodecError::InvalidConfiguration)
+        ));
     }
 
     #[test]
-    fn inventory_session_restart_hydration_rejects_digest_and_session_mismatches() {
-        let codec = codec();
-        let snapshot = snapshot_event_cursor(&codec);
-        let session_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
-        let binding = codec
-            .bind_inventory_session(
-                device(),
-                session_id,
-                &snapshot,
-                42,
-                1_700_000_300,
-                1_700_000_001,
-                10,
-                42,
-            )
-            .unwrap();
-        let session = codec
-            .issue_inventory_session_id(&binding, 1_700_000_001, 10, 42)
-            .unwrap();
-        let persisted_bytes = session.as_str().as_bytes().to_vec();
-        let persisted_sha256 = session.binding_hash();
-        let mut wrong_sha256 = persisted_sha256;
-        wrong_sha256[0] ^= 1;
+    fn sealed_capability_rejects_undersized_and_oversized_ciphertext() {
+        let mut random = DeterministicRandom::new(0xAAAA);
+        let sealer = sealer();
+        let token = mint_capability_token(&mut random).unwrap();
+        let binding = page_binding(Some(token.lookup_hash()));
 
+        let oversized = SealedCapability {
+            nonce: [0; 12],
+            ciphertext: vec![0x42; cursor::MAX_SEALED_CIPHERTEXT_BYTES + 1],
+        };
         assert_eq!(
-            codec
-                .hydrate_inventory_session_token(
-                    &persisted_bytes,
-                    wrong_sha256,
-                    &binding,
-                    1_700_000_002,
-                    10,
-                    42,
-                )
-                .unwrap_err(),
-            CursorCodecError::DigestMismatch
+            sealer.verify_successor(&oversized, &binding).unwrap_err(),
+            SealerError::TooLong
         );
 
-        let other_binding = codec
-            .bind_inventory_session(
-                device(),
-                Uuid::parse_str("99999999-9999-4999-a999-999999999999").unwrap(),
-                &snapshot,
-                42,
-                1_700_000_300,
-                1_700_000_002,
-                10,
-                42,
-            )
-            .unwrap();
+        let undersized = SealedCapability {
+            nonce: [0; 12],
+            ciphertext: vec![0x42; 16],
+        };
         assert_eq!(
-            codec
-                .hydrate_inventory_session_token(
-                    &persisted_bytes,
-                    persisted_sha256,
-                    &other_binding,
-                    1_700_000_002,
-                    10,
-                    42,
-                )
+            sealer.verify_successor(&undersized, &binding).unwrap_err(),
+            SealerError::InvalidField
+        );
+
+        let too_long = vec![0x42; 497];
+        assert_eq!(
+            sealer
+                .seal_successor(&too_long, &binding, &mut random)
                 .unwrap_err(),
-            CursorCodecError::BindingMismatch
+            SealerError::TooLong
+        );
+        assert_eq!(
+            sealer
+                .seal_successor(&[], &binding, &mut random)
+                .unwrap_err(),
+            SealerError::InvalidField
         );
     }
 }

@@ -15747,7 +15747,16 @@ pub(crate) fn persistence_plan_for_test(
                         bound_coordinate: request.bound_coordinate,
                         key_package_ref: edge.key_package_ref,
                         key_package_wrapper_sha256: [0u8; 32],
-                        package_not_after: request.expires_at,
+                        package_not_after: effects
+                            .reservation_changes
+                            .iter()
+                            .filter_map(|change| change.after())
+                            .find(|reservation| {
+                                reservation.request_id == edge.request_id
+                                    && reservation.key_package_ref == edge.key_package_ref
+                            })
+                            .map(|reservation| reservation.package_not_after)
+                            .unwrap_or(request.expires_at),
                         claimed_at: request.received_at,
                         expected_status: edge.from,
                         successor_status: edge.to,

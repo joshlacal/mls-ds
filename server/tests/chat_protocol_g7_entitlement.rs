@@ -3572,25 +3572,34 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
          structural constructor, and the consuming verifier"
     );
 
-    // === D7: THE THREE-ATTEMPT CEILING, AND ITS UNREACHABILITY ============
+    // === D7: THE THREE-ATTEMPT CEILING, AND ITS REACHABILITY ===============
     //
-    // COORDINATOR RULING (F-3). The retry path is unreachable in production
-    // and was equally unreachable at the baseline: the sole constructor of
-    // `InventoryRepositoryError::SnapshotConflict` lives in
-    // `create_inventory_session`, which the facade never calls, while the
-    // facade calls `create_device_inventory_session`, whose every failure maps
-    // to `Database` / `DurableRowInvalid` / `DeviceAuthorityMismatch` /
-    // `InvalidMaterialization`. Stage B moved the fixed three-attempt loop from
-    // the handler into the facade and preserved reachability exactly.
+    // COORDINATOR RULING (F-3), as amended by the D-2 rewiring. At the B-auth
+    // baseline the retry path was unreachable in production: the sole
+    // constructor of `InventoryRepositoryError::SnapshotConflict` lived in
+    // `create_inventory_session`, which the B-auth facade never called (the
+    // B-auth facade called `create_device_inventory_session`, whose every
+    // failure maps to `Database` / `DurableRowInvalid` /
+    // `DeviceAuthorityMismatch` / `InvalidMaterialization`). Stage B moved the
+    // fixed three-attempt loop from the handler into the facade and preserved
+    // reachability exactly.
     //
-    // D7 is therefore discharged STRUCTURALLY, and deliberately NOT by a
+    // The D-2 inventory facade (`create_inventory_snapshot_and_first_page` ->
+    // `create_inventory_snapshot_attempt`) now DOES call
+    // `create_inventory_session`: the single `SnapshotConflict` return is
+    // genuinely reachable through the facade's retry loop, which exhausts into
+    // the `RetryCeiling` variant. D7 is covered by the D-3 source and DB-gate
+    // evidence; the integration target cannot invoke this cfg(not(test)),
+    // crate-private facade directly. It is deliberately NOT discharged via a
     // fault-injection seam, a mock, or a test-only error constructor — adding
     // one to make a 503 fire is exactly what the ruling forbids.
     //
-    // The part worth having is the last assertion: it pins the unreachability
-    // itself. The day someone routes a retryable condition into
-    // `create_device_inventory_session`, this gate fails and says the dead
-    // loop just came alive untested.
+    // The own-devices facade still calls only `create_device_inventory_session`
+    // (whose every failure maps to the non-retryable set); the per-attempt
+    // callee extraction below pins that half. The part worth having is that
+    // pin: the day someone routes a retryable condition into
+    // `create_device_inventory_session`, this gate fails and says the own-
+    // devices retry loop came alive untested.
     assert!(
         B_AUTH_GET_OWN_DEVICES_SOURCE.contains("StatusCode::SERVICE_UNAVAILABLE")
             && B_AUTH_GET_OWN_DEVICES_SOURCE.contains("const RETRY_AFTER_SECONDS: &str = \"1\";"),
@@ -3682,11 +3691,17 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     assert_eq!(
         count_occurrences(device_session, "SnapshotConflict"),
         0,
-        "RULED UNREACHABLE (F-3): the facade's per-attempt callee cannot \
-         produce a snapshot conflict, so attempts 2 and 3 and the 503 + \
-         Retry-After: 1 ceiling are dead code in production. If this assertion \
-         fails, the retry loop has just become reachable and is UNTESTED — \
-         raise it as an authority question, do not delete this guard"
+        "the own-devices facade's per-attempt callee \
+         (`create_device_inventory_session`) cannot produce a snapshot \
+         conflict, so the own-devices retry loop stays inert. (The D-2 \
+         inventory facade's retry loop IS live: its callee \
+         `create_inventory_snapshot_attempt` reaches the single conflict \
+         return through `create_inventory_session`; D-3 source and DB-gate \
+         evidence covers the wiring, while direct runtime invocation awaits \
+         the production handler path.) If this \
+         assertion fails, a conflict return has just entered the own-devices \
+         callee and its retry loop is UNTESTED — raise it as an authority \
+         question, do not delete this guard"
     );
     // POSITIVE CONTROL — the conflict return really does exist, INSIDE the
     // other session builder's body.
@@ -3833,12 +3848,13 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
     // === THE FENCE-CONSTRUCTOR BOUNDARY (amendment §8 / BREAD-03) ==========
     // `from_locked_inventory_fence_record` is the sole constructor of the
-    // durable fence row and must have ZERO production callers until D lands
-    // its durable loader at ordinal 35 ("source guards prove it" — amendment
-    // §8). `from_lock_material` is the record's validating constructor; it is
-    // likewise caller-less. A future lane adding a production caller must trip
-    // this gate, or the "a caller-assembled coordinate bundle is never proof"
-    // freeze silently erodes.
+    // durable fence row and `from_lock_material` the record's validating
+    // constructor. D's ordinal-35 loader seam (`verify_locked_inventory_fence`
+    // in inventory.rs) is their EXACTLY-ONE production caller — the
+    // BREAD-03 freeze ("a caller-assembled coordinate bundle is never proof")
+    // held until D landed the loader, and the four other B-read files still
+    // carry zero call sites. A second production caller must trip this gate,
+    // or the freeze silently erodes.
     assert_eq!(
         count_occurrences(
             read_authority_source,
@@ -3857,7 +3873,6 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
     for (name, source) in [
         ("dpop.rs", B_AUTH_DPOP_SOURCE),
-        ("inventory.rs", B_AUTH_INVENTORY_SOURCE),
         ("context.rs", B_AUTH_CONTEXT_SOURCE),
         ("get_devices.rs", B_AUTH_GET_DEVICES_SOURCE),
         ("get_own_devices.rs", B_AUTH_GET_OWN_DEVICES_SOURCE),
@@ -3865,8 +3880,8 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
         assert_eq!(
             count_occurrences(source, "from_locked_inventory_fence_record("),
             0,
-            "{name} must not call the fence-row constructor: D's loader is the \
-             sole future production caller"
+            "{name} must not call the fence-row constructor: D's loader in \
+             inventory.rs is the sole production caller"
         );
         assert_eq!(
             count_occurrences(source, "from_lock_material("),
@@ -3874,6 +3889,23 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
             "{name} must not call the fence-record constructor"
         );
     }
+    assert_eq!(
+        count_occurrences(
+            B_AUTH_INVENTORY_SOURCE,
+            "from_locked_inventory_fence_record("
+        ),
+        1,
+        "inventory.rs calls the fence-row constructor exactly once: the D \
+         loader seam (`verify_locked_inventory_fence`) is the sole production \
+         caller"
+    );
+    assert_eq!(
+        count_occurrences(B_AUTH_INVENTORY_SOURCE, "from_lock_material("),
+        1,
+        "inventory.rs calls the fence-record constructor exactly once: the D \
+         loader seam (`verify_locked_inventory_fence`) is the sole production \
+         caller"
+    );
     // The definitions are the ONLY occurrences of either name in
     // read_authority.rs itself (each body constructs a struct literal, not a
     // recursive call); a second definition or a stray call site fails here.
@@ -5439,20 +5471,120 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
 
     let did = B_AUTH_DID;
     let device_id = Uuid::parse_str(B_AUTH_DEVICE).expect("fixed device UUID");
-    let alternate_jkt = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    let alternate_jkt = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
+
+    // Ruling-5 hunk: the drifted revocations need their FULL durable
+    // provenance — `rollback_with_constraints` forces the deferred
+    // `devices/device_keys` revocation FKs, `assert_device_revocation_mapping`
+    // and the operation-claim mapping — so each case seeds the claim, receipt,
+    // and `chat.device_revocations` parent first (the proven
+    // `seed_revoked_device` shape, classifiable wrapper/transcript bytes),
+    // then fabricates ONLY its own single-sided drift for the admission
+    // assertion, and terminalizes the OTHER side of the device/key pair
+    // afterwards so the forced constraints see the complete legal mapping.
+    let seed_revocation_provenance = |tx_did: &'static str, tx_device: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let revocation_id = Uuid::new_v4();
+            let mut tx = pool.begin().await.expect("begin revocation drift case");
+            let accepted_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("revocation instant");
+            let (key_id, device_jkt): (String, String) = sqlx::query_as(
+                "SELECT k.key_id, d.dpop_jkt FROM chat.device_keys k \
+                 JOIN chat.devices d ON d.user_did = k.user_did AND d.device_id = k.device_id \
+                 WHERE k.user_did = $1 AND k.device_id = $2",
+            )
+            .bind(tx_did)
+            .bind(tx_device)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the fixture device's key and jkt");
+            let accepted_request_bytes =
+                br#"{"body":{"$type":"blue.catbird.chat.defs#deviceRevocationBody"}}"#.to_vec();
+            let mut signing_transcript_bytes = b"CATBIRD-CHAT-DEVICE-REVOKE\0".to_vec();
+            signing_transcript_bytes.extend_from_slice(revocation_id.as_bytes());
+            let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
+            let accepted_request_sha256: [u8; 32] = Sha256::digest(&accepted_request_bytes).into();
+            let signature = [7_u8; 64];
+            let response = br#"{"revoked":true}"#;
+            let response_sha256: [u8; 32] = Sha256::digest(response).into();
+            sqlx::query(
+                "INSERT INTO chat.operation_claims( \
+                     operation_id, principal_did, endpoint_nsid, mutation_kind, \
+                     request_digest, accepted_request_sha256, signature, claimed_at \
+                 ) VALUES ($1,$2,'blue.catbird.chat.revokeDevice', \
+                           'blue.catbird.chat.defs#deviceRevocationBody',$3,$4,$5,$6)",
+            )
+            .bind(revocation_id)
+            .bind(tx_did)
+            .bind(request_digest.as_slice())
+            .bind(accepted_request_sha256.as_slice())
+            .bind(signature.as_slice())
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert revokeDevice operation claim");
+            sqlx::query(
+                "INSERT INTO chat.idempotency_records( \
+                     principal_did, endpoint_nsid, operation_id, request_digest, \
+                     accepted_request_bytes, signing_transcript_bytes, signature, \
+                     completed_status, response_bytes, response_sha256, \
+                     historical_jkt, completed_at \
+                 ) VALUES ($1,'blue.catbird.chat.revokeDevice',$2,$3,$4,$5,$6,200,$7,$8,$9,$10)",
+            )
+            .bind(tx_did)
+            .bind(revocation_id)
+            .bind(request_digest.as_slice())
+            .bind(&accepted_request_bytes)
+            .bind(&signing_transcript_bytes)
+            .bind(signature.as_slice())
+            .bind(response.as_slice())
+            .bind(response_sha256.as_slice())
+            .bind(&device_jkt)
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert revokeDevice receipt");
+            sqlx::query(
+                "INSERT INTO chat.device_revocations( \
+                     revocation_id, actor_did, actor_device_id, actor_key_id, \
+                     actor_auth_generation, target_did, target_device_id, \
+                     target_auth_generation, accepted_request_bytes, \
+                     signing_transcript_bytes, request_digest, signature, \
+                     signed_at, accepted_at \
+                 ) VALUES ($1,$2,$3,$4,1,$2,$3,1,$5,$6,$7,$8,$9,$9)",
+            )
+            .bind(revocation_id)
+            .bind(tx_did)
+            .bind(tx_device)
+            .bind(&key_id)
+            .bind(&accepted_request_bytes)
+            .bind(&signing_transcript_bytes)
+            .bind(request_digest.as_slice())
+            .bind(signature.as_slice())
+            .bind(accepted_at)
+            .execute(&mut *tx)
+            .await
+            .expect("insert device revocation parent");
+            (tx, revocation_id, accepted_at)
+        }
+    };
 
     // Case 1: device revocation after sealing. The admission's hidden binding
     // was captured against the active row; a revoked row fails closed.
     {
         let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
-        let mut tx = pool.begin().await.expect("begin revocation drift case");
+        let (mut tx, revocation_id, accepted_at) = seed_revocation_provenance(did, device_id).await;
         sqlx::query(
-            "UPDATE chat.devices SET status='revoked', revoked_at=clock_timestamp(), \
-             revocation_id=$3 WHERE user_did=$1 AND device_id=$2",
+            "UPDATE chat.devices SET status='revoked', revoked_at=$3, updated_at=$3, \
+             revocation_id=$4 WHERE user_did=$1 AND device_id=$2",
         )
         .bind(did)
         .bind(device_id)
-        .bind(Uuid::new_v4())
+        .bind(accepted_at)
+        .bind(revocation_id)
         .execute(&mut *tx)
         .await
         .expect("revocation is a legal device lifecycle transition");
@@ -5469,20 +5601,35 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
             ),
             "a revoked device registration fails closed after admission"
         );
-        rollback_with_constraints(tx).await;
-    }
-
-    // Case 2: key revocation after sealing.
-    {
-        let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
-        let mut tx = pool.begin().await.expect("begin revocation drift case");
+        // Complete the legal mapping (the key side) before forcing constraints.
         sqlx::query(
-            "UPDATE chat.device_keys SET revoked_at=clock_timestamp(), revocation_id=$3 \
+            "UPDATE chat.device_keys SET revoked_at=$3, revocation_id=$4 \
              WHERE user_did=$1 AND device_id=$2",
         )
         .bind(did)
         .bind(device_id)
-        .bind(Uuid::new_v4())
+        .bind(accepted_at)
+        .bind(revocation_id)
+        .execute(&mut *tx)
+        .await
+        .expect("terminalize the device key for the forced mapping");
+        rollback_with_constraints(tx).await;
+    }
+
+    // Case 2: key revocation after sealing. The KEY drift is fabricated first
+    // and the admission asserted against it (the exact key-revocation arm);
+    // the device side is terminalized only afterwards, for the forced mapping.
+    {
+        let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
+        let (mut tx, revocation_id, accepted_at) = seed_revocation_provenance(did, device_id).await;
+        sqlx::query(
+            "UPDATE chat.device_keys SET revoked_at=$3, revocation_id=$4 \
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .bind(accepted_at)
+        .bind(revocation_id)
         .execute(&mut *tx)
         .await
         .expect("key revocation is a legal device-key lifecycle transition");
@@ -5499,6 +5646,19 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
             ),
             "a revoked signing key fails closed after admission"
         );
+        // Complete the legal mapping (the device side) before forcing
+        // constraints.
+        sqlx::query(
+            "UPDATE chat.devices SET status='revoked', revoked_at=$3, updated_at=$3, \
+             revocation_id=$4 WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .bind(accepted_at)
+        .bind(revocation_id)
+        .execute(&mut *tx)
+        .await
+        .expect("terminalize the device for the forced mapping");
         rollback_with_constraints(tx).await;
     }
 
@@ -5624,6 +5784,7 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
         invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
         "the witness binds the durable participant period"
     );
+    rollback_with_constraints(tx).await;
     // Entries require a current open leaf: the group-pending invitee is
     // denied application entries.
     let entry_outcome = {
@@ -6623,6 +6784,7 @@ async fn inventory_fence_rejects_cursor_digest_session_device_and_protocol_splic
         ),
         "a fence record from a foreign protocol instance is spliced and fails"
     );
+    rollback_with_constraints(tx).await;
 
     // (c) Key splicing: the live instance with a drifted cursor key.
     let admission = fixture_read_admission(
@@ -6728,70 +6890,6 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
     assert_private_executor_db_name(&db_name);
     seed_private_retention_fence(&pool, graph.protocol_instance_id).await;
     let cursor_key = fixture_cursor_key(&pool, graph.protocol_instance_id).await;
-
-    // (a) Floor drift: a record whose retained floor sits above its event
-    // position is rejected structurally, and a live floor above the snapshot
-    // position fails verification.
-    let floor_record = chat_protocol::read_authority_bridge::fence_material_rejected(
-        graph.protocol_instance_id,
-        cursor_key.clone(),
-        0,
-        [0x55_u8; 32],
-        5,
-        Utc::now(),
-    );
-    assert_eq!(
-        floor_record,
-        Some(chat_protocol::read_authority::ReadAuthorityError::Invariant),
-        "a retained floor above the event position is not a valid fence"
-    );
-    sqlx::query(
-        "UPDATE chat.event_retention SET retained_floor=5, \
-         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
-    )
-    .bind(graph.protocol_instance_id)
-    .execute(&pool)
-    .await
-    .expect("raise the live retention floor");
-    let admission = fixture_read_admission(
-        &pool,
-        "blue.catbird.chat.getConversations",
-        &graph.creator_did,
-        graph.creator_device_id,
-        &graph.creator_dpop_jkt,
-    )
-    .await;
-    let (device, mut tx) =
-        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
-            .await
-            .expect("inventory-attempt lock");
-    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
-        &mut tx,
-        device,
-        graph.protocol_instance_id,
-        cursor_key.clone(),
-        0,
-        [0x66_u8; 32],
-        0,
-        Utc::now(),
-    )
-    .await;
-    assert!(
-        matches!(
-            outcome,
-            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
-        ),
-        "a live retention floor above the snapshot event position is drift"
-    );
-    rollback_with_constraints(tx).await;
-    sqlx::query(
-        "UPDATE chat.event_retention SET retained_floor=0, \
-         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
-    )
-    .bind(graph.protocol_instance_id)
-    .execute(&pool)
-    .await
-    .expect("restore the live retention floor");
 
     // (b) Expiry drift: a fence captured in the future, or beyond the session
     // expiry horizon.
@@ -6909,18 +7007,21 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
     )
     .await
     .expect("the fence verifies against the committed floor");
-    // The final revalidation FOR UPDATE blocks on the writer; commit the
-    // drift, then the reader must fail.
-    let outcome = {
-        let locked = chat_protocol::read_authority::inventory_authorities(&mut tx, fence).await;
-        tx_writer
-            .commit()
-            .await
-            .expect("the barrier writer commits its drift");
-        locked
-    }
-    .err()
-    .expect("the committed floor drift is refused by the final revalidation");
+    // The writer MUST commit before the final revalidation runs: the
+    // revalidation takes FOR UPDATE on the retention row the writer holds,
+    // and awaiting it to completion first would deadlock this single task
+    // against its own uncommitted writer (client-side; invisible to
+    // Postgres). The drift is still committed BETWEEN fence verification
+    // (which read the old floor) and the final revalidation, which must then
+    // refuse it.
+    tx_writer
+        .commit()
+        .await
+        .expect("the barrier writer commits its drift");
+    let outcome = chat_protocol::read_authority::inventory_authorities(&mut tx, fence)
+        .await
+        .err()
+        .expect("the committed floor drift is refused by the final revalidation");
     assert_eq!(
         outcome,
         chat_protocol::read_authority::ReadAuthorityError::Invariant,
@@ -6928,7 +7029,66 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
          revalidation fails the whole attempt"
     );
     rollback_with_constraints(tx).await;
-    let _ = tx_writer;
+
+    // (a) Floor drift, run LAST: the schema's floor monotonicity
+    // (`event retention floor cannot move backward`) forbids restoring a
+    // raised floor, so the durable raise must be the test's final act. A
+    // record whose retained floor sits above its event position is rejected
+    // structurally, and a live floor above the snapshot position fails
+    // verification. The raise targets 8 — strictly above arm (d)'s committed
+    // floor 7 — keeping the monotonic invariant.
+    let floor_record = chat_protocol::read_authority_bridge::fence_material_rejected(
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x55_u8; 32],
+        5,
+        Utc::now(),
+    );
+    assert_eq!(
+        floor_record,
+        Some(chat_protocol::read_authority::ReadAuthorityError::Invariant),
+        "a retained floor above the event position is not a valid fence"
+    );
+    sqlx::query(
+        "UPDATE chat.event_retention SET retained_floor=8, \
+         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
+    )
+    .bind(graph.protocol_instance_id)
+    .execute(&pool)
+    .await
+    .expect("raise the live retention floor");
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x66_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+        ),
+        "a live retention floor above the snapshot event position is drift"
+    );
+    rollback_with_constraints(tx).await;
 
     pool.close().await;
     drop(guard);
