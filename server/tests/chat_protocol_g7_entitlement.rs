@@ -595,6 +595,719 @@ mod chat_protocol {
             })
         }
     }
+    /// Test-crate visibility bridge for the B-read authority module.
+    ///
+    /// The B-read budgets, conversions, lock entry point, and fence types are
+    /// `pub(in crate::chat_protocol)`. A `#[test] fn` must live at the crate
+    /// root for the sealed `--exact` gate commands to name it, and the crate
+    /// root is outside that visibility. This module sits INSIDE
+    /// `crate::chat_protocol`, so it can reach them and hand the crate root
+    /// only plain values and `pub(crate)` view DTOs.
+    ///
+    /// It adds **no constructor**: every function here calls a production
+    /// constructor or accessor and cannot fabricate a budget, attempt,
+    /// authority, or fence.
+    pub mod read_authority_bridge {
+        use super::dpop::{ReadAdmissionAttempt, VerifiedReadAdmission};
+        use super::read_authority::{
+            ControlRecipientFenceWitness, ConversationInventoryArm, ConversationInventoryAuthority,
+            ConversationStateReadAuthority, CurrentConversationRelationshipWitness,
+            EntryIntervalTerminalWitness, EntryIntervalWitness, EntryReadAuthority,
+            InventoryFenceWitness, LockedDurableInventoryFenceRow, LockedInventoryFenceRecord,
+            LockedReadDeviceAuthority, ReadAuthorityError, VerifiedInventoryFence,
+        };
+        use chrono::{DateTime, Utc};
+        use sqlx::{PgPool, Postgres, Transaction};
+        use uuid::Uuid;
+
+        /// Mint the ordinary budget and spend its single attempt, dropping it
+        /// unspent on purpose: this probes the endpoint gate, which runs
+        /// before any SQL.
+        pub fn try_single_read_admission(
+            admission: VerifiedReadAdmission,
+            endpoint: OrdinaryReadEndpoint,
+        ) -> Result<(), ReadAuthorityError> {
+            let budget = super::read_authority::into_single_read_admission(
+                admission,
+                endpoint.into_production(),
+            )?;
+            let _attempt: ReadAdmissionAttempt = budget.into_attempt();
+            Ok(())
+        }
+
+        /// Mint the inventory budget and bind its exactly-three attempts. The
+        /// `let [_, _, _] = …` pattern is an exact-length binding: it compiles
+        /// only while `into_attempts` returns exactly three elements, so a
+        /// fourth attempt is unrepresentable here as well as in production.
+        pub fn try_inventory_read_admission(
+            admission: VerifiedReadAdmission,
+            endpoint: InventoryReadEndpoint,
+        ) -> Result<usize, ReadAuthorityError> {
+            let budget = super::read_authority::into_inventory_read_admission(
+                admission,
+                endpoint.into_production(),
+            )?;
+            let attempts = budget.into_attempts();
+            let [_first, _second, _third] = attempts;
+            Ok(3)
+        }
+
+        /// The production lock entry point, handed to the crate root.
+        pub async fn lock_read_device_authority_once(
+            tx: &mut Transaction<'_, Postgres>,
+            attempt: ReadAdmissionAttempt,
+        ) -> Result<LockedReadDeviceAuthority, ReadAuthorityError> {
+            super::read_authority::lock_read_device_authority_once(tx, attempt).await
+        }
+
+        /// Test-crate mirrors of the closed endpoint enums. The production
+        /// enums are `pub(in crate::chat_protocol)` and cannot be named or
+        /// re-exported wider; these mirrors carry the SAME closed variant set
+        /// and are converted into the production enums at the production
+        /// conversion call. They add no endpoint and no method: they are
+        /// argument carriers for the tests, and the production conversions
+        /// still perform the hidden endpoint/method revalidation.
+        #[derive(Clone, Copy)]
+        pub(crate) enum OrdinaryReadEndpoint {
+            GetConversationState,
+            GetEntries,
+            GetPendingWelcomes,
+            GetLeafRecoveryInbox,
+            GetBlob,
+            GetSubscriptionTicket,
+            SubscribeEvents,
+            PublishTyping,
+        }
+
+        impl OrdinaryReadEndpoint {
+            fn into_production(self) -> super::read_authority::OrdinaryReadEndpoint {
+                match self {
+                    Self::GetConversationState => {
+                        super::read_authority::OrdinaryReadEndpoint::GetConversationState
+                    }
+                    Self::GetEntries => super::read_authority::OrdinaryReadEndpoint::GetEntries,
+                    Self::GetPendingWelcomes => {
+                        super::read_authority::OrdinaryReadEndpoint::GetPendingWelcomes
+                    }
+                    Self::GetLeafRecoveryInbox => {
+                        super::read_authority::OrdinaryReadEndpoint::GetLeafRecoveryInbox
+                    }
+                    Self::GetBlob => super::read_authority::OrdinaryReadEndpoint::GetBlob,
+                    Self::GetSubscriptionTicket => {
+                        super::read_authority::OrdinaryReadEndpoint::GetSubscriptionTicket
+                    }
+                    Self::SubscribeEvents => {
+                        super::read_authority::OrdinaryReadEndpoint::SubscribeEvents
+                    }
+                    Self::PublishTyping => {
+                        super::read_authority::OrdinaryReadEndpoint::PublishTyping
+                    }
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        pub(crate) enum InventoryReadEndpoint {
+            GetConversations,
+        }
+
+        impl InventoryReadEndpoint {
+            fn into_production(self) -> super::read_authority::InventoryReadEndpoint {
+                super::read_authority::InventoryReadEndpoint::GetConversations
+            }
+        }
+
+        /// Mint the ordinary budget, spend its single attempt, and lock the
+        /// exact device. The transaction stays alive in the returned handle so
+        /// the test can authorize against it and then roll back with forced
+        /// deferred constraints.
+        pub async fn lock_single_attempt(
+            pool: &PgPool,
+            admission: VerifiedReadAdmission,
+            endpoint: OrdinaryReadEndpoint,
+        ) -> Result<(LockedReadDeviceAuthority, Transaction<'static, Postgres>), ReadAuthorityError>
+        {
+            let budget = super::read_authority::into_single_read_admission(
+                admission,
+                endpoint.into_production(),
+            )?;
+            let attempt = budget.into_attempt();
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let guard = lock_read_device_authority_once(&mut tx, attempt).await?;
+            Ok((guard, tx))
+        }
+
+        /// Mint the ordinary budget, spend its single attempt, and lock the
+        /// exact device inside an ALREADY-open transaction (used by the drift
+        /// cases that stage row mutations before the lock).
+        pub async fn single_attempt_lock_in(
+            tx: &mut Transaction<'_, Postgres>,
+            admission: VerifiedReadAdmission,
+            endpoint: OrdinaryReadEndpoint,
+        ) -> Result<LockedReadDeviceAuthority, ReadAuthorityError> {
+            let budget = super::read_authority::into_single_read_admission(
+                admission,
+                endpoint.into_production(),
+            )?;
+            let attempt = budget.into_attempt();
+            lock_read_device_authority_once(tx, attempt).await
+        }
+
+        /// Mint the inventory budget, spend its first attempt, and lock the
+        /// exact device. The transaction stays alive in the returned handle.
+        pub async fn lock_inventory_attempt(
+            pool: &PgPool,
+            admission: VerifiedReadAdmission,
+        ) -> Result<(LockedReadDeviceAuthority, Transaction<'static, Postgres>), ReadAuthorityError>
+        {
+            let budget = super::read_authority::into_inventory_read_admission(
+                admission,
+                super::read_authority::InventoryReadEndpoint::GetConversations,
+            )?;
+            let attempts = budget.into_attempts();
+            let [first, _second, _third] = attempts;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let guard = lock_read_device_authority_once(&mut tx, first).await?;
+            Ok((guard, tx))
+        }
+
+        pub fn device_txid(device: &LockedReadDeviceAuthority) -> i64 {
+            device.txid()
+        }
+
+        pub fn device_verify_same_transaction(
+            device: &LockedReadDeviceAuthority,
+            txid: i64,
+        ) -> Result<(), ReadAuthorityError> {
+            device.verify_same_transaction(txid)
+        }
+
+        pub fn device_binding_sha256(device: &LockedReadDeviceAuthority) -> [u8; 32] {
+            *device.device_row_sha256()
+        }
+
+        pub fn device_identity(device: &LockedReadDeviceAuthority) -> (String, Uuid) {
+            (device.user_did().to_owned(), device.device_id())
+        }
+
+        /// Probe the validating durable-record constructor: `Some(error)` when
+        /// the material is rejected, `None` when it is structurally accepted.
+        /// The record itself never leaves the bridge.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn fence_material_rejected(
+            protocol_instance_id: Uuid,
+            cursor_key_id: String,
+            event_position: u64,
+            event_cursor_sha256: [u8; 32],
+            retained_floor: u64,
+            captured_at: DateTime<Utc>,
+        ) -> Option<ReadAuthorityError> {
+            LockedInventoryFenceRecord::from_lock_material(
+                protocol_instance_id,
+                cursor_key_id,
+                event_position,
+                event_cursor_sha256,
+                retained_floor,
+                captured_at,
+            )
+            .err()
+        }
+
+        /// Verify one fence built from durable lock material against the
+        /// given transaction and locked device. The record and durable row
+        /// never leave the bridge.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) async fn verify_fence_material(
+            tx: &mut Transaction<'_, Postgres>,
+            device: LockedReadDeviceAuthority,
+            protocol_instance_id: Uuid,
+            cursor_key_id: String,
+            event_position: u64,
+            event_cursor_sha256: [u8; 32],
+            retained_floor: u64,
+            captured_at: DateTime<Utc>,
+        ) -> Result<VerifiedInventoryFence, ReadAuthorityError> {
+            let record = LockedInventoryFenceRecord::from_lock_material(
+                protocol_instance_id,
+                cursor_key_id,
+                event_position,
+                event_cursor_sha256,
+                retained_floor,
+                captured_at,
+            )?;
+            let row = super::read_authority::from_locked_inventory_fence_record(record);
+            super::read_authority::verify_inventory_fence(tx, device, row).await
+        }
+
+        /// Probe the B-read seam methods directly: the hidden endpoint/method
+        /// revalidation runs before any SQL, and the seam's OWN redacted error
+        /// (not the free function's mapping) is returned.
+        pub fn seam_single_outcome(
+            admission: VerifiedReadAdmission,
+            endpoint: OrdinaryReadEndpoint,
+        ) -> Result<(), super::dpop::ReadAdmissionBindingError> {
+            let production = endpoint.into_production();
+            let attempt = admission
+                .into_single_read_attempt(production.nsid(), production.canonical_method())?;
+            let _ = attempt;
+            Ok(())
+        }
+
+        /// Probe the inventory seam directly.
+        pub fn seam_inventory_outcome(
+            admission: VerifiedReadAdmission,
+            endpoint: InventoryReadEndpoint,
+        ) -> Result<(), super::dpop::ReadAdmissionBindingError> {
+            let production = endpoint.into_production();
+            let attempts = admission
+                .into_inventory_read_attempts(production.nsid(), production.canonical_method())?;
+            let [_first, _second, _third] = attempts;
+            Ok(())
+        }
+
+        /// What one full three-attempt inventory run actually spent.
+        pub struct FreshGuardLedger {
+            /// Distinct transaction identities the three guards were minted
+            /// under.
+            pub distinct_transactions: usize,
+            /// Times the PREVIOUS attempt's guard was refused by the successor
+            /// attempt's fresh transaction.
+            pub prior_refusals: usize,
+            /// Attempts whose lock+verify succeeded.
+            pub verified: usize,
+        }
+
+        /// Spend the fixed three-attempt inventory budget: each attempt locks
+        /// fresh rows in its own fresh transaction and mints a guard for that
+        /// transaction; the previous transaction is rolled back and its guard
+        /// dropped before the next array element is used.
+        pub async fn inventory_fresh_guard_ledger(
+            pool: &PgPool,
+            admission: VerifiedReadAdmission,
+        ) -> Result<FreshGuardLedger, ReadAuthorityError> {
+            let budget = super::read_authority::into_inventory_read_admission(
+                admission,
+                super::read_authority::InventoryReadEndpoint::GetConversations,
+            )?;
+            let attempts = budget.into_attempts();
+            // The exact-length binding: a fourth element is a compile error.
+            let [first, second, third] = attempts;
+            let mut verified = 0_usize;
+            let mut prior_refusals = 0_usize;
+            let mut transaction_ids: Vec<i64> = Vec::with_capacity(3);
+            let mut prior_guard: Option<LockedReadDeviceAuthority> = None;
+            for attempt in [first, second, third] {
+                let mut tx = pool
+                    .begin()
+                    .await
+                    .map_err(|_| ReadAuthorityError::Storage)?;
+                let txid: i64 = sqlx::query_scalar("SELECT txid_current()::bigint")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|_| ReadAuthorityError::Storage)?;
+                // PRIOR-TRANSACTION DROP: the previous attempt's transaction
+                // was rolled back above, so its guard must be refused by this
+                // fresh transaction.
+                if let Some(prior) = prior_guard.take() {
+                    if prior.verify_same_transaction(txid).is_err() {
+                        prior_refusals += 1;
+                    }
+                }
+                let guard = lock_read_device_authority_once(&mut tx, attempt).await?;
+                verified += 1;
+                transaction_ids.push(device_txid(&guard));
+                prior_guard = Some(guard);
+                let _ = tx.rollback().await;
+            }
+            transaction_ids.sort();
+            transaction_ids.dedup();
+            Ok(FreshGuardLedger {
+                distinct_transactions: transaction_ids.len(),
+                prior_refusals,
+                verified,
+            })
+        }
+
+        /// Lock one single-attempt ordinary guard under transaction A, then
+        /// authorize a conversation under transaction B.
+        ///
+        /// Returns `(locked_ok, transactions_differ, outcome)` where `outcome`
+        /// is the refusal the foreign transaction produced. The conversation
+        /// id is deliberately nonexistent: if the same-transaction check runs
+        /// before any conversation lookup, the refusal is the transaction
+        /// identity error and never `ConversationNotFound`.
+        pub async fn single_foreign_transaction_outcome(
+            pool: &PgPool,
+            admission: VerifiedReadAdmission,
+        ) -> Result<(bool, bool, ReadAuthorityError), ReadAuthorityError> {
+            let budget = super::read_authority::into_single_read_admission(
+                admission,
+                super::read_authority::OrdinaryReadEndpoint::GetConversationState,
+            )?;
+            let attempt = budget.into_attempt();
+            let mut tx_a = pool
+                .begin()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let guard = lock_read_device_authority_once(&mut tx_a, attempt).await?;
+            let txid_a = device_txid(&guard);
+            let _ = tx_a.rollback().await;
+
+            let mut tx_b = pool
+                .begin()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let txid_b: i64 = sqlx::query_scalar("SELECT txid_current()::bigint")
+                .fetch_one(&mut *tx_b)
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let outcome = super::read_authority::authorize_conversation_state(
+                &mut tx_b,
+                guard,
+                Uuid::new_v4(),
+            )
+            .await
+            .err()
+            .expect("a guard minted under transaction A cannot authorize under B");
+            let _ = tx_b.rollback().await;
+            Ok((true, txid_a != txid_b, outcome))
+        }
+
+        /// One full inventory run: budget attempt, device lock, fence
+        /// verification, authorities, and a constraint-forced rollback.
+        pub struct InventoryRunOutcome {
+            pub device_txid: i64,
+            pub device_binding: [u8; 32],
+            pub authorities: Vec<InventoryAuthorityView>,
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub async fn inventory_run(
+            pool: &PgPool,
+            admission: VerifiedReadAdmission,
+            protocol_instance_id: Uuid,
+            cursor_key_id: String,
+            event_position: u64,
+            event_cursor_sha256: [u8; 32],
+            retained_floor: u64,
+            captured_at: DateTime<Utc>,
+        ) -> Result<InventoryRunOutcome, ReadAuthorityError> {
+            let budget = super::read_authority::into_inventory_read_admission(
+                admission,
+                super::read_authority::InventoryReadEndpoint::GetConversations,
+            )?;
+            let attempts = budget.into_attempts();
+            let [first, _second, _third] = attempts;
+            let mut tx = pool
+                .begin()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            let guard = lock_read_device_authority_once(&mut tx, first).await?;
+            let device_txid = device_txid(&guard);
+            let device_binding = device_binding_sha256(&guard);
+            let fence = verify_fence_material(
+                &mut tx,
+                guard,
+                protocol_instance_id,
+                cursor_key_id,
+                event_position,
+                event_cursor_sha256,
+                retained_floor,
+                captured_at,
+            )
+            .await?;
+            let authorities = super::read_authority::inventory_authorities(&mut tx, fence).await?;
+            let views: Vec<InventoryAuthorityView> =
+                authorities.iter().map(inventory_authority_view).collect();
+            sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            tx.rollback()
+                .await
+                .map_err(|_| ReadAuthorityError::Storage)?;
+            Ok(InventoryRunOutcome {
+                device_txid,
+                device_binding,
+                authorities: views,
+            })
+        }
+
+        // -------------------------------------------------------------------
+        // Minimum-immutable-view DTOs. The production accessors are
+        // `pub(in crate::chat_protocol)` (BREAD-08); this bridge converts them
+        // into plain `pub(crate)` views for the crate root.
+        // -------------------------------------------------------------------
+
+        #[derive(Debug, Clone)]
+        pub(crate) enum RelationshipArmView {
+            OpenLeaf,
+            ActiveParticipant,
+            GroupPendingParticipant,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct RelationshipWitnessView {
+            pub arm: RelationshipArmView,
+            pub participant_period_id: Uuid,
+            pub leaf_period_id: Option<Uuid>,
+            pub open_membership_interval_id: Option<Uuid>,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct StateAuthorityView {
+            pub conversation_id: Uuid,
+            pub graph_digest: [u8; 32],
+            pub snapshot_digest: [u8; 32],
+            pub user_did: String,
+            pub device_id: Uuid,
+            pub relationship: RelationshipWitnessView,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) enum IntervalTerminalView {
+            Open {
+                observed_head_seq: u64,
+                row_sha256: [u8; 32],
+            },
+            Closed {
+                terminal_seq: u64,
+                closing_transition_id: Uuid,
+                closing_outer_entry_fingerprint: [u8; 32],
+                closing_kind: String,
+                row_sha256: [u8; 32],
+            },
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct IntervalWitnessView {
+            pub membership_interval_id: Uuid,
+            pub conversation_id: Uuid,
+            pub recipient_did: String,
+            pub recipient_device_id: Uuid,
+            pub start_seq: u64,
+            pub opening_transition_id: Uuid,
+            pub opening_outer_entry_fingerprint: [u8; 32],
+            pub terminal: IntervalTerminalView,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct ControlRecipientFenceView {
+            pub maximum_event_position: u64,
+            pub maximum_entry_seq: u64,
+            pub ordered_recipient_rows_sha256: [u8; 32],
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct EntryAuthorityView {
+            pub ordered_intervals: Vec<IntervalWitnessView>,
+            pub ordered_intervals_sha256: [u8; 32],
+            pub control_recipient_fence: ControlRecipientFenceView,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct InventoryFenceWitnessView {
+            pub protocol_instance_id: Uuid,
+            pub cursor_key_id: String,
+            pub event_position: u64,
+            pub event_cursor_sha256: [u8; 32],
+            pub retained_floor: u64,
+            pub captured_at: DateTime<Utc>,
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) enum InventoryArmView {
+            State {
+                participant_period_id: Uuid,
+            },
+            Removal {
+                membership_interval_id: Uuid,
+                terminal_seq: u64,
+                closing_transition_id: Uuid,
+                closing_outer_entry_fingerprint: Vec<u8>,
+                removed_at: DateTime<Utc>,
+            },
+            Close {
+                terminal_seq: u64,
+                closing_transition_id: Uuid,
+                closing_outer_entry_fingerprint: Vec<u8>,
+            },
+        }
+
+        #[derive(Debug, Clone)]
+        pub(crate) struct InventoryAuthorityView {
+            pub txid: i64,
+            pub device_binding_sha256: [u8; 32],
+            pub conversation_id: Uuid,
+            pub graph_digest: [u8; 32],
+            pub snapshot_digest: [u8; 32],
+            pub fence: InventoryFenceWitnessView,
+            pub arm: InventoryArmView,
+        }
+
+        pub(crate) fn state_authority_view(
+            authority: &ConversationStateReadAuthority,
+        ) -> StateAuthorityView {
+            let relationship = match authority.relationship() {
+                CurrentConversationRelationshipWitness::CurrentOpenLeaf {
+                    participant_period_id,
+                    leaf_period_id,
+                    open_membership_interval_id,
+                } => RelationshipWitnessView {
+                    arm: RelationshipArmView::OpenLeaf,
+                    participant_period_id: *participant_period_id,
+                    leaf_period_id: Some(*leaf_period_id),
+                    open_membership_interval_id: Some(*open_membership_interval_id),
+                },
+                CurrentConversationRelationshipWitness::CurrentActiveParticipant {
+                    participant_period_id,
+                } => RelationshipWitnessView {
+                    arm: RelationshipArmView::ActiveParticipant,
+                    participant_period_id: *participant_period_id,
+                    leaf_period_id: None,
+                    open_membership_interval_id: None,
+                },
+                CurrentConversationRelationshipWitness::CurrentGroupPendingParticipant {
+                    participant_period_id,
+                } => RelationshipWitnessView {
+                    arm: RelationshipArmView::GroupPendingParticipant,
+                    participant_period_id: *participant_period_id,
+                    leaf_period_id: None,
+                    open_membership_interval_id: None,
+                },
+            };
+            StateAuthorityView {
+                conversation_id: authority.conversation_id(),
+                graph_digest: *authority.graph_digest(),
+                snapshot_digest: *authority.snapshot_digest(),
+                user_did: authority.user_did().to_owned(),
+                device_id: authority.device_id(),
+                relationship,
+            }
+        }
+
+        fn interval_terminal_view(terminal: &EntryIntervalTerminalWitness) -> IntervalTerminalView {
+            match terminal {
+                EntryIntervalTerminalWitness::Open {
+                    observed_head_seq,
+                    row_sha256,
+                } => IntervalTerminalView::Open {
+                    observed_head_seq: *observed_head_seq,
+                    row_sha256: *row_sha256,
+                },
+                EntryIntervalTerminalWitness::Closed {
+                    terminal_seq,
+                    closing_transition_id,
+                    closing_outer_entry_fingerprint,
+                    closing_kind,
+                    row_sha256,
+                } => IntervalTerminalView::Closed {
+                    terminal_seq: *terminal_seq,
+                    closing_transition_id: *closing_transition_id,
+                    closing_outer_entry_fingerprint: *closing_outer_entry_fingerprint,
+                    closing_kind: closing_kind.clone(),
+                    row_sha256: *row_sha256,
+                },
+            }
+        }
+
+        fn interval_view(interval: &EntryIntervalWitness) -> IntervalWitnessView {
+            IntervalWitnessView {
+                membership_interval_id: interval.membership_interval_id(),
+                conversation_id: interval.conversation_id(),
+                recipient_did: interval.recipient_did().to_owned(),
+                recipient_device_id: interval.recipient_device_id(),
+                start_seq: interval.start_seq(),
+                opening_transition_id: interval.opening_transition_id(),
+                opening_outer_entry_fingerprint: *interval.opening_outer_entry_fingerprint(),
+                terminal: interval_terminal_view(interval.terminal()),
+            }
+        }
+
+        fn control_recipient_fence_view(
+            fence: &ControlRecipientFenceWitness,
+        ) -> ControlRecipientFenceView {
+            ControlRecipientFenceView {
+                maximum_event_position: fence.maximum_event_position(),
+                maximum_entry_seq: fence.maximum_entry_seq(),
+                ordered_recipient_rows_sha256: *fence.ordered_recipient_rows_sha256(),
+            }
+        }
+
+        pub(crate) fn entry_authority_view(authority: &EntryReadAuthority) -> EntryAuthorityView {
+            EntryAuthorityView {
+                ordered_intervals: authority
+                    .ordered_intervals()
+                    .iter()
+                    .map(interval_view)
+                    .collect(),
+                ordered_intervals_sha256: *authority.ordered_intervals_sha256(),
+                control_recipient_fence: control_recipient_fence_view(
+                    authority.control_recipient_fence(),
+                ),
+            }
+        }
+
+        fn inventory_fence_view(fence: &InventoryFenceWitness) -> InventoryFenceWitnessView {
+            InventoryFenceWitnessView {
+                protocol_instance_id: fence.protocol_instance_id(),
+                cursor_key_id: fence.cursor_key_id().to_owned(),
+                event_position: fence.event_position(),
+                event_cursor_sha256: *fence.event_cursor_sha256(),
+                retained_floor: fence.retained_floor(),
+                captured_at: fence.captured_at(),
+            }
+        }
+
+        pub(crate) fn inventory_authority_view(
+            authority: &ConversationInventoryAuthority,
+        ) -> InventoryAuthorityView {
+            let arm = match authority.arm() {
+                ConversationInventoryArm::State {
+                    participant_period_id,
+                } => InventoryArmView::State {
+                    participant_period_id: *participant_period_id,
+                },
+                ConversationInventoryArm::Removal {
+                    membership_interval_id,
+                    terminal_seq,
+                    closing_transition_id,
+                    closing_outer_entry_fingerprint,
+                    removed_at,
+                } => InventoryArmView::Removal {
+                    membership_interval_id: *membership_interval_id,
+                    terminal_seq: *terminal_seq,
+                    closing_transition_id: *closing_transition_id,
+                    closing_outer_entry_fingerprint: closing_outer_entry_fingerprint.clone(),
+                    removed_at: *removed_at,
+                },
+                ConversationInventoryArm::Close {
+                    terminal_seq,
+                    closing_transition_id,
+                    closing_outer_entry_fingerprint,
+                } => InventoryArmView::Close {
+                    terminal_seq: *terminal_seq,
+                    closing_transition_id: *closing_transition_id,
+                    closing_outer_entry_fingerprint: closing_outer_entry_fingerprint.clone(),
+                },
+            };
+            InventoryAuthorityView {
+                txid: authority.txid(),
+                device_binding_sha256: *authority.device_binding_sha256(),
+                conversation_id: authority.conversation_id(),
+                graph_digest: *authority.graph_digest(),
+                snapshot_digest: *authority.snapshot_digest(),
+                fence: inventory_fence_view(authority.fence()),
+                arm,
+            }
+        }
+    }
     pub mod wire {
         pub use catbird_server::chat_protocol::wire::*;
     }
@@ -603,6 +1316,13 @@ mod chat_protocol {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/public_state.rs"
+        ));
+    }
+    pub mod read_authority {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_authority.rs"
         ));
     }
     pub mod relationship_policy {
@@ -1763,7 +2483,8 @@ fn b_auth_read_admission_rejects_invalid_receipt_shapes_redacted() {
             let outcome: Result<(), &chat_protocol::dpop::ReadAdmissionBindingError> = Err(error);
             outcome.expect("read admission binding refused");
         }))
-        .expect_err("expecting an Err must panic");
+        .err()
+        .expect("expecting an Err must panic");
         panic_renderings.push(panic_message(&payload));
     }
     std::panic::set_hook(previous_hook);
@@ -2126,12 +2847,69 @@ fn b_auth_get_own_devices_budget_mints_fixed_three_attempts() {
     // assertion green. `concat!` is evaluated at compile time, so the joined
     // needle exists only in the binary; the file text contains the two halves
     // separately and matches nothing.
+    //
+    // THE COUNT IS THREE, NOT ONE, AS OF B-READ. The sealed B-auth guard pinned
+    // exactly one site (the `b_auth_bridge`'s own-devices spend). B-read added
+    // the `read_authority_bridge`, whose ordinary-attempt and inventory-attempt
+    // spends destructure the same arrays the same way — amendment §4 requires
+    // the guard to track the B-read reality, so the exact-length proof now has
+    // three sites, all in bridges. The lines are not pinned (they move on every
+    // edit); the COUNT and the requirement that each site sit between the two
+    // bridge banners are the load-bearing facts.
     let destructuring = concat!("let [_first, _second, _third] = ", "attempts;");
+    let sites: Vec<usize> = {
+        let mut from = 0_usize;
+        let mut found = Vec::new();
+        while let Some(offset) = B_AUTH_G7_SELF_SOURCE[from..].find(destructuring) {
+            let index = from + offset;
+            let line = B_AUTH_G7_SELF_SOURCE[..index].matches('\n').count() + 1;
+            found.push(line);
+            from = index + destructuring.len();
+        }
+        found
+    };
     assert_eq!(
-        count_occurrences(B_AUTH_G7_SELF_SOURCE, destructuring),
-        1,
+        sites.len(),
+        3,
         "the exact-length destructuring that makes a fourth attempt a compile \
-         error must occur exactly once, in the bridge and nowhere else"
+         error occurs exactly three times, once per bridge, and nowhere else; \
+         found {sites:?}"
+    );
+    let b_auth_bridge_start = B_AUTH_G7_SELF_SOURCE
+        .find("pub mod b_auth_bridge {")
+        .expect("the B-auth bridge banner");
+    let read_authority_bridge_start = B_AUTH_G7_SELF_SOURCE
+        .find("pub mod read_authority_bridge {")
+        .expect("the B-read bridge banner");
+    // Convert each site's LINE NUMBER back to its byte offset (a line number
+    // is not a byte index) before comparing against the banner offsets.
+    let site_offsets: Vec<usize> = sites
+        .iter()
+        .map(|line| {
+            B_AUTH_G7_SELF_SOURCE
+                .split('\n')
+                .take(*line - 1)
+                .map(|part| part.len() + 1)
+                .sum()
+        })
+        .collect();
+    assert_eq!(
+        site_offsets
+            .iter()
+            .filter(
+                |offset| **offset >= b_auth_bridge_start && **offset < read_authority_bridge_start
+            )
+            .count(),
+        1,
+        "exactly one destructuring site lies in the B-auth bridge"
+    );
+    assert_eq!(
+        site_offsets
+            .iter()
+            .filter(|offset| **offset >= read_authority_bridge_start)
+            .count(),
+        2,
+        "exactly two destructuring sites lie in the B-read bridge"
     );
 }
 
@@ -2955,15 +3733,155 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
 
     // === FROZEN / READ-ONLY BYTE IDENTITY ==================================
-    // `read_authority.rs` is B-read-exclusive and MUST NOT EXIST YET. The
-    // sealed authority lists it as read-only, but B-read has not created it;
-    // its appearance would mean B-read started early, which the global
-    // prohibitions forbid.
+    // `read_authority.rs` is B-read-exclusive and NOW EXISTS: B-read created
+    // it under the seam authority amendment. The absence check that stood here
+    // is superseded for B-read only (amendment §4). The sealed B-auth budget
+    // guards above remain untouched.
+    let read_authority_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/chat_protocol/read_authority.rs");
     assert!(
-        !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/chat_protocol/read_authority.rs")
-            .exists(),
-        "read_authority.rs must not exist before B-read begins"
+        read_authority_path.exists(),
+        "read_authority.rs exists: B-read owns it under the seam authority amendment"
+    );
+    assert_eq!(
+        count_occurrences(B_AUTH_DPOP_SOURCE, "fn into_single_read_attempt("),
+        1,
+        "exactly one B-read single-attempt seam definition"
+    );
+    assert_eq!(
+        count_occurrences(B_AUTH_DPOP_SOURCE, "fn into_inventory_read_attempts("),
+        1,
+        "exactly one B-read inventory seam definition"
+    );
+    // The seam methods live OUTSIDE the sealed read-section window (after the
+    // pre-existing JWT types), so the twelve-function filter above still sees
+    // exactly the sealed B-auth surface. This placement is asserted absolutely:
+    // the seam banner sits strictly after the window's terminal anchor.
+    let read_section_start = B_AUTH_DPOP_SOURCE
+        .find("// Opaque existing-device read admission (Stage B).")
+        .expect("the B-auth read section banner");
+    let window_end = read_section_start
+        + B_AUTH_DPOP_SOURCE[read_section_start..]
+            .find("#[derive(Debug, Deserialize)]")
+            .expect("the read section ends before the pre-existing JWT types");
+    let seam_start = B_AUTH_DPOP_SOURCE
+        .find("// B-read seam (seam authority amendment")
+        .expect("the B-read seam banner");
+    assert!(
+        seam_start > window_end,
+        "the B-read seam methods must lie OUTSIDE the sealed B-auth read-section \
+         window so the twelve-function surface stays unchanged"
+    );
+    // Source guards per amendment §4: the two seam methods are the ONLY
+    // `ReadAdmissionAttempt` mints for B-read endpoints, the budgets have no
+    // other constructor, and no test-only constructor exists.
+    let read_authority_source: &str = include_str!("../src/chat_protocol/read_authority.rs");
+    // The needle is `ReadAdmissionAttempt {` as a STRUCT-LITERAL position: a
+    // function signature (`-> ReadAdmissionAttempt {`) also contains the text,
+    // so the count is taken over the comment-stripped code with the exact
+    // binding field following the brace, which only a real construction has.
+    let mint_needle = "ReadAdmissionAttempt {\n            binding:";
+    assert_eq!(
+        count_occurrences(&code_only(read_authority_source), mint_needle),
+        0,
+        "B-read never mints an attempt: the budgets hold and consume attempts, \
+         the seam methods in dpop.rs are the only mint boundary"
+    );
+    assert_eq!(
+        count_occurrences(read_authority_source, "from_repository_lock("),
+        1,
+        "exactly one production locked-row constructor callsite in read_authority.rs \
+         (the B-read lock entry point); the inventory.rs callsite above stays \
+         the other one"
+    );
+    assert_eq!(
+        count_occurrences(
+            read_authority_source,
+            "pub(in crate::chat_protocol) struct SingleReadAdmission {"
+        ),
+        1,
+        "the ordinary budget has exactly one declaration and no other constructor"
+    );
+    assert_eq!(
+        count_occurrences(
+            read_authority_source,
+            "pub(in crate::chat_protocol) struct InventoryReadAdmission {"
+        ),
+        1,
+        "the inventory budget has exactly one declaration and no other constructor"
+    );
+    assert_eq!(
+        count_occurrences(read_authority_source, "#[cfg(test)]"),
+        0,
+        "read_authority.rs contains no test-only module or constructor"
+    );
+    assert_eq!(
+        count_occurrences(read_authority_source, "seal_read_admission("),
+        0,
+        "B-read may not seal an admission: sealing remains B-auth/handler-owned"
+    );
+    assert_eq!(
+        count_occurrences(read_authority_source, "admit_unsigned_read("),
+        0,
+        "B-read may not admit unsigned reads: that bridge remains B-auth-owned"
+    );
+    // === THE FENCE-CONSTRUCTOR BOUNDARY (amendment §8 / BREAD-03) ==========
+    // `from_locked_inventory_fence_record` is the sole constructor of the
+    // durable fence row and must have ZERO production callers until D lands
+    // its durable loader at ordinal 35 ("source guards prove it" — amendment
+    // §8). `from_lock_material` is the record's validating constructor; it is
+    // likewise caller-less. A future lane adding a production caller must trip
+    // this gate, or the "a caller-assembled coordinate bundle is never proof"
+    // freeze silently erodes.
+    assert_eq!(
+        count_occurrences(
+            read_authority_source,
+            "pub(in crate::chat_protocol) fn from_locked_inventory_fence_record("
+        ),
+        1,
+        "exactly one durable fence-row constructor definition"
+    );
+    assert_eq!(
+        count_occurrences(
+            read_authority_source,
+            "pub(in crate::chat_protocol) fn from_lock_material("
+        ),
+        1,
+        "exactly one validating fence-record constructor definition"
+    );
+    for (name, source) in [
+        ("dpop.rs", B_AUTH_DPOP_SOURCE),
+        ("inventory.rs", B_AUTH_INVENTORY_SOURCE),
+        ("context.rs", B_AUTH_CONTEXT_SOURCE),
+        ("get_devices.rs", B_AUTH_GET_DEVICES_SOURCE),
+        ("get_own_devices.rs", B_AUTH_GET_OWN_DEVICES_SOURCE),
+    ] {
+        assert_eq!(
+            count_occurrences(source, "from_locked_inventory_fence_record("),
+            0,
+            "{name} must not call the fence-row constructor: D's loader is the \
+             sole future production caller"
+        );
+        assert_eq!(
+            count_occurrences(source, "from_lock_material("),
+            0,
+            "{name} must not call the fence-record constructor"
+        );
+    }
+    // The definitions are the ONLY occurrences of either name in
+    // read_authority.rs itself (each body constructs a struct literal, not a
+    // recursive call); a second definition or a stray call site fails here.
+    assert_eq!(
+        count_occurrences(read_authority_source, "from_locked_inventory_fence_record("),
+        1,
+        "the fence-row constructor name appears exactly once in read_authority.rs: \
+         the definition; any caller or second definition changes this count"
+    );
+    assert_eq!(
+        count_occurrences(read_authority_source, "from_lock_material("),
+        1,
+        "the fence-record constructor name appears exactly once in read_authority.rs: \
+         the definition; any caller or second definition changes this count"
     );
     assert_eq!(
         hex::encode(Sha256::digest(B_AUTH_DEVICE_DIRECTORY_SOURCE.as_bytes())),
@@ -3785,7 +4703,41 @@ fn assert_attempt_minting_sites() {
         3,
         "the getOwnDevices conversion mints exactly three — no fourth"
     );
-    // The two conversions are the ONLY places attempts are minted. The
+    // The B-read seam bodies (B-read-owned, outside the sealed read section)
+    // mint exactly one ordinary attempt and exactly three inventory attempts.
+    let seam_single_conversion = {
+        let start = B_AUTH_DPOP_SOURCE
+            .find("pub(in crate::chat_protocol) fn into_single_read_attempt(")
+            .expect("exact B-read single-attempt seam");
+        let end = start
+            + B_AUTH_DPOP_SOURCE[start..]
+                .find("\n    }\n")
+                .expect("B-read single-attempt seam terminates");
+        &B_AUTH_DPOP_SOURCE[start..end]
+    };
+    let seam_inventory_conversion = {
+        let start = B_AUTH_DPOP_SOURCE
+            .find("pub(in crate::chat_protocol) fn into_inventory_read_attempts(")
+            .expect("exact B-read inventory seam");
+        let end = start
+            + B_AUTH_DPOP_SOURCE[start..]
+                .find("\n    }\n")
+                .expect("B-read inventory seam terminates");
+        &B_AUTH_DPOP_SOURCE[start..end]
+    };
+    assert_eq!(
+        count_occurrences(seam_single_conversion, "ReadAdmissionAttempt {"),
+        1,
+        "the B-read single-attempt seam mints exactly one"
+    );
+    assert_eq!(
+        count_occurrences(seam_inventory_conversion, "ReadAdmissionAttempt {"),
+        3,
+        "the B-read inventory seam mints exactly three — no fourth"
+    );
+    let minted_in_seams = count_occurrences(seam_single_conversion, "ReadAdmissionAttempt {")
+        + count_occurrences(seam_inventory_conversion, "ReadAdmissionAttempt {");
+    // The two B-read conversions are the ONLY places attempts are minted. The
     // remaining whole-file occurrences are named individually, so a new minting
     // site anywhere in the module fails this assertion instead of hiding in a
     // slack total.
@@ -3803,8 +4755,8 @@ fn assert_attempt_minting_sites() {
     }
     assert_eq!(
         count_occurrences(B_AUTH_DPOP_SOURCE, "ReadAdmissionAttempt {"),
-        minted_in_conversions + non_minting.len(),
-        "the whole-file count must be exactly the four minting literals plus \
+        minted_in_conversions + minted_in_seams + non_minting.len(),
+        "the whole-file count must be exactly the eight minting literals plus \
      the declaration, the return type, and the impl line — a fifth minting \
      site would show up here"
     );
@@ -3891,6 +4843,2086 @@ async fn b_auth_get_own_devices_fourth_attempt_fails_before_sql() {
         "the ledger binds exactly three array elements, in the bridge and \
          nowhere else"
     );
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// B-read: consuming read authority (Checkpoint B-read).
+//
+// The pure/source tests below run in the no-database gate. The database tests
+// are `#[ignore]`d exactly like the B-auth cases and take their own private
+// `chat_exec_*` executor database through the frozen `executor_seed` graph
+// fixtures; every rollback first forces deferred constraints immediate
+// (BREAD-07).
+// ---------------------------------------------------------------------------
+
+/// A committed, sealed admission for an exact fixture device row.
+async fn fixture_read_admission(
+    pool: &PgPool,
+    endpoint: &str,
+    did: &str,
+    device_id: Uuid,
+    dpop_jkt: &str,
+) -> chat_protocol::dpop::VerifiedReadAdmission {
+    let authority = repository::auth::authorize_unsigned_request(
+        pool,
+        chat_protocol::dpop::repository_test_evidence::ordinary_device_with_binding(
+            Uuid::new_v4(),
+            b_auth_proof_jti(),
+            endpoint,
+            B_AUTH_T,
+            did,
+            device_id,
+            dpop_jkt,
+        ),
+    )
+    .await
+    .expect("the seeded fixture device authorizes an unsigned read");
+    chat_protocol::dpop::seal_read_admission(authority)
+        .expect("a committed existing-device receipt seals a read admission")
+}
+
+/// A fresh bare DID, distinct per call, over the valid `did:plc:[a-z2-7]{24}`
+/// grammar.
+fn b_read_fresh_did(seed_byte: u8) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let suffix: String = (0..24)
+        .map(|index| ALPHABET[usize::from(seed_byte.wrapping_add(index * 7) % 32)] as char)
+        .collect();
+    format!("did:plc:{suffix}")
+}
+
+/// Register one additional active device (with its immutable key) for `did`.
+/// The signing key is derived per device so the active-JKT uniqueness
+/// constraint never collides.
+async fn register_read_device(pool: &PgPool, did: &str, device_id: Uuid) -> String {
+    let mut seed = Sha256::new();
+    seed.update(b"CATBIRD-CHAT-B-READ-TEST-DEVICE\0");
+    seed.update(device_id.as_bytes());
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed.finalize().into());
+    let public_key = signing_key.verifying_key().as_bytes().to_vec();
+    let key_id = chat_protocol::validation::ed25519_key_id(&public_key)
+        .expect("derive B-read test device key id")
+        .as_str()
+        .to_owned();
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did, created_at) \
+         VALUES($1,$2::timestamptz) ON CONFLICT DO NOTHING",
+    )
+    .bind(did)
+    .bind(B_AUTH_T)
+    .execute(pool)
+    .await
+    .expect("register the B-read test principal");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.devices (
+            user_did, device_id, device_name, status, dpop_jkt,
+            auth_generation, capabilities, created_at, updated_at
+        ) VALUES ($1,$2,$3,'active',$4,1,chat.protocol_capabilities(),
+                  $5::timestamptz,$5::timestamptz)
+        "#,
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind("b-read-test-device")
+    .bind(&key_id)
+    .bind(B_AUTH_T)
+    .execute(pool)
+    .await
+    .expect("register the B-read test device row");
+    sqlx::query(
+        r#"
+        INSERT INTO chat.device_keys (
+            user_did, device_id, key_id, signing_public_key,
+            enrollment_auth_generation, created_at
+        ) VALUES ($1,$2,$3,$4,1,$5::timestamptz)
+        "#,
+    )
+    .bind(did)
+    .bind(device_id)
+    .bind(&key_id)
+    .bind(public_key)
+    .bind(B_AUTH_T)
+    .execute(pool)
+    .await
+    .expect("register the B-read test device key row");
+    key_id
+}
+
+/// Seed the exact private retention fence for a fixture protocol instance
+/// (floor zero) if it is absent.
+async fn seed_private_retention_fence(pool: &PgPool, protocol_instance_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) \
+         VALUES($1,0,date_trunc('milliseconds',clock_timestamp())) ON CONFLICT DO NOTHING",
+    )
+    .bind(protocol_instance_id)
+    .execute(pool)
+    .await
+    .expect("seed exact private G7 retention fence");
+}
+
+/// The fixture protocol instance's durable cursor key.
+async fn fixture_cursor_key(pool: &PgPool, protocol_instance_id: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT cursor_key_id FROM chat.protocol_instances WHERE protocol_instance_id=$1",
+    )
+    .bind(protocol_instance_id)
+    .fetch_one(pool)
+    .await
+    .expect("read the fixture protocol instance cursor key")
+}
+
+/// Source input for the B-read source guards.
+const B_READ_READ_AUTHORITY_SOURCE: &str = include_str!("../src/chat_protocol/read_authority.rs");
+
+#[test]
+fn read_admission_seal_consumes_repository_locked_generation() {
+    // The seal takes exactly the committed request and nothing else: no
+    // generation argument, no caller-selected coordinate.
+    assert!(
+        B_AUTH_DPOP_SOURCE.contains(
+            "pub(crate) fn seal_read_admission(\n    request: VerifiedChatDeviceRequest,\n) -> \
+             Result<VerifiedReadAdmission, ReadAdmissionBindingError> {"
+        ),
+        "the seal signature consumes only the committed request"
+    );
+    // The binding's locked generation is set from the receipt's locked
+    // coordinates seam, never from a request field or caller argument.
+    assert!(
+        B_AUTH_DPOP_SOURCE.contains("let locked_auth_generation = coordinates.auth_generation;"),
+        "the sealed binding generation comes from the repository-locked coordinates"
+    );
+    assert_eq!(
+        count_occurrences(B_AUTH_DPOP_SOURCE, "fn locked_auth_generation("),
+        0,
+        "the mutation-path getter is not exposed on the read side"
+    );
+    // BREAD-08 / §3: the B-read seam methods and budgets expose no raw
+    // generation getter or argument.
+    assert_eq!(
+        count_occurrences(&code_only(read_section_of_dpop()), "fn generation("),
+        0,
+        "no raw generation getter exists in the sealed read section"
+    );
+    assert_eq!(
+        count_occurrences(&code_only(read_section_of_dpop()), "fn auth_generation("),
+        0,
+        "no raw auth-generation getter exists in the sealed read section"
+    );
+    assert_eq!(
+        count_occurrences(B_READ_READ_AUTHORITY_SOURCE, "fn locked_auth_generation("),
+        0,
+        "read_authority.rs exposes no locked-generation getter"
+    );
+    for seam_body in ["into_single_read_attempt", "into_inventory_read_attempts"] {
+        let start = B_AUTH_DPOP_SOURCE
+            .find(&format!("fn {seam_body}("))
+            .unwrap_or_else(|| panic!("the {seam_body} seam exists"));
+        let end = start
+            + B_AUTH_DPOP_SOURCE[start..]
+                .find("\n    }\n")
+                .expect("seam body terminates");
+        let body = &B_AUTH_DPOP_SOURCE[start..end];
+        assert_eq!(
+            count_occurrences(body, "generation"),
+            0,
+            "the {seam_body} seam accepts and exposes no generation"
+        );
+        assert_eq!(
+            count_occurrences(body, "jkt"),
+            0,
+            "the {seam_body} seam accepts and exposes no JKT"
+        );
+    }
+    // The free conversions take the admission and the closed endpoint only.
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains(
+            "pub(in crate::chat_protocol) fn into_single_read_admission(\n    \
+             admission: VerifiedReadAdmission,\n    endpoint: OrdinaryReadEndpoint,\n"
+        ),
+        "the ordinary conversion takes only the admission and the closed endpoint"
+    );
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains(
+            "pub(in crate::chat_protocol) fn into_inventory_read_admission(\n    \
+             admission: VerifiedReadAdmission,\n    endpoint: InventoryReadEndpoint,\n"
+        ),
+        "the inventory conversion takes only the admission and the closed endpoint"
+    );
+}
+
+/// The sealed B-auth read-section window, reused by the pure B-read guards.
+fn read_section_of_dpop() -> &'static str {
+    let start = B_AUTH_DPOP_SOURCE
+        .find("// Opaque existing-device read admission (Stage B).")
+        .expect("the B-auth read section banner");
+    let section = &B_AUTH_DPOP_SOURCE[start..];
+    let end = section
+        .find("#[derive(Debug, Deserialize)]")
+        .expect("the read section ends before the pre-existing JWT types");
+    &section[..end]
+}
+
+#[test]
+fn read_admission_rejects_missing_nonpositive_and_invalid_receipt_binding() {
+    // The REAL production structural constructor over synthetic shapes: the
+    // missing/empty coordinate and nonpositive-generation negatives execute
+    // here, in the no-database gate.
+    let valid_jkt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let valid_sha = [0x5A_u8; 32];
+    let outcome = |did: &str,
+                   device_id: Uuid,
+                   status: &str,
+                   jkt: &str,
+                   generation: i64,
+                   key_id: &str,
+                   sha: [u8; 32]| {
+        chat_protocol::b_auth_bridge::structural_row_outcome(
+            "1", did, device_id, status, jkt, generation, key_id, sha, None,
+        )
+    };
+    // Missing coordinates.
+    assert!(
+        matches!(
+            outcome("", Uuid::new_v4(), "active", valid_jkt, 1, "k", valid_sha),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "empty DID is rejected before verification"
+    );
+    assert!(
+        matches!(
+            outcome(
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                Uuid::nil(),
+                "active",
+                valid_jkt,
+                1,
+                "k",
+                valid_sha
+            ),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "nil device is rejected before verification"
+    );
+    assert!(
+        matches!(
+            outcome(
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                Uuid::new_v4(),
+                "",
+                valid_jkt,
+                1,
+                "k",
+                valid_sha
+            ),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "empty device status is rejected before verification"
+    );
+    assert!(
+        matches!(
+            outcome(
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                Uuid::new_v4(),
+                "active",
+                valid_jkt,
+                1,
+                "",
+                valid_sha
+            ),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "empty key id is rejected before verification"
+    );
+    // Nonpositive generations.
+    assert!(
+        matches!(
+            outcome(
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                Uuid::new_v4(),
+                "active",
+                valid_jkt,
+                0,
+                "k",
+                valid_sha
+            ),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "zero generation is rejected before verification"
+    );
+    assert!(
+        matches!(
+            outcome(
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                Uuid::new_v4(),
+                "active",
+                valid_jkt,
+                -1,
+                "k",
+                valid_sha
+            ),
+            Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+        ),
+        "negative generation is rejected before verification"
+    );
+    // Invalid receipt bindings: noncanonical, non-32-byte, padded, or
+    // non-base64url JKT, and a wrong-length signing-key digest.
+    for bad_jkt in [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // 42 chars
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", // padded
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA!", // non-base64url
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB", // 43 chars, wrong value
+        "",
+    ] {
+        assert!(
+            matches!(
+                outcome(
+                    "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                    Uuid::new_v4(),
+                    "active",
+                    bad_jkt,
+                    1,
+                    "k",
+                    valid_sha
+                ),
+                Err(chat_protocol::dpop::ReadAdmissionBindingError::LockedRowShape)
+            ),
+            "malformed JKT {bad_jkt:?} is rejected before verification"
+        );
+    }
+    // The defence-in-depth nonpositive branch stays in the seal itself.
+    assert_eq!(
+        count_occurrences(B_AUTH_DPOP_SOURCE, "auth_generation <= 0"),
+        3,
+        "the nonpositive branches remain at the seal, the structural \
+         constructor, and the consuming verifier"
+    );
+}
+
+#[test]
+fn read_admission_exposes_no_generation_getter_or_raw_tuple_constructor() {
+    let read_section = read_section_of_dpop();
+    // No tuple constructor and no raw coordinate bundle anywhere in the read
+    // section or the B-read module.
+    for forbidden in [
+        "struct ReadAdmissionBinding(",
+        "struct VerifiedReadAdmission(",
+        "struct ReadAdmissionAttempt(",
+        "struct SingleReadAdmission(",
+        "struct InventoryReadAdmission(",
+    ] {
+        assert_eq!(
+            count_occurrences(B_AUTH_DPOP_SOURCE, forbidden)
+                + count_occurrences(B_READ_READ_AUTHORITY_SOURCE, forbidden),
+            0,
+            "no raw tuple constructor may exist for `{forbidden}`"
+        );
+    }
+    // No From/Into conversion into or out of any B-read budget or authority.
+    for type_name in [
+        "SingleReadAdmission",
+        "InventoryReadAdmission",
+        "LockedReadDeviceAuthority",
+        "ConversationStateReadAuthority",
+        "EntryReadAuthority",
+        "VerifiedInventoryFence",
+        "ConversationInventoryAuthority",
+    ] {
+        assert_eq!(
+            count_occurrences(
+                B_READ_READ_AUTHORITY_SOURCE,
+                &format!("impl From<{type_name}>")
+            ) + count_occurrences(
+                B_READ_READ_AUTHORITY_SOURCE,
+                &format!("> for {type_name} {{")
+            ),
+            0,
+            "{type_name} must have no trait conversion"
+        );
+    }
+    // No serde derive on the admission, budget, or authority types.
+    for type_name in [
+        "VerifiedReadAdmission",
+        "ReadAdmissionBinding",
+        "GetDevicesReadAdmission",
+        "GetOwnDevicesReadAdmission",
+        "ReadAdmissionAttempt",
+        "SingleReadAdmission",
+        "InventoryReadAdmission",
+        "LockedReadDeviceAuthority",
+        "VerifiedInventoryFence",
+    ] {
+        let mut from = 0_usize;
+        while let Some(offset) = B_AUTH_DPOP_SOURCE[from..].find(type_name) {
+            let index = from + offset;
+            let before = &B_AUTH_DPOP_SOURCE[..index];
+            if before.ends_with("struct ") || before.ends_with("pub(crate) struct ") {
+                let declaration_start = before.rfind("#[derive(").map_or(index, |d| d);
+                let declaration = &B_AUTH_DPOP_SOURCE[declaration_start..index + type_name.len()];
+                assert!(
+                    !declaration.contains("Serialize") && !declaration.contains("Deserialize"),
+                    "{type_name} must not derive serde: {declaration}"
+                );
+            }
+            from = index + type_name.len();
+        }
+    }
+    let read_code = code_only(read_section);
+    for forbidden in [
+        "fn generation(",
+        "fn auth_generation(&self)",
+        "fn jkt(&self)",
+        "fn key_id(&self)",
+        "fn replay_ids(&self)",
+        "fn trusted_instant(&self)",
+        "fn transaction_id(&self)",
+    ] {
+        assert_eq!(
+            count_occurrences(&read_code, forbidden),
+            0,
+            "the sealed read authority must expose no `{forbidden}`"
+        );
+    }
+    // The B-read budgets are non-Clone/Copy/Debug: no derives and no manual
+    // impls.
+    for type_name in ["SingleReadAdmission", "InventoryReadAdmission"] {
+        for forbidden in [
+            format!("impl Clone for {type_name}"),
+            format!("impl Copy for {type_name}"),
+            format!("impl std::fmt::Debug for {type_name}"),
+        ] {
+            assert_eq!(
+                count_occurrences(B_READ_READ_AUTHORITY_SOURCE, &forbidden),
+                0,
+                "{type_name} must not implement `{forbidden}`"
+            );
+        }
+        // The declaration block (attribute lines through the struct line) must
+        // carry no derive. Counted per-declaration, never as a whole-file
+        // arithmetic, so derives on the endpoint/error enums cannot leak in.
+        let declaration = declaration_with_attributes(
+            B_READ_READ_AUTHORITY_SOURCE,
+            &format!("struct {type_name}"),
+        );
+        assert!(
+            !declaration.contains("#[derive"),
+            "{type_name} must derive nothing, found: {declaration}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn read_admission_attempts_mint_only_three_fresh_transaction_guards() {
+    let (pool, guard) = b_auth_pool().await;
+    let db_name = guard.db_name.clone();
+    let maintenance_url = guard.maintenance_url.clone();
+    assert_private_executor_db_name(&db_name);
+
+    let admission = real_read_admission(&pool, "blue.catbird.chat.getConversations").await;
+    let ledger =
+        chat_protocol::read_authority_bridge::inventory_fresh_guard_ledger(&pool, admission)
+            .await
+            .expect("the fixed three-attempt inventory budget spends against the seeded device");
+    assert_eq!(
+        ledger.verified, 3,
+        "each of the three inventory attempts locked and verified exactly one row"
+    );
+    assert_eq!(
+        ledger.distinct_transactions, 3,
+        "every inventory attempt ran in its own fresh transaction"
+    );
+    assert_eq!(
+        ledger.prior_refusals, 2,
+        "the second and third attempts each refuse their predecessor's guard"
+    );
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn fourth_read_admission_attempt_fails_before_sql() {
+    assert_attempt_minting_sites();
+
+    let (pool, guard) = b_auth_pool().await;
+    let db_name = guard.db_name.clone();
+    let maintenance_url = guard.maintenance_url.clone();
+    assert_private_executor_db_name(&db_name);
+
+    let replay_rows_before = consumed_replay_rows(&pool).await;
+    let admission = real_read_admission(&pool, "blue.catbird.chat.getConversations").await;
+    let replay_rows_committed = consumed_replay_rows(&pool).await;
+    assert!(
+        replay_rows_committed > replay_rows_before,
+        "the admission's authority transaction committed its replay set"
+    );
+    let ledger =
+        chat_protocol::read_authority_bridge::inventory_fresh_guard_ledger(&pool, admission)
+            .await
+            .expect("the fixed three-attempt inventory budget spends against the seeded device");
+    assert_eq!(ledger.verified, 3, "exactly three attempts exist to spend");
+    // A fourth attempt is unrepresentable: the budget field is a fixed-size
+    // [T; 3] array, the seam mints exactly three (assert_attempt_minting_sites
+    // above), and the exact-length binding in the ledger compiles only for
+    // three elements. The whole budget was consumed by value, so no attempt
+    // survives to authorize any fourth lock.
+    assert_eq!(
+        consumed_replay_rows(&pool).await,
+        replay_rows_committed,
+        "spending the whole inventory budget — including every rollback — \
+         changes no committed replay rows"
+    );
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn single_attempt_rejects_foreign_transaction_before_conversation_lookup() {
+    let (pool, guard) = b_auth_pool().await;
+    let db_name = guard.db_name.clone();
+    let maintenance_url = guard.maintenance_url.clone();
+    assert_private_executor_db_name(&db_name);
+
+    let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
+    let (locked_ok, transactions_differ, outcome) =
+        chat_protocol::read_authority_bridge::single_foreign_transaction_outcome(&pool, admission)
+            .await
+            .expect("the attempt locks under its own transaction");
+    assert!(
+        locked_ok,
+        "the single attempt locked and verified under transaction A"
+    );
+    assert!(
+        transactions_differ,
+        "the two sampled transaction identities really differ"
+    );
+    // The conversation id handed to the foreign transaction does not exist:
+    // the refusal is the transaction-identity error, never
+    // ConversationNotFound, so the same-transaction check demonstrably ran
+    // before any conversation lookup.
+    assert_eq!(
+        outcome,
+        chat_protocol::read_authority::ReadAuthorityError::Invariant,
+        "a guard minted under transaction A fails under transaction B before a \
+         protected lookup"
+    );
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
+    let (pool, guard) = b_auth_pool().await;
+    let db_name = guard.db_name.clone();
+    let maintenance_url = guard.maintenance_url.clone();
+    assert_private_executor_db_name(&db_name);
+
+    let did = B_AUTH_DID;
+    let device_id = Uuid::parse_str(B_AUTH_DEVICE).expect("fixed device UUID");
+    let alternate_jkt = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    // Case 1: device revocation after sealing. The admission's hidden binding
+    // was captured against the active row; a revoked row fails closed.
+    {
+        let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
+        let mut tx = pool.begin().await.expect("begin revocation drift case");
+        sqlx::query(
+            "UPDATE chat.devices SET status='revoked', revoked_at=clock_timestamp(), \
+             revocation_id=$3 WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .expect("revocation is a legal device lifecycle transition");
+        let outcome = chat_protocol::read_authority_bridge::single_attempt_lock_in(
+            &mut tx,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(chat_protocol::read_authority::ReadAuthorityError::DeviceRevoked)
+            ),
+            "a revoked device registration fails closed after admission"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    // Case 2: key revocation after sealing.
+    {
+        let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
+        let mut tx = pool.begin().await.expect("begin revocation drift case");
+        sqlx::query(
+            "UPDATE chat.device_keys SET revoked_at=clock_timestamp(), revocation_id=$3 \
+             WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .expect("key revocation is a legal device-key lifecycle transition");
+        let outcome = chat_protocol::read_authority_bridge::single_attempt_lock_in(
+            &mut tx,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(chat_protocol::read_authority::ReadAuthorityError::DeviceRevoked)
+            ),
+            "a revoked signing key fails closed after admission"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    // Case 3: JKT + generation drift after sealing, staged as the only legal
+    // identity-change shape (rebind: jkt change with generation +1). The
+    // hidden binding still names the sealed jkt/generation, so the locked row
+    // drifts and fails before any protected read.
+    {
+        let admission = real_read_admission(&pool, "blue.catbird.chat.getConversationState").await;
+        let mut tx = pool.begin().await.expect("begin revocation drift case");
+        sqlx::query(
+            "UPDATE chat.devices SET dpop_jkt=$3, auth_generation=2, \
+             updated_at=clock_timestamp() WHERE user_did=$1 AND device_id=$2",
+        )
+        .bind(did)
+        .bind(device_id)
+        .bind(alternate_jkt)
+        .execute(&mut *tx)
+        .await
+        .expect("the rebind shape is the only legal identity-change transition");
+        let outcome = chat_protocol::read_authority_bridge::single_attempt_lock_in(
+            &mut tx,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+            ),
+            "post-seal JKT/generation drift fails closed before any protected read"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
+    let fixture = executor_seed::private_genuine_group_pending_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+
+    // The creator keeps its open leaf: state authority with the open-leaf arm.
+    let creator_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &fixture.graph.creator_did,
+        fixture.graph.creator_device_id,
+        &fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let (creator_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        creator_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("creator single-attempt lock");
+    let creator_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        creator_guard,
+        conversation_id,
+    )
+    .await
+    .expect("the creator's current open leaf authorizes state");
+    let creator_view = chat_protocol::read_authority_bridge::state_authority_view(&creator_state);
+    assert!(
+        matches!(
+            creator_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::OpenLeaf
+        ),
+        "the creator carries the current open-leaf witness"
+    );
+    assert_ne!(
+        creator_view.graph_digest, [0_u8; 32],
+        "the sealed aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        creator_view.snapshot_digest, [0_u8; 32],
+        "the sealed aggregate carries a nonzero snapshot digest"
+    );
+    rollback_with_constraints(tx).await;
+
+    // The group-pending invitee authorizes current state only, with the
+    // group-pending witness.
+    let invitee_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &fixture.invitee.did,
+        fixture.invitee.device_id,
+        &fixture.invitee.dpop_jkt,
+    )
+    .await;
+    let (invitee_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        invitee_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("invitee single-attempt lock");
+    let invitee_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        invitee_guard,
+        conversation_id,
+    )
+    .await
+    .expect("a group-pending participant authorizes current state");
+    let invitee_view = chat_protocol::read_authority_bridge::state_authority_view(&invitee_state);
+    assert!(
+        matches!(
+            invitee_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::GroupPendingParticipant
+        ),
+        "the group-pending invitee carries the group-pending witness"
+    );
+    assert_eq!(
+        invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
+        "the witness binds the durable participant period"
+    );
+    // Entries require a current open leaf: the group-pending invitee is
+    // denied application entries.
+    let entry_outcome = {
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            &fixture.invitee.did,
+            fixture.invitee.device_id,
+            &fixture.invitee.dpop_jkt,
+        )
+        .await;
+        let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("invitee entry single-attempt lock");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+                .await
+                .err()
+                .expect("a group-pending participant has no entry authority");
+        rollback_with_constraints(tx).await;
+        outcome
+    };
+    assert_eq!(
+        entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "group-pending authorizes state only, never application entries"
+    );
+
+    // A direct-pending invitee is NotEntitled to current state.
+    let direct = executor_seed::private_genuine_direct_pending_graph().await;
+    let direct_pool = direct.pool.clone();
+    let direct_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversationState",
+        &direct.invitee.did,
+        direct.invitee.device_id,
+        &direct.invitee.dpop_jkt,
+    )
+    .await;
+    let (direct_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &direct_pool,
+        direct_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("direct invitee single-attempt lock");
+    let direct_outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        direct_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .err()
+    .expect("a direct-pending invitee is not entitled to state");
+    assert_eq!(
+        direct_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "direct-pending remains NotEntitled"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn former_exact_device_gets_access_outside_membership_interval() {
+    let fixture = executor_seed::private_genuine_removal_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+    let removed = &fixture.removed;
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &removed.did,
+        removed.device_id,
+        &removed.dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("single-attempt lock");
+    let state_outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        guard,
+        conversation_id,
+    )
+    .await
+    .err()
+    .expect("the removed exact device has no current-state capability");
+    assert_eq!(
+        state_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "a removed exact leaf with a finite interval receives the outside-interval error"
+    );
+    rollback_with_constraints(tx).await;
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getEntries",
+        &removed.did,
+        removed.device_id,
+        &removed.dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
+    .await
+    .expect("single-attempt lock");
+    let entry_outcome =
+        chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+            .await
+            .err()
+            .expect("a former exact device has no entry authority");
+    assert_eq!(
+        entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "the former-device interval denial is the outside-interval error, and G7 \
+         never synthesizes current state from historical rows"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn post_reset_old_exact_device_cannot_inherit_current_did_state() {
+    let fixture = executor_seed::private_genuine_reset_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+    let old = &fixture.old;
+
+    // BREAD-05 shape proof: the old exact device's DID is still a current
+    // participant, and the old exact device has no current leaf — the exact
+    // DID-level current-state inheritance trap the classification must refuse.
+    let current_participant: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants \
+         WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
+    )
+    .bind(conversation_id)
+    .bind(&old.did)
+    .fetch_one(&pool)
+    .await
+    .expect("count the old DID's current participant rows");
+    assert_eq!(
+        current_participant, 1,
+        "the reset-retired DID remains a current participant (the BREAD-05 shape)"
+    );
+    let old_leaf: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND device_id=$3 AND active",
+    )
+    .bind(conversation_id)
+    .bind(&old.did)
+    .bind(old.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count the old exact device's active leaves");
+    assert_eq!(old_leaf, 0, "the old exact device has no current leaf");
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &old.did,
+        old.device_id,
+        &old.dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("single-attempt lock");
+    let state_outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        guard,
+        conversation_id,
+    )
+    .await
+    .err()
+    .expect("the post-reset old exact device must not inherit the DID's current state");
+    assert_eq!(
+        state_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "BREAD-05: the exact device's finite reset interval is classified before \
+         the DID-only zero-leaf participant arm"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn unrelated_terminal_requester_is_not_entitled() {
+    let fixture = executor_seed::private_genuine_terminal_close_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+
+    let unrelated_did = b_read_fresh_did(0x0B);
+    let unrelated_device = Uuid::new_v4();
+    let unrelated_jkt = register_read_device(&pool, &unrelated_did, unrelated_device).await;
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("single-attempt lock");
+    let outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        guard,
+        conversation_id,
+    )
+    .await
+    .err()
+    .expect("an unrelated requester is not entitled to a terminal conversation");
+    assert_eq!(
+        outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "BREAD-04: an unrelated terminal requester receives NotEntitled, never \
+         AccessOutsideMembershipInterval"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn terminal_proof_holder_gets_access_outside_membership_interval() {
+    let fixture = executor_seed::private_genuine_terminal_close_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &fixture.graph.creator_did,
+        fixture.graph.creator_device_id,
+        &fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("single-attempt lock");
+    let outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        guard,
+        conversation_id,
+    )
+    .await
+    .err()
+    .expect("an exact terminal schedule-proof holder has no current-state capability");
+    assert_eq!(
+        outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "the exact schedule-proof holder receives AccessOutsideMembershipInterval"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
+    let fixture = executor_seed::private_genuine_removal_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+    let removed = &fixture.removed;
+
+    // The removed exact device's single finite interval: ordered trivially,
+    // inclusive at the finite terminal, with exact closing provenance.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getEntries",
+        &removed.did,
+        removed.device_id,
+        &removed.dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
+    .await
+    .expect("single-attempt lock");
+    let removed_entries =
+        chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+            .await
+            .expect("the exact-device interval union authorizes the removed device's own entries");
+    let removed_view = chat_protocol::read_authority_bridge::entry_authority_view(&removed_entries);
+    assert_eq!(
+        removed_view.ordered_intervals.len(),
+        1,
+        "the removed exact device has exactly one interval"
+    );
+    let interval = &removed_view.ordered_intervals[0];
+    assert_eq!(
+        interval.membership_interval_id, removed.membership_interval_id,
+        "the witness binds the durable membership interval id"
+    );
+    assert_eq!(interval.start_seq, removed.interval_start_seq);
+    match &interval.terminal {
+        chat_protocol::read_authority_bridge::IntervalTerminalView::Closed {
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+            closing_kind,
+            row_sha256,
+        } => {
+            assert_eq!(
+                *terminal_seq, removed.terminal_seq,
+                "the finite terminal sequence is inclusive"
+            );
+            assert_eq!(
+                *closing_transition_id, removed.terminal_transition_id,
+                "the closing transition provenance binds the exact entry"
+            );
+            assert_eq!(
+                *closing_outer_entry_fingerprint, removed.terminal_outer_entry_fingerprint,
+                "the closing outer-entry fingerprint binds the exact entry"
+            );
+            assert_eq!(closing_kind, "remove");
+            assert_ne!(*row_sha256, [0_u8; 32], "the row binding digest is nonzero");
+        }
+        other => panic!("the removed device interval must be finite, found {other:?}"),
+    }
+    assert_ne!(
+        removed_view.ordered_intervals_sha256, [0_u8; 32],
+        "the ordered interval digest is derived under the same transaction"
+    );
+    assert!(
+        removed_view.control_recipient_fence.maximum_entry_seq >= removed.terminal_seq,
+        "the control-recipient fence reaches at least the inclusive terminal"
+    );
+    assert_ne!(
+        removed_view
+            .control_recipient_fence
+            .ordered_recipient_rows_sha256,
+        [0_u8; 32],
+        "the ordered control-recipient set is bound at the same fence"
+    );
+    rollback_with_constraints(tx).await;
+
+    // The creator's open interval is the last (only) interval and observes the
+    // head.
+    let creator_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getEntries",
+        &fixture.graph.creator_did,
+        fixture.graph.creator_device_id,
+        &fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let (creator_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        creator_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
+    .await
+    .expect("creator entry single-attempt lock");
+    let creator_entries =
+        chat_protocol::read_authority::authorize_entries(&mut tx, creator_guard, conversation_id)
+            .await
+            .expect("the creator's current open leaf authorizes entries");
+    let creator_view = chat_protocol::read_authority_bridge::entry_authority_view(&creator_entries);
+    assert_eq!(
+        creator_view.ordered_intervals.len(),
+        1,
+        "the creator has exactly one open interval"
+    );
+    match &creator_view.ordered_intervals[0].terminal {
+        chat_protocol::read_authority_bridge::IntervalTerminalView::Open {
+            observed_head_seq,
+            row_sha256,
+        } => {
+            assert!(
+                *observed_head_seq >= creator_view.ordered_intervals[0].start_seq,
+                "the observed head sequence covers the open interval's start"
+            );
+            assert_ne!(
+                *row_sha256, [0_u8; 32],
+                "the open row binding digest is nonzero"
+            );
+        }
+        other => panic!("the creator interval must be open, found {other:?}"),
+    }
+    rollback_with_constraints(tx).await;
+
+    // Source pins: the loader orders by (start_seq, membership_interval_id)
+    // and the validator rejects overlaps and open-not-last intervals.
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains("ORDER BY ai.start_seq, ai.membership_interval_id"),
+        "the interval loader is deterministic in (start_seq, membership_interval_id) order"
+    );
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains("start_seq <= previous_terminal"),
+        "the validator rejects overlapping intervals"
+    );
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains("An open interval must be last"),
+        "the validator rejects an open interval that is not last"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn entry_intervals_preserve_readd_gaps_and_generation_boundaries() {
+    let fixture = executor_seed::private_genuine_reset_graph().await;
+    let pool = fixture.pool.clone();
+    let conversation_id = fixture.graph.conversation_id;
+    let old = &fixture.old;
+
+    // Generation-bound proof: the old exact device's interval lives in the
+    // superseded generation while the conversation is current at generation 1.
+    let interval_generation: i64 = sqlx::query_scalar(
+        "SELECT generation FROM chat.application_intervals WHERE membership_interval_id=$1",
+    )
+    .bind(old.membership_interval_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the old interval's generation");
+    assert_eq!(
+        u64::try_from(interval_generation).expect("generation fits u64"),
+        old.old_generation,
+        "the retired interval is generation-bound to the old generation"
+    );
+    let current_generation: i64 = sqlx::query_scalar(
+        "SELECT current_generation FROM chat.conversations WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read the conversation's current generation");
+    assert_eq!(current_generation, 1, "the reset successor is current");
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getEntries",
+        &old.did,
+        old.device_id,
+        &old.dpop_jkt,
+    )
+    .await;
+    let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
+    .await
+    .expect("single-attempt lock");
+    let entries = chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+        .await
+        .expect("the exact-device interval union still authorizes the old device's own entries");
+    let view = chat_protocol::read_authority_bridge::entry_authority_view(&entries);
+    // The re-add gap stays invisible: exactly one closed interval, never a
+    // synthesized open interval after the terminal sequence.
+    assert_eq!(
+        view.ordered_intervals.len(),
+        1,
+        "no backfill interval is synthesized after the reset terminal"
+    );
+    match &view.ordered_intervals[0].terminal {
+        chat_protocol::read_authority_bridge::IntervalTerminalView::Closed {
+            terminal_seq,
+            closing_kind,
+            ..
+        } => {
+            assert_eq!(
+                *terminal_seq, old.terminal_seq,
+                "the reset terminal is inclusive"
+            );
+            assert_eq!(closing_kind, "reset", "the reset closing kind is exact");
+        }
+        other => panic!("the old device interval must be reset-closed, found {other:?}"),
+    }
+    let observed_head: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(seq),0)::bigint FROM chat.entries WHERE conversation_id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read the observed head sequence");
+    assert!(
+        u64::try_from(observed_head).expect("head fits u64") > old.terminal_seq,
+        "entries after the reset terminal exist — the gap is real and stays unbackfilled"
+    );
+    rollback_with_constraints(tx).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn entry_authority_rejects_wrong_device_conversation_and_transaction() {
+    let (pool, guard, graph) = private_genuine_graph().await;
+    let maintenance_url = guard.maintenance_url.clone();
+    let db_name = guard.db_name.clone();
+    assert_private_executor_db_name(&db_name);
+    let conversation_id = graph.conversation_id;
+
+    // Wrong conversation: the conversation does not exist.
+    {
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            &graph.creator_did,
+            graph.creator_device_id,
+            &graph.creator_dpop_jkt,
+        )
+        .await;
+        let (device, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("single-attempt lock");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx, device, Uuid::new_v4())
+                .await
+                .err()
+                .expect("a nonexistent conversation cannot authorize entries");
+        assert_eq!(
+            outcome,
+            chat_protocol::read_authority::ReadAuthorityError::ConversationNotFound,
+            "conversation absence remains ConversationNotFound"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    // Wrong device: a registered but entirely unrelated device.
+    {
+        let unrelated_did = b_read_fresh_did(0x0C);
+        let unrelated_device = Uuid::new_v4();
+        let unrelated_jkt = register_read_device(&pool, &unrelated_did, unrelated_device).await;
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            &unrelated_did,
+            unrelated_device,
+            &unrelated_jkt,
+        )
+        .await;
+        let (device, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("single-attempt lock");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx, device, conversation_id)
+                .await
+                .err()
+                .expect("an unrelated device cannot authorize entries");
+        assert_eq!(
+            outcome,
+            chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+            "the unrelated requester receives NotEntitled"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    // Wrong transaction: the guard was minted under transaction A and is
+    // refused under transaction B before any protected lookup.
+    {
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getEntries",
+            &graph.creator_did,
+            graph.creator_device_id,
+            &graph.creator_dpop_jkt,
+        )
+        .await;
+        let (device, mut tx_a) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("single-attempt lock under transaction A");
+        rollback_with_constraints(tx_a).await;
+
+        let mut tx_b = pool.begin().await.expect("begin foreign transaction");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx_b, device, conversation_id)
+                .await
+                .err()
+                .expect("the guard is terminal under a foreign transaction");
+        assert_eq!(
+            outcome,
+            chat_protocol::read_authority::ReadAuthorityError::Invariant,
+            "a guard minted under transaction A fails under transaction B before \
+             a protected lookup"
+        );
+        rollback_with_constraints(tx_b).await;
+    }
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+/// Run one inventory scenario: seed the retention fence, mint the admission,
+/// lock the device, build the exact fence record, and collect the authorities.
+async fn inventory_run_for_fixture(
+    pool: &PgPool,
+    protocol_instance_id: Uuid,
+    admission: chat_protocol::dpop::VerifiedReadAdmission,
+) -> chat_protocol::read_authority_bridge::InventoryRunOutcome {
+    seed_private_retention_fence(pool, protocol_instance_id).await;
+    let cursor_key = fixture_cursor_key(pool, protocol_instance_id).await;
+    chat_protocol::read_authority_bridge::inventory_run(
+        pool,
+        admission,
+        protocol_instance_id,
+        cursor_key,
+        0,
+        [0x11_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await
+    .expect("the inventory run completes against the genuine fixture")
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn inventory_precedence_is_close_open_finite_participant_none() {
+    // Close arm: terminal conversation plus exact schedule proof.
+    let close_fixture = executor_seed::private_genuine_terminal_close_graph().await;
+    let close_pool = close_fixture.pool.clone();
+    let close_admission = fixture_read_admission(
+        &close_pool,
+        "blue.catbird.chat.getConversations",
+        &close_fixture.graph.creator_did,
+        close_fixture.graph.creator_device_id,
+        &close_fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let close_run = inventory_run_for_fixture(
+        &close_pool,
+        close_fixture.graph.protocol_instance_id,
+        close_admission,
+    )
+    .await;
+    assert_eq!(
+        close_run.authorities.len(),
+        1,
+        "the proof holder sees exactly its own terminal conversation"
+    );
+    let close_view = &close_run.authorities[0];
+    assert_eq!(
+        close_view.conversation_id,
+        close_fixture.graph.conversation_id
+    );
+    match &close_view.arm {
+        chat_protocol::read_authority_bridge::InventoryArmView::Close {
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+        } => {
+            assert_eq!(*terminal_seq, close_fixture.terminal_seq);
+            assert_eq!(
+                *closing_transition_id, close_fixture.close_transition_id,
+                "the close arm binds the exact closing transition"
+            );
+            assert_eq!(
+                closing_outer_entry_fingerprint.as_slice(),
+                close_fixture.closing_outer_entry_fingerprint.as_slice(),
+                "the close arm binds the exact closing outer-entry fingerprint"
+            );
+        }
+        other => panic!("the terminal proof holder must select the close arm, found {other:?}"),
+    }
+    assert_eq!(
+        close_view.snapshot_digest, [0_u8; 32],
+        "close tombstones carry no snapshot digest"
+    );
+
+    // Open arm: active conversation plus exact open membership interval.
+    let (open_pool, _open_guard, open_graph) = private_genuine_graph().await;
+    let open_admission = fixture_read_admission(
+        &open_pool,
+        "blue.catbird.chat.getConversations",
+        &open_graph.creator_did,
+        open_graph.creator_device_id,
+        &open_graph.creator_dpop_jkt,
+    )
+    .await;
+    let open_run =
+        inventory_run_for_fixture(&open_pool, open_graph.protocol_instance_id, open_admission)
+            .await;
+    assert_eq!(
+        open_run.authorities.len(),
+        1,
+        "the open-leaf requester sees its conversation"
+    );
+    let open_view = &open_run.authorities[0];
+    assert_eq!(open_view.conversation_id, open_graph.conversation_id);
+    match &open_view.arm {
+        chat_protocol::read_authority_bridge::InventoryArmView::State {
+            participant_period_id,
+        } => {
+            assert_ne!(
+                *participant_period_id,
+                Uuid::nil(),
+                "the state arm binds the participant period"
+            );
+        }
+        other => panic!("the exact open interval must select the state arm, found {other:?}"),
+    }
+    assert_eq!(open_view.txid, open_run.device_txid);
+    assert_eq!(open_view.device_binding_sha256, open_run.device_binding);
+    assert_eq!(
+        open_view.fence.protocol_instance_id,
+        open_graph.protocol_instance_id
+    );
+    assert_ne!(open_view.graph_digest, [0_u8; 32]);
+    assert_ne!(open_view.snapshot_digest, [0_u8; 32]);
+
+    // Finite arm: active conversation plus latest exact finite interval.
+    let removal_fixture = executor_seed::private_genuine_removal_graph().await;
+    let removal_pool = removal_fixture.pool.clone();
+    let removal_admission = fixture_read_admission(
+        &removal_pool,
+        "blue.catbird.chat.getConversations",
+        &removal_fixture.removed.did,
+        removal_fixture.removed.device_id,
+        &removal_fixture.removed.dpop_jkt,
+    )
+    .await;
+    let removal_run = inventory_run_for_fixture(
+        &removal_pool,
+        removal_fixture.graph.protocol_instance_id,
+        removal_admission,
+    )
+    .await;
+    assert_eq!(
+        removal_run.authorities.len(),
+        1,
+        "the removed device sees its conversation"
+    );
+    let removal_view = &removal_run.authorities[0];
+    match &removal_view.arm {
+        chat_protocol::read_authority_bridge::InventoryArmView::Removal {
+            membership_interval_id,
+            terminal_seq,
+            closing_transition_id,
+            closing_outer_entry_fingerprint,
+            removed_at,
+        } => {
+            assert_eq!(
+                *membership_interval_id,
+                removal_fixture.removed.membership_interval_id
+            );
+            assert_eq!(*terminal_seq, removal_fixture.removed.terminal_seq);
+            assert_eq!(
+                *closing_transition_id,
+                removal_fixture.removed.terminal_transition_id
+            );
+            assert_eq!(
+                closing_outer_entry_fingerprint.as_slice(),
+                removal_fixture
+                    .removed
+                    .terminal_outer_entry_fingerprint
+                    .as_slice()
+            );
+            assert_eq!(
+                *removed_at, removal_fixture.removed.removed_at,
+                "the removal arm binds the durable removed-at instant"
+            );
+        }
+        other => panic!("the finite exact interval must select the removal arm, found {other:?}"),
+    }
+    // The removal graph's creator (same corpus DID) also sees a state arm in
+    // the same database.
+    let creator_admission = fixture_read_admission(
+        &removal_pool,
+        "blue.catbird.chat.getConversations",
+        &removal_fixture.graph.creator_did,
+        removal_fixture.graph.creator_device_id,
+        &removal_fixture.graph.creator_dpop_jkt,
+    )
+    .await;
+    let creator_run = inventory_run_for_fixture(
+        &removal_pool,
+        removal_fixture.graph.protocol_instance_id,
+        creator_admission,
+    )
+    .await;
+    assert_eq!(creator_run.authorities.len(), 1);
+    assert!(
+        matches!(
+            creator_run.authorities[0].arm,
+            chat_protocol::read_authority_bridge::InventoryArmView::State { .. }
+        ),
+        "the removal graph's creator keeps its open-interval state arm"
+    );
+
+    // Participant arm: an eligible current participant with no exact-device
+    // interval (a sibling device of the reset-retired DID).
+    let reset_fixture = executor_seed::private_genuine_reset_graph().await;
+    let reset_pool = reset_fixture.pool.clone();
+    let sibling_device = Uuid::new_v4();
+    let sibling_jkt =
+        register_read_device(&reset_pool, &reset_fixture.old.did, sibling_device).await;
+    let sibling_admission = fixture_read_admission(
+        &reset_pool,
+        "blue.catbird.chat.getConversations",
+        &reset_fixture.old.did,
+        sibling_device,
+        &sibling_jkt,
+    )
+    .await;
+    let sibling_run = inventory_run_for_fixture(
+        &reset_pool,
+        reset_fixture.graph.protocol_instance_id,
+        sibling_admission,
+    )
+    .await;
+    assert_eq!(
+        sibling_run.authorities.len(),
+        1,
+        "the sibling sees the reset conversation once"
+    );
+    assert!(
+        matches!(
+            sibling_run.authorities[0].arm,
+            chat_protocol::read_authority_bridge::InventoryArmView::State { .. }
+        ),
+        "a sibling with no former exact interval uses the DID-level participant arm"
+    );
+    // The old exact device in the same database selects the removal arm — the
+    // finite interval beats the DID-level participant arm.
+    let old_admission = fixture_read_admission(
+        &reset_pool,
+        "blue.catbird.chat.getConversations",
+        &reset_fixture.old.did,
+        reset_fixture.old.device_id,
+        &reset_fixture.old.dpop_jkt,
+    )
+    .await;
+    let old_run = inventory_run_for_fixture(
+        &reset_pool,
+        reset_fixture.graph.protocol_instance_id,
+        old_admission,
+    )
+    .await;
+    assert_eq!(old_run.authorities.len(), 1);
+    assert!(
+        matches!(
+            old_run.authorities[0].arm,
+            chat_protocol::read_authority_bridge::InventoryArmView::Removal { .. }
+        ),
+        "the reset-closed exact device selects the removal arm, not state"
+    );
+
+    // None arm: the direct-pending invitee is a candidate but yields no item.
+    let direct_fixture = executor_seed::private_genuine_direct_pending_graph().await;
+    let direct_pool = direct_fixture.pool.clone();
+    let direct_candidate: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.participants WHERE conversation_id=$1 AND user_did=$2",
+    )
+    .bind(direct_fixture.graph.conversation_id)
+    .bind(&direct_fixture.invitee.did)
+    .fetch_one(&direct_pool)
+    .await
+    .expect("count the direct-pending candidate rows");
+    assert_eq!(
+        direct_candidate, 1,
+        "the direct-pending invitee IS a candidate (arm precedence excludes it, \
+         not candidate discovery)"
+    );
+    let direct_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversations",
+        &direct_fixture.invitee.did,
+        direct_fixture.invitee.device_id,
+        &direct_fixture.invitee.dpop_jkt,
+    )
+    .await;
+    let direct_run = inventory_run_for_fixture(
+        &direct_pool,
+        direct_fixture.graph.protocol_instance_id,
+        direct_admission,
+    )
+    .await;
+    assert_eq!(
+        direct_run.authorities.len(),
+        0,
+        "direct-pending selects no inventory item"
+    );
+
+    // None: an unrelated requester is not even a candidate.
+    let (unrelated_pool, _unrelated_guard, unrelated_graph) = private_genuine_graph().await;
+    let unrelated_did = b_read_fresh_did(0x0D);
+    let unrelated_device = Uuid::new_v4();
+    let unrelated_jkt =
+        register_read_device(&unrelated_pool, &unrelated_did, unrelated_device).await;
+    let unrelated_admission = fixture_read_admission(
+        &unrelated_pool,
+        "blue.catbird.chat.getConversations",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let unrelated_run = inventory_run_for_fixture(
+        &unrelated_pool,
+        unrelated_graph.protocol_instance_id,
+        unrelated_admission,
+    )
+    .await;
+    assert_eq!(
+        unrelated_run.authorities.len(),
+        0,
+        "an unrelated requester is not a candidate and sees no item"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn inventory_fence_rejects_cursor_digest_session_device_and_protocol_splicing() {
+    let (pool, guard, graph) = private_genuine_graph().await;
+    let maintenance_url = guard.maintenance_url.clone();
+    let db_name = guard.db_name.clone();
+    assert_private_executor_db_name(&db_name);
+    seed_private_retention_fence(&pool, graph.protocol_instance_id).await;
+    let cursor_key = fixture_cursor_key(&pool, graph.protocol_instance_id).await;
+
+    // (a) A zero cursor digest is rejected by the validating constructor.
+    let zero_digest = chat_protocol::read_authority_bridge::fence_material_rejected(
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0_u8; 32],
+        0,
+        Utc::now(),
+    );
+    assert_eq!(
+        zero_digest,
+        Some(chat_protocol::read_authority::ReadAuthorityError::Invariant),
+        "a bare zero digest is never proof"
+    );
+
+    // (b) Protocol splicing: a record built against a foreign protocol
+    // instance.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    let foreign_instance = Uuid::new_v4();
+    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        foreign_instance,
+        cursor_key.clone(),
+        0,
+        [0x22_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+        ),
+        "a fence record from a foreign protocol instance is spliced and fails"
+    );
+
+    // (c) Key splicing: the live instance with a drifted cursor key.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    let drifted_key = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        graph.protocol_instance_id,
+        drifted_key.to_owned(),
+        0,
+        [0x33_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+        ),
+        "a fence record bound to a drifted cursor key fails"
+    );
+    rollback_with_constraints(tx).await;
+
+    // (d) Device/session splicing: the device was locked under transaction A
+    // but the fence is verified under transaction B.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx_a) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock under transaction A");
+    let mut tx_b = pool.begin().await.expect("begin foreign transaction B");
+    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx_b,
+        device,
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x44_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+        ),
+        "a fence verified outside the device lock's transaction is spliced and fails"
+    );
+    rollback_with_constraints(tx_b).await;
+    rollback_with_constraints(tx_a).await;
+
+    // (e) Positive control: the same transaction, exact instance and key.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let run = inventory_run_for_fixture(&pool, graph.protocol_instance_id, admission).await;
+    assert_eq!(
+        run.authorities.len(),
+        1,
+        "the exact fence verifies and the open-leaf conversation yields one item"
+    );
+    assert_eq!(
+        run.authorities[0].fence.event_cursor_sha256, [0x11_u8; 32],
+        "the authority binds the exact cursor digest from the verified fence"
+    );
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
+async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
+    let (pool, guard, graph) = private_genuine_graph().await;
+    let maintenance_url = guard.maintenance_url.clone();
+    let db_name = guard.db_name.clone();
+    assert_private_executor_db_name(&db_name);
+    seed_private_retention_fence(&pool, graph.protocol_instance_id).await;
+    let cursor_key = fixture_cursor_key(&pool, graph.protocol_instance_id).await;
+
+    // (a) Floor drift: a record whose retained floor sits above its event
+    // position is rejected structurally, and a live floor above the snapshot
+    // position fails verification.
+    let floor_record = chat_protocol::read_authority_bridge::fence_material_rejected(
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x55_u8; 32],
+        5,
+        Utc::now(),
+    );
+    assert_eq!(
+        floor_record,
+        Some(chat_protocol::read_authority::ReadAuthorityError::Invariant),
+        "a retained floor above the event position is not a valid fence"
+    );
+    sqlx::query(
+        "UPDATE chat.event_retention SET retained_floor=5, \
+         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
+    )
+    .bind(graph.protocol_instance_id)
+    .execute(&pool)
+    .await
+    .expect("raise the live retention floor");
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x66_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+        ),
+        "a live retention floor above the snapshot event position is drift"
+    );
+    rollback_with_constraints(tx).await;
+    sqlx::query(
+        "UPDATE chat.event_retention SET retained_floor=0, \
+         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
+    )
+    .bind(graph.protocol_instance_id)
+    .execute(&pool)
+    .await
+    .expect("restore the live retention floor");
+
+    // (b) Expiry drift: a fence captured in the future, or beyond the session
+    // expiry horizon.
+    for (label, captured_at) in [
+        ("future", Utc::now() + chrono::Duration::minutes(1)),
+        ("stale", Utc::now() - chrono::Duration::minutes(30)),
+    ] {
+        let admission = fixture_read_admission(
+            &pool,
+            "blue.catbird.chat.getConversations",
+            &graph.creator_did,
+            graph.creator_device_id,
+            &graph.creator_dpop_jkt,
+        )
+        .await;
+        let (device, mut tx) =
+            chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+                .await
+                .expect("inventory-attempt lock");
+        let outcome = chat_protocol::read_authority_bridge::verify_fence_material(
+            &mut tx,
+            device,
+            graph.protocol_instance_id,
+            cursor_key.clone(),
+            0,
+            [0x77_u8; 32],
+            0,
+            captured_at,
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(chat_protocol::read_authority::ReadAuthorityError::Invariant)
+            ),
+            "a {label} fence capture is temporal drift"
+        );
+        rollback_with_constraints(tx).await;
+    }
+
+    // (c) Head drift: the fence claims a snapshot event position beyond the
+    // protocol's maximum event position.
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    let fence = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        1,
+        [0x88_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await
+    .expect("the fence verifies: position 1 is floor-consistent and fresh");
+    let outcome = chat_protocol::read_authority::inventory_authorities(&mut tx, fence)
+        .await
+        .err()
+        .expect("the head revalidation refuses a snapshot beyond the event stream");
+    assert_eq!(
+        outcome,
+        chat_protocol::read_authority::ReadAuthorityError::Invariant,
+        "a fence snapshot position beyond the head is drift"
+    );
+    rollback_with_constraints(tx).await;
+
+    // (d) Key drift through the deterministic FOR UPDATE barrier: a writer
+    // holds an uncommitted retention-floor raise; the final revalidation
+    // blocks on the row lock, the writer commits, and the committed drift is
+    // then refused. No sleeps: the barrier is the lock itself.
+    let mut tx_writer = pool.begin().await.expect("begin the barrier writer");
+    sqlx::query(
+        "UPDATE chat.event_retention SET retained_floor=7, \
+         updated_at=clock_timestamp() WHERE protocol_instance_id=$1",
+    )
+    .bind(graph.protocol_instance_id)
+    .execute(&mut *tx_writer)
+    .await
+    .expect("the writer holds the retention row lock uncommitted");
+
+    let admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversations",
+        &graph.creator_did,
+        graph.creator_device_id,
+        &graph.creator_dpop_jkt,
+    )
+    .await;
+    let (device, mut tx) =
+        chat_protocol::read_authority_bridge::lock_inventory_attempt(&pool, admission)
+            .await
+            .expect("inventory-attempt lock");
+    // Verification reads the committed floor (0) — the writer's raise is not
+    // visible yet.
+    let fence = chat_protocol::read_authority_bridge::verify_fence_material(
+        &mut tx,
+        device,
+        graph.protocol_instance_id,
+        cursor_key.clone(),
+        0,
+        [0x99_u8; 32],
+        0,
+        Utc::now(),
+    )
+    .await
+    .expect("the fence verifies against the committed floor");
+    // The final revalidation FOR UPDATE blocks on the writer; commit the
+    // drift, then the reader must fail.
+    let outcome = {
+        let locked = chat_protocol::read_authority::inventory_authorities(&mut tx, fence).await;
+        tx_writer
+            .commit()
+            .await
+            .expect("the barrier writer commits its drift");
+        locked
+    }
+    .err()
+    .expect("the committed floor drift is refused by the final revalidation");
+    assert_eq!(
+        outcome,
+        chat_protocol::read_authority::ReadAuthorityError::Invariant,
+        "key/floor drift committed between fence verification and final \
+         revalidation fails the whole attempt"
+    );
+    rollback_with_constraints(tx).await;
+    let _ = tx_writer;
 
     pool.close().await;
     drop(guard);

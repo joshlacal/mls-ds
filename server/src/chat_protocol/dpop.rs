@@ -862,6 +862,61 @@ struct TokenHeader {
     kid: String,
 }
 
+// ---------------------------------------------------------------------------
+// B-read seam (seam authority amendment §2, fix round 3 §9): the two additive
+// `VerifiedReadAdmission` conversions that validate the hidden endpoint and
+// canonical method against `&'static str` NSID/method constants before minting
+// attempts. The constants come only from B-read's closed endpoint enums via
+// `read_authority.rs`'s two free functions; this file stays lexically
+// self-contained (no crate-qualified chat_protocol references) so the eleven
+// integration crates that path-include it keep compiling. This block is the
+// entire B-read slice of `dpop.rs`; it is placed AFTER the sealed read section
+// so the sealed B-auth read-section guards keep their window and count. No new
+// `use` statement was added.
+// ---------------------------------------------------------------------------
+
+impl VerifiedReadAdmission {
+    /// B-read seam: validate the hidden endpoint/method and mint exactly one
+    /// attempt for an ordinary read endpoint.
+    ///
+    /// The hidden binding is validated against the `&'static str` NSID and
+    /// canonical method supplied by B-read's closed ordinary-endpoint enum
+    /// BEFORE any SQL: a foreign ordinary endpoint or a method mismatch fails
+    /// with `EndpointBinding`/`MethodBinding` and spends nothing.
+    pub(in crate::chat_protocol) fn into_single_read_attempt(
+        self,
+        endpoint_nsid: &'static str,
+        canonical_method: &'static str,
+    ) -> Result<ReadAdmissionAttempt, ReadAdmissionBindingError> {
+        let binding = self.into_closed_endpoint_binding(endpoint_nsid, canonical_method)?;
+        Ok(ReadAdmissionAttempt {
+            binding: Arc::new(binding),
+        })
+    }
+
+    /// B-read seam: validate the hidden endpoint/method and mint exactly three
+    /// attempts for the inventory endpoint.
+    ///
+    /// A fourth element is unrepresentable because the field is a fixed-size
+    /// array of exactly this length and no push/reset/mint operation exists.
+    pub(in crate::chat_protocol) fn into_inventory_read_attempts(
+        self,
+        endpoint_nsid: &'static str,
+        canonical_method: &'static str,
+    ) -> Result<[ReadAdmissionAttempt; 3], ReadAdmissionBindingError> {
+        let binding = Arc::new(self.into_closed_endpoint_binding(endpoint_nsid, canonical_method)?);
+        Ok([
+            ReadAdmissionAttempt {
+                binding: Arc::clone(&binding),
+            },
+            ReadAdmissionAttempt {
+                binding: Arc::clone(&binding),
+            },
+            ReadAdmissionAttempt { binding },
+        ])
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfirmationClaim {
