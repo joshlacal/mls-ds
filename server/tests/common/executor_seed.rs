@@ -6181,8 +6181,10 @@ pub async fn build_creation_with_invitee(
     let metadata = MetadataSnapshotBinding::for_test_creation(
         *conversation_id.as_bytes(),
         0,
+        *coordinate.group_id(),
         0,
         *coordinate.group_context_hash(),
+        *coordinate.confirmation_tag(),
         *transition_id.as_bytes(),
         1,
         alice_id.clone(),
@@ -6713,8 +6715,10 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     let reencryption = MetadataSnapshotBinding::for_test_creation(
         *conversation_id.as_bytes(),
         0,
+        *successor_coord.group_id(),
         successor_coord.epoch(),
         *successor_coord.group_context_hash(),
+        *successor_coord.confirmation_tag(),
         fixture.creation_transition_id,
         1,
         fixture.alice_id.clone(),

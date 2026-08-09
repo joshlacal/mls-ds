@@ -1575,7 +1575,7 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 }
 
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "f2d0f424d13524c75c91091f2d4f2a3382f89d61c86539ed36602a92755e6748";
+    "1c852639e4fe4bf17af88bbfe3456a95c26d93c2535530d3c54a81ff0983e20f";
 const SEALED_REPOSITORY_CORE_SHA256: &str =
     "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
 

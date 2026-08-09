@@ -2306,6 +2306,7 @@ mod historical_control_path {
     use uuid::Uuid;
 
     use crate::chat_protocol::repository::core::participant_removal_graph_digest_for_test;
+    use crate::chat_protocol::state_machine as sm;
     use crate::chat_protocol::state_machine::{
         classify_acceptance, classify_role_producer, DeviceIdentity,
         HistoricalRehydrationAuthority, HydrationAuthority, ParticipantHydrationRow,
@@ -2986,6 +2987,84 @@ mod historical_control_path {
                 });
             assert_eq!(from_bytes, from_row, "kind {}", case.entry_kind);
         }
+
+        let template = crate::frozen_public_state::restore_genesis();
+        let entry = build_real_corpus_creation_entry(*template.coordinate().conversation_id());
+        let historical =
+            HistoricalRehydrationAuthority::new(entry.cid, entry.head_next_entry_seq).unwrap();
+        let exact = historical
+            .hydrate_historical_control_from_durable_bytes(
+                entry.public_row_json.clone(),
+                entry.raw_wrapper.clone(),
+                &entry.public_key,
+            )
+            .unwrap()
+            .into_transition()
+            .expect("genuine creation transition");
+        let exact_metadata = sm::metadata_binding_of_transition(&exact).unwrap().clone();
+        let actor = exact
+            .signed_authority()
+            .expect("signed authority")
+            .actor()
+            .clone();
+        let planning = sm::TransitionEvidence::for_test_creation_with_metadata(
+            exact.seq(),
+            *exact.transition_id(),
+            *exact.outer_entry_fingerprint(),
+            exact.received_at(),
+            sm::ConversationKind::Group,
+            *template.coordinate(),
+            actor.clone(),
+            exact_metadata,
+        )
+        .expect("structural Creation planning evidence");
+        let sm::CreationDecision::Create(plan) = sm::plan_creation(
+            None,
+            sm::CreationCommand {
+                kind: sm::ConversationKind::Group,
+                creator: actor,
+                invitees: Vec::new(),
+                transition: planning,
+                public_state: template,
+            },
+        )
+        .expect("exact historical Creation plans") else {
+            panic!("group creation is fresh");
+        };
+        let baseline = plan.into_state();
+        let authority = HydrationAuthority::new(entry.cid).unwrap();
+        let mut rows = sm::ConversationStateHydration::for_test_from_state(baseline);
+        rows.producer = exact.clone();
+        rows.metadata = Some(sm::metadata_binding_of_transition(&exact).unwrap().clone());
+        rows.metadata_producer = Some(exact.clone());
+        rows.intervals[0].opening = exact.clone();
+        sm::hydrate_conversation_state(&authority, rows.clone())
+            .expect("exact historical Creation aggregate hydrates");
+        let mut wrapper: Value = serde_json::from_slice(&entry.raw_wrapper).unwrap();
+        wrapper["body"]["metadataSnapshot"]["coordinate"]["groupId"] =
+            json!(STANDARD.encode([0x6b; 32]));
+        let raw_wrapper = resign(wrapper, &entry.signing_key());
+        let mut row: Value = serde_json::from_slice(&entry.public_row_json).unwrap();
+        row["signedRequest"] = serde_json::from_slice(&raw_wrapper).unwrap();
+        let drifted = historical
+            .hydrate_historical_control_from_durable_bytes(
+                serde_json::to_vec(&row).unwrap(),
+                raw_wrapper,
+                &entry.public_key,
+            )
+            .unwrap()
+            .into_transition()
+            .expect("signed drift remains metadata evidence");
+        let binding = sm::metadata_binding_of_transition(&drifted).unwrap();
+        assert_eq!(binding.coordinate_group_id(), &[0x6b; 32]);
+        rows.producer = drifted.clone();
+        rows.metadata = Some(binding);
+        rows.metadata_producer = Some(drifted.clone());
+        rows.intervals[0].opening = drifted;
+        assert_eq!(
+            sm::hydrate_conversation_state(&authority, rows),
+            Err(StateMachineError::InvariantViolation)
+        );
     }
 
     #[test]

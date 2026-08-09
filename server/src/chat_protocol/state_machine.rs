@@ -585,12 +585,20 @@ impl MetadataSnapshotBinding {
         self.coordinate.generation
     }
 
+    pub(crate) fn coordinate_group_id(&self) -> &[u8; 32] {
+        &self.coordinate.group_id
+    }
+
     pub(crate) fn coordinate_epoch(&self) -> u64 {
         self.coordinate.epoch
     }
 
     pub(crate) fn coordinate_group_context_hash(&self) -> &[u8; 32] {
         &self.coordinate.group_context_hash
+    }
+
+    pub(crate) fn coordinate_confirmation_tag(&self) -> &[u8; 32] {
+        &self.coordinate.confirmation_tag
     }
 
     pub(crate) fn author(&self) -> &DeviceIdentity {
@@ -656,8 +664,10 @@ impl MetadataAvatarDescriptorBinding {
 struct MetadataCryptoCoordinate {
     conversation_id: [u8; 16],
     generation: u64,
+    group_id: [u8; 32],
     epoch: u64,
     group_context_hash: [u8; 32],
+    confirmation_tag: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5878,8 +5888,10 @@ fn parse_metadata_snapshot(
         // == *coordinate.conversation_id()`), so no re-check is needed here.
         conversation_id: closed_fixed_bytes::<16>(&coordinate, "conversationId")?,
         generation: closed_integer(&coordinate, "generation")?,
+        group_id: closed_fixed_bytes(&coordinate, "groupId")?,
         epoch: closed_integer(&coordinate, "epoch")?,
         group_context_hash: closed_fixed_bytes(&coordinate, "groupContextHash")?,
+        confirmation_tag: closed_fixed_bytes(&coordinate, "confirmationTag")?,
     };
     let Some(CanonicalValueRef::Object(proof)) = object.get("authorProof") else {
         return Err(StateMachineError::InvalidHydrationAuthority);
@@ -5961,8 +5973,10 @@ fn metadata_coordinate_matches(
 ) -> bool {
     metadata.coordinate.conversation_id == *coordinate.conversation_id()
         && metadata.coordinate.generation == coordinate.generation()
+        && metadata.coordinate.group_id == *coordinate.group_id()
         && metadata.coordinate.epoch == coordinate.epoch()
         && metadata.coordinate.group_context_hash == *coordinate.group_context_hash()
+        && metadata.coordinate.confirmation_tag == *coordinate.confirmation_tag()
 }
 
 fn transition_binding_is_route_bound(
@@ -8299,8 +8313,10 @@ impl ConversationState {
                 let metadata = MetadataSnapshotBinding::for_test_creation(
                     *state.coordinate.conversation_id(),
                     state.coordinate.generation(),
+                    *state.coordinate.group_id(),
                     state.coordinate.epoch(),
                     *state.coordinate.group_context_hash(),
+                    *state.coordinate.confirmation_tag(),
                     old_terminal.transition_id,
                     old_terminal.seq,
                     request.requester.clone(),
@@ -12140,8 +12156,10 @@ mod recovery_plan_fingerprint_tests {
         let metadata = MetadataSnapshotBinding::for_test_creation(
             *prior.conversation_id(),
             next.generation(),
+            *next.group_id(),
             next.epoch(),
             *next.group_context_hash(),
+            *next.confirmation_tag(),
             transition_id,
             7,
             actor.clone(),
@@ -15269,8 +15287,10 @@ impl MetadataSnapshotBinding {
     pub(crate) fn for_test_creation(
         conversation_id: [u8; 16],
         generation: u64,
+        group_id: [u8; 32],
         epoch: u64,
         group_context_hash: [u8; 32],
+        confirmation_tag: [u8; 32],
         transition_id: [u8; 16],
         origin_seq: u64,
         author: DeviceIdentity,
@@ -15291,8 +15311,10 @@ impl MetadataSnapshotBinding {
             coordinate: MetadataCryptoCoordinate {
                 conversation_id,
                 generation,
+                group_id,
                 epoch,
                 group_context_hash,
+                confirmation_tag,
             },
             origin_transition_id: transition_id,
             metadata_version,
@@ -21223,9 +21245,12 @@ pub(in crate::chat_protocol) mod executor {
             || before_metadata == after_metadata
             || after_metadata.coordinate_conversation_id() != hydration.coordinate.conversation_id()
             || after_metadata.coordinate_generation() != hydration.coordinate.generation()
+            || after_metadata.coordinate_group_id() != hydration.coordinate.group_id()
             || after_metadata.coordinate_epoch() != hydration.coordinate.epoch()
             || after_metadata.coordinate_group_context_hash()
                 != hydration.coordinate.group_context_hash()
+            || after_metadata.coordinate_confirmation_tag()
+                != hydration.coordinate.confirmation_tag()
             || after_metadata.author() != successor_device
             || metadata_author.author_role != "admin"
             || metadata_author.author_device_status != "active"
@@ -30667,8 +30692,10 @@ pub(in crate::chat_protocol) mod executor {
                 coordinate: MetadataCryptoCoordinate {
                     conversation_id: *coordinate.conversation_id(),
                     generation: coordinate.generation(),
+                    group_id: *coordinate.group_id(),
                     epoch: coordinate.epoch(),
                     group_context_hash: *coordinate.group_context_hash(),
+                    confirmation_tag: *coordinate.confirmation_tag(),
                 },
                 origin_transition_id: transition_id,
                 metadata_version: version,
@@ -30994,6 +31021,77 @@ pub(in crate::chat_protocol) mod executor {
                 welcome_dispositions: Vec::new(),
             };
             (plan, context)
+        }
+
+        fn mutate_all_inner_metadata_coordinates(
+            plan: &mut ConversationPersistencePlan,
+            group_id: Option<[u8; 32]>,
+            confirmation_tag: Option<[u8; 32]>,
+        ) -> usize {
+            fn mutate(
+                metadata: &mut MetadataSnapshotBinding,
+                group_id: Option<[u8; 32]>,
+                confirmation_tag: Option<[u8; 32]>,
+            ) {
+                if let Some(group_id) = group_id {
+                    metadata.coordinate.group_id = group_id;
+                }
+                if let Some(confirmation_tag) = confirmation_tag {
+                    metadata.coordinate.confirmation_tag = confirmation_tag;
+                }
+            }
+
+            let mut copies = 0;
+            mutate(
+                plan.effects
+                    .metadata_change
+                    .as_mut()
+                    .and_then(|change| change.after.as_mut())
+                    .expect("metadata delta after binding"),
+                group_id,
+                confirmation_tag,
+            );
+            copies += 1;
+            let PlanAuthority::Transition(evidence) = plan
+                .effects
+                .authority
+                .as_mut()
+                .expect("metadata plan authority")
+            else {
+                panic!("metadata plan authority is a transition");
+            };
+            let Some(TransitionBodyBinding::Metadata { metadata, .. }) =
+                evidence.body_binding.as_mut()
+            else {
+                panic!("metadata plan authority has a metadata body");
+            };
+            mutate(metadata, group_id, confirmation_tag);
+            copies += 1;
+            mutate(
+                plan.state
+                    .metadata
+                    .as_mut()
+                    .expect("hydrated metadata binding"),
+                group_id,
+                confirmation_tag,
+            );
+            copies += 1;
+            for evidence in [
+                &mut plan.state.producer,
+                plan.state
+                    .metadata_producer
+                    .as_mut()
+                    .expect("metadata producer"),
+            ] {
+                let Some(TransitionBodyBinding::Metadata { metadata, .. }) =
+                    evidence.body_binding.as_mut()
+                else {
+                    panic!("metadata producer has a metadata body");
+                };
+                mutate(metadata, group_id, confirmation_tag);
+                copies += 1;
+            }
+            copies
         }
 
         fn exact_due_expiry_fixture(
@@ -31333,6 +31431,22 @@ pub(in crate::chat_protocol) mod executor {
 
         #[test]
         fn metadata_preflight_rejects_author_column_drift() {
+            for (label, group_id, confirmation_tag) in [
+                ("group ID", Some([0x91; 32]), None),
+                ("confirmation tag", None, Some([0x92; 32])),
+            ] {
+                let (mut plan, context) = exact_fixture();
+                assert_eq!(
+                    mutate_all_inner_metadata_coordinates(&mut plan, group_id, confirmation_tag),
+                    5,
+                    "{label} mutation must cover every inner metadata copy",
+                );
+                assert!(matches!(
+                    preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6,),
+                    Err(ExecutorError::InconsistentPlan(_))
+                ));
+            }
+
             let (plan, mut context) = exact_fixture();
             context
                 .metadata_author
@@ -31486,6 +31600,20 @@ pub(in crate::chat_protocol) mod executor {
                     )),
                 }
             };
+
+            for (label, group_id, confirmation_tag) in [
+                ("all-inner group ID drift", Some([0x91; 32]), None),
+                ("all-inner confirmation-tag drift", None, Some([0x92; 32])),
+            ] {
+                let (mut plan, context) = exact_fixture();
+                if mutate_all_inner_metadata_coordinates(&mut plan, group_id, confirmation_tag) != 5
+                {
+                    return Err(format!(
+                        "{label} did not mutate all five inner metadata copies"
+                    ));
+                }
+                reject(label, &plan, &context)?;
+            }
 
             let (plan, mut context) = exact_fixture();
             context.events[0].payload_bytes.push(0);
