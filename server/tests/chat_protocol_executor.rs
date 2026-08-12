@@ -73,13 +73,14 @@ mod chat_protocol {
         pub use crate::relationship_policy_source::*;
     }
     pub mod repository {
-        // The raw executor harness never mints production capsules, but the
-        // included state-machine module retains their sealed proof types in
-        // signatures. Minimal opaque stubs keep that production boundary
-        // unforgeable while allowing the legacy test seam to compile.
-        // `execution_context` is `#[cfg(not(test))]` in the lib, so the
-        // `#[path]`-including harness must include the real module itself; the
-        // seed harness needs its unscoped hydrator and artifacts.
+        // Every module the executor's dependency closure names — `auth`,
+        // `blobs`, `core`, `delivery`, `execution_context`, `prelude`,
+        // `recovery`, `relationship`, `transition` — is the REAL production
+        // source, path-included the way the sibling harnesses do it (see
+        // `tests/chat_protocol_conversation_substrate.rs`). Several are
+        // `#[cfg(not(test))]` in the lib (`core`, `execution_context`,
+        // `relationship`), so a `#[path]`-including harness must include the
+        // real module itself rather than link it.
         #[allow(dead_code)]
         pub mod execution_context {
             include!(concat!(
@@ -117,91 +118,20 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/prelude.rs"
             ));
         }
+        // `recovery` is `#[allow(dead_code)] pub(crate)` (unconditional) in the
+        // lib, and supplies the REAL `RecoveryPersistenceWitness`,
+        // `RecoveryExecutorWriteAuthority`, `PreparedRecoveryExecutionGraph`, and
+        // `RecoverySqlAuthoritySeal` that `execution_context` and the executor
+        // name in their signatures. Path-included here — exactly as
+        // `tests/chat_protocol_conversation_substrate.rs` does — so this harness
+        // exercises the production Recovery persistence boundary rather than
+        // opaque stand-ins.
         pub mod recovery {
-            /// The raw executor harness never mints a production Recovery
-            /// witness. This opaque test-topology stand-in exists only because
-            /// the generic executor accepts `Option<&RecoveryPersistenceWitness>`;
-            /// every raw test passes `None`.
-            pub(crate) struct RecoveryPersistenceWitness {
-                _private: (),
-            }
-
-            /// The executor accepts `Option<RecoveryExecutorWriteAuthority>`; the raw
-            /// harness never mints one, so an opaque lifetime-carrying stand-in keeps
-            /// the production boundary unforgeable while letting the seam compile.
-            pub(crate) struct RecoveryExecutorWriteAuthority<'witness> {
-                _private: std::marker::PhantomData<&'witness ()>,
-            }
-
-            impl RecoveryExecutorWriteAuthority<'_> {
-                pub(crate) async fn apply_open(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::executor::ExecutorError>
-                {
-                    unreachable!("the raw executor harness never mints a write authority")
-                }
-
-                pub(crate) async fn apply_terminal(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::executor::ExecutorError>
-                {
-                    unreachable!("the raw executor harness never mints a write authority")
-                }
-            }
-
-            /// Opaque stand-in: `execution_context` names this type in a signature the
-            /// harness never exercises.
-            pub(crate) struct PreparedRecoveryExecutionGraph {
-                _private: (),
-            }
-
-            impl PreparedRecoveryExecutionGraph {
-                pub(crate) fn plan(
-                    &self,
-                ) -> &super::super::state_machine::ConversationPersistencePlan {
-                    unreachable!("the raw executor harness never prepares a recovery graph")
-                }
-
-                pub(crate) fn accepted_control_entry_bytes(&self) -> Option<Vec<u8>> {
-                    unreachable!("the raw executor harness never prepares a recovery graph")
-                }
-
-                pub(crate) async fn validate_prewrite(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<
-                    RecoveryExecutorWriteAuthority<'_>,
-                    super::super::repository::execution_context::ExecutionContextHydrationError,
-                > {
-                    unreachable!("the raw executor harness never prepares a recovery graph")
-                }
-            }
-
-            /// Opaque authority required by exact Recovery SQL writers. Raw
-            /// executor tests never construct one because they exercise the
-            /// explicit status-CAS compatibility path.
-            #[derive(Debug)]
-            pub(crate) struct RecoverySqlAuthoritySeal {
-                _private: (),
-            }
-
-            impl RecoveryPersistenceWitness {
-                pub(crate) async fn apply_open(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("raw executor tests cannot mint a Recovery witness")
-                }
-
-                pub(crate) async fn apply_terminal(
-                    &self,
-                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                ) -> Result<(), super::super::state_machine::ExecutorError> {
-                    unreachable!("raw executor tests cannot mint a Recovery witness")
-                }
-            }
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/recovery.rs"
+            ));
         }
         pub mod relationship {
             #![allow(dead_code)]
