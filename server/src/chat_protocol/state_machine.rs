@@ -32524,8 +32524,18 @@ pub(in crate::chat_protocol) mod executor {
 
         /// ROW-B WEDGE (leave-fulfillment arm).
         ///
-        /// A `leaveCommit` over a coordinate carrying ANOTHER member's OVERDUE pending
-        /// leave must partition cleanly. Past the 24h consent TTL
+        /// THE USER SEQUENCE:
+        ///   1. Bob asks to leave. Nobody commits it for 24 hours, so his consent
+        ///      lapses and nothing sweeps the row.
+        ///   2. Carol now asks to leave, and someone commits HER leave.
+        ///   3. That `leaveCommit` must succeed — carol must be able to leave even
+        ///      though bob's request went stale.
+        ///
+        /// Before the fix step 3 failed permanently: bob's lapsed row rode along in
+        /// carol's plan as a prior-bound delta the arm refused, and every retry
+        /// replanned it identically.
+        ///
+        /// Past the 24h consent TTL
         /// `resolve_prior_bound_work` emits Row B (`Pending->Expired`), not Row A
         /// (`Pending->Stale`); `classify_prior_bound_staling` proves it and
         /// `write_prior_bound_staling` writes it, but this arm's own partition

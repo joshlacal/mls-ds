@@ -3600,7 +3600,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
 /// `reset_activation_supersedes_prior_pending_welcome` (Row A), which still pins the
 /// supersession path unchanged.
 #[tokio::test]
-async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging() {
+async fn reset_activation_over_overdue_leave_and_welcome_expires_them_instead_of_wedging() {
     let (pool, _db) = setup().await;
     let manifest = corpus_manifest();
     let scenario = run_fulfillment_scenario(&pool).await;
@@ -3644,15 +3644,35 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
             .fetch_one(&pool)
             .await
             .expect("pending welcome expires_at");
-    let overdue_millis = welcome_expires_at.timestamp_millis() + 1_000;
 
-    // 1. Alice opens a reset request (seq 4) against the fulfillment coordinate, one
-    //    minute before the activation and already past the welcome's expiry.
+    // 1. THE USER SEQUENCE, step one: bob asks to leave. Single-clock, because this
+    //    leave is going to be allowed to EXPIRE and the DB pins an expired
+    //    terminalization at exactly `received_at + 24h`.
+    let leave_applied_at =
+        DateTime::from_timestamp_millis(clock_now(&pool).await.timestamp_millis())
+            .expect("truncated leave instant");
+    let leave_received =
+        ServerTimestamp::from_unix_millis_for_test(leave_applied_at.timestamp_millis()).unwrap();
+    let bob_leave_expires_at = leave_applied_at + Duration::hours(24);
+    let (leave_state, bob_leave_request_id, _leave_seq, _lp, _lc) =
+        commit_leave_request_at(&pool, &scenario, 4, leave_received, Some(leave_applied_at)).await;
+
+    // Step two: NOBODY COMMITS THE LEAVE FOR 24 HOURS. Everything below happens one
+    // second after bob's consent lapsed. Bob's pending Welcome (reserved key package,
+    // seeded earlier) is overdue by then too, so BOTH prior-bound families are Row B.
+    let overdue_millis = bob_leave_expires_at.timestamp_millis() + 1_000;
+    assert!(
+        welcome_expires_at < bob_leave_expires_at,
+        "the welcome was reserved before the leave, so it lapses first"
+    );
+
+    // Step three: alice opens a reset request (seq 5) one minute before activating —
+    //    inside its OWN 24h consent TTL, but already past bob's lapsed leave.
     let req_received = ServerTimestamp::from_unix_millis_for_test(overdue_millis - 60_000).unwrap();
     let reset_request_id = Uuid::new_v4();
     let req_evidence = RequestEvidence::for_test(
         RequestEntryKind::ResetRequest,
-        4,
+        5,
         *reset_request_id.as_bytes(),
         alice_id.clone(),
         *conversation_id.as_bytes(),
@@ -3661,7 +3681,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
     )
     .unwrap();
     let req_planned = plan_reset_request(
-        &scenario.fulfillment_state,
+        &leave_state,
         ResetRequestCommand {
             actor: alice_id.clone(),
             reset_request_id: *reset_request_id.as_bytes(),
@@ -3676,7 +3696,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
         *conversation_id.as_bytes(),
         *req_entry.as_bytes(),
         scenario.coordinate,
-        4,
+        5,
         req_received,
     );
     let req_plan = persistence_plan_for_test(req_planned, req_head);
@@ -3761,7 +3781,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
             .expect("reset request COMMIT past all deferred triggers");
     }
 
-    // 2. Alice activates the reset (seq 5): gen0 retires, gen1 forms with alice's
+    // Step four: alice activates the reset (seq 6): gen0 retires, gen1 forms with alice's
     //    genesis leaf, and bob's pending welcome supersedes.
     let successor_coordinate = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
@@ -3812,7 +3832,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
         vec![0xA9_u8; 48],
     );
     let act_evidence = TransitionEvidence::for_test_reset_activation_with_metadata(
-        5,
+        6,
         *act_transition.as_bytes(),
         [0x1B_u8; 32],
         act_received,
@@ -3839,7 +3859,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
         *conversation_id.as_bytes(),
         *act_entry.as_bytes(),
         scenario.coordinate,
-        5,
+        6,
         act_received,
     );
     let plan = persistence_plan_for_test(planned, head_cas);
@@ -3963,7 +3983,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
     tx.commit()
         .await
         .expect("reset activation COMMIT past all deferred triggers");
-    assert_eq!(applied.allocated_seq, 5);
+    assert_eq!(applied.allocated_seq, 6);
 
     // Head at the gen1 successor pointer; bob's pending welcome superseded.
     let (gen, sv, next_seq): (i64, i64, i64) = sqlx::query_as(
@@ -3973,7 +3993,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
     .fetch_one(&pool)
     .await
     .expect("head");
-    assert_eq!((gen, sv, next_seq), (1, 0, 6));
+    assert_eq!((gen, sv, next_seq), (1, 0, 7));
     // The prior-bound welcome is EXPIRED at its own instant, with NO transition or
     // revocation provenance — the activation observed the expiry, it did not cause it.
     let (welcome_status, welcome_terminal, terminal_transition_id, terminal_revocation_id): (
@@ -4024,6 +4044,27 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
     );
     assert_eq!(rw_created, welcome_expires_at);
 
+    // AND bob's lapsed leave request is `expired` at its own `expires_at`, with NO
+    // transition provenance — the activation observed the lapse, it did not cause it
+    // (`leave_requests_terminal_shape_check`: expired => digest/transition NULL and
+    // terminal_at = expires_at). Before the fix this activation could not run at all.
+    let (leave_status, leave_terminal, leave_tid, leave_digest): (
+        String,
+        Option<DateTime<Utc>>,
+        Option<Uuid>,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT status,terminal_at,terminal_transition_id,terminal_request_digest \
+           FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(bob_leave_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("bob leave terminal");
+    assert_eq!(leave_status, "expired");
+    assert_eq!(leave_terminal, Some(bob_leave_expires_at));
+    assert_eq!((leave_tid, leave_digest), (None, None));
+
     // NOTE: the sibling Row-A test's `welcome_dispositions_terminal_source_shape_check`
     // probes are deliberately NOT repeated here. They mutate a `superseded`
     // disposition's `terminal_transition_id` / `terminal_revocation_id`; an `expired`
@@ -4048,7 +4089,7 @@ async fn reset_activation_over_an_overdue_welcome_expires_it_instead_of_wedging(
     assert_eq!(req_status, "consumed");
     // Both gen0 intervals Reset-closed at the activation seq.
     let closed_at_reset: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.application_intervals WHERE conversation_id=$1 AND terminal_seq=5 AND closing_kind='reset'",
+        "SELECT count(*) FROM chat.application_intervals WHERE conversation_id=$1 AND terminal_seq=6 AND closing_kind='reset'",
     )
     .bind(conversation_id)
     .fetch_one(&pool)
@@ -8168,6 +8209,32 @@ async fn commit_leave_request(
     chat_protocol::state_machine::ConversationPersistencePlan,
     ExecutionContext,
 ) {
+    commit_leave_request_at(pool, scenario, request_seq, received_at, None).await
+}
+
+/// `commit_leave_request` with an explicit `applied_at`.
+///
+/// The durable row's `received_at` IS the executor's `applied_at`
+/// (state_machine.rs `NewLeaveRequest`), and `leave_requests_expiry_check` pins
+/// `expires_at = received_at + 24h`, while the executor derives an EXPIRED
+/// terminalization's `terminal_at` from the PLAN's `expires_at` (= evidence
+/// `received_at + 24h`). Production has one clock there
+/// (`applied_at == server_instant(evidence.received_at())`), so a caller whose leave
+/// is ever allowed to EXPIRE must pass that same instant here — a second sample of
+/// the DB clock makes `leave_requests_terminal_shape_check` unsatisfiable.
+async fn commit_leave_request_at(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    request_seq: u64,
+    received_at: ServerTimestamp,
+    applied_at_override: Option<DateTime<Utc>>,
+) -> (
+    ConversationState,
+    Uuid,
+    u64,
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
     let fixture = &scenario.fixture;
     let conversation_id = scenario.conversation_id;
     let bob_id = scenario.bob_id.clone();
@@ -8206,7 +8273,10 @@ async fn commit_leave_request(
         received_at,
     );
     let plan = persistence_plan_for_test(planned, head_cas);
-    let applied_at = clock_now(pool).await;
+    let applied_at = match applied_at_override {
+        Some(applied_at) => applied_at,
+        None => clock_now(pool).await,
+    };
     let transcript = vec![0x72_u8; 16];
     let ctx = ExecutionContext {
         protocol_instance_id: fixture.protocol_instance_id,
@@ -11832,9 +11902,17 @@ async fn zero_leaf_leave_stales_other_members_pending_leave_request() {
     cleanup(&pool, conversation_id).await;
 }
 
-/// ROW-B WEDGE (zero-leaf-leave arm): a zeroLeafLeave over a coordinate carrying a
-/// DIFFERENT member's OVERDUE pending leave must commit, terminalizing that leave
-/// `expired` at its own `expires_at` — not wedge.
+/// ROW-B WEDGE (zero-leaf-leave arm).
+///
+/// THE USER SEQUENCE:
+///   1. Bob asks to leave the conversation.
+///   2. Nobody commits his leave for 24 hours, so his consent lapses. Nothing on the
+///      server sweeps it — the row just sits there `pending` and overdue.
+///   3. Carol (a leafless invitee) now removes herself. That must still work, and it
+///      must terminalize bob's lapsed leave `expired` at his own `expires_at`.
+///
+/// Before the fix step 3 failed, and every retry replanned the identical shape, so
+/// the conversation never recovered on its own.
 ///
 /// `resolve_prior_bound_work` branches on `evidence.received_at >= expires_at`: past
 /// the 24h consent TTL it emits Row B (`Pending->Expired` + `Expiry(expires_at)`),
