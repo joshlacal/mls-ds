@@ -394,35 +394,39 @@ async fn observe_fulfillment_residue(
     sqlx::query_as(
         "SELECT conversation.current_generation AS generation,\
                 conversation.current_state_version AS state_version,\
-                conversation.next_entry_seq,conversation.protocol_instance_id,\
+                conversation.next_entry_seq,\
+                (SELECT protocol_instance_id FROM chat.protocol_instances \
+                  WHERE singleton) AS protocol_instance_id,\
                 request.status AS request_status,reservation.status AS reservation_status,\
                 package.status AS package_status,request.fulfilling_transition_id,\
                 reservation.consumed_transition_id AS reservation_transition_id,\
                 package.terminal_transition_id AS package_transition_id,\
-                (SELECT count(*) FROM chat.generation_states state\
+                (SELECT count(*) FROM chat.generation_states state \
                   WHERE state.conversation_id=conversation.conversation_id)\
                     AS generation_state_count,\
-                (SELECT count(*) FROM chat.transitions transition\
+                (SELECT count(*) FROM chat.transitions transition \
                   WHERE transition.conversation_id=conversation.conversation_id)\
                     AS transition_count,\
-                (SELECT count(*) FROM chat.entries entry\
+                (SELECT count(*) FROM chat.entries entry \
                   WHERE entry.conversation_id=conversation.conversation_id) AS entry_count,\
-                (SELECT count(*) FROM chat.welcome_bundles welcome\
+                (SELECT count(*) FROM chat.welcome_bundles welcome \
                   WHERE welcome.conversation_id=conversation.conversation_id) AS welcome_count,\
-                (SELECT count(*) FROM chat.welcome_deliveries delivery\
+                (SELECT count(*) FROM chat.welcome_deliveries delivery \
                    JOIN chat.welcome_bundles welcome USING(welcome_id)\
                   WHERE welcome.conversation_id=conversation.conversation_id)\
                     AS welcome_delivery_count,\
-                (SELECT count(*) FROM chat.events event\
-                  WHERE event.protocol_instance_id=conversation.protocol_instance_id)\
+                (SELECT count(*) FROM chat.events event \
+                  WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                          FROM chat.protocol_instances WHERE singleton))\
                     AS event_count,\
-                (SELECT count(*) FROM chat.outbox outbox\
+                (SELECT count(*) FROM chat.outbox outbox \
                    JOIN chat.events event USING(event_position)\
-                  WHERE event.protocol_instance_id=conversation.protocol_instance_id)\
+                  WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                          FROM chat.protocol_instances WHERE singleton))\
                     AS outbox_count,\
-                (SELECT count(*) FROM chat.operation_claims claim\
+                (SELECT count(*) FROM chat.operation_claims claim \
                   WHERE claim.operation_id=$2) AS claim_count,\
-                (SELECT count(*) FROM chat.operation_claims claim\
+                (SELECT count(*) FROM chat.operation_claims claim \
                   WHERE claim.operation_id=$2 \
                     AND claim.principal_did=$3 \
                     AND claim.endpoint_nsid=$4 \
@@ -431,12 +435,13 @@ async fn observe_fulfillment_residue(
                     AND claim.accepted_request_sha256=$7 \
                     AND claim.signature=$8 \
                     AND claim.claimed_at=$9) AS exact_claim_binding_count,\
-                (SELECT count(*) FROM chat.idempotency_records receipt\
+                (SELECT count(*) FROM chat.idempotency_records receipt \
                   WHERE receipt.operation_id=$2) AS completion_count \
            FROM chat.leaf_recovery_requests request \
            JOIN chat.key_package_reservations reservation \
              ON reservation.recovery_request_id=request.recovery_request_id \
-           JOIN chat.key_packages package ON package.key_package_ref=request.key_package_ref \
+           JOIN chat.key_packages package \
+             ON package.key_package_ref=reservation.key_package_ref \
            JOIN chat.conversations conversation \
              ON conversation.conversation_id=request.conversation_id \
           WHERE request.recovery_request_id=$1",
@@ -541,9 +546,9 @@ async fn verify_successor_and_delivery(
     let (event_kind, protocol_instance_id, recipient_rows, outbox_rows): (String, Uuid, i64, i64) =
         sqlx::query_as(
             "SELECT event.event_kind,event.protocol_instance_id,\
-                (SELECT count(*) FROM chat.event_recipients recipient\
+                (SELECT count(*) FROM chat.event_recipients recipient \
                   WHERE recipient.event_position=event.event_position),\
-                (SELECT count(*) FROM chat.outbox outbox\
+                (SELECT count(*) FROM chat.outbox outbox \
                   WHERE outbox.event_position=event.event_position) \
            FROM chat.events event WHERE event.event_position=$1",
         )
@@ -876,7 +881,7 @@ async fn verify_due_for_expiry_delta(
     }
     let (event_kind, protocol_instance_id, outbox_rows): (String, Uuid, i64) = sqlx::query_as(
         "SELECT event.event_kind,event.protocol_instance_id,\
-                    (SELECT count(*) FROM chat.outbox outbox\
+                    (SELECT count(*) FROM chat.outbox outbox \
                       WHERE outbox.event_position=event.event_position) \
                FROM chat.events event WHERE event.event_position=$1",
     )

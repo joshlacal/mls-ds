@@ -3077,6 +3077,41 @@ pub mod production_composition_proof {
         include!("recovery/production_fulfillment_proof.rs");
     }
 
+    mod production_fallback_minter {
+        include!("recovery/production_fallback_minter.rs");
+    }
+
+    /// Produce, through the real relationship collector/sealer/writer, the fresh
+    /// singleton `recoveryReservation` fallback that the client Recovery proofs
+    /// require and deliberately refuse to mint for themselves.
+    #[doc(hidden)]
+    pub async fn mint_singleton_recovery_reservation_fallback(
+        pool: &PgPool,
+        did: &str,
+    ) -> Result<(), String> {
+        production_fallback_minter::mint_singleton_recovery_reservation_fallback(pool, did).await
+    }
+
+    /// Produce, through the real relationship collector/sealer/writer, the fresh
+    /// two-party `recoveryReservation` + `recoveryFulfillment` fallback pair that
+    /// the Recovery fulfillment proofs require over one exact canonical DID set.
+    #[doc(hidden)]
+    pub async fn mint_two_party_recovery_fallbacks(
+        pool: &PgPool,
+        first: &str,
+        second: &str,
+    ) -> Result<(), String> {
+        production_fallback_minter::mint_two_party_recovery_fallbacks(pool, first, second).await
+    }
+
+    /// Open and commit one durable Recovery request through the real client
+    /// production path. It becomes a production-valid *due* scheduler fixture
+    /// once its real TTL elapses.
+    #[doc(hidden)]
+    pub async fn commit_open_recovery_request(pool: &PgPool) -> Result<Uuid, String> {
+        production_client_proof::commit_open_recovery_request(pool).await
+    }
+
     #[doc(hidden)]
     pub async fn run_request_leaf_recovery_happy_path(pool: &PgPool) -> Result<(), String> {
         production_client_proof::run_request_leaf_recovery_happy_path(pool).await
@@ -3232,67 +3267,71 @@ pub mod production_composition_proof {
                     to_jsonb(reservation) AS reservation_row,\
                     to_jsonb(package) AS package_row,\
                     to_jsonb(conversation) AS conversation_row,\
-                    conversation.protocol_instance_id,\
+                    (SELECT protocol_instance_id FROM chat.protocol_instances \
+                      WHERE singleton) AS protocol_instance_id,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(generation)\
                                              ORDER BY generation.generation)\
-                      FROM chat.generations generation\
+                      FROM chat.generations generation \
                      WHERE generation.conversation_id=request.conversation_id),\
                              '[]'::jsonb) AS generations,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(state)\
                                              ORDER BY state.generation,state.state_version)\
-                      FROM chat.generation_states state\
+                      FROM chat.generation_states state \
                      WHERE state.conversation_id=request.conversation_id),\
                              '[]'::jsonb) AS generation_states,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(metadata)\
                                              ORDER BY metadata.metadata_snapshot_id)\
-                      FROM chat.metadata_snapshots metadata\
+                      FROM chat.metadata_snapshots metadata \
                      WHERE metadata.conversation_id=request.conversation_id),\
                              '[]'::jsonb) AS metadata_snapshots,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(transition)\
                                              ORDER BY transition.entry_seq,transition.transition_id)\
-                      FROM chat.transitions transition\
+                      FROM chat.transitions transition \
                      WHERE transition.conversation_id=request.conversation_id),\
                              '[]'::jsonb) AS transitions,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(entry)\
                                              ORDER BY entry.seq,entry.entry_id)\
-                      FROM chat.entries entry\
+                      FROM chat.entries entry \
                      WHERE entry.conversation_id=request.conversation_id),\
                              '[]'::jsonb) AS entries,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(event)\
                                              ORDER BY event.event_position)\
-                      FROM chat.events event\
-                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                      FROM chat.events event \
+                     WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                             FROM chat.protocol_instances WHERE singleton)),\
                              '[]'::jsonb) AS events,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(recipient)\
                                              ORDER BY recipient.event_position,\
                                                       recipient.user_did,\
                                                       recipient.device_id)\
-                      FROM chat.event_recipients recipient\
+                      FROM chat.event_recipients recipient \
                       JOIN chat.events event USING(event_position)\
-                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                     WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                             FROM chat.protocol_instances WHERE singleton)),\
                              '[]'::jsonb) AS event_recipients,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(work)\
                                              ORDER BY work.event_position,work.outbox_id)\
-                      FROM chat.outbox work\
+                      FROM chat.outbox work \
                       JOIN chat.events event USING(event_position)\
-                     WHERE event.protocol_instance_id=conversation.protocol_instance_id),\
+                     WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                             FROM chat.protocol_instances WHERE singleton)),\
                              '[]'::jsonb) AS outbox,\
                     COALESCE((SELECT jsonb_agg(to_jsonb(completion)\
                                              ORDER BY completion.principal_did,\
                                                       completion.endpoint_nsid,\
                                                       completion.operation_id)\
-                      FROM chat.idempotency_records completion\
-                      WHERE completion.principal_did=request.requester_did\
+                      FROM chat.idempotency_records completion \
+                      WHERE completion.principal_did=request.requester_did \
                         AND completion.endpoint_nsid='blue.catbird.chat.requestLeafRecovery'\
                         AND completion.operation_id=request.recovery_request_id),\
-                             '[]'::jsonb) AS request_completions\
-             FROM chat.leaf_recovery_requests request\
-             JOIN chat.key_package_reservations reservation\
-               ON reservation.recovery_request_id=request.recovery_request_id\
-             JOIN chat.key_packages package\
-               ON package.key_package_ref=request.key_package_ref\
-             JOIN chat.conversations conversation\
-               ON conversation.conversation_id=request.conversation_id\
+                             '[]'::jsonb) AS request_completions \
+             FROM chat.leaf_recovery_requests request \
+             JOIN chat.key_package_reservations reservation \
+               ON reservation.recovery_request_id=request.recovery_request_id \
+             JOIN chat.key_packages package \
+               ON package.key_package_ref=reservation.key_package_ref \
+             JOIN chat.conversations conversation \
+               ON conversation.conversation_id=request.conversation_id \
              WHERE request.recovery_request_id=$1",
         )
         .bind(request_id)
@@ -3326,26 +3365,26 @@ pub mod production_composition_proof {
             .map_err(|error| format!("enter privileged aggregate-drift simulation: {error}"))?;
         let changed = sqlx::query(
             "WITH target AS (\
-               SELECT metadata.metadata_snapshot_id\
-                 FROM chat.leaf_recovery_requests request\
-                 JOIN chat.conversations conversation\
-                   ON conversation.conversation_id=request.conversation_id\
-                 JOIN chat.metadata_snapshots metadata\
-                   ON metadata.conversation_id=request.conversation_id\
-                  AND metadata.generation=request.generation\
-                 JOIN chat.transitions producer\
-                   ON producer.conversation_id=metadata.conversation_id\
-                  AND producer.transition_id=metadata.producing_transition_id\
-                WHERE request.recovery_request_id=$1\
-                  AND producer.entry_seq < conversation.next_entry_seq\
-                ORDER BY producer.entry_seq DESC,metadata.metadata_snapshot_id DESC\
+               SELECT metadata.metadata_snapshot_id \
+                 FROM chat.leaf_recovery_requests request \
+                 JOIN chat.conversations conversation \
+                   ON conversation.conversation_id=request.conversation_id \
+                 JOIN chat.metadata_snapshots metadata \
+                   ON metadata.conversation_id=request.conversation_id \
+                  AND metadata.generation=request.generation \
+                 JOIN chat.transitions producer \
+                   ON producer.conversation_id=metadata.conversation_id \
+                  AND producer.transition_id=metadata.producing_transition_id \
+                WHERE request.recovery_request_id=$1 \
+                  AND producer.entry_seq < conversation.next_entry_seq \
+                ORDER BY producer.entry_seq DESC,metadata.metadata_snapshot_id DESC \
                 LIMIT 1\
              )\
              UPDATE chat.metadata_snapshots metadata SET \
                  ciphertext=set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),\
                  ciphertext_sha256=digest(\
                    set_byte(metadata.ciphertext,0,get_byte(metadata.ciphertext,0) # 1),'sha256')\
-             FROM target\
+             FROM target \
              WHERE metadata.metadata_snapshot_id=target.metadata_snapshot_id",
         )
         .bind(request_id)
@@ -3380,10 +3419,10 @@ pub mod production_composition_proof {
                  snapshot_sha256=digest(set_byte(\
                    state.public_snapshot_bytes,0,get_byte(state.public_snapshot_bytes,0) # 1),\
                    'sha256')\
-             FROM chat.leaf_recovery_requests request\
-             WHERE request.recovery_request_id=$1\
-               AND state.conversation_id=request.conversation_id\
-               AND state.generation=request.generation\
+             FROM chat.leaf_recovery_requests request \
+             WHERE request.recovery_request_id=$1 \
+               AND state.conversation_id=request.conversation_id \
+               AND state.generation=request.generation \
                AND state.state_version=request.bound_state_version",
         )
         .bind(request_id)
@@ -3422,8 +3461,8 @@ pub mod production_composition_proof {
         let changed = match drift {
             ExactRecoveryDrift::Request => {
                 sqlx::query(
-                    "UPDATE chat.leaf_recovery_requests\
-                    SET requester_auth_generation=requester_auth_generation+1\
+                    "UPDATE chat.leaf_recovery_requests \
+                    SET requester_auth_generation=requester_auth_generation+1 \
                   WHERE recovery_request_id=$1",
                 )
                 .bind(request_id)
@@ -3432,8 +3471,8 @@ pub mod production_composition_proof {
             }
             ExactRecoveryDrift::Reservation => {
                 sqlx::query(
-                    "UPDATE chat.key_package_reservations\
-                    SET requester_auth_generation=requester_auth_generation+1\
+                    "UPDATE chat.key_package_reservations \
+                    SET requester_auth_generation=requester_auth_generation+1 \
                   WHERE recovery_request_id=$1",
                 )
                 .bind(request_id)
@@ -3442,14 +3481,16 @@ pub mod production_composition_proof {
             }
             ExactRecoveryDrift::Package => {
                 sqlx::query(
-                    "UPDATE chat.key_packages package SET\
+                    "UPDATE chat.key_packages package SET \
                     wrapper_bytes=set_byte(package.wrapper_bytes,0,\
                         get_byte(package.wrapper_bytes,0) # 1),\
                     wrapper_sha256=digest(set_byte(package.wrapper_bytes,0,\
                         get_byte(package.wrapper_bytes,0) # 1),'sha256')\
-                  FROM chat.leaf_recovery_requests request\
-                 WHERE request.recovery_request_id=$1\
-                   AND package.key_package_ref=request.key_package_ref",
+                  FROM chat.leaf_recovery_requests request \
+                  JOIN chat.key_package_reservations reservation \
+                    USING(recovery_request_id) \
+                 WHERE request.recovery_request_id=$1 \
+                   AND package.key_package_ref=reservation.key_package_ref",
                 )
                 .bind(request_id)
                 .execute(&mut **transaction)
@@ -3779,10 +3820,12 @@ pub mod production_composition_proof {
         };
         let (request_expires_at, package_not_after): (DateTime<Utc>, DateTime<Utc>) =
             sqlx::query_as(
-                "SELECT request.expires_at,package.not_after\
-                   FROM chat.leaf_recovery_requests request\
-                   JOIN chat.key_packages package\
-                     ON package.key_package_ref=request.key_package_ref\
+                "SELECT request.expires_at,package.not_after \
+                   FROM chat.leaf_recovery_requests request \
+                   JOIN chat.key_package_reservations reservation \
+                     USING(recovery_request_id) \
+                   JOIN chat.key_packages package \
+                     ON package.key_package_ref=reservation.key_package_ref \
                   WHERE request.recovery_request_id=$1",
             )
             .bind(request_id)
@@ -3909,7 +3952,7 @@ pub mod production_composition_proof {
         let event_position = applied.applied.event_positions[0];
         let (event_kind, protocol_instance_id, outbox_rows): (String, Uuid, i64) = sqlx::query_as(
             "SELECT event.event_kind,event.protocol_instance_id,\
-                        (SELECT count(*) FROM chat.outbox outbox\
+                        (SELECT count(*) FROM chat.outbox outbox \
                           WHERE outbox.event_position=event.event_position)\
                    FROM chat.events event WHERE event.event_position=$1",
         )

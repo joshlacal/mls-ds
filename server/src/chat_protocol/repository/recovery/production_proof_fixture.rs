@@ -1129,6 +1129,14 @@ fn build_two_member_fulfillment_products(
 ) -> Result<TwoMemberFulfillmentProducts, String> {
     let provider = openmls_libcrux_crypto::Provider::new()
         .map_err(|error| format!("create Recovery fulfillment OpenMLS provider: {error:?}"))?;
+    // The fulfiller is a genuinely separate MLS client and needs its own
+    // provider. Sharing one provider makes the fulfiller's Welcome join collide
+    // with the requester's already-stored group under the same GroupId
+    // (`GroupAlreadyExists`), and would also let the join silently read the
+    // requester's private state instead of its own.
+    let fulfiller_provider = openmls_libcrux_crypto::Provider::new().map_err(|error| {
+        format!("create fulfiller Recovery fulfillment OpenMLS provider: {error:?}")
+    })?;
     let requester_signer = SignatureKeyPair::from_raw(
         XWING_CIPHERSUITE.signature_algorithm(),
         requester.signing_key.to_bytes().to_vec(),
@@ -1143,7 +1151,7 @@ fn build_two_member_fulfillment_products(
         fulfiller.signing_public_key().to_vec(),
     );
     fulfiller_signer
-        .store(provider.storage())
+        .store(fulfiller_provider.storage())
         .map_err(|error| format!("store fulfiller OpenMLS signer: {error:?}"))?;
     let lifetime = Lifetime::init(
         u64::try_from((at - chrono::Duration::minutes(1)).timestamp())
@@ -1203,7 +1211,7 @@ fn build_two_member_fulfillment_products(
         fulfiller_key_package_ref,
         fulfiller_key_package_wrapper,
         fulfiller_key_package_init_key,
-    ) = build_key_package_material(fulfiller, at, &provider, &fulfiller_signer)?;
+    ) = build_key_package_material(fulfiller, at, &fulfiller_provider, &fulfiller_signer)?;
     let add_aad = recovery_commit_aad(conversation_id, add_transition_id, acceptance.coordinate())?;
     requester_group.set_aad(add_aad.clone());
     let (add_commit, add_welcome, add_group_info) = requester_group
@@ -1255,13 +1263,13 @@ fn build_two_member_fulfillment_products(
         return Err("fulfiller join artifact is not an MLS Welcome".to_owned());
     };
     let mut fulfiller_group = StagedWelcome::new_from_welcome(
-        &provider,
+        &fulfiller_provider,
         config.join_config(),
         join_welcome,
         Some(requester_group.export_ratchet_tree().into()),
     )
     .map_err(|error| format!("stage fulfiller Recovery Welcome: {error:?}"))?
-    .into_group(&provider)
+    .into_group(&fulfiller_provider)
     .map_err(|error| format!("join fulfiller Recovery MLS group: {error:?}"))?;
     let (
         requester_recovery_package,
@@ -1280,7 +1288,7 @@ fn build_two_member_fulfillment_products(
     // the emitted Commit carries concrete proposals rather than proposal refs.
     let messages = fulfiller_group
         .swap_members(
-            &provider,
+            &fulfiller_provider,
             &fulfiller_signer,
             &[LeafNodeIndex::new(0)],
             &[requester_recovery_package],
@@ -1309,7 +1317,7 @@ fn build_two_member_fulfillment_products(
         _ => return Err("replacement successor GroupInfo has the wrong MLS body".to_owned()),
     };
     fulfiller_group
-        .merge_pending_commit(&provider)
+        .merge_pending_commit(&fulfiller_provider)
         .map_err(|error| format!("merge Recovery fulfillment Commit: {error:?}"))?;
     let next_coordinate =
         coordinate_from_merged_group(&fulfiller_group, &next_group_context, conversation_id, 3)?;
@@ -1833,6 +1841,15 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
     sqlx::query(r#"INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,invitation_transition_id,invitation_entry_id,invited_at,acceptance_transition_id,acceptance_entry_id,accepted_at,current_membership,created_at) VALUES($1,$2,$3,'active','member',$4,$5,$6,$7,$4,$8,$5,$9,$10,$5,true,$5)"#)
         .bind(fulfiller_participant_period_id).bind(conversation_id).bind(&fulfiller.did).bind(creation.transition_id).bind(at).bind(&requester.did).bind(requester.device_id).bind(creation.entry_id).bind(acceptance.transition_id).bind(acceptance.entry_id)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Recovery fulfiller participant: {error}"))?;
+    // Both KeyPackage rows must exist before the member_devices leaves below:
+    // `member_devices_package_fk` references (join_key_package_ref, user_did,
+    // device_id) in chat.key_packages and is not deferrable.
+    sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,terminal_transition_id,terminal_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'consumed',$10,$11,$11)"#)
+        .bind(products.fulfiller_key_package_ref.to_vec()).bind(&products.fulfiller_key_package_wrapper).bind(Sha256::digest(&products.fulfiller_key_package_wrapper).to_vec()).bind(&products.fulfiller_key_package_init_key).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(add_fulfillment.transition_id).bind(at)
+        .execute(&mut *transaction).await.map_err(|error| format!("insert consumed fulfiller Recovery KeyPackage: {error}"))?;
+    sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#)
+        .bind(products.requester_key_package_ref.to_vec()).bind(&products.requester_key_package_wrapper).bind(Sha256::digest(&products.requester_key_package_wrapper).to_vec()).bind(&products.requester_key_package_init_key).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(at)
+        .execute(&mut *transaction).await.map_err(|error| format!("insert fresh requester Recovery KeyPackage: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,$6,$7,$8,$9,1,'genesis',0,$10,1,true,$11)"#)
         .bind(requester_leaf_period_id).bind(requester_participant_period_id).bind(conversation_id).bind(&requester.did).bind(requester.device_id).bind(i64::from(requester_genesis_leaf.leaf_index())).bind(requester_genesis_leaf.basic_credential()).bind(requester_genesis_leaf.signature_key()).bind(&requester.key_id).bind(creation.transition_id).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert Recovery requester leaf: {error}"))?;
@@ -1870,12 +1887,6 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
     sqlx::query(r#"INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,3,'add',$5,$6,2,$7,$8,$9,$10,$11,$12)"#)
         .bind(add_fulfillment.transition_id).bind(conversation_id).bind(&fulfiller.did).bind(fulfiller.device_id).bind(add_fulfillment.transition_id).bind(add_fulfillment.outer_fingerprint.to_vec()).bind(products.prior.coordinate().group_id()).bind(i64::try_from(products.prior.coordinate().epoch()).map_err(|_| "Add Recovery epoch overflow".to_owned())?).bind(products.prior.coordinate().group_context_hash()).bind(products.prior.coordinate().confirmation_tag()).bind(fulfiller_leaf_period_id).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert fulfiller Add interval: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,terminal_transition_id,terminal_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'consumed',$10,$11,$11)"#)
-        .bind(products.fulfiller_key_package_ref.to_vec()).bind(&products.fulfiller_key_package_wrapper).bind(Sha256::digest(&products.fulfiller_key_package_wrapper).to_vec()).bind(&products.fulfiller_key_package_init_key).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(add_fulfillment.transition_id).bind(at)
-        .execute(&mut *transaction).await.map_err(|error| format!("insert consumed fulfiller Recovery KeyPackage: {error}"))?;
-    sqlx::query(r#"INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,'available',$10)"#)
-        .bind(products.requester_key_package_ref.to_vec()).bind(&products.requester_key_package_wrapper).bind(Sha256::digest(&products.requester_key_package_wrapper).to_vec()).bind(&products.requester_key_package_init_key).bind(&requester.did).bind(requester.device_id).bind(&requester.key_id).bind(key_package_not_before).bind(key_package_not_after).bind(at)
-        .execute(&mut *transaction).await.map_err(|error| format!("insert fresh requester Recovery KeyPackage: {error}"))?;
     sqlx::query(r#"INSERT INTO chat.key_package_reservations(recovery_request_id,key_package_ref,conversation_id,generation,requester_did,requester_device_id,requester_key_id,requester_auth_generation,recipient_did,recipient_device_id,bound_state_version,bound_group_id,bound_epoch,bound_group_context_hash,bound_confirmation_tag,purpose,expires_at,status,consumed_transition_id,terminal_at,created_at) VALUES($1,$2,$3,0,$4,$5,$6,1,$4,$5,1,$7,$8,$9,$10,'leafRecovery',$11,'consumed',$12,$13,$13)"#)
         .bind(acceptance.request_id).bind(products.fulfiller_key_package_ref.to_vec()).bind(conversation_id).bind(&fulfiller.did).bind(fulfiller.device_id).bind(&fulfiller.key_id).bind(products.acceptance.coordinate().group_id()).bind(i64::try_from(products.acceptance.coordinate().epoch()).map_err(|_| "acceptance epoch overflow".to_owned())?).bind(products.acceptance.coordinate().group_context_hash()).bind(products.acceptance.coordinate().confirmation_tag()).bind(acceptance.expires_at).bind(add_fulfillment.transition_id).bind(at)
         .execute(&mut *transaction).await.map_err(|error| format!("insert consumed acceptance reservation: {error}"))?;

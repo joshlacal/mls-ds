@@ -192,11 +192,15 @@ async fn corrupt_scope_dpop(
     transaction: &mut Transaction<'_, Postgres>,
     proof: &ClientRequestProof,
 ) -> Result<(), String> {
+    // Both alternates must themselves satisfy `chat.is_base64url_sha256`: a
+    // SHA-256 thumbprint is 43 base64url characters whose final character
+    // encodes only two bits, so it must come from the restricted terminal
+    // alphabet. `B` is not in it, which is why the drift must end in `A`.
     let alternate =
-        if proof.fixture.identity.dpop_jkt() == "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" {
+        if proof.fixture.identity.dpop_jkt() == "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA" {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         } else {
-            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA"
         };
     sqlx::query("SET LOCAL session_replication_role='replica'")
         .execute(&mut **transaction)
@@ -262,13 +266,15 @@ where
                 (SELECT status FROM chat.key_package_reservations WHERE recovery_request_id=$2),\
                 (SELECT count(*) FROM chat.idempotency_records WHERE operation_id=$1),\
                 (SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1),\
-                (SELECT count(*) FROM chat.events event JOIN chat.conversations conversation\
-                   ON conversation.protocol_instance_id=event.protocol_instance_id\
-                  WHERE conversation.conversation_id=$3),\
-                (SELECT count(*) FROM chat.outbox outbox JOIN chat.events event\
-                   ON event.event_position=outbox.event_position JOIN chat.conversations conversation\
-                   ON conversation.protocol_instance_id=event.protocol_instance_id\
-                  WHERE conversation.conversation_id=$3),\
+                (SELECT count(*) FROM chat.events event JOIN chat.conversations conversation \
+                   ON conversation.conversation_id=$3 \
+                  WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                          FROM chat.protocol_instances WHERE singleton)),\
+                (SELECT count(*) FROM chat.outbox outbox JOIN chat.events event \
+                   ON event.event_position=outbox.event_position JOIN chat.conversations conversation \
+                   ON conversation.conversation_id=$3 \
+                  WHERE event.protocol_instance_id=(SELECT protocol_instance_id \
+                          FROM chat.protocol_instances WHERE singleton)),\
                 (SELECT status FROM chat.key_packages WHERE key_package_ref=$4),\
                 (SELECT dpop_jkt FROM chat.devices WHERE user_did=$5 AND device_id=$6)",
     )
@@ -363,7 +369,7 @@ async fn require_exact_event_outbox(
     let (kind, protocol_instance_id, outbox_count): (String, Uuid, i64) = sqlx::query_as(
         "SELECT event.event_kind,event.protocol_instance_id,\
                 (SELECT count(*) FROM chat.outbox WHERE event_position=event.event_position)\
-           FROM chat.events event\
+           FROM chat.events event \
           WHERE event.event_position=$1",
     )
     .bind(event_position)
@@ -371,7 +377,9 @@ async fn require_exact_event_outbox(
     .await
     .map_err(|error| format!("read exact Recovery event/outbox linkage: {error}"))?;
     let expected_protocol_instance_id: Uuid = sqlx::query_scalar(
-        "SELECT protocol_instance_id FROM chat.conversations WHERE conversation_id=$1",
+        "SELECT instance.protocol_instance_id FROM chat.protocol_instances instance \
+           JOIN chat.conversations conversation ON conversation.conversation_id=$1 \
+          WHERE instance.singleton",
     )
     .bind(fixture.conversation_id)
     .fetch_one(&mut **transaction)
@@ -620,6 +628,21 @@ async fn commit_open_request(pool: &PgPool) -> Result<ClientRequestProof, String
     Ok(proof)
 }
 
+/// Open one durable Recovery request through the real client production path
+/// and commit it, returning its canonical request identity.
+///
+/// This is the entrypoint `seed_durable_recovery_fixture` deliberately refuses
+/// to provide: the aggregate it seeds is immutable prerequisite state, while the
+/// request itself must be made, authorized, and committed by a production
+/// runner. The committed request is `open` with the real
+/// `min(trusted + 5 minutes, package.not_after)` expiry, so it becomes a
+/// production-valid *due* fixture once that real TTL elapses — no row is edited
+/// to manufacture dueness.
+pub(super) async fn commit_open_recovery_request(pool: &PgPool) -> Result<Uuid, String> {
+    let proof = commit_open_request(pool).await?;
+    Ok(proof.envelope.operation_id)
+}
+
 async fn prepare_cancellation(
     proof: &ClientRequestProof,
     authority: &VerifiedChatDeviceRequest,
@@ -675,7 +698,8 @@ async fn assert_terminal_triple(
         "SELECT request.status,reservation.status,package.status \
            FROM chat.leaf_recovery_requests request \
            JOIN chat.key_package_reservations reservation USING(recovery_request_id) \
-           JOIN chat.key_packages package ON package.key_package_ref=request.key_package_ref \
+           JOIN chat.key_packages package \
+             ON package.key_package_ref=reservation.key_package_ref \
           WHERE request.recovery_request_id=$1",
     )
     .bind(proof.envelope.operation_id)
