@@ -20775,40 +20775,62 @@ pub(in crate::chat_protocol) mod executor {
             &self.keys
         }
 
-        /// Design 5 step 6. Compare what the writer actually wrote against what this
-        /// partition approved, by KEY and not merely by count, and do it before any
-        /// other writer runs. A count-only check cannot tell a skipped family from a
-        /// duplicated one, and `write_prior_bound_supersessions` SKIPS any delta that
-        /// is not its exact supersession shape — so a silent drop is exactly the
-        /// failure mode this catches.
-        fn verify_write_receipt(
-            &self,
-            receipt: &PriorBoundWriteReceipt,
-        ) -> Result<(), ExecutorError> {
-            if receipt.keys != self.keys {
-                return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound writer key set disagrees with the classified families",
-                ));
-            }
-            if receipt.counts.requests != self.requests()
-                || receipt.counts.reservations != self.reservations()
-                || receipt.counts.packages != self.packages()
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound writer counts disagree with the classified families",
-                ));
-            }
-            Ok(())
-        }
     }
 
-    /// What `write_prior_bound_supersessions` actually wrote: the per-family counts
-    /// each arm already folds into its `FamilyCounts`, plus the exact keys, kept as a
-    /// DISTINCT value so the added key set never leaks into the welcome / reset /
-    /// leave counts the tail fence consumes.
-    struct PriorBoundWriteReceipt {
-        counts: FamilyCounts,
-        keys: BTreeSet<([u8; 16], [u8; 32])>,
+    use prior_bound_receipt::PriorBoundWriteReceipt;
+
+    /// The write receipt lives in its own module so its fields are UNREACHABLE from the
+    /// nine executor arms. An arm cannot obtain the counts it needs without calling
+    /// `reconcile_into_counts`, so deleting the design 5 step 6 fence is a COMPILE
+    /// ERROR rather than a silent skip. An independent review demonstrated the need:
+    /// with the fence expressed as a discardable `verify(&receipt)?` call, removing all
+    /// nine left the entire suite green.
+    mod prior_bound_receipt {
+        use super::{BTreeSet, ExecutorError, FamilyCounts, PriorBoundPartition};
+
+        /// What `write_prior_bound_supersessions` actually wrote: the per-family counts
+        /// each arm folds into its `FamilyCounts`, plus the exact keys — kept DISTINCT
+        /// so the key set never leaks into the welcome / reset / leave counts the tail
+        /// fence consumes.
+        pub(in crate::chat_protocol::state_machine::executor) struct PriorBoundWriteReceipt {
+            counts: FamilyCounts,
+            keys: BTreeSet<([u8; 16], [u8; 32])>,
+        }
+
+        impl PriorBoundWriteReceipt {
+            pub(in crate::chat_protocol::state_machine::executor) fn new(
+                counts: FamilyCounts,
+                keys: BTreeSet<([u8; 16], [u8; 32])>,
+            ) -> Self {
+                Self { counts, keys }
+            }
+
+            /// Design 5 step 6. The ONLY way to reach the counts. Compares what the
+            /// writer actually wrote against what the classifier approved, by KEY and
+            /// not merely by count: `write_prior_bound_supersessions` SKIPS any delta
+            /// that is not its exact supersession shape, so a silent drop is the real
+            /// failure mode, and a count-only comparison cannot tell a dropped family
+            /// from a substituted one.
+            pub(in crate::chat_protocol::state_machine::executor) fn reconcile_into_counts(
+                self,
+                expected: &PriorBoundPartition,
+            ) -> Result<FamilyCounts, ExecutorError> {
+                if self.keys != *expected.keys() {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound writer key set disagrees with the classified families",
+                    ));
+                }
+                if self.counts.requests != expected.requests()
+                    || self.counts.reservations != expected.reservations()
+                    || self.counts.packages != expected.packages()
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound writer counts disagree with the classified families",
+                    ));
+                }
+                Ok(self.counts)
+            }
+        }
     }
 
     /// The single prior-bound recovery classifier, shared by all nine
@@ -20884,7 +20906,7 @@ pub(in crate::chat_protocol) mod executor {
                     continue;
                 }
                 return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound recovery request delta is not terminal",
+                    "metadata recovery request delta is not terminal",
                 ));
             };
             let key = (after_request.request_id, after_request.key_package_ref);
@@ -20908,7 +20930,7 @@ pub(in crate::chat_protocol) mod executor {
                 }
                 _ => {
                     return Err(ExecutorError::InconsistentPlan(
-                        "prior-bound recovery request has an illegal terminal shape",
+                        "metadata recovery request has an illegal terminal shape",
                     ))
                 }
             };
@@ -20918,7 +20940,7 @@ pub(in crate::chat_protocol) mod executor {
                 || request_keys.insert(key, expired).is_some()
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound recovery request terminalization drifted",
+                    "metadata recovery request terminalization drifted",
                 ));
             }
         }
@@ -20932,7 +20954,7 @@ pub(in crate::chat_protocol) mod executor {
                     continue;
                 }
                 return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound reservation delta is not terminal",
+                    "metadata reservation delta is not terminal",
                 ));
             };
             let key = (
@@ -20959,7 +20981,7 @@ pub(in crate::chat_protocol) mod executor {
                 }
                 _ => {
                     return Err(ExecutorError::InconsistentPlan(
-                        "prior-bound reservation has an illegal terminal shape",
+                        "metadata reservation has an illegal terminal shape",
                     ))
                 }
             };
@@ -20969,7 +20991,7 @@ pub(in crate::chat_protocol) mod executor {
                 || reservation_keys.insert(key, expired).is_some()
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound reservation terminalization drifted",
+                    "metadata reservation terminalization drifted",
                 ));
             }
         }
@@ -21011,7 +21033,7 @@ pub(in crate::chat_protocol) mod executor {
             })
         {
             return Err(ExecutorError::InconsistentPlan(
-                "prior-bound recovery request/reservation/package families are not bijective",
+                "metadata recovery request/reservation/package families are not bijective",
             ));
         }
 
@@ -21029,7 +21051,7 @@ pub(in crate::chat_protocol) mod executor {
                         && request.key_package_ref == binding.key_package_ref
                 })
                 .ok_or(ExecutorError::InconsistentPlan(
-                    "prior-bound package authority has no exact recovery request",
+                    "metadata package authority has no exact recovery request",
                 ))?;
             let reservation = effects
                 .reservation_changes()
@@ -21040,7 +21062,7 @@ pub(in crate::chat_protocol) mod executor {
                         && reservation.key_package_ref == binding.key_package_ref
                 })
                 .ok_or(ExecutorError::InconsistentPlan(
-                    "prior-bound package authority has no exact reservation",
+                    "metadata package authority has no exact reservation",
                 ))?;
             let (origin_key_id, origin_auth_generation) = match &request.origin {
                 RecoveryOriginEvidence::Acceptance(value) => {
@@ -21049,7 +21071,7 @@ pub(in crate::chat_protocol) mod executor {
                             .authority
                             .as_ref()
                             .ok_or(ExecutorError::InconsistentPlan(
-                                "prior-bound recovery acceptance has no signing authority",
+                                "metadata recovery acceptance has no signing authority",
                             ))?;
                     (authority.key_id, authority.auth_generation)
                 }
@@ -21098,11 +21120,11 @@ pub(in crate::chat_protocol) mod executor {
                         .get(&key)
                         .map(|(_, successor)| *successor)
                         .ok_or(ExecutorError::InconsistentPlan(
-                            "prior-bound package authority has no semantic edge",
+                            "metadata package authority has no semantic edge",
                         ))?
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound recovery package CAS authority drift",
+                    "metadata recovery package CAS authority drift",
                 ));
             }
         }
@@ -21139,13 +21161,22 @@ pub(in crate::chat_protocol) mod executor {
         effects: &TransitionEffects,
         prior: &PublicGroupSnapshotCoordinate,
     ) -> Result<([u8; 16], [u8; 32]), ExecutorError> {
+        // CRITICAL: the acceptance own family is opened as PART of the coordinate
+        // change, so `plan_accept_conversation_inner` binds both the request and the
+        // reservation to `coordinate_only_successor(prior)`, never to `prior` itself.
+        // Comparing against `prior` here rejects every acceptConversation before its
+        // head CAS, and retry re-plans the identical shape — a permanent
+        // device-can-never-join wedge. Only the PRIOR-BOUND families are prior-bound.
+        let own_bound = coordinate_only_successor(prior).map_err(|_| {
+            ExecutorError::InconsistentPlan("acceptance successor is not coordinate-only")
+        })?;
         let mut own: Option<([u8; 16], [u8; 32])> = None;
         for change in effects.recovery_request_changes() {
             let (None, Some(after)) = (change.before(), change.after()) else {
                 continue;
             };
             if after.status != RecoveryRequestStatus::Open
-                || after.bound_coordinate != *prior
+                || after.bound_coordinate != own_bound
                 || after.terminal.is_some()
             {
                 return Err(ExecutorError::InconsistentPlan(
@@ -21172,7 +21203,7 @@ pub(in crate::chat_protocol) mod executor {
             };
             if (after.request_id, after.key_package_ref) != own
                 || after.status != ReservationStatus::Active
-                || after.bound_coordinate != *prior
+                || after.bound_coordinate != own_bound
                 || after.terminal.is_some()
             {
                 return Err(ExecutorError::InconsistentPlan(
@@ -25967,9 +25998,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -26389,9 +26420,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -26833,9 +26864,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27339,9 +27370,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27541,9 +27572,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27850,9 +27881,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -28160,9 +28191,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -29063,9 +29094,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -29398,9 +29429,9 @@ pub(in crate::chat_protocol) mod executor {
                 .await?;
         // Design 5 step 6: reconcile the recovery families against the classifier's
         // KEYED expectation immediately, before any other writer runs. No unrelated
-        // write may intervene.
-        partition.verify_write_receipt(&receipt)?;
-        let mut superseded = receipt.counts;
+        // write may intervene. The counts are reachable ONLY through this call, so the
+        // fence cannot be dropped without breaking the build.
+        let mut superseded = receipt.reconcile_into_counts(&partition)?;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -30228,7 +30259,7 @@ pub(in crate::chat_protocol) mod executor {
                 }
             }
         }
-        Ok(PriorBoundWriteReceipt { counts, keys })
+        Ok(PriorBoundWriteReceipt::new(counts, keys))
     }
 
     /// Durably stale each prior-coordinate PENDING reset/leave request the plan
@@ -31964,34 +31995,147 @@ pub(in crate::chat_protocol) mod executor {
                 leave_requests: 0,
             };
 
-            partition
-                .verify_write_receipt(&PriorBoundWriteReceipt {
-                    counts: counts(2),
-                    keys: BTreeSet::from([key_a, key_b]),
-                })
+            let reconciled = PriorBoundWriteReceipt::new(counts(2), BTreeSet::from([key_a, key_b]))
+                .reconcile_into_counts(&partition)
                 .expect("an exact receipt must reconcile");
+            assert_eq!(reconciled.packages, 2, "the counts must survive reconciliation");
 
             // A dropped family.
             assert!(
-                partition
-                    .verify_write_receipt(&PriorBoundWriteReceipt {
-                        counts: counts(1),
-                        keys: BTreeSet::from([key_a]),
-                    })
+                PriorBoundWriteReceipt::new(counts(1), BTreeSet::from([key_a]))
+                    .reconcile_into_counts(&partition)
                     .is_err(),
                 "a silently dropped family must be rejected"
             );
 
             // Right COUNT, wrong identity — the case a count-only fence cannot see.
             assert!(
-                partition
-                    .verify_write_receipt(&PriorBoundWriteReceipt {
-                        counts: counts(2),
-                        keys: BTreeSet::from([key_a, (uuid(0x77), [0x78; 32])]),
-                    })
-                    .is_err(),
+                PriorBoundWriteReceipt::new(
+                    counts(2),
+                    BTreeSet::from([key_a, (uuid(0x77), [0x78; 32])])
+                )
+                .reconcile_into_counts(&partition)
+                .is_err(),
                 "a substituted family must be rejected even at the right count"
             );
+        }
+
+        /// REGRESSION — the acceptance own family is bound to the SUCCESSOR.
+        ///
+        /// `plan_accept_conversation_inner` opens its recovery request and reservation
+        /// with `bound_coordinate: coordinate_only_successor(prior)` (:13452, :13463),
+        /// because the family is created as PART of the coordinate change. A classifier
+        /// that compares the own family against `prior` rejects every acceptConversation
+        /// before its head CAS, and retry re-plans the identical shape — a permanent
+        /// device-can-never-join wedge. This pins the coordinate the own family must
+        /// carry, in both directions.
+        #[test]
+        fn acceptance_own_family_is_bound_to_the_successor_not_the_prior() {
+            fn acceptance_plan(bind_to_successor: bool) -> (ConversationPersistencePlan, ExecutionContext) {
+                let (mut plan, context) = exact_fixture();
+                let prior = plan.expected_prior.expect("prior");
+                let successor = coordinate_only_successor(&prior).expect("successor");
+                let bound = if bind_to_successor { successor } else { prior };
+                let actor = plan
+                    .effects
+                    .authority
+                    .as_ref()
+                    .and_then(|authority| match authority {
+                        PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                        _ => None,
+                    })
+                    .expect("actor authority")
+                    .actor
+                    .clone();
+                let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+                let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+                let request_id = uuid(0x60);
+                let key_package_ref = [0x61; 32];
+                let origin_key_id = [0x62; 32];
+                let origin = request_evidence(
+                    RequestEntryKind::LeafRecoveryRequest,
+                    request_id,
+                    actor.clone(),
+                    *prior.conversation_id(),
+                    received_at,
+                    origin_key_id,
+                );
+                plan.effects.recovery_request_changes.push(StateChange {
+                    before: None,
+                    after: Some(RecoveryRequest {
+                        request_id,
+                        target: actor.clone(),
+                        kind: LeafRecoveryKind::Add,
+                        source: RecoverySource::Acceptance,
+                        bound_coordinate: bound,
+                        key_package_ref,
+                        received_at,
+                        expires_at,
+                        status: RecoveryRequestStatus::Open,
+                        origin: RecoveryOriginEvidence::Request(origin),
+                        terminal: None,
+                    }),
+                });
+                plan.effects.reservation_changes.push(StateChange {
+                    before: None,
+                    after: Some(RecoveryReservation {
+                        request_id,
+                        target: actor.clone(),
+                        bound_coordinate: bound,
+                        key_package_ref,
+                        received_at,
+                        expires_at,
+                        package_not_after: expires_at,
+                        status: ReservationStatus::Active,
+                        terminal: None,
+                    }),
+                });
+                plan.effects.package_transitions.push(PackageTransition {
+                    request_id,
+                    key_package_ref,
+                    from: PackageStatus::Available,
+                    to: PackageStatus::Reserved,
+                });
+                let mut package_cas = RecoveryPackageCasBinding {
+                    transaction_id: plan
+                        .effects
+                        .head_cas
+                        .as_ref()
+                        .expect("head cas")
+                        .transaction_id
+                        .clone(),
+                    conversation_id: *prior.conversation_id(),
+                    request_id,
+                    target: actor,
+                    target_key_id: origin_key_id,
+                    target_auth_generation: 3,
+                    bound_coordinate: bound,
+                    key_package_ref,
+                    key_package_wrapper_sha256: [0x63; 32],
+                    package_not_after: expires_at,
+                    claimed_at: received_at,
+                    expected_status: PackageStatus::Available,
+                    successor_status: PackageStatus::Reserved,
+                    locked_row_digest: [0x64; 32],
+                    authority_digest: [0; 32],
+                };
+                package_cas.authority_digest = recovery_package_cas_authority_digest(&package_cas);
+                plan.effects.recovery_package_cas.push(package_cas);
+                (plan, context)
+            }
+
+            // What the planner actually emits.
+            let (plan, context) = acceptance_plan(true);
+            classify_prior_bound_recovery(&plan, &context, OwnFamilyKind::Acceptance)
+                .expect("the planner's successor-bound acceptance family must be accepted");
+
+            // A prior-bound own family is NOT what acceptance opens, and must not pass.
+            let (plan, context) = acceptance_plan(false);
+            match classify_prior_bound_recovery(&plan, &context, OwnFamilyKind::Acceptance) {
+                Err(ExecutorError::InconsistentPlan(_)) => {}
+                Ok(_) => panic!("a prior-bound acceptance own family was accepted"),
+                Err(error) => panic!("rejected with the wrong executor error: {error:?}"),
+            }
         }
 
         #[test]
