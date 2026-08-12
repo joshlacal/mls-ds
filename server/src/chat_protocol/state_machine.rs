@@ -16063,6 +16063,26 @@ impl ConversationPersistencePlan {
         self
     }
 
+    /// Bind the REAL durable wrapper digest onto every synthesized recovery-package
+    /// CAS binding, re-sealing each authority digest.
+    ///
+    /// `persistence_plan_for_test` cannot derive this: only an `Acceptance` origin
+    /// carries wrapper material, so a `Request`-origin plan leaves it `[0u8; 32]`.
+    /// The durable release pins `kp.wrapper_sha256 = $3`, so a fixture that seeds a
+    /// real key package must hand its digest back to the plan or the compare-and-set
+    /// conflicts.
+    pub(crate) fn with_recovery_package_wrapper_sha256_for_test(
+        mut self,
+        wrapper_sha256: [u8; 32],
+    ) -> Self {
+        for binding in &mut self.effects.recovery_package_cas {
+            binding.key_package_wrapper_sha256 = wrapper_sha256;
+            binding.authority_digest = [0u8; 32];
+            binding.authority_digest = recovery_package_cas_authority_digest(binding);
+        }
+        self
+    }
+
     /// Drift one immutable, non-semantic field of the exact reserved-package
     /// guard while preserving request/ref/status bijection. Reset must reject
     /// this before its head CAS; a verifier that consults only PackageTransition

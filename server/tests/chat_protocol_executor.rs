@@ -3538,7 +3538,11 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         4,
         rec_received,
     );
-    let rec_plan = persistence_plan_for_test(rec_planned, rec_head);
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256, which the synthesized binding cannot derive from a
+    // Request-origin plan.
+    let rec_plan = persistence_plan_for_test(rec_planned, rec_head)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     let rec_applied_at = clock_now(&pool).await;
     let rec_transcript = vec![0xC2_u8; 16];
     let alice_pred_rec = device_event_predecessor(&pool, &alice_did, alice_device).await;
@@ -12604,7 +12608,10 @@ async fn build_policy_edge(
         seq,
         received_at,
     );
-    let plan = persistence_plan_for_test(planned, head_cas);
+    // The policy edge carries the PRIOR-BOUND release binding; it needs the same real
+    // durable wrapper digest, for the same reason.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
 
     let applied_at = clock_now(pool).await;
     let payload = vec![0x51_u8; 12];
@@ -12901,7 +12908,11 @@ async fn seed_alice_open_recovery(
         2,
         rec_received,
     );
-    let rec_plan = persistence_plan_for_test(rec_planned, rec_head);
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256, which the synthesized binding cannot derive from a
+    // Request-origin plan.
+    let rec_plan = persistence_plan_for_test(rec_planned, rec_head)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     let rec_applied_at = clock_now(pool).await;
     let rec_transcript = vec![0x72_u8; 16];
     let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
