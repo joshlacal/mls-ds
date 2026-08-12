@@ -1,0 +1,40 @@
+# Cargo configuration for the mls-ds workspace.
+
+[env]
+# Raise the stack for threads cargo spawns, so the test suite cannot silently
+# truncate.
+#
+# libtest runs each test on a std thread with the default 2 MiB stack. Four
+# fixtures in tests/chat_protocol_executor.rs -- the
+# populated_pre_v4_upgrade_* family, all of which call
+# prepare_transition_supersession_history -- need ~2.08 MB in a debug build and
+# so overflow it.
+#
+# The failure mode is the dangerous part, not the crash: a stack overflow
+# aborts the whole process with SIGABRT, so the run stops partway, prints no
+# `test result:` summary, and reports only the failures it happened to reach.
+# That undercount reads exactly like a smaller failure set. It has already
+# produced one wrong conclusion here (a run that aborted early was recorded as
+# "11 failures" when the real number was 18).
+#
+# The demand is fixture-side, not production-side: 82% of those frames are
+# test-crate async futures held by value across await points, which debug
+# builds do not elide. The largest production future in the crate is
+# handlers::chat::submit_transition::handle at ~115 KB, roughly 15x smaller,
+# and it is heap-allocated as a spawned task. The same tests need only ~443 KB
+# in release. So this is a debug-build test-harness accommodation with no
+# production meaning.
+#
+# 8 MiB gives ~4x headroom over the measured 2.08 MB requirement. The previous
+# margin was 3%, which meant any new helper frame anywhere in that fixture
+# chain would silently push more tests over. The durable fix is to Box::pin
+# those fixture futures so they live on the heap; until then this keeps the
+# suite honest.
+#
+# Note this applies to processes cargo launches. Production runs the compiled
+# binary under systemd, not via cargo, so the server is unaffected.
+RUST_MIN_STACK = "8388608"
+
+# audiopus_sys fails under CMake 4.x without a minimum policy version.
+# Tracked as backlog item N2.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
