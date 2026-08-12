@@ -4413,6 +4413,7 @@ pub(crate) mod genuine_terminal_fixture {
             welcome_response: None,
             welcome_dispositions: vec![WelcomeDispositionInput {
                 welcome_id: graph.fulfillment.welcome_id,
+                recovery_work_id: None,
                 event: EventFanout {
                     event_id: Uuid::new_v4(),
                     event_kind: EventKind::WelcomeDisposition,

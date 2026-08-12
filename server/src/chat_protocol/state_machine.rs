@@ -15974,7 +15974,20 @@ pub(crate) fn persistence_plan_for_test(
     // `bind_welcome_cas`, so synthesizing it here keeps the test plan
     // production-shaped. Only the identity/coordinate/status columns are read by the
     // executor; the locked-row digest is a provenance placeholder.
-    if effects.welcome_cas.is_none() {
+    //
+    // ONLY for those three plan kinds. `into_persistence_plan`'s
+    // `welcome_authority_valid` requires `welcome_cas.is_none()` on every other kind,
+    // so a coordinate-changing commit NEVER carries one — including when its
+    // prior-bound welcome delta is a due `Pending->Expired`. Synthesizing one there
+    // built a plan production cannot produce, and every commit arm correctly rejected
+    // it as `UnsupportedEffect(".. welcome .. CAS")` — which made the whole
+    // prior-bound expiry path untestable through this seam.
+    if effects.welcome_cas.is_none()
+        && matches!(
+            effects.kind,
+            PlanKind::WelcomeExpiry | PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection
+        )
+    {
         if let Some((before, after)) = effects.welcome_changes.iter().find_map(|change| {
             match (change.before.as_ref(), change.after.as_ref()) {
                 (Some(before), Some(after))
@@ -20461,12 +20474,23 @@ pub(in crate::chat_protocol) mod executor {
     }
 
     /// The `welcomeDisposition` event + outbox the executor appends when a
-    /// coordinate change supersedes a prior-coordinate pending Welcome. The
+    /// coordinate change retires a prior-coordinate pending Welcome. The
     /// disposition row (`terminalize_welcome_delivery`) is bound to this event's
     /// position.
+    ///
+    /// A prior-bound welcome retires one of two ways, and the DB treats them very
+    /// differently. `Pending->Superseded` is caused BY the transition and creates no
+    /// recovery work. `Pending->Expired` is a due expiry the transition merely
+    /// OBSERVES — `assert_recovery_work_integrity` requires exactly one
+    /// `welcomeExpired` `recovery_work_items` row for it, exactly as the dedicated
+    /// `apply_welcome_expiry` arm writes. So the expiry case needs the same fresh
+    /// primary key `WelcomeExpiryContext` carries, minted by the same repository
+    /// hydration; `None` for the supersession case, which must have no work item.
     #[derive(Clone, Debug)]
     pub(crate) struct WelcomeDispositionInput {
         pub(crate) welcome_id: Uuid,
+        /// `Some` iff this welcome's delta is `Pending->Expired`.
+        pub(crate) recovery_work_id: Option<Uuid>,
         pub(crate) event: EventFanout,
     }
 
@@ -20932,6 +20956,12 @@ pub(in crate::chat_protocol) mod executor {
         /// (`Pending -> Fulfilled`); per ADR-019 Erratum 01 the same `leaveCommit`
         /// MAY additionally stale other members' prior-bound pending leaves.
         LeaveFulfillment,
+        /// `apply_reset_activation` consumes the exact signed reset request it
+        /// activates (`Pending -> Consumed`). Every other prior-bound reset / leave /
+        /// Welcome in the plan is work its generation retirement retires. The own
+        /// edge's cardinality and its binding to the signed request id stay
+        /// `preflight_reset_activation`'s own pre-CAS check.
+        ResetActivation,
     }
 
     /// The single prior-bound reset / leave / Welcome classifier, shared by the
@@ -20974,6 +21004,15 @@ pub(in crate::chat_protocol) mod executor {
                     "prior-bound reset request delta is not terminal",
                 ));
             };
+            // The arm's own consumption edge binds the exact signed request id, so it
+            // is not a staling. Select it out here exactly as the leave loop below
+            // selects out a fulfillment; its cardinality and signed-id binding stay
+            // `preflight_reset_activation`'s own pre-CAS check.
+            if own_kind == OwnStalingKind::ResetActivation
+                && after.status == ResetRequestStatus::Consumed
+            {
+                continue;
+            }
             let exact_terminal = match after.status {
                 ResetRequestStatus::Stale => {
                     terminal_is_exact_transition(&after.terminal, producer)
@@ -21834,203 +21873,68 @@ pub(in crate::chat_protocol) mod executor {
             }
         };
 
+        // Prior-bound reset / leave / Welcome work this generation retirement
+        // retires, proved by the SHARED classifier — the same one every other
+        // coordinate-changing arm calls, and the only place these three families are
+        // shape-checked.
+        //
+        // The four hand-rolled loops this replaces accepted only Row A
+        // (`Pending->Stale` / `Pending->Superseded`, terminal evidence = this
+        // transition) and duplicated, more narrowly, checks the arm already performs.
+        // But `resolve_prior_bound_work` emits Row B — status `Expired` with
+        // `Expiry(expires_at)` — for ANY prior-bound reset / leave / Welcome whose
+        // `expires_at` had already passed at `evidence.received_at`, and
+        // `write_prior_bound_staling` / `write_welcome_supersessions` already write
+        // that row. So an `activateReset` over a coordinate carrying a peer's overdue
+        // pending leave (24h TTL, never swept) or an overdue pending Welcome was
+        // planner-legal and executor-fatal, and a retry replanned the identical
+        // shape: a permanent wedge. The classifier proves BOTH rows exactly —
+        // identity unchanged, `before` Pending, `before` bound to this exact prior,
+        // Row A's terminal the exact producer, Row B's terminal an exact DUE expiry
+        // (`applied_at >= expires_at`) — so accepting it here is the executor
+        // accepting its own planner's output, not a relaxation.
+        //
+        // The recovery request / reservation / package / `recovery_package_cas`
+        // loops are gone for the same reason: `apply_reset_activation` already calls
+        // `classify_prior_bound_recovery` (strictly before this preflight), which
+        // proves those four families as a strict superset — both rows, the
+        // request/reservation/package bijection, the `Reserved->Available` package
+        // edge, and every CAS field equality. The `PriorBoundPartition` it returns has
+        // no public constructor, so that call cannot be dropped without a compile
+        // error.
+        let welcome_ids = classify_prior_bound_staling(plan, ctx, OwnStalingKind::ResetActivation)?;
+
+        // The arm's OWN edge, which the classifier deliberately leaves to it: exactly
+        // one `Pending->Consumed` reset request, and it must be the exact request the
+        // signed producer body names. It can never be Row B —
+        // `plan_reset_activation_inner` rejects an overdue target with `WorkExpired`
+        // before planning.
         let mut own_reset = None;
-        let mut staled_resets = BTreeSet::new();
         for change in effects.reset_request_changes() {
             let (Some(before), Some(after)) = (change.before(), change.after()) else {
                 return Err(ExecutorError::InconsistentPlan(
                     "reset request delta is not terminal",
                 ));
             };
-            if !reset_request_identity_is_unchanged(before, after)
-                || !terminal_is_exact_transition(&after.terminal, producer)
+            if after.status != ResetRequestStatus::Consumed {
+                continue;
+            }
+            if after.request_id != signed_request_id
+                || !reset_request_identity_is_unchanged(before, after)
                 || before.status != ResetRequestStatus::Pending
                 || before.bound_coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
+                || own_reset.replace(after).is_some()
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "reset request identity/binding/terminal drift",
+                    "reset own request identity/binding/terminal drift",
                 ));
-            }
-            match after.status {
-                ResetRequestStatus::Consumed if after.request_id == signed_request_id => {
-                    if own_reset.replace(after).is_some() {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "reset consumes multiple own requests",
-                        ));
-                    }
-                }
-                ResetRequestStatus::Stale if after.request_id != signed_request_id => {
-                    if !staled_resets.insert(after.request_id) {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "reset repeats a staled reset request",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "reset request delta has an illegal direction",
-                    ))
-                }
             }
         }
         let _own_reset = own_reset.ok_or(ExecutorError::InconsistentPlan(
             "reset consumes no exact signed pending request",
         ))?;
 
-        let mut staled_leaves = BTreeSet::new();
-        for change in effects.leave_request_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset leave request delta is not terminal",
-                ));
-            };
-            if !leave_request_identity_is_unchanged(before, after)
-                || before.status != LeaveRequestStatus::Pending
-                || after.status != LeaveRequestStatus::Stale
-                || before.bound_coordinate != *prior
-                || !terminal_is_exact_transition(&after.terminal, producer)
-                || !staled_leaves.insert(after.request_id)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset leave staling is not exact/prior-bound",
-                ));
-            }
-        }
-
-        let mut request_keys = BTreeSet::new();
-        for change in effects.recovery_request_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset recovery request delta is not terminal",
-                ));
-            };
-            if !recovery_request_identity_is_unchanged(before, after)
-                || before.status != RecoveryRequestStatus::Open
-                || after.status != RecoveryRequestStatus::Superseded
-                || before.bound_coordinate != *prior
-                || !terminal_is_exact_transition(&after.terminal, producer)
-                || !request_keys.insert((after.request_id, after.key_package_ref))
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset recovery supersession is not exact/prior-bound",
-                ));
-            }
-        }
-        let mut reservation_keys = BTreeSet::new();
-        for change in effects.reservation_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset reservation delta is not terminal",
-                ));
-            };
-            if !recovery_reservation_identity_is_unchanged(before, after)
-                || before.status != ReservationStatus::Active
-                || after.status != ReservationStatus::Released
-                || before.bound_coordinate != *prior
-                || !terminal_is_exact_transition(&after.terminal, producer)
-                || !reservation_keys.insert((after.request_id, after.key_package_ref))
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset reservation release is not exact/prior-bound",
-                ));
-            }
-        }
-        let package_keys = effects
-            .package_transitions()
-            .iter()
-            .filter_map(|edge| {
-                (edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available)
-                    .then_some((edge.request_id, edge.key_package_ref))
-            })
-            .collect::<BTreeSet<_>>();
-        verify_recovery_package_bijection(effects)?;
-        if request_keys != reservation_keys
-            || request_keys != package_keys
-            || package_keys.len() != effects.package_transitions().len()
-        {
-            return Err(ExecutorError::InconsistentPlan(
-                "reset recovery request/reservation/package families are not bijective",
-            ));
-        }
-        let head = effects.head_cas().ok_or(ExecutorError::InconsistentPlan(
-            "reset recovery package authority has no head binding",
-        ))?;
-        for binding in effects.recovery_package_cas() {
-            let request = effects
-                .recovery_request_changes()
-                .iter()
-                .filter_map(StateChange::after)
-                .find(|request| {
-                    request.request_id == binding.request_id
-                        && request.key_package_ref == binding.key_package_ref
-                })
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "reset package authority has no exact recovery request",
-                ))?;
-            let reservation = effects
-                .reservation_changes()
-                .iter()
-                .filter_map(StateChange::after)
-                .find(|reservation| {
-                    reservation.request_id == binding.request_id
-                        && reservation.key_package_ref == binding.key_package_ref
-                })
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "reset package authority has no exact reservation",
-                ))?;
-            let (origin_key_id, origin_auth_generation) = match &request.origin {
-                RecoveryOriginEvidence::Acceptance(value) => {
-                    let authority =
-                        value
-                            .authority
-                            .as_ref()
-                            .ok_or(ExecutorError::InconsistentPlan(
-                                "reset recovery acceptance has no signing authority",
-                            ))?;
-                    (authority.key_id, authority.auth_generation)
-                }
-                RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
-            };
-            if binding.transaction_id != head.transaction_id
-                || binding.conversation_id != *prior.conversation_id()
-                || binding.target != request.target
-                || binding.target != reservation.target
-                || binding.target_key_id != origin_key_id
-                || binding.target_auth_generation != origin_auth_generation
-                || binding.bound_coordinate != *prior
-                || binding.bound_coordinate != request.bound_coordinate
-                || binding.bound_coordinate != reservation.bound_coordinate
-                || binding.package_not_after != reservation.package_not_after
-                || binding.claimed_at != request.received_at
-                || binding.claimed_at != reservation.received_at
-                || binding.expected_status != PackageStatus::Reserved
-                || binding.successor_status != PackageStatus::Available
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset recovery package CAS authority drift",
-                ));
-            }
-        }
-
-        let mut welcome_ids = BTreeSet::new();
-        for change in effects.welcome_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset Welcome delta is not terminal",
-                ));
-            };
-            if !welcome_identity_is_unchanged(before, after)
-                || before.status != WelcomeStatus::Pending
-                || after.status != WelcomeStatus::Superseded
-                || before.coordinate != *prior
-                || !terminal_is_exact_transition(&after.terminal, producer)
-                || !welcome_ids.insert(after.welcome_id)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset Welcome supersession is not exact/prior-bound",
-                ));
-            }
-        }
         let disposition_ids = ctx
             .welcome_dispositions
             .iter()
@@ -22275,8 +22179,16 @@ pub(in crate::chat_protocol) mod executor {
                     .iter()
                     .find_map(|change| {
                         change.after().filter(|after| {
+                            // BOTH terminal rows carry a `welcomeDisposition` event.
+                            // Which row this is was already proved exactly by
+                            // `classify_prior_bound_staling` above; here we only need
+                            // the delta the disposition event belongs to, so pinning
+                            // `Superseded` alone rejected the legal due-expiry row.
                             after.welcome_id == *input.welcome_id.as_bytes()
-                                && after.status == WelcomeStatus::Superseded
+                                && matches!(
+                                    after.status,
+                                    WelcomeStatus::Superseded | WelcomeStatus::Expired
+                                )
                         })
                     })
                     .ok_or(ExecutorError::InconsistentPlan(
@@ -26828,6 +26740,95 @@ pub(in crate::chat_protocol) mod executor {
         Ok(partition)
     }
 
+    /// Partition `apply_leave_fulfillment`'s leave-request deltas and return the ONE
+    /// request the commit fulfills (ADR-019 Erratum 01).
+    ///
+    /// Extracted so it is reachable WITHOUT a database, for the same reason
+    /// `preflight_leave_fulfillment` was: `apply_leave_fulfillment` is `async` and
+    /// needs a live transaction, so a shipped defect in this partition could be
+    /// reinstated with the whole suite still green. Pinned by
+    /// `leave_fulfillment_partition_accepts_an_overdue_prior_bound_leave`.
+    fn partition_leave_fulfillment_requests(
+        effects: &TransitionEffects,
+    ) -> Result<[u8; 16], ExecutorError> {
+        // Partition the leave-request deltas (ADR-019 Erratum 01). A leaveCommit
+        // fulfills EXACTLY ONE requester's leave (its own Pending->Fulfilled edge) and
+        // MAY additionally retire any number of OTHER members' predecessor-bound
+        // pending leaves — `Pending->Stale` when the commit supersedes them, or
+        // `Pending->Expired` when their own 24h `expires_at` had already passed at
+        // `evidence.received_at` (`resolve_prior_bound_work` picks the row; the
+        // OVERDUE case is Row B). Both are legal prior-bound terminalizations that the
+        // shared `classify_prior_bound_staling` proves exactly and
+        // `write_prior_bound_staling` already writes, so both must be accepted here or
+        // an overdue peer leave permanently wedges every leaveCommit on the
+        // coordinate. This arm's OWN request can never be Row B:
+        // `plan_leave_fulfillment_inner` rejects an overdue target with `WorkExpired`
+        // before planning.
+        //
+        // Reject every other shape: a non-transition delta, a request that did not
+        // start Pending, a re-binding (ruling point 4), a second Fulfilled, or a
+        // retirement that targets the fulfilled request itself (ruling point 3 — the
+        // fulfilled request is `fulfilled`, never `stale`/`expired`). The retired
+        // others flow through `write_prior_bound_staling` at the tail; reconcile
+        // own(1) + staled == total.
+        let mut fulfilled_request_id: Option<[u8; 16]> = None;
+        for change in effects.leave_request_changes() {
+            let (before, after) = match (change.before(), change.after()) {
+                (Some(before), Some(after)) => (before, after),
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment leave-request delta must be a status transition",
+                    ))
+                }
+            };
+            if before.status() != LeaveRequestStatus::Pending {
+                return Err(ExecutorError::InconsistentPlan(
+                    "leave fulfillment leave-request delta must start Pending",
+                ));
+            }
+            if before.bound_coordinate != after.bound_coordinate {
+                return Err(ExecutorError::InconsistentPlan(
+                    "leave fulfillment must not re-bind a leave request",
+                ));
+            }
+            match after.status() {
+                LeaveRequestStatus::Fulfilled => {
+                    if fulfilled_request_id.is_some() {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "leave fulfillment must fulfill exactly one leave request",
+                        ));
+                    }
+                    fulfilled_request_id = Some(after.request_id);
+                }
+                LeaveRequestStatus::Stale | LeaveRequestStatus::Expired => {}
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment leave-request delta must be Fulfilled, Stale or Expired",
+                    ))
+                }
+            }
+        }
+        let fulfilled_request_id = fulfilled_request_id.ok_or(ExecutorError::InconsistentPlan(
+            "leave fulfillment must fulfill a pending leave request",
+        ))?;
+        // Ruling point 3: no prior-bound retirement may target the request being
+        // fulfilled — neither a staling nor a due expiry.
+        for change in effects.leave_request_changes() {
+            if let Some(after) = change.after() {
+                if matches!(
+                    after.status(),
+                    LeaveRequestStatus::Stale | LeaveRequestStatus::Expired
+                ) && after.request_id == fulfilled_request_id
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "leave fulfillment must not retire the request it fulfills",
+                    ));
+                }
+            }
+        }
+        Ok(fulfilled_request_id)
+    }
+
     async fn apply_leave_fulfillment(
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         plan: &ConversationPersistencePlan,
@@ -26882,67 +26883,7 @@ pub(in crate::chat_protocol) mod executor {
                 "leave fulfillment commit metadata author",
             ))?;
 
-        // Partition the leave-request deltas (ADR-019 Erratum 01). A leaveCommit
-        // fulfills EXACTLY ONE requester's leave (its own Pending->Fulfilled edge) and
-        // MAY additionally stale any number of OTHER members' predecessor-bound pending
-        // leaves (Pending->Stale). Reject every other shape: a non-transition delta, a
-        // request that did not start Pending, a re-binding (ruling point 4), a second
-        // Fulfilled, or a Stale that targets the fulfilled request itself (ruling point
-        // 3 — the fulfilled request is `fulfilled`, never `stale`). The Pending->Stale
-        // others flow through `write_prior_bound_staling` at the tail; reconcile
-        // own(1) + staled == total.
-        let mut fulfilled_request_id: Option<[u8; 16]> = None;
-        for change in effects.leave_request_changes() {
-            let (before, after) = match (change.before(), change.after()) {
-                (Some(before), Some(after)) => (before, after),
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "leave fulfillment leave-request delta must be a status transition",
-                    ))
-                }
-            };
-            if before.status() != LeaveRequestStatus::Pending {
-                return Err(ExecutorError::InconsistentPlan(
-                    "leave fulfillment leave-request delta must start Pending",
-                ));
-            }
-            if before.bound_coordinate != after.bound_coordinate {
-                return Err(ExecutorError::InconsistentPlan(
-                    "leave fulfillment must not re-bind a leave request",
-                ));
-            }
-            match after.status() {
-                LeaveRequestStatus::Fulfilled => {
-                    if fulfilled_request_id.is_some() {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "leave fulfillment must fulfill exactly one leave request",
-                        ));
-                    }
-                    fulfilled_request_id = Some(after.request_id);
-                }
-                LeaveRequestStatus::Stale => {}
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "leave fulfillment leave-request delta must be Fulfilled or Stale",
-                    ))
-                }
-            }
-        }
-        let fulfilled_request_id = fulfilled_request_id.ok_or(ExecutorError::InconsistentPlan(
-            "leave fulfillment must fulfill a pending leave request",
-        ))?;
-        // Ruling point 3: no Stale delta may target the request being fulfilled.
-        for change in effects.leave_request_changes() {
-            if let Some(after) = change.after() {
-                if after.status() == LeaveRequestStatus::Stale
-                    && after.request_id == fulfilled_request_id
-                {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "leave fulfillment must not stale the request it fulfills",
-                    ));
-                }
-            }
-        }
+        let fulfilled_request_id = partition_leave_fulfillment_requests(effects)?;
         let leave_request_id = Uuid::from_bytes(fulfilled_request_id);
 
         // Exactly one participant is removed (the requester).
@@ -28002,9 +27943,16 @@ pub(in crate::chat_protocol) mod executor {
         // leave_request_changes (ADR-019 Erratum 01): a zeroLeafLeave (leavePolicy)
         // owns NO leave request of its own — it removes a leafless invitee via a
         // zeroLeafLeaveEntry, never a leave request. Every leave delta must therefore
-        // be a Pending->Stale staling of a DIFFERENT member's predecessor-bound pending
-        // leave (own leave count 0). Validate the shape here; the own-DID exclusion is
-        // checked below once the leaver is resolved. The stale rows flow through
+        // be a prior-bound terminalization of a DIFFERENT member's predecessor-bound
+        // pending leave (own leave count 0): `Pending->Stale` when this coordinate
+        // change supersedes it, or `Pending->Expired` when its own 24h `expires_at`
+        // had already passed at `evidence.received_at` — `resolve_prior_bound_work`
+        // emits the second row unconditionally for an overdue request, and
+        // `write_prior_bound_staling` already writes it. Accepting only the first row
+        // made an overdue peer leave a permanent wedge. Validate the shape here; the
+        // exact terminal evidence for BOTH rows is proved by the shared
+        // `classify_prior_bound_staling` below, and the own-DID exclusion is checked
+        // once the leaver is resolved. The rows flow through
         // `write_prior_bound_staling` at the tail (own 0 + staled == total).
         for change in effects.leave_request_changes() {
             let (before, after) = match (change.before(), change.after()) {
@@ -28016,10 +27964,13 @@ pub(in crate::chat_protocol) mod executor {
                 }
             };
             if before.status() != LeaveRequestStatus::Pending
-                || after.status() != LeaveRequestStatus::Stale
+                || !matches!(
+                    after.status(),
+                    LeaveRequestStatus::Stale | LeaveRequestStatus::Expired
+                )
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "zero-leaf leave leave-request delta must be Pending->Stale",
+                    "zero-leaf leave leave-request delta must be Pending->Stale/Expired",
                 ));
             }
             // No re-binding (ruling point 4): staling never moves a request's binding.
@@ -30817,22 +30768,70 @@ pub(in crate::chat_protocol) mod executor {
                 .ok_or(ExecutorError::MissingContext(
                     "welcome disposition event for a superseded welcome",
                 ))?;
-            let position = append_one_event_with_cursor(
-                transaction,
-                ctx,
-                &disposition.event,
-                event_cursor.as_deref_mut(),
-            )
-            .await?;
             if after.status() == WelcomeStatus::Expired {
+                // A DUE EXPIRY the transition merely OBSERVES. Every instant this
+                // writes is the welcome's own `expires_at`, never `applied_at`:
+                // `assert_welcome_disposition_cas` pins `event.created_at =
+                // delivery.terminal_at`, and `assert_recovery_work_integrity` pins
+                // `recovery_work_items.created_at = disposition.terminal_at`. This is
+                // exactly the shape the dedicated `apply_welcome_expiry` arm writes.
+                let terminal_at = server_instant(after.expires_at())?;
+                let recovery_work_id =
+                    disposition
+                        .recovery_work_id
+                        .ok_or(ExecutorError::MissingContext(
+                            "recovery work id for a prior-bound Welcome expiry",
+                        ))?;
+                let position = append_one_event_at_with_cursor(
+                    transaction,
+                    ctx,
+                    &disposition.event,
+                    terminal_at,
+                    event_cursor.as_deref_mut(),
+                )
+                .await?;
                 delivery::terminalize_prior_bound_welcome_expiry(
                     transaction,
                     after,
-                    server_instant(after.expires_at())?,
+                    terminal_at,
                     position,
                 )
                 .await?;
+                // The `welcomeExpired` re-add work the recipient is owed. Without it
+                // the deferred `assert_recovery_work_integrity` rejects the WHOLE
+                // transition (`winner_kind='expired'` requires exactly one item), and
+                // the invitee is never re-invited.
+                delivery::insert_recovery_work_item(
+                    transaction,
+                    &delivery::NewRecoveryWorkItem {
+                        recovery_work_id,
+                        conversation_id: Uuid::from_bytes(*after.coordinate().conversation_id()),
+                        recipient_did: device_did(after.recipient())?,
+                        recipient_device_id: device_uuid(after.recipient()),
+                        source_kind: delivery::RecoveryWorkSourceKind::WelcomeExpired,
+                        source_id: welcome_id,
+                        generation: checked_i64(after.coordinate().generation())?,
+                        state_version: checked_i64(after.coordinate().state_version())?,
+                        created_at: terminal_at,
+                    },
+                )
+                .await?;
             } else {
+                if disposition.recovery_work_id.is_some() {
+                    // Only a due expiry creates recovery work; a supersession that
+                    // carried one would be rejected by the same deferred trigger
+                    // ('non-recovery Welcome disposition has recovery work').
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound Welcome supersession must carry no recovery work id",
+                    ));
+                }
+                let position = append_one_event_with_cursor(
+                    transaction,
+                    ctx,
+                    &disposition.event,
+                    event_cursor.as_deref_mut(),
+                )
+                .await?;
                 let terminal_disposition = match cause {
                     WelcomeSupersessionCause::Transition {
                         terminal_transition_id,
@@ -30872,6 +30871,26 @@ pub(in crate::chat_protocol) mod executor {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         ctx: &ExecutionContext,
         event: &EventFanout,
+        event_cursor: Option<&mut EventChainCursor>,
+    ) -> Result<i64, ExecutorError> {
+        append_one_event_at_with_cursor(transaction, ctx, event, ctx.applied_at, event_cursor).await
+    }
+
+    /// `append_one_event_with_cursor` with an explicit `created_at` for the event
+    /// row and its outbox work.
+    ///
+    /// Almost every event is stamped `ctx.applied_at`. The exception is a Welcome
+    /// terminal disposition: `assert_welcome_disposition_cas` requires
+    /// `event.created_at = delivery.terminal_at`, and a due EXPIRY's terminal
+    /// instant is the welcome's own `expires_at`, which is strictly before
+    /// `applied_at` whenever the expiry is observed by a later transition. The
+    /// dedicated `apply_welcome_expiry` arm already appends at `terminal_at`
+    /// directly; this is the same rule for the shared prior-bound writer.
+    async fn append_one_event_at_with_cursor(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        ctx: &ExecutionContext,
+        event: &EventFanout,
+        created_at: DateTime<Utc>,
         mut event_cursor: Option<&mut EventChainCursor>,
     ) -> Result<i64, ExecutorError> {
         // The symbolic schedule is a prewrite contract. Resolve and validate
@@ -30899,21 +30918,15 @@ pub(in crate::chat_protocol) mod executor {
                 event_id: event.event_id,
                 event_kind: event.event_kind,
                 payload_bytes: event.payload_bytes.clone(),
-                created_at: ctx.applied_at,
+                created_at,
                 protocol_instance_id: ctx.protocol_instance_id,
             },
         )
         .await?;
         delivery::insert_event_recipients(transaction, position, &recipients).await?;
         for (outbox_id, work_kind) in &event.outbox {
-            delivery::enqueue_outbox(
-                transaction,
-                *outbox_id,
-                position,
-                *work_kind,
-                ctx.applied_at,
-            )
-            .await?;
+            delivery::enqueue_outbox(transaction, *outbox_id, position, *work_kind, created_at)
+                .await?;
         }
         if let Some(cursor) = event_cursor {
             cursor
@@ -31953,6 +31966,9 @@ pub(in crate::chat_protocol) mod executor {
                     let outbox_id = Uuid::from_bytes(uuid(0x6f));
                     context.welcome_dispositions.push(WelcomeDispositionInput {
                         welcome_id: Uuid::from_bytes(welcome_id),
+                        // A `Pending->Expired` delta: the recovery work id is part of
+                        // its exact shape.
+                        recovery_work_id: Some(Uuid::from_bytes(uuid(0x70))),
                         event: EventFanout {
                             event_id,
                             event_kind: EventKind::WelcomeDisposition,
@@ -32504,6 +32520,95 @@ pub(in crate::chat_protocol) mod executor {
                 partition.keys().contains(&(request_id, key_package_ref)),
                 "the family must be carried to the writer, not dropped"
             );
+        }
+
+        /// ROW-B WEDGE (leave-fulfillment arm).
+        ///
+        /// A `leaveCommit` over a coordinate carrying ANOTHER member's OVERDUE pending
+        /// leave must partition cleanly. Past the 24h consent TTL
+        /// `resolve_prior_bound_work` emits Row B (`Pending->Expired`), not Row A
+        /// (`Pending->Stale`); `classify_prior_bound_staling` proves it and
+        /// `write_prior_bound_staling` writes it, but this arm's own partition
+        /// accepted only Row A — planner-legal, executor-fatal, and a retry replans the
+        /// identical shape. Nothing sweeps overdue leaves, so the wedge is permanent.
+        ///
+        /// The arm's OWN request can never be Row B: `plan_leave_fulfillment_inner`
+        /// rejects an overdue target with `WorkExpired` before planning. So the shape
+        /// under test is exactly one `Fulfilled` plus one overdue peer `Expired`.
+        #[test]
+        fn leave_fulfillment_partition_accepts_an_overdue_prior_bound_leave() {
+            let (mut plan, _context, _) = exact_due_expiry_fixture(DueExpiryFamily::Leave);
+            let prior = plan.expected_prior.expect("prior");
+            // The fixture's overdue peer leave (`Pending->Expired`, exact due expiry).
+            let overdue_request_id = uuid(0x67);
+            assert_eq!(
+                plan.effects.leave_request_changes.len(),
+                1,
+                "fixture carries exactly the overdue peer leave"
+            );
+
+            // The arm's own edge: a DIFFERENT requester's `Pending->Fulfilled`.
+            let requester = device(0x71);
+            let request_id = uuid(0x72);
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(90_404_000).unwrap();
+            let origin = request_evidence(
+                RequestEntryKind::LeaveRequest,
+                request_id,
+                requester.clone(),
+                *prior.conversation_id(),
+                received_at,
+                [0x73; 32],
+            );
+            let before = LeaveRequest {
+                request_id,
+                requester,
+                bound_coordinate: prior,
+                received_at,
+                expires_at,
+                status: LeaveRequestStatus::Pending,
+                origin,
+                terminal: None,
+                fulfilled_participant: None,
+            };
+            let mut after = before.clone();
+            after.status = LeaveRequestStatus::Fulfilled;
+            plan.effects.leave_request_changes.push(StateChange {
+                before: Some(before),
+                after: Some(after),
+            });
+
+            let fulfilled = partition_leave_fulfillment_requests(plan.effects())
+                .expect("an overdue prior-bound peer leave must not wedge the partition");
+            assert_eq!(
+                fulfilled, request_id,
+                "the arm's own fulfilled request, never the overdue peer"
+            );
+            assert_ne!(fulfilled, overdue_request_id);
+        }
+
+        /// Ruling point 3 stays enforced for BOTH prior-bound rows: a delta that
+        /// retires the very request being fulfilled is illegal whether it is a staling
+        /// or a due expiry. Widening the partition to accept Row B must not open this.
+        #[test]
+        fn leave_fulfillment_partition_rejects_expiring_the_request_it_fulfills() {
+            let (mut plan, _context, _) = exact_due_expiry_fixture(DueExpiryFamily::Leave);
+            let overdue = plan.effects.leave_request_changes[0].clone();
+            let mut before = overdue.before.expect("overdue before").clone();
+            let mut after = overdue.after.expect("overdue after").clone();
+            before.status = LeaveRequestStatus::Pending;
+            after.status = LeaveRequestStatus::Fulfilled;
+            after.terminal = None;
+            // Same request id as the fixture's `Pending->Expired` delta.
+            plan.effects.leave_request_changes.push(StateChange {
+                before: Some(before),
+                after: Some(after),
+            });
+
+            match partition_leave_fulfillment_requests(plan.effects()) {
+                Err(ExecutorError::InconsistentPlan(_)) => {}
+                other => panic!("expiring the fulfilled request was accepted: {other:?}"),
+            }
         }
 
         /// One prior-bound family plus the knobs each negative case perturbs.

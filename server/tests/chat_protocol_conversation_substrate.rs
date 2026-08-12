@@ -30268,6 +30268,7 @@ mod historical_control_loader {
                 welcome_response: None,
                 welcome_dispositions: vec![WelcomeDispositionInput {
                     welcome_id,
+                    recovery_work_id: None,
                     event: EventFanout {
                         event_id: Uuid::new_v4(),
                         event_kind: EventKind::WelcomeDisposition,

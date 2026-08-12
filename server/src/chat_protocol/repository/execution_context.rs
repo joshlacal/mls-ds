@@ -1948,7 +1948,16 @@ async fn hydrate_execution_context_inner_with_g6(
                 .await?
             }
         };
-        welcome_dispositions.push(WelcomeDispositionInput { welcome_id, event });
+        // A due expiry additionally materializes `welcomeExpired` recovery work, so
+        // it needs a fresh `recovery_work_items` primary key — minted here exactly
+        // as the dedicated `welcomeExpiry` / `welcomeRejection` edges mint theirs
+        // below. A supersession creates no work item and must carry no id.
+        let recovery_work_id = (status == "expired").then(Uuid::new_v4);
+        welcome_dispositions.push(WelcomeDispositionInput {
+            welcome_id,
+            recovery_work_id,
+            event,
+        });
     }
 
     let primary_kind = primary_event_kind(plan);
