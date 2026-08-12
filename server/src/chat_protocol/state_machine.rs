@@ -20750,6 +20750,7 @@ pub(in crate::chat_protocol) mod executor {
     /// approximate. Callers rebuild their `FamilyCounts` recovery fields from
     /// these accessors so the pre-writer fence stays load-bearing instead of
     /// becoming tautological.
+    #[derive(Debug)]
     struct PriorBoundPartition {
         /// One entry per prior-bound family, `(request_id, key_package_ref)`.
         keys: BTreeSet<([u8; 16], [u8; 32])>,
@@ -20773,6 +20774,41 @@ pub(in crate::chat_protocol) mod executor {
         fn keys(&self) -> &BTreeSet<([u8; 16], [u8; 32])> {
             &self.keys
         }
+
+        /// Design 5 step 6. Compare what the writer actually wrote against what this
+        /// partition approved, by KEY and not merely by count, and do it before any
+        /// other writer runs. A count-only check cannot tell a skipped family from a
+        /// duplicated one, and `write_prior_bound_supersessions` SKIPS any delta that
+        /// is not its exact supersession shape — so a silent drop is exactly the
+        /// failure mode this catches.
+        fn verify_write_receipt(
+            &self,
+            receipt: &PriorBoundWriteReceipt,
+        ) -> Result<(), ExecutorError> {
+            if receipt.keys != self.keys {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound writer key set disagrees with the classified families",
+                ));
+            }
+            if receipt.counts.requests != self.requests()
+                || receipt.counts.reservations != self.reservations()
+                || receipt.counts.packages != self.packages()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound writer counts disagree with the classified families",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// What `write_prior_bound_supersessions` actually wrote: the per-family counts
+    /// each arm already folds into its `FamilyCounts`, plus the exact keys, kept as a
+    /// DISTINCT value so the added key set never leaks into the welcome / reset /
+    /// leave counts the tail fence consumes.
+    struct PriorBoundWriteReceipt {
+        counts: FamilyCounts,
+        keys: BTreeSet<([u8; 16], [u8; 32])>,
     }
 
     /// The single prior-bound recovery classifier, shared by all nine
@@ -21892,7 +21928,7 @@ pub(in crate::chat_protocol) mod executor {
         ctx: &ExecutionContext,
         transition_id: Uuid,
         seq_i64: i64,
-    ) -> Result<FamilyCounts, ExecutorError> {
+    ) -> Result<(FamilyCounts, PriorBoundPartition), ExecutorError> {
         reject_if_present("participant_changes", effects.participant_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
@@ -22232,7 +22268,7 @@ pub(in crate::chat_protocol) mod executor {
             },
             &prior_bound,
         )?;
-        Ok(prior_bound)
+        Ok((prior_bound, partition))
     }
 
     #[derive(Debug)]
@@ -22240,6 +22276,10 @@ pub(in crate::chat_protocol) mod executor {
         metadata: &'a MetadataSnapshotBinding,
         author: &'a MetadataAuthorColumns,
         avatar: Option<&'a MetadataAvatarPersistence>,
+        /// The classified prior-bound families, carried to `apply_metadata_transition`
+        /// so it reconciles the writer's receipt against them before any other writer
+        /// runs (design 5 step 6).
+        prior_bound: PriorBoundPartition,
     }
 
     /// Re-derive the complete metadata-transition contract from the sealed plan
@@ -22517,7 +22557,8 @@ pub(in crate::chat_protocol) mod executor {
         // Prior-bound recovery families. This block WAS the reference
         // implementation; it is now the shared classifier every one of the nine
         // coordinate-changing arms calls, strictly before its own first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
+        let prior_bound_partition =
+            classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
         for change in effects.reset_request_changes() {
             let (Some(before_reset), Some(after_reset)) = (change.before(), change.after()) else {
                 return Err(ExecutorError::InconsistentPlan(
@@ -22724,6 +22765,7 @@ pub(in crate::chat_protocol) mod executor {
         }
 
         Ok(MetadataExecutionBinding {
+            prior_bound: prior_bound_partition,
             metadata: after,
             author,
             avatar,
@@ -25521,7 +25563,7 @@ pub(in crate::chat_protocol) mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "fulfillment adds no pending welcome",
             ))?;
-        let preflight_prior_bound =
+        let (preflight_prior_bound, partition) =
             preflight_leaf_recovery_fulfillment(plan, effects, hydration, ctx, transition_id, seq_i64)?;
 
         // 1. Head CAS sv+1.
@@ -25920,9 +25962,14 @@ pub(in crate::chat_protocol) mod executor {
         let event_positions = write_events(transaction, ctx).await?;
         // Prior-coordinate open-work supersession (a legal interleaving): the corpus
         // fulfillment carries none, but the path composes it for the general case.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -26030,7 +26077,7 @@ pub(in crate::chat_protocol) mod executor {
         // legal Row B due-expiry family was rejected here exactly as it was in leaf
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // generic commit
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // generic commit
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
             || effects.invitation_quota_cas().is_some()
@@ -26337,9 +26384,14 @@ pub(in crate::chat_protocol) mod executor {
         let event_positions = write_events(transaction, ctx).await?;
         // Supersede prior-coordinate open work (requests/reservations/packages) +
         // any prior pending Welcome the epoch change retired.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -26435,7 +26487,7 @@ pub(in crate::chat_protocol) mod executor {
         // comment above. Any leaveCommit on a coordinate with open recovery work was
         // planner-legal and executor-fatal. Prior-bound package work is now classified,
         // not rejected.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
@@ -26776,9 +26828,14 @@ pub(in crate::chat_protocol) mod executor {
         //     Pending->Stale leaves of OTHER members the leaveCommit retired (bound to
         //     this transition + the commit's request digest); reconcile own(1) +
         //     staled == total.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27122,7 +27179,7 @@ pub(in crate::chat_protocol) mod executor {
         // legal Row B due-expiry family was rejected here exactly as it was in leaf
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // policy
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // policy
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("policy metadata change"));
         }
@@ -27277,9 +27334,14 @@ pub(in crate::chat_protocol) mod executor {
         //    NONE of these families (own == default), so every such delta MUST be a
         //    supersession/staling the shared writers below applied — reconcile rejects
         //    any that is neither (silent-drop guard).
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27341,6 +27403,7 @@ pub(in crate::chat_protocol) mod executor {
         let expected_state_version = checked_i64(expected_prior.state_version())?;
         let expected_next_entry_seq = checked_i64(head.expected_next_entry_seq())?;
         let binding = preflight_metadata_transition(plan, ctx, transition_id, seq_i64)?;
+        let partition = &binding.prior_bound;
 
         // 1. Serialize and advance the exact head coordinate + entry counter.
         transition::cas_conversation_head(
@@ -27473,9 +27536,14 @@ pub(in crate::chat_protocol) mod executor {
 
         // 8. Terminalize every prior-coordinate work item retired by this
         // coordinate change, then prove no family was silently skipped.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27595,7 +27663,7 @@ pub(in crate::chat_protocol) mod executor {
         // legal Row B due-expiry family was rejected here exactly as it was in leaf
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // zero-leaf leave
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // zero-leaf leave
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "zero-leaf leave metadata change",
@@ -27777,9 +27845,14 @@ pub(in crate::chat_protocol) mod executor {
         // so every such delta MUST be a supersession/staling the shared writers
         // applied — reconcile rejects any that is neither. reset was rejected above
         // (count 0), so its family trivially reconciles.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -27867,7 +27940,7 @@ pub(in crate::chat_protocol) mod executor {
         // legal Row B due-expiry family was rejected here exactly as it was in leaf
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // close
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // close
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("close metadata change"));
         }
@@ -28082,9 +28155,14 @@ pub(in crate::chat_protocol) mod executor {
         //     (Pending->Stale). The close has ZERO own recovery/welcome/reset/leave
         //     edges, so own == default and every such delta MUST be a supersession/
         //     staling the calls below applied — reconcile rejects any that is neither.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -28642,7 +28720,7 @@ pub(in crate::chat_protocol) mod executor {
         // legal Row B due-expiry family was rejected here exactly as it was in leaf
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // reset activation
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // reset activation
         if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "reset revocation/welcome CAS",
@@ -28980,9 +29058,14 @@ pub(in crate::chat_protocol) mod executor {
         //     leave delta MUST be a supersession/staling the calls below applied —
         //     reconcile rejects any that is neither (silent-drop guard). The reset
         //     loop in write_prior_bound_staling skips the own Pending->Consumed edge.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -29165,7 +29248,7 @@ pub(in crate::chat_protocol) mod executor {
         // family and left every prior-bound supersession to the writer, unproven
         // before the head CAS. The classifier derives the own family independently
         // by exact typed shape and proves every other family, Row A and Row B.
-        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::Acceptance)?;
+        let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::Acceptance)?;
 
         // 1. Head CAS advances the coordinate + counter (sv+1, same generation).
         transition::cas_conversation_head(
@@ -29310,9 +29393,14 @@ pub(in crate::chat_protocol) mod executor {
         //     above (own counts {1,1,1}); write_prior_bound_supersessions SKIPS those
         //     (they are not the supersession shape), so it consumes ONLY the other
         //     member's work, and reconcile proves own + superseded == total.
-        let mut superseded =
+        let receipt =
             write_prior_bound_supersessions(transaction, effects, transition_id, applied_at)
                 .await?;
+        // Design 5 step 6: reconcile the recovery families against the classifier's
+        // KEYED expectation immediately, before any other writer runs. No unrelated
+        // write may intervene.
+        partition.verify_write_receipt(&receipt)?;
+        let mut superseded = receipt.counts;
         superseded.welcomes = write_welcome_supersessions(
             transaction,
             ctx,
@@ -30019,8 +30107,9 @@ pub(in crate::chat_protocol) mod executor {
         effects: &TransitionEffects,
         transition_id: Uuid,
         applied_at: DateTime<Utc>,
-    ) -> Result<FamilyCounts, ExecutorError> {
+    ) -> Result<PriorBoundWriteReceipt, ExecutorError> {
         let mut counts = FamilyCounts::default();
+        let mut keys: BTreeSet<([u8; 16], [u8; 32])> = BTreeSet::new();
         // Consume the exact locked package authority while its paired durable
         // request/reservation rows are still in the Open/Active pre-state.
         // Terminalizing those rows first would force this writer to fall back
@@ -30082,6 +30171,7 @@ pub(in crate::chat_protocol) mod executor {
                 )
                 .await?;
                 counts.packages += 1;
+                keys.insert((edge.request_id, edge.key_package_ref));
             }
         }
         for change in effects.recovery_request_changes() {
@@ -30138,7 +30228,7 @@ pub(in crate::chat_protocol) mod executor {
                 }
             }
         }
-        Ok(counts)
+        Ok(PriorBoundWriteReceipt { counts, keys })
     }
 
     /// Durably stale each prior-coordinate PENDING reset/leave request the plan
@@ -31850,6 +31940,58 @@ pub(in crate::chat_protocol) mod executor {
                 Ok(_) => panic!("an own family closing by due expiry was accepted"),
                 Err(error) => panic!("rejected with the wrong executor error: {error:?}"),
             }
+        }
+
+        /// The keyed write-receipt check (design 5 step 6). `write_prior_bound_supersessions`
+        /// SKIPS any delta that is not its exact supersession shape, so a silent drop
+        /// is a real failure mode — and a count-only comparison cannot tell a dropped
+        /// family from a substituted one. Reachable in production only through the
+        /// `apply_*` arms, which need a live transaction, so it is proven here directly.
+        #[test]
+        fn write_receipt_must_match_the_classified_families_by_key() {
+            let key_a = (uuid(0x60), [0x61; 32]);
+            let key_b = (uuid(0x66), [0x67; 32]);
+            let partition = PriorBoundPartition {
+                keys: BTreeSet::from([key_a, key_b]),
+                own: None,
+            };
+            let counts = |n: usize| FamilyCounts {
+                requests: n,
+                reservations: n,
+                packages: n,
+                welcomes: 0,
+                reset_requests: 0,
+                leave_requests: 0,
+            };
+
+            partition
+                .verify_write_receipt(&PriorBoundWriteReceipt {
+                    counts: counts(2),
+                    keys: BTreeSet::from([key_a, key_b]),
+                })
+                .expect("an exact receipt must reconcile");
+
+            // A dropped family.
+            assert!(
+                partition
+                    .verify_write_receipt(&PriorBoundWriteReceipt {
+                        counts: counts(1),
+                        keys: BTreeSet::from([key_a]),
+                    })
+                    .is_err(),
+                "a silently dropped family must be rejected"
+            );
+
+            // Right COUNT, wrong identity — the case a count-only fence cannot see.
+            assert!(
+                partition
+                    .verify_write_receipt(&PriorBoundWriteReceipt {
+                        counts: counts(2),
+                        keys: BTreeSet::from([key_a, (uuid(0x77), [0x78; 32])]),
+                    })
+                    .is_err(),
+                "a substituted family must be rejected even at the right count"
+            );
         }
 
         #[test]
