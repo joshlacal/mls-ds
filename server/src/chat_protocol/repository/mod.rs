@@ -13,6 +13,16 @@ pub(crate) mod core;
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) mod execution_context;
+// `expiry_sweep` is the scheduler-side input for the two work families that
+// terminalize on a deadline no client request is guaranteed to reach: due OPEN
+// leaf-recovery requests and due PENDING Welcome deliveries. It composes the
+// already-sealed welcome-expiry route and the already-built welcome claim; it
+// adds no writer and no authority. It depends on `core`/`execution_context`, so
+// it carries their `#[cfg(not(test))]` gate; the integration harness `include!`s
+// the file directly.
+#[cfg(not(test))]
+#[allow(dead_code)]
+pub(crate) mod expiry_sweep;
 // `delivery` and `transition` are the dumb-SQL writers the E2b-2 transition
 // executor composes. They are unconditionally compiled (not `#[cfg(not(test))]`)
 // so the executor — which is likewise now unconditional — resolves

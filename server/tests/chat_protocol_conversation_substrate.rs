@@ -157,11 +157,25 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/execution_context.rs"
             ));
         }
+        pub mod welcome {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome.rs"
+            ));
+        }
         pub mod welcome_terminal {
             #![allow(dead_code)]
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/welcome_terminal.rs"
+            ));
+        }
+        pub mod expiry_sweep {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/expiry_sweep.rs"
             ));
         }
         pub mod relationship {
@@ -23477,7 +23491,7 @@ mod historical_control_loader {
             fulfillment
         }
 
-        async fn commit_genuine_policy_acceptance_fulfillment(
+        pub(super) async fn commit_genuine_policy_acceptance_fulfillment(
             pool: &PgPool,
         ) -> GenuinePolicyRoleGraph {
             let cid = Uuid::parse_str(
@@ -33157,6 +33171,177 @@ mod historical_control_loader {
             tx.rollback().await.expect("rollback");
         }
     }
+    // ===================================================================
+    // Clean-chat Welcome expiry sweep — live end-to-end proof.
+    //
+    // `commit_genuine_policy_acceptance_fulfillment` is the only fixture in
+    // the harness whose conversation hydrates through the PRODUCTION
+    // aggregate reader (its public state is the pinned genuine MLS corpus,
+    // not a synthetic tree summary), and it leaves exactly one PENDING
+    // `chat.welcome_deliveries` row. That makes it the only place the
+    // server-authored sweep — aggregate lock -> Welcome lock ->
+    // `plan_welcome_expiry_entry` -> `prepare_welcome_terminal_execution` ->
+    // the sealed executor arm — can be driven end to end.
+    //
+    // The observed instant is the only injected value, and it is exactly the
+    // input the client acknowledge/reject facade supplies from its trusted
+    // DPoP instant. It gates NOTHING but dueness: every terminal value
+    // written is derived from the immutable row, so the disposition
+    // `terminal_at` and the recovery-work `created_at` are the delivery's OWN
+    // `expires_at`, never the observed instant. A late sweep therefore writes
+    // exactly what an on-time sweep would have written — which is what makes
+    // this testable at all, since `welcome_deliveries.expires_at` is
+    // immutable (`welcome_deliveries_identity_immutable` admits only
+    // `status`/`terminal_at`) and is sourced from a KeyPackage `not_after`
+    // with a 600-second floor, so an already-due delivery cannot be seeded.
+    // ===================================================================
+    mod welcome_expiry_sweep {
+        use chrono::{DateTime, Utc};
+        use sqlx::PgPool;
+        use uuid::Uuid;
+
+        use super::recovery_leg::commit_genuine_policy_acceptance_fulfillment;
+        use crate::chat_protocol::repository::expiry_sweep::{
+            expire_due_welcome_delivery, WelcomeSweepOutcome,
+        };
+
+        async fn delivery_row(
+            pool: &PgPool,
+            welcome_id: Uuid,
+        ) -> (String, Option<DateTime<Utc>>, DateTime<Utc>) {
+            sqlx::query_as(
+                "SELECT status, terminal_at, expires_at \
+                   FROM chat.welcome_deliveries WHERE welcome_id = $1",
+            )
+            .bind(welcome_id)
+            .fetch_one(pool)
+            .await
+            .expect("read the seeded Welcome delivery")
+        }
+
+        async fn recovery_work_rows(
+            pool: &PgPool,
+            source_id: Uuid,
+        ) -> Vec<(Uuid, String, DateTime<Utc>, String)> {
+            sqlx::query_as(
+                "SELECT recovery_work_id, source_kind, created_at, status \
+                   FROM chat.recovery_work_items WHERE source_id = $1 \
+                  ORDER BY recovery_work_id",
+            )
+            .bind(source_id)
+            .fetch_all(pool)
+            .await
+            .expect("read the recovery-work items")
+        }
+
+        /// A pending Welcome observed BEFORE its `expires_at` is not swept:
+        /// the lock classifies it `PendingNotDue`, the sweep reports `NotDue`,
+        /// and neither the delivery row nor its recovery-work projection
+        /// changes.
+        #[tokio::test]
+        #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
+        async fn a_not_yet_due_welcome_delivery_is_not_swept() {
+            let (pool, _database) = crate::executor_seed::setup().await;
+            let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let welcome_id = graph.fulfillment.welcome_id;
+
+            let (status, terminal_at, expires_at) = delivery_row(&pool, welcome_id).await;
+            assert_eq!(status, "pending");
+            assert!(terminal_at.is_none());
+
+            // Exactly one millisecond before the deadline — the last instant at
+            // which the delivery is still live. (The corpus fixture's pinned
+            // instants put the real clock past `expires_at`, so the boundary
+            // itself, not the wall clock, is what this pins.)
+            let observed_at = expires_at - chrono::Duration::milliseconds(1);
+
+            let mut tx = pool.begin().await.expect("begin sweep");
+            let outcome = expire_due_welcome_delivery(&mut tx, cid, welcome_id, observed_at)
+                .await
+                .expect("the sweep classifies without erroring");
+            assert_eq!(outcome, WelcomeSweepOutcome::NotDue);
+            tx.commit().await.expect("commit sweep");
+
+            let (status, terminal_at, _) = delivery_row(&pool, welcome_id).await;
+            assert_eq!(status, "pending", "a not-yet-due delivery stays pending");
+            assert!(terminal_at.is_none());
+            assert!(
+                recovery_work_rows(&pool, welcome_id).await.is_empty(),
+                "a not-yet-due delivery produces no recovery work"
+            );
+        }
+
+        /// The load-bearing case. A pending Welcome observed AT its
+        /// `expires_at` is terminalized `expired` through the sealed executor
+        /// arm and produces exactly one `welcomeExpired` recovery-work item,
+        /// both stamped at the delivery's OWN `expires_at`. Sweeping the same
+        /// delivery again is a no-op: it is retained terminal and no second
+        /// work item appears.
+        #[tokio::test]
+        #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
+        async fn a_due_welcome_delivery_is_swept_exactly_once() {
+            let (pool, _database) = crate::executor_seed::setup().await;
+            let graph = commit_genuine_policy_acceptance_fulfillment(&pool).await;
+            let cid = Uuid::from_bytes(graph.entry.cid);
+            let welcome_id = graph.fulfillment.welcome_id;
+
+            let (status, _, expires_at) = delivery_row(&pool, welcome_id).await;
+            assert_eq!(status, "pending");
+            // Dueness is `locked_at >= expires_at`, so the exact deadline is
+            // the earliest due instant.
+            let observed_at = expires_at;
+
+            let mut tx = pool.begin().await.expect("begin sweep");
+            let outcome = expire_due_welcome_delivery(&mut tx, cid, welcome_id, observed_at)
+                .await
+                .expect("the due sweep plans and executes");
+            assert_eq!(outcome, WelcomeSweepOutcome::Expired);
+            tx.commit().await.expect("commit sweep");
+
+            let (status, terminal_at, _) = delivery_row(&pool, welcome_id).await;
+            assert_eq!(status, "expired");
+            assert_eq!(
+                terminal_at,
+                Some(expires_at),
+                "the terminal instant is the delivery's own expires_at, never the observed instant"
+            );
+
+            let work = recovery_work_rows(&pool, welcome_id).await;
+            assert_eq!(work.len(), 1, "exactly one welcomeExpired work item");
+            assert_eq!(work[0].1, "welcomeExpired");
+            assert_eq!(
+                work[0].2, expires_at,
+                "the work item is stamped at the delivery's expires_at"
+            );
+            assert_eq!(work[0].3, "pending");
+            let first_work_id = work[0].0;
+
+            // Idempotence: a second sweep of the same delivery writes nothing.
+            let mut tx = pool.begin().await.expect("begin second sweep");
+            let repeated = expire_due_welcome_delivery(
+                &mut tx,
+                cid,
+                welcome_id,
+                observed_at + chrono::Duration::milliseconds(1),
+            )
+            .await
+            .expect("the repeated sweep classifies without erroring");
+            assert_eq!(repeated, WelcomeSweepOutcome::RetainedTerminal);
+            tx.commit().await.expect("commit second sweep");
+
+            let (status, terminal_at, _) = delivery_row(&pool, welcome_id).await;
+            assert_eq!(status, "expired");
+            assert_eq!(terminal_at, Some(expires_at));
+            let work = recovery_work_rows(&pool, welcome_id).await;
+            assert_eq!(
+                work.len(),
+                1,
+                "the repeated sweep creates no second work item"
+            );
+            assert_eq!(work[0].0, first_work_id);
+        }
+    }
 }
 
 // ===========================================================================
@@ -33953,5 +34138,64 @@ mod real_tree_genesis_seed {
             Uuid::parse_str(device_text).expect("device uuid"),
             leaf.signature_key().to_vec(),
         )
+    }
+}
+
+// ===========================================================================
+// Clean-chat expiry sweep — due-enumeration proof.
+//
+// Drives `chat_protocol::repository::expiry_sweep`, the scheduler-side input the
+// background worker (`handlers::chat::expiry_worker`) calls. The Welcome half of
+// the sweep is proven inside `historical_control_loader::recovery_leg`, beside
+// the only fulfillment fixture whose conversation hydrates through the
+// production aggregate.
+// ===========================================================================
+mod chat_expiry_sweep_enumeration {
+    use crate::chat_protocol::repository::expiry_sweep::claim_due_leaf_recovery_requests;
+    use chrono::{DateTime, Duration, Utc};
+    use sqlx::PgPool;
+
+    async fn whole_millisecond_now(pool: &PgPool) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(pool)
+            .await
+            .expect("sample the trusted database clock")
+    }
+
+    /// The due enumeration is bounded by `status = 'open'` FIRST: the seeded
+    /// fulfillment terminalizes its leaf-recovery request, and no observed
+    /// instant — however far past its `expires_at` — may ever enumerate it. A
+    /// terminal row is not sweepable work, so the sweeper can never re-drive a
+    /// request some other path already resolved.
+    #[tokio::test]
+    #[ignore = "requires loopback PostgreSQL and creates a private executor database"]
+    async fn due_leaf_recovery_enumeration_never_returns_a_terminal_request() {
+        let (pool, _database) = crate::executor_seed::setup().await;
+        let scenario = crate::executor_seed::run_fulfillment_scenario(&pool).await;
+
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM chat.leaf_recovery_requests WHERE recovery_request_id = $1",
+        )
+        .bind(scenario.recovery_request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the seeded recovery request");
+        assert_eq!(
+            status, "fulfilled",
+            "the seeded scenario terminalizes its recovery request"
+        );
+
+        let now = whole_millisecond_now(&pool).await;
+        for observed_at in [now, now + Duration::days(365)] {
+            let mut transaction = pool.begin().await.expect("begin enumeration");
+            let due = claim_due_leaf_recovery_requests(&mut transaction, observed_at, 128)
+                .await
+                .expect("enumeration executes against the production schema");
+            assert!(
+                due.is_empty(),
+                "a terminal leaf-recovery request is never due work (observed_at = {observed_at})"
+            );
+            transaction.rollback().await.expect("rollback enumeration");
+        }
     }
 }

@@ -921,6 +921,32 @@ async fn main() -> anyhow::Result<()> {
         }),
     );
 
+    // Clean-chat expiry sweeper. Overdue OPEN leaf-recovery requests and overdue
+    // PENDING Welcome deliveries hold reserved key packages and block their
+    // owner's re-request; nothing clears them on a quiet conversation. This is
+    // the only clean-chat background worker, and it is gated on the SAME cutover
+    // flag as every chat route: while `CHAT_CUTOVER_ENABLED` is off the task is
+    // never spawned, so no timer exists and nothing ever reads `chat.*`. (The
+    // worker re-checks the flag itself, so a future caller that spawns it
+    // unconditionally still performs zero chat access — unlike the device-auth
+    // cleanup worker above, which is unconditional and is its own known problem.)
+    if chat_runtime.cutover_enabled() {
+        let chat_expiry_pool = db_pool.clone();
+        let chat_expiry_runtime = chat_runtime.clone();
+        tokio::spawn(async move {
+            catbird_server::handlers::chat::run_chat_expiry_sweeper(
+                chat_expiry_pool,
+                chat_expiry_runtime,
+            )
+            .await;
+        });
+        tracing::info!("Clean-chat expiry sweeper worker started (cutover enabled)");
+    } else {
+        tracing::info!(
+            "Clean-chat expiry sweeper worker NOT started (CHAT_CUTOVER_ENABLED is off)"
+        );
+    }
+
     let app_state = AppState {
         db_pool: db_pool.clone(),
         sse_state,

@@ -24,6 +24,8 @@ mod context;
 mod device_views;
 mod enroll_device;
 mod errors;
+#[cfg(not(test))]
+mod expiry_worker;
 mod get_devices;
 mod get_own_devices;
 mod rebind_device_authentication;
@@ -43,6 +45,8 @@ mod submit_transition;
 mod welcome;
 
 use errors::ChatFailure;
+#[cfg(not(test))]
+pub use expiry_worker::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
 pub use runtime::ChatRuntime;
 
 /// Build the isolated `blue.catbird.chat.*` router. Generic over the

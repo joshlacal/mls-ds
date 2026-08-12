@@ -32,7 +32,6 @@ pub(crate) enum RecoveryExpiryServiceOutcome {
 /// `ExpiryNotDue`, missing requests, corrupt rows, CAS drift, and storage
 /// failures remain typed [`RecoveryRepositoryError`] values for the scheduler's
 /// retry/logging policy. This function does not translate them into XRPC codes.
-#[allow(dead_code)]
 pub(crate) async fn expire_one(
     pool: &DbPool,
     request_id: Uuid,

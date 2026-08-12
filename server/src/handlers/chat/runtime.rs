@@ -76,7 +76,11 @@ impl ChatRuntime {
         })
     }
 
-    pub(crate) fn cutover_enabled(&self) -> bool {
+    /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at
+    /// startup, whether to spawn the clean-chat background workers at all: while
+    /// the gate is off nothing in this tree may touch `chat.*`, and a worker that
+    /// was merely spawned-and-no-opping would still hold a timer.
+    pub fn cutover_enabled(&self) -> bool {
         self.cutover_enabled
     }
 

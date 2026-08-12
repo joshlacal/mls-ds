@@ -72,13 +72,18 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     Arc::new(ChatRuntime::from_env().expect("build clean-chat runtime"))
 }
 
-fn router(cutover_enabled: bool) -> Router {
-    let pool = sqlx::postgres::PgPoolOptions::new()
+/// A pool that is never connected. Any real database access through it fails,
+/// which is what makes "the gated worker never touched the pool" observable.
+fn lazy_pool() -> DbPool {
+    sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect_lazy("postgres://127.0.0.1/task6_router_must_not_connect")
-        .expect("lazy pool");
+        .expect("lazy pool")
+}
+
+fn router(cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
-        pool,
+        pool: lazy_pool(),
         runtime: runtime(cutover_enabled),
     })
 }
@@ -131,5 +136,88 @@ async fn implemented_task6_routes_reach_admission_when_cutover_is_open() {
         let (status, body) = send(router(true), post(&path)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} is still stubbed");
         assert_eq!(body["error"], "InvalidDPoP", "{path} is still stubbed");
+    }
+}
+
+// ===========================================================================
+// Clean-chat expiry sweeper — cutover gate.
+//
+// The whole `blue.catbird.chat.*` surface must stay inert while
+// `CHAT_CUTOVER_ENABLED` is off; that property is the entire basis for shipping
+// this code dark, and a background worker is the one thing in the tree that
+// could touch `chat.*` with no request to gate it. `main.rs` refuses to spawn
+// the sweeper at all when the flag is off, and the worker re-checks the flag
+// before building its timer or borrowing the pool. These tests pin the second
+// gate directly, using the same never-connectable lazy pool the router tests
+// use: if the gated worker touched the pool at all it would have to connect.
+// ===========================================================================
+mod expiry_sweeper_cutover_gate {
+    use super::{lazy_pool, runtime};
+    use catbird_server::handlers::chat::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
+    use std::time::Duration;
+
+    /// Cutover OFF: the sweeper returns immediately instead of entering its
+    /// loop, so no timer is created and the (never-connectable) pool is never
+    /// used.
+    #[tokio::test]
+    async fn sweeper_returns_immediately_when_cutover_is_off() {
+        let finished = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_chat_expiry_sweeper(lazy_pool(), runtime(false)),
+        )
+        .await;
+        assert!(
+            finished.is_ok(),
+            "a cutover-off sweeper must return without entering its loop"
+        );
+    }
+
+    /// Cutover ON: the same call does NOT return — it enters the sweep loop.
+    /// This is the paired negative that proves the previous test is measuring
+    /// the gate and not merely a worker that always exits.
+    #[tokio::test]
+    async fn sweeper_enters_its_loop_when_cutover_is_on() {
+        let finished = tokio::time::timeout(
+            Duration::from_millis(750),
+            run_chat_expiry_sweeper(lazy_pool(), runtime(true)),
+        )
+        .await;
+        assert!(
+            finished.is_err(),
+            "a cutover-on sweeper must keep sweeping rather than return"
+        );
+    }
+
+    /// The cadence is read from the environment with documented defaults; a
+    /// missing, unparseable, or non-positive value can never produce a zero
+    /// interval (which `tokio::time::interval` would panic on) or an empty
+    /// batch.
+    #[test]
+    fn sweep_config_defaults_are_positive_and_env_overridable() {
+        let defaults = ChatExpirySweepConfig::default();
+        assert_eq!(defaults.interval_secs, 60);
+        assert_eq!(defaults.batch, 128);
+
+        for (interval, batch) in [("0", "0"), ("not-a-number", "-4"), ("", " ")] {
+            std::env::set_var("CHAT_EXPIRY_SWEEP_INTERVAL_SECS", interval);
+            std::env::set_var("CHAT_EXPIRY_SWEEP_BATCH", batch);
+            assert_eq!(
+                ChatExpirySweepConfig::from_env(),
+                defaults,
+                "a rejected value ({interval:?}, {batch:?}) falls back to the default"
+            );
+        }
+
+        std::env::set_var("CHAT_EXPIRY_SWEEP_INTERVAL_SECS", "15");
+        std::env::set_var("CHAT_EXPIRY_SWEEP_BATCH", "7");
+        assert_eq!(
+            ChatExpirySweepConfig::from_env(),
+            ChatExpirySweepConfig {
+                interval_secs: 15,
+                batch: 7
+            }
+        );
+        std::env::remove_var("CHAT_EXPIRY_SWEEP_INTERVAL_SECS");
+        std::env::remove_var("CHAT_EXPIRY_SWEEP_BATCH");
     }
 }
