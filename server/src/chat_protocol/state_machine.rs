@@ -20807,6 +20807,143 @@ pub(in crate::chat_protocol) mod executor {
             && server_instant(expires_at).is_ok_and(|expiry| applied_at >= expiry)
     }
 
+    /// Which reset / leave / Welcome edge, if any, the calling arm terminalizes
+    /// itself. Everything else in those three families is prior-bound work the
+    /// arm's coordinate change retires.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum OwnStalingKind {
+        /// The arm terminalizes none of these families itself.
+        None,
+        /// `apply_leave_fulfillment` fulfills its requester's leave
+        /// (`Pending -> Fulfilled`); per ADR-019 Erratum 01 the same `leaveCommit`
+        /// MAY additionally stale other members' prior-bound pending leaves.
+        LeaveFulfillment,
+    }
+
+    /// The single prior-bound reset / leave / Welcome classifier, shared by the
+    /// coordinate-changing executor arms and called by each strictly BEFORE its own
+    /// first head compare-and-set. Returns the terminalized Welcome ids so a caller
+    /// can prove its disposition bijection against them.
+    ///
+    /// Extracted from `preflight_metadata_transition`, the only arm that proved
+    /// these shapes. The others relied on `reconcile_coordinate_change_families`,
+    /// but that fence runs AFTER the writers and only counts what they consumed —
+    /// and both `write_welcome_supersessions` and `write_prior_bound_staling`
+    /// accept a `Pending->Expired` delta. An incoherent expiry (transition evidence
+    /// carried on an `Expired` status, or an expiry not yet due at `applied_at`)
+    /// therefore reconciled cleanly and COMMITTED, terminalizing a live Welcome
+    /// delivery / reset / leave request that was never actually due.
+    ///
+    /// Derives every comparand from `plan` and `ctx` — the prior coordinate from
+    /// the head CAS, the producer from the hydrated successor state. `own_kind`
+    /// selects the arm's own edge by exact typed shape, never by a caller-supplied
+    /// id or predicate; that edge's cardinality stays the arm's own pre-CAS check.
+    fn classify_prior_bound_staling(
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        own_kind: OwnStalingKind,
+    ) -> Result<BTreeSet<[u8; 16]>, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects.head_cas().ok_or(ExecutorError::InconsistentPlan(
+            "prior-bound staling needs a head CAS binding",
+        ))?;
+        let prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "prior-bound staling needs an expected prior",
+            ))?;
+        let producer = &plan.state().producer;
+
+        for change in effects.reset_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound reset request delta is not terminal",
+                ));
+            };
+            let exact_terminal = match after.status {
+                ResetRequestStatus::Stale => {
+                    terminal_is_exact_transition(&after.terminal, producer)
+                }
+                ResetRequestStatus::Expired => {
+                    terminal_is_exact_due_expiry(&after.terminal, after.expires_at, ctx.applied_at)
+                }
+                _ => false,
+            };
+            if !reset_request_identity_is_unchanged(before, after)
+                || before.status != ResetRequestStatus::Pending
+                || before.bound_coordinate != *prior
+                || !exact_terminal
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound reset request staling drifted",
+                ));
+            }
+        }
+
+        for change in effects.leave_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound leave request delta is not terminal",
+                ));
+            };
+            // The arm's own fulfillment edge binds a fulfilled participant, so it is
+            // neither identity-unchanged nor a staling. Select it out here; its
+            // cardinality and exact shape stay `apply_leave_fulfillment`'s own
+            // pre-CAS partition (exactly one Fulfilled, never also staled).
+            if own_kind == OwnStalingKind::LeaveFulfillment
+                && after.status == LeaveRequestStatus::Fulfilled
+            {
+                continue;
+            }
+            let exact_terminal = match after.status {
+                LeaveRequestStatus::Stale => {
+                    terminal_is_exact_transition(&after.terminal, producer)
+                }
+                LeaveRequestStatus::Expired => {
+                    terminal_is_exact_due_expiry(&after.terminal, after.expires_at, ctx.applied_at)
+                }
+                _ => false,
+            };
+            if !leave_request_identity_is_unchanged(before, after)
+                || before.status != LeaveRequestStatus::Pending
+                || before.bound_coordinate != *prior
+                || !exact_terminal
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound leave request staling drifted",
+                ));
+            }
+        }
+        let mut welcome_ids = BTreeSet::new();
+        for change in effects.welcome_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound Welcome delta is not terminal",
+                ));
+            };
+            let exact_terminal = match after.status {
+                WelcomeStatus::Superseded => {
+                    terminal_is_exact_transition(&after.terminal, producer)
+                }
+                WelcomeStatus::Expired => {
+                    terminal_is_exact_due_expiry(&after.terminal, after.expires_at, ctx.applied_at)
+                }
+                _ => false,
+            };
+            if !welcome_identity_is_unchanged(before, after)
+                || before.status != WelcomeStatus::Pending
+                || before.coordinate != *prior
+                || !exact_terminal
+                || !welcome_ids.insert(after.welcome_id)
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound Welcome supersession drifted",
+                ));
+            }
+        }
+        Ok(welcome_ids)
+    }
+
     /// Everything the nine executor arms may know about prior-bound recovery work.
     ///
     /// `PriorBoundPartition`'s fields are private to this module and it has no public
@@ -22725,90 +22862,10 @@ pub(in crate::chat_protocol) mod executor {
         // implementation; it is now the shared classifier every one of the nine
         // coordinate-changing arms calls, strictly before its own first head CAS.
         let prior_bound_partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
-        for change in effects.reset_request_changes() {
-            let (Some(before_reset), Some(after_reset)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata reset request delta is not terminal",
-                ));
-            };
-            let exact_terminal = match after_reset.status {
-                ResetRequestStatus::Stale => {
-                    terminal_is_exact_transition(&after_reset.terminal, producer)
-                }
-                ResetRequestStatus::Expired => terminal_is_exact_due_expiry(
-                    &after_reset.terminal,
-                    after_reset.expires_at,
-                    ctx.applied_at,
-                ),
-                _ => false,
-            };
-            if !reset_request_identity_is_unchanged(before_reset, after_reset)
-                || before_reset.status != ResetRequestStatus::Pending
-                || before_reset.bound_coordinate != *prior
-                || !exact_terminal
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata reset request staling drifted",
-                ));
-            }
-        }
-        for change in effects.leave_request_changes() {
-            let (Some(before_leave), Some(after_leave)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata leave request delta is not terminal",
-                ));
-            };
-            let exact_terminal = match after_leave.status {
-                LeaveRequestStatus::Stale => {
-                    terminal_is_exact_transition(&after_leave.terminal, producer)
-                }
-                LeaveRequestStatus::Expired => terminal_is_exact_due_expiry(
-                    &after_leave.terminal,
-                    after_leave.expires_at,
-                    ctx.applied_at,
-                ),
-                _ => false,
-            };
-            if !leave_request_identity_is_unchanged(before_leave, after_leave)
-                || before_leave.status != LeaveRequestStatus::Pending
-                || before_leave.bound_coordinate != *prior
-                || !exact_terminal
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata leave request staling drifted",
-                ));
-            }
-        }
-        let mut welcome_ids = BTreeSet::new();
-        for change in effects.welcome_changes() {
-            let (Some(before_welcome), Some(after_welcome)) = (change.before(), change.after())
-            else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata Welcome delta is not terminal",
-                ));
-            };
-            let exact_terminal = match after_welcome.status {
-                WelcomeStatus::Superseded => {
-                    terminal_is_exact_transition(&after_welcome.terminal, producer)
-                }
-                WelcomeStatus::Expired => terminal_is_exact_due_expiry(
-                    &after_welcome.terminal,
-                    after_welcome.expires_at,
-                    ctx.applied_at,
-                ),
-                _ => false,
-            };
-            if !welcome_identity_is_unchanged(before_welcome, after_welcome)
-                || before_welcome.status != WelcomeStatus::Pending
-                || before_welcome.coordinate != *prior
-                || !exact_terminal
-                || !welcome_ids.insert(after_welcome.welcome_id)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata Welcome supersession drifted",
-                ));
-            }
-        }
+        // Prior-bound reset / leave / Welcome families. This block WAS the reference
+        // implementation too; it is now `classify_prior_bound_staling`, shared with
+        // the five arms that previously proved none of it.
+        let welcome_ids = classify_prior_bound_staling(plan, ctx, OwnStalingKind::None)?;
         let disposition_ids = ctx
             .welcome_dispositions
             .iter()
@@ -26250,6 +26307,13 @@ pub(in crate::chat_protocol) mod executor {
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
         let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // generic commit
+
+        // Prior-bound reset / leave / Welcome families. A generic commit owns none of
+        // them, so every such delta must be an exact terminalization of prior-bound
+        // work. The tail reconciliation only counts what the writers consumed, and
+        // both writers accept a `Pending->Expired` shape, so an incoherent expiry
+        // used to commit here.
+        classify_prior_bound_staling(plan, ctx, OwnStalingKind::None)?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
             || effects.invitation_quota_cas().is_some()
@@ -26634,6 +26698,10 @@ pub(in crate::chat_protocol) mod executor {
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         // Prior-bound package work is CLASSIFIED, not rejected.
         let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
+        // Prior-bound reset / leave / Welcome families. The arm's ONE own leave edge
+        // (Pending->Fulfilled) is selected out by kind; every other delta must be an
+        // exact terminalization of prior-bound work.
+        classify_prior_bound_staling(plan, ctx, OwnStalingKind::LeaveFulfillment)?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
@@ -27368,6 +27436,9 @@ pub(in crate::chat_protocol) mod executor {
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
         let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // policy
+
+        // Prior-bound reset / leave / Welcome families. Policy owns none of them.
+        classify_prior_bound_staling(plan, ctx, OwnStalingKind::None)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("policy metadata change"));
         }
@@ -27852,6 +27923,10 @@ pub(in crate::chat_protocol) mod executor {
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
         let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // zero-leaf leave
+
+        // Prior-bound reset / leave / Welcome families. A zero-leaf leave owns none
+        // of them (its own consent never reaches a leave-request delta here).
+        classify_prior_bound_staling(plan, ctx, OwnStalingKind::None)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "zero-leaf leave metadata change",
@@ -28129,6 +28204,9 @@ pub(in crate::chat_protocol) mod executor {
         // recovery fulfillment. The shared classifier proves both rows, strictly
         // before this arm's first head CAS.
         let partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // close
+
+        // Prior-bound reset / leave / Welcome families. A close owns none of them.
+        classify_prior_bound_staling(plan, ctx, OwnStalingKind::None)?;
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("close metadata change"));
         }
