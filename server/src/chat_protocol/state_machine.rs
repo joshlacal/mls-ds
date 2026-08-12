@@ -31346,6 +31346,14 @@ pub(in crate::chat_protocol) mod executor {
                 .clone();
             let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
             let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            // Production relation, not the boundary. MIN_KEY_PACKAGE_REMAINING_SECONDS
+            // (600) strictly exceeds RECOVERY_RESERVATION_TTL_MILLIS (300_000) and the
+            // floor is re-enforced at CLAIM time against claimed_at
+            // (repository/core.rs:2994, :3397), so a claimed package always outlives its
+            // reservation. A fixture with package_not_after == expires_at sits exactly on
+            // `terminal_time >= after.package_not_after` (:9984) and makes the planner
+            // emit Reserved -> Expired — a shape production cannot produce.
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
             let terminal = Some(WorkTerminalEvidence::Expiry(expires_at));
             let mut expected = FamilyCounts {
                 requests: 0,
@@ -31392,7 +31400,7 @@ pub(in crate::chat_protocol) mod executor {
                         key_package_ref,
                         received_at,
                         expires_at,
-                        package_not_after: expires_at,
+                        package_not_after,
                         status: ReservationStatus::Active,
                         terminal: None,
                     };
@@ -31411,7 +31419,11 @@ pub(in crate::chat_protocol) mod executor {
                         request_id,
                         key_package_ref,
                         from: PackageStatus::Reserved,
-                        to: PackageStatus::Expired,
+                        // Production shape: terminal_time (expires_at) is strictly
+                        // before package_not_after, so the real selector at :9984
+                        // yields Available. Tests that need the unproducible
+                        // Reserved -> Expired mutate this deliberately.
+                        to: PackageStatus::Available,
                     });
                     let mut package_cas = RecoveryPackageCasBinding {
                         transaction_id: plan
@@ -31429,10 +31441,10 @@ pub(in crate::chat_protocol) mod executor {
                         bound_coordinate: prior,
                         key_package_ref,
                         key_package_wrapper_sha256: [0x63; 32],
-                        package_not_after: expires_at,
+                        package_not_after,
                         claimed_at: received_at,
                         expected_status: PackageStatus::Reserved,
-                        successor_status: PackageStatus::Expired,
+                        successor_status: PackageStatus::Available,
                         locked_row_digest: [0x64; 32],
                         authority_digest: [0; 32],
                     };
@@ -31647,7 +31659,22 @@ pub(in crate::chat_protocol) mod executor {
             // clamps) while every reader still accepted it. Closing that
             // writer-cannot-produce / reader-still-accepts asymmetry is the point
             // of the correction, so this assertion must invert.
-            let (plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+            // The fixture now emits the PRODUCTION shape (Reserved -> Available), so the
+            // unproducible edge has to be constructed deliberately — which is the honest
+            // way to assert that it is rejected.
+            let (mut plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+            for edge in plan.effects.package_transitions.iter_mut() {
+                if edge.to == PackageStatus::Available {
+                    edge.to = PackageStatus::Expired;
+                }
+            }
+            for binding in plan.effects.recovery_package_cas.iter_mut() {
+                if binding.successor_status == PackageStatus::Available {
+                    binding.successor_status = PackageStatus::Expired;
+                    binding.authority_digest = [0; 32];
+                    binding.authority_digest = recovery_package_cas_authority_digest(binding);
+                }
+            }
             match preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6) {
                 Err(ExecutorError::InconsistentPlan(_)) => {}
                 Ok(_) => panic!("Reserved -> Expired prior-bound package edge was accepted"),
@@ -31683,38 +31710,19 @@ pub(in crate::chat_protocol) mod executor {
         /// REGRESSION — the Row B legality proof for the C2 prior-bound correction.
         ///
         /// A due-expiry family whose package returns to `Available` is legal
-        /// prior-bound work. Before the correction only `preflight_metadata_transition`
-        /// proved it; the other eight arms carried guards that accepted Row A
-        /// (`Open -> Superseded` / `Active -> Released`) ONLY, so this exact shape was
-        /// rejected by leaf recovery fulfillment (wedging the recovering device
-        /// permanently, since retry re-planned the identical shape), and by generic
-        /// commit, policy, zero-leaf leave, close and reset activation. All nine now
-        /// share one classifier, so proving the shape here proves it for every arm.
+        /// prior-bound work, and it is what the planner actually emits.
+        ///
+        /// SCOPE, stated honestly: this exercises `preflight_metadata_transition`, the
+        /// ONE arm that always accepted the shape — it passes at sealed e98 too. It is a
+        /// non-regression check on the extraction, NOT proof for the other eight arms.
+        /// The arms that used to reject this shape are covered by
+        /// `fulfillment_arm_tolerates_an_overdue_peer_recovery_family` and
+        /// `prior_bound_only_arm_accepts_a_row_b_family`.
         #[test]
         fn prior_bound_row_b_due_expiry_is_accepted_with_a_release_edge() {
-            let (mut plan, context, expected) =
-                exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+            let (plan, context, expected) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
 
-            // The fixture ships the production-unproducible `Reserved -> Expired`
-            // edge. Turn it into the legal Row B shape: the request and reservation
-            // still expire by exact due-expiry evidence, but the PACKAGE is released
-            // back to `Available` — which is what a real expiry sweep emits, because
-            // MIN_KEY_PACKAGE_REMAINING (600s) strictly exceeds
-            // RECOVERY_RESERVATION_TTL (300s), so the package always outlives the
-            // reservation.
-            for edge in plan.effects.package_transitions.iter_mut() {
-                if edge.to == PackageStatus::Expired {
-                    edge.to = PackageStatus::Available;
-                }
-            }
-            for binding in plan.effects.recovery_package_cas.iter_mut() {
-                if binding.successor_status == PackageStatus::Expired {
-                    binding.successor_status = PackageStatus::Available;
-                    binding.authority_digest = [0; 32];
-                    binding.authority_digest = recovery_package_cas_authority_digest(binding);
-                }
-            }
-
+            // No hand-patching: the fixture already carries the production shape.
             preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
                 .expect("a legal Row B due-expiry family must be executable");
             reconcile_coordinate_change_families(
@@ -31745,6 +31753,7 @@ pub(in crate::chat_protocol) mod executor {
             locked_row_digest: [u8; 32],
             received_at: ServerTimestamp,
             expires_at: ServerTimestamp,
+            package_not_after: ServerTimestamp,
             after_request_status: RecoveryRequestStatus,
             after_reservation_status: ReservationStatus,
             terminal: Option<WorkTerminalEvidence>,
@@ -31781,7 +31790,7 @@ pub(in crate::chat_protocol) mod executor {
                 key_package_ref,
                 received_at,
                 expires_at,
-                package_not_after: expires_at,
+                package_not_after,
                 status: ReservationStatus::Active,
                 terminal: None,
             };
@@ -31818,7 +31827,7 @@ pub(in crate::chat_protocol) mod executor {
                 bound_coordinate: prior,
                 key_package_ref,
                 key_package_wrapper_sha256: [0x63; 32],
-                package_not_after: expires_at,
+                package_not_after,
                 claimed_at: received_at,
                 expected_status: PackageStatus::Reserved,
                 successor_status: package_to,
@@ -31845,7 +31854,7 @@ pub(in crate::chat_protocol) mod executor {
         /// shape that used to wedge: one own family closing by this producer's
         /// transition, plus one overdue peer family closing by due expiry.
         #[test]
-        fn fulfillment_tolerates_an_overdue_peer_recovery_family() {
+        fn fulfillment_arm_tolerates_an_overdue_peer_recovery_family() {
             let (mut plan, context) = exact_fixture();
             let prior = plan.expected_prior.expect("prior");
             let actor = plan
@@ -31862,6 +31871,14 @@ pub(in crate::chat_protocol) mod executor {
             let producer = plan.state.producer.clone();
             let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
             let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            // Production relation, not the boundary. MIN_KEY_PACKAGE_REMAINING_SECONDS
+            // (600) strictly exceeds RECOVERY_RESERVATION_TTL_MILLIS (300_000) and the
+            // floor is re-enforced at CLAIM time against claimed_at
+            // (repository/core.rs:2994, :3397), so a claimed package always outlives its
+            // reservation. A fixture with package_not_after == expires_at sits exactly on
+            // `terminal_time >= after.package_not_after` (:9984) and makes the planner
+            // emit Reserved -> Expired — a shape production cannot produce.
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
 
             let own_request_id = uuid(0x60);
             let own_ref = [0x61; 32];
@@ -31875,6 +31892,7 @@ pub(in crate::chat_protocol) mod executor {
                 [0x64; 32],
                 received_at,
                 expires_at,
+                package_not_after,
                 RecoveryRequestStatus::Fulfilled,
                 ReservationStatus::Consumed,
                 Some(WorkTerminalEvidence::Transition(producer)),
@@ -31894,18 +31912,46 @@ pub(in crate::chat_protocol) mod executor {
                 [0x69; 32],
                 received_at,
                 expires_at,
+                package_not_after,
                 RecoveryRequestStatus::Expired,
                 ReservationStatus::Expired,
                 Some(WorkTerminalEvidence::Expiry(expires_at)),
                 PackageStatus::Available,
             );
 
+            // Drive the REAL ARM, not just the extracted classifier. Defect 2 lived in
+            // `preflight_leaf_recovery_fulfillment`, which had zero test callers — that
+            // absence is why the wedge shipped.
+            //
+            // SCOPE, stated honestly: this plan is metadata-shaped, so the arm cannot
+            // reach Ok — it needs an own pending Welcome it does not carry. What this
+            // asserts is exactly the property Defect 2 broke: with an overdue peer
+            // present, the arm passes prior-bound classification and reaches a LATER,
+            // unrelated guard. Any prior-bound rejection yields a different message and
+            // fails this assertion, which is what makes it discriminating.
+            match preflight_leaf_recovery_fulfillment(
+                &plan,
+                plan.effects(),
+                plan.state(),
+                &context,
+                Uuid::from_bytes(uuid(0x24)),
+                6,
+            ) {
+                Err(ExecutorError::InconsistentPlan(message)) => assert_eq!(
+                    message, "fulfillment carries no own pending welcome",
+                    "the arm must get PAST prior-bound classification with an overdue \
+                     peer present; a prior-bound error here means the wedge is back"
+                ),
+                Ok(_) => panic!("metadata-shaped plan unexpectedly satisfied the whole arm"),
+                Err(error) => panic!("arm failed with an unexpected error: {error:?}"),
+            }
+
             let partition = classify_prior_bound_recovery(
                 &plan,
                 &context,
                 OwnFamilyKind::LeafRecoveryFulfillment,
             )
-            .expect("an overdue peer family must not wedge leaf recovery fulfillment");
+            .expect("classifier agrees with the arm");
 
             assert_eq!(
                 partition.own,
@@ -31944,6 +31990,14 @@ pub(in crate::chat_protocol) mod executor {
                 .clone();
             let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
             let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            // Production relation, not the boundary. MIN_KEY_PACKAGE_REMAINING_SECONDS
+            // (600) strictly exceeds RECOVERY_RESERVATION_TTL_MILLIS (300_000) and the
+            // floor is re-enforced at CLAIM time against claimed_at
+            // (repository/core.rs:2994, :3397), so a claimed package always outlives its
+            // reservation. A fixture with package_not_after == expires_at sits exactly on
+            // `terminal_time >= after.package_not_after` (:9984) and makes the planner
+            // emit Reserved -> Expired — a shape production cannot produce.
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
 
             // A Fulfilled/Consumed family — the own shape — but terminalized by expiry.
             push_recovery_family(
@@ -31956,6 +32010,7 @@ pub(in crate::chat_protocol) mod executor {
                 [0x64; 32],
                 received_at,
                 expires_at,
+                package_not_after,
                 RecoveryRequestStatus::Fulfilled,
                 ReservationStatus::Consumed,
                 Some(WorkTerminalEvidence::Expiry(expires_at)),
@@ -31971,6 +32026,67 @@ pub(in crate::chat_protocol) mod executor {
                 Ok(_) => panic!("an own family closing by due expiry was accepted"),
                 Err(error) => panic!("rejected with the wrong executor error: {error:?}"),
             }
+        }
+
+        /// REGRESSION FOR DEFECT 1, at the level a no-DB test can reach.
+        ///
+        /// `apply_leave_fulfillment` carried
+        /// `reject_if_present("recovery_package_cas", ..)`, which — because
+        /// `into_persistence_plan` enforces the CAS <-> edge bijection — meant "reject any
+        /// plan carrying any package edge", the exact opposite of the comment above it.
+        /// Any leaveCommit on a coordinate with open recovery work was planner-legal and
+        /// executor-fatal. That arm is `async` and needs a live transaction, so the
+        /// end-to-end proof belongs in the DB packet; what is provable here is the
+        /// classification the arm now performs instead of rejecting — and `OwnFamilyKind::None`
+        /// carrying real prior-bound work had no direct coverage at all.
+        #[test]
+        fn prior_bound_only_arm_accepts_a_row_b_family() {
+            let (mut plan, context) = exact_fixture();
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("actor authority")
+                .actor
+                .clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
+
+            // One overdue prior-bound family and nothing owned — the shape a leaveCommit
+            // over a coordinate with open recovery work carries.
+            let request_id = uuid(0x66);
+            let key_package_ref = [0x67; 32];
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                request_id,
+                key_package_ref,
+                [0x68; 32],
+                [0x69; 32],
+                received_at,
+                expires_at,
+                package_not_after,
+                RecoveryRequestStatus::Expired,
+                ReservationStatus::Expired,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Available,
+            );
+
+            let partition = classify_prior_bound_recovery(&plan, &context, OwnFamilyKind::None)
+                .expect("prior-bound recovery work must be classified, not rejected");
+            assert_eq!(partition.own, None, "this arm owns no recovery family");
+            assert_eq!(partition.requests(), 1);
+            assert!(
+                partition.keys().contains(&(request_id, key_package_ref)),
+                "the family must be carried to the writer, not dropped"
+            );
         }
 
         /// The keyed write-receipt check (design 5 step 6). `write_prior_bound_supersessions`
@@ -32049,6 +32165,15 @@ pub(in crate::chat_protocol) mod executor {
                     .clone();
                 let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
                 let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+                let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
+            // Production relation, not the boundary. MIN_KEY_PACKAGE_REMAINING_SECONDS
+            // (600) strictly exceeds RECOVERY_RESERVATION_TTL_MILLIS (300_000) and the
+            // floor is re-enforced at CLAIM time against claimed_at
+            // (repository/core.rs:2994, :3397), so a claimed package always outlives its
+            // reservation. A fixture with package_not_after == expires_at sits exactly on
+            // `terminal_time >= after.package_not_after` (:9984) and makes the planner
+            // emit Reserved -> Expired — a shape production cannot produce.
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
                 let request_id = uuid(0x60);
                 let key_package_ref = [0x61; 32];
                 let origin_key_id = [0x62; 32];
@@ -32085,7 +32210,7 @@ pub(in crate::chat_protocol) mod executor {
                         key_package_ref,
                         received_at,
                         expires_at,
-                        package_not_after: expires_at,
+                        package_not_after,
                         status: ReservationStatus::Active,
                         terminal: None,
                     }),
@@ -32112,7 +32237,7 @@ pub(in crate::chat_protocol) mod executor {
                     bound_coordinate: bound,
                     key_package_ref,
                     key_package_wrapper_sha256: [0x63; 32],
-                    package_not_after: expires_at,
+                    package_not_after,
                     claimed_at: received_at,
                     expected_status: PackageStatus::Available,
                     successor_status: PackageStatus::Reserved,
@@ -32274,7 +32399,21 @@ pub(in crate::chat_protocol) mod executor {
             // `Reserved -> Expired` package edge is production-unproducible and
             // must now be rejected rather than accepted.
             {
-                let (plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+                // The fixture emits the PRODUCTION shape (Reserved -> Available), so the
+                // unproducible edge is constructed deliberately here.
+                let (mut plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+                for edge in plan.effects.package_transitions.iter_mut() {
+                    if edge.to == PackageStatus::Available {
+                        edge.to = PackageStatus::Expired;
+                    }
+                }
+                for binding in plan.effects.recovery_package_cas.iter_mut() {
+                    if binding.successor_status == PackageStatus::Available {
+                        binding.successor_status = PackageStatus::Expired;
+                        binding.authority_digest = [0; 32];
+                        binding.authority_digest = recovery_package_cas_authority_digest(binding);
+                    }
+                }
                 match preflight_metadata_transition(
                     &plan,
                     &context,
