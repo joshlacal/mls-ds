@@ -405,6 +405,63 @@ async fn assert_welcome_source_commit_rejects(
     );
 }
 
+/// The exact `revokeDevice` wrapper/transcript shapes every seeded receipt must
+/// carry. `assert_operation_claim_mapping` (migrations 20260728000002/000004)
+/// derives the mutation kind from BOTH the wrapper JSON (`body.$type`) and the
+/// transcript's NUL-terminated signature domain, then requires
+/// claim == wrapper == transcript kind under an endpoint that accepts it, so
+/// these bytes must be CLASSIFIABLE rather than arbitrary.
+const REVOKE_DEVICE_WRAPPER_JSON: &[u8] =
+    br#"{"body":{"$type":"blue.catbird.chat.defs#deviceRevocationBody"}}"#;
+const REVOKE_DEVICE_TRANSCRIPT_DOMAIN: &[u8] = b"CATBIRD-CHAT-DEVICE-REVOKE\0";
+
+/// Seed the parent `revokeDevice` operation claim of a receipt about to be
+/// written in the same transaction.
+///
+/// `idempotency_records_operation_claim_fk` (migration 20260728000004) is
+/// IMMEDIATE, so the claim must precede its receipt, carrying the exact
+/// authority columns the deferred `assert_operation_claim_mapping` re-joins the
+/// receipt on. The `populated_pre_v4_upgrade_*` fixtures reach these same
+/// revocation seeds through `fresh_pre_v4_upgrade_db`, whose schema predates
+/// `chat.operation_claims` entirely — there the claim is not required and the
+/// table does not exist, so probe before writing.
+async fn seed_revoke_operation_claim(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    principal_did: &str,
+    operation_id: Uuid,
+    request_digest: &[u8],
+    accepted_request_bytes: &[u8],
+    signature: &[u8],
+    claimed_at: DateTime<Utc>,
+) {
+    let claims_exist: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.operation_claims') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await
+            .expect("probe chat.operation_claims");
+    if !claims_exist {
+        return;
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO chat.operation_claims(
+            operation_id, principal_did, endpoint_nsid, mutation_kind,
+            request_digest, accepted_request_sha256, signature, claimed_at
+        ) VALUES($1,$2,'blue.catbird.chat.revokeDevice',
+                 'blue.catbird.chat.defs#deviceRevocationBody',$3,$4,$5,$6)
+        "#,
+    )
+    .bind(operation_id)
+    .bind(principal_did)
+    .bind(request_digest)
+    .bind(Sha256::digest(accepted_request_bytes).to_vec())
+    .bind(signature)
+    .bind(claimed_at)
+    .execute(&mut **tx)
+    .await
+    .expect("seed revokeDevice operation claim");
+}
+
 async fn commit_isolated_device_revocation(pool: &PgPool) -> (Uuid, DateTime<Utc>) {
     let target_did = random_plc_did();
     let target_device = Uuid::new_v4();
@@ -415,12 +472,23 @@ async fn commit_isolated_device_revocation(pool: &PgPool) -> (Uuid, DateTime<Utc
     let accepted_at = DateTime::from_timestamp_millis(clock_now(pool).await.timestamp_millis())
         .expect("whole-millisecond isolated revocation instant");
     let revocation_id = Uuid::new_v4();
-    let accepted_request = vec![0x91_u8; 8];
-    let signing_transcript = vec![0x92_u8; 8];
+    let accepted_request = REVOKE_DEVICE_WRAPPER_JSON.to_vec();
+    let mut signing_transcript = REVOKE_DEVICE_TRANSCRIPT_DOMAIN.to_vec();
+    signing_transcript.extend_from_slice(&[0x92_u8; 8]);
     let request_digest = Sha256::digest(&signing_transcript).to_vec();
     let signature = vec![0x93_u8; 64];
     let response = vec![0x94_u8; 8];
     let mut tx = pool.begin().await.expect("begin isolated revocation");
+    seed_revoke_operation_claim(
+        &mut tx,
+        &target_did,
+        revocation_id,
+        &request_digest,
+        &accepted_request,
+        &signature,
+        accepted_at,
+    )
+    .await;
     sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
@@ -10952,10 +11020,11 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
     // revocation actor_key_id (which the batch re-encodes back to `alice_key_id`).
     let actor_key_id: [u8; 32] = Sha256::digest(&alice_sig_key).into();
     let revocation_id = Uuid::new_v4();
-    let signing_transcript = vec![0x7b_u8; 24];
+    let mut signing_transcript = REVOKE_DEVICE_TRANSCRIPT_DOMAIN.to_vec();
+    signing_transcript.extend_from_slice(&[0x7b_u8; 24]);
     let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
     let signature = [0x5a_u8; 64];
-    let signed_request = vec![0x7c_u8; 24];
+    let signed_request = REVOKE_DEVICE_WRAPPER_JSON.to_vec();
     let evidence = DeviceRevocationEvidence::for_test(
         *revocation_id.as_bytes(),
         alice_id.clone(),
@@ -11044,12 +11113,22 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
     }
 }
 
-/// Seed the `revokeDevice` idempotency receipt the DEFERRED mapping trigger
-/// requires (production's request handler writes this through the sealed
-/// operation-completion path).
+/// Seed the `revokeDevice` operation claim + idempotency receipt the DEFERRED
+/// mapping triggers require (production's request handler writes both through
+/// the sealed operation-completion path).
 async fn seed_revoke_receipt(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, s: &RevocationSetup) {
     let response_bytes = b"revokeDevice-ok".to_vec();
     let response_sha256 = Sha256::digest(&response_bytes).to_vec();
+    seed_revoke_operation_claim(
+        tx,
+        &s.target_did,
+        s.revocation_id,
+        &s.request_digest,
+        &s.signed_request,
+        &s.signature,
+        s.accepted_dt,
+    )
+    .await;
     sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
@@ -11218,9 +11297,10 @@ async fn commit_bob_welcome_revocation(
     let accepted_st =
         ServerTimestamp::from_unix_millis_for_test(accepted_at.timestamp_millis()).unwrap();
     let revocation_id = Uuid::new_v4();
-    let signing_transcript = vec![0x8A_u8; 24];
+    let mut signing_transcript = REVOKE_DEVICE_TRANSCRIPT_DOMAIN.to_vec();
+    signing_transcript.extend_from_slice(&[0x8A_u8; 24]);
     let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
-    let signed_request = vec![0x8B_u8; 24];
+    let signed_request = REVOKE_DEVICE_WRAPPER_JSON.to_vec();
     let signature = [0x8C_u8; 64];
     let actor_key_id: [u8; 32] = Sha256::digest(&bob_signing_key).into();
     let evidence = DeviceRevocationEvidence::for_test(
@@ -11307,6 +11387,16 @@ async fn commit_bob_welcome_revocation(
 
     let response_bytes = b"revokeDevice-welcome-ok".to_vec();
     let mut tx = pool.begin().await.expect("begin Welcome revocation");
+    seed_revoke_operation_claim(
+        &mut tx,
+        &scenario.bob_did,
+        revocation_id,
+        &request_digest,
+        &signed_request,
+        &signature,
+        accepted_at,
+    )
+    .await;
     sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
