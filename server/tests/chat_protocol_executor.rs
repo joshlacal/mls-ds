@@ -77,9 +77,31 @@ mod chat_protocol {
         // included state-machine module retains their sealed proof types in
         // signatures. Minimal opaque stubs keep that production boundary
         // unforgeable while allowing the legacy test seam to compile.
+        // `execution_context` is `#[cfg(not(test))]` in the lib, so the
+        // `#[path]`-including harness must include the real module itself; the
+        // seed harness needs its unscoped hydrator and artifacts.
+        #[allow(dead_code)]
         pub mod execution_context {
-            pub(crate) struct ExecutionContextHydrationProof;
-            pub(crate) struct RevocationBatchHydrationProof;
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/execution_context.rs"
+            ));
+        }
+        // Unconditionally compiled in the lib for exactly this reason (see the
+        // comments on `repository::blobs` / `key_packages` in repository/mod.rs).
+        #[allow(dead_code)]
+        pub mod blobs {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/blobs.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod key_packages {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/key_packages.rs"
+            ));
         }
         #[allow(dead_code)]
         pub mod auth {
@@ -102,6 +124,59 @@ mod chat_protocol {
             /// every raw test passes `None`.
             pub(crate) struct RecoveryPersistenceWitness {
                 _private: (),
+            }
+
+            /// The executor accepts `Option<RecoveryExecutorWriteAuthority>`; the raw
+            /// harness never mints one, so an opaque lifetime-carrying stand-in keeps
+            /// the production boundary unforgeable while letting the seam compile.
+            pub(crate) struct RecoveryExecutorWriteAuthority<'witness> {
+                _private: std::marker::PhantomData<&'witness ()>,
+            }
+
+            impl RecoveryExecutorWriteAuthority<'_> {
+                pub(crate) async fn apply_open(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::executor::ExecutorError>
+                {
+                    unreachable!("the raw executor harness never mints a write authority")
+                }
+
+                pub(crate) async fn apply_terminal(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<(), super::super::state_machine::executor::ExecutorError>
+                {
+                    unreachable!("the raw executor harness never mints a write authority")
+                }
+            }
+
+            /// Opaque stand-in: `execution_context` names this type in a signature the
+            /// harness never exercises.
+            pub(crate) struct PreparedRecoveryExecutionGraph {
+                _private: (),
+            }
+
+            impl PreparedRecoveryExecutionGraph {
+                pub(crate) fn plan(
+                    &self,
+                ) -> &super::super::state_machine::ConversationPersistencePlan {
+                    unreachable!("the raw executor harness never prepares a recovery graph")
+                }
+
+                pub(crate) fn accepted_control_entry_bytes(&self) -> Option<Vec<u8>> {
+                    unreachable!("the raw executor harness never prepares a recovery graph")
+                }
+
+                pub(crate) async fn validate_prewrite(
+                    &self,
+                    _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                ) -> Result<
+                    RecoveryExecutorWriteAuthority<'_>,
+                    super::super::repository::execution_context::ExecutionContextHydrationError,
+                > {
+                    unreachable!("the raw executor harness never prepares a recovery graph")
+                }
             }
 
             /// Opaque authority required by exact Recovery SQL writers. Raw
@@ -1094,6 +1169,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     // 5. Apply + COMMIT the policy edge.
@@ -1680,6 +1756,7 @@ async fn build_signed_policy_apply(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     PolicyApplyFixture {
         plan,
@@ -2139,6 +2216,7 @@ fn close_ctx(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     }
 }
 
@@ -2392,6 +2470,7 @@ async fn reset_request_commits_without_changing_the_coordinate() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin reset");
@@ -2547,6 +2626,7 @@ async fn commit_reset_request(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     let mut tx = pool.begin().await.expect("begin reset request");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -2752,6 +2832,7 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin activation");
@@ -3016,6 +3097,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -3207,6 +3289,7 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
@@ -3519,6 +3602,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -3644,6 +3728,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -3832,6 +3917,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
@@ -4149,6 +4235,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -4409,6 +4496,7 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -4615,6 +4703,7 @@ async fn acceptance_stales_prior_pending_reset_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -4779,6 +4868,7 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -4991,6 +5081,7 @@ async fn build_replace_recovery_request(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     BuiltReplaceRequest {
         plan,
@@ -5165,6 +5256,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     // Preparing and then abandoning the plan is write-free. This is the
@@ -5458,6 +5550,7 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
         }),
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin welcome expiry");
@@ -5692,6 +5785,7 @@ async fn build_welcome_response(
             rejection,
         }),
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     (plan, ctx, expires_at)
 }
@@ -6124,6 +6218,7 @@ async fn build_generic_commit(pool: &PgPool, scenario: &FulfillmentScenario) -> 
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     BuiltGenericCommit {
@@ -7127,6 +7222,7 @@ async fn commit_leave_request(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     let mut tx = pool.begin().await.expect("begin leave request");
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -7316,6 +7412,7 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     let mut tx = pool.begin().await.expect("begin leave cancellation");
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -7488,6 +7585,7 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
@@ -7692,6 +7790,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
@@ -7943,6 +8042,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin leave fulfillment");
@@ -8206,6 +8306,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin replace request");
@@ -8422,6 +8523,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let bob_signature_key = hex::decode(&manifest.identity.bob.signature_public_key_hex).unwrap();
@@ -8889,6 +8991,7 @@ async fn build_bob_leave_fulfillment(
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
     (plan, ctx, post_leave)
 }
@@ -9091,6 +9194,7 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin close");
@@ -9311,6 +9415,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin request");
@@ -9492,6 +9597,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let mut tx = pool.begin().await.expect("begin generic commit");
@@ -9666,6 +9772,7 @@ async fn seed_reset_leave_then_build_commit(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -9768,6 +9875,7 @@ async fn seed_reset_leave_then_build_commit(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin leave request");
@@ -9942,6 +10050,7 @@ async fn seed_reset_leave_then_build_commit(
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let _ = commit_request_digest;
@@ -10242,6 +10351,7 @@ async fn seed_three_member_bob_pending_leave(
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin policy add carol");
@@ -10353,6 +10463,7 @@ async fn seed_three_member_bob_pending_leave(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin bob leave request");
@@ -10479,6 +10590,7 @@ async fn build_carol_zero_leaf_leave(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     (plan, ctx, transition_id)
 }
@@ -10806,6 +10918,7 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -10896,6 +11009,7 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
 
     RevocationSetup {
@@ -11174,6 +11288,7 @@ async fn commit_bob_welcome_revocation(
                 outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
             },
         }],
+        metadata_avatar: None,
     };
 
     let response_bytes = b"revokeDevice-welcome-ok".to_vec();
@@ -12574,6 +12689,7 @@ async fn build_policy_edge(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     (plan, ctx)
 }
@@ -12841,6 +12957,7 @@ async fn seed_alice_open_recovery(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     let mut tx = pool.begin().await.expect("begin recovery request");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &rec_plan, &rec_ctx)
@@ -13290,6 +13407,7 @@ async fn build_reset_activation_edge(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        metadata_avatar: None,
     };
     (plan, ctx, request_id)
 }
