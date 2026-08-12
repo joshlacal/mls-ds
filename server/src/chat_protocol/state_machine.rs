@@ -1079,6 +1079,34 @@ impl RequestEvidence {
         })
     }
 
+    /// `for_test`, but carrying a REAL registered key id. `for_test` synthesizes
+    /// `key_id: [byte; 32]`, which can never equal the thumbprint of an actor actually
+    /// registered in the database, and the durable CAS pins `owner_key_id`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test_with_key_id(
+        kind: RequestEntryKind,
+        seq: u64,
+        request_id: [u8; 16],
+        actor: DeviceIdentity,
+        conversation_id: [u8; 16],
+        received_at: ServerTimestamp,
+        byte: u8,
+        key_id: [u8; 32],
+    ) -> Result<Self, StateMachineError> {
+        let mut evidence = Self::for_test(
+            kind,
+            seq,
+            request_id,
+            actor,
+            conversation_id,
+            received_at,
+            byte,
+        )?;
+        evidence.key_id = key_id;
+        Ok(evidence)
+    }
+
     /// A signed, NON-control welcome-response `RequestEvidence` (acknowledge /
     /// reject): entry-less (`control_entry_id`/`control_seq` = None) with the
     /// `WelcomeResponse` body binding `plan_welcome_response` requires to match the
@@ -15758,14 +15786,26 @@ pub(crate) fn persistence_plan_for_test(
                 .filter_map(|change| change.after())
                 .find(|request| request.request_id == edge.request_id)
             {
+                // The shared prior-bound classifier proves the FULL binding identity, so
+                // these can no longer be placeholders: derive the origin key id and auth
+                // generation from the request exactly as production does. A zeroed
+                // `target_key_id` is what the durable CAS rejects via `owner_key_id = $6`.
+                let (origin_key_id, origin_auth_generation) = match &request.origin {
+                    RecoveryOriginEvidence::Acceptance(value) => value
+                        .authority
+                        .as_ref()
+                        .map(|authority| (authority.key_id, authority.auth_generation))
+                        .unwrap_or(([0u8; 32], 1)),
+                    RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
+                };
                 effects.recovery_package_cas.push({
                     let mut binding = RecoveryPackageCasBinding {
                         transaction_id: head_cas.transaction_id.clone(),
                         conversation_id: *request.bound_coordinate.conversation_id(),
                         request_id: edge.request_id,
                         target: request.target.clone(),
-                        target_key_id: [0u8; 32],
-                        target_auth_generation: 1,
+                        target_key_id: origin_key_id,
+                        target_auth_generation: origin_auth_generation,
                         bound_coordinate: request.bound_coordinate,
                         key_package_ref: edge.key_package_ref,
                         key_package_wrapper_sha256: [0u8; 32],

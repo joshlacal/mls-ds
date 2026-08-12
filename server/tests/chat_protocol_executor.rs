@@ -12863,7 +12863,14 @@ async fn seed_alice_open_recovery(
     )
     .unwrap();
     let recovery_request_id = Uuid::new_v4();
-    let rec_evidence = RequestEvidence::for_test(
+    // The evidence must carry Alice's REAL registered key id: the key package row was
+    // seeded with it, and the durable CAS pins `owner_key_id`.
+    let alice_key_id_bytes: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&fixture.alice_key_id)
+        .expect("alice key id is base64url")
+        .try_into()
+        .expect("alice key id is 32 bytes");
+    let rec_evidence = RequestEvidence::for_test_with_key_id(
         RequestEntryKind::LeafRecoveryRequest,
         2,
         *recovery_request_id.as_bytes(),
@@ -12871,6 +12878,7 @@ async fn seed_alice_open_recovery(
         *conversation_id.as_bytes(),
         rec_received,
         0x71,
+        alice_key_id_bytes,
     )
     .unwrap();
     let rec_planned = plan_leaf_recovery_request(
