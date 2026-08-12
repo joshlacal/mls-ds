@@ -14946,14 +14946,20 @@ fn plan_leave_request_inner(
     if would_remove_last_active_admin(prior, command.actor.principal()) {
         return Err(StateMachineError::LastAdminRequired);
     }
-    if prior.leave_requests.iter().any(|request| {
+    // Expire-first: a lapsed pending request is dead consent that no longer
+    // authorizes a `leaveCommit`, but `leave_requests_one_pending_uq` and the
+    // `LeaveAlreadyPending` guard below still see it as pending. Observing its
+    // own deadline here — before the guard reads the aggregate — is what keeps a
+    // requester from being trapped behind his own lapsed request.
+    let mut state = prior.clone();
+    expire_due_leave_requests(&mut state, command.received_at);
+    if state.leave_requests.iter().any(|request| {
         request.requester.principal() == command.actor.principal()
             && request.status == LeaveRequestStatus::Pending
     }) {
         return Err(StateMachineError::LeaveAlreadyPending);
     }
     let expires_at = command.received_at.checked_add_millis(CONSENT_TTL_MILLIS)?;
-    let mut state = prior.clone();
     state.leave_requests.push(LeaveRequest {
         request_id: command.leave_request_id,
         requester: command.actor,
@@ -16878,6 +16884,44 @@ fn resolve_prior_bound_work(
             welcome.terminal = Some(WorkTerminalEvidence::Transition(evidence.clone()));
         }
     }
+}
+
+/// Expire every past-due `Pending` leave request the incoming request observes
+/// on the already-locked aggregate, BEFORE the pending-uniqueness guard reads it.
+///
+/// This is the leave-family form of the expire-first discipline welcome and
+/// recovery already use: `repository/core.rs` classifies a past-due pending
+/// welcome as `PendingDue` at the row lock, and `repository/recovery.rs`
+/// (`classify_client_terminal_disposition`) maps every `OpenDue` action to
+/// `ExpireFirst`. Leave requests live INSIDE the conversation aggregate rather
+/// than in a separately locked row, so the equivalent classification point is
+/// the planner reading the locked state — the same place `resolve_prior_bound_work`
+/// already performs this exact `Pending -> Expired` edge for coordinate-advancing
+/// transitions.
+///
+/// The terminal is `WorkTerminalEvidence::Expiry(request.expires_at)` — the
+/// request's OWN deadline, never the observer's instant — which
+/// `write_observed_leave_expiries` persists as status `expired` with a NULL
+/// terminal transition and digest and `terminal_at = expires_at`, the only shape
+/// `leave_requests_terminal_shape_check` accepts. Expiry is therefore an
+/// OBSERVATION of the row's DB-enforced TTL that binds nothing about whoever
+/// observed it, which is why any member's request may clear a lapsed row and why
+/// the sweep is not restricted to the actor's own requests.
+///
+/// The boundary matches `classify_pending_reset_at` and `classify_locked_recovery`:
+/// `observed_at < expires_at` is still live, `observed_at >= expires_at` is due.
+/// Returns the number of requests swept.
+fn expire_due_leave_requests(state: &mut ConversationState, observed_at: ServerTimestamp) -> usize {
+    let mut swept = 0;
+    for request in &mut state.leave_requests {
+        if request.status != LeaveRequestStatus::Pending || observed_at < request.expires_at {
+            continue;
+        }
+        request.status = LeaveRequestStatus::Expired;
+        request.terminal = Some(WorkTerminalEvidence::Expiry(request.expires_at));
+        swept += 1;
+    }
+    swept
 }
 
 fn coordinate_only_successor(
@@ -28737,14 +28781,38 @@ pub(in crate::chat_protocol) mod executor {
                 "leave request invitation quota CAS",
             ));
         }
-        // Exactly one new pending leave request in the delta.
-        if effects.leave_request_changes().len() != 1 {
+        // Exactly one new pending leave request, plus the observed expiry of
+        // however many past-due pending rows `expire_due_leave_requests` swept at
+        // the lock. Any OTHER delta shape is a hard `InconsistentPlan` — the same
+        // no-silent-drop discipline `reconcile_coordinate_change_families` enforces
+        // for the coordinate-changing arms.
+        let changes = effects.leave_request_changes();
+        let openings = changes
+            .iter()
+            .filter(|change| {
+                matches!(
+                    (change.before(), change.after()),
+                    (None, Some(after)) if after.status() == LeaveRequestStatus::Pending
+                )
+            })
+            .count();
+        let observed_expiries = changes
+            .iter()
+            .filter(|change| {
+                matches!(
+                    (change.before(), change.after()),
+                    (Some(before), Some(after))
+                        if before.status() == LeaveRequestStatus::Pending
+                            && after.status() == LeaveRequestStatus::Expired
+                )
+            })
+            .count();
+        if openings != 1 || openings + observed_expiries != changes.len() {
             return Err(ExecutorError::InconsistentPlan(
-                "leave request must change exactly one request",
+                "leave request must open exactly one pending request and observe only expiries",
             ));
         }
-        let request = effects
-            .leave_request_changes()
+        let request = changes
             .iter()
             .find_map(|change| match (change.before(), change.after()) {
                 (None, Some(after)) if after.status() == LeaveRequestStatus::Pending => Some(after),
@@ -28779,7 +28847,19 @@ pub(in crate::chat_protocol) mod executor {
         append.transition_id = None;
         delivery::append_entry_at(transaction, &append, u64::try_from(seq_i64).unwrap()).await?;
 
-        // 3. The pending leave_requests row. Signed material is the entry's (the
+        // 3. Observed expiry of every past-due pending row the planner swept.
+        //    MUST precede the insert: `leave_requests_one_pending_uq` is a plain
+        //    partial unique index, NOT a deferrable constraint, so a same-requester
+        //    replacement would collide the moment the insert lands while the lapsed
+        //    row is still `pending`.
+        let written_expiries = write_observed_leave_expiries(transaction, effects).await?;
+        if written_expiries != observed_expiries {
+            return Err(ExecutorError::InconsistentPlan(
+                "leave request observed expiry write count drift",
+            ));
+        }
+
+        // 4. The pending leave_requests row. Signed material is the entry's (the
         //    entry<->row mapping trigger requires byte-equality); the bound
         //    coordinate is the unchanged current coordinate; `expires_at` is the
         //    DB-required `received_at + 24h`.
@@ -28808,7 +28888,7 @@ pub(in crate::chat_protocol) mod executor {
         )
         .await?;
 
-        // 4. Audience + event.
+        // 5. Audience + event.
         let recipients = build_entry_recipients(&ctx.entry_recipients)?;
         delivery::insert_entry_recipients(
             transaction,
@@ -30643,6 +30723,49 @@ pub(in crate::chat_protocol) mod executor {
             }
         }
         Ok(counts)
+    }
+
+    /// Durably record the OBSERVED expiry of every past-due `pending` leave
+    /// request an expire-first planner swept on the coordinate-PRESERVING request
+    /// path (`expire_due_leave_requests`).
+    ///
+    /// This writes the identical terminal shape `write_prior_bound_staling` writes
+    /// for the identical `Pending -> Expired` delta, and for the identical reason:
+    /// status `expired`, NULL `terminal_request_digest`, NULL
+    /// `terminal_transition_id`, and `terminal_at` = the request's OWN `expires_at`
+    /// — the only combination `leave_requests_terminal_shape_check` accepts for
+    /// `expired`. Nothing about the observing actor is bound, so the row records
+    /// that consent lapsed, never that anyone withdrew or superseded it.
+    ///
+    /// Any delta that is not exactly `Pending -> Expired` is skipped here; the
+    /// caller has already proven that the ONLY shapes present are its own opening
+    /// plus these expiries, and cross-checks this function's return against that
+    /// count, so a skipped delta can never become a silent drop.
+    async fn write_observed_leave_expiries(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        effects: &TransitionEffects,
+    ) -> Result<usize, ExecutorError> {
+        let mut written = 0;
+        for change in effects.leave_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                continue;
+            };
+            if before.status() != LeaveRequestStatus::Pending
+                || after.status() != LeaveRequestStatus::Expired
+            {
+                continue;
+            }
+            transition::terminalize_leave_request(
+                transaction,
+                Uuid::from_bytes(after.request_id),
+                &LeaveRequestTermination::Expired {
+                    terminal_at: server_instant(after.expires_at)?,
+                },
+            )
+            .await?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     /// The per-family count of deltas a coordinate-changing arm actually

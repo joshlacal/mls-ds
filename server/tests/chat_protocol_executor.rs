@@ -8235,6 +8235,35 @@ async fn commit_leave_request_at(
     chat_protocol::state_machine::ConversationPersistencePlan,
     ExecutionContext,
 ) {
+    commit_leave_request_against(
+        pool,
+        scenario,
+        &scenario.fulfillment_state,
+        request_seq,
+        received_at,
+        applied_at_override,
+    )
+    .await
+}
+
+/// `commit_leave_request_at` planning against an EXPLICIT prior aggregate rather
+/// than the pristine scenario state, so a second leave request can be planned on
+/// top of the first one's resulting state. `leaveRequest` is coordinate-preserving,
+/// so `scenario.coordinate` remains the correct head CAS binding either way.
+async fn commit_leave_request_against(
+    pool: &PgPool,
+    scenario: &FulfillmentScenario,
+    prior_state: &ConversationState,
+    request_seq: u64,
+    received_at: ServerTimestamp,
+    applied_at_override: Option<DateTime<Utc>>,
+) -> (
+    ConversationState,
+    Uuid,
+    u64,
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
     let fixture = &scenario.fixture;
     let conversation_id = scenario.conversation_id;
     let bob_id = scenario.bob_id.clone();
@@ -8253,7 +8282,7 @@ async fn commit_leave_request_at(
     .unwrap();
     let registration = LockedRegistrationProjection::for_test(&evidence);
     let planned = plan_leave_request(
-        &scenario.fulfillment_state,
+        prior_state,
         LeaveRequestCommand {
             actor: bob_id.clone(),
             leave_request_id: *request_id.as_bytes(),
@@ -8410,6 +8439,106 @@ async fn leave_request_commits_pending_consent_without_advancing_coordinate() {
             .await
             .expect("leave requests");
     assert_eq!(leave_requests, 1, "replay wrote no duplicate leave request");
+}
+
+/// THE USER SEQUENCE, durably: bob asks to leave, NOBODY commits it for 24 hours,
+/// and bob asks again.
+///
+/// This is the coordinate-PRESERVING twin of the reset-activation proof above.
+/// There the lapse was observed only because some other member advanced the
+/// coordinate and reached `resolve_prior_bound_work`; here bob's own second
+/// request observes it, which is the whole point — a requester must not need
+/// another member's unrelated transition to get unstuck.
+///
+/// Two things are proved that the planner alone cannot: the lapsed row is
+/// terminalized `expired` at its OWN `expires_at` with NULL transition and digest
+/// (the only shape `leave_requests_terminal_shape_check` accepts, and the shape
+/// that says the server OBSERVED the lapse rather than authoring a terminal), and
+/// the expiry lands BEFORE the insert, so `leave_requests_one_pending_uq` — a
+/// plain partial unique index on `(conversation_id, requester_did)`, not a
+/// deferrable constraint — does not reject bob's replacement.
+///
+/// Single-clock throughout: this leave is allowed to expire, and the executor
+/// derives the expired `terminal_at` from the PLAN's `expires_at`, so `applied_at`
+/// must be `server_instant(received_at)` exactly as production sets it.
+#[tokio::test]
+async fn lapsed_leave_request_is_expired_by_its_requesters_own_re_request() {
+    let (pool, _db) = setup().await;
+    let scenario = run_fulfillment_scenario(&pool).await;
+    let conversation_id = scenario.conversation_id;
+    let bob_did = scenario.bob_did.clone();
+
+    // 1. Bob asks to leave (seq 4).
+    let first_applied_at =
+        DateTime::from_timestamp_millis(clock_now(&pool).await.timestamp_millis())
+            .expect("truncated leave instant");
+    let first_received =
+        ServerTimestamp::from_unix_millis_for_test(first_applied_at.timestamp_millis()).unwrap();
+    let first_expires_at = first_applied_at + Duration::hours(24);
+    let (first_state, first_request_id, _seq, _plan, _ctx) =
+        commit_leave_request_at(&pool, &scenario, 4, first_received, Some(first_applied_at)).await;
+
+    // 2. Twenty-four hours pass with no `leaveCommit`. Bob asks again at exactly
+    //    his own deadline — the instant his consent became due.
+    let second_applied_at = first_expires_at;
+    let second_received =
+        ServerTimestamp::from_unix_millis_for_test(second_applied_at.timestamp_millis()).unwrap();
+    let (_second_state, second_request_id, _seq2, _plan2, _ctx2) = commit_leave_request_against(
+        &pool,
+        &scenario,
+        &first_state,
+        5,
+        second_received,
+        Some(second_applied_at),
+    )
+    .await;
+
+    // The lapsed request is `expired` at its own deadline, with NO provenance:
+    // nobody cancelled it, no transition staled it, the server observed the lapse.
+    let (status, terminal_at, terminal_tid, terminal_digest): (
+        String,
+        Option<DateTime<Utc>>,
+        Option<Uuid>,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT status,terminal_at,terminal_transition_id,terminal_request_digest \
+           FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(first_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("lapsed leave terminal");
+    assert_eq!(status, "expired");
+    assert_eq!(terminal_at, Some(first_expires_at));
+    assert_eq!((terminal_tid, terminal_digest), (None, None));
+
+    // And bob's replacement is live, past the partial unique index that his own
+    // lapsed row used to hold against him.
+    let (second_status, second_requester): (String, String) = sqlx::query_as(
+        "SELECT status,requester_did FROM chat.leave_requests WHERE leave_request_id=$1",
+    )
+    .bind(second_request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replacement leave row");
+    assert_eq!(
+        (second_status.as_str(), second_requester.as_str()),
+        ("pending", bob_did.as_str())
+    );
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.leave_requests \
+          WHERE conversation_id=$1 AND requester_did=$2 AND status='pending'",
+    )
+    .bind(conversation_id)
+    .bind(&bob_did)
+    .fetch_one(&pool)
+    .await
+    .expect("pending leave count");
+    assert_eq!(
+        pending, 1,
+        "exactly one live consent survives the replacement"
+    );
 }
 
 #[tokio::test]

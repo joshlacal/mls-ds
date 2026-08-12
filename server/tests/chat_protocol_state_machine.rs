@@ -1858,6 +1858,174 @@ fn leafed_group_leave_request_and_cancellation_preserve_coordinate_and_public_st
     );
 }
 
+/// THE USER SEQUENCE: a member asks to leave, nobody commits it for 24 hours,
+/// and he asks again.
+///
+/// Before expire-first this was a permanent trap. His lapsed row still counted as
+/// `Pending`, so `LeaveAlreadyPending` (and `leave_requests_one_pending_uq`)
+/// refused the re-request; and `plan_leave_cancellation_inner` refuses an overdue
+/// request with `WorkExpired`, so he could not withdraw it either. Nothing in the
+/// leave family could move again without some OTHER member happening to advance
+/// the coordinate, which is the only thing that ever reached
+/// `resolve_prior_bound_work`.
+#[test]
+fn lapsed_leave_request_is_expired_by_its_requesters_own_re_request() {
+    let manifest = corpus_manifest();
+    let group = added_group();
+    let conversation_id = *group.coordinate().conversation_id();
+    let first_id = uuid_v4_bytes(0x8b);
+    let requested = plan_leave_request(
+        &group,
+        registered_leave_request(
+            bob(&manifest),
+            first_id,
+            fixture_received_at(4),
+            conversation_id,
+            4,
+            0x8b,
+        ),
+    )
+    .expect("leafed non-admin group participant may request leave")
+    .into_state();
+    let deadline = *requested.leave_request(&first_id).unwrap().expires_at();
+
+    // Exactly at its own deadline the request is due, so the requester's next
+    // signed request observes the lapse and is admitted behind it.
+    let second_id = uuid_v4_bytes(0x8c);
+    let replaced = plan_leave_request(
+        &requested,
+        registered_leave_request(
+            bob(&manifest),
+            second_id,
+            deadline,
+            conversation_id,
+            5,
+            0x8c,
+        ),
+    )
+    .expect("a requester whose own consent lapsed may ask again")
+    .into_state();
+
+    // The lapsed request is terminal as EXPIRED — never cancelled, never stale.
+    assert_eq!(
+        replaced.leave_request(&first_id).unwrap().status(),
+        LeaveRequestStatus::Expired
+    );
+    assert_eq!(
+        replaced.leave_request(&second_id).unwrap().status(),
+        LeaveRequestStatus::Pending
+    );
+    // Neither the coordinate nor the group's public state moved: expiry is an
+    // observation, not a mutation of the conversation.
+    assert_eq!(replaced.coordinate(), group.coordinate());
+    assert_eq!(replaced.public_state(), group.public_state());
+    assert_eq!(replaced.intervals(), group.intervals());
+    // `validate_leave_work` admits `Expired` ONLY when the terminal is exactly
+    // `Expiry(request.expires_at)` — the request's own deadline, carrying nothing
+    // about who observed it. Round-tripping through durable hydration proves the
+    // terminal the planner wrote is the terminal the row projects back.
+    assert_eq!(
+        hydrate_conversation_state(replaced.clone()),
+        Ok(replaced),
+        "the observed expiry survives the durable projection unchanged"
+    );
+}
+
+/// The boundary is the one `classify_pending_reset_at` and
+/// `classify_locked_recovery` already use: due is `observed_at >= expires_at`, so
+/// one millisecond earlier the consent is still LIVE and still blocks. Expire-first
+/// must not become a way to discard a request that has not actually lapsed.
+#[test]
+fn leave_request_one_millisecond_before_its_deadline_still_blocks_a_re_request() {
+    let manifest = corpus_manifest();
+    let group = added_group();
+    let conversation_id = *group.coordinate().conversation_id();
+    let first_id = uuid_v4_bytes(0x8d);
+    let requested = plan_leave_request(
+        &group,
+        registered_leave_request(
+            bob(&manifest),
+            first_id,
+            fixture_received_at(4),
+            conversation_id,
+            4,
+            0x8d,
+        ),
+    )
+    .unwrap()
+    .into_state();
+    let deadline = *requested.leave_request(&first_id).unwrap().expires_at();
+    let not_yet_due =
+        ServerTimestamp::from_unix_millis_for_test(deadline.unix_millis() - 1).unwrap();
+
+    assert_eq!(
+        plan_leave_request(
+            &requested,
+            registered_leave_request(
+                bob(&manifest),
+                uuid_v4_bytes(0x8e),
+                not_yet_due,
+                conversation_id,
+                5,
+                0x8e,
+            ),
+        ),
+        Err(StateMachineError::LeaveAlreadyPending)
+    );
+    assert_eq!(
+        requested.leave_request(&first_id).unwrap().status(),
+        LeaveRequestStatus::Pending,
+        "a live request is untouched by the sweep"
+    );
+}
+
+/// Cancelling a request that has already lapsed stays REFUSED, and deliberately so.
+///
+/// `validate_leave_work` admits a `Cancelled` leave request only when the
+/// cancellation evidence satisfies `evidence.received_at < request.expires_at`, and
+/// `assert_control_request_entry` requires every `leaveCancellationEntry` to map to
+/// exactly one row with `status = 'cancelled'`. So a cancellation that "succeeded"
+/// after the deadline would have to record `cancelled` — i.e. author a withdrawal
+/// that never happened onto a row whose consent objectively lapsed. Expiry is an
+/// observation; cancellation is an authored act, and the two are not interchangeable.
+/// The requester's remedy is the re-request proved above, not a false terminal.
+#[test]
+fn lapsed_leave_request_cannot_be_cancelled_after_its_deadline() {
+    let manifest = corpus_manifest();
+    let group = added_group();
+    let conversation_id = *group.coordinate().conversation_id();
+    let request_id = uuid_v4_bytes(0x8f);
+    let requested = plan_leave_request(
+        &group,
+        registered_leave_request(
+            bob(&manifest),
+            request_id,
+            fixture_received_at(4),
+            conversation_id,
+            4,
+            0x8f,
+        ),
+    )
+    .unwrap()
+    .into_state();
+    let deadline = *requested.leave_request(&request_id).unwrap().expires_at();
+
+    assert_eq!(
+        plan_leave_cancellation(
+            &requested,
+            registered_leave_cancellation(
+                bob(&manifest),
+                request_id,
+                deadline,
+                conversation_id,
+                5,
+                0x90,
+            ),
+        ),
+        Err(StateMachineError::WorkExpired)
+    );
+}
+
 #[test]
 fn fulfilled_leave_proof_matrix_is_complete_and_allows_later_rejoin() {
     let manifest = corpus_manifest();
