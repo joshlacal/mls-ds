@@ -20809,7 +20809,6 @@ pub(in crate::chat_protocol) mod executor {
             pub(super) fn keys(&self) -> &BTreeSet<([u8; 16], [u8; 32])> {
                 &self.keys
             }
-
         }
 
         pub(super) use prior_bound_receipt::PriorBoundWriteReceipt;
@@ -20894,11 +20893,9 @@ pub(in crate::chat_protocol) mod executor {
             own_kind: OwnFamilyKind,
         ) -> Result<PriorBoundPartition, ExecutorError> {
             let effects = plan.effects();
-            let head = effects
-                .head_cas()
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "prior-bound classification needs a head CAS binding",
-                ))?;
+            let head = effects.head_cas().ok_or(ExecutorError::InconsistentPlan(
+                "prior-bound classification needs a head CAS binding",
+            ))?;
             let prior = head
                 .expected_prior()
                 .ok_or(ExecutorError::InconsistentPlan(
@@ -21020,8 +21017,10 @@ pub(in crate::chat_protocol) mod executor {
                         ))
                     }
                 };
-                if !recovery_reservation_identity_is_unchanged(before_reservation, after_reservation)
-                    || before_reservation.status != ReservationStatus::Active
+                if !recovery_reservation_identity_is_unchanged(
+                    before_reservation,
+                    after_reservation,
+                ) || before_reservation.status != ReservationStatus::Active
                     || before_reservation.bound_coordinate != *prior
                     || reservation_keys.insert(key, expired).is_some()
                 {
@@ -21047,7 +21046,12 @@ pub(in crate::chat_protocol) mod executor {
                 .package_transitions()
                 .iter()
                 .filter(|edge| own != Some((edge.request_id, edge.key_package_ref)))
-                .map(|edge| ((edge.request_id, edge.key_package_ref), (edge.from, edge.to)))
+                .map(|edge| {
+                    (
+                        (edge.request_id, edge.key_package_ref),
+                        (edge.from, edge.to),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>();
             verify_recovery_package_bijection(effects)?;
             let own_edges = usize::from(own.is_some());
@@ -21120,14 +21124,13 @@ pub(in crate::chat_protocol) mod executor {
                 // A universal fail-closed rule would be a different truth table than
                 // the sealed base and would strand design 6.4 positive rows 2/3/4.
                 if let RecoveryOriginEvidence::Acceptance(value) = &request.origin {
-                    let recovery = match value.body_binding.as_ref() {
-                        Some(TransitionBodyBinding::Acceptance { recovery, .. }) => recovery,
-                        _ => {
-                            return Err(ExecutorError::InconsistentPlan(
+                    let recovery =
+                        match value.body_binding.as_ref() {
+                            Some(TransitionBodyBinding::Acceptance { recovery, .. }) => recovery,
+                            _ => return Err(ExecutorError::InconsistentPlan(
                                 "prior-bound recovery acceptance has no acceptance body binding",
-                            ))
-                        }
-                    };
+                            )),
+                        };
                     if binding.key_package_wrapper_sha256 != recovery.key_package_wrapper_sha256
                         || <[u8; 32]>::from(sha2::Sha256::digest(&recovery.key_package_wrapper))
                             != recovery.key_package_wrapper_sha256
@@ -21149,6 +21152,12 @@ pub(in crate::chat_protocol) mod executor {
                     || binding.package_not_after != reservation.package_not_after
                     || binding.claimed_at != request.received_at
                     || binding.claimed_at != reservation.received_at
+                    // Sealed proved this pair directly; the binding pins every other
+                    // cross-field equality but not `expires_at`, which is what
+                    // `terminal_is_exact_due_expiry` tests the terminal against. A
+                    // request and reservation disagreeing here could have one due and
+                    // the other not.
+                    || request.expires_at != reservation.expires_at
                     || binding.expected_status != PackageStatus::Reserved
                     || binding.successor_status
                         != package_keys
@@ -21278,7 +21287,7 @@ pub(in crate::chat_protocol) mod executor {
             prior: &PublicGroupSnapshotCoordinate,
             producer: &super::super::TransitionEvidence,
         ) -> Result<([u8; 16], [u8; 32]), ExecutorError> {
-            let mut own: Option<([u8; 16], [u8; 32])> = None;
+            let mut own: Option<&RecoveryRequest> = None;
             for change in effects.recovery_request_changes() {
                 let (Some(before), Some(after)) = (change.before(), change.after()) else {
                     continue;
@@ -21299,18 +21308,16 @@ pub(in crate::chat_protocol) mod executor {
                         "fulfillment own recovery request identity/terminal drift",
                     ));
                 }
-                if own
-                    .replace((after.request_id, after.key_package_ref))
-                    .is_some()
-                {
+                if own.replace(after).is_some() {
                     return Err(ExecutorError::InconsistentPlan(
                         "fulfillment carries multiple own recovery requests",
                     ));
                 }
             }
-            let own = own.ok_or(ExecutorError::InconsistentPlan(
+            let own_request = own.ok_or(ExecutorError::InconsistentPlan(
                 "fulfillment carries no own fulfilled recovery request",
             ))?;
+            let own = (own_request.request_id, own_request.key_package_ref);
 
             let mut reservations = 0usize;
             for change in effects.reservation_changes() {
@@ -21325,6 +21332,13 @@ pub(in crate::chat_protocol) mod executor {
                     || !recovery_reservation_identity_is_unchanged(before, after)
                     || before.bound_coordinate != *prior
                     || !terminal_is_exact_transition(&after.terminal, producer)
+                    // Sealed proved the own request and reservation agree field-for-field
+                    // ("fulfillment own request/reservation are not bijective"). The
+                    // key and request id are implied by the `own` match above; target,
+                    // received_at and expires_at are not.
+                    || after.target != own_request.target
+                    || after.received_at != own_request.received_at
+                    || after.expires_at != own_request.expires_at
                 {
                     return Err(ExecutorError::InconsistentPlan(
                         "fulfillment own reservation has an illegal shape",
@@ -21358,7 +21372,6 @@ pub(in crate::chat_protocol) mod executor {
     use prior_bound::{
         classify_prior_bound_recovery, OwnFamilyKind, PriorBoundPartition, PriorBoundWriteReceipt,
     };
-
 
     fn recovery_request_identity_is_unchanged(
         before: &RecoveryRequest,
@@ -22629,8 +22642,7 @@ pub(in crate::chat_protocol) mod executor {
         // Prior-bound recovery families. This block WAS the reference
         // implementation; it is now the shared classifier every one of the nine
         // coordinate-changing arms calls, strictly before its own first head CAS.
-        let prior_bound_partition =
-            classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
+        let prior_bound_partition = classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
         for change in effects.reset_request_changes() {
             let (Some(before_reset), Some(after_reset)) = (change.before(), change.after()) else {
                 return Err(ExecutorError::InconsistentPlan(
@@ -25635,8 +25647,14 @@ pub(in crate::chat_protocol) mod executor {
             .ok_or(ExecutorError::InconsistentPlan(
                 "fulfillment adds no pending welcome",
             ))?;
-        let (preflight_prior_bound, partition) =
-            preflight_leaf_recovery_fulfillment(plan, effects, hydration, ctx, transition_id, seq_i64)?;
+        let (preflight_prior_bound, partition) = preflight_leaf_recovery_fulfillment(
+            plan,
+            effects,
+            hydration,
+            ctx,
+            transition_id,
+            seq_i64,
+        )?;
 
         // 1. Head CAS sv+1.
         transition::cas_conversation_head(
@@ -32085,6 +32103,71 @@ pub(in crate::chat_protocol) mod executor {
             }
         }
 
+        /// The sealed fulfillment arm proved its own request and reservation agree
+        /// field-for-field ("fulfillment own request/reservation are not bijective").
+        /// The extraction dropped target / received_at / expires_at; an independent
+        /// review caught it. This pins the restoration.
+        #[test]
+        fn fulfillment_own_request_and_reservation_must_agree() {
+            let (mut plan, context) = exact_fixture();
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("actor authority")
+                .actor
+                .clone();
+            let producer = plan.state.producer.clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                uuid(0x60),
+                [0x61; 32],
+                [0x62; 32],
+                [0x64; 32],
+                received_at,
+                expires_at,
+                package_not_after,
+                RecoveryRequestStatus::Fulfilled,
+                ReservationStatus::Consumed,
+                Some(WorkTerminalEvidence::Transition(producer)),
+                PackageStatus::Consumed,
+            );
+
+            // Shift BOTH sides of the own reservation so identity-unchanged still holds
+            // and its terminal is untouched. The only defect is that it now disagrees
+            // with the own request — exactly what sealed proved and the extraction lost.
+            let shifted = ServerTimestamp::from_unix_millis(4_500).unwrap();
+            {
+                let change = &mut plan.effects.reservation_changes[0];
+                if let Some(before) = change.before.as_mut() {
+                    before.expires_at = shifted;
+                }
+                if let Some(after) = change.after.as_mut() {
+                    after.expires_at = shifted;
+                }
+            }
+
+            match classify_prior_bound_recovery(
+                &plan,
+                &context,
+                OwnFamilyKind::LeafRecoveryFulfillment,
+            ) {
+                Err(ExecutorError::InconsistentPlan(_)) => {}
+                Ok(_) => panic!("an own request/reservation disagreement was accepted"),
+                Err(error) => panic!("rejected with the wrong error: {error:?}"),
+            }
+        }
+
         /// REGRESSION FOR DEFECT 1, at the level a no-DB test can reach.
         ///
         /// `apply_leave_fulfillment` carried
@@ -32149,6 +32232,215 @@ pub(in crate::chat_protocol) mod executor {
             );
         }
 
+        /// One prior-bound family plus the knobs each negative case perturbs.
+        fn one_prior_bound_family(
+            digest: [u8; 32],
+        ) -> (ConversationPersistencePlan, ExecutionContext) {
+            let (mut plan, context) = exact_fixture();
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("actor authority")
+                .actor
+                .clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                uuid(0x66),
+                [0x67; 32],
+                [0x68; 32],
+                digest,
+                received_at,
+                expires_at,
+                package_not_after,
+                RecoveryRequestStatus::Expired,
+                ReservationStatus::Expired,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Available,
+            );
+            (plan, context)
+        }
+
+        fn classify_none(
+            plan: &ConversationPersistencePlan,
+            context: &ExecutionContext,
+        ) -> Result<PriorBoundPartition, ExecutorError> {
+            classify_prior_bound_recovery(plan, context, OwnFamilyKind::None)
+        }
+
+        /// NEGATIVE BATTERY. Each case deletes exactly one classifier guarantee. An
+        /// independent review showed every one of these could be removed from the
+        /// classifier with the whole suite still green, so each is pinned here.
+        #[test]
+        fn classifier_rejects_each_prior_bound_drift() {
+            // Baseline: the unperturbed family is accepted, so every rejection below is
+            // attributable to the perturbation and not to a malformed fixture.
+            let (plan, context) = one_prior_bound_family([0x69; 32]);
+            classify_none(&plan, &context).expect("the unperturbed family must be accepted");
+
+            // 1. Prior-bound request must come FROM Open.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            if let Some(before) = plan.effects.recovery_request_changes[0].before.as_mut() {
+                before.status = RecoveryRequestStatus::Fulfilled;
+            }
+            assert!(
+                classify_none(&plan, &context).is_err(),
+                "a prior-bound request not leaving Open must be rejected"
+            );
+
+            // 2. Prior-bound family must be bound to the PRIOR coordinate.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            let foreign =
+                coordinate_only_successor(&plan.expected_prior.expect("prior")).expect("successor");
+            if let Some(before) = plan.effects.recovery_request_changes[0].before.as_mut() {
+                before.bound_coordinate = foreign;
+            }
+            assert!(
+                classify_none(&plan, &context).is_err(),
+                "a family bound to a foreign coordinate must be rejected"
+            );
+
+            // 3. Terminal evidence must be exact: a due-expiry family whose terminal is
+            //    absent is not terminalized, it is silently dropped work.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            if let Some(after) = plan.effects.recovery_request_changes[0].after.as_mut() {
+                after.terminal = None;
+            }
+            assert!(
+                classify_none(&plan, &context).is_err(),
+                "a prior-bound request with no terminal evidence must be rejected"
+            );
+
+            // 4. Request and reservation must agree on expires_at — the value
+            //    terminal_is_exact_due_expiry tests the terminal against. Sealed proved
+            //    this pair directly and the extraction had dropped it.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            let shifted = ServerTimestamp::from_unix_millis(4_500).unwrap();
+            // Shift BOTH sides of the reservation and its terminal together, so
+            // identity-unchanged holds and its own due-expiry evidence stays exact. The
+            // ONLY thing wrong is that it now disagrees with the request. Without this
+            // the case is rejected by an earlier guard and proves nothing about the pair.
+            if let Some(before) = plan.effects.reservation_changes[0].before.as_mut() {
+                before.expires_at = shifted;
+            }
+            if let Some(after) = plan.effects.reservation_changes[0].after.as_mut() {
+                after.expires_at = shifted;
+                after.terminal = Some(WorkTerminalEvidence::Expiry(shifted));
+            }
+            match classify_none(&plan, &context) {
+                Err(ExecutorError::InconsistentPlan(message)) => assert_eq!(
+                    message, "metadata recovery package CAS authority drift",
+                    "the cross-field expires_at pair must be the rejecting check"
+                ),
+                Ok(_) => panic!("a request/reservation expires_at disagreement was accepted"),
+                Err(error) => panic!("rejected with the wrong error: {error:?}"),
+            }
+
+            // 5. The package edge must be Reserved -> Available. Reserved -> Expired is
+            //    production-unproducible and every reader used to accept it.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            for edge in plan.effects.package_transitions.iter_mut() {
+                edge.to = PackageStatus::Expired;
+            }
+            for binding in plan.effects.recovery_package_cas.iter_mut() {
+                binding.successor_status = PackageStatus::Expired;
+                binding.authority_digest = [0; 32];
+                binding.authority_digest = recovery_package_cas_authority_digest(binding);
+            }
+            assert!(
+                classify_none(&plan, &context).is_err(),
+                "Reserved -> Expired must be rejected for a prior-bound family"
+            );
+
+            // 6. The CAS binding must agree with the family it claims to authorize.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            for binding in plan.effects.recovery_package_cas.iter_mut() {
+                binding.claimed_at = ServerTimestamp::from_unix_millis(9_000).unwrap();
+                binding.authority_digest = [0; 32];
+                binding.authority_digest = recovery_package_cas_authority_digest(binding);
+            }
+            assert!(
+                classify_none(&plan, &context).is_err(),
+                "a CAS binding whose claimed_at drifts from the family must be rejected"
+            );
+        }
+
+        /// Check 8-DiD, which this correction introduces and which had no negative test.
+        /// `recovery_package_guard_digest` hashes `key_package_ref`, so two bindings with
+        /// distinct refs sharing one locked-row digest means the planner reused a guard's
+        /// digest across references — real drift, not a hash collision.
+        #[test]
+        fn check_8_did_rejects_one_locked_row_digest_across_two_refs() {
+            let shared = [0x69; 32];
+            let (mut plan, context) = one_prior_bound_family(shared);
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan.effects.recovery_package_cas[0].target.clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
+
+            // A second, otherwise-legal family on a DIFFERENT key package reference —
+            // but carrying the first family's locked-row digest.
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                uuid(0x71),
+                [0x72; 32],
+                [0x73; 32],
+                shared,
+                received_at,
+                expires_at,
+                package_not_after,
+                RecoveryRequestStatus::Expired,
+                ReservationStatus::Expired,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Available,
+            );
+
+            match classify_none(&plan, &context) {
+                Err(ExecutorError::InconsistentPlan(message)) => assert_eq!(
+                    message, "distinct key package refs share one locked row digest",
+                    "8-DiD must be the rejecting check"
+                ),
+                Ok(_) => panic!("two refs sharing one locked-row digest were accepted"),
+                Err(error) => panic!("rejected with the wrong error: {error:?}"),
+            }
+
+            // Control: distinct digests on the same two families are accepted.
+            let (mut plan, context) = one_prior_bound_family([0x69; 32]);
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan.effects.recovery_package_cas[0].target.clone();
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                uuid(0x71),
+                [0x72; 32],
+                [0x73; 32],
+                [0x74; 32],
+                received_at,
+                expires_at,
+                package_not_after,
+                RecoveryRequestStatus::Expired,
+                ReservationStatus::Expired,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Available,
+            );
+            classify_none(&plan, &context)
+                .expect("two families with distinct digests must be accepted");
+        }
+
         /// The keyed write-receipt check (design 5 step 6). `write_prior_bound_supersessions`
         /// SKIPS any delta that is not its exact supersession shape, so a silent drop
         /// is a real failure mode — and a count-only comparison cannot tell a dropped
@@ -32172,7 +32464,10 @@ pub(in crate::chat_protocol) mod executor {
             let reconciled = PriorBoundWriteReceipt::new(counts(2), BTreeSet::from([key_a, key_b]))
                 .reconcile_into_counts(&partition)
                 .expect("an exact receipt must reconcile");
-            assert_eq!(reconciled.packages, 2, "the counts must survive reconciliation");
+            assert_eq!(
+                reconciled.packages, 2,
+                "the counts must survive reconciliation"
+            );
 
             // A dropped family.
             assert!(
@@ -32205,7 +32500,9 @@ pub(in crate::chat_protocol) mod executor {
         /// carry, in both directions.
         #[test]
         fn acceptance_own_family_is_bound_to_the_successor_not_the_prior() {
-            fn acceptance_plan(bind_to_successor: bool) -> (ConversationPersistencePlan, ExecutionContext) {
+            fn acceptance_plan(
+                bind_to_successor: bool,
+            ) -> (ConversationPersistencePlan, ExecutionContext) {
                 let (mut plan, context) = exact_fixture();
                 let prior = plan.expected_prior.expect("prior");
                 let successor = coordinate_only_successor(&prior).expect("successor");
@@ -32223,15 +32520,9 @@ pub(in crate::chat_protocol) mod executor {
                     .clone();
                 let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
                 let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+                // Production relation, not the boundary: package_not_after strictly
+                // outlives expires_at (see the note on exact_due_expiry_fixture).
                 let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
-            // Production relation, not the boundary. MIN_KEY_PACKAGE_REMAINING_SECONDS
-            // (600) strictly exceeds RECOVERY_RESERVATION_TTL_MILLIS (300_000) and the
-            // floor is re-enforced at CLAIM time against claimed_at
-            // (repository/core.rs:2994, :3397), so a claimed package always outlives its
-            // reservation. A fixture with package_not_after == expires_at sits exactly on
-            // `terminal_time >= after.package_not_after` (:9984) and makes the planner
-            // emit Reserved -> Expired — a shape production cannot produce.
-            let package_not_after = ServerTimestamp::from_unix_millis(305_000).unwrap();
                 let request_id = uuid(0x60);
                 let key_package_ref = [0x61; 32];
                 let origin_key_id = [0x62; 32];
