@@ -1111,7 +1111,20 @@ impl RequestEvidence {
     /// reject): entry-less (`control_entry_id`/`control_seq` = None) with the
     /// `WelcomeResponse` body binding `plan_welcome_response` requires to match the
     /// pending welcome's coordinate + `transition_seq`. `request_id` = the welcome
-    /// id, actor = the recipient.
+    /// id, actor = the recipient. `rejection_reason` must be `None` for an
+    /// acknowledgement and one of the five protocol reasons for a rejection —
+    /// the durable disposition row stores it verbatim, so the caller (not this
+    /// constructor) owns which reason the client signed.
+    ///
+    /// The signed `authority` is populated because a welcome response is ALWAYS
+    /// client-signed in production: `plan_welcome_response_entry` binds it through
+    /// `bind_non_control_request_authority`, which rejects `authority.is_none()`,
+    /// and the executor's `preflight_welcome_response_execution_context` re-reads
+    /// that same authority to re-verify the accepted control-entry content. Without
+    /// it this constructor yields a shape production can never emit. `type_id` /
+    /// `domain` come from the signed kind itself and `durable_row_digest` is
+    /// recomputed over the completed evidence, so the result satisfies every
+    /// `validate_request_evidence` authority predicate exactly as a durable row does.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test_welcome_response(
@@ -1122,6 +1135,7 @@ impl RequestEvidence {
         coordinates: PublicGroupSnapshotCoordinate,
         transition_seq: u64,
         received_at: ServerTimestamp,
+        rejection_reason: Option<&str>,
         byte: u8,
     ) -> Result<Self, StateMachineError> {
         let mut evidence = Self::for_test(
@@ -1138,9 +1152,35 @@ impl RequestEvidence {
         evidence.body_binding = Some(RequestBodyBinding::WelcomeResponse {
             coordinates,
             transition_seq,
-            rejection_reason: (kind == RequestEntryKind::WelcomeRejection)
-                .then(|| "invalidWelcome".to_owned()),
+            rejection_reason: rejection_reason.map(str::to_owned),
         });
+        let signed_kind = request_entry_signed_kind(kind);
+        // The signing transcript is `domain || canonical_projection` and the request
+        // digest is its SHA-256 — the exact shape `transcript_for` produces, which
+        // `chat.welcome_dispositions_signature_shape_check`
+        // (`request_digest = digest(signing_transcript_bytes,'sha256')`) enforces on
+        // the durable disposition row.
+        let canonical_projection = vec![byte.wrapping_add(6), byte.wrapping_add(7)];
+        let mut transcript_bytes = signed_kind.domain().to_vec();
+        transcript_bytes.extend_from_slice(&canonical_projection);
+        evidence.request_digest = Sha256::digest(&transcript_bytes).into();
+        evidence.authority = Some(AuthenticatedEntryEvidence {
+            kind: signed_kind,
+            type_id: signed_kind.type_id(),
+            domain: signed_kind.domain().to_vec(),
+            control_entry_id: None,
+            control_conversation_id: None,
+            actor: evidence.actor.clone(),
+            key_id: evidence.key_id,
+            auth_generation: evidence.auth_generation,
+            signed_at: received_at,
+            request_digest: evidence.request_digest,
+            signature: evidence.signature,
+            signed_request_bytes: evidence.signed_request_bytes.clone(),
+            canonical_projection,
+            transcript_bytes,
+        });
+        evidence.durable_row_digest = durable_signed_request_evidence_digest(&evidence);
         Ok(evidence)
     }
 
@@ -15438,13 +15478,33 @@ impl TransitionEvidence {
     /// body a real acceptance produces: the coordinate-only successor `next`, the
     /// `add` recovery binding bound to `next`, and the retained-invitation
     /// provenance (which must match the pending participant's invitation).
-    /// `authority` stays `None`, which `require_acceptance_body` accepts while
-    /// still enforcing the request-id / conversation / target / kind /
-    /// bound-coordinate fields.
+    ///
+    /// The signed `authority` is populated because production mints it
+    /// UNCONDITIONALLY — `transition_from_control` wraps every accepted control
+    /// entry with `authenticated_entry`, and both the hydration fence
+    /// (`recovery_acceptance_authority_matches_durable`) and the planner
+    /// (`reserved_package_cas_for_request`) reject an acceptance-origin recovery
+    /// request whose evidence lacks it. Leaving it `None` produced a shape no
+    /// production path can emit, and every follow-on transition that supersedes an
+    /// acceptance-opened recovery family reads the origin's `key_id` /
+    /// `auth_generation` out of it.
+    ///
+    /// Two arguments therefore have to be the REAL durable facts, not placeholders:
+    ///   * `requester_key_id` / `requester_auth_generation` become the signing
+    ///     authority's, which the prior-bound package CAS carries as
+    ///     `target_key_id` / `target_auth_generation` and the durable release CAS
+    ///     pins against `key_packages.owner_key_id` / `owner_auth_generation` (and
+    ///     the request/reservation `requester_*` columns). Pass the acceptor's
+    ///     registered key id, decoded from base64url.
+    ///   * `key_package_wrapper` must be the exact wrapper bytes of the reserved
+    ///     key-package row, because `acceptance_recovery_package_artifact_matches`
+    ///     requires the signed body's wrapper digest to equal the locked row's, and
+    ///     the release CAS pins `key_packages.wrapper_sha256`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_test_acceptance(
         seq: u64,
         transition_id: [u8; 16],
+        entry_id: [u8; 16],
         outer_entry_fingerprint: [u8; 32],
         received_at: ServerTimestamp,
         prior: PublicGroupSnapshotCoordinate,
@@ -15453,14 +15513,14 @@ impl TransitionEvidence {
         invitation_transition_id: [u8; 16],
         inviter: DeviceIdentity,
         key_package_ref: [u8; 32],
+        key_package_wrapper: Vec<u8>,
         requester_key_id: [u8; 32],
         requester_auth_generation: u64,
         package_not_after: ServerTimestamp,
     ) -> Result<Self, StateMachineError> {
         let next = coordinate_only_successor(&prior)?;
         let expires_at = recovery_expiry(received_at, package_not_after)?;
-        let wrapper = vec![0xAA_u8; 32];
-        let wrapper_sha256: [u8; 32] = Sha256::digest(&wrapper).into();
+        let wrapper_sha256: [u8; 32] = Sha256::digest(&key_package_wrapper).into();
         let mut evidence =
             Self::for_test_at(seq, transition_id, outer_entry_fingerprint, received_at)?;
         evidence.body_binding = Some(TransitionBodyBinding::Acceptance {
@@ -15474,19 +15534,46 @@ impl TransitionEvidence {
             recovery: AcceptanceRecoveryBinding {
                 request_id: recovery_request_id,
                 conversation_id: *prior.conversation_id(),
-                target: acceptor,
+                target: acceptor.clone(),
                 kind: LeafRecoveryKind::Add,
                 bound_coordinate: next,
                 requester_key_id,
                 requester_auth_generation,
                 key_package_ref,
-                key_package_wrapper: wrapper,
+                key_package_wrapper,
                 key_package_wrapper_sha256: wrapper_sha256,
                 requested_at: received_at,
                 expires_at,
                 canonical_digest: [0x5A_u8; 32],
             },
         });
+        // The outer control projection and server fields are opaque here — nothing
+        // on this path parses them — but they must be non-empty and covered by the
+        // durable row digest, exactly as `validate_transition_evidence` requires of
+        // any evidence carrying an authority.
+        let kind = SignedMutationKind::ParticipantAcceptance;
+        let canonical_projection = vec![0xA1_u8, 0xA2, 0xA3];
+        let mut transcript_bytes = kind.domain().to_vec();
+        transcript_bytes.extend_from_slice(&canonical_projection);
+        evidence.outer_control_projection = vec![0xA4_u8, 0xA5];
+        evidence.server_fields_dag_cbor = vec![0xA6_u8, 0xA7];
+        evidence.authority = Some(AuthenticatedEntryEvidence {
+            kind,
+            type_id: kind.type_id(),
+            domain: kind.domain().to_vec(),
+            control_entry_id: Some(entry_id),
+            control_conversation_id: Some(*prior.conversation_id()),
+            actor: acceptor,
+            key_id: requester_key_id,
+            auth_generation: requester_auth_generation,
+            signed_at: received_at,
+            request_digest: Sha256::digest(&transcript_bytes).into(),
+            signature: [0xA8_u8; 64],
+            signed_request_bytes: vec![0xA9_u8, 0xAA],
+            canonical_projection,
+            transcript_bytes,
+        });
+        evidence.durable_row_digest = durable_control_transition_row_digest(&evidence)?;
         Ok(evidence)
     }
 
@@ -15790,13 +15877,40 @@ pub(crate) fn persistence_plan_for_test(
                 // these can no longer be placeholders: derive the origin key id and auth
                 // generation from the request exactly as production does. A zeroed
                 // `target_key_id` is what the durable CAS rejects via `owner_key_id = $6`.
+                //
+                // The Acceptance branch is a hard failure, never a fallback. Production
+                // mints the signing authority unconditionally
+                // (`transition_from_control`), and both the hydration fence and
+                // `reserved_package_cas_for_request` refuse an acceptance-origin request
+                // without it, so a fixture that lacks one is simply invalid. Substituting
+                // a zeroed key id here only hid that: it produced a binding the executor's
+                // prior-bound classifier rejects with "acceptance has no signing
+                // authority" and, had it got that far, a durable CAS that matches no row.
                 let (origin_key_id, origin_auth_generation) = match &request.origin {
-                    RecoveryOriginEvidence::Acceptance(value) => value
-                        .authority
-                        .as_ref()
-                        .map(|authority| (authority.key_id, authority.auth_generation))
-                        .unwrap_or(([0u8; 32], 1)),
+                    RecoveryOriginEvidence::Acceptance(value) => {
+                        let authority = value.authority.as_ref().expect(
+                            "acceptance-origin recovery request must carry its signing \
+                             authority; production mints it unconditionally",
+                        );
+                        (authority.key_id, authority.auth_generation)
+                    }
                     RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
+                };
+                // Production reads this from the LOCKED key-package row
+                // (`*guard.wrapper_sha256()`), which it separately proves equal to the
+                // wrapper the acceptance signed. An acceptance-origin request therefore
+                // carries the digest out of its own signed body; a request-origin one has
+                // no such comparand in the plan and keeps the existing placeholder.
+                let key_package_wrapper_sha256 = match &request.origin {
+                    RecoveryOriginEvidence::Acceptance(value) => {
+                        match value.body_binding.as_ref() {
+                            Some(TransitionBodyBinding::Acceptance { recovery, .. }) => {
+                                recovery.key_package_wrapper_sha256
+                            }
+                            _ => [0u8; 32],
+                        }
+                    }
+                    RecoveryOriginEvidence::Request(_) => [0u8; 32],
                 };
                 effects.recovery_package_cas.push({
                     let mut binding = RecoveryPackageCasBinding {
@@ -15808,7 +15922,7 @@ pub(crate) fn persistence_plan_for_test(
                         target_auth_generation: origin_auth_generation,
                         bound_coordinate: request.bound_coordinate,
                         key_package_ref: edge.key_package_ref,
-                        key_package_wrapper_sha256: [0u8; 32],
+                        key_package_wrapper_sha256,
                         package_not_after: effects
                             .reservation_changes
                             .iter()

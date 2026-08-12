@@ -171,7 +171,10 @@ mod chat_protocol {
     }
 }
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
@@ -183,9 +186,9 @@ use uuid::Uuid;
 use chat_protocol::public_state::ActivePublicState;
 use chat_protocol::repository::delivery::WelcomeRejectionReason;
 use chat_protocol::repository::delivery::{
-    append_entry_at, AppendEntry, DeliveryRepositoryError, EntryEntitlementKind,
-    EventEntitlementKind, EventKind, EventRecipient, NewEvent, NewRecoveryWorkItem, OutboxWorkKind,
-    RecoveryWorkSourceKind,
+    append_entry_at, canonical_welcome_disposition_event_payload, AppendEntry,
+    DeliveryRepositoryError, EntryEntitlementKind, EventEntitlementKind, EventKind, EventRecipient,
+    NewEvent, NewRecoveryWorkItem, OutboxWorkKind, RecoveryWorkSourceKind,
 };
 use chat_protocol::repository::transition::ResetReason;
 use chat_protocol::repository::transition::{
@@ -209,11 +212,11 @@ use chat_protocol::state_machine::{
     ExecutorError, HydrationAuthority, LeafPersistenceColumns, LeafRecoveryCancellation,
     LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
     LeaveFulfillment, LeaveRequestCommand, LockedRegistrationProjection, MetadataAuthorColumns,
-    MetadataSnapshotBinding, PolicyPlanMutation, PrincipalId, RecoveryOpenContext,
+    MetadataSnapshotBinding, PlanAuthority, PolicyPlanMutation, PrincipalId, RecoveryOpenContext,
     RequestEntryKind, RequestEvidence, ResetActivation, ResetRequestCommand, ResetRequestRow,
     RevocationPackageCasBinding, RevocationTargetCasBinding, ServerTimestamp, SpineArtifacts,
-    TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
+    TransitionEvidence, WelcomeDispositionInput, WelcomeExpiryAuthority, WelcomeExpiryContext,
+    WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus, ZeroLeafLeave,
 };
 use chat_protocol::transcript::{
     decode_and_verify_control_entry, decode_canonical_signed_mutation,
@@ -1274,6 +1277,7 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
             user_did: fixture.alice_did.clone(),
             role: "member",
         }],
+        None,
     );
     let mut duplicate_wrapper: Value =
         serde_json::from_slice(&non_attesting_control.entry.signed_request_bytes).unwrap();
@@ -1288,23 +1292,35 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
         "duplicate signed ChangeRole arms passed canonical decoding"
     );
     let non_attesting_old = non_attesting_control.transition;
+    // This policy supersedes the recovery family bob's acceptance opened, so any
+    // plan that reaches a durable writer must be bound to the transaction it runs
+    // in. The unbound plan below is only ever used for prewrite-rejection probes,
+    // which fail before any SQL.
+    let policy_changes = vec![SignedPolicyChange::ChangeRole {
+        user_did: fixture.bob_did.clone(),
+        role: "admin",
+    }];
+    let policy_audience = vec![
+        (fixture.alice_id.clone(), fixture.alice_did.clone()),
+        (fixture.bob_id.clone(), fixture.bob_did.clone()),
+    ];
+    // Strictly after the acceptance's own DB-clock instant, which was sampled
+    // before this one: transitions must be monotone in `received_at`, and the
+    // supersession must land at `terminal_at >= requested_at`. Kept within a
+    // millisecond of the real clock so later `clock_timestamp()` drift probes still
+    // sort AFTER the row this policy stamps.
+    let policy_received_millis = clock_now(&pool).await.timestamp_millis() + 1;
     let policy = build_signed_policy_apply(
         &pool,
         fixture,
         prior,
         3,
-        vec![SignedPolicyChange::ChangeRole {
-            user_did: fixture.bob_did.clone(),
-            role: "admin",
-        }],
-        vec![
-            (fixture.alice_id.clone(), fixture.alice_did.clone()),
-            (fixture.bob_id.clone(), fixture.bob_did.clone()),
-        ],
+        policy_changes.clone(),
+        policy_audience.clone(),
+        Some(policy_received_millis),
+        None,
     )
     .await;
-    let transition_id = policy.transition_id;
-    let applied_at = policy.ctx.applied_at;
     let plan = &policy.plan;
     let ctx = &policy.ctx;
 
@@ -1333,8 +1349,12 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
     for drift in ["old-role", "current-membership"] {
         assert_policy_role_cas_conflict_rolls_back(
             &pool,
-            plan,
-            ctx,
+            fixture,
+            prior,
+            3,
+            policy_changes.clone(),
+            policy_audience.clone(),
+            policy_received_millis,
             conversation_id,
             &fixture.bob_did,
             drift,
@@ -1362,10 +1382,32 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
     .expect("participant before policy");
 
     let mut transaction = pool.begin().await.expect("begin signed ChangeRole");
-    let applied =
-        apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, plan, ctx)
-            .await
-            .expect("signed ChangeRole policy applies");
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("signed ChangeRole transaction id");
+    let committed = build_signed_policy_apply(
+        &pool,
+        fixture,
+        prior,
+        3,
+        policy_changes,
+        policy_audience,
+        Some(policy_received_millis),
+        Some(transaction_id),
+    )
+    .await;
+    // Every post-commit assertion reads the transition that ACTUALLY committed:
+    // each `build_signed_policy_apply` mints its own control entry / transition id.
+    let transition_id = committed.transition_id;
+    let applied_at = committed.ctx.applied_at;
+    let applied = apply_conversation_persistence_plan_unscoped_for_test(
+        &mut transaction,
+        &committed.plan,
+        &committed.ctx,
+    )
+    .await
+    .expect("signed ChangeRole policy applies");
     transaction
         .commit()
         .await
@@ -1445,6 +1487,11 @@ async fn signed_policy_change_role_commits_exact_active_participant_update() {
             (fixture.bob_id.clone(), fixture.bob_did.clone()),
             (third_id, third_did.clone()),
         ],
+        // Layered on the DB-clock policy above, so it needs a later instant too.
+        Some(policy_received_millis + 1),
+        // The first policy already superseded the only prior-bound recovery
+        // family, so this plan reaches no transaction-pinned recovery writer.
+        None,
     )
     .await;
     let mixed_transition_id = mixed.transition_id;
@@ -1660,6 +1707,14 @@ struct PolicyApplyFixture {
     transition_id: Uuid,
 }
 
+/// `transaction_id` binds the plan's head CAS — and therefore every prior-bound
+/// recovery-package CAS `persistence_plan_for_test` derives from it — to ONE
+/// PostgreSQL transaction. A policy that supersedes a prior open recovery family
+/// reaches `release_reserved_recovery_package`, which pins
+/// `txid_current()::text = $1`, so such a plan can only be applied in the exact
+/// transaction it was built for. Pass `None` when the plan carries no recovery
+/// family (mirrors `build_policy_edge`).
+#[allow(clippy::too_many_arguments)]
 async fn build_signed_policy_apply(
     pool: &PgPool,
     fixture: &CreationApply,
@@ -1667,12 +1722,14 @@ async fn build_signed_policy_apply(
     seq: u64,
     changes: Vec<SignedPolicyChange>,
     mut audience: Vec<(DeviceIdentity, String)>,
+    received_millis: Option<i64>,
+    transaction_id: Option<String>,
 ) -> PolicyApplyFixture {
     let add_count = changes
         .iter()
         .filter(|change| matches!(change, SignedPolicyChange::Add(_)))
         .count();
-    let signed = signed_policy_control(fixture, prior, seq, changes);
+    let signed = signed_policy_control(fixture, prior, seq, changes, received_millis);
     assert_eq!(
         signed
             .transition
@@ -1689,13 +1746,23 @@ async fn build_signed_policy_apply(
     )
     .expect("genuine signed policy plan");
     let state = planned.resulting_state().clone();
-    let head = ConversationHeadCasBinding::for_test_edge(
-        *fixture.conversation_id.as_bytes(),
-        *signed.entry.entry_id.as_bytes(),
-        *prior.coordinate(),
-        seq,
-        signed.received_at,
-    );
+    let head = match transaction_id {
+        Some(transaction_id) => ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+            transaction_id,
+            *fixture.conversation_id.as_bytes(),
+            *signed.entry.entry_id.as_bytes(),
+            *prior.coordinate(),
+            seq,
+            signed.received_at,
+        ),
+        None => ConversationHeadCasBinding::for_test_edge(
+            *fixture.conversation_id.as_bytes(),
+            *signed.entry.entry_id.as_bytes(),
+            *prior.coordinate(),
+            seq,
+            signed.received_at,
+        ),
+    };
     let plan = persistence_plan_for_test(planned, head);
 
     audience.sort_by(|left, right| {
@@ -1714,9 +1781,16 @@ async fn build_signed_policy_apply(
         ));
     }
     let marker = u8::try_from(seq).unwrap();
+    // ONE clock, as production has (`applied_at == server_instant(received_at)`).
+    // A second DB-clock sample would stamp the durable rows BEFORE the transition
+    // the plan is signed for, and a policy that supersedes a prior recovery request
+    // must land at `terminal_at >= requested_at`
+    // (`leaf_recovery_requests_terminal_shape_check`).
+    let applied_at =
+        DateTime::from_timestamp_millis(signed.received_at.unix_millis()).expect("policy instant");
     let ctx = ExecutionContext {
         protocol_instance_id: fixture.protocol_instance_id,
-        applied_at: clock_now(pool).await,
+        applied_at,
         actor: ExecutionActor {
             user_did: fixture.alice_did.clone(),
             device_id: fixture.alice_device,
@@ -1791,16 +1865,27 @@ async fn commit_accepted_group(pool: &PgPool) -> AcceptedGroupFixture {
     .await;
     let package_not_after_ts =
         ServerTimestamp::from_unix_millis_for_test(package_not_after.timestamp_millis()).unwrap();
-    let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
-    )
-    .unwrap();
+    // ONE clock, as production has: the acceptance's signed `received_at` IS the
+    // instant its durable rows are stamped with. The recovery request and
+    // reservation this acceptance opens are later RELEASED by the policy edge built
+    // on top of it, and that release CAS pins `requested_at`/`created_at` ($17)
+    // against the plan's `claimed_at` — which is this exact `received_at`. A second
+    // sample of the DB clock for `applied_at` makes that CAS unsatisfiable.
+    //
+    // The shared instant has to come from the DB CLOCK, not the corpus manifest:
+    // `assert_recovery_fulfillment_mapping` requires
+    // `generation_states.created_at <= leaf_recovery_requests.requested_at`, and the
+    // creation this acceptance builds on was applied at the DB clock. Superseding
+    // policies therefore take their protocol instant from the DB clock too (see
+    // `signed_policy_control`'s `received_millis` override).
+    let (received_at, accept_applied_at) = single_clock_instant(pool, 0).await;
     let entry_id = Uuid::new_v4();
     let transition_id = Uuid::new_v4();
     let recovery_request_id = *Uuid::new_v4().as_bytes();
     let evidence = TransitionEvidence::for_test_acceptance(
         2,
         *transition_id.as_bytes(),
+        *entry_id.as_bytes(),
         [0x16_u8; 32],
         received_at,
         fixture.coordinate,
@@ -1809,7 +1894,8 @@ async fn commit_accepted_group(pool: &PgPool) -> AcceptedGroupFixture {
         fixture.creation_transition_id,
         fixture.alice_id.clone(),
         key_package_ref,
-        Sha256::digest([0x62_u8; 32]).into(),
+        seeded_key_package_wrapper(),
+        registered_key_id_bytes(&fixture.bob_key_id),
         1,
         package_not_after_ts,
     )
@@ -1843,6 +1929,7 @@ async fn commit_accepted_group(pool: &PgPool) -> AcceptedGroupFixture {
         entry_id,
         bob_period,
         package_not_after,
+        accept_applied_at,
     )
     .await;
     let mut transaction = pool.begin().await.expect("begin acceptance");
@@ -1913,10 +2000,23 @@ async fn assert_policy_prewrite_rejection(
         .expect("rollback policy rejection");
 }
 
+/// Drift the stored participant row, then apply a policy plan built FOR THIS
+/// transaction and prove the participant-role CAS is what rejects it.
+///
+/// The plan is rebuilt inside the drift transaction rather than reused, because
+/// this policy supersedes a prior open recovery family and therefore reaches
+/// `release_reserved_recovery_package`, whose `txid_current()::text = $1` would
+/// otherwise conflict FIRST — the assertion below would then hold for the wrong
+/// reason, since both writers surface the same typed `CompareAndSetConflict`.
+#[allow(clippy::too_many_arguments)]
 async fn assert_policy_role_cas_conflict_rolls_back(
     pool: &PgPool,
-    plan: &chat_protocol::state_machine::ConversationPersistencePlan,
-    ctx: &ExecutionContext,
+    fixture: &CreationApply,
+    prior: &ConversationState,
+    seq: u64,
+    changes: Vec<SignedPolicyChange>,
+    audience: Vec<(DeviceIdentity, String)>,
+    received_millis: i64,
     conversation_id: Uuid,
     target_did: &str,
     drift: &'static str,
@@ -1960,8 +2060,27 @@ async fn assert_policy_role_cas_conflict_rolls_back(
         }
         _ => unreachable!("unknown role CAS drift"),
     }
-    let result =
-        apply_conversation_persistence_plan_unscoped_for_test(&mut transaction, plan, ctx).await;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("role CAS drift transaction id");
+    let drifted = build_signed_policy_apply(
+        pool,
+        fixture,
+        prior,
+        seq,
+        changes,
+        audience,
+        Some(received_millis),
+        Some(transaction_id),
+    )
+    .await;
+    let result = apply_conversation_persistence_plan_unscoped_for_test(
+        &mut transaction,
+        &drifted.plan,
+        &drifted.ctx,
+    )
+    .await;
     assert!(
         matches!(
             result,
@@ -3237,12 +3356,19 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             server_fields_bytes: vec![0xAE_u8; 8],
             outer_entry_fingerprint: vec![0x1B_u8; 32],
         }),
+        // `ctx.spine` describes the RETIRED generation state a reset writes
+        // (`apply_reset_activation` step 3); the successor's own snapshot/leaf
+        // count come from `successor_public_state`. So `leaf_count` is the gen0
+        // leaf count — BOTH alice and bob — which is exactly what the executor's
+        // `spine.leaf_count == closing_leaf_periods.len()` cardinality check
+        // reads. (The sibling `reset_activation_supersedes_prior_open_recovery_request`
+        // already pairs `leaf_count: 2` with its two closing leaf periods.)
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![0xB1_u8; 16],
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
             tree_summary_bytes: vec![0xB2_u8; 16],
             tree_summary_sha256: Sha256::digest([0xB2_u8; 16]).to_vec(),
-            leaf_count: 1,
+            leaf_count: 2,
             genesis_group_info_bytes: vec![0xB3_u8; 16],
             genesis_group_info_sha256: Sha256::digest([0xB3_u8; 16]).to_vec(),
         },
@@ -4111,6 +4237,19 @@ fn random_ref32() -> [u8; 32] {
     bytes
 }
 
+/// A registered device's key id as the 32 raw bytes protocol evidence carries.
+/// Durable rows store the base64url thumbprint (`key_packages.owner_key_id`,
+/// `leaf_recovery_requests.requester_key_id`), and every CAS that pins one
+/// compares the decoded bytes, so signed evidence must carry the SAME key — never
+/// a synthesized digest.
+fn registered_key_id_bytes(key_id: &str) -> [u8; 32] {
+    URL_SAFE_NO_PAD
+        .decode(key_id)
+        .expect("registered key id is base64url")
+        .try_into()
+        .expect("registered key id is 32 bytes")
+}
+
 #[tokio::test]
 async fn acceptance_commits_recovery_open_and_promotes_participant() {
     let (pool, _db) = setup().await;
@@ -4154,6 +4293,7 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
     let evidence = TransitionEvidence::for_test_acceptance(
         2,
         *transition_id.as_bytes(),
+        *entry_id.as_bytes(),
         [0x16_u8; 32],
         received_at,
         fixture.coordinate,
@@ -4162,7 +4302,8 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
         fixture.creation_transition_id,
         fixture.alice_id.clone(),
         key_package_ref,
-        Sha256::digest([0x62_u8; 32]).into(),
+        seeded_key_package_wrapper(),
+        registered_key_id_bytes(&bob_key_id),
         1,
         pkg_not_after_ts,
     )
@@ -4414,6 +4555,7 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
     let evidence = TransitionEvidence::for_test_acceptance(
         2,
         *transition_id.as_bytes(),
+        *entry_id.as_bytes(),
         [0x16_u8; 32],
         received_at,
         fixture.coordinate,
@@ -4422,7 +4564,8 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
         fixture.creation_transition_id,
         fixture.alice_id.clone(),
         key_package_ref,
-        Sha256::digest([0x62_u8; 32]).into(),
+        seeded_key_package_wrapper(),
+        registered_key_id_bytes(&bob_key_id),
         1,
         pkg_not_after_ts,
     )
@@ -4632,6 +4775,7 @@ async fn acceptance_stales_prior_pending_reset_request() {
     let evidence = TransitionEvidence::for_test_acceptance(
         3,
         *transition_id.as_bytes(),
+        *entry_id.as_bytes(),
         [0x16_u8; 32],
         received_at,
         fixture.coordinate,
@@ -4640,7 +4784,8 @@ async fn acceptance_stales_prior_pending_reset_request() {
         fixture.creation_transition_id,
         fixture.alice_id.clone(),
         key_package_ref,
-        Sha256::digest([0x62_u8; 32]).into(),
+        seeded_key_package_wrapper(),
+        registered_key_id_bytes(&bob_key_id),
         1,
         pkg_not_after_ts,
     )
@@ -5516,83 +5661,20 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
             .await
             .expect("pending welcome expires_at");
 
-    let planned = plan_welcome_expiry_for_test(&scenario.fulfillment_state, *welcome_id.as_bytes())
-        .expect("valid welcome expiry plan");
-    let locked_at = ServerTimestamp::from_unix_millis_for_test(expires_at.timestamp_millis())
-        .expect("locked_at");
-    // Entry-less head: prior = the fulfillment coordinate, counter UNCHANGED at 4.
-    let head_cas = ConversationHeadCasBinding::for_test_internal(
-        *conversation_id.as_bytes(),
-        scenario.coordinate,
-        4,
-        locked_at,
-    );
-    let plan = persistence_plan_for_test(planned, head_cas);
-
-    // applied_at == the welcome's expires_at (the disposition event created_at must
-    // equal the delivery terminal_at per `assert_welcome_disposition_cas`).
-    let applied_at = expires_at;
-    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
-    let bob_pred = device_event_predecessor(&pool, &scenario.bob_did, bob_device).await;
     let recovery_work_id = Uuid::new_v4();
     let disposition_event_id = Uuid::new_v4();
-    let fixture = &scenario.fixture;
-    let ctx = ExecutionContext {
-        protocol_instance_id: fixture.protocol_instance_id,
-        applied_at,
-        // Server-observed expiry: the actor fields are not written (no transition).
-        actor: ExecutionActor {
-            user_did: fixture.alice_did.clone(),
-            device_id: fixture.alice_device,
-            key_id: fixture.alice_key_id.clone(),
-            auth_generation: 1,
-            role: TransitionActorRole::Admin,
-            device_status: "active".to_owned(),
-        },
-        authority: ExecutionAuthority::Entryless {
-            operation_id: welcome_id,
-        },
-        spine: SpineArtifacts {
-            public_snapshot_bytes: vec![],
-            public_snapshot_sha256: vec![],
-            tree_summary_bytes: vec![],
-            tree_summary_sha256: vec![],
-            leaf_count: 2,
-            genesis_group_info_bytes: vec![],
-            genesis_group_info_sha256: vec![],
-        },
-        opened_leaves: vec![],
-        metadata_author: None,
-        participant_period_ids: vec![],
-        leaf_period_ids: vec![],
-        entry_recipients: vec![],
-        events: vec![],
-        closing_leaf_periods: vec![],
-        closing_participant_periods: vec![],
-        reset_request_row: None,
-        recovery_open: None,
-        // The recovery-work id + the welcomeDisposition event (recipient = bob, the
-        // welcome recipient, entitlement `welcome`, a `stream` outbox row).
-        welcome_expiry: Some(WelcomeExpiryContext {
-            recovery_work_id,
-            event: EventFanout {
-                event_id: disposition_event_id,
-                event_kind: EventKind::WelcomeDisposition,
-                payload_bytes: vec![0xF8_u8; 8],
-                recipients: vec![(
-                    scenario.bob_id.clone(),
-                    EventEntitlementKind::Welcome,
-                    bob_pred,
-                )],
-                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
-            },
-        }),
-        welcome_response: None,
-        welcome_dispositions: vec![],
-        metadata_avatar: None,
-    };
+    let outbox_id = Uuid::new_v4();
 
     let mut tx = pool.begin().await.expect("begin welcome expiry");
+    let (plan, ctx) = build_welcome_expiry(
+        &pool,
+        &mut tx,
+        &scenario,
+        recovery_work_id,
+        disposition_event_id,
+        outbox_id,
+    )
+    .await;
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome expiry applies");
@@ -5687,7 +5769,23 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
     .await
     .unwrap();
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
+    // A replay is a fresh worker attempt: it re-locks, so it re-derives the
+    // transaction-scoped facts the executor re-checks (`txid_current()` and the
+    // recipient's current event predecessor) while reusing the SAME operation
+    // identity — welcome id, disposition event id, outbox id and recovery-work id.
+    // Only the pending-only delivery CAS can reject it.
+    let (replay_plan, replay_ctx) = build_welcome_expiry(
+        &pool,
+        &mut tx2,
+        &scenario,
+        recovery_work_id,
+        disposition_event_id,
+        outbox_id,
+    )
+    .await;
+    let replay =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &replay_plan, &replay_ctx)
+            .await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "welcome expiry replay must conflict, got {replay:?}"
@@ -5703,17 +5801,167 @@ async fn welcome_expiry_terminalizes_delivery_and_materializes_recovery_work() {
     assert_eq!(before, after, "welcome expiry replay left zero residue");
 }
 
+/// Build the welcome-expiry plan + execution context BOUND TO `transaction` — the
+/// caller-owned PostgreSQL transaction the executor will run in.
+///
+/// Two of the executor's welcome-expiry preconditions are transaction-scoped facts
+/// it re-derives and re-checks rather than trusts: `txid_current()` (which must
+/// equal both the head CAS and the welcome CAS transaction id) and the recipient's
+/// current `max(event_position)` (the disposition event's audience predecessor).
+/// So the plan can only be assembled once the transaction exists, exactly as a
+/// production expiry worker plans under the lock it already holds.
+///
+/// The plan carries the `WelcomeExpiryAuthority` that production's
+/// `plan_welcome_expiry_entry` mints from the consumed `LockedWelcomeGuard`
+/// (state_machine.rs `bind_welcome_expiry_authority`): the welcome's own identity,
+/// recipient, bound coordinate, transition seq, its deterministic `expires_at` as
+/// the terminal instant, and the observed instant. Without it the executor
+/// correctly rejects the plan as unauthorized.
+async fn build_welcome_expiry(
+    pool: &PgPool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scenario: &FulfillmentScenario,
+    recovery_work_id: Uuid,
+    disposition_event_id: Uuid,
+    outbox_id: Uuid,
+) -> (
+    chat_protocol::state_machine::ConversationPersistencePlan,
+    ExecutionContext,
+) {
+    let conversation_id = scenario.conversation_id;
+    let welcome_id = scenario.welcome_id;
+    let welcome = scenario
+        .fulfillment_state
+        .welcome(welcome_id.as_bytes())
+        .expect("pending welcome in the fulfillment state")
+        .clone();
+    assert_eq!(welcome.status(), WelcomeStatus::Pending);
+    // A welcome expiry is stamped at the welcome's own deterministic `expires_at`:
+    // the worker observes it exactly at that instant, so terminal_at == observed_at.
+    let terminal_at = welcome.expires_at();
+    let applied_at =
+        DateTime::from_timestamp_millis(terminal_at.unix_millis()).expect("expiry instant");
+
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await
+        .expect("caller-owned transaction id");
+
+    let planned = plan_welcome_expiry_for_test(&scenario.fulfillment_state, *welcome_id.as_bytes())
+        .expect("valid welcome expiry plan");
+    // Entry-less head: prior = the fulfillment coordinate, counter UNCHANGED at 4.
+    let head_cas = ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+        transaction_id,
+        *conversation_id.as_bytes(),
+        scenario.coordinate,
+        4,
+        terminal_at,
+    );
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_execution_context_authority_for_test(PlanAuthority::WelcomeExpiry(
+            WelcomeExpiryAuthority::for_test(
+                *welcome.welcome_id(),
+                welcome.recipient().clone(),
+                *welcome.coordinate(),
+                welcome.transition_seq(),
+                terminal_at,
+                terminal_at,
+            ),
+        ));
+
+    let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
+    let bob_pred = device_event_predecessor(pool, &scenario.bob_did, bob_device).await;
+    let fixture = &scenario.fixture;
+    let ctx = ExecutionContext {
+        protocol_instance_id: fixture.protocol_instance_id,
+        applied_at,
+        // A server-observed expiry has no signing actor: the executor pins the
+        // actor columns to the WELCOME RECIPIENT (the device whose delivery is
+        // being terminalized) and to that device's exact participant role.
+        actor: ExecutionActor {
+            user_did: scenario.bob_did.clone(),
+            device_id: bob_device,
+            key_id: fixture.bob_key_id.clone(),
+            auth_generation: 1,
+            role: TransitionActorRole::Member,
+            device_status: "active".to_owned(),
+        },
+        authority: ExecutionAuthority::Entryless {
+            operation_id: welcome_id,
+        },
+        spine: SpineArtifacts {
+            public_snapshot_bytes: vec![],
+            public_snapshot_sha256: vec![],
+            tree_summary_bytes: vec![],
+            tree_summary_sha256: vec![],
+            leaf_count: 2,
+            genesis_group_info_bytes: vec![],
+            genesis_group_info_sha256: vec![],
+        },
+        opened_leaves: vec![],
+        metadata_author: None,
+        participant_period_ids: vec![],
+        leaf_period_ids: vec![],
+        entry_recipients: vec![],
+        events: vec![],
+        closing_leaf_periods: vec![],
+        closing_participant_periods: vec![],
+        reset_request_row: None,
+        recovery_open: None,
+        // The recovery-work id + the welcomeDisposition event (recipient = bob, the
+        // welcome recipient, entitlement `welcome`, a `stream` outbox row). The
+        // payload is the server-owned canonical projection — the executor rebuilds
+        // it and rejects anything else.
+        welcome_expiry: Some(WelcomeExpiryContext {
+            recovery_work_id,
+            event: EventFanout {
+                event_id: disposition_event_id,
+                event_kind: EventKind::WelcomeDisposition,
+                payload_bytes: canonical_welcome_disposition_event_payload(welcome_id, "expired"),
+                recipients: vec![(
+                    scenario.bob_id.clone(),
+                    EventEntitlementKind::Welcome,
+                    bob_pred,
+                )],
+                outbox: vec![(outbox_id, OutboxWorkKind::Stream)],
+            },
+        }),
+        welcome_response: None,
+        welcome_dispositions: vec![],
+        metadata_avatar: None,
+    };
+    (plan, ctx)
+}
+
 /// Build (but do not apply) a client-authored welcome response (acknowledge /
-/// reject) against the fulfillment scenario's pending Welcome for bob. Returns the
-/// plan + ctx + the delivery's `expires_at` (for verification). `applied_at` (the
-/// request instant, used for every timestamp) is set just before `expires_at` so
-/// the DB `terminal_at < expires_at` shape holds.
+/// reject) against the fulfillment scenario's pending Welcome for bob, BOUND TO
+/// `transaction` — the caller-owned PostgreSQL transaction the executor will run
+/// in. Returns the plan + ctx + the delivery's `expires_at` (for verification).
+/// `applied_at` (the request instant, used for every timestamp) is set just before
+/// `expires_at` so the DB `terminal_at < expires_at` shape holds.
+///
+/// Two of the executor's welcome-response preconditions are transaction-scoped
+/// facts it re-derives rather than trusts — `txid_current()` (which must equal both
+/// the head CAS and the welcome CAS transaction id) and the recipient's current
+/// `max(event_position)` — so the plan can only be assembled once the transaction
+/// exists, exactly as production plans under the lock it already holds.
+///
+/// The plan carries the `PlanAuthority::Request` that production's
+/// `plan_welcome_response_entry` binds via `bind_non_control_request_authority`,
+/// and the execution context's control-entry content is DERIVED FROM that signed
+/// authority (type id, accepted wrapper bytes, canonical projection, transcript,
+/// digest, signature, key id) rather than invented — the executor re-verifies every
+/// one of those fields against the authority before it writes anything.
+#[allow(clippy::too_many_arguments)]
 async fn build_welcome_response(
     pool: &PgPool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     scenario: &FulfillmentScenario,
     kind: RequestEntryKind,
     successor: WelcomeStatus,
     rejection: Option<WelcomeRejectionWork>,
+    disposition_event_id: Uuid,
+    outbox_id: Uuid,
     byte: u8,
 ) -> (
     chat_protocol::state_machine::ConversationPersistencePlan,
@@ -5744,6 +5992,16 @@ async fn build_welcome_response(
     let received_ms = expires_at.timestamp_millis() - 1_000;
     let received_at = ServerTimestamp::from_unix_millis_for_test(received_ms).unwrap();
     let applied_at = DateTime::from_timestamp_millis(received_ms).unwrap();
+    // The reason the CLIENT signed. It is the sole source of the durable
+    // disposition's `rejection_reason`: the executor rejects any recovery work whose
+    // reason is not the signed one.
+    let signed_rejection_reason = rejection.as_ref().map(|work| match work.reason {
+        WelcomeRejectionReason::NoMatchingKeyPackage => "noMatchingKeyPackage",
+        WelcomeRejectionReason::InvalidWelcome => "invalidWelcome",
+        WelcomeRejectionReason::UnsupportedCipherSuite => "unsupportedCipherSuite",
+        WelcomeRejectionReason::CoordinateMismatch => "coordinateMismatch",
+        WelcomeRejectionReason::LocalStateConflict => "localStateConflict",
+    });
 
     let evidence = RequestEvidence::for_test_welcome_response(
         kind,
@@ -5753,45 +6011,62 @@ async fn build_welcome_response(
         scenario.coordinate,
         transition_seq as u64,
         received_at,
+        signed_rejection_reason,
         byte,
     )
     .unwrap();
-    let planned = plan_welcome_response_for_test(&scenario.fulfillment_state, evidence, successor)
-        .expect("valid welcome response plan");
-    let head_cas = ConversationHeadCasBinding::for_test_internal(
+    // Every control-entry column the executor re-verifies comes from the signed
+    // authority itself, so the accepted entry is the client's request, not a
+    // look-alike.
+    let signed = evidence
+        .signed_authority()
+        .expect("welcome response evidence is signed")
+        .clone();
+    let outer_entry_fingerprint = evidence.durable_row_digest().to_vec();
+    let planned =
+        plan_welcome_response_for_test(&scenario.fulfillment_state, evidence.clone(), successor)
+            .expect("valid welcome response plan");
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await
+        .expect("caller-owned transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_internal_with_transaction_id(
+        transaction_id,
         *conversation_id.as_bytes(),
         scenario.coordinate,
         4,
         received_at,
     );
-    let plan = persistence_plan_for_test(planned, head_cas);
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_execution_context_authority_for_test(PlanAuthority::Request(evidence));
 
     let bob_pred = device_event_predecessor(pool, &bob_did, bob_device).await;
-    // The client's signed authorization the disposition row binds (from ctx.entry).
-    let transcript = vec![byte; 24];
     let ctx = ExecutionContext {
         protocol_instance_id: fixture.protocol_instance_id,
         applied_at,
         actor: ExecutionActor {
             user_did: bob_did.clone(),
             device_id: bob_device,
-            key_id: fixture.bob_key_id.clone(),
-            auth_generation: 1,
+            key_id: URL_SAFE_NO_PAD.encode(signed.key_id()),
+            auth_generation: signed.auth_generation() as i64,
             role: TransitionActorRole::Member,
             device_status: "active".to_owned(),
         },
+        // The accepted signed request IS the control entry: its id is the welcome id
+        // the client signed against, and every byte string below is the authority's.
         authority: ExecutionAuthority::ControlEntry(ControlEntryContent {
-            entry_id: Uuid::new_v4(),
-            entry_kind: "blue.catbird.chat.defs#applicationEntry".to_owned(),
-            accepted_payload_bytes: vec![byte.wrapping_add(1); 8],
-            accepted_payload_sha256: Sha256::digest([byte.wrapping_add(1); 8]).to_vec(),
-            signed_request_bytes: transcript.clone(),
-            unsigned_projection_bytes: vec![byte.wrapping_add(2); 8],
-            signing_transcript_bytes: transcript.clone(),
-            request_digest: Sha256::digest(&transcript).to_vec(),
-            signature: vec![byte.wrapping_add(3); 64],
-            server_fields_bytes: vec![byte.wrapping_add(4); 8],
-            outer_entry_fingerprint: vec![byte.wrapping_add(5); 32],
+            entry_id: welcome_id,
+            entry_kind: signed.type_id().to_owned(),
+            accepted_payload_bytes: signed.signed_request_bytes().to_vec(),
+            accepted_payload_sha256: Sha256::digest(signed.signed_request_bytes()).to_vec(),
+            signed_request_bytes: signed.signed_request_bytes().to_vec(),
+            unsigned_projection_bytes: signed.canonical_projection().to_vec(),
+            signing_transcript_bytes: signed.transcript_bytes().to_vec(),
+            request_digest: signed.request_digest().to_vec(),
+            signature: signed.signature().to_vec(),
+            // A non-control signed request carries no server-authored fields.
+            server_fields_bytes: vec![],
+            outer_entry_fingerprint,
         }),
         spine: SpineArtifacts {
             public_snapshot_bytes: vec![],
@@ -5813,13 +6088,25 @@ async fn build_welcome_response(
         reset_request_row: None,
         recovery_open: None,
         welcome_expiry: None,
+        // The payload is the server-owned canonical projection of the disposition —
+        // the executor rebuilds it from the welcome id + winner kind and rejects
+        // anything else.
         welcome_response: Some(WelcomeResponseContext {
             event: EventFanout {
-                event_id: Uuid::new_v4(),
+                event_id: disposition_event_id,
                 event_kind: EventKind::WelcomeDisposition,
-                payload_bytes: vec![byte.wrapping_add(6); 8],
+                payload_bytes: canonical_welcome_disposition_event_payload(
+                    welcome_id,
+                    match successor {
+                        WelcomeStatus::Acknowledged => "acknowledged",
+                        WelcomeStatus::Rejected => "rejected",
+                        other => {
+                            panic!("welcome response successor must be terminal, got {other:?}")
+                        }
+                    },
+                ),
                 recipients: vec![(bob_id.clone(), EventEntitlementKind::Welcome, bob_pred)],
-                outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
+                outbox: vec![(outbox_id, OutboxWorkKind::Stream)],
             },
             rejection,
         }),
@@ -5835,17 +6122,22 @@ async fn welcome_acknowledgement_terminalizes_delivery_without_recovery_work() {
     let scenario = run_fulfillment_scenario(&pool).await;
     let conversation_id = scenario.conversation_id;
     let welcome_id = scenario.welcome_id;
+    let disposition_event_id = Uuid::new_v4();
+    let outbox_id = Uuid::new_v4();
+
+    let mut tx = pool.begin().await.expect("begin ack");
     let (plan, ctx, _expires) = build_welcome_response(
         &pool,
+        &mut tx,
         &scenario,
         RequestEntryKind::WelcomeAcknowledgement,
         WelcomeStatus::Acknowledged,
         None,
+        disposition_event_id,
+        outbox_id,
         0x51,
     )
     .await;
-
-    let mut tx = pool.begin().await.expect("begin ack");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome acknowledgement applies");
@@ -5891,9 +6183,25 @@ async fn welcome_acknowledgement_terminalizes_delivery_without_recovery_work() {
             .expect("recovery work");
     assert_eq!(rw_count, 0);
 
-    // Replay -> delivery-CAS conflict, zero residue.
+    // Replay -> delivery-CAS conflict, zero residue. A replay is a fresh attempt at
+    // the SAME signed request (same welcome id, disposition event id and outbox id);
+    // only the transaction-scoped facts the executor re-derives are rebuilt.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
+    let (replay_plan, replay_ctx, _) = build_welcome_response(
+        &pool,
+        &mut tx2,
+        &scenario,
+        RequestEntryKind::WelcomeAcknowledgement,
+        WelcomeStatus::Acknowledged,
+        None,
+        disposition_event_id,
+        outbox_id,
+        0x51,
+    )
+    .await;
+    let replay =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &replay_plan, &replay_ctx)
+            .await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "acknowledgement replay must conflict on the delivery CAS, got {replay:?}"
@@ -5909,8 +6217,13 @@ async fn welcome_rejection_terminalizes_delivery_and_creates_recovery_work() {
     let welcome_id = scenario.welcome_id;
     let bob_did = scenario.bob_did.clone();
     let recovery_work_id = Uuid::new_v4();
+    let disposition_event_id = Uuid::new_v4();
+    let outbox_id = Uuid::new_v4();
+
+    let mut tx = pool.begin().await.expect("begin reject");
     let (plan, ctx, _expires) = build_welcome_response(
         &pool,
+        &mut tx,
         &scenario,
         RequestEntryKind::WelcomeRejection,
         WelcomeStatus::Rejected,
@@ -5918,11 +6231,11 @@ async fn welcome_rejection_terminalizes_delivery_and_creates_recovery_work() {
             recovery_work_id,
             reason: WelcomeRejectionReason::NoMatchingKeyPackage,
         }),
+        disposition_event_id,
+        outbox_id,
         0x61,
     )
     .await;
-
-    let mut tx = pool.begin().await.expect("begin reject");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("welcome rejection applies");
@@ -5961,9 +6274,27 @@ async fn welcome_rejection_terminalizes_delivery_and_creates_recovery_work() {
     assert_eq!(rw_id, recovery_work_id);
     let _ = conversation_id;
 
-    // Replay -> delivery-CAS conflict, no duplicate recovery work.
+    // Replay -> delivery-CAS conflict, no duplicate recovery work. Same signed
+    // request, same recovery-work id; only the transaction-scoped facts are rebuilt.
     let mut tx2 = pool.begin().await.expect("begin replay");
-    let replay = apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &plan, &ctx).await;
+    let (replay_plan, replay_ctx, _) = build_welcome_response(
+        &pool,
+        &mut tx2,
+        &scenario,
+        RequestEntryKind::WelcomeRejection,
+        WelcomeStatus::Rejected,
+        Some(WelcomeRejectionWork {
+            recovery_work_id,
+            reason: WelcomeRejectionReason::NoMatchingKeyPackage,
+        }),
+        disposition_event_id,
+        outbox_id,
+        0x61,
+    )
+    .await;
+    let replay =
+        apply_conversation_persistence_plan_unscoped_for_test(&mut tx2, &replay_plan, &replay_ctx)
+            .await;
     assert!(
         matches!(replay, Err(ExecutorError::Delivery(_))),
         "rejection replay must conflict on the delivery CAS, got {replay:?}"
@@ -5988,17 +6319,20 @@ async fn welcome_response_corrupted_cas_binding_is_rejected() {
     let (pool, _db) = setup().await;
     let scenario = run_fulfillment_scenario(&pool).await;
     let welcome_id = scenario.welcome_id;
+    let mut tx = pool.begin().await.expect("begin");
     let (plan, ctx, _expires) = build_welcome_response(
         &pool,
+        &mut tx,
         &scenario,
         RequestEntryKind::WelcomeAcknowledgement,
         WelcomeStatus::Acknowledged,
         None,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
         0x71,
     )
     .await;
     let bad = plan.with_welcome_cas_corrupted_for_test();
-    let mut tx = pool.begin().await.expect("begin");
     let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
     assert!(
         matches!(result, Err(ExecutorError::InconsistentPlan(_))),
@@ -6293,6 +6627,7 @@ struct SignedPolicyControl {
     received_at: ServerTimestamp,
 }
 
+#[derive(Clone)]
 enum SignedPolicyChange {
     Add(String),
     ChangeRole {
@@ -6309,11 +6644,16 @@ impl SignedPolicyChange {
     }
 }
 
+/// `received_millis` overrides the corpus-derived protocol instant. Transitions
+/// must be monotone in `received_at`, so a policy layered on top of an edge whose
+/// own instant had to come from the DB clock (see `commit_accepted_group`) must be
+/// stamped after it; pass `None` for the default `evaluation + seq*1s + 1s`.
 fn signed_policy_control(
     fixture: &CreationApply,
     prior: &ConversationState,
     seq: u64,
     mut changes: Vec<SignedPolicyChange>,
+    received_millis: Option<i64>,
 ) -> SignedPolicyControl {
     let transition_id = Uuid::new_v4();
     let entry_id = Uuid::new_v4();
@@ -6350,7 +6690,8 @@ fn signed_policy_control(
         PublicGroupSnapshotLifecycle::Active,
     );
     let evaluation_millis = corpus_manifest().evaluation_unix_seconds as i64 * 1_000;
-    let received_millis = evaluation_millis + i64::try_from(seq).unwrap() * 1_000 + 1_000;
+    let received_millis = received_millis
+        .unwrap_or_else(|| evaluation_millis + i64::try_from(seq).unwrap() * 1_000 + 1_000);
     let signed_at = DateTime::<Utc>::from_timestamp_millis(received_millis - 500)
         .unwrap()
         .to_rfc3339_opts(SecondsFormat::Millis, true);

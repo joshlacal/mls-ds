@@ -6406,6 +6406,16 @@ pub async fn device_event_predecessor(pool: &PgPool, did: &str, device: Uuid) ->
     .expect("predecessor")
 }
 
+/// The exact `wrapper_bytes` every seeded key package carries. An acceptance
+/// signs this artifact into its recovery binding, and production requires the
+/// signed wrapper digest to equal the locked row's
+/// (`acceptance_recovery_package_artifact_matches`) while the durable release CAS
+/// pins `key_packages.wrapper_sha256`. One constant, so a fixture cannot sign a
+/// wrapper the row does not hold.
+pub fn seeded_key_package_wrapper() -> Vec<u8> {
+    vec![0xC1_u8; 32]
+}
+
 /// Seed one `available` key package owned by `(owner_did, owner_device)` and
 /// return its exact `not_after` (the value the reservation's
 /// `expires_at = LEAST(created_at + 5 min, not_after)` mapping check needs).
@@ -6423,7 +6433,7 @@ pub async fn seed_key_package(
     // so a sub-millisecond `not_after` would never match the round-tripped instant.
     let not_after =
         DateTime::from_timestamp_millis((now + Duration::hours(24)).timestamp_millis()).unwrap();
-    let wrapper = vec![0xC1_u8; 32];
+    let wrapper = seeded_key_package_wrapper();
     let init_key = {
         let mut key = vec![0u8; 32];
         key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -6454,6 +6464,15 @@ pub async fn seed_key_package(
 /// fulfillment scenario). Actor = the invitee (member/active), audience = the two
 /// current devices, recovery_open bound to the invitee's participant period.
 #[allow(clippy::too_many_arguments)]
+/// `applied_at` is the instant every durable row this acceptance writes is
+/// stamped with — including `leaf_recovery_requests.requested_at` and
+/// `key_package_reservations.created_at`, which the prior-bound release CAS later
+/// pins as `$17` against the plan's `claimed_at` (the acceptance evidence's
+/// `received_at`). Production has ONE clock there
+/// (`applied_at == server_instant(evidence.received_at())`), so a caller whose
+/// acceptance is ever superseded must pass the instant its evidence was signed at,
+/// not a second sample of the DB clock.
+#[allow(clippy::too_many_arguments)]
 pub async fn acceptance_ctx(
     pool: &PgPool,
     fixture: &CreationApply,
@@ -6463,8 +6482,8 @@ pub async fn acceptance_ctx(
     entry_id: Uuid,
     bob_period: Uuid,
     package_not_after: DateTime<Utc>,
+    applied_at: DateTime<Utc>,
 ) -> ExecutionContext {
-    let applied_at = clock_now(pool).await;
     let payload = vec![0xA1_u8; 12];
     let transcript = vec![0xA2_u8; 12];
     ExecutionContext {
@@ -6674,10 +6693,21 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
     let recovery_request_id = Uuid::new_v4();
     let accept_transition = Uuid::new_v4();
     let accept_entry = Uuid::new_v4();
-    let bob_sig_digest: [u8; 32] = Sha256::digest([0x62_u8; 32]).into();
+    // The acceptance's signing key IS the reserved key package's owner key: the
+    // prior-bound package CAS carries it as `target_key_id` and the durable CAS
+    // pins it against `key_packages.owner_key_id`.
+    let bob_key_id_bytes: [u8; 32] = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&fixture.bob_key_id)
+            .expect("bob key id is base64url")
+            .try_into()
+            .expect("bob key id is 32 bytes")
+    };
     let accept_evidence = TransitionEvidence::for_test_acceptance(
         2,
         *accept_transition.as_bytes(),
+        *accept_entry.as_bytes(),
         [0x16_u8; 32],
         accept_received,
         fixture.coordinate,
@@ -6686,7 +6716,8 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
         fixture.creation_transition_id,
         fixture.alice_id.clone(),
         corpus_ref,
-        bob_sig_digest,
+        seeded_key_package_wrapper(),
+        bob_key_id_bytes,
         1,
         pkg_not_after_ts,
     )
@@ -6720,6 +6751,10 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
         accept_entry,
         bob_period,
         package_not_after,
+        // This scenario's acceptance is CONSUMED by the fulfillment, never
+        // released, so it is not reached by the transaction-pinned release CAS;
+        // keep its historical DB-clock stamp.
+        clock_now(&pool).await,
     )
     .await;
     {

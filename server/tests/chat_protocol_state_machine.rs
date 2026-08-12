@@ -1389,6 +1389,7 @@ fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
     let acceptance = TransitionEvidence::for_test_acceptance(
         ACCEPT_SEQ,
         uuid_v4_bytes(0x22),
+        uuid_v4_bytes(0x24),
         [0x22; 32],
         fixture_received_at(ACCEPT_SEQ),
         prior,
@@ -1397,6 +1398,7 @@ fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
         uuid_v4_bytes(0x11),
         alice(&manifest),
         hex_array(&manifest.chain.inner_key_package_ref_hex),
+        wrapper.clone(),
         [0x44; 32],
         1,
         fixture_package_not_after(),
