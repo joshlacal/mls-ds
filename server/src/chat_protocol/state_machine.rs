@@ -21880,6 +21880,7 @@ pub(in crate::chat_protocol) mod executor {
     /// interval shape. The write phase retains applied-count reconciliation as a
     /// second fence.
     fn preflight_leaf_recovery_fulfillment(
+        plan: &ConversationPersistencePlan,
         effects: &TransitionEffects,
         hydration: &ConversationStateHydration,
         ctx: &ExecutionContext,
@@ -21917,185 +21918,44 @@ pub(in crate::chat_protocol) mod executor {
             ));
         }
 
-        let mut own_request: Option<&RecoveryRequest> = None;
-        let mut superseded_requests = BTreeSet::new();
-        for change in effects.recovery_request_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "fulfillment recovery request change is not terminal",
-                ));
-            };
-            if !recovery_request_identity_is_unchanged(before, after)
-                || !terminal_is_exact_transition(&after.terminal, producer)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "fulfillment recovery request identity/terminal drift",
-                ));
-            }
-            match (before.status, after.status) {
-                (RecoveryRequestStatus::Open, RecoveryRequestStatus::Fulfilled) => {
-                    if own_request.replace(after).is_some() {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "fulfillment carries multiple own recovery requests",
-                        ));
-                    }
-                }
-                (RecoveryRequestStatus::Open, RecoveryRequestStatus::Superseded) => {
-                    if !superseded_requests.insert((after.request_id, after.key_package_ref)) {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "fulfillment repeats a superseded recovery request",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "fulfillment recovery request change has an illegal direction",
-                    ))
-                }
-            }
-        }
-        let own_request = own_request.ok_or(ExecutorError::InconsistentPlan(
-            "fulfillment carries no own fulfilled recovery request",
+        // DEFECT 2 FIX. The two blocks this replaces demanded
+        // `terminal_is_exact_transition` of EVERY recovery request and reservation
+        // on the coordinate, so a peer's overdue `Expiry` terminal fell through to
+        // the `_ => illegal direction` arm. Open recovery requests are unique per
+        // TARGET and coordinate-preserving, so peers stack requests on one
+        // coordinate with staggered `expires_at`; fulfilling one device while a
+        // peer's request was overdue produced a planner-valid, executor-fatal plan,
+        // and the recovering device wedged PERMANENTLY because retry re-planned the
+        // identical shape. Prior-bound families are now classified, not rejected.
+        let partition =
+            classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::LeafRecoveryFulfillment)?;
+        let own_key = partition.own.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no own recovery family",
         ))?;
+        let own_request = effects
+            .recovery_request_changes()
+            .iter()
+            .filter_map(StateChange::after)
+            .find(|request| (request.request_id, request.key_package_ref) == own_key)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment carries no own fulfilled recovery request",
+            ))?;
+        let own_reservation = effects
+            .reservation_changes()
+            .iter()
+            .filter_map(StateChange::after)
+            .find(|reservation| (reservation.request_id, reservation.key_package_ref) == own_key)
+            .ok_or(ExecutorError::InconsistentPlan(
+                "fulfillment carries no own consumed reservation",
+            ))?;
 
-        let mut own_reservation: Option<&RecoveryReservation> = None;
-        let mut superseded_reservations = BTreeSet::new();
-        for change in effects.reservation_changes() {
-            let (Some(before), Some(after)) = (change.before(), change.after()) else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "fulfillment reservation change is not terminal",
-                ));
-            };
-            if !recovery_reservation_identity_is_unchanged(before, after)
-                || !terminal_is_exact_transition(&after.terminal, producer)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "fulfillment reservation identity/terminal drift",
-                ));
-            }
-            match (before.status, after.status) {
-                (ReservationStatus::Active, ReservationStatus::Consumed) => {
-                    if own_reservation.replace(after).is_some() {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "fulfillment carries multiple own reservations",
-                        ));
-                    }
-                }
-                (ReservationStatus::Active, ReservationStatus::Released) => {
-                    if !superseded_reservations.insert((after.request_id, after.key_package_ref)) {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "fulfillment repeats a released reservation",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "fulfillment reservation change has an illegal direction",
-                    ))
-                }
-            }
-        }
-        let own_reservation = own_reservation.ok_or(ExecutorError::InconsistentPlan(
-            "fulfillment carries no own consumed reservation",
-        ))?;
-        if own_request.request_id != own_reservation.request_id
-            || own_request.target != own_reservation.target
-            || own_request.bound_coordinate != own_reservation.bound_coordinate
-            || own_request.key_package_ref != own_reservation.key_package_ref
-            || own_request.received_at != own_reservation.received_at
-            || own_request.expires_at != own_reservation.expires_at
-        {
-            return Err(ExecutorError::InconsistentPlan(
-                "fulfillment own request/reservation are not bijective",
-            ));
-        }
-
+        // Retained: the own package edge's driven-ref and direction check.
         verify_recovery_package_consistency(
             effects,
             &own_request.key_package_ref,
             PackageStatus::Reserved,
             PackageStatus::Consumed,
         )?;
-        let mut own_packages = 0usize;
-        let mut superseded_packages = BTreeSet::new();
-        for edge in effects.package_transitions() {
-            match (edge.from, edge.to) {
-                (PackageStatus::Reserved, PackageStatus::Consumed)
-                    if edge.request_id == own_request.request_id
-                        && edge.key_package_ref == own_request.key_package_ref =>
-                {
-                    own_packages += 1;
-                }
-                (PackageStatus::Reserved, PackageStatus::Available) => {
-                    if !superseded_packages.insert((edge.request_id, edge.key_package_ref)) {
-                        return Err(ExecutorError::InconsistentPlan(
-                            "fulfillment repeats a reactivated package",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "fulfillment package edge has an illegal direction/binding",
-                    ))
-                }
-            }
-        }
-        if own_packages != 1
-            || superseded_requests != superseded_reservations
-            || superseded_requests != superseded_packages
-        {
-            return Err(ExecutorError::InconsistentPlan(
-                "fulfillment recovery/request/package supersessions are not bijective",
-            ));
-        }
-        for (request_id, key_package_ref) in &superseded_requests {
-            let request = effects
-                .recovery_request_changes()
-                .iter()
-                .find_map(|change| {
-                    change.after().filter(|after| {
-                        after.request_id == *request_id
-                            && after.key_package_ref == *key_package_ref
-                            && after.status == RecoveryRequestStatus::Superseded
-                    })
-                })
-                .expect("superseded request key was collected from this family");
-            let reservation = effects
-                .reservation_changes()
-                .iter()
-                .find_map(|change| {
-                    change.after().filter(|after| {
-                        after.request_id == *request_id
-                            && after.key_package_ref == *key_package_ref
-                            && after.status == ReservationStatus::Released
-                    })
-                })
-                .expect("released reservation key was collected from this family");
-            let binding = effects
-                .recovery_package_cas()
-                .iter()
-                .find(|binding| {
-                    binding.request_id == *request_id
-                        && binding.key_package_ref == *key_package_ref
-                        && binding.expected_status == PackageStatus::Reserved
-                        && binding.successor_status == PackageStatus::Available
-                })
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "superseded package CAS is missing",
-                ))?;
-            if request.target != reservation.target
-                || request.target != binding.target
-                || request.bound_coordinate != reservation.bound_coordinate
-                || request.bound_coordinate != binding.bound_coordinate
-                || request.received_at != reservation.received_at
-                || request.expires_at != reservation.expires_at
-                || reservation.package_not_after != binding.package_not_after
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "prior-bound request/reservation/package identities drift",
-                ));
-            }
-        }
 
         let own_cas = effects
             .recovery_package_cas()
@@ -22343,9 +22203,13 @@ pub(in crate::chat_protocol) mod executor {
         }
 
         let prior_bound = FamilyCounts {
-            requests: superseded_requests.len(),
-            reservations: superseded_reservations.len(),
-            packages: superseded_packages.len(),
+            // Rebuilt from the classifier's typed partition, over ALL classified
+            // prior-bound keys (Row A and Row B). welcomes/reset_requests/
+            // leave_requests keep their own locals — those families are outside
+            // the classifier's scope, and zeroing them would fail the fence.
+            requests: partition.requests(),
+            reservations: partition.reservations(),
+            packages: partition.packages(),
             welcomes: superseded_welcomes.len(),
             reset_requests: staled_resets.len(),
             leave_requests: staled_leaves.len(),
@@ -25652,7 +25516,7 @@ pub(in crate::chat_protocol) mod executor {
                 "fulfillment adds no pending welcome",
             ))?;
         let preflight_prior_bound =
-            preflight_leaf_recovery_fulfillment(effects, hydration, ctx, transition_id, seq_i64)?;
+            preflight_leaf_recovery_fulfillment(plan, effects, hydration, ctx, transition_id, seq_i64)?;
 
         // 1. Head CAS sv+1.
         transition::cas_conversation_head(
@@ -26154,34 +26018,13 @@ pub(in crate::chat_protocol) mod executor {
         // package Reserved->Available) and a prior pending Welcome. Handled by
         // write_prior_bound_supersessions + write_welcome_supersessions; every such
         // delta MUST be a supersession shape (exact-shape checks below).
-        for change in effects.recovery_request_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "generic commit recovery request change is not a supersession",
-                ));
-            }
-        }
-        for change in effects.reservation_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "generic commit reservation change is not a release",
-                ));
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
-                return Err(ExecutorError::InconsistentPlan(
-                    "generic commit package edge is not a Reserved->Available release",
-                ));
-            }
-        }
-        verify_recovery_package_bijection(effects)?;
+        // Prior-bound recovery families. The three shape loops this replaces
+        // accepted only Row A (Open->Superseded / Active->Released) and never
+        // checked terminal evidence, family identity, or the CAS bindings — so a
+        // legal Row B due-expiry family was rejected here exactly as it was in leaf
+        // recovery fulfillment. The shared classifier proves both rows, strictly
+        // before this arm's first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // generic commit
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
             || effects.invitation_quota_cas().is_some()
@@ -26580,7 +26423,13 @@ pub(in crate::chat_protocol) mod executor {
         // leaves (the partition check below enforces exactly-one-fulfilled + others-
         // only Pending->Stale). Reject the families it never carries.
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
-        reject_if_present("recovery_package_cas", effects.recovery_package_cas())?;
+        // DEFECT 1 FIX. This line was `reject_if_present("recovery_package_cas", ..)`,
+        // which — because `into_persistence_plan` enforces the CAS <-> edge bijection —
+        // meant "reject any plan carrying any package edge", the exact opposite of the
+        // comment above. Any leaveCommit on a coordinate with open recovery work was
+        // planner-legal and executor-fatal. Prior-bound package work is now classified,
+        // not rejected.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
         if effects.revocation_target_cas().is_some()
             || effects.welcome_cas().is_some()
@@ -27261,34 +27110,13 @@ pub(in crate::chat_protocol) mod executor {
         reject_if_present("interval_changes", effects.interval_changes())?;
         reject_if_present("terminal_proof_changes", effects.terminal_proof_changes())?;
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
-        for change in effects.recovery_request_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "policy recovery request change is not a supersession",
-                ));
-            }
-        }
-        for change in effects.reservation_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "policy reservation change is not a release",
-                ));
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
-                return Err(ExecutorError::InconsistentPlan(
-                    "policy package edge is not a Reserved->Available release",
-                ));
-            }
-        }
-        verify_recovery_package_bijection(effects)?;
+        // Prior-bound recovery families. The three shape loops this replaces
+        // accepted only Row A (Open->Superseded / Active->Released) and never
+        // checked terminal evidence, family identity, or the CAS bindings — so a
+        // legal Row B due-expiry family was rejected here exactly as it was in leaf
+        // recovery fulfillment. The shared classifier proves both rows, strictly
+        // before this arm's first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // policy
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("policy metadata change"));
         }
@@ -27755,34 +27583,13 @@ pub(in crate::chat_protocol) mod executor {
             }
         }
         reject_if_present("revocation_package_cas", effects.revocation_package_cas())?;
-        for change in effects.recovery_request_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "zero-leaf leave recovery request change is not a supersession",
-                ));
-            }
-        }
-        for change in effects.reservation_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "zero-leaf leave reservation change is not a release",
-                ));
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
-                return Err(ExecutorError::InconsistentPlan(
-                    "zero-leaf leave package edge is not a Reserved->Available release",
-                ));
-            }
-        }
-        verify_recovery_package_bijection(effects)?;
+        // Prior-bound recovery families. The three shape loops this replaces
+        // accepted only Row A (Open->Superseded / Active->Released) and never
+        // checked terminal evidence, family identity, or the CAS bindings — so a
+        // legal Row B due-expiry family was rejected here exactly as it was in leaf
+        // recovery fulfillment. The shared classifier proves both rows, strictly
+        // before this arm's first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // zero-leaf leave
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "zero-leaf leave metadata change",
@@ -28048,34 +27855,13 @@ pub(in crate::chat_protocol) mod executor {
         // (mirroring the generic-commit arm) and consumed below. `recovery_package_cas`
         // is the production-shape package witness the bijection validates, NOT a
         // rejected family.
-        for change in effects.recovery_request_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "close recovery request change is not a supersession",
-                ));
-            }
-        }
-        for change in effects.reservation_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "close reservation change is not a release",
-                ));
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
-                return Err(ExecutorError::InconsistentPlan(
-                    "close package edge is not a Reserved->Available release",
-                ));
-            }
-        }
-        verify_recovery_package_bijection(effects)?;
+        // Prior-bound recovery families. The three shape loops this replaces
+        // accepted only Row A (Open->Superseded / Active->Released) and never
+        // checked terminal evidence, family identity, or the CAS bindings — so a
+        // legal Row B due-expiry family was rejected here exactly as it was in leaf
+        // recovery fulfillment. The shared classifier proves both rows, strictly
+        // before this arm's first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // close
         if effects.metadata_change().is_some() {
             return Err(ExecutorError::UnsupportedEffect("close metadata change"));
         }
@@ -28844,34 +28630,13 @@ pub(in crate::chat_protocol) mod executor {
         // the bijection validates, NOT a rejected family — so a reset that retires a
         // generation with an OPEN recovery request (reserved package) is composed,
         // not hard-errored.
-        for change in effects.recovery_request_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == RecoveryRequestStatus::Open
-                    && after.status() == RecoveryRequestStatus::Superseded)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset recovery request change is not a supersession",
-                ));
-            }
-        }
-        for change in effects.reservation_changes() {
-            if !matches!((change.before(), change.after()), (Some(before), Some(after))
-                if before.status() == ReservationStatus::Active
-                    && after.status() == ReservationStatus::Released)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset reservation change is not a release",
-                ));
-            }
-        }
-        for edge in effects.package_transitions() {
-            if edge.from != PackageStatus::Reserved || edge.to != PackageStatus::Available {
-                return Err(ExecutorError::InconsistentPlan(
-                    "reset package edge is not a Reserved->Available release",
-                ));
-            }
-        }
-        verify_recovery_package_bijection(effects)?;
+        // Prior-bound recovery families. The three shape loops this replaces
+        // accepted only Row A (Open->Superseded / Active->Released) and never
+        // checked terminal evidence, family identity, or the CAS bindings — so a
+        // legal Row B due-expiry family was rejected here exactly as it was in leaf
+        // recovery fulfillment. The shared classifier proves both rows, strictly
+        // before this arm's first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?; // reset activation
         if effects.revocation_target_cas().is_some() || effects.welcome_cas().is_some() {
             return Err(ExecutorError::UnsupportedEffect(
                 "reset revocation/welcome CAS",
@@ -29389,6 +29154,12 @@ pub(in crate::chat_protocol) mod executor {
             PackageStatus::Available,
             PackageStatus::Reserved,
         )?;
+
+        // Prior-bound recovery families. Acceptance previously proved only its OWN
+        // family and left every prior-bound supersession to the writer, unproven
+        // before the head CAS. The classifier derives the own family independently
+        // by exact typed shape and proves every other family, Row A and Row B.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::Acceptance)?;
 
         // 1. Head CAS advances the coordinate + counter (sv+1, same generation).
         transition::cas_conversation_head(
