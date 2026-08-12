@@ -12913,6 +12913,14 @@ async fn seed_alice_open_recovery(
     // Request-origin plan.
     let rec_plan = persistence_plan_for_test(rec_planned, rec_head)
         .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
+    // KNOWN FIXTURE INCONSISTENCY, diagnosed but not resolved: the durable
+    // request/reservation rows take `requested_at` / `created_at` from THIS
+    // clock-based applied_at, while the release CAS binding takes `claimed_at` from the
+    // plan's eval-based `received_at` above. `rr.requested_at = $17` therefore never
+    // matches and the prior-bound release conflicts. Aligning them by making
+    // applied_at eval-based instead trips
+    // chat.assert_recovery_fulfillment_mapping ("recovery request reservation mapping
+    // mismatch"), so the fixture's time model needs reconciling, not a one-line swap.
     let rec_applied_at = clock_now(pool).await;
     let rec_transcript = vec![0x72_u8; 16];
     let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
