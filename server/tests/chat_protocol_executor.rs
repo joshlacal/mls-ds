@@ -8704,10 +8704,19 @@ async fn leaf_recovery_replace_fulfillment_rotates_leaf_and_closes_prior_interva
 }
 
 /// Desync negative for the `replace` composition: with the OLD leaf period absent
-/// from `ctx.closing_leaf_periods`, the executor must HARD-ERROR (`MissingContext`)
-/// rather than silently opening bob's new leaf while leaving the old one active —
-/// the exact half-rotation silent-bug this arm guards against. The whole
-/// transaction rolls back (zero residue).
+/// from `ctx.closing_leaf_periods`, the executor must HARD-ERROR rather than
+/// silently opening bob's new leaf while leaving the old one active — the exact
+/// half-rotation silent-bug this arm guards against. The whole transaction rolls
+/// back (zero residue).
+///
+/// The contractual detector is the composite target-shape guard at
+/// `state_machine.rs:22354-22374`, whose `ctx.closing_leaf_periods.len() !=
+/// usize::from(is_replace)` clause (:22370) is exactly this case: a `Replace`
+/// fulfillment must carry precisely one closing leaf period. It therefore raises
+/// `InconsistentPlan`, not `MissingContext` — the context is not missing a field,
+/// the plan's request kind and the context's leaf shape disagree. This assertion
+/// previously named `MissingContext` and so could never hold; the guard was
+/// always right.
 #[tokio::test]
 async fn leaf_recovery_replace_fulfillment_without_old_leaf_period_is_rejected() {
     let (pool, _db) = setup().await;
@@ -8729,9 +8738,19 @@ async fn leaf_recovery_replace_fulfillment_without_old_leaf_period_is_rejected()
         .await
         .expect("begin rejected replace fulfillment");
     let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx).await;
+    // Pin the exact message, not merely the variant: a bare
+    // `matches!(_, InconsistentPlan(_))` would also be satisfied by any of the
+    // other shape rejections in this arm, so the test could pass without the
+    // closing-leaf-period clause ever being the thing that fired.
     assert!(
-        matches!(result, Err(ExecutorError::MissingContext(_))),
-        "replace fulfillment without the old leaf period must hard-error, got {result:?}"
+        matches!(
+            result,
+            Err(ExecutorError::InconsistentPlan(
+                "fulfillment target leaf/context shape disagrees with request kind"
+            ))
+        ),
+        "replace fulfillment without the old leaf period must hard-error on the \
+         target-shape guard, got {result:?}"
     );
     tx.rollback().await.expect("rollback rejected replace");
     let after: i64 =
