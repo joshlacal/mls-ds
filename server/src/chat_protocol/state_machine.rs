@@ -20834,7 +20834,7 @@ pub(in crate::chat_protocol) mod executor {
             OwnFamilyKind::None => None,
             OwnFamilyKind::Acceptance => Some(classify_own_acceptance_family(effects, prior)?),
             OwnFamilyKind::LeafRecoveryFulfillment => {
-                Some(classify_own_fulfillment_family(effects, prior)?)
+                Some(classify_own_fulfillment_family(effects, prior, producer)?)
             }
         };
 
@@ -21174,6 +21174,7 @@ pub(in crate::chat_protocol) mod executor {
     fn classify_own_fulfillment_family(
         effects: &TransitionEffects,
         prior: &PublicGroupSnapshotCoordinate,
+        producer: &super::TransitionEvidence,
     ) -> Result<([u8; 16], [u8; 32]), ExecutorError> {
         let mut own: Option<([u8; 16], [u8; 32])> = None;
         for change in effects.recovery_request_changes() {
@@ -21187,9 +21188,13 @@ pub(in crate::chat_protocol) mod executor {
             }
             if !recovery_request_identity_is_unchanged(before, after)
                 || before.bound_coordinate != *prior
+                // The own family closes by THIS producer's transition. An `Expiry`
+                // terminal is never the fulfilling device's own work; it belongs to
+                // a prior-bound peer family and is classified as such.
+                || !terminal_is_exact_transition(&after.terminal, producer)
             {
                 return Err(ExecutorError::InconsistentPlan(
-                    "fulfillment own recovery request identity drift",
+                    "fulfillment own recovery request identity/terminal drift",
                 ));
             }
             if own
@@ -21217,6 +21222,7 @@ pub(in crate::chat_protocol) mod executor {
                 || after.status != ReservationStatus::Consumed
                 || !recovery_reservation_identity_is_unchanged(before, after)
                 || before.bound_coordinate != *prior
+                || !terminal_is_exact_transition(&after.terminal, producer)
             {
                 return Err(ExecutorError::InconsistentPlan(
                     "fulfillment own reservation has an illegal shape",
@@ -31550,6 +31556,299 @@ pub(in crate::chat_protocol) mod executor {
                     &expected,
                 )
                 .expect("due-expiry family must reconcile without a silent drop");
+            }
+        }
+
+        /// REGRESSION — the Row B legality proof for the C2 prior-bound correction.
+        ///
+        /// A due-expiry family whose package returns to `Available` is legal
+        /// prior-bound work. Before the correction only `preflight_metadata_transition`
+        /// proved it; the other eight arms carried guards that accepted Row A
+        /// (`Open -> Superseded` / `Active -> Released`) ONLY, so this exact shape was
+        /// rejected by leaf recovery fulfillment (wedging the recovering device
+        /// permanently, since retry re-planned the identical shape), and by generic
+        /// commit, policy, zero-leaf leave, close and reset activation. All nine now
+        /// share one classifier, so proving the shape here proves it for every arm.
+        #[test]
+        fn prior_bound_row_b_due_expiry_is_accepted_with_a_release_edge() {
+            let (mut plan, context, expected) =
+                exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+
+            // The fixture ships the production-unproducible `Reserved -> Expired`
+            // edge. Turn it into the legal Row B shape: the request and reservation
+            // still expire by exact due-expiry evidence, but the PACKAGE is released
+            // back to `Available` — which is what a real expiry sweep emits, because
+            // MIN_KEY_PACKAGE_REMAINING (600s) strictly exceeds
+            // RECOVERY_RESERVATION_TTL (300s), so the package always outlives the
+            // reservation.
+            for edge in plan.effects.package_transitions.iter_mut() {
+                if edge.to == PackageStatus::Expired {
+                    edge.to = PackageStatus::Available;
+                }
+            }
+            for binding in plan.effects.recovery_package_cas.iter_mut() {
+                if binding.successor_status == PackageStatus::Expired {
+                    binding.successor_status = PackageStatus::Available;
+                    binding.authority_digest = [0; 32];
+                    binding.authority_digest = recovery_package_cas_authority_digest(binding);
+                }
+            }
+
+            preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6)
+                .expect("a legal Row B due-expiry family must be executable");
+            reconcile_coordinate_change_families(
+                plan.effects(),
+                &FamilyCounts {
+                    requests: 0,
+                    reservations: 0,
+                    packages: 0,
+                    welcomes: 0,
+                    reset_requests: 0,
+                    leave_requests: 0,
+                },
+                &expected,
+            )
+            .expect("Row B must reconcile without a silent drop");
+        }
+
+        /// Builds one complete prior-bound recovery family (request + reservation +
+        /// package edge + sealed CAS binding) onto an existing plan.
+        #[allow(clippy::too_many_arguments)]
+        fn push_recovery_family(
+            plan: &mut ConversationPersistencePlan,
+            prior: PublicGroupSnapshotCoordinate,
+            actor: DeviceIdentity,
+            request_id: [u8; 16],
+            key_package_ref: [u8; 32],
+            origin_key_id: [u8; 32],
+            locked_row_digest: [u8; 32],
+            received_at: ServerTimestamp,
+            expires_at: ServerTimestamp,
+            after_request_status: RecoveryRequestStatus,
+            after_reservation_status: ReservationStatus,
+            terminal: Option<WorkTerminalEvidence>,
+            package_to: PackageStatus,
+        ) {
+            let origin = request_evidence(
+                RequestEntryKind::LeafRecoveryRequest,
+                request_id,
+                actor.clone(),
+                *prior.conversation_id(),
+                received_at,
+                origin_key_id,
+            );
+            let before_request = RecoveryRequest {
+                request_id,
+                target: actor.clone(),
+                kind: LeafRecoveryKind::Add,
+                source: RecoverySource::Request,
+                bound_coordinate: prior,
+                key_package_ref,
+                received_at,
+                expires_at,
+                status: RecoveryRequestStatus::Open,
+                origin: RecoveryOriginEvidence::Request(origin),
+                terminal: None,
+            };
+            let mut after_request = before_request.clone();
+            after_request.status = after_request_status;
+            after_request.terminal = terminal.clone();
+            let before_reservation = RecoveryReservation {
+                request_id,
+                target: actor.clone(),
+                bound_coordinate: prior,
+                key_package_ref,
+                received_at,
+                expires_at,
+                package_not_after: expires_at,
+                status: ReservationStatus::Active,
+                terminal: None,
+            };
+            let mut after_reservation = before_reservation.clone();
+            after_reservation.status = after_reservation_status;
+            after_reservation.terminal = terminal;
+            plan.effects.recovery_request_changes.push(StateChange {
+                before: Some(before_request),
+                after: Some(after_request),
+            });
+            plan.effects.reservation_changes.push(StateChange {
+                before: Some(before_reservation),
+                after: Some(after_reservation),
+            });
+            plan.effects.package_transitions.push(PackageTransition {
+                request_id,
+                key_package_ref,
+                from: PackageStatus::Reserved,
+                to: package_to,
+            });
+            let mut package_cas = RecoveryPackageCasBinding {
+                transaction_id: plan
+                    .effects
+                    .head_cas
+                    .as_ref()
+                    .expect("head cas")
+                    .transaction_id
+                    .clone(),
+                conversation_id: *prior.conversation_id(),
+                request_id,
+                target: actor,
+                target_key_id: origin_key_id,
+                target_auth_generation: 3,
+                bound_coordinate: prior,
+                key_package_ref,
+                key_package_wrapper_sha256: [0x63; 32],
+                package_not_after: expires_at,
+                claimed_at: received_at,
+                expected_status: PackageStatus::Reserved,
+                successor_status: package_to,
+                locked_row_digest,
+                authority_digest: [0; 32],
+            };
+            package_cas.authority_digest = recovery_package_cas_authority_digest(&package_cas);
+            plan.effects.recovery_package_cas.push(package_cas);
+        }
+
+        /// REGRESSION FOR DEFECT 2 — the permanent device wedge.
+        ///
+        /// `preflight_leaf_recovery_fulfillment` demanded
+        /// `terminal_is_exact_transition` of EVERY recovery request and reservation on
+        /// the coordinate, so a peer's overdue `Expiry` terminal fell through to the
+        /// `_ => illegal direction` arm. Open recovery requests are unique per TARGET
+        /// and coordinate-preserving, so peers legitimately stack requests on one
+        /// coordinate with staggered `expires_at`. Fulfilling one device while a peer's
+        /// request was overdue therefore produced a planner-valid, executor-fatal plan —
+        /// and the recovering device wedged PERMANENTLY, because retry re-planned the
+        /// identical shape.
+        ///
+        /// This exercises the classifier that now owns that logic, with exactly the
+        /// shape that used to wedge: one own family closing by this producer's
+        /// transition, plus one overdue peer family closing by due expiry.
+        #[test]
+        fn fulfillment_tolerates_an_overdue_peer_recovery_family() {
+            let (mut plan, context) = exact_fixture();
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("actor authority")
+                .actor
+                .clone();
+            let producer = plan.state.producer.clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+
+            let own_request_id = uuid(0x60);
+            let own_ref = [0x61; 32];
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor.clone(),
+                own_request_id,
+                own_ref,
+                [0x62; 32],
+                [0x64; 32],
+                received_at,
+                expires_at,
+                RecoveryRequestStatus::Fulfilled,
+                ReservationStatus::Consumed,
+                Some(WorkTerminalEvidence::Transition(producer)),
+                PackageStatus::Consumed,
+            );
+
+            // The overdue peer. Different target key/ref, closing by due expiry.
+            let peer_request_id = uuid(0x66);
+            let peer_ref = [0x67; 32];
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                peer_request_id,
+                peer_ref,
+                [0x68; 32],
+                [0x69; 32],
+                received_at,
+                expires_at,
+                RecoveryRequestStatus::Expired,
+                ReservationStatus::Expired,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Available,
+            );
+
+            let partition = classify_prior_bound_recovery(
+                &plan,
+                &context,
+                OwnFamilyKind::LeafRecoveryFulfillment,
+            )
+            .expect("an overdue peer family must not wedge leaf recovery fulfillment");
+
+            assert_eq!(
+                partition.own,
+                Some((own_request_id, own_ref)),
+                "the own family must be the fulfilled one, derived by typed shape"
+            );
+            assert_eq!(
+                partition.requests(),
+                1,
+                "the overdue peer must be classified as prior-bound work, not dropped"
+            );
+            assert!(
+                partition.keys().contains(&(peer_request_id, peer_ref)),
+                "the peer family key must be carried to the writer"
+            );
+        }
+
+        /// The correction must not become permissive in the other direction: the OWN
+        /// family closes by THIS producer's transition, never by due expiry. If an own
+        /// family could carry an `Expiry` terminal it would be indistinguishable from
+        /// prior-bound peer work, and the arm would consume a family it does not own.
+        #[test]
+        fn fulfillment_own_family_may_not_close_by_due_expiry() {
+            let (mut plan, context) = exact_fixture();
+            let prior = plan.expected_prior.expect("prior");
+            let actor = plan
+                .effects
+                .authority
+                .as_ref()
+                .and_then(|authority| match authority {
+                    PlanAuthority::Transition(transition) => transition.authority.as_ref(),
+                    _ => None,
+                })
+                .expect("actor authority")
+                .actor
+                .clone();
+            let received_at = ServerTimestamp::from_unix_millis(4_000).unwrap();
+            let expires_at = ServerTimestamp::from_unix_millis(5_000).unwrap();
+
+            // A Fulfilled/Consumed family — the own shape — but terminalized by expiry.
+            push_recovery_family(
+                &mut plan,
+                prior,
+                actor,
+                uuid(0x60),
+                [0x61; 32],
+                [0x62; 32],
+                [0x64; 32],
+                received_at,
+                expires_at,
+                RecoveryRequestStatus::Fulfilled,
+                ReservationStatus::Consumed,
+                Some(WorkTerminalEvidence::Expiry(expires_at)),
+                PackageStatus::Consumed,
+            );
+
+            match classify_prior_bound_recovery(
+                &plan,
+                &context,
+                OwnFamilyKind::LeafRecoveryFulfillment,
+            ) {
+                Err(ExecutorError::InconsistentPlan(_)) => {}
+                Ok(_) => panic!("an own family closing by due expiry was accepted"),
+                Err(error) => panic!("rejected with the wrong executor error: {error:?}"),
             }
         }
 
