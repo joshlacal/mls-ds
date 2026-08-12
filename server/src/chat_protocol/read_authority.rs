@@ -794,9 +794,20 @@ pub(crate) async fn authorize_conversation_state(
         .map_err(map_hydration_error)?;
 
     let graph_digest = *locked.locked_graph_digest();
-    let snapshot_digest = *locked
-        .locked_snapshot_digest()
-        .ok_or(ReadAuthorityError::Invariant)?;
+    // The snapshot digest is required only on a GRANTABLE arm, so it is taken
+    // after classification (below). Requiring it here made every terminal
+    // conversation fail `Invariant` before it could be denied properly: a
+    // terminal aggregate structurally carries no active snapshot, so hydration
+    // returns `(None, None)` (repository/core.rs:10317) and the guard
+    // constructor *requires* that pairing (core.rs:2881-2888) — absence is the
+    // correct shape, not drift. The sibling authority already treats it that
+    // way (`inventory_authorities`, :1815: "close tombstones carry no snapshot
+    // digest").
+    //
+    // The effect was a denial turning into a 500: `Invariant` maps to an
+    // internal error with no protocol code (:181-185), so a client reading a
+    // closed conversation could not tell "closed" from "server broken" instead
+    // of receiving the typed `AccessOutsideMembershipInterval` / `NotEntitled`.
     let arm = classify_current_relationship(device.user_did(), device.device_id(), locked.state())?;
     let participant_period_id =
         load_participant_period_id(tx, conversation_id, device.user_did()).await?;
@@ -824,6 +835,18 @@ pub(crate) async fn authorize_conversation_state(
             }
         }
     };
+
+    // Every arm that reaches here is grantable, so the digest must be present.
+    // `ActiveParticipant` and `GroupPendingParticipant` are reachable only past
+    // the `facts.terminal` guard (:605), and `facts.terminal` is
+    // `state.active_public_state().is_none()` (:545) — the same predicate the
+    // guard constructor pairs the digest with. `OpenLeaf` cannot reach a
+    // terminal conversation either: `load_leaf_period_id` (:757-774) already
+    // rejected it, because hydration proved `active_leaf_count == 0` under the
+    // same lock (core.rs:10341-10350).
+    let snapshot_digest = *locked
+        .locked_snapshot_digest()
+        .ok_or(ReadAuthorityError::Invariant)?;
 
     Ok(ConversationStateReadAuthority {
         device,
