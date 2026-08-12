@@ -15822,7 +15822,29 @@ pub(crate) fn persistence_plan_for_test(
                         claimed_at: request.received_at,
                         expected_status: edge.from,
                         successor_status: edge.to,
-                        locked_row_digest: [1u8; 32],
+                        // Per-binding, never a constant. Production's
+                        // `recovery_package_guard_digest` (repository/core.rs:3322-3336)
+                        // covers the key package ref, its status, its use kind and
+                        // `claimed_at`, so two guards for distinct refs necessarily carry
+                        // distinct digests. Synthesizing one shared constant made every
+                        // multi-family test plan violate that, which check 8-DiD rejects as
+                        // "distinct key package refs share one locked row digest" the moment
+                        // a plan carries two recovery families -- as acceptance does, pairing
+                        // a prior open request with its own new one.
+                        //
+                        // Only uniqueness and non-zero-ness are load-bearing here: the
+                        // durable release CAS binds 19 parameters and this digest is not
+                        // among them (repository/transition.rs:1711-1729); its sole durable
+                        // use is the non-zero rejection at :1633. So this needs to be a
+                        // faithful *shape*, not a value matching any stored row.
+                        locked_row_digest: {
+                            let mut digest = Sha256::new();
+                            digest.update(b"CATBIRD-CHAT-TEST-LOCKED-RECOVERY-ROW\0");
+                            digest.update(edge.key_package_ref);
+                            digest.update([edge.from as u8, edge.to as u8]);
+                            digest.update(request.received_at.unix_millis().to_be_bytes());
+                            digest.finalize().into()
+                        },
                         authority_digest: [0u8; 32],
                     };
                     binding.authority_digest = recovery_package_cas_authority_digest(&binding);
