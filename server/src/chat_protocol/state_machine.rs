@@ -20725,6 +20725,527 @@ pub(in crate::chat_protocol) mod executor {
             && server_instant(expires_at).is_ok_and(|expiry| applied_at >= expiry)
     }
 
+    /// Which coordinate-changing recovery family, if any, the calling arm drives
+    /// itself. Everything the arm does NOT drive is prior-bound work it must
+    /// supersede, and is classified by `classify_prior_bound_recovery`.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum OwnFamilyKind {
+        /// Seven of the nine arms drive no recovery family of their own.
+        None,
+        /// `apply_acceptance` opens exactly one family:
+        /// `(None -> Open, None -> Active, Available -> Reserved)`.
+        Acceptance,
+        /// `preflight_leaf_recovery_fulfillment` closes exactly one family:
+        /// `(Open -> Fulfilled, Active -> Consumed, Reserved -> Consumed)`.
+        LeafRecoveryFulfillment,
+    }
+
+    /// Typed partition of a plan's recovery families, produced by
+    /// `classify_prior_bound_recovery`.
+    ///
+    /// Every prior-bound family contributes **exactly one** request, one
+    /// reservation and one package edge — the classifier rejects the plan
+    /// otherwise — so the per-family counts are the key count, and
+    /// `requests()`/`reservations()`/`packages()` are exact rather than
+    /// approximate. Callers rebuild their `FamilyCounts` recovery fields from
+    /// these accessors so the pre-writer fence stays load-bearing instead of
+    /// becoming tautological.
+    struct PriorBoundPartition {
+        /// One entry per prior-bound family, `(request_id, key_package_ref)`.
+        keys: BTreeSet<([u8; 16], [u8; 32])>,
+        /// The arm's own family key, when `OwnFamilyKind` is not `None`.
+        own: Option<([u8; 16], [u8; 32])>,
+    }
+
+    impl PriorBoundPartition {
+        fn requests(&self) -> usize {
+            self.keys.len()
+        }
+
+        fn reservations(&self) -> usize {
+            self.keys.len()
+        }
+
+        fn packages(&self) -> usize {
+            self.keys.len()
+        }
+
+        fn keys(&self) -> &BTreeSet<([u8; 16], [u8; 32])> {
+            &self.keys
+        }
+    }
+
+    /// The single prior-bound recovery classifier, shared by all nine
+    /// coordinate-changing executor arms and called by each strictly BEFORE its
+    /// own first head compare-and-set.
+    ///
+    /// Extracted from `preflight_metadata_transition`, which was the only arm
+    /// that proved these properties. The other eight either rejected every plan
+    /// carrying package work outright or accepted it unproven, which is what
+    /// wedged device recovery: a fulfillment whose peer's request is overdue is
+    /// planner-legal and was executor-fatal, and retry re-planned the identical
+    /// shape.
+    ///
+    /// Derives every comparand internally from `plan` and `ctx` — design 4.5
+    /// forbids trusting caller-supplied loose effects, prior coordinates,
+    /// producer IDs, due times, CAS lists, status filters, or exemption
+    /// predicates. `own_kind` selects the arm's own family by exact typed shape
+    /// and cardinality; it is not an exemption set.
+    ///
+    /// Only the properties common to all nine arms are validated here. Each
+    /// arm's successor generation / state-version / epoch / close shape remains
+    /// that arm's own pre-CAS check.
+    fn classify_prior_bound_recovery(
+        plan: &ConversationPersistencePlan,
+        ctx: &ExecutionContext,
+        own_kind: OwnFamilyKind,
+    ) -> Result<PriorBoundPartition, ExecutorError> {
+        let effects = plan.effects();
+        let head = effects
+            .head_cas()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "prior-bound classification needs a head CAS binding",
+            ))?;
+        let prior = head
+            .expected_prior()
+            .ok_or(ExecutorError::InconsistentPlan(
+                "prior-bound classification needs an expected prior",
+            ))?;
+        let producer = &plan.state().producer;
+
+        // Properties common to all nine arms. Arm-specific successor shape
+        // (reset advances generation+1 / stateVersion 0; close retires the
+        // coordinate; commit and fulfillment bump state-version and epoch) stays
+        // in each arm's existing check.
+        if head.conversation_id() != prior.conversation_id()
+            || plan.expected_prior.as_ref() != Some(prior)
+            || plan
+                .successor_coordinate
+                .as_ref()
+                .is_some_and(|successor| successor.conversation_id() != prior.conversation_id())
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "prior-bound classification: plan/head coordinate binding drifted",
+            ));
+        }
+
+        // The arm's own family, derived by exact typed shape and cardinality.
+        let own = match own_kind {
+            OwnFamilyKind::None => None,
+            OwnFamilyKind::Acceptance => Some(classify_own_acceptance_family(effects, prior)?),
+            OwnFamilyKind::LeafRecoveryFulfillment => {
+                Some(classify_own_fulfillment_family(effects, prior)?)
+            }
+        };
+
+        let mut request_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
+        for change in effects.recovery_request_changes() {
+            let (Some(before_request), Some(after_request)) = (change.before(), change.after())
+            else {
+                // A creation or deletion is only legal as the arm's own family;
+                // `classify_own_acceptance_family` has already proved that shape.
+                if own_kind == OwnFamilyKind::Acceptance && change.before().is_none() {
+                    continue;
+                }
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound recovery request delta is not terminal",
+                ));
+            };
+            let key = (after_request.request_id, after_request.key_package_ref);
+            if own == Some(key) {
+                continue;
+            }
+            let expired = match after_request.status {
+                RecoveryRequestStatus::Superseded
+                    if terminal_is_exact_transition(&after_request.terminal, producer) =>
+                {
+                    false
+                }
+                RecoveryRequestStatus::Expired
+                    if terminal_is_exact_due_expiry(
+                        &after_request.terminal,
+                        after_request.expires_at,
+                        ctx.applied_at,
+                    ) =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound recovery request has an illegal terminal shape",
+                    ))
+                }
+            };
+            if !recovery_request_identity_is_unchanged(before_request, after_request)
+                || before_request.status != RecoveryRequestStatus::Open
+                || before_request.bound_coordinate != *prior
+                || request_keys.insert(key, expired).is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound recovery request terminalization drifted",
+                ));
+            }
+        }
+
+        let mut reservation_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
+        for change in effects.reservation_changes() {
+            let (Some(before_reservation), Some(after_reservation)) =
+                (change.before(), change.after())
+            else {
+                if own_kind == OwnFamilyKind::Acceptance && change.before().is_none() {
+                    continue;
+                }
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound reservation delta is not terminal",
+                ));
+            };
+            let key = (
+                after_reservation.request_id,
+                after_reservation.key_package_ref,
+            );
+            if own == Some(key) {
+                continue;
+            }
+            let expired = match after_reservation.status {
+                ReservationStatus::Released
+                    if terminal_is_exact_transition(&after_reservation.terminal, producer) =>
+                {
+                    false
+                }
+                ReservationStatus::Expired
+                    if terminal_is_exact_due_expiry(
+                        &after_reservation.terminal,
+                        after_reservation.expires_at,
+                        ctx.applied_at,
+                    ) =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound reservation has an illegal terminal shape",
+                    ))
+                }
+            };
+            if !recovery_reservation_identity_is_unchanged(before_reservation, after_reservation)
+                || before_reservation.status != ReservationStatus::Active
+                || before_reservation.bound_coordinate != *prior
+                || reservation_keys.insert(key, expired).is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound reservation terminalization drifted",
+                ));
+            }
+        }
+
+        // Own/prior key collision is a hard rejection, never a silent skip
+        // (design 4.5). The `continue` arms above skip the own key by exact
+        // match; a planner that also emitted it as prior-bound work would be
+        // caught here.
+        if let Some(own_key) = own {
+            if request_keys.contains_key(&own_key) || reservation_keys.contains_key(&own_key) {
+                return Err(ExecutorError::InconsistentPlan(
+                    "own recovery family also appears as prior-bound work",
+                ));
+            }
+        }
+
+        let package_keys = effects
+            .package_transitions()
+            .iter()
+            .filter(|edge| own != Some((edge.request_id, edge.key_package_ref)))
+            .map(|edge| ((edge.request_id, edge.key_package_ref), (edge.from, edge.to)))
+            .collect::<BTreeMap<_, _>>();
+        verify_recovery_package_bijection(effects)?;
+        let own_edges = usize::from(own.is_some());
+        if request_keys != reservation_keys
+            || request_keys.len() != package_keys.len()
+            || package_keys.len() + own_edges != effects.package_transitions().len()
+            // Design 4.3: `Reserved -> Expired` is rejected for prior-bound
+            // families. It is production-unproducible — MIN_KEY_PACKAGE_REMAINING
+            // (600s) strictly exceeds RECOVERY_RESERVATION_TTL (300s), so
+            // `recovery_expiry`'s `.min()` never clamps — but readers still
+            // accepted it. Both Row A and Row B terminalize the package to
+            // `Available`; only the request/reservation terminal shape differs.
+            || request_keys.keys().any(|key| {
+                !matches!(
+                    package_keys.get(key),
+                    Some((PackageStatus::Reserved, PackageStatus::Available))
+                )
+            })
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "prior-bound recovery request/reservation/package families are not bijective",
+            ));
+        }
+
+        for binding in effects.recovery_package_cas() {
+            let key = (binding.request_id, binding.key_package_ref);
+            if own == Some(key) {
+                continue;
+            }
+            let request = effects
+                .recovery_request_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|request| {
+                    request.request_id == binding.request_id
+                        && request.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "prior-bound package authority has no exact recovery request",
+                ))?;
+            let reservation = effects
+                .reservation_changes()
+                .iter()
+                .filter_map(StateChange::after)
+                .find(|reservation| {
+                    reservation.request_id == binding.request_id
+                        && reservation.key_package_ref == binding.key_package_ref
+                })
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "prior-bound package authority has no exact reservation",
+                ))?;
+            let (origin_key_id, origin_auth_generation) = match &request.origin {
+                RecoveryOriginEvidence::Acceptance(value) => {
+                    let authority =
+                        value
+                            .authority
+                            .as_ref()
+                            .ok_or(ExecutorError::InconsistentPlan(
+                                "prior-bound recovery acceptance has no signing authority",
+                            ))?;
+                    (authority.key_id, authority.auth_generation)
+                }
+                RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
+            };
+            // Amended design 4.4 check 8. The wrapper SHA has a comparand on the
+            // `Acceptance` branch only; on the `Request` branch check 8 reads
+            // neither the body binding nor the signed authority, and their
+            // absence is NOT a rejection ground — `RequestEvidence.key_id` and
+            // `.auth_generation` are non-Optional and are taken directly above.
+            // A universal fail-closed rule would be a different truth table than
+            // the sealed base and would strand design 6.4 positive rows 2/3/4.
+            if let RecoveryOriginEvidence::Acceptance(value) = &request.origin {
+                let recovery = match value.body_binding.as_ref() {
+                    Some(TransitionBodyBinding::Acceptance { recovery, .. }) => recovery,
+                    _ => {
+                        return Err(ExecutorError::InconsistentPlan(
+                            "prior-bound recovery acceptance has no acceptance body binding",
+                        ))
+                    }
+                };
+                if binding.key_package_wrapper_sha256 != recovery.key_package_wrapper_sha256
+                    || <[u8; 32]>::from(sha2::Sha256::digest(&recovery.key_package_wrapper))
+                        != recovery.key_package_wrapper_sha256
+                {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "prior-bound recovery package wrapper digest drift",
+                    ));
+                }
+            }
+            if binding.transaction_id != head.transaction_id
+                || binding.conversation_id != *prior.conversation_id()
+                || binding.target != request.target
+                || binding.target != reservation.target
+                || binding.target_key_id != origin_key_id
+                || binding.target_auth_generation != origin_auth_generation
+                || binding.bound_coordinate != *prior
+                || binding.bound_coordinate != request.bound_coordinate
+                || binding.bound_coordinate != reservation.bound_coordinate
+                || binding.package_not_after != reservation.package_not_after
+                || binding.claimed_at != request.received_at
+                || binding.claimed_at != reservation.received_at
+                || binding.expected_status != PackageStatus::Reserved
+                || binding.successor_status
+                    != package_keys
+                        .get(&key)
+                        .map(|(_, successor)| *successor)
+                        .ok_or(ExecutorError::InconsistentPlan(
+                            "prior-bound package authority has no semantic edge",
+                        ))?
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "prior-bound recovery package CAS authority drift",
+                ));
+            }
+        }
+
+        // Amended design 4.4 check 8-DiD (defence in depth; mandatory here, not a
+        // 6.4 matrix row). `recovery_package_guard_digest` hashes
+        // `key_package_ref` with every variable-length input length-prefixed, so
+        // distinct refs imply distinct digests absent a SHA-256 collision. This
+        // fires on planner digest-reuse across two references.
+        let mut seen_row_digests: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
+        for binding in effects.recovery_package_cas() {
+            if let Some(previous_ref) =
+                seen_row_digests.insert(binding.locked_row_digest, binding.key_package_ref)
+            {
+                if previous_ref != binding.key_package_ref {
+                    return Err(ExecutorError::InconsistentPlan(
+                        "distinct key package refs share one locked row digest",
+                    ));
+                }
+            }
+        }
+
+        Ok(PriorBoundPartition {
+            keys: request_keys.into_keys().collect(),
+            own,
+        })
+    }
+
+    /// `apply_acceptance`'s own family: exactly one
+    /// `(None -> Open, None -> Active, Available -> Reserved)` triple, keyed
+    /// `(request_id, key_package_ref)`. Derived by exact typed shape and
+    /// cardinality — never by a caller-supplied exemption set.
+    fn classify_own_acceptance_family(
+        effects: &TransitionEffects,
+        prior: &PublicGroupSnapshotCoordinate,
+    ) -> Result<([u8; 16], [u8; 32]), ExecutorError> {
+        let mut own: Option<([u8; 16], [u8; 32])> = None;
+        for change in effects.recovery_request_changes() {
+            let (None, Some(after)) = (change.before(), change.after()) else {
+                continue;
+            };
+            if after.status != RecoveryRequestStatus::Open
+                || after.bound_coordinate != *prior
+                || after.terminal.is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "acceptance own recovery request has an illegal shape",
+                ));
+            }
+            if own
+                .replace((after.request_id, after.key_package_ref))
+                .is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "acceptance carries multiple own recovery requests",
+                ));
+            }
+        }
+        let own = own.ok_or(ExecutorError::InconsistentPlan(
+            "acceptance carries no own opened recovery request",
+        ))?;
+
+        let mut reservations = 0usize;
+        for change in effects.reservation_changes() {
+            let (None, Some(after)) = (change.before(), change.after()) else {
+                continue;
+            };
+            if (after.request_id, after.key_package_ref) != own
+                || after.status != ReservationStatus::Active
+                || after.bound_coordinate != *prior
+                || after.terminal.is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "acceptance own reservation has an illegal shape",
+                ));
+            }
+            reservations += 1;
+        }
+        if reservations != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "acceptance must open exactly one reservation",
+            ));
+        }
+
+        let own_edges = effects
+            .package_transitions()
+            .iter()
+            .filter(|edge| (edge.request_id, edge.key_package_ref) == own)
+            .collect::<Vec<_>>();
+        if own_edges.len() != 1
+            || own_edges[0].from != PackageStatus::Available
+            || own_edges[0].to != PackageStatus::Reserved
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "acceptance must drive exactly one Available -> Reserved package edge",
+            ));
+        }
+        Ok(own)
+    }
+
+    /// `preflight_leaf_recovery_fulfillment`'s own family: exactly one
+    /// `(Open -> Fulfilled, Active -> Consumed, Reserved -> Consumed)` triple.
+    /// Its terminal must be the exact producer transition — an `Expiry` terminal
+    /// is never the fulfilling device's own work.
+    fn classify_own_fulfillment_family(
+        effects: &TransitionEffects,
+        prior: &PublicGroupSnapshotCoordinate,
+    ) -> Result<([u8; 16], [u8; 32]), ExecutorError> {
+        let mut own: Option<([u8; 16], [u8; 32])> = None;
+        for change in effects.recovery_request_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                continue;
+            };
+            if before.status != RecoveryRequestStatus::Open
+                || after.status != RecoveryRequestStatus::Fulfilled
+            {
+                continue;
+            }
+            if !recovery_request_identity_is_unchanged(before, after)
+                || before.bound_coordinate != *prior
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment own recovery request identity drift",
+                ));
+            }
+            if own
+                .replace((after.request_id, after.key_package_ref))
+                .is_some()
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment carries multiple own recovery requests",
+                ));
+            }
+        }
+        let own = own.ok_or(ExecutorError::InconsistentPlan(
+            "fulfillment carries no own fulfilled recovery request",
+        ))?;
+
+        let mut reservations = 0usize;
+        for change in effects.reservation_changes() {
+            let (Some(before), Some(after)) = (change.before(), change.after()) else {
+                continue;
+            };
+            if (after.request_id, after.key_package_ref) != own {
+                continue;
+            }
+            if before.status != ReservationStatus::Active
+                || after.status != ReservationStatus::Consumed
+                || !recovery_reservation_identity_is_unchanged(before, after)
+                || before.bound_coordinate != *prior
+            {
+                return Err(ExecutorError::InconsistentPlan(
+                    "fulfillment own reservation has an illegal shape",
+                ));
+            }
+            reservations += 1;
+        }
+        if reservations != 1 {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must consume exactly one own reservation",
+            ));
+        }
+
+        let own_edges = effects
+            .package_transitions()
+            .iter()
+            .filter(|edge| (edge.request_id, edge.key_package_ref) == own)
+            .collect::<Vec<_>>();
+        if own_edges.len() != 1
+            || own_edges[0].from != PackageStatus::Reserved
+            || own_edges[0].to != PackageStatus::Consumed
+        {
+            return Err(ExecutorError::InconsistentPlan(
+                "fulfillment must drive exactly one Reserved -> Consumed package edge",
+            ));
+        }
+        Ok(own)
+    }
+
     fn recovery_request_identity_is_unchanged(
         before: &RecoveryRequest,
         after: &RecoveryRequest,
@@ -22123,195 +22644,10 @@ pub(in crate::chat_protocol) mod executor {
             ));
         }
 
-        let mut request_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
-        for change in effects.recovery_request_changes() {
-            let (Some(before_request), Some(after_request)) = (change.before(), change.after())
-            else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata recovery request delta is not terminal",
-                ));
-            };
-            let expired = match after_request.status {
-                RecoveryRequestStatus::Superseded
-                    if terminal_is_exact_transition(&after_request.terminal, producer) =>
-                {
-                    false
-                }
-                RecoveryRequestStatus::Expired
-                    if terminal_is_exact_due_expiry(
-                        &after_request.terminal,
-                        after_request.expires_at,
-                        ctx.applied_at,
-                    ) =>
-                {
-                    true
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "metadata recovery request has an illegal terminal shape",
-                    ))
-                }
-            };
-            if !recovery_request_identity_is_unchanged(before_request, after_request)
-                || before_request.status != RecoveryRequestStatus::Open
-                || before_request.bound_coordinate != *prior
-                || request_keys
-                    .insert(
-                        (after_request.request_id, after_request.key_package_ref),
-                        expired,
-                    )
-                    .is_some()
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata recovery request terminalization drifted",
-                ));
-            }
-        }
-        let mut reservation_keys: BTreeMap<([u8; 16], [u8; 32]), bool> = BTreeMap::new();
-        for change in effects.reservation_changes() {
-            let (Some(before_reservation), Some(after_reservation)) =
-                (change.before(), change.after())
-            else {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata reservation delta is not terminal",
-                ));
-            };
-            let expired = match after_reservation.status {
-                ReservationStatus::Released
-                    if terminal_is_exact_transition(&after_reservation.terminal, producer) =>
-                {
-                    false
-                }
-                ReservationStatus::Expired
-                    if terminal_is_exact_due_expiry(
-                        &after_reservation.terminal,
-                        after_reservation.expires_at,
-                        ctx.applied_at,
-                    ) =>
-                {
-                    true
-                }
-                _ => {
-                    return Err(ExecutorError::InconsistentPlan(
-                        "metadata reservation has an illegal terminal shape",
-                    ))
-                }
-            };
-            if !recovery_reservation_identity_is_unchanged(before_reservation, after_reservation)
-                || before_reservation.status != ReservationStatus::Active
-                || before_reservation.bound_coordinate != *prior
-                || reservation_keys
-                    .insert(
-                        (
-                            after_reservation.request_id,
-                            after_reservation.key_package_ref,
-                        ),
-                        expired,
-                    )
-                    .is_some()
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata reservation terminalization drifted",
-                ));
-            }
-        }
-        let package_keys = effects
-            .package_transitions()
-            .iter()
-            .map(|edge| {
-                (
-                    (edge.request_id, edge.key_package_ref),
-                    (edge.from, edge.to),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        verify_recovery_package_bijection(effects)?;
-        if request_keys != reservation_keys
-            || request_keys.len() != package_keys.len()
-            || package_keys.len() != effects.package_transitions().len()
-            || request_keys.iter().any(|(key, expired)| {
-                !matches!(
-                    package_keys.get(key),
-                    Some((PackageStatus::Reserved, PackageStatus::Available)) if !expired
-                ) && !matches!(
-                    package_keys.get(key),
-                    Some((
-                        PackageStatus::Reserved,
-                        PackageStatus::Available | PackageStatus::Expired
-                    )) if *expired
-                )
-            })
-        {
-            return Err(ExecutorError::InconsistentPlan(
-                "metadata recovery request/reservation/package families are not bijective",
-            ));
-        }
-        for binding in effects.recovery_package_cas() {
-            let request = effects
-                .recovery_request_changes()
-                .iter()
-                .filter_map(StateChange::after)
-                .find(|request| {
-                    request.request_id == binding.request_id
-                        && request.key_package_ref == binding.key_package_ref
-                })
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "metadata package authority has no exact recovery request",
-                ))?;
-            let reservation = effects
-                .reservation_changes()
-                .iter()
-                .filter_map(StateChange::after)
-                .find(|reservation| {
-                    reservation.request_id == binding.request_id
-                        && reservation.key_package_ref == binding.key_package_ref
-                })
-                .ok_or(ExecutorError::InconsistentPlan(
-                    "metadata package authority has no exact reservation",
-                ))?;
-            let (origin_key_id, origin_auth_generation) = match &request.origin {
-                RecoveryOriginEvidence::Acceptance(value) => {
-                    let authority =
-                        value
-                            .authority
-                            .as_ref()
-                            .ok_or(ExecutorError::InconsistentPlan(
-                                "metadata recovery acceptance has no signing authority",
-                            ))?;
-                    (authority.key_id, authority.auth_generation)
-                }
-                RecoveryOriginEvidence::Request(value) => (value.key_id, value.auth_generation),
-            };
-            let expected_expired = request.status == RecoveryRequestStatus::Expired;
-            if binding.transaction_id != head.transaction_id
-                || binding.conversation_id != *prior.conversation_id()
-                || binding.target != request.target
-                || binding.target != reservation.target
-                || binding.target_key_id != origin_key_id
-                || binding.target_auth_generation != origin_auth_generation
-                || binding.bound_coordinate != *prior
-                || binding.bound_coordinate != request.bound_coordinate
-                || binding.bound_coordinate != reservation.bound_coordinate
-                || binding.package_not_after != reservation.package_not_after
-                || binding.claimed_at != request.received_at
-                || binding.claimed_at != reservation.received_at
-                || binding.expected_status != PackageStatus::Reserved
-                || binding.successor_status
-                    != package_keys
-                        .get(&(binding.request_id, binding.key_package_ref))
-                        .map(|(_, successor)| *successor)
-                        .ok_or(ExecutorError::InconsistentPlan(
-                            "metadata package authority has no semantic edge",
-                        ))?
-                || (!expected_expired && binding.successor_status != PackageStatus::Available)
-                || (binding.successor_status == PackageStatus::Expired
-                    && server_instant(binding.package_not_after)? > ctx.applied_at)
-            {
-                return Err(ExecutorError::InconsistentPlan(
-                    "metadata recovery package CAS authority drift",
-                ));
-            }
-        }
+        // Prior-bound recovery families. This block WAS the reference
+        // implementation; it is now the shared classifier every one of the nine
+        // coordinate-changing arms calls, strictly before its own first head CAS.
+        classify_prior_bound_recovery(plan, ctx, OwnFamilyKind::None)?;
         for change in effects.reset_request_changes() {
             let (Some(before_reset), Some(after_reset)) = (change.before(), change.after()) else {
                 return Err(ExecutorError::InconsistentPlan(
@@ -31403,9 +31739,26 @@ pub(in crate::chat_protocol) mod executor {
         }
 
         #[test]
-        fn metadata_preflight_accepts_every_exact_due_expiry_family() {
+        fn metadata_preflight_accepts_due_expiry_families_and_rejects_reserved_to_expired() {
+            // INVERTED at the C2 prior-bound correction. This assertion previously
+            // accepted all four families, including a Recovery family carrying a
+            // `Reserved -> Expired` package edge. Amended design 4.3/4.4 rejects
+            // that edge for prior-bound families: it is production-unproducible
+            // (MIN_KEY_PACKAGE_REMAINING 600s strictly exceeds
+            // RECOVERY_RESERVATION_TTL 300s, so `recovery_expiry`'s `.min()` never
+            // clamps) while every reader still accepted it. Closing that
+            // writer-cannot-produce / reader-still-accepts asymmetry is the point
+            // of the correction, so this assertion must invert.
+            let (plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+            match preflight_metadata_transition(&plan, &context, Uuid::from_bytes(uuid(0x24)), 6) {
+                Err(ExecutorError::InconsistentPlan(_)) => {}
+                Ok(_) => panic!("Reserved -> Expired prior-bound package edge was accepted"),
+                Err(error) => {
+                    panic!("Reserved -> Expired rejected with the wrong error: {error:?}")
+                }
+            }
+
             for family in [
-                DueExpiryFamily::Recovery,
                 DueExpiryFamily::Reset,
                 DueExpiryFamily::Leave,
                 DueExpiryFamily::Welcome,
@@ -31560,11 +31913,32 @@ pub(in crate::chat_protocol) mod executor {
                     return Err(format!("{label} lost its persistence authority"));
                 }
             }
+            // INVERTED at the C2 prior-bound correction, same reason as the
+            // cfg(test) assertion above: a Recovery family carrying a
+            // `Reserved -> Expired` package edge is production-unproducible and
+            // must now be rejected rather than accepted.
+            {
+                let (plan, context, _) = exact_due_expiry_fixture(DueExpiryFamily::Recovery);
+                match preflight_metadata_transition(
+                    &plan,
+                    &context,
+                    Uuid::from_bytes(uuid(0x24)),
+                    6,
+                ) {
+                    Err(ExecutorError::InconsistentPlan(_)) => {}
+                    Ok(_) => {
+                        return Err(
+                            "Reserved -> Expired prior-bound package edge was accepted".into()
+                        )
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Reserved -> Expired rejected with the wrong error: {error:?}"
+                        ))
+                    }
+                }
+            }
             for (label, family) in [
-                (
-                    "Recovery/reservation/package expiry",
-                    DueExpiryFamily::Recovery,
-                ),
                 ("Reset expiry", DueExpiryFamily::Reset),
                 ("Leave expiry", DueExpiryFamily::Leave),
                 ("Welcome expiry", DueExpiryFamily::Welcome),
