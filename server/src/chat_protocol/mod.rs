@@ -52,9 +52,18 @@ pub(crate) fn xwing_public_key_is_valid(bytes: &[u8]) -> bool {
     {
         return false;
     }
+    // `decode` alone is the whole check. It runs `mlkem768::validate_public_key`,
+    // which IS the FIPS 203 encapsulation-key check (deserialize-reduced,
+    // re-serialize, byte-compare), and `mlkem768::encapsulate` returns a plain
+    // tuple rather than a `Result`, so the ML-KEM half of an encapsulation can
+    // reject nothing. The X-Wing half's only fallible step is `x25519_derive`,
+    // which errs exactly on an all-zero shared secret -- the probe the length and
+    // canonicality guard above already performs with the same clamped `[0xA5; 32]`
+    // scalar, plus a canonicality check `decode` does not do at all. Encapsulating
+    // here cost ~66% of a per-key validation that runs 2L+N times per snapshot
+    // decode, under the conversation head lock, and rejected nothing.
     std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let public_key = KemPublicKey::decode(KemAlgorithm::XWingKemDraft06, bytes)?;
-        public_key.encapsulate_derand(&[0xA5; 64]).map(|_| ())
+        KemPublicKey::decode(KemAlgorithm::XWingKemDraft06, bytes).map(|_| ())
     }))
     .is_ok_and(|result| result.is_ok())
 }
