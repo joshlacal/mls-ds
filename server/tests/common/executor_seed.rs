@@ -5931,6 +5931,43 @@ pub async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
         .expect("sample trusted database clock")
 }
 
+/// SINGLE-CLOCK fixture time — the protocol instant and the `ExecutionContext`
+/// instant for one transition, as the SAME whole millisecond.
+///
+/// Production derives `ExecutionContext::applied_at` FROM the protocol instant
+/// (`repository/execution_context.rs:249,270` `server_instant(evidence.received_at())`,
+/// `:297` `accepted_at()`, `:313,329` `terminal_at()`). A fixture that samples two
+/// different clocks writes `leaf_recovery_requests.requested_at` /
+/// `key_package_reservations.created_at` from `applied_at`
+/// (`state_machine.rs:29638,29700`) while the later prior-bound release CAS binds
+/// `claimed_at` from the protocol `received_at` (`state_machine.rs:15822` ->
+/// `:30322` -> `transition.rs:1727`), so `rr.requested_at = $17`
+/// (`transition.rs:1681`) and `kr.created_at = $17` (`:1701`) can never match.
+///
+/// The sample is taken from the trusted DATABASE clock — the same source every
+/// seeded row uses — so `participants/devices/device_keys/generation_states.created_at
+/// <= requested_at` (delivery.sql:3179-3206) still holds: every such row is written
+/// before this sample, and `offset_millis` is non-negative.
+///
+/// It is truncated to whole milliseconds because `ServerTimestamp` is
+/// millisecond-resolution (`state_machine.rs:173-199`): a microsecond tail on
+/// `applied_at` would make `rr.requested_at = $17` fail even under one clock. Same
+/// reason `seed_key_package` aligns `not_after` (`executor_seed.rs:6384-6388`).
+///
+/// `offset_millis` preserves the intra-test ordering the old
+/// `evaluation_unix_seconds + N` literals encoded: samples are monotone in program
+/// order, so equal-or-increasing offsets keep equal-or-increasing instants.
+pub async fn single_clock_instant(
+    pool: &PgPool,
+    offset_millis: i64,
+) -> (ServerTimestamp, DateTime<Utc>) {
+    let millis = clock_now(pool).await.timestamp_millis() + offset_millis;
+    (
+        ServerTimestamp::from_unix_millis_for_test(millis).expect("fixture protocol instant"),
+        DateTime::from_timestamp_millis(millis).expect("fixture applied instant"),
+    )
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorpusManifest {

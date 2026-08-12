@@ -2180,10 +2180,7 @@ async fn close_supersedes_pending_leaf_recovery_request() {
     .expect("alice leaf period");
 
     // Alice closes the group WHILE the recovery request is pending (close entry seq 2).
-    let close_received = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 5_000,
-    )
-    .unwrap();
+    let (close_received, applied_at) = single_clock_instant(&pool, 5_000).await;
     let entry_id = Uuid::new_v4();
     let close_transition = Uuid::new_v4();
     // The close entry fingerprint MUST equal `close_ctx`'s entry outer fingerprint
@@ -2203,20 +2200,32 @@ async fn close_supersedes_pending_leaf_recovery_request() {
         },
     )
     .expect("valid close plan with a pending recovery request");
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
+    let alice_pred =
+        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
+    let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
+
+    let mut tx = pool.begin().await.expect("begin close");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in — the placeholder `for_test_edge` mints can
+    // never match, and every release would conflict.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("close transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+        transaction_id,
         *conversation_id.as_bytes(),
         *entry_id.as_bytes(),
         fixture.coordinate,
         2,
         close_received,
     );
-    let plan = persistence_plan_for_test(planned, head_cas);
-    let applied_at = clock_now(&pool).await;
-    let alice_pred =
-        device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
-    let ctx = close_ctx(&fixture, entry_id, applied_at, leaf_period_id, alice_pred);
-
-    let mut tx = pool.begin().await.expect("begin close");
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256 (transition.rs:1655), which the synthesized superseding
+    // plan cannot derive on its own.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("close with a pending recovery request applies");
@@ -3433,12 +3442,20 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         seed_key_package(&pool, &alice_did, alice_device, &alice_key_id, &rec_ref).await;
     let rec_pkg_not_after_ts =
         ServerTimestamp::from_unix_millis_for_test(rec_pkg_not_after.timestamp_millis()).unwrap();
-    let rec_received = ServerTimestamp::from_unix_millis_for_test(
-        manifest.evaluation_unix_seconds as i64 * 1_000 + 4_000,
-    )
-    .unwrap();
+    // Single-clock: ONE database-clock millisecond is both the protocol instant and
+    // the ExecutionContext instant (state_machine.rs:29638,29700 vs
+    // transition.rs:1681,1701).
+    let (rec_received, rec_applied_at) = single_clock_instant(&pool, 4_000).await;
     let recovery_request_id = Uuid::new_v4();
-    let rec_evidence = RequestEvidence::for_test(
+    // The evidence must carry Alice's REAL registered key id: the key package row was
+    // seeded with it, and the durable release CAS pins `owner_key_id`
+    // (transition.rs:1657).
+    let alice_key_id_bytes: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&alice_key_id)
+        .expect("alice key id is base64url")
+        .try_into()
+        .expect("alice key id is 32 bytes");
+    let rec_evidence = RequestEvidence::for_test_with_key_id(
         RequestEntryKind::LeafRecoveryRequest,
         4,
         *recovery_request_id.as_bytes(),
@@ -3446,6 +3463,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         *conversation_id.as_bytes(),
         rec_received,
         0xC1,
+        alice_key_id_bytes,
     )
     .unwrap();
     let rec_planned = plan_leaf_recovery_request(
@@ -3473,7 +3491,6 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     // Request-origin plan.
     let rec_plan = persistence_plan_for_test(rec_planned, rec_head)
         .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
-    let rec_applied_at = clock_now(&pool).await;
     let rec_transcript = vec![0xC2_u8; 16];
     let alice_pred_rec = device_event_predecessor(&pool, &alice_did, alice_device).await;
     let rec_ctx = ExecutionContext {
@@ -3558,10 +3575,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     assert_eq!((pre.0.as_str(), pre.1.as_str()), ("open", "reserved"));
 
     // 1. Alice opens a reset request (seq 4) against the recovery-request state.
-    let req_received = ServerTimestamp::from_unix_millis_for_test(
-        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
-    )
-    .unwrap();
+    let (req_received, req_applied_at) = single_clock_instant(&pool, 5_000).await;
     let reset_request_id = Uuid::new_v4();
     let req_evidence = RequestEvidence::for_test(
         RequestEntryKind::ResetRequest,
@@ -3593,7 +3607,6 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         req_received,
     );
     let req_plan = persistence_plan_for_test(req_planned, req_head);
-    let req_applied_at = clock_now(&pool).await;
     let req_transcript = vec![0x92_u8; 16];
     let req_digest = Sha256::digest(&req_transcript).to_vec();
     let req_signature = vec![0x93_u8; 64];
@@ -3699,10 +3712,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         *scenario.coordinate.confirmation_tag(),
         PublicGroupSnapshotLifecycle::Superseded,
     );
-    let act_received = ServerTimestamp::from_unix_millis_for_test(
-        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
-    )
-    .unwrap();
+    let (act_received, applied_at) = single_clock_instant(&pool, 6_000).await;
     let act_transition = Uuid::new_v4();
     let act_entry = Uuid::new_v4();
     let metadata = MetadataSnapshotBinding::for_test_creation(
@@ -3746,14 +3756,6 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         },
     )
     .expect("valid reset activation plan");
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
-        *conversation_id.as_bytes(),
-        *act_entry.as_bytes(),
-        scenario.coordinate,
-        5,
-        act_received,
-    );
-    let plan = persistence_plan_for_test(planned, head_cas);
 
     let mut participant_rows: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT user_did,participant_period_id FROM chat.participants WHERE conversation_id=$1 AND current_membership",
@@ -3765,7 +3767,6 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     participant_rows.sort_by(|l, r| l.0.as_bytes().cmp(r.0.as_bytes()));
     let participant_period_ids: Vec<Uuid> = participant_rows.iter().map(|(_, id)| *id).collect();
 
-    let applied_at = clock_now(&pool).await;
     let payload = vec![0xAA_u8; 12];
     let transcript = vec![0xAB_u8; 12];
     let alice_pred = device_event_predecessor(&pool, &alice_did, alice_device).await;
@@ -3799,7 +3800,7 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             public_snapshot_sha256: Sha256::digest([0xB1_u8; 16]).to_vec(),
             tree_summary_bytes: vec![0xB2_u8; 16],
             tree_summary_sha256: Sha256::digest([0xB2_u8; 16]).to_vec(),
-            leaf_count: 1,
+            leaf_count: 2,
             genesis_group_info_bytes: vec![0xB3_u8; 16],
             genesis_group_info_sha256: Sha256::digest([0xB3_u8; 16]).to_vec(),
         },
@@ -3855,6 +3856,26 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("reset activation transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+        transaction_id,
+        *conversation_id.as_bytes(),
+        *act_entry.as_bytes(),
+        scenario.coordinate,
+        5,
+        act_received,
+    );
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256 (transition.rs:1655), which the synthesized superseding
+    // plan cannot derive on its own.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("reset activation applies");
@@ -4311,16 +4332,14 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
         &key_package_ref,
     )
     .await;
-    // Acceptance at eval+3000 — AFTER alice's request (eval+2000), so the
-    // supersession's transition_follows_origin holds.
-    let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
-    )
-    .unwrap();
-    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
-    )
-    .unwrap();
+    // Acceptance at clock+3000 — AFTER alice's request (clock+2000, sampled earlier),
+    // so `transition_follows_origin` (state_machine.rs:18396-18397) holds.
+    let (received_at, applied_at) = single_clock_instant(&pool, 3_000).await;
+    // MUST be the seeded row's exact `not_after`: `recovery_expiry`
+    // (state_machine.rs:13708) rejects `package_not_after <= received_at`, and a
+    // clock-based received_at is ~16 days past the old eval+1h literal.
+    let pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(package_not_after.timestamp_millis()).unwrap();
     let entry_id = Uuid::new_v4();
     let transition_id = Uuid::new_v4();
     let recovery_request_id = *Uuid::new_v4().as_bytes();
@@ -4351,15 +4370,6 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
         },
     )
     .expect("valid acceptance plan over a co-open recovery request");
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
-        *conversation_id.as_bytes(),
-        *entry_id.as_bytes(),
-        fixture.coordinate,
-        2,
-        received_at,
-    );
-    let plan = persistence_plan_for_test(planned, head_cas);
-    let applied_at = clock_now(&pool).await;
     let payload = vec![0xA1_u8; 12];
     let transcript = vec![0xA2_u8; 12];
     let ctx = ExecutionContext {
@@ -4434,6 +4444,26 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("acceptance transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+        transaction_id,
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256 (transition.rs:1655), which the synthesized superseding
+    // plan cannot derive on its own.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("acceptance that supersedes a co-open recovery request applies");
@@ -4912,16 +4942,27 @@ async fn build_replace_recovery_request(
         &key_package_ref,
     )
     .await;
-    let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
-    )
-    .unwrap();
-    let pkg_not_after_ts = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_600_000,
-    )
-    .unwrap();
+    // Single-clock: ONE database-clock millisecond is both the protocol instant and
+    // the ExecutionContext instant, so `requested_at`/`created_at`
+    // (state_machine.rs:29638,29700) equal the `claimed_at` the prior-bound release
+    // CAS binds as $17 (transition.rs:1681,1701).
+    let (received_at, applied_at) = single_clock_instant(pool, 3_000).await;
+    // The protocol package_not_after MUST be the seeded row's exact `not_after`: the
+    // release CAS pins `kp.not_after = $8` (transition.rs:1658) from the plan's
+    // reservation package_not_after (state_machine.rs:30321), and `recovery_expiry`
+    // (state_machine.rs:13708) rejects `package_not_after <= received_at`.
+    let pkg_not_after_ts =
+        ServerTimestamp::from_unix_millis_for_test(package_not_after.timestamp_millis()).unwrap();
     let request_id = Uuid::new_v4();
-    let evidence = RequestEvidence::for_test(
+    // The evidence must carry Alice's REAL registered key id: the key package row was
+    // seeded with it, and the durable release CAS pins `owner_key_id`
+    // (transition.rs:1657).
+    let alice_key_id_bytes: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&fixture.alice_key_id)
+        .expect("alice key id is base64url")
+        .try_into()
+        .expect("alice key id is 32 bytes");
+    let evidence = RequestEvidence::for_test_with_key_id(
         RequestEntryKind::LeafRecoveryRequest,
         2,
         *request_id.as_bytes(),
@@ -4929,6 +4970,7 @@ async fn build_replace_recovery_request(
         *conversation_id.as_bytes(),
         received_at,
         request_byte,
+        alice_key_id_bytes,
     )
     .unwrap();
     let planned = plan_leaf_recovery_request(
@@ -4952,7 +4994,6 @@ async fn build_replace_recovery_request(
         received_at,
     );
     let plan = persistence_plan_for_test(planned, head_cas);
-    let applied_at = clock_now(pool).await;
     let transcript = vec![request_byte; 16];
     let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
     let ctx = ExecutionContext {
@@ -5098,10 +5139,7 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
     .expect("baseline append/event/outbox counts");
 
     // Cancel the open request: received AFTER the request, a DISTINCT digest.
-    let cancel_received = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 4_000,
-    )
-    .unwrap();
+    let (cancel_received, applied_at) = single_clock_instant(&pool, 4_000).await;
     let cancel_evidence = RequestEvidence::for_test(
         RequestEntryKind::LeafRecoveryCancellation,
         2,
@@ -5130,7 +5168,6 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
     );
     let plan = persistence_plan_for_test(planned, head_cas);
 
-    let applied_at = clock_now(&pool).await;
     let cancel_transcript = vec![0x82_u8; 16];
     let alice_pred =
         device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
@@ -7626,8 +7663,8 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
         tx.commit().await.expect("creation COMMIT");
     }
 
-    // Alice (active) opens an entry-less recovery request (eval+2000), then bob's
-    // zeroLeafLeave (eval+3000, strictly after) supersedes it.
+    // Alice (active) opens an entry-less recovery request (clock+2000), then bob's
+    // zeroLeafLeave (clock+3000, strictly after) supersedes it.
     let (rr_state, alice_rid, alice_ref) = seed_alice_open_recovery(&pool, &fixture).await;
 
     let bob_period: Uuid = sqlx::query_scalar(
@@ -7638,10 +7675,7 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
     .fetch_one(&pool)
     .await
     .expect("bob participant period");
-    let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 3_000,
-    )
-    .unwrap();
+    let (received_at, applied_at) = single_clock_instant(&pool, 3_000).await;
     let transition_id = Uuid::new_v4();
     let evidence =
         TransitionEvidence::for_test_at(2, *transition_id.as_bytes(), [0x82_u8; 32], received_at)
@@ -7655,15 +7689,6 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
     )
     .expect("valid zero-leaf leave plan over a co-open recovery request");
     let entry_id = Uuid::new_v4();
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
-        *conversation_id.as_bytes(),
-        *entry_id.as_bytes(),
-        fixture.coordinate,
-        2,
-        received_at,
-    );
-    let plan = persistence_plan_for_test(planned, head_cas);
-    let applied_at = clock_now(&pool).await;
     let transcript = vec![0x92_u8; 16];
     let ctx = ExecutionContext {
         protocol_instance_id: fixture.protocol_instance_id,
@@ -7728,6 +7753,26 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("zero-leaf leave transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+        transaction_id,
+        *conversation_id.as_bytes(),
+        *entry_id.as_bytes(),
+        fixture.coordinate,
+        2,
+        received_at,
+    );
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256 (transition.rs:1655), which the synthesized superseding
+    // plan cannot derive on its own.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("zero-leaf leave over a co-open recovery request applies");
@@ -9250,12 +9295,20 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     .await;
     let req_pkg_not_after_ts =
         ServerTimestamp::from_unix_millis_for_test(req_pkg_not_after.timestamp_millis()).unwrap();
-    let req_received = ServerTimestamp::from_unix_millis_for_test(
-        manifest.evaluation_unix_seconds as i64 * 1_000 + 5_000,
-    )
-    .unwrap();
+    // Single-clock: ONE database-clock millisecond is both the protocol instant and
+    // the ExecutionContext instant (state_machine.rs:29638,29700 vs
+    // transition.rs:1681,1701).
+    let (req_received, req_applied_at) = single_clock_instant(&pool, 5_000).await;
     let request_id = Uuid::new_v4();
-    let req_evidence = RequestEvidence::for_test(
+    // The evidence must carry Alice's REAL registered key id: the key package row was
+    // seeded with it, and the durable release CAS pins `owner_key_id`
+    // (transition.rs:1657).
+    let alice_request_key_id: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&fixture.alice_key_id)
+        .expect("alice key id is base64url")
+        .try_into()
+        .expect("alice key id is 32 bytes");
+    let req_evidence = RequestEvidence::for_test_with_key_id(
         RequestEntryKind::LeafRecoveryRequest,
         4,
         *request_id.as_bytes(),
@@ -9263,6 +9316,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         *conversation_id.as_bytes(),
         req_received,
         0xC1,
+        alice_request_key_id,
     )
     .unwrap();
     let req_planned = plan_leaf_recovery_request(
@@ -9286,7 +9340,6 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         req_received,
     );
     let req_plan = persistence_plan_for_test(req_planned, req_head);
-    let req_applied_at = clock_now(&pool).await;
     let req_transcript = vec![0xC1_u8; 16];
     let req_pred = device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
     let req_ctx = ExecutionContext {
@@ -9395,10 +9448,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     .expect("synthetic zero-proposal commit");
     let commit_transition = Uuid::new_v4();
     let commit_entry = Uuid::new_v4();
-    let commit_received = ServerTimestamp::from_unix_millis_for_test(
-        manifest.evaluation_unix_seconds as i64 * 1_000 + 6_000,
-    )
-    .unwrap();
+    let (commit_received, applied_at) = single_clock_instant(&pool, 6_000).await;
     let alice_key_id_bytes: [u8; 32] = Sha256::digest(&scenario.alice_sig_key).into();
     let reencryption = MetadataSnapshotBinding::for_test_creation(
         *conversation_id.as_bytes(),
@@ -9436,16 +9486,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         },
     )
     .expect("valid generic commit plan");
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
-        *conversation_id.as_bytes(),
-        *commit_entry.as_bytes(),
-        *request_state.coordinate(),
-        4,
-        commit_received,
-    );
-    let plan = persistence_plan_for_test(planned, head_cas);
 
-    let applied_at = clock_now(&pool).await;
     let alice_pred =
         device_event_predecessor(&pool, &fixture.alice_did, fixture.alice_device).await;
     let bob_device = Uuid::from_bytes(*scenario.bob_id.device_id());
@@ -9535,6 +9576,26 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     };
 
     let mut tx = pool.begin().await.expect("begin generic commit");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("generic commit transaction id");
+    let head_cas = ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+        transaction_id,
+        *conversation_id.as_bytes(),
+        *commit_entry.as_bytes(),
+        *request_state.coordinate(),
+        4,
+        commit_received,
+    );
+    // seed_key_package writes wrapper_bytes = vec![0xC1; 32]; the durable release CAS
+    // pins kp.wrapper_sha256 (transition.rs:1655), which the synthesized superseding
+    // plan cannot derive on its own.
+    let plan = persistence_plan_for_test(planned, head_cas)
+        .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("generic commit with supersession applies");
@@ -12493,11 +12554,19 @@ async fn device_revocation_without_receipt_fails_the_commit_trigger() {
 /// Build (but do not apply) a real policy `addParticipant` edge on top of a
 /// committed creation `fixture`, returning its plan + execution context. Mirrors
 /// `group_policy_add_participant_commits_state_version_plus_one`.
+///
+/// `transaction_id` binds the head CAS to the EXACT PostgreSQL transaction the plan
+/// will be applied in. It is REQUIRED when the plan carries a prior-bound recovery
+/// release: `release_reserved_recovery_package` pins `txid_current()::text = $1`
+/// (transition.rs:1651) against it, so the placeholder `for_test_edge` mints always
+/// conflicts. It must be `None` for the concurrency proofs, which apply ONE plan
+/// from two competing transactions and therefore cannot bind either id.
 async fn build_policy_edge(
     pool: &PgPool,
     fixture: &CreationApply,
     state: &chat_protocol::state_machine::ConversationState,
     seq: u64,
+    transaction_id: Option<String>,
 ) -> (
     chat_protocol::state_machine::ConversationPersistencePlan,
     ExecutionContext,
@@ -12507,12 +12576,10 @@ async fn build_policy_edge(
     let bob2_device = Uuid::from_bytes(*bob2_id.device_id());
     let _ = seed_actor(pool, &bob2_did, bob2_device, &[0x63_u8; 32]).await;
 
-    // A receivedAt strictly after any prior edge at a lower seq (so an edge that
-    // follows a committed reset request at seq 2 is monotonically later).
-    let received_at = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + (seq as i64) * 1_000 + 2_000,
-    )
-    .unwrap();
+    // A receivedAt strictly after any prior edge at a lower seq. Same DB clock as
+    // `seed_alice_open_recovery`, sampled later with a larger offset, so it is strictly
+    // after the request it supersedes (state_machine.rs:18396).
+    let (received_at, applied_at) = single_clock_instant(pool, (seq as i64) * 1_000 + 2_000).await;
     let entry_id = Uuid::new_v4();
     let transition_id = Uuid::new_v4();
     let policy_evidence = TransitionEvidence::for_test_policy_add(
@@ -12531,19 +12598,28 @@ async fn build_policy_edge(
         [0x99_u8; 32],
     )
     .expect("valid policy plan");
-    let head_cas = ConversationHeadCasBinding::for_test_edge(
-        *conversation_id.as_bytes(),
-        *entry_id.as_bytes(),
-        fixture.coordinate,
-        seq,
-        received_at,
-    );
+    let head_cas = match transaction_id {
+        Some(transaction_id) => ConversationHeadCasBinding::for_test_edge_with_transaction_id(
+            transaction_id,
+            *conversation_id.as_bytes(),
+            *entry_id.as_bytes(),
+            fixture.coordinate,
+            seq,
+            received_at,
+        ),
+        None => ConversationHeadCasBinding::for_test_edge(
+            *conversation_id.as_bytes(),
+            *entry_id.as_bytes(),
+            fixture.coordinate,
+            seq,
+            received_at,
+        ),
+    };
     // The policy edge carries the PRIOR-BOUND release binding; it needs the same real
     // durable wrapper digest, for the same reason.
     let plan = persistence_plan_for_test(planned, head_cas)
         .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
 
-    let applied_at = clock_now(pool).await;
     let payload = vec![0x51_u8; 12];
     let transcript = vec![0x52_u8; 12];
     let recipients_devices = [
@@ -12695,7 +12771,9 @@ async fn concurrent_edge_apply_from_one_coordinate_yields_one_commit() {
         .expect("creation applies");
     tx.commit().await.expect("creation COMMIT");
 
-    let (plan, ctx) = build_policy_edge(&pool, &fixture, &fixture.state, 2).await;
+    // No transaction binding: the SAME plan is applied from two competing
+    // transactions, so neither id could be bound.
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &fixture.state, 2, None).await;
 
     let barrier = Barrier::new(2);
     let racer_a = async {
@@ -12791,14 +12869,13 @@ async fn seed_alice_open_recovery(
     .await;
     let pkg_not_after_ts =
         ServerTimestamp::from_unix_millis_for_test(pkg_not_after.timestamp_millis()).unwrap();
-    // Eval-based so the request precedes the eval-based coordinate-advancing edge
-    // that supersedes it (the Superseded arm of validate_recovery_work requires
-    // `transition.received_at >= request.received_at`); a clock-based (real-now)
-    // request would sort AFTER the eval-based (2023) edge and fail that check.
-    let rec_received = ServerTimestamp::from_unix_millis_for_test(
-        corpus_manifest().evaluation_unix_seconds as i64 * 1_000 + 2_000,
-    )
-    .unwrap();
+    // Single clock, matching production (execution_context.rs:249,270): the DB-clock
+    // millisecond below is BOTH `rec_received` and `rec_applied_at`, so the durable
+    // `requested_at`/`created_at` (state_machine.rs:29638,29700) equal the `claimed_at`
+    // the release CAS binds as $17 (transition.rs:1681,1701). Superseding edges sample
+    // the same clock LATER with a larger offset, so the Superseded arm's
+    // `transition.received_at >= request.received_at` (state_machine.rs:18396) holds.
+    let (rec_received, rec_applied_at) = single_clock_instant(pool, 2_000).await;
     let recovery_request_id = Uuid::new_v4();
     // The evidence must carry Alice's REAL registered key id: the key package row was
     // seeded with it, and the durable CAS pins `owner_key_id`.
@@ -12843,15 +12920,6 @@ async fn seed_alice_open_recovery(
     // Request-origin plan.
     let rec_plan = persistence_plan_for_test(rec_planned, rec_head)
         .with_recovery_package_wrapper_sha256_for_test(Sha256::digest(vec![0xC1_u8; 32]).into());
-    // KNOWN FIXTURE INCONSISTENCY, diagnosed but not resolved: the durable
-    // request/reservation rows take `requested_at` / `created_at` from THIS
-    // clock-based applied_at, while the release CAS binding takes `claimed_at` from the
-    // plan's eval-based `received_at` above. `rr.requested_at = $17` therefore never
-    // matches and the prior-bound release conflicts. Aligning them by making
-    // applied_at eval-based instead trips
-    // chat.assert_recovery_fulfillment_mapping ("recovery request reservation mapping
-    // mismatch"), so the fixture's time model needs reconciling, not a one-line swap.
-    let rec_applied_at = clock_now(pool).await;
     let rec_transcript = vec![0x72_u8; 16];
     let alice_pred = device_event_predecessor(pool, &fixture.alice_did, fixture.alice_device).await;
     let rec_ctx = ExecutionContext {
@@ -12942,9 +13010,16 @@ async fn policy_add_supersedes_prior_open_recovery_request() {
     tx.commit().await.expect("creation COMMIT");
 
     let (rr_state, recovery_request_id, rec_ref) = seed_alice_open_recovery(&pool, &fixture).await;
-    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
 
     let mut tx = pool.begin().await.expect("begin policy");
+    // The prior-bound release CAS pins `txid_current()::text = $1` (transition.rs:1651)
+    // against the head CAS transaction id, so the binding must carry the REAL id of the
+    // transaction the plan is applied in.
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("policy transaction id");
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2, Some(transaction_id)).await;
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
         .await
         .expect("policy add over a co-open recovery request applies");
@@ -12999,7 +13074,9 @@ async fn policy_untracked_recovery_delta_is_rejected() {
     tx.commit().await.expect("creation COMMIT");
 
     let (rr_state, _rid, _ref) = seed_alice_open_recovery(&pool, &fixture).await;
-    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2).await;
+    // No transaction binding needed: the injected untracked delta is rejected as
+    // `InconsistentPlan` before any durable CAS runs.
+    let (plan, ctx) = build_policy_edge(&pool, &fixture, &rr_state, 2, None).await;
     let bad = plan.with_extra_untracked_recovery_request_for_test();
     let mut tx = pool.begin().await.expect("begin policy");
     let result = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &bad, &ctx).await;
