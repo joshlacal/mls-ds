@@ -6505,7 +6505,12 @@ mod historical_control_loader {
 
         #[test]
         fn g6_capsule_binding_covers_prepared_plan_context_and_event_schedule() {
-            let state_machine = include_str!("../src/chat_protocol/state_machine.rs");
+            // state_machine's executor module moved to its own file post-C2-seal;
+            // the guard scans the same source text, now split across two files.
+            let state_machine = concat!(
+                include_str!("../src/chat_protocol/state_machine.rs"),
+                include_str!("../src/chat_protocol/state_machine/executor.rs"),
+            );
             let execution = include_str!("../src/chat_protocol/repository/execution_context.rs");
             let member_digest_item = g6_source_item(
                 state_machine,

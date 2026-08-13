@@ -5,8 +5,21 @@ const STATE_MACHINE_PATH: &str = concat!(
     "/src/chat_protocol/state_machine.rs"
 );
 
+// The executor module moved to its own file post-C2-seal; the guard scans the
+// same source text, now split across two files.
+const STATE_MACHINE_EXECUTOR_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/chat_protocol/state_machine/executor.rs"
+);
+
 fn state_machine_source() -> String {
-    fs::read_to_string(STATE_MACHINE_PATH).expect("read state-machine source")
+    let mut source =
+        fs::read_to_string(STATE_MACHINE_PATH).expect("read state-machine source");
+    source.push_str(
+        &fs::read_to_string(STATE_MACHINE_EXECUTOR_PATH)
+            .expect("read state-machine executor source"),
+    );
+    source
 }
 
 #[test]
