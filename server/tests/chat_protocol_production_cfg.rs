@@ -20,7 +20,9 @@ fn fresh_plc_did() -> String {
         bits += 8;
         while bits >= 5 {
             bits -= 5;
-            suffix.push(char::from(ALPHABET[((accumulator >> bits) & 0x1f) as usize]));
+            suffix.push(char::from(
+                ALPHABET[((accumulator >> bits) & 0x1f) as usize],
+            ));
         }
     }
     format!("did:plc:{suffix}")

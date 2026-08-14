@@ -13,8 +13,7 @@ const STATE_MACHINE_EXECUTOR_PATH: &str = concat!(
 );
 
 fn state_machine_source() -> String {
-    let mut source =
-        fs::read_to_string(STATE_MACHINE_PATH).expect("read state-machine source");
+    let mut source = fs::read_to_string(STATE_MACHINE_PATH).expect("read state-machine source");
     source.push_str(
         &fs::read_to_string(STATE_MACHINE_EXECUTOR_PATH)
             .expect("read state-machine executor source"),
