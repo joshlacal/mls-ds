@@ -263,6 +263,19 @@ async fn clock_now(pool: &PgPool) -> DateTime<Utc> {
         .expect("sample trusted database clock")
 }
 
+/// The first `event_position` no committed disposition holds. `event_position`
+/// is UNIQUE across the whole of `chat.welcome_dispositions`, so a literal
+/// position is only free until some run commits one — the same reason the
+/// seeds above mint fresh identities rather than reusing fixed ones.
+async fn next_free_welcome_disposition_position(pool: &PgPool) -> i64 {
+    let highest: Option<i64> =
+        sqlx::query_scalar("SELECT max(event_position) FROM chat.welcome_dispositions")
+            .fetch_one(pool)
+            .await
+            .expect("read the highest committed welcome disposition position");
+    highest.unwrap_or(0) + 1
+}
+
 /// Seed a principal + device + device key and return `(device_id, key_id,
 /// public_key)`. Each identity is fresh so the not-truncated test DB stays
 /// independent between runs.
@@ -2260,6 +2273,11 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_fixture(&pool).await;
     let now = clock_now(&pool).await;
+    // `welcome_dispositions_event_position_uq` is UNIQUE over the whole table,
+    // and this suite isolates by rolling back rather than by owning the
+    // database. Any disposition another run committed makes a hardcoded
+    // position collide with 23505, so take positions past everything present.
+    let free_event_position = next_free_welcome_disposition_position(&pool).await;
 
     let mut transition_tx = pool.begin().await.unwrap();
     let (welcome_id, recovery_request_id, key_package_ref, not_after) =
@@ -2284,7 +2302,7 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
             terminal_transition_id: fixture.creation_transition_id,
         },
         now + Duration::minutes(1),
-        1,
+        free_event_position,
     )
     .await
     .expect("persist transition supersession source");
@@ -2326,7 +2344,7 @@ async fn welcome_supersession_disposition_persists_exact_exclusive_source_id() {
             terminal_revocation_id,
         },
         now + Duration::minutes(1),
-        2,
+        free_event_position + 1,
     )
     .await
     .expect("persist revocation supersession source");

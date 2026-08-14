@@ -1574,8 +1574,16 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
     assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
+// Re-pinned after the C2 lane. The previous value was set at `e98ef5da` and
+// three later sealed commits changed the helper without re-pinning it, so both
+// guards below asserted a baseline that no longer existed:
+//   b2f7ae9e  production's single-clock time model in the executor fixtures
+//   a63bc3fa  the signing authority production always mints
+//   0c6290a0  the planner's own due-expiry rows in coordinate-changing arms
+// Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
+// an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "1c852639e4fe4bf17af88bbfe3456a95c26d93c2535530d3c54a81ff0983e20f";
+    "d7a4e316c3292ea7958a9d454154ebf1957a2e24735fc20d18cb1d42773f92f8";
 const SEALED_REPOSITORY_CORE_SHA256: &str =
     "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
 
