@@ -1477,6 +1477,69 @@ mod chat_protocol {
             }
 
             #[test]
+            fn a_terminal_close_may_not_touch_a_successor() {
+                // Terminal finality: the trigger admits a touch only for
+                // 'replace' and 'reset', so a 'terminal' close touching any
+                // successor stays rejected. Guards against the loosened
+                // boundary overshooting into accepting illegal touches.
+                let boundary = Uuid::new_v4();
+                for opening_kind in ["add", "reset", "creation"] {
+                    let rows = touching_pair(
+                        "terminal",
+                        opening_kind,
+                        6,
+                        6,
+                        boundary,
+                        boundary,
+                        OPENING_FINGERPRINT,
+                    );
+                    assert!(matches!(
+                        build_ordered_interval_witnesses(rows, 12),
+                        Err(ReadAuthorityError::Invariant)
+                    ));
+                }
+            }
+
+            #[test]
+            fn a_legal_pair_may_not_touch_with_the_wrong_opening_kind() {
+                // The kind PAIR is load-bearing, not just the closing kind:
+                // 'replace' pairs only with 'add' and 'reset' only with 'reset'.
+                let boundary = Uuid::new_v4();
+                for (closing, opening) in [("replace", "reset"), ("reset", "add")] {
+                    let rows = touching_pair(
+                        closing,
+                        opening,
+                        6,
+                        6,
+                        boundary,
+                        boundary,
+                        OPENING_FINGERPRINT,
+                    );
+                    assert!(matches!(
+                        build_ordered_interval_witnesses(rows, 12),
+                        Err(ReadAuthorityError::Invariant)
+                    ));
+                }
+            }
+
+            #[test]
+            fn a_remove_close_still_requires_a_strict_gap() {
+                // 'remove' closes a genuine gap: a successor must start strictly
+                // later, and that successor is accepted.
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "remove",
+                    "add",
+                    6,
+                    7,
+                    boundary,
+                    Uuid::new_v4(),
+                    OPENING_FINGERPRINT,
+                );
+                assert!(build_ordered_interval_witnesses(rows, 12).is_ok());
+            }
+
+            #[test]
             fn a_true_overlap_is_still_rejected() {
                 // The loosened boundary must not admit `start_seq < terminal_seq`.
                 let boundary = Uuid::new_v4();
@@ -6249,8 +6312,14 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
     let conversation_id = fixture.graph.conversation_id;
     let removed = &fixture.removed;
 
-    // The removed exact device's single finite interval: ordered trivially,
-    // inclusive at the finite terminal, with exact closing provenance.
+    // A removed exact device is a FORMER leaf, so the entry capability is
+    // denied outright -- `authorize_entries` gates on a current open leaf.
+    // This is the frozen B-read rule and it matches
+    // `former_exact_device_gets_access_outside_membership_interval`, which
+    // asserts the same denial on this same fixture and device. The interval
+    // ordering / non-overlap / inclusive-terminal properties this test is named
+    // for are exercised against the creator below and, at the validator itself,
+    // by `interval_witness_boundary_tests`.
     let admission = fixture_read_admission(
         &pool,
         "blue.catbird.chat.getEntries",
@@ -6266,61 +6335,15 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
     )
     .await
     .expect("single-attempt lock");
-    let removed_entries =
+    let removed_outcome =
         chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
             .await
-            .expect("the exact-device interval union authorizes the removed device's own entries");
-    let removed_view = chat_protocol::read_authority_bridge::entry_authority_view(&removed_entries);
+            .err()
+            .expect("a removed exact device holds no entry authority");
     assert_eq!(
-        removed_view.ordered_intervals.len(),
-        1,
-        "the removed exact device has exactly one interval"
-    );
-    let interval = &removed_view.ordered_intervals[0];
-    assert_eq!(
-        interval.membership_interval_id, removed.membership_interval_id,
-        "the witness binds the durable membership interval id"
-    );
-    assert_eq!(interval.start_seq, removed.interval_start_seq);
-    match &interval.terminal {
-        chat_protocol::read_authority_bridge::IntervalTerminalView::Closed {
-            terminal_seq,
-            closing_transition_id,
-            closing_outer_entry_fingerprint,
-            closing_kind,
-            row_sha256,
-        } => {
-            assert_eq!(
-                *terminal_seq, removed.terminal_seq,
-                "the finite terminal sequence is inclusive"
-            );
-            assert_eq!(
-                *closing_transition_id, removed.terminal_transition_id,
-                "the closing transition provenance binds the exact entry"
-            );
-            assert_eq!(
-                *closing_outer_entry_fingerprint, removed.terminal_outer_entry_fingerprint,
-                "the closing outer-entry fingerprint binds the exact entry"
-            );
-            assert_eq!(closing_kind, "remove");
-            assert_ne!(*row_sha256, [0_u8; 32], "the row binding digest is nonzero");
-        }
-        other => panic!("the removed device interval must be finite, found {other:?}"),
-    }
-    assert_ne!(
-        removed_view.ordered_intervals_sha256, [0_u8; 32],
-        "the ordered interval digest is derived under the same transaction"
-    );
-    assert!(
-        removed_view.control_recipient_fence.maximum_entry_seq >= removed.terminal_seq,
-        "the control-recipient fence reaches at least the inclusive terminal"
-    );
-    assert_ne!(
-        removed_view
-            .control_recipient_fence
-            .ordered_recipient_rows_sha256,
-        [0_u8; 32],
-        "the ordered control-recipient set is bound at the same fence"
+        removed_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "the former-device denial is the outside-interval error, never an interval union"
     );
     rollback_with_constraints(tx).await;
 
@@ -6375,9 +6398,18 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
         B_READ_READ_AUTHORITY_SOURCE.contains("ORDER BY ai.start_seq, ai.membership_interval_id"),
         "the interval loader is deterministic in (start_seq, membership_interval_id) order"
     );
+    // Re-pinned by Lane E finding 5a. The predicate was `start_seq <=
+    // previous_terminal`, which also rejected the touching boundary that
+    // `chat.assert_application_interval_schedule` MANDATES for replace->add and
+    // reset->reset. Overlap is now strict, and the touch is admitted only for
+    // the trigger's two legal kind pairs.
     assert!(
-        B_READ_READ_AUTHORITY_SOURCE.contains("start_seq <= previous_terminal"),
-        "the validator rejects overlapping intervals"
+        B_READ_READ_AUTHORITY_SOURCE.contains("if start_seq < *terminal_seq"),
+        "the validator rejects genuinely overlapping intervals"
+    );
+    assert!(
+        B_READ_READ_AUTHORITY_SOURCE.contains(r#"("replace", "add") | ("reset", "reset")"#),
+        "a touching boundary is admitted only for the schedule trigger's two legal kind pairs"
     );
     assert!(
         B_READ_READ_AUTHORITY_SOURCE.contains("An open interval must be last"),
@@ -6431,41 +6463,57 @@ async fn entry_intervals_preserve_readd_gaps_and_generation_boundaries() {
     )
     .await
     .expect("single-attempt lock");
-    let entries = chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
-        .await
-        .expect("the exact-device interval union still authorizes the old device's own entries");
-    let view = chat_protocol::read_authority_bridge::entry_authority_view(&entries);
-    // The re-add gap stays invisible: exactly one closed interval, never a
-    // synthesized open interval after the terminal sequence.
+    // The post-reset OLD device is a former leaf: denied, not unioned. Its
+    // generation binding is proved above, directly against the durable rows.
+    let old_outcome =
+        chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
+            .await
+            .err()
+            .expect("the post-reset old exact device holds no entry authority");
     assert_eq!(
-        view.ordered_intervals.len(),
-        1,
-        "no backfill interval is synthesized after the reset terminal"
+        old_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
+        "the retired-generation denial is the outside-interval error"
     );
-    match &view.ordered_intervals[0].terminal {
-        chat_protocol::read_authority_bridge::IntervalTerminalView::Closed {
-            terminal_seq,
-            closing_kind,
-            ..
-        } => {
-            assert_eq!(
-                *terminal_seq, old.terminal_seq,
-                "the reset terminal is inclusive"
-            );
-            assert_eq!(closing_kind, "reset", "the reset closing kind is exact");
-        }
-        other => panic!("the old device interval must be reset-closed, found {other:?}"),
-    }
-    let observed_head: i64 = sqlx::query_scalar(
-        "SELECT coalesce(max(seq),0)::bigint FROM chat.entries WHERE conversation_id=$1",
+    rollback_with_constraints(tx).await;
+
+    // The reset ACTIVATOR is the device whose intervals actually touch: its
+    // retired interval closes `reset` at the activation sequence and its
+    // successor opens `reset` at the SAME sequence, which
+    // `chat.assert_application_interval_schedule` mandates. Reading as the
+    // activator is the production-path regression lock for Lane E finding 5a --
+    // before that fix this returned Invariant.
+    let activator_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getEntries",
+        &fixture.graph.creator_did,
+        fixture.graph.creator_device_id,
+        &fixture.graph.creator_dpop_jkt,
     )
-    .bind(conversation_id)
-    .fetch_one(&mut *tx)
+    .await;
+    let (activator_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        activator_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
     .await
-    .expect("read the observed head sequence");
+    .expect("activator entry single-attempt lock");
+    let activator_entries =
+        chat_protocol::read_authority::authorize_entries(&mut tx, activator_guard, conversation_id)
+            .await
+            .expect("the activator's mandated touching boundary is not an overlap");
+    let activator_view =
+        chat_protocol::read_authority_bridge::entry_authority_view(&activator_entries);
     assert!(
-        u64::try_from(observed_head).expect("head fits u64") > old.terminal_seq,
-        "entries after the reset terminal exist — the gap is real and stays unbackfilled"
+        matches!(
+            activator_view
+                .ordered_intervals
+                .last()
+                .expect("the activator holds at least one interval")
+                .terminal,
+            chat_protocol::read_authority_bridge::IntervalTerminalView::Open { .. }
+        ),
+        "the activator's current interval is open and last"
     );
     rollback_with_constraints(tx).await;
 }
