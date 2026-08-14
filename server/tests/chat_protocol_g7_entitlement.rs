@@ -1330,6 +1330,172 @@ mod chat_protocol {
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/read_authority.rs"
         ));
+
+        /// Pure coverage for the interval-witness validator's boundary rules. These run
+        /// wherever a harness `include!`s this file as a module of the test crate, so
+        /// they need no database and no fixture corpus.
+        #[cfg(test)]
+        mod interval_witness_boundary_tests {
+            use super::*;
+
+            const OPENING_FINGERPRINT: [u8; 32] = [7u8; 32];
+            const UNRELATED_FINGERPRINT: [u8; 32] = [9u8; 32];
+
+            /// One closed row that ends at `terminal_seq` with the given closing
+            /// evidence, followed by one open row that starts at `start_seq`.
+            fn touching_pair(
+                closing_kind: &str,
+                opening_kind: &str,
+                terminal_seq: i64,
+                start_seq: i64,
+                boundary_transition: Uuid,
+                opening_transition: Uuid,
+                closing_fingerprint: [u8; 32],
+            ) -> Vec<ExactDeviceIntervalRow> {
+                let conversation_id = Uuid::new_v4();
+                let recipient_device_id = Uuid::new_v4();
+                let base = |start: i64, opening_kind: &str, opening_transition: Uuid| {
+                    ExactDeviceIntervalRow {
+                        membership_interval_id: Uuid::new_v4(),
+                        conversation_id,
+                        generation: 0,
+                        recipient_did: "did:plc:reader".to_owned(),
+                        recipient_device_id,
+                        start_seq: start,
+                        opening_transition_id: opening_transition,
+                        opening_outer_entry_fingerprint: OPENING_FINGERPRINT.to_vec(),
+                        opening_kind: opening_kind.to_owned(),
+                        terminal_seq: None,
+                        closing_transition_id: None,
+                        closing_outer_entry_fingerprint: None,
+                        closing_kind: None,
+                    }
+                };
+                let mut closed = base(1, "creation", Uuid::new_v4());
+                closed.terminal_seq = Some(terminal_seq);
+                closed.closing_transition_id = Some(boundary_transition);
+                closed.closing_outer_entry_fingerprint = Some(closing_fingerprint.to_vec());
+                closed.closing_kind = Some(closing_kind.to_owned());
+                vec![closed, base(start_seq, opening_kind, opening_transition)]
+            }
+
+            #[test]
+            fn reset_touching_boundary_is_accepted() {
+                // The reset activator's own pair: `chat.assert_application_interval_schedule`
+                // REQUIRES the successor to open exactly at the reset terminal.
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "reset",
+                    "reset",
+                    6,
+                    6,
+                    boundary,
+                    boundary,
+                    OPENING_FINGERPRINT,
+                );
+                let witnesses = build_ordered_interval_witnesses(rows, 12)
+                    .expect("a mandated reset->reset touch is not an overlap");
+                assert_eq!(witnesses.len(), 2);
+                assert_eq!(witnesses[1].start_seq, 6);
+            }
+
+            #[test]
+            fn replace_touching_boundary_is_accepted() {
+                // The leaf-recovery-replaced device's pair; `replace` without a touching
+                // successor is itself a schema violation.
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "replace",
+                    "add",
+                    4,
+                    4,
+                    boundary,
+                    boundary,
+                    OPENING_FINGERPRINT,
+                );
+                let witnesses = build_ordered_interval_witnesses(rows, 9)
+                    .expect("a mandated replace->add touch is not an overlap");
+                assert_eq!(witnesses.len(), 2);
+            }
+
+            #[test]
+            fn touching_boundary_needs_the_same_transition_on_both_sides() {
+                let rows = touching_pair(
+                    "reset",
+                    "reset",
+                    6,
+                    6,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    OPENING_FINGERPRINT,
+                );
+                // `matches!` rather than `unwrap_err`: the witness stays non-Debug.
+                assert!(matches!(
+                    build_ordered_interval_witnesses(rows, 12),
+                    Err(ReadAuthorityError::Invariant)
+                ));
+            }
+
+            #[test]
+            fn touching_boundary_needs_the_same_entry_fingerprint() {
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "reset",
+                    "reset",
+                    6,
+                    6,
+                    boundary,
+                    boundary,
+                    UNRELATED_FINGERPRINT,
+                );
+                // `matches!` rather than `unwrap_err`: the witness stays non-Debug.
+                assert!(matches!(
+                    build_ordered_interval_witnesses(rows, 12),
+                    Err(ReadAuthorityError::Invariant)
+                ));
+            }
+
+            #[test]
+            fn only_replace_add_and_reset_reset_may_touch() {
+                // `remove` closes a genuine gap, so its successor must start strictly
+                // later; the trigger rejects a `remove` touch as illegal.
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "remove",
+                    "add",
+                    6,
+                    6,
+                    boundary,
+                    boundary,
+                    OPENING_FINGERPRINT,
+                );
+                // `matches!` rather than `unwrap_err`: the witness stays non-Debug.
+                assert!(matches!(
+                    build_ordered_interval_witnesses(rows, 12),
+                    Err(ReadAuthorityError::Invariant)
+                ));
+            }
+
+            #[test]
+            fn a_true_overlap_is_still_rejected() {
+                // The loosened boundary must not admit `start_seq < terminal_seq`.
+                let boundary = Uuid::new_v4();
+                let rows = touching_pair(
+                    "reset",
+                    "reset",
+                    6,
+                    5,
+                    boundary,
+                    boundary,
+                    OPENING_FINGERPRINT,
+                );
+                // `matches!` rather than `unwrap_err`: the witness stays non-Debug.
+                assert!(matches!(
+                    build_ordered_interval_witnesses(rows, 12),
+                    Err(ReadAuthorityError::Invariant)
+                ));
+            }
+        }
     }
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;

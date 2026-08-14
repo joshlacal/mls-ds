@@ -1005,6 +1005,10 @@ struct ExactDeviceIntervalRow {
     start_seq: i64,
     opening_transition_id: Uuid,
     opening_outer_entry_fingerprint: Vec<u8>,
+    // Read only to mirror the schedule trigger's touching-boundary rule below.
+    // Deliberately absent from `interval_row_binding_digest`: the frozen witness
+    // bytes must not change, and `generation` already separates a reset touch.
+    opening_kind: String,
     terminal_seq: Option<i64>,
     closing_transition_id: Option<Uuid>,
     closing_outer_entry_fingerprint: Option<Vec<u8>>,
@@ -1027,6 +1031,7 @@ async fn load_exact_device_interval_rows(
                ai.start_seq,
                ai.opening_transition_id,
                ai.opening_outer_entry_fingerprint,
+               ai.opening_kind,
                ai.terminal_seq,
                ai.closing_transition_id,
                ai.closing_outer_entry_fingerprint,
@@ -1106,6 +1111,12 @@ fn interval_row_binding_digest(
 /// not last, and requires the open/closed shape and terminal provenance for
 /// every row. A closed terminal sequence is inclusive; gaps between a
 /// terminal sequence and a later opening remain invisible (no backfill).
+///
+/// An opening AT the previous terminal sequence is a touching boundary, not an
+/// overlap: `chat.assert_application_interval_schedule` mandates it for
+/// replace->add and reset->reset. It is accepted only with the same boundary
+/// evidence the trigger requires, so the reader is exactly as strict as the
+/// writer.
 fn build_ordered_interval_witnesses(
     rows: Vec<ExactDeviceIntervalRow>,
     observed_head_seq: u64,
@@ -1166,17 +1177,44 @@ fn build_ordered_interval_witnesses(
             if previous.start_seq >= start_seq {
                 return Err(ReadAuthorityError::Invariant);
             }
-            if let Some(previous_terminal) = previous.terminal.terminal_seq() {
-                if start_seq <= previous_terminal {
-                    // Overlapping intervals: the next opening must follow the
-                    // previous terminal sequence (inclusive terminal).
+            match &previous.terminal {
+                EntryIntervalTerminalWitness::Closed {
+                    terminal_seq,
+                    closing_transition_id,
+                    closing_outer_entry_fingerprint,
+                    closing_kind,
+                    ..
+                } => {
+                    if start_seq < *terminal_seq {
+                        return Err(ReadAuthorityError::Invariant);
+                    }
+                    if start_seq == *terminal_seq {
+                        // Not an overlap. `chat.assert_application_interval_schedule`
+                        // treats only `terminal_seq > start_seq` as overlapping, and
+                        // for replace->add and reset->reset it REQUIRES this touching
+                        // boundary -- a non-touching successor is itself rejected, so
+                        // every reset activator and every leaf-recovery-replaced
+                        // device has one. Mirror the trigger's own predicate exactly.
+                        // Nothing widens: the entry at the shared sequence is already
+                        // visible through the closed interval's inclusive terminal.
+                        let kinds_pair = matches!(
+                            (closing_kind.as_str(), row.opening_kind.as_str()),
+                            ("replace", "add") | ("reset", "reset")
+                        );
+                        if !kinds_pair
+                            || *closing_transition_id != row.opening_transition_id
+                            || *closing_outer_entry_fingerprint != opening_fingerprint
+                        {
+                            return Err(ReadAuthorityError::Invariant);
+                        }
+                    }
+                }
+                EntryIntervalTerminalWitness::Open { .. } => {
+                    // A previous open interval means a duplicate tail; unreachable
+                    // after the open-must-be-last check above, kept as defence in
+                    // depth.
                     return Err(ReadAuthorityError::Invariant);
                 }
-            } else {
-                // A previous open interval means a duplicate tail; unreachable
-                // after the open-must-be-last check above, kept as defence in
-                // depth.
-                return Err(ReadAuthorityError::Invariant);
             }
         }
         witnesses.push(EntryIntervalWitness {
