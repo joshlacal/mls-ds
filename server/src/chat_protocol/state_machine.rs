@@ -17779,6 +17779,17 @@ fn commit_metadata_matches(
     metadata_coordinate_matches(next_metadata, next_coordinate)
         && next_metadata.metadata_version == prior_metadata.metadata_version
         && next_metadata.origin_transition_id == prior_metadata.origin_transition_id
+        // `assert_metadata_snapshot_mapping`'s commit arm carries ciphertext_size
+        // forward IS NOT DISTINCT FROM the prior snapshot. Without this the
+        // length drift survives planning and only fails in the deferred trigger
+        // at COMMIT, turning a client-supplied re-encryption of the wrong length
+        // into a 23514 storage 500 instead of a typed InvalidTransition.
+        && next_metadata.ciphertext.len() == prior_metadata.ciphertext.len()
+        // `assert_metadata_snapshot_mapping`'s commit arm carries ciphertext_size
+        // forward IS NOT DISTINCT FROM the prior snapshot. Without this the
+        // length drift survives planning and only fails in the deferred trigger
+        // at COMMIT, turning a client-supplied re-encryption of the wrong length
+        // into a 23514 storage 500 instead of a typed InvalidTransition.
         && next_metadata.author_proof == prior_metadata.author_proof
         && next_metadata.avatar_binding == prior_metadata.avatar_binding
         && next_metadata.nonce != prior_metadata.nonce
@@ -19571,3 +19582,133 @@ pub(crate) use executor::{
 
 #[path = "state_machine/executor.rs"]
 pub(in crate::chat_protocol) mod executor;
+
+/// Pure coverage for the epoch-commit metadata carry-forward rule. The commit
+/// arm of `chat.assert_metadata_snapshot_mapping` is a DEFERRED trigger, so a
+/// field it pins but the planner does not reject only fails at COMMIT, as a
+/// 23514 storage error rather than a typed rejection.
+#[cfg(test)]
+mod commit_metadata_carry_forward_tests {
+    use super::*;
+
+    fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
+        let mut value = [byte; 16];
+        value[6] = 0x40 | (byte & 0x0f);
+        value[8] = 0x80 | (byte & 0x3f);
+        value
+    }
+
+    fn coordinate() -> PublicGroupSnapshotCoordinate {
+        PublicGroupSnapshotCoordinate::new(
+            uuid_v4_bytes(0x11),
+            0,
+            1,
+            [0x22; 32],
+            0,
+            [0x33; 32],
+            [0x44; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        )
+    }
+
+    fn metadata(nonce_byte: u8, ciphertext_len: usize) -> MetadataSnapshotBinding {
+        let coordinate = coordinate();
+        let ciphertext = vec![0x5a; ciphertext_len];
+        let author = DeviceIdentity::new(
+            PrincipalId::new(b"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_vec()).unwrap(),
+            uuid_v4_bytes(0x55),
+        )
+        .unwrap();
+        MetadataSnapshotBinding {
+            coordinate: MetadataCryptoCoordinate {
+                conversation_id: *coordinate.conversation_id(),
+                generation: coordinate.generation(),
+                group_id: *coordinate.group_id(),
+                epoch: coordinate.epoch(),
+                group_context_hash: *coordinate.group_context_hash(),
+                confirmation_tag: *coordinate.confirmation_tag(),
+            },
+            origin_transition_id: uuid_v4_bytes(0x66),
+            metadata_version: 4,
+            nonce: [nonce_byte; 12],
+            ciphertext_sha256: sha2::Sha256::digest(&ciphertext).into(),
+            ciphertext,
+            avatar_binding: None,
+            author_proof: MetadataAuthorProofBinding {
+                author,
+                author_key_id: [0x77; 32],
+                signature_public_key: [0x88; 32],
+                auth_generation_at_origin: 3,
+                origin_transition_id: uuid_v4_bytes(0x66),
+                origin_seq: 1,
+            },
+            canonical_snapshot: Vec::new(),
+            digest: [0x99; 32],
+        }
+    }
+
+    /// A prior state carrying `prior_metadata`; only `metadata` is read here.
+    fn prior_state(prior_metadata: MetadataSnapshotBinding) -> ConversationState {
+        ConversationState {
+            kind: ConversationKind::Direct,
+            coordinate: coordinate(),
+            producer: TransitionEvidence::for_test_at(
+                1,
+                uuid_v4_bytes(0xa1),
+                [0xa1; 32],
+                ServerTimestamp::from_unix_millis(1).unwrap(),
+            )
+            .unwrap(),
+            public_state: None,
+            metadata: Some(prior_metadata),
+            metadata_producer: None,
+            participants: Vec::new(),
+            leaves: Vec::new(),
+            intervals: Vec::new(),
+            terminal_proofs: Vec::new(),
+            recovery_requests: Vec::new(),
+            recovery_reservations: Vec::new(),
+            reset_requests: Vec::new(),
+            leave_requests: Vec::new(),
+            welcomes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_same_length_re_encryption_is_accepted() {
+        let prior = prior_state(metadata(0x01, 48));
+        assert!(commit_metadata_matches(
+            &prior,
+            &metadata(0x02, 48),
+            &coordinate()
+        ));
+    }
+
+    #[test]
+    fn a_re_encryption_of_a_different_length_is_rejected() {
+        // The DDL carries ciphertext_size forward IS NOT DISTINCT FROM the prior
+        // snapshot, so this must be refused during planning rather than becoming
+        // a deferred 23514 at COMMIT.
+        let prior = prior_state(metadata(0x01, 48));
+        assert!(!commit_metadata_matches(
+            &prior,
+            &metadata(0x02, 64),
+            &coordinate()
+        ));
+        assert!(!commit_metadata_matches(
+            &prior,
+            &metadata(0x02, 32),
+            &coordinate()
+        ));
+    }
+
+    #[test]
+    fn a_reused_nonce_is_still_rejected() {
+        let prior = prior_state(metadata(0x01, 48));
+        assert!(!commit_metadata_matches(
+            &prior,
+            &metadata(0x01, 48),
+            &coordinate()
+        ));
+    }
+}
