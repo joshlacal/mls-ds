@@ -209,6 +209,7 @@ mod chat_protocol {
                 conversation_id: Uuid,
                 preparation_kind: PendingSealKindForTest,
                 operation_id: Uuid,
+                dispose_lapsed: bool,
             ) -> Result<Option<LockedPendingResetRequestGuard>, ResetRepositoryError> {
                 let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
                     .fetch_one(&mut **transaction)
@@ -237,6 +238,17 @@ mod chat_protocol {
                     PendingSealKindForTest::Request => ResetPreparationKind::Request,
                     PendingSealKindForTest::Activation => ResetPreparationKind::Activation,
                 };
+                // The production selector: a Request against a LAPSED row
+                // disposes of it against the row's recorded authority;
+                // everything else keeps the strict live seal.
+                let binding = if dispose_lapsed
+                    && matches!(kind, ResetPreparationKind::Request)
+                    && trusted_instant >= row.expires_at
+                {
+                    ResetAuthorityBinding::RecordedForDisposal
+                } else {
+                    ResetAuthorityBinding::Live
+                };
                 seal_pending_reset(
                     row,
                     &transaction_id,
@@ -246,6 +258,7 @@ mod chat_protocol {
                     head_digest,
                     kind,
                     operation_id,
+                    binding,
                 )
                 .map(Some)
             }
@@ -833,6 +846,21 @@ async fn seal_as(
     actor: &ResetActor,
     kind: PendingSealKindForTest,
 ) -> Result<bool, ResetRepositoryError> {
+    seal_as_at(fixture, actor, kind, Duration::zero(), true).await
+}
+
+/// `after` moves the probe's trusted instant forward. The row's `received_at` /
+/// `expires_at` cannot be backdated instead: `reset_requests_identity_immutable`
+/// makes every column except `status`, `terminal_transition_id` and
+/// `terminal_at` immutable, so the only honest way to observe a LAPSED row is to
+/// ask later.
+async fn seal_as_at(
+    fixture: &PrivateGenuinePendingResetGraph,
+    actor: &ResetActor,
+    kind: PendingSealKindForTest,
+    after: Duration,
+    dispose_lapsed: bool,
+) -> Result<bool, ResetRepositoryError> {
     // `parse_reset_authority` derives a Request's operation id FROM its
     // `resetRequestId` and requires `idempotencyKey` to equal it, so a Request
     // carries one fresh id in both slots -- it is a NEW request, which is
@@ -850,7 +878,7 @@ async fn seal_as(
         ),
     };
     let mut tx = fixture.pool.begin().await.expect("begin seal probe");
-    let at = trusted_now(&mut tx).await;
+    let at = trusted_now(&mut tx).await + after;
     let mutation = signed_reset(
         actor,
         mutation_kind,
@@ -866,6 +894,7 @@ async fn seal_as(
         fixture.conversation_id,
         kind,
         operation_id,
+        dispose_lapsed,
     )
     .await;
     tx.rollback().await.expect("probe leaves no residue");
@@ -1070,4 +1099,258 @@ async fn a_wedged_row_survives_untouched_and_unexpired() {
         expires_at > at,
         "the wedged row is live, not expired: {expires_at} <= {at}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FIX (a) — lapsed-row disposal bound to RECORDED authority.
+//
+// These are desired-state assertions, unlike the wedge documentation above.
+// Note what they do NOT claim: the six cases above still pass unchanged,
+// because they use a LIVE row. Fix (a) time-bounds the wedge to the row's 24h
+// expiry; only fix (b) prevents the outage.
+// ---------------------------------------------------------------------------
+
+/// The lapsed row a revoked requester left behind is disposable by a DIFFERENT
+/// principal. This is the rescue that finding 3 made unreachable.
+#[tokio::test]
+async fn lapsed_row_from_a_revoked_requester_is_disposable_by_another_principal() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let other = ResetActor::other(&fixture).await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    revoke_requester_device(&fixture, at).await;
+
+    let lapsed = Duration::hours(24) + Duration::minutes(1);
+
+    // RED, kept in the same test so the fix cannot be mistaken for the row
+    // having been disposable all along: with the live seal it is still wedged
+    // even once lapsed.
+    let wedged = seal_as_at(
+        &fixture,
+        &other,
+        PendingSealKindForTest::Request,
+        lapsed,
+        false,
+    )
+    .await
+    .expect_err("the live seal wedges a lapsed row too");
+    assert!(matches!(wedged, ResetRepositoryError::DeviceOrKeyDrift));
+
+    let sealed = seal_as_at(
+        &fixture,
+        &other,
+        PendingSealKindForTest::Request,
+        lapsed,
+        true,
+    )
+    .await
+    .expect("recorded-authority disposal seals the lapsed row");
+    assert!(sealed);
+}
+
+/// Same for the rebind trigger.
+#[tokio::test]
+async fn lapsed_row_from_a_rebound_requester_is_disposable_by_another_principal() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    rebind_requester_auth_generation(&fixture, at).await;
+    let other = ResetActor::other(&fixture).await;
+
+    let sealed = seal_as_at(
+        &fixture,
+        &other,
+        PendingSealKindForTest::Request,
+        Duration::hours(24) + Duration::minutes(1),
+        true,
+    )
+    .await
+    .expect("recorded-authority disposal seals the lapsed row");
+    assert!(sealed);
+}
+
+/// THE HARD CONSTRAINT. `activateReset` keeps FULL strict live-authority
+/// verification: a drifted requester still fails, lapsed or not, and the
+/// relaxation is unreachable from the activation path.
+#[tokio::test]
+async fn activation_keeps_full_strict_live_authority_even_on_a_lapsed_row() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let other = ResetActor::other(&fixture).await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    rebind_requester_auth_generation(&fixture, at).await;
+
+    for after in [Duration::zero(), Duration::hours(24) + Duration::minutes(1)] {
+        let error = seal_as_at(
+            &fixture,
+            &other,
+            PendingSealKindForTest::Activation,
+            after,
+            true,
+        )
+        .await
+        .expect_err("activation never relaxes the live seal");
+        assert!(
+            matches!(error, ResetRepositoryError::DeviceOrKeyDrift),
+            "activation must still drift after {after}, observed {error:?}"
+        );
+    }
+}
+
+/// Disposal does not weaken what the row must prove about ITSELF.
+///
+/// This is asserted structurally rather than by corrupting a stored value:
+/// `chat.device_keys.signing_public_key` is immutable at the schema level
+/// (`enforce_immutable_identity`), as are every column of `chat.reset_requests`
+/// except the three terminal ones — so the byte binding cannot be broken from a
+/// test at all, which is itself part of why it is safe to relax the live check.
+/// What remains falsifiable is the SHAPE of the relaxation, and that is what is
+/// pinned here: exactly one comparison is skipped, and everything that binds the
+/// row to its own signed bytes runs unconditionally.
+#[test]
+fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
+    let source = include_str!("../src/chat_protocol/repository/reset.rs");
+
+    // Positive controls.
+    assert!(source.contains("fn seal_pending_reset("));
+    assert!(source.contains("enum ResetAuthorityBinding"));
+
+    // The relaxation is applied in EXACTLY one place, and it guards exactly the
+    // live-device comparison.
+    assert_eq!(
+        source
+            .matches("binding == ResetAuthorityBinding::Live")
+            .count(),
+        1,
+        "the live-authority relaxation must have exactly one site"
+    );
+
+    let seal = &source[source
+        .find("fn seal_pending_reset(")
+        .expect("seal_pending_reset is present")..];
+    let seal = &seal[..seal
+        .find("\nasync fn cas_terminalize(")
+        .expect("seal_pending_reset is bounded by cas_terminalize")];
+
+    // Everything that binds the row to its own immutable bytes is unconditional:
+    // it appears in the sealed body with no binding mentioned between the
+    // relaxation site and it.
+    let relaxation = seal
+        .find("binding == ResetAuthorityBinding::Live")
+        .expect("relaxation is inside the seal");
+    for unconditional in [
+        "validate_requester_public_key_hash(requester_public_key",
+        "decode_and_verify_signed_mutation(&row.signed_request_bytes",
+        "parse_reset_authority(&verified, ResetPreparationKind::Request)",
+    ] {
+        let at = seal
+            .find(unconditional)
+            .unwrap_or_else(|| panic!("{unconditional} must still run under disposal"));
+        assert!(
+            at > relaxation,
+            "{unconditional} must run after the relaxation site"
+        );
+        assert!(
+            !seal[relaxation..at].contains("ResetAuthorityBinding::RecordedForDisposal"),
+            "{unconditional} must not be gated on the disposal binding"
+        );
+    }
+
+    // A disposal binding can mint EXACTLY the expiry terminal.
+    assert!(
+        source.contains("(ResetAuthorityBinding::RecordedForDisposal, _) => {"),
+        "every non-Request disposal shape must be rejected"
+    );
+    assert_eq!(
+        source
+            .matches("ResetAuthorityBinding::RecordedForDisposal")
+            .count(),
+        3,
+        "disposal is named at exactly the two guarded match arms and the one selector"
+    );
+
+    // The selector never admits an Activation.
+    assert!(
+        source.contains("matches!(parsed.kind, ResetPreparationKind::Request)\n                && trusted_instant >= row.expires_at"),
+        "disposal is selected only for a Request against a lapsed row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ENDPOINT LEVEL — through the production `requestReset` facade.
+//
+// The child-module probe above selects the authority binding itself, so on its
+// own it proves only that `seal_pending_reset` ACCEPTS a disposal binding. These
+// two go through `prepare_reset_request_authority`, which means production picks
+// the binding. They are a matched pair: same conversation shape, same drifted
+// requester, same caller — only the row's age differs.
+// ---------------------------------------------------------------------------
+
+async fn request_reset_through_the_facade(
+    fixture: &PrivateGenuinePendingResetGraph,
+    actor: &ResetActor,
+    after: Duration,
+) -> Result<String, ResetRepositoryError> {
+    let mut tx = fixture.pool.begin().await.expect("begin facade request");
+    let at = trusted_now(&mut tx).await + after;
+    let fresh = Uuid::new_v4();
+    let mutation = signed_reset(
+        actor,
+        SignedMutationKind::ResetRequest,
+        fresh,
+        fresh,
+        &fixture.prior,
+        at,
+    );
+    let prelude = prelude(&mut tx, actor, at, &mutation).await;
+    let outcome = async {
+        let authority = reset::prepare_reset_request_authority(&mut tx, prelude, &mutation).await?;
+        reset::expire_pending_reset_for_replacement(&mut tx, authority).await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+                .bind(fixture.reset_request_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        Ok(status)
+    }
+    .await;
+    tx.rollback().await.expect("facade probe leaves no residue");
+    outcome
+}
+
+/// WEDGE, at the endpoint. While the row is LIVE, the drifted requester still
+/// blocks `requestReset` for a different principal. Fix (a) deliberately does
+/// not change this — only fix (b) will.
+#[tokio::test]
+async fn endpoint_request_reset_is_still_wedged_while_the_row_is_live() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let other = ResetActor::other(&fixture).await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    revoke_requester_device(&fixture, at).await;
+
+    let error = request_reset_through_the_facade(&fixture, &other, Duration::zero())
+        .await
+        .expect_err("a live wedged row still blocks the endpoint");
+    assert!(
+        matches!(error, ResetRepositoryError::DeviceOrKeyDrift),
+        "observed {error:?}"
+    );
+}
+
+/// FIXED, at the endpoint. Once the row lapses, the documented rescue is
+/// reachable again and actually CLEARS the row: production selects the
+/// recorded-authority binding, the disposition classifies `ExpiredReplacement`,
+/// and the durable status becomes `expired`.
+#[tokio::test]
+async fn endpoint_request_reset_disposes_of_a_wedged_lapsed_row() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let other = ResetActor::other(&fixture).await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    revoke_requester_device(&fixture, at).await;
+
+    let status = request_reset_through_the_facade(
+        &fixture,
+        &other,
+        Duration::hours(24) + Duration::minutes(1),
+    )
+    .await
+    .expect("the documented rescue is reachable once the row lapses");
+    assert_eq!(status, "expired");
 }

@@ -2290,16 +2290,38 @@ async fn prepare_reset_attempt(
     let pending_row = load_locked_pending_row(transaction, conversation_id).await?;
     let pending = match pending_row {
         None => None,
-        Some(row) => Some(seal_pending_reset(
-            row,
-            &transaction_id,
-            trusted_instant,
-            scope,
-            head_coordinate,
-            head_digest,
-            parsed.kind,
-            parsed.operation_id,
-        )?),
+        Some(row) => {
+            // Finding 3. `load_locked_pending_row` selects by conversation_id
+            // ALONE, and this seal used to re-verify the ORIGINAL requester's
+            // LIVE device unconditionally. So once that requester was revoked or
+            // rebound, the row became unsealable for EVERY principal — including
+            // through the `requestReset` arm that exists to classify a lapsed row
+            // `ExpiredReplacement` and clear it. The documented rescue was
+            // unreachable and the conversation lost reset capability outright.
+            //
+            // A LAPSED row is therefore disposed of against the authority the row
+            // RECORDED, re-verified below over its own immutable signed bytes.
+            // `Activation` is deliberately absent from this condition:
+            // `activateReset` keeps full strict live-authority verification.
+            let binding = if matches!(parsed.kind, ResetPreparationKind::Request)
+                && trusted_instant >= row.expires_at
+            {
+                ResetAuthorityBinding::RecordedForDisposal
+            } else {
+                ResetAuthorityBinding::Live
+            };
+            Some(seal_pending_reset(
+                row,
+                &transaction_id,
+                trusted_instant,
+                scope,
+                head_coordinate,
+                head_digest,
+                parsed.kind,
+                parsed.operation_id,
+                binding,
+            )?)
+        }
     };
 
     Ok(PreparedResetAttempt {
@@ -2783,6 +2805,24 @@ async fn load_locked_pending_row(
     .await?)
 }
 
+/// Which authority a pending row is sealed AGAINST.
+///
+/// `Live` is the strict rule both endpoints have always used: the ORIGINAL
+/// requester's device and key must still be active, unrevoked, and at the exact
+/// generation the row recorded.
+///
+/// `RecordedForDisposal` exists only so a LAPSED row can be disposed of. It
+/// binds to the authority the row itself RECORDED and to its immutable signed
+/// bytes — every structural check, the coordinate match, the transcript digest,
+/// the recorded public-key hash and a full re-verification of the signature
+/// still run — and skips ONLY the live-device comparison. It authorizes exactly
+/// one terminal, `Expired`. `activateReset` never uses it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetAuthorityBinding {
+    Live,
+    RecordedForDisposal,
+}
+
 fn seal_pending_reset(
     row: PendingResetRow,
     transaction_id: &str,
@@ -2792,6 +2832,7 @@ fn seal_pending_reset(
     head_digest: [u8; 32],
     preparation_kind: ResetPreparationKind,
     operation_id: Uuid,
+    binding: ResetAuthorityBinding,
 ) -> Result<LockedPendingResetRequestGuard, ResetRepositoryError> {
     if row.status != "pending"
         || row.terminal_transition_id.is_some()
@@ -2837,11 +2878,17 @@ fn seal_pending_reset(
                 && candidate.enrollment_auth_generation() == row.requester_auth_generation
         })
         .ok_or(ResetRepositoryError::MissingDeviceKey)?;
-    if device.auth_generation() != row.requester_auth_generation
-        || key.enrollment_auth_generation() != row.requester_auth_generation
-        || device.status() != "active"
-        || device.revoked_at().is_some()
-        || key.revoked_at().is_some()
+    // Finding 3: this comparison is what made a pending row unsealable — and so
+    // the whole conversation unresettable — once its requester was revoked or
+    // rebound. It stays exactly as strict for every live use, including all of
+    // `activateReset`; only lapsed-row disposal is exempt, and that path binds
+    // to the recorded authority re-verified below instead.
+    if binding == ResetAuthorityBinding::Live
+        && (device.auth_generation() != row.requester_auth_generation
+            || key.enrollment_auth_generation() != row.requester_auth_generation
+            || device.status() != "active"
+            || device.revoked_at().is_some()
+            || key.revoked_at().is_some())
     {
         return Err(ResetRepositoryError::DeviceOrKeyDrift);
     }
@@ -2902,14 +2949,32 @@ fn seal_pending_reset(
         key.revoked_at(),
     );
     let immutable_row_digest = reset_immutable_row_digest(&row, &prior);
-    let authorized_terminal = match preparation_kind {
-        ResetPreparationKind::Request if trusted_instant >= row.expires_at => {
+    let authorized_terminal = match (binding, preparation_kind) {
+        // Defence in depth: a disposal binding can mint EXACTLY the expiry
+        // terminal, and only for a row that has genuinely lapsed. It can never
+        // reach `Consumed` (an activation) or `Stale`, so relaxing the live
+        // check cannot widen what the guard is able to authorize.
+        (ResetAuthorityBinding::RecordedForDisposal, ResetPreparationKind::Request)
+            if trusted_instant >= row.expires_at =>
+        {
             SealedResetTerminal::Expired
         }
-        ResetPreparationKind::Request => SealedResetTerminal::Unavailable,
-        ResetPreparationKind::Activation => SealedResetTerminal::Consumed {
-            transition_id: operation_id,
-        },
+        (ResetAuthorityBinding::RecordedForDisposal, _) => {
+            return Err(ResetRepositoryError::GuardInvariant);
+        }
+        (ResetAuthorityBinding::Live, ResetPreparationKind::Request)
+            if trusted_instant >= row.expires_at =>
+        {
+            SealedResetTerminal::Expired
+        }
+        (ResetAuthorityBinding::Live, ResetPreparationKind::Request) => {
+            SealedResetTerminal::Unavailable
+        }
+        (ResetAuthorityBinding::Live, ResetPreparationKind::Activation) => {
+            SealedResetTerminal::Consumed {
+                transition_id: operation_id,
+            }
+        }
     };
     let guard_digest = locked_pending_reset_digest(
         transaction_id,
