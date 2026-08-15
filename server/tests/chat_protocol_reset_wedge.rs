@@ -651,8 +651,37 @@ fn revocation_instant(fixture: &PrivateGenuinePendingResetGraph) -> DateTime<Utc
 }
 
 async fn revoke_requester_device(fixture: &PrivateGenuinePendingResetGraph, at: DateTime<Utc>) {
+    revoke_requester_device_inner(fixture, at, RevocationDrive::ProductionExecutor).await;
+}
+
+/// Which layer the revocation trigger drives.
+///
+/// `ProductionExecutor` is the honest one: it runs
+/// `apply_device_revocation_batch_prefix`, the stage fix (b) lives in, so a
+/// desired-state assertion below is not vacuous.
+///
+/// `SchemaWritersOnly` exists for the two migration shape probes. They need a
+/// revocation row to point a terminal at while the reset row is STILL PENDING,
+/// which the production path no longer leaves behind — it terminalizes the row
+/// itself. It asserts nothing about behaviour; it only stages rows.
+#[derive(Clone, Copy, PartialEq)]
+enum RevocationDrive {
+    ProductionExecutor,
+    SchemaWritersOnly,
+}
+
+async fn revoke_requester_device_inner(
+    fixture: &PrivateGenuinePendingResetGraph,
+    at: DateTime<Utc>,
+    drive: RevocationDrive,
+) {
     use chat_protocol::repository::transition::{
         cas_registration_revoke, insert_device_revocation, NewDeviceRevocation, RegistrationRevoke,
+    };
+    use chat_protocol::state_machine::{
+        apply_device_revocation_batch_unscoped_for_test, DeviceIdentity,
+        DeviceRevocationBatchPersistencePlan, DeviceRevocationEvidence, PrincipalId,
+        RevocationTargetCasBinding, ServerTimestamp,
     };
 
     let revocation_id = Uuid::new_v4();
@@ -745,39 +774,90 @@ async fn revoke_requester_device(fixture: &PrivateGenuinePendingResetGraph, at: 
     .execute(&mut *tx)
     .await
     .expect("seed the caller-owned revokeDevice receipt");
-    insert_device_revocation(
-        &mut tx,
-        &NewDeviceRevocation {
-            revocation_id,
-            actor_did: fixture.requester_did.clone(),
-            actor_device_id: fixture.requester_device_id,
-            actor_key_id: fixture.requester_key_id.clone(),
-            actor_auth_generation: fixture.requester_auth_generation,
-            target_did: fixture.requester_did.clone(),
-            target_device_id: fixture.requester_device_id,
-            target_auth_generation: fixture.requester_auth_generation,
-            accepted_request_bytes,
-            signing_transcript_bytes,
-            request_digest,
-            signature,
-            signed_at: at,
-            accepted_at: at,
-        },
-    )
-    .await
-    .expect("insert the production revocation row");
-    cas_registration_revoke(
-        &mut tx,
-        &RegistrationRevoke {
-            target_did: fixture.requester_did.clone(),
-            target_device_id: fixture.requester_device_id,
-            expected_auth_generation: fixture.requester_auth_generation,
-            revocation_id,
-            revoked_at: at,
-        },
-    )
-    .await
-    .expect("production registration revoke");
+    match drive {
+        // Drive the executor stage the fix lives in, NOT the two writers
+        // beneath it. The batch carries no conversations, so this runs exactly
+        // the device-global prefix.
+        RevocationDrive::ProductionExecutor => {
+            let requester_identity = DeviceIdentity::new(
+                PrincipalId::new(fixture.requester_did.as_bytes().to_vec())
+                    .expect("requester principal id"),
+                *fixture.requester_device_id.as_bytes(),
+            )
+            .expect("requester device identity");
+            let accepted_st = ServerTimestamp::from_unix_millis_for_test(at.timestamp_millis())
+                .expect("revocation instant is a server timestamp");
+            // The device key id is base64url(sha256(pubkey)); its raw 32 bytes
+            // ARE the revocation actor_key_id, which the batch re-encodes back.
+            let actor_key_id: [u8; 32] = Sha256::digest(&fixture.requester_public_key).into();
+            let evidence = DeviceRevocationEvidence::for_test(
+                *revocation_id.as_bytes(),
+                requester_identity.clone(),
+                requester_identity.clone(),
+                actor_key_id,
+                fixture.requester_auth_generation as u64,
+                fixture.requester_auth_generation as u64,
+                accepted_st,
+                accepted_st,
+                request_digest
+                    .as_slice()
+                    .try_into()
+                    .expect("32-byte request digest"),
+                signature.as_slice().try_into().expect("64-byte signature"),
+                accepted_request_bytes,
+                signing_transcript_bytes,
+            );
+            let target_cas = RevocationTargetCasBinding::for_test(
+                requester_identity,
+                fixture.requester_auth_generation as u64,
+                accepted_st,
+            );
+            let batch = DeviceRevocationBatchPersistencePlan::for_test(
+                evidence,
+                target_cas,
+                vec![],
+                vec![],
+            );
+            apply_device_revocation_batch_unscoped_for_test(&mut tx, &batch, &[])
+                .await
+                .expect("production device-revocation batch prefix");
+        }
+        RevocationDrive::SchemaWritersOnly => {
+            insert_device_revocation(
+                &mut tx,
+                &NewDeviceRevocation {
+                    revocation_id,
+                    actor_did: fixture.requester_did.clone(),
+                    actor_device_id: fixture.requester_device_id,
+                    actor_key_id: fixture.requester_key_id.clone(),
+                    actor_auth_generation: fixture.requester_auth_generation,
+                    target_did: fixture.requester_did.clone(),
+                    target_device_id: fixture.requester_device_id,
+                    target_auth_generation: fixture.requester_auth_generation,
+                    accepted_request_bytes,
+                    signing_transcript_bytes,
+                    request_digest,
+                    signature,
+                    signed_at: at,
+                    accepted_at: at,
+                },
+            )
+            .await
+            .expect("insert the production revocation row");
+            cas_registration_revoke(
+                &mut tx,
+                &RegistrationRevoke {
+                    target_did: fixture.requester_did.clone(),
+                    target_device_id: fixture.requester_device_id,
+                    expected_auth_generation: fixture.requester_auth_generation,
+                    revocation_id,
+                    revoked_at: at,
+                },
+            )
+            .await
+            .expect("production registration revoke");
+        }
+    }
     tx.commit().await.expect("commit the revocation");
 
     let (status, revoked): (String, bool) = sqlx::query_as(
@@ -943,28 +1023,57 @@ async fn wedge_control_undrifted_requester_seals_for_both_kinds_and_either_princ
     }
 }
 
-/// TRIGGER 1, revocation. Both preparation kinds fail, for the principal that
-/// did NOT request the reset. The `Request` failure is the load-bearing one:
-/// that arm is the documented rescue that would classify the row
-/// `ExpiredReplacement` and clear it, and it never reaches that classification.
+/// TRIGGER 1, revocation — DESIRED STATE after fix (b).
+///
+/// This used to assert `DeviceOrKeyDrift` for both kinds. It no longer can:
+/// revoking the requester terminalizes its pending row inside
+/// `apply_device_revocation_batch_prefix`, so there is no pending row left for
+/// the seal to wedge on. Both kinds now find nothing and succeed vacuously,
+/// which is exactly the outage being gone.
 #[tokio::test]
-async fn wedge_revoked_requester_drifts_the_seal_for_both_kinds() {
+async fn revocation_terminalizes_the_pending_row_so_no_seal_is_wedged() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
     let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
+    let (status, terminal_revocation_id, terminal_at): (
+        String,
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
+        r#"SELECT status,terminal_revocation_id,terminal_at
+                 FROM chat.reset_requests WHERE reset_request_id=$1"#,
+    )
+    .bind(fixture.reset_request_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the reset row survives as a terminalized row");
+    assert_eq!(status, "revoked");
+    assert_eq!(terminal_at, Some(at));
+
+    // The terminal is bound to the revocation that actually targeted this
+    // requester — the composite FK's guarantee, read back.
+    let bound_to_its_own_revocation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM chat.device_revocations \
+         WHERE revocation_id=$1 AND target_did=$2 AND target_device_id=$3)",
+    )
+    .bind(terminal_revocation_id.expect("a revoked row carries its revocation"))
+    .bind(&fixture.requester_did)
+    .bind(fixture.requester_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read the bound revocation");
+    assert!(bound_to_its_own_revocation);
+
     for kind in [
         PendingSealKindForTest::Request,
         PendingSealKindForTest::Activation,
     ] {
-        let error = seal_as(&fixture, &other, kind)
+        let sealed = seal_as(&fixture, &other, kind)
             .await
-            .expect_err("a revoked requester wedges the seal");
-        assert!(
-            matches!(error, ResetRepositoryError::DeviceOrKeyDrift),
-            "expected DeviceOrKeyDrift as {kind:?}, observed {error:?}"
-        );
+            .unwrap_or_else(|error| panic!("no principal is wedged as {kind:?}: {error:?}"));
+        assert!(!sealed, "no pending row remains to seal as {kind:?}");
     }
 }
 
@@ -1021,15 +1130,17 @@ async fn wedge_blocks_the_original_requester_too() {
     assert!(matches!(error, ResetRepositoryError::DeviceOrKeyDrift));
 }
 
-/// "Nothing in the schedule clears the row."
+/// Who can clear a pending Reset row — DESIRED STATE after fix (b).
 ///
-/// The wedge is permanent only if no background path disposes of a pending
-/// Reset. This enumerates every production writer of `chat.reset_requests`
-/// instead of asserting an absence, and carries positive controls so a rename,
-/// a moved file, or a truncated read fails LOUDLY rather than reading as "no
-/// clearer exists".
+/// Originally "nothing in the schedule clears the row", which is what made the
+/// wedge permanent. Revocation now does, so the enumeration names BOTH terminal
+/// writers rather than asserting there is one. It still enumerates every
+/// production writer instead of asserting an absence, and still carries positive
+/// controls so a rename, a moved file, or a truncated read fails LOUDLY.
+///
+/// The scheduled sweep is still not one of them: expiry never gained a Reset arm.
 #[test]
-fn no_scheduled_path_can_clear_a_pending_reset_row() {
+fn exactly_two_writers_clear_a_pending_reset_row_and_revocation_is_one() {
     let reset = include_str!("../src/chat_protocol/repository/reset.rs");
     let transition = include_str!("../src/chat_protocol/repository/transition.rs");
     let sweep = include_str!("../src/chat_protocol/repository/expiry_sweep.rs");
@@ -1039,20 +1150,24 @@ fn no_scheduled_path_can_clear_a_pending_reset_row() {
     // path that stops resolving cannot masquerade as a clean absence.
     assert!(reset.contains("fn seal_pending_reset("));
     assert!(transition.contains("pub(crate) async fn terminalize_reset_request("));
+    assert!(
+        transition.contains("pub(crate) async fn terminalize_reset_requests_for_revoked_device(")
+    );
     assert!(sweep.contains("pub(crate) async fn trusted_sweep_instant("));
     assert!(executor.contains("transition::terminalize_reset_request("));
+    assert!(executor.contains("transition::terminalize_reset_requests_for_revoked_device("));
 
-    // Exactly two production statements move a pending row to a terminal
-    // status, and both sit BEHIND the seal.
+    // THREE production statements now move a pending row to a terminal status.
     assert_eq!(
         reset.matches("UPDATE chat.reset_requests").count(),
         1,
-        "reset.rs holds exactly one terminal writer (cas_terminalize)"
+        "reset.rs holds exactly one terminal writer (cas_terminalize), behind the seal"
     );
     assert_eq!(
         transition.matches("UPDATE chat.reset_requests").count(),
-        1,
-        "transition.rs holds exactly one terminal writer (terminalize_reset_request)"
+        2,
+        "transition.rs holds exactly two terminal writers: the seal-gated \
+         terminalize_reset_request, and the device-global revocation writer"
     );
     assert_eq!(
         reset
@@ -1060,6 +1175,31 @@ fn no_scheduled_path_can_clear_a_pending_reset_row() {
             .count(),
         1,
         "the locked terminal writer keeps its single caller, downstream of the seal"
+    );
+
+    // The revocation writer is NOT behind the seal — that is the whole point of
+    // fix (b) — and it is reached from the device-global revocation stage only.
+    assert_eq!(
+        executor
+            .matches("transition::terminalize_reset_requests_for_revoked_device(")
+            .count(),
+        1,
+        "the revocation writer has exactly one call site"
+    );
+    let prefix = executor
+        .split("async fn apply_device_revocation_batch_prefix(")
+        .nth(1)
+        .expect("positive control: the device-global revocation stage exists");
+    let revoke_registration = prefix
+        .find("cas_registration_revoke(transaction, &registration_revoke)")
+        .expect("positive control: the stage revokes the registration");
+    let terminalize = prefix
+        .find("transition::terminalize_reset_requests_for_revoked_device(")
+        .expect("the revocation writer sits inside the device-global stage");
+    assert!(
+        revoke_registration < terminalize,
+        "the reset terminal must be written AFTER the revocation and the revoked \
+         registration exist, or the deferred composite FK cannot resolve"
     );
 
     // The scheduled sweep never names the table at all: it sweeps welcome
@@ -1121,10 +1261,14 @@ async fn a_wedged_row_survives_untouched_and_unexpired() {
 // expiry; only fix (b) prevents the outage.
 // ---------------------------------------------------------------------------
 
-/// The lapsed row a revoked requester left behind is disposable by a DIFFERENT
-/// principal. This is the rescue that finding 3 made unreachable.
+/// A revoked requester never LEAVES a lapsed row to rescue — DESIRED STATE.
+///
+/// Fix (a) time-bounded this case to 24 hours; fix (b) removes it entirely,
+/// because the row is terminalized at revocation rather than surviving to lapse.
+/// The rebind twin below still exercises fix (a)'s disposal on the trigger that
+/// genuinely still produces a wedged row.
 #[tokio::test]
-async fn lapsed_row_from_a_revoked_requester_is_disposable_by_another_principal() {
+async fn a_revoked_requester_leaves_no_lapsed_row_to_rescue() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
     let at = revocation_instant(&fixture);
@@ -1132,30 +1276,32 @@ async fn lapsed_row_from_a_revoked_requester_is_disposable_by_another_principal(
 
     let lapsed = Duration::hours(24) + Duration::minutes(1);
 
-    // RED, kept in the same test so the fix cannot be mistaken for the row
-    // having been disposable all along: with the live seal it is still wedged
-    // even once lapsed.
-    let wedged = seal_as_at(
-        &fixture,
-        &other,
-        PendingSealKindForTest::Request,
-        lapsed,
-        false,
-    )
-    .await
-    .expect_err("the live seal wedges a lapsed row too");
-    assert!(matches!(wedged, ResetRepositoryError::DeviceOrKeyDrift));
+    // Neither binding wedges, because neither finds a pending row: not the
+    // strict live seal, and not the recorded-authority disposal.
+    for dispose_lapsed in [false, true] {
+        let sealed = seal_as_at(
+            &fixture,
+            &other,
+            PendingSealKindForTest::Request,
+            lapsed,
+            dispose_lapsed,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("a revoked requester leaves nothing wedged (dispose_lapsed={dispose_lapsed}): {error:?}")
+        });
+        assert!(!sealed);
+    }
 
-    let sealed = seal_as_at(
-        &fixture,
-        &other,
-        PendingSealKindForTest::Request,
-        lapsed,
-        true,
-    )
-    .await
-    .expect("recorded-authority disposal seals the lapsed row");
-    assert!(sealed);
+    // And the row is terminal at the revocation, NOT at expiry — a revocation
+    // must never be recorded as an ordinary lapse.
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+            .bind(fixture.reset_request_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("read the terminalized row");
+    assert_eq!(status, "revoked");
 }
 
 /// Same for the rebind trigger.
@@ -1294,6 +1440,45 @@ fn recorded_authority_disposal_still_binds_the_immutable_signed_bytes() {
 // requester, same caller — only the row's age differs.
 // ---------------------------------------------------------------------------
 
+/// Drive ONLY `prepare_reset_request_authority` — the chokepoint the wedge sat
+/// in. Returns the reset row's durable status afterwards.
+///
+/// The full facade helper below additionally calls
+/// `expire_pending_reset_for_replacement`, which production reaches only for the
+/// `ExpiredReplacement` disposition; forcing it against a row that is no longer
+/// pending would be probing a path the endpoint never takes.
+async fn prepare_reset_request_through_the_facade(
+    fixture: &PrivateGenuinePendingResetGraph,
+    actor: &ResetActor,
+    after: Duration,
+) -> Result<String, ResetRepositoryError> {
+    let mut tx = fixture.pool.begin().await.expect("begin facade prepare");
+    let at = trusted_now(&mut tx).await + after;
+    let fresh = Uuid::new_v4();
+    let mutation = signed_reset(
+        actor,
+        SignedMutationKind::ResetRequest,
+        fresh,
+        fresh,
+        &fixture.prior,
+        at,
+    );
+    let prelude = prelude(&mut tx, actor, at, &mutation).await;
+    let outcome = async {
+        let _authority =
+            reset::prepare_reset_request_authority(&mut tx, prelude, &mutation).await?;
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM chat.reset_requests WHERE reset_request_id=$1")
+                .bind(fixture.reset_request_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        Ok(status)
+    }
+    .await;
+    tx.rollback().await.expect("facade probe leaves no residue");
+    outcome
+}
+
 async fn request_reset_through_the_facade(
     fixture: &PrivateGenuinePendingResetGraph,
     actor: &ResetActor,
@@ -1326,35 +1511,66 @@ async fn request_reset_through_the_facade(
     outcome
 }
 
-/// WEDGE, at the endpoint. While the row is LIVE, the drifted requester still
-/// blocks `requestReset` for a different principal. Fix (a) deliberately does
-/// not change this — only fix (b) will.
+/// FIXED, at the endpoint, IMMEDIATELY — the load-bearing desired-state case.
+///
+/// This is the assertion the whole finding turns on. It used to require
+/// `DeviceOrKeyDrift`: a different principal could not `requestReset` at all
+/// while the revoked requester's row was live. Now the row is already
+/// terminalized, so the facade goes straight through with no waiting period.
 #[tokio::test]
-async fn endpoint_request_reset_is_still_wedged_while_the_row_is_live() {
+async fn endpoint_request_reset_is_no_longer_wedged_while_the_row_is_live() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
     let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
-    let error = request_reset_through_the_facade(&fixture, &other, Duration::zero())
+    let status = prepare_reset_request_through_the_facade(&fixture, &other, Duration::zero())
         .await
-        .expect_err("a live wedged row still blocks the endpoint");
+        .expect("a different principal can request a reset with no waiting period");
+    // Terminalized by the revocation, not re-classified as an ordinary expiry.
+    assert_eq!(status, "revoked");
+}
+
+/// The same at a LAPSED instant. Fix (a)'s disposal route is not needed for the
+/// revocation trigger any more — there is nothing left to dispose of — and the
+/// row must still read as revoked rather than being rewritten to `expired`.
+#[tokio::test]
+async fn endpoint_request_reset_leaves_a_revoked_row_revoked_once_lapsed() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let other = ResetActor::other(&fixture).await;
+    let at = revocation_instant(&fixture);
+    revoke_requester_device(&fixture, at).await;
+
+    let status = prepare_reset_request_through_the_facade(
+        &fixture,
+        &other,
+        Duration::hours(24) + Duration::minutes(1),
+    )
+    .await
+    .expect("the endpoint is reachable once the row lapses");
+    assert_eq!(status, "revoked");
+}
+
+/// Fix (a) still has an endpoint-level proof, on the trigger that STILL leaves a
+/// wedged row: a rebound requester. This also closes the facade-layer gap the
+/// fifth addendum recorded — the lapsed-row endpoint case had never been sealed
+/// at this layer.
+#[tokio::test]
+async fn endpoint_request_reset_disposes_of_a_lapsed_row_from_a_rebound_requester() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let at = executor_seed::clock_now(&fixture.pool).await;
+    rebind_requester_auth_generation(&fixture, at).await;
+    let other = ResetActor::other(&fixture).await;
+
+    // Still wedged while LIVE — fix (a) is deliberately expiry-bounded, and
+    // rebind is not a revocation, so fix (b) does not reach it.
+    let error = prepare_reset_request_through_the_facade(&fixture, &other, Duration::zero())
+        .await
+        .expect_err("a live rebound-requester row still blocks the endpoint");
     assert!(
         matches!(error, ResetRepositoryError::DeviceOrKeyDrift),
         "observed {error:?}"
     );
-}
-
-/// FIXED, at the endpoint. Once the row lapses, the documented rescue is
-/// reachable again and actually CLEARS the row: production selects the
-/// recorded-authority binding, the disposition classifies `ExpiredReplacement`,
-/// and the durable status becomes `expired`.
-#[tokio::test]
-async fn endpoint_request_reset_disposes_of_a_wedged_lapsed_row() {
-    let fixture = private_genuine_pending_reset_graph().await;
-    let other = ResetActor::other(&fixture).await;
-    let at = revocation_instant(&fixture);
-    revoke_requester_device(&fixture, at).await;
 
     let status = request_reset_through_the_facade(
         &fixture,
@@ -1408,7 +1624,9 @@ async fn try_terminal_shape(
 async fn revocation_terminal_shape_is_admitted_and_old_shapes_still_bind() {
     let fixture = private_genuine_pending_reset_graph().await;
     let at = revocation_instant(&fixture);
-    revoke_requester_device(&fixture, at).await;
+    // Schema-level only: this probes what the CHECK admits, so it needs the
+    // reset row STILL PENDING to write shapes onto.
+    revoke_requester_device_inner(&fixture, at, RevocationDrive::SchemaWritersOnly).await;
 
     let (revocation_id, accepted_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
         "SELECT revocation_id,accepted_at FROM chat.device_revocations \
@@ -1512,7 +1730,9 @@ async fn revocation_terminal_shape_is_admitted_and_old_shapes_still_bind() {
 async fn a_reset_row_cannot_be_terminalized_by_a_foreign_revocation() {
     let fixture = private_genuine_pending_reset_graph().await;
     let at = revocation_instant(&fixture);
-    revoke_requester_device(&fixture, at).await;
+    // Schema-level only: the FK probe writes its own terminal, so the row must
+    // still be pending rather than already terminalized by the executor.
+    revoke_requester_device_inner(&fixture, at, RevocationDrive::SchemaWritersOnly).await;
 
     let mut tx = fixture
         .pool

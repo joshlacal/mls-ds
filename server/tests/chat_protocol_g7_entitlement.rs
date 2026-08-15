@@ -1832,8 +1832,14 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
     "6428038d04be0ab28bd9743cd146690dbfe8d708293739cff738ed1aa3d1b1f1";
+// Re-pinned 2026-08-15 for finding 3 fix (b): `load_reset_request_hydration_rows`
+// admits the ratified `revoked` status and selects `terminal_revocation_id`,
+// `select_reset_terminal` gained the revocation arm (and now checks the
+// revocation column on every arm, mirroring the DB shape check), and
+// `graph_digest_reset` encodes the fifth status. Taken from POST-rustfmt bytes.
+// An unexplained mismatch here still means core.rs drifted.
 const SEALED_REPOSITORY_CORE_SHA256: &str =
-    "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
+    "f118cc9c303cb013e20b8752a6f36edb250ec744cac39215fe52212fc5b74258";
 
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {

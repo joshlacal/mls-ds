@@ -5379,6 +5379,16 @@ async fn apply_device_revocation_batch_prefix(
 
     insert_device_revocation(transaction, &revocation_row).await?;
     cas_registration_revoke(transaction, &registration_revoke).await?;
+    // After the revocation row and the revoked registration both exist, so the
+    // deferred composite FK into chat.device_revocations resolves at COMMIT.
+    transition::terminalize_reset_requests_for_revoked_device(
+        transaction,
+        &registration_revoke.target_did,
+        registration_revoke.target_device_id,
+        revocation_id,
+        accepted_at,
+    )
+    .await?;
     for binding in plan.revoked_packages() {
         if binding.conversation_id().is_none() {
             transition::cas_key_package_status(

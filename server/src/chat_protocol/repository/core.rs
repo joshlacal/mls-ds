@@ -8677,6 +8677,7 @@ pub(crate) enum ResetLeaveHydrationError {
 pub(crate) struct ResetTerminalColumns {
     pub(crate) status: &'static str,
     pub(crate) terminal_transition_id: Option<Uuid>,
+    pub(crate) terminal_revocation_id: Option<Uuid>,
     pub(crate) terminal_at: Option<DateTime<Utc>>,
     pub(crate) expires_at: DateTime<Utc>,
 }
@@ -8695,36 +8696,69 @@ pub(crate) enum ResetTerminalSelection {
     Expiry {
         terminal_at: DateTime<Utc>,
     },
+    /// The requester's own device was revoked while the request was pending.
+    /// Carries the revocation rather than a transition; the composite FK on
+    /// `chat.reset_requests` guarantees the revocation targets this requester.
+    Revocation {
+        revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
 }
 
 pub(crate) fn select_reset_terminal(
     columns: ResetTerminalColumns,
 ) -> Result<ResetTerminalSelection, ResetLeaveHydrationError> {
+    // Each arm mirrors the corresponding `reset_requests_terminal_shape_check`
+    // arm, INCLUDING the revocation column: a shape the database would refuse
+    // must not hydrate here either.
     match columns.status {
-        "pending" if columns.terminal_transition_id.is_none() && columns.terminal_at.is_none() => {
+        "pending"
+            if columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_none()
+                && columns.terminal_at.is_none() =>
+        {
             Ok(ResetTerminalSelection::Pending)
         }
         "expired"
             if columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_none()
                 && columns.terminal_at == Some(columns.expires_at) =>
         {
             Ok(ResetTerminalSelection::Expiry {
                 terminal_at: columns.expires_at,
             })
         }
-        "stale" if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() => {
+        "stale"
+            if columns.terminal_transition_id.is_some()
+                && columns.terminal_revocation_id.is_none()
+                && columns.terminal_at.is_some() =>
+        {
             Ok(ResetTerminalSelection::StaleTransition {
                 transition_id: columns.terminal_transition_id.expect("shape checked"),
                 terminal_at: columns.terminal_at.expect("shape checked"),
             })
         }
-        "consumed" if columns.terminal_transition_id.is_some() && columns.terminal_at.is_some() => {
+        "consumed"
+            if columns.terminal_transition_id.is_some()
+                && columns.terminal_revocation_id.is_none()
+                && columns.terminal_at.is_some() =>
+        {
             Ok(ResetTerminalSelection::ConsumedTransition {
                 transition_id: columns.terminal_transition_id.expect("shape checked"),
                 terminal_at: columns.terminal_at.expect("shape checked"),
             })
         }
-        "pending" | "stale" | "consumed" | "expired" => {
+        "revoked"
+            if columns.terminal_transition_id.is_none()
+                && columns.terminal_revocation_id.is_some()
+                && columns.terminal_at.is_some() =>
+        {
+            Ok(ResetTerminalSelection::Revocation {
+                revocation_id: columns.terminal_revocation_id.expect("shape checked"),
+                terminal_at: columns.terminal_at.expect("shape checked"),
+            })
+        }
+        "pending" | "stale" | "consumed" | "expired" | "revoked" => {
             Err(ResetLeaveHydrationError::TerminalMismatch)
         }
         _ => Err(ResetLeaveHydrationError::OutOfDomain),
@@ -9001,25 +9035,31 @@ pub(crate) async fn load_reset_request_hydration_rows(
 ) -> Result<Vec<ResetRequestHydrationRow>, ResetLeaveHydrationError> {
     let conversation_bytes = *conversation_id.as_bytes();
 
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        Uuid,
-        String,
-        Uuid,
-        i64,
-        i64,
-        Vec<u8>,
-        i64,
-        Vec<u8>,
-        Vec<u8>,
-        String,
-        Vec<u8>,
-        Vec<u8>,
-        DateTime<Utc>,
-        DateTime<Utc>,
-        Option<Uuid>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
+    // A named row rather than a tuple: with `terminal_revocation_id` this
+    // projection is 17 columns, and sqlx implements `FromRow` for tuples only
+    // up to 16.
+    #[derive(sqlx::FromRow)]
+    struct ResetRequestHydrationQueryRow {
+        reset_request_id: Uuid,
+        requester_did: String,
+        requester_device_id: Uuid,
+        prior_generation: i64,
+        prior_state_version: i64,
+        prior_group_id: Vec<u8>,
+        prior_epoch: i64,
+        prior_group_context_hash: Vec<u8>,
+        prior_confirmation_tag: Vec<u8>,
+        status: String,
+        request_digest: Vec<u8>,
+        signed_request_bytes: Vec<u8>,
+        received_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        terminal_transition_id: Option<Uuid>,
+        terminal_at: Option<DateTime<Utc>>,
+        terminal_revocation_id: Option<Uuid>,
+    }
+
+    let rows: Vec<ResetRequestHydrationQueryRow> = sqlx::query_as(
         r#"
         SELECT
             reset_request_id,
@@ -9037,7 +9077,8 @@ pub(crate) async fn load_reset_request_hydration_rows(
             received_at,
             expires_at,
             terminal_transition_id,
-            terminal_at
+            terminal_at,
+            terminal_revocation_id
         FROM chat.reset_requests
         WHERE conversation_id = $1
         "#,
@@ -9047,7 +9088,7 @@ pub(crate) async fn load_reset_request_hydration_rows(
     .await?;
 
     let mut requests: Vec<ResetRequestHydrationRow> = Vec::with_capacity(rows.len());
-    for (
+    for ResetRequestHydrationQueryRow {
         reset_request_id,
         requester_did,
         requester_device_id,
@@ -9064,7 +9105,8 @@ pub(crate) async fn load_reset_request_hydration_rows(
         expires_at,
         terminal_transition_id,
         terminal_at,
-    ) in rows
+        terminal_revocation_id,
+    } in rows
     {
         let request_id = *reset_request_id.as_bytes();
         let requester = reset_leave_device(requester_did, requester_device_id)?;
@@ -9083,9 +9125,11 @@ pub(crate) async fn load_reset_request_hydration_rows(
                 "stale" => "stale",
                 "consumed" => "consumed",
                 "expired" => "expired",
+                "revoked" => "revoked",
                 _ => return Err(ResetLeaveHydrationError::OutOfDomain),
             },
             terminal_transition_id,
+            terminal_revocation_id,
             terminal_at,
             expires_at,
         })?;
@@ -9094,6 +9138,7 @@ pub(crate) async fn load_reset_request_hydration_rows(
             ResetTerminalSelection::StaleTransition { .. } => ResetRequestStatus::Stale,
             ResetTerminalSelection::ConsumedTransition { .. } => ResetRequestStatus::Consumed,
             ResetTerminalSelection::Expiry { .. } => ResetRequestStatus::Expired,
+            ResetTerminalSelection::Revocation { .. } => ResetRequestStatus::Revoked,
         };
         let origin = load_control_request_origin(
             transaction,
@@ -9132,6 +9177,38 @@ pub(crate) async fn load_reset_request_hydration_rows(
                     return Err(ResetLeaveHydrationError::InvalidTerminal);
                 };
                 require_terminal_timestamp(evidence.received_at(), terminal_at)?;
+                Some(terminal)
+            }
+            // The revocation-bound terminal reuses the locator the leaf-recovery
+            // precedent already established; no new terminal shape is invented.
+            ResetTerminalSelection::Revocation {
+                revocation_id,
+                terminal_at,
+            } => {
+                let terminal = load_work_terminal_hydration_row(
+                    transaction,
+                    authority,
+                    conversation_id,
+                    WorkTerminalLocator::DeviceRevocation { revocation_id },
+                )
+                .await
+                .map_err(|error| match error {
+                    WorkTerminalHydrationError::Database(error) => {
+                        ResetLeaveHydrationError::Database(error)
+                    }
+                    _ => ResetLeaveHydrationError::InvalidTerminal,
+                })?;
+                let WorkTerminalHydrationRow::DeviceRevocation(ref evidence) = terminal else {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                };
+                // Re-derive the composite FK's guarantee in the aggregate: the
+                // revocation must name this row's requester as its target.
+                if evidence.revocation_id() != revocation_id.as_bytes()
+                    || evidence.target() != &requester
+                {
+                    return Err(ResetLeaveHydrationError::InvalidTerminal);
+                }
+                require_terminal_timestamp(evidence.accepted_at(), terminal_at)?;
                 Some(terminal)
             }
             ResetTerminalSelection::Expiry { terminal_at } => Some(
@@ -10063,11 +10140,15 @@ fn graph_digest_reset(digest: &mut Sha256, value: &ResetRequestHydrationRow) {
     graph_digest_coordinate(digest, &value.bound_coordinate);
     digest.update(value.received_at.unix_millis().to_be_bytes());
     digest.update(value.expires_at.unix_millis().to_be_bytes());
+    // SECOND canonical encoding of this enum, and it must agree with
+    // `state_machine::reset_request_status_code`. Same ratified extension:
+    // codes 1-4 unchanged, `revoked` appended as 5.
     digest.update([match value.status {
         ResetRequestStatus::Pending => 1,
         ResetRequestStatus::Stale => 2,
         ResetRequestStatus::Consumed => 3,
         ResetRequestStatus::Expired => 4,
+        ResetRequestStatus::Revoked => 5,
     }]);
     graph_digest_request(digest, &value.origin);
     graph_digest_option(digest, value.terminal.as_ref(), graph_digest_terminal);

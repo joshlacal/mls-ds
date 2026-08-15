@@ -13066,6 +13066,14 @@ async fn add_temporary_writer_columns(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("add nullable writer-compatibility columns");
+    // The device-global revocation stage also terminalizes the revoked
+    // requester's pending resets, which the pre-v4 boundary predates. The
+    // boundary under test is `welcome_dispositions`, so this column is added and
+    // dropped with the others rather than moving PRE_V4_CHAT_MIGRATIONS.
+    sqlx::query("ALTER TABLE chat.reset_requests ADD COLUMN terminal_revocation_id UUID")
+        .execute(pool)
+        .await
+        .expect("add the reset writer-compatibility column");
 }
 
 async fn restore_exact_pre_v4_table_boundary(pool: &PgPool) {
@@ -13077,6 +13085,10 @@ async fn restore_exact_pre_v4_table_boundary(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("drop writer-compatibility columns before v4");
+    sqlx::query("ALTER TABLE chat.reset_requests DROP COLUMN terminal_revocation_id")
+        .execute(pool)
+        .await
+        .expect("drop the reset writer-compatibility column before v4");
     assert_eq!(
         welcome_source_column_count(pool).await,
         0,

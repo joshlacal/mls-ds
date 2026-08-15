@@ -789,6 +789,13 @@ pub(crate) enum ResetRequestTermination {
     Expired {
         terminal_at: DateTime<Utc>,
     },
+    /// A revocation of the requester's own device supersedes the request. Binds
+    /// the revocation rather than a transition, because a revocation performs
+    /// none; the composite FK guarantees the revocation targets THIS requester.
+    SupersededByRevocation {
+        terminal_revocation_id: Uuid,
+        terminal_at: DateTime<Utc>,
+    },
 }
 
 /// Terminalize a pending reset request. CAS on `status = 'pending'`; a repeat or
@@ -798,16 +805,25 @@ pub(crate) async fn terminalize_reset_request(
     reset_request_id: Uuid,
     termination: &ResetRequestTermination,
 ) -> Result<(), TransitionRepositoryError> {
-    let (status, terminal_transition_id, terminal_at) = match termination {
+    let (status, terminal_transition_id, terminal_revocation_id, terminal_at) = match termination {
         ResetRequestTermination::Stale {
             terminal_transition_id,
             terminal_at,
-        } => ("stale", Some(*terminal_transition_id), *terminal_at),
+        } => ("stale", Some(*terminal_transition_id), None, *terminal_at),
         ResetRequestTermination::Consumed {
             terminal_transition_id,
             terminal_at,
-        } => ("consumed", Some(*terminal_transition_id), *terminal_at),
-        ResetRequestTermination::Expired { terminal_at } => ("expired", None, *terminal_at),
+        } => (
+            "consumed",
+            Some(*terminal_transition_id),
+            None,
+            *terminal_at,
+        ),
+        ResetRequestTermination::Expired { terminal_at } => ("expired", None, None, *terminal_at),
+        ResetRequestTermination::SupersededByRevocation {
+            terminal_revocation_id,
+            terminal_at,
+        } => ("revoked", None, Some(*terminal_revocation_id), *terminal_at),
     };
 
     let result = sqlx::query(
@@ -815,7 +831,8 @@ pub(crate) async fn terminalize_reset_request(
         UPDATE chat.reset_requests
            SET status = $2,
                terminal_transition_id = $3,
-               terminal_at = $4
+               terminal_at = $4,
+               terminal_revocation_id = $5
          WHERE reset_request_id = $1
            AND status = 'pending'
         "#,
@@ -824,6 +841,7 @@ pub(crate) async fn terminalize_reset_request(
     .bind(status)
     .bind(terminal_transition_id)
     .bind(terminal_at)
+    .bind(terminal_revocation_id)
     .execute(&mut **transaction)
     .await?;
 
@@ -831,6 +849,41 @@ pub(crate) async fn terminalize_reset_request(
         return Err(TransitionRepositoryError::CompareAndSetConflict);
     }
     Ok(())
+}
+
+/// Terminalize every pending reset request signed by a device that is being
+/// revoked, device-globally, and report how many rows moved.
+///
+/// Deliberately NOT a CAS on an expected row count: zero is the ordinary case
+/// (most revoked devices have no pending reset), and the `status = 'pending'`
+/// predicate makes a replayed revocation idempotent rather than conflicting.
+pub(crate) async fn terminalize_reset_requests_for_revoked_device(
+    transaction: &mut Transaction<'_, Postgres>,
+    requester_did: &str,
+    requester_device_id: Uuid,
+    terminal_revocation_id: Uuid,
+    terminal_at: DateTime<Utc>,
+) -> Result<u64, TransitionRepositoryError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE chat.reset_requests
+           SET status = 'revoked',
+               terminal_transition_id = NULL,
+               terminal_at = $4,
+               terminal_revocation_id = $3
+         WHERE requester_did = $1
+           AND requester_device_id = $2
+           AND status = 'pending'
+        "#,
+    )
+    .bind(requester_did)
+    .bind(requester_device_id)
+    .bind(terminal_revocation_id)
+    .bind(terminal_at)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 // ===========================================================================

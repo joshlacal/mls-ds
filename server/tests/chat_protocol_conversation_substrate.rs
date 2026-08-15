@@ -30382,9 +30382,20 @@ mod historical_control_loader {
             let expires_at = instant("2030-02-02T00:00:00.000Z");
             let terminal_at = instant("2030-02-01T00:01:00.000Z");
             let transition_id = Uuid::new_v4();
+            let revocation_id = Uuid::new_v4();
             let columns = |status, transition, terminal| ResetTerminalColumns {
                 status,
                 terminal_transition_id: transition,
+                terminal_revocation_id: None,
+                terminal_at: terminal,
+                expires_at,
+            };
+            // The revocation arm carries its own evidence column, so it needs a
+            // constructor that can set it.
+            let revoked_columns = |status, transition, revocation, terminal| ResetTerminalColumns {
+                status,
+                terminal_transition_id: transition,
+                terminal_revocation_id: revocation,
                 terminal_at: terminal,
                 expires_at,
             };
@@ -30409,6 +30420,20 @@ mod historical_control_loader {
                 }) if selected_transition_id == transition_id && selected_terminal_at == terminal_at
             ));
 
+            // The revoked arm: admitted with exactly its own evidence.
+            assert!(matches!(
+                select_reset_terminal(revoked_columns(
+                    "revoked",
+                    None,
+                    Some(revocation_id),
+                    Some(terminal_at),
+                )),
+                Ok(ResetTerminalSelection::Revocation {
+                    revocation_id: selected_revocation_id,
+                    terminal_at: selected_terminal_at,
+                }) if selected_revocation_id == revocation_id && selected_terminal_at == terminal_at
+            ));
+
             for malformed in [
                 columns("pending", Some(transition_id), None),
                 columns("pending", None, Some(terminal_at)),
@@ -30418,6 +30443,31 @@ mod historical_control_loader {
                 columns("consumed", Some(transition_id), None),
                 columns("expired", Some(transition_id), Some(expires_at)),
                 columns("expired", None, Some(terminal_at)),
+                // `revoked` without its revocation, without its instant, or
+                // carrying a transition as well.
+                revoked_columns("revoked", None, None, Some(terminal_at)),
+                revoked_columns("revoked", None, Some(revocation_id), None),
+                revoked_columns(
+                    "revoked",
+                    Some(transition_id),
+                    Some(revocation_id),
+                    Some(terminal_at),
+                ),
+                // A revocation id smuggled into an arm that must not carry one.
+                revoked_columns("pending", None, Some(revocation_id), None),
+                revoked_columns("expired", None, Some(revocation_id), Some(expires_at)),
+                revoked_columns(
+                    "stale",
+                    Some(transition_id),
+                    Some(revocation_id),
+                    Some(terminal_at),
+                ),
+                revoked_columns(
+                    "consumed",
+                    Some(transition_id),
+                    Some(revocation_id),
+                    Some(terminal_at),
+                ),
             ] {
                 assert!(matches!(
                     select_reset_terminal(malformed),

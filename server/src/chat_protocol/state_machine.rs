@@ -7597,6 +7597,10 @@ pub(crate) enum ResetRequestStatus {
     Stale,
     Consumed,
     Expired,
+    /// The requester's own device was revoked while the request was pending.
+    /// Ratified 2026-08-15 as the fifth reset-request status; see
+    /// `reset_request_status_code` for the canonical encoding.
+    Revoked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11808,6 +11812,10 @@ fn reset_request_status_code(value: ResetRequestStatus) -> u8 {
         ResetRequestStatus::Stale => 2,
         ResetRequestStatus::Consumed => 3,
         ResetRequestStatus::Expired => 4,
+        // Ratified 2026-08-15. The four codes above are unchanged, so every
+        // digest over a row that is not `revoked` is byte-identical to before;
+        // this EXTENDS the domain rather than renumbering it.
+        ResetRequestStatus::Revoked => 5,
     }
 }
 
@@ -19268,6 +19276,16 @@ fn validate_reset_work(state: &ConversationState) -> Result<(), StateMachineErro
             ResetRequestStatus::Expired => {
                 request.terminal == Some(WorkTerminalEvidence::Expiry(request.expires_at))
             }
+            // Mirrors the `revoked` arm of `reset_requests_terminal_shape_check`:
+            // the revocation must target this row's own requester, and may fall
+            // after the row lapsed — a device can be revoked long after the
+            // request it invalidates, so there is deliberately no upper bound.
+            ResetRequestStatus::Revoked => request.terminal.as_ref().is_some_and(|terminal| {
+                matches!(terminal, WorkTerminalEvidence::DeviceRevocation(evidence)
+                if validate_device_revocation_evidence(evidence)
+                    && evidence.target == request.requester
+                    && evidence.accepted_at >= request.received_at)
+            }),
         };
         if !valid {
             return Err(StateMachineError::InvariantViolation);
