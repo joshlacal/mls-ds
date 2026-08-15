@@ -639,6 +639,17 @@ async fn pending_reset_fixture_leaves_one_live_unconsumed_request() {
 /// bind `(revocation_id, revoked_at)`. `auth_generation` is deliberately left
 /// unchanged — the deferred FKs require it to equal the revocation row's
 /// `target_auth_generation`.
+/// A revocation instant that genuinely FOLLOWS the request it invalidates.
+///
+/// The graph fixture forward-dates its timeline — `received_at` lands a few
+/// seconds ahead of the moment the rows are written — so the wall clock at seed
+/// time is BEHIND the pending row. Revoking at "now" would place the revocation
+/// before the request its requester signed, which the new terminal shape
+/// rightly refuses (`terminal_at >= received_at`).
+fn revocation_instant(fixture: &PrivateGenuinePendingResetGraph) -> DateTime<Utc> {
+    fixture.received_at + Duration::seconds(1)
+}
+
 async fn revoke_requester_device(fixture: &PrivateGenuinePendingResetGraph, at: DateTime<Utc>) {
     use chat_protocol::repository::transition::{
         cas_registration_revoke, insert_device_revocation, NewDeviceRevocation, RegistrationRevoke,
@@ -940,7 +951,7 @@ async fn wedge_control_undrifted_requester_seals_for_both_kinds_and_either_princ
 async fn wedge_revoked_requester_drifts_the_seal_for_both_kinds() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
-    let at = executor_seed::clock_now(&fixture.pool).await;
+    let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
     for kind in [
@@ -1116,7 +1127,7 @@ async fn a_wedged_row_survives_untouched_and_unexpired() {
 async fn lapsed_row_from_a_revoked_requester_is_disposable_by_another_principal() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
-    let at = executor_seed::clock_now(&fixture.pool).await;
+    let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
     let lapsed = Duration::hours(24) + Duration::minutes(1);
@@ -1322,7 +1333,7 @@ async fn request_reset_through_the_facade(
 async fn endpoint_request_reset_is_still_wedged_while_the_row_is_live() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
-    let at = executor_seed::clock_now(&fixture.pool).await;
+    let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
     let error = request_reset_through_the_facade(&fixture, &other, Duration::zero())
@@ -1342,7 +1353,7 @@ async fn endpoint_request_reset_is_still_wedged_while_the_row_is_live() {
 async fn endpoint_request_reset_disposes_of_a_wedged_lapsed_row() {
     let fixture = private_genuine_pending_reset_graph().await;
     let other = ResetActor::other(&fixture).await;
-    let at = executor_seed::clock_now(&fixture.pool).await;
+    let at = revocation_instant(&fixture);
     revoke_requester_device(&fixture, at).await;
 
     let status = request_reset_through_the_facade(
@@ -1353,4 +1364,219 @@ async fn endpoint_request_reset_disposes_of_a_wedged_lapsed_row() {
     .await
     .expect("the documented rescue is reachable once the row lapses");
     assert_eq!(status, "expired");
+}
+
+// ---------------------------------------------------------------------------
+// MIGRATION — the revocation-bound terminal shape on chat.reset_requests.
+//
+// Proves the new (status, terminal column) combination is admitted AND that
+// every previously valid combination still binds exactly as before, so the
+// widened check cannot have loosened an existing arm by accident.
+// ---------------------------------------------------------------------------
+
+/// Attempt one UPDATE inside a savepoint. Returns the SQLSTATE on rejection.
+async fn try_terminal_shape(
+    pool: &PgPool,
+    reset_request_id: Uuid,
+    set_clause: &str,
+    binds: &[&(dyn std::fmt::Debug)],
+) -> Result<(), String> {
+    let _ = binds;
+    let mut tx = pool.begin().await.expect("begin shape probe");
+    let sql = format!(
+        "UPDATE chat.reset_requests SET {set_clause} WHERE reset_request_id='{reset_request_id}'"
+    );
+    let outcome = sqlx::query(&sql)
+        .execute(&mut *tx)
+        .await
+        .map(|_| ())
+        // The SQLSTATE, not the Display text: `to_string()` renders the message
+        // without the code, so asserting on "23514" against it silently never
+        // matches.
+        .map_err(|error| {
+            error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .map(|code| code.into_owned())
+                .unwrap_or_else(|| error.to_string())
+        });
+    tx.rollback().await.expect("shape probe leaves no residue");
+    outcome
+}
+
+#[tokio::test]
+async fn revocation_terminal_shape_is_admitted_and_old_shapes_still_bind() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let at = revocation_instant(&fixture);
+    revoke_requester_device(&fixture, at).await;
+
+    let (revocation_id, accepted_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT revocation_id,accepted_at FROM chat.device_revocations \
+         WHERE target_did=$1 AND target_device_id=$2",
+    )
+    .bind(&fixture.requester_did)
+    .bind(fixture.requester_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the revocation this reset row's requester is the target of");
+
+    let id = fixture.reset_request_id;
+    let ts = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Micros, true);
+
+    // ADMITTED: the new arm.
+    try_terminal_shape(
+        &fixture.pool,
+        id,
+        &format!(
+            "status='revoked',terminal_revocation_id='{revocation_id}',terminal_at='{}'",
+            ts(accepted_at)
+        ),
+        &[],
+    )
+    .await
+    .expect("a revoked requester's pending row terminalizes against its revocation");
+
+    // REJECTED: 'revoked' without the revocation id, or with a transition id as
+    // well — the new status must carry exactly its own evidence.
+    for bad in [
+        format!("status='revoked',terminal_at='{}'", ts(accepted_at)),
+        format!(
+            "status='revoked',terminal_revocation_id='{revocation_id}',\
+             terminal_transition_id='{}',terminal_at='{}'",
+            Uuid::new_v4(),
+            ts(accepted_at)
+        ),
+        format!("status='revoked',terminal_revocation_id='{revocation_id}'"),
+    ] {
+        let error = try_terminal_shape(&fixture.pool, id, &bad, &[])
+            .await
+            .expect_err("malformed revoked shape must be rejected");
+        assert!(error == "23514", "{error}");
+    }
+
+    // REJECTED: every OLD arm still binds exactly as before. A revocation id may
+    // not be smuggled into 'stale'/'consumed'/'expired'/'pending'.
+    for bad in [
+        format!(
+            "status='stale',terminal_revocation_id='{revocation_id}',terminal_at='{}'",
+            ts(accepted_at)
+        ),
+        format!(
+            "status='consumed',terminal_revocation_id='{revocation_id}',terminal_at='{}'",
+            ts(accepted_at)
+        ),
+        format!(
+            "status='expired',terminal_revocation_id='{revocation_id}',terminal_at='{}'",
+            ts(fixture.expires_at)
+        ),
+        format!("status='consumed',terminal_at='{}'", ts(accepted_at)),
+        format!("status='expired',terminal_at='{}'", ts(accepted_at)),
+        format!("terminal_revocation_id='{revocation_id}'"),
+    ] {
+        let error = try_terminal_shape(&fixture.pool, id, &bad, &[])
+            .await
+            .expect_err("an old terminal arm must bind exactly as before");
+        assert_eq!(
+            error, "23514",
+            "an old terminal arm must raise a check violation"
+        );
+    }
+
+    // ADMITTED still: the pre-existing arms, unchanged.
+    try_terminal_shape(
+        &fixture.pool,
+        id,
+        &format!(
+            "status='stale',terminal_transition_id='{}',terminal_at='{}'",
+            Uuid::new_v4(),
+            ts(accepted_at)
+        ),
+        &[],
+    )
+    .await
+    .expect("the stale arm is unchanged");
+    try_terminal_shape(
+        &fixture.pool,
+        id,
+        &format!("status='expired',terminal_at='{}'", ts(fixture.expires_at)),
+        &[],
+    )
+    .await
+    .expect("the expiry arm is unchanged");
+}
+
+/// The composite FK is the structural guarantee that a reset row can only be
+/// terminalized by ITS OWN requester's revocation — never attributed to someone
+/// else's. It is DEFERRABLE, so it surfaces at COMMIT.
+#[tokio::test]
+async fn a_reset_row_cannot_be_terminalized_by_a_foreign_revocation() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let at = revocation_instant(&fixture);
+    revoke_requester_device(&fixture, at).await;
+
+    let mut tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin foreign-revocation probe");
+    sqlx::query(
+        "UPDATE chat.reset_requests SET status='revoked',terminal_revocation_id=$2,terminal_at=$3 \
+         WHERE reset_request_id=$1",
+    )
+    .bind(fixture.reset_request_id)
+    .bind(Uuid::new_v4())
+    .bind(at)
+    .execute(&mut *tx)
+    .await
+    .expect("the CHECK shape alone accepts this row");
+    let error = tx
+        .commit()
+        .await
+        .expect_err("the deferred FK must reject a revocation this requester is not the target of");
+    assert!(error
+        .to_string()
+        .contains("reset_requests_terminal_revocation_fk"));
+}
+
+/// Lifecycle: `pending -> revoked` is admitted, and a revoked row is terminal.
+#[tokio::test]
+async fn revoked_is_a_terminal_successor_of_pending_and_cannot_be_rewritten() {
+    let fixture = private_genuine_pending_reset_graph().await;
+    let at = revocation_instant(&fixture);
+    revoke_requester_device(&fixture, at).await;
+
+    let (revocation_id, accepted_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+        "SELECT revocation_id,accepted_at FROM chat.device_revocations \
+         WHERE target_did=$1 AND target_device_id=$2",
+    )
+    .bind(&fixture.requester_did)
+    .bind(fixture.requester_device_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("the requester's revocation");
+
+    let mut tx = fixture.pool.begin().await.expect("begin lifecycle probe");
+    sqlx::query(
+        "UPDATE chat.reset_requests SET status='revoked',terminal_revocation_id=$2,terminal_at=$3 \
+         WHERE reset_request_id=$1",
+    )
+    .bind(fixture.reset_request_id)
+    .bind(revocation_id)
+    .bind(accepted_at)
+    .execute(&mut *tx)
+    .await
+    .expect("pending -> revoked is an admitted lifecycle transition");
+
+    let error =
+        sqlx::query("UPDATE chat.reset_requests SET status='expired' WHERE reset_request_id=$1")
+            .bind(fixture.reset_request_id)
+            .execute(&mut *tx)
+            .await
+            .expect_err("a terminal reset request cannot be rewritten");
+    assert!(error
+        .to_string()
+        .contains("terminal reset request cannot be rewritten"));
+    tx.rollback()
+        .await
+        .expect("lifecycle probe leaves no residue");
 }
