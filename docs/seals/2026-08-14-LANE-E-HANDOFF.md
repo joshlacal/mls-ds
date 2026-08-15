@@ -184,6 +184,17 @@ build or was truncated, which is not the same as "fewer failures".
 **Absence proofs need a positive control.** A grep truncated by `head` produced a
 false "no guard pins this" conclusion here; a guard did pin it.
 
+**`rg` respects gitignore.** A workspace-wide sweep for the corpus path returned
+ONE hit and looked conclusive; the sub-repos were being skipped. Re-run per repo
+with `-uu` (excluding `target/`, `.jj/`, `.git/`). That single mistake is the
+difference between the two reference sites first reported and the ten that exist.
+
+**Take a frozen hash AFTER formatting, never before.** Repointing the corpus
+paths shortened lines enough that rustfmt reflowed three files, `executor_seed.rs`
+among them. The hash was pinned, the format then invalidated it, and it had to be
+re-pinned a second time to the post-format bytes. Order is: edit → `rustfmt` →
+`shasum` → pin → run the suites.
+
 ---
 
 ## 4. Guards you must not casually break
