@@ -1812,10 +1812,17 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 //   b2f7ae9e  production's single-clock time model in the executor fixtures
 //   a63bc3fa  the signing authority production always mints
 //   0c6290a0  the planner's own due-expiry rows in coordinate-changing arms
+// Re-pinned for the finding-3 wedge fixture: `seed_private_genuine_pending_reset`
+// and `private_genuine_pending_reset_graph` seed the same genuine two-leaf graph
+// as `seed_private_genuine_reset` but stop BEFORE `commit_dynamic_reset_activation`,
+// leaving a live `chat.reset_requests` row in `pending`. Nothing existing could
+// produce that state: the reset fixture consumes the row in the same call, and the
+// shared clean-chat database holds zero reset rows. Additive only — no existing
+// seed path changed. Value taken from the POST-rustfmt bytes.
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "ba8aa803109b1677a3a02affdf5010205613421325b7eeb4f168372aad882e22";
+    "088eee508a6fb3088bff555f9ee593d3c86dcc108a0ac5175426ea4ced1cdf23";
 const SEALED_REPOSITORY_CORE_SHA256: &str =
     "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
 

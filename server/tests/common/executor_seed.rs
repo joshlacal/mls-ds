@@ -5788,6 +5788,123 @@ pub(crate) mod genuine_terminal_fixture {
             current_snapshot_digest,
         }
     }
+
+    /// The same genuine two-leaf graph as [`seed_private_genuine_reset`],
+    /// stopped one step earlier: the Reset REQUEST is committed and its
+    /// `chat.reset_requests` row is left `pending`, with no activation.
+    ///
+    /// `seed_private_genuine_reset` immediately consumes that row via
+    /// `commit_dynamic_reset_activation`, so it cannot witness anything about a
+    /// row that is still awaiting activation. The shared clean-chat database
+    /// holds zero `chat.reset_requests` rows, so a live pending row can only
+    /// come from a self-bootstrapping per-run database — never by seeding the
+    /// shared one, which other lanes depend on.
+    ///
+    /// Every byte here is genuine: `commit_dynamic_reset_request` writes real
+    /// `signed_request_bytes`, `signing_transcript_bytes`, `request_digest` and
+    /// `signature` produced by the graph's own signing key, so
+    /// `seal_pending_reset` reaches its live-authority check instead of
+    /// tripping an earlier structural arm.
+    pub(super) struct PendingResetFixtureData {
+        pub creation_graph: GenuineCreationGraph,
+        pub conversation_id: Uuid,
+        /// The principal that signed the pending Reset request: the graph
+        /// creator, an active admin.
+        pub requester_did: String,
+        pub requester_device_id: Uuid,
+        pub requester_key_id: String,
+        pub requester_auth_generation: i64,
+        pub requester_signing_seed: [u8; 32],
+        pub requester_public_key: Vec<u8>,
+        /// A SECOND active principal in the same conversation, so a test can
+        /// prove the wedge blocks principals other than the requester.
+        pub other_did: String,
+        pub other_device_id: Uuid,
+        pub other_key_id: String,
+        pub other_signing_seed: [u8; 32],
+        pub other_public_key: Vec<u8>,
+        pub reset_request_id: Uuid,
+        pub received_at: DateTime<Utc>,
+        pub expires_at: DateTime<Utc>,
+        pub prior: PublicGroupSnapshotCoordinate,
+    }
+
+    pub(super) async fn seed_private_genuine_pending_reset(
+        pool: &PgPool,
+    ) -> PendingResetFixtureData {
+        let dynamic = seed_dynamic_genuine_two_leaf_graph(pool).await;
+        let request_at = dynamic.remove_at - chrono::Duration::seconds(1);
+        let request = commit_dynamic_reset_request(pool, &dynamic.graph, request_at).await;
+        let graph = dynamic.graph;
+        let cid = Uuid::from_bytes(graph.entry.cid);
+
+        let (status, requester_auth_generation, expires_at): (String, i64, DateTime<Utc>) =
+            sqlx::query_as(
+                r#"SELECT status,requester_auth_generation,expires_at
+                     FROM chat.reset_requests
+                    WHERE reset_request_id=$1 AND conversation_id=$2"#,
+            )
+            .bind(request.request_id)
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("load the seeded pending Reset row");
+        assert_eq!(status, "pending", "fixture stops before activation");
+        assert_eq!(
+            expires_at,
+            request_at + chrono::Duration::hours(24),
+            "pending row carries the schema's exact 24h expiry"
+        );
+
+        // Both principals must be live and current, or a later
+        // `DeviceOrKeyDrift` would not isolate the wedge.
+        for (did, device_id) in [
+            (graph.entry.actor_did.as_str(), graph.entry.actor_device_id),
+            (graph.invitee.did.as_str(), graph.invitee.device_id),
+        ] {
+            let (device_status, revoked, membership): (String, bool, bool) = sqlx::query_as(
+                r#"SELECT d.status,d.revoked_at IS NOT NULL,p.current_membership
+                     FROM chat.devices d
+                     JOIN chat.participants p
+                       ON p.user_did=d.user_did AND p.conversation_id=$3
+                    WHERE d.user_did=$1 AND d.device_id=$2"#,
+            )
+            .bind(did)
+            .bind(device_id)
+            .bind(cid)
+            .fetch_one(pool)
+            .await
+            .expect("load seeded principal device");
+            assert_eq!(device_status, "active");
+            assert!(!revoked);
+            assert!(membership, "{did} is a current participant");
+        }
+
+        PendingResetFixtureData {
+            creation_graph: graph.creation_graph,
+            conversation_id: cid,
+            requester_did: graph.entry.actor_did.clone(),
+            requester_device_id: graph.entry.actor_device_id,
+            requester_key_id: graph.entry.actor_key_id.clone(),
+            requester_auth_generation,
+            requester_signing_seed: graph.entry.signing_seed,
+            requester_public_key: graph.entry.public_key.clone(),
+            other_did: graph.invitee.did.clone(),
+            other_device_id: graph.invitee.device_id,
+            other_key_id: graph.invitee.key_id.clone(),
+            other_signing_seed: graph.invitee.signing_key.to_bytes(),
+            other_public_key: graph
+                .invitee
+                .signing_key
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+            reset_request_id: request.request_id,
+            received_at: request_at,
+            expires_at,
+            prior: graph.committed.coordinate().clone(),
+        }
+    }
 }
 
 pub struct GenuineFormerLeaf {
@@ -5921,6 +6038,56 @@ pub async fn private_genuine_reset_graph() -> PrivateGenuineResetGraph {
         current_group_id: reset.current_group_id,
         current_graph_digest: reset.current_graph_digest,
         current_snapshot_digest: reset.current_snapshot_digest,
+    }
+}
+
+/// A per-run database holding a genuine conversation whose Reset request is
+/// still PENDING — the state `private_genuine_reset_graph` skips past.
+pub struct PrivateGenuinePendingResetGraph {
+    pub pool: PgPool,
+    _database: FreshDbGuard,
+    pub graph: GenuineCreationGraph,
+    pub conversation_id: Uuid,
+    pub requester_did: String,
+    pub requester_device_id: Uuid,
+    pub requester_key_id: String,
+    pub requester_auth_generation: i64,
+    pub requester_signing_seed: [u8; 32],
+    pub requester_public_key: Vec<u8>,
+    pub other_did: String,
+    pub other_device_id: Uuid,
+    pub other_key_id: String,
+    pub other_signing_seed: [u8; 32],
+    pub other_public_key: Vec<u8>,
+    pub reset_request_id: Uuid,
+    pub received_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub prior: PublicGroupSnapshotCoordinate,
+}
+
+pub async fn private_genuine_pending_reset_graph() -> PrivateGenuinePendingResetGraph {
+    let (pool, database) = setup().await;
+    let pending = genuine_terminal_fixture::seed_private_genuine_pending_reset(&pool).await;
+    PrivateGenuinePendingResetGraph {
+        pool,
+        _database: database,
+        graph: pending.creation_graph,
+        conversation_id: pending.conversation_id,
+        requester_did: pending.requester_did,
+        requester_device_id: pending.requester_device_id,
+        requester_key_id: pending.requester_key_id,
+        requester_auth_generation: pending.requester_auth_generation,
+        requester_signing_seed: pending.requester_signing_seed,
+        requester_public_key: pending.requester_public_key,
+        other_did: pending.other_did,
+        other_device_id: pending.other_device_id,
+        other_key_id: pending.other_key_id,
+        other_signing_seed: pending.other_signing_seed,
+        other_public_key: pending.other_public_key,
+        reset_request_id: pending.reset_request_id,
+        received_at: pending.received_at,
+        expires_at: pending.expires_at,
+        prior: pending.prior,
     }
 }
 
