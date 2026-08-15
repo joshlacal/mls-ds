@@ -2861,7 +2861,13 @@ pub(crate) mod genuine_terminal_fixture {
                 "authGeneration": 1,
                 "prior": coordinate_json(prior),
                 "reason": "manualRecovery",
-                "idempotencyKey": Uuid::new_v4(),
+                // production `parse_reset_authority` derives a Reset REQUEST's
+                // operation id FROM `resetRequestId` and then requires
+                // `idempotencyKey` to equal it. A fresh uuid here made these
+                // otherwise-genuine bytes unparseable by `seal_pending_reset`,
+                // which only went unnoticed because the sole consumer consumed
+                // the row via activation without re-parsing the request.
+                "idempotencyKey": request_id,
                 "signedAt": signed_at,
             },
             "signature": STANDARD.encode([0_u8; 64]),

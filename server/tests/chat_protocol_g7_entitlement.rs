@@ -1817,12 +1817,21 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // as `seed_private_genuine_reset` but stop BEFORE `commit_dynamic_reset_activation`,
 // leaving a live `chat.reset_requests` row in `pending`. Nothing existing could
 // produce that state: the reset fixture consumes the row in the same call, and the
-// shared clean-chat database holds zero reset rows. Additive only — no existing
-// seed path changed. Value taken from the POST-rustfmt bytes.
+// shared clean-chat database holds zero reset rows. Value taken from the
+// POST-rustfmt bytes.
+// Re-pinned once more in the same lane for a REPAIR the wedge control exposed:
+// `build_genuine_reset_request` signed `idempotencyKey` as a fresh uuid, but
+// production `parse_reset_authority` derives a Reset REQUEST's operation id FROM
+// `resetRequestId` and then requires `idempotencyKey` to equal it. Those
+// otherwise-genuine bytes were therefore unparseable by `seal_pending_reset`
+// (`InvalidResetRow`), which went unnoticed only because the sole consumer
+// consumed the row through activation without re-parsing the request. The
+// fixture now signs `idempotencyKey: request_id`, which is what production
+// requires; every suite that consumes the seed is unchanged by it.
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "088eee508a6fb3088bff555f9ee593d3c86dcc108a0ac5175426ea4ced1cdf23";
+    "6428038d04be0ab28bd9743cd146690dbfe8d708293739cff738ed1aa3d1b1f1";
 const SEALED_REPOSITORY_CORE_SHA256: &str =
     "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
 
