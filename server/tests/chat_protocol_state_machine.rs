@@ -317,8 +317,7 @@ struct CorpusChain {
 }
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire")
 }
 
 fn corpus_file(name: &str) -> Vec<u8> {

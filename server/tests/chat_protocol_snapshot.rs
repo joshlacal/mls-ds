@@ -125,7 +125,7 @@ struct RawSnapshot {
 
 fn corpus_file(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+        .join("tests/fixtures/crypto-wire")
         .join(name);
     fs::read(path).expect("read frozen crypto-wire corpus artifact")
 }

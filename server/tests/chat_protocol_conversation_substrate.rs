@@ -2801,7 +2801,7 @@ mod historical_control_path {
     #[test]
     fn corpus_creation_entry_preserves_manifest_chronology() {
         let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/manifest.json");
+            .join("tests/fixtures/crypto-wire/manifest.json");
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(manifest_path).expect("read frozen corpus manifest"),
         )
@@ -4900,7 +4900,7 @@ mod historical_control_loader {
         } else if public_state.is_some() {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire/group-info.mls"),
+                    .join("tests/fixtures/crypto-wire/group-info.mls"),
             )
             .expect("read genuine frozen genesis GroupInfo")
         } else {
@@ -10588,7 +10588,7 @@ mod historical_control_loader {
         fn corpus_file(name: &str) -> Vec<u8> {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+                    .join("tests/fixtures/crypto-wire")
                     .join(name),
             )
             .expect("read frozen crypto-wire artifact")
@@ -33573,7 +33573,7 @@ mod real_tree_genesis_seed {
 
     fn corpus_file(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/generated-artifacts/mls-chat-v1/crypto-wire")
+            .join("tests/fixtures/crypto-wire")
             .join(name);
         fs::read(path).expect("read frozen crypto-wire corpus artifact")
     }

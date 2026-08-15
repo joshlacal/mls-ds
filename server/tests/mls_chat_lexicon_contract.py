@@ -35,6 +35,12 @@ STACK_ROOT = MLS_DS_ROOT.parent
 CANONICAL_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/chat"
 MIRROR_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/chat"
 VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.json"
+# Deliberately still the GENERATION home, not the in-repo snapshot. The Rust
+# suites now read a frozen copy committed at server/tests/fixtures/crypto-wire so
+# they never traverse out of the repository; this contract test is cross-stack by
+# nature (see CANONICAL_ROOT in PetrelCatbird above) and checks the artifacts
+# where the generator writes them. Keeping the two paths distinct is what lets a
+# regeneration that has not been re-snapshotted into the repo be noticed here.
 CRYPTO_WIRE_ROOT = STACK_ROOT / "docs/generated-artifacts/mls-chat-v1/crypto-wire"
 PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"

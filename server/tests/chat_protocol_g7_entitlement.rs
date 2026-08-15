@@ -1803,6 +1803,9 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
     assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
+// Re-pinned AGAIN when the frozen crypto-wire corpus moved in-repo to
+// server/tests/fixtures/crypto-wire: executor_seed.rs:148's include_str! had to
+// stop traversing ../../../../docs out of the repository, which changes its bytes.
 // Re-pinned after the C2 lane. The previous value was set at `e98ef5da` and
 // three later sealed commits changed the helper without re-pinning it, so both
 // guards below asserted a baseline that no longer existed:
@@ -1812,7 +1815,7 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "d7a4e316c3292ea7958a9d454154ebf1957a2e24735fc20d18cb1d42773f92f8";
+    "ba8aa803109b1677a3a02affdf5010205613421325b7eeb4f168372aad882e22";
 const SEALED_REPOSITORY_CORE_SHA256: &str =
     "60f07e0cc88d454c5c90957b06d4544c7f841735ce97875c2c9db9025a2fd2c4";
 
