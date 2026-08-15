@@ -27,7 +27,7 @@ pub struct CleanProtocol13ManifestEntry {
     pub migration: Migration,
 }
 
-pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 13]> = LazyLock::new(
+pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 14]> = LazyLock::new(
     || {
         [
             CleanProtocol13ManifestEntry {
@@ -160,6 +160,16 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 1
                     Cow::Borrowed(include_str!("../../migrations/20260729000001_chat_g7_inventory_entitlement.sql")),
                 ),
             },
+            CleanProtocol13ManifestEntry {
+                filename: "20260730000001_reset_request_revocation_terminal.sql",
+                reviewed_sha384: "36ea55abb2cc644213fad4edd21df3e3ee10e680d63e714a22193eaf483fb022cf76106bf79fdd8a4ba1c285eb64d28b",
+                migration: Migration::new(
+                    20260730000001,
+                    Cow::Borrowed("reset request revocation terminal"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260730000001_reset_request_revocation_terminal.sql")),
+                ),
+            },
         ]
     },
 );
@@ -179,8 +189,8 @@ impl MigrationSource<'static> for CleanProtocol13MigrationSource {
 }
 
 pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
-    if CLEAN_PROTOCOL_13_MANIFEST.len() != 13 {
-        return Err("reviewed clean-protocol manifest must contain exactly 13 migrations".into());
+    if CLEAN_PROTOCOL_13_MANIFEST.len() != 14 {
+        return Err("reviewed clean-protocol manifest must contain exactly 14 migrations".into());
     }
     for (index, entry) in CLEAN_PROTOCOL_13_MANIFEST.iter().enumerate() {
         let filename_version = entry
@@ -211,7 +221,7 @@ pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
         .map_err(|error| format!("resolve reviewed clean-protocol migrator: {error}"))?;
     migrator.set_ignore_missing(false);
     migrator.set_locking(true);
-    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 13 {
+    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 14 {
         return Err("reviewed clean-protocol migrator policy mismatch".into());
     }
     for (entry, migration) in CLEAN_PROTOCOL_13_MANIFEST.iter().zip(migrator.iter()) {
@@ -942,7 +952,7 @@ async fn validate_exact_reviewed_ledger(
         .collect::<Vec<_>>();
     if actual != expected {
         return Err(
-            "clean-chat fixed target is not the exact reviewed 13-row installation; \
+            "clean-chat fixed target is not the exact reviewed 14-row installation; \
              validation-only setup refuses migration or repair"
                 .into(),
         );

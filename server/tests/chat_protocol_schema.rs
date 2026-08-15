@@ -57,14 +57,14 @@ static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 13]> = LazyLock::new(|| {
 // post-20260729000001 migration chain. The sequence catalog remained
 // structurally unchanged.
 const COLUMN_CATALOG_SHA256: &str =
-    "c01fdfbd6d6791c299756fec7fddc8ff01320cb567b56a049ad30bf0d78dbad0";
+    "5fb33ed1f5d5bfbe6f8bfc12ebf1917458ef38e392a5105b826e4c98a91808d6";
 // Promoted from the 2026-07-30 read-only smoke run (preimage
 // preimages/Q6-constraint-901.txt, 901 ordered lines), independently
 // recomputed from those lines before promotion. Its CHECK expressions render
 // 180 schema-qualified calls (chat.is_safe_integer, chat.is_bare_did) because
 // `chat` is absent from search_path; see the search_path note below.
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "0398bd6707f9b5624e04d4b478de1fdd1b9fb6f832987ae3600de18dc9e93ae3";
+    "c3c4145bc277c675cd155918f4dbc470ddecca39dfa7ea951e22ab766c559734";
 const INDEX_CATALOG_SHA256: &str =
     "0cdb03b2c957221b394b5c2a98d9d4da11a025d14f9bc8cbca1d8eb4e995416f";
 // Promoted from the same smoke run (preimage preimages/Q8-function-104.txt,
@@ -72,9 +72,9 @@ const INDEX_CATALOG_SHA256: &str =
 // embeds a SHA-256 of pg_get_functiondef output, so the server renders the
 // bytes this digest covers.
 const FUNCTION_CATALOG_SHA256: &str =
-    "b5137402bb1cded092a3f5f49ea367b0889dea33d422e9271d24c63f38fcfa40";
+    "5ab53f0f1be8b0b41299eda8203f3222e583e5df34b0cd030b651d6654741d65";
 const TRIGGER_CATALOG_SHA256: &str =
-    "26124ff69f4633654a3b07e711d72a8811ad53b4a2faa024fd5188452f2f04d6";
+    "32ad307d67708c60f6248258de54ab38423ae5a211b9bd3a6f8ff4f5686f3b49";
 const SEQUENCE_CATALOG_SHA256: &str =
     "0f5fdcab044481afeaca50ac88cff13edd4b583df914da2c798e4a4194464abe";
 // search_path dependency for CONSTRAINT_/FUNCTION_CATALOG_SHA256 above and
@@ -2650,7 +2650,7 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
     let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
         .await
         .expect("construct reviewed exact-13 migrator");
-    assert_eq!(migrator.iter().count(), 13);
+    assert_eq!(migrator.iter().count(), 14);
     assert!(!migrator.ignore_missing);
     assert!(migrator.locking);
 }
