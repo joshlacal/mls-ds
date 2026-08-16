@@ -493,12 +493,16 @@ async fn lock_leave_replay_post_state(
     let head: Option<(String,i64,i64,i64)> = sqlx::query_as("SELECT lifecycle,current_generation,current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1 FOR SHARE").bind(parsed.conversation_id).fetch_optional(&mut **transaction).await?;
     let (lifecycle, generation, state_version, next_seq) =
         head.ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
-    let expected_lifecycle = if parsed.kind == SignedMutationKind::ConversationClose {
-        "superseded"
+    // A completed request/cancellation/zero-leaf operation remains replayable
+    // after a later close supersedes the conversation.  The retained entry,
+    // operation completion, and request row below are the immutable linkage;
+    // only a close replay itself requires the terminal head.
+    let lifecycle_is_valid = if parsed.kind == SignedMutationKind::ConversationClose {
+        lifecycle == "superseded"
     } else {
-        "active"
+        matches!(lifecycle.as_str(), "active" | "superseded")
     };
-    if lifecycle != expected_lifecycle || seq <= 0 || next_seq <= seq {
+    if !lifecycle_is_valid || seq <= 0 || next_seq <= seq {
         return Err(LeaveFacadeError::InvalidCanonicalMaterial);
     }
     if let Some(request_id) = parsed
