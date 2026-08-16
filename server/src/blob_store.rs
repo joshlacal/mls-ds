@@ -75,7 +75,20 @@ struct RouteTestObject {
 pub struct BlobStore {
     s3: S3Client,
     bucket: String,
+    /// Optional object-key prefix applied to every physical key. Production
+    /// `new()` leaves it empty; the disposable S3 lifecycle fixture sets it to
+    /// `clean-chat-rc-<timestamp>/` so all fixture objects live under one
+    /// listable, deletable prefix. The database commitment and the
+    /// deterministic CID derivation are untouched (keys stay bare CIDs at the
+    /// repository layer; the prefix is a physical-storage concern only).
+    key_prefix: String,
     route_test_objects: Option<Arc<HashMap<String, RouteTestObject>>>,
+}
+
+impl BlobStore {
+    fn physical_key(&self, logical: &str) -> String {
+        format!("{}{}", self.key_prefix, logical)
+    }
 }
 
 impl BlobStore {
@@ -115,6 +128,7 @@ impl BlobStore {
         Self {
             s3: S3Client::from_conf(config),
             bucket,
+            key_prefix: String::new(),
             route_test_objects: Some(Arc::new(HashMap::new())),
         }
     }
@@ -171,6 +185,59 @@ impl BlobStore {
         Self {
             s3,
             bucket: BUCKET.to_owned(),
+            key_prefix: String::new(),
+            route_test_objects: None,
+        }
+    }
+
+    /// Construct a REAL S3-backed client for the disposable S3 lifecycle
+    /// fixture (Task 2). Unlike `for_route_tests` this talks to the configured
+    /// S3-compatible endpoint (local MinIO) through the exact production
+    /// `put_for_blob` / `get_authorized` / `delete` code paths; the bucket is
+    /// DB-namespaced (disposable route-test pattern) and every object is
+    /// stored under `prefix` so the whole fixture is one listable, deletable
+    /// prefix. Production `new()` is untouched.
+    pub async fn for_s3_fixture(prefix: &str) -> Self {
+        let endpoint =
+            std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let access_key = std::env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set");
+        let secret_key = std::env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set");
+        let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let suffix = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .and_then(|url| url.rsplit('/').next().map(str::to_owned))
+            .unwrap_or_else(|| "default".to_owned());
+        let suffix: String = suffix
+            .chars()
+            .map(|character| {
+                if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let bucket = format!("catbird-blobs-route-test-{suffix}");
+
+        let creds = Credentials::new(&access_key, &secret_key, None, None, "env");
+        let config = Builder::new()
+            .behavior_version_latest()
+            .endpoint_url(&endpoint)
+            .region(Region::new(region))
+            .credentials_provider(creds)
+            .force_path_style(true)
+            .build();
+        let s3 = S3Client::from_conf(config);
+        let _ = s3.create_bucket().bucket(&bucket).send().await;
+        info!(
+            "BlobStore S3 fixture initialized (endpoint={}, bucket={}, prefix={})",
+            endpoint, bucket, prefix
+        );
+        Self {
+            s3,
+            bucket,
+            key_prefix: prefix.to_owned(),
             route_test_objects: None,
         }
     }
@@ -185,7 +252,7 @@ impl BlobStore {
         self.s3
             .put_object()
             .bucket(&self.bucket)
-            .key(blob_id)
+            .key(self.physical_key(blob_id))
             .body(ByteStream::from(data))
             .content_type("application/octet-stream")
             .send()
@@ -227,7 +294,7 @@ impl BlobStore {
         self.s3
             .put_object()
             .bucket(&self.bucket)
-            .key(&cid)
+            .key(self.physical_key(&cid))
             .body(ByteStream::from(data))
             .content_type(media_type)
             .metadata("cid", &cid)
@@ -246,7 +313,7 @@ impl BlobStore {
             .s3
             .get_object()
             .bucket(&self.bucket)
-            .key(blob_id)
+            .key(self.physical_key(blob_id))
             .send()
             .await
             .map_err(|e| {
@@ -303,7 +370,7 @@ impl BlobStore {
             .s3
             .get_object()
             .bucket(&self.bucket)
-            .key(storage.object_store_key())
+            .key(self.physical_key(storage.object_store_key()))
             .send()
             .await
             .map_err(|error| {
@@ -343,7 +410,7 @@ impl BlobStore {
         self.s3
             .delete_object()
             .bucket(&self.bucket)
-            .key(blob_id)
+            .key(self.physical_key(blob_id))
             .send()
             .await
             .map_err(|e| {

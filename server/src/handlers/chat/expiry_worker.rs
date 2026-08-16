@@ -411,12 +411,12 @@ async fn reclaim_due_blob_objects_with_deleter<D: BlobObjectDeleter + ?Sized>(
 ) -> Result<BlobGcCounts, BlobGcError> {
     let mut transaction = pool.begin().await?;
     let rows: Vec<(Uuid, String, Vec<u8>)> = query_as(
-        "SELECT blob_id, object_store_key, ciphertext_sha256\
-           FROM chat.blobs\
-          WHERE object_gc_status = 'pending'\
-            AND object_gc_after <= clock_timestamp()\
-          ORDER BY object_gc_after, blob_id\
-          FOR UPDATE SKIP LOCKED\
+        "SELECT blob_id, object_store_key, ciphertext_sha256 \
+           FROM chat.blobs \
+          WHERE object_gc_status = 'pending' \
+            AND object_gc_after <= clock_timestamp() \
+          ORDER BY object_gc_after, blob_id \
+          FOR UPDATE SKIP LOCKED \
           LIMIT $1",
     )
     .bind(batch)
@@ -449,12 +449,12 @@ async fn reclaim_due_blob_objects_with_deleter<D: BlobObjectDeleter + ?Sized>(
             continue;
         }
         sqlx::query(
-            "UPDATE chat.blobs\
-                SET object_gc_status = 'reclaimed',\
-                    object_store_key = NULL,\
-                    object_deleted_at = clock_timestamp()\
-              WHERE blob_id = $1\
-                AND object_gc_status = 'pending'\
+            "UPDATE chat.blobs \
+                SET object_gc_status = 'reclaimed', \
+                    object_store_key = NULL, \
+                    object_deleted_at = clock_timestamp() \
+              WHERE blob_id = $1 \
+                AND object_gc_status = 'pending' \
                 AND object_store_key = $2",
         )
         .bind(blob_id)
