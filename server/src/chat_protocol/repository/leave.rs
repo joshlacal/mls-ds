@@ -21,11 +21,8 @@ use crate::chat_protocol::{
             ExecutionContextHydrationError,
         },
         prelude::{
-            lock_signed_operation_replay_authority, release_signed_operation_replay,
-            CanonicalDeviceIdentity, CanonicalLockScope, LockedSignedOperationReplayAuthority,
-            OperationReservationGuard, PreludeError, PreparedSignedOperation,
-            PreparedSignedOperationState, ScopeBoundBusinessAuthority,
-            SignedOperationReplayPostStateProof,
+            CanonicalDeviceIdentity, CanonicalLockScope, OperationReservationGuard, PreludeError,
+            PreparedSignedOperation, PreparedSignedOperationState, ScopeBoundBusinessAuthority,
         },
         transition::TransitionRepositoryError,
     },
@@ -37,6 +34,12 @@ use crate::chat_protocol::{
         VerifiedSignedMutation,
     },
     validation::CanonicalUuidV4,
+};
+
+#[cfg(not(test))]
+use crate::chat_protocol::repository::prelude::{
+    lock_signed_operation_replay_authority, release_signed_operation_replay,
+    LockedSignedOperationReplayAuthority, SignedOperationReplayPostStateProof,
 };
 
 const OK: i32 = 200;
@@ -479,8 +482,14 @@ async fn lock_leave_replay_post_state(
     let accepted = mutation
         .accepted_wrapper_bytes()
         .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
-    let entry: Option<(Uuid,i64)> = sqlx::query_as("SELECT entry_id,seq FROM chat.entries WHERE conversation_id=$1 AND signed_request_bytes=$2 FOR SHARE").bind(parsed.conversation_id).bind(accepted).fetch_optional(&mut **transaction).await?;
-    let (entry_id, seq) = entry.ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+    let entry: Option<(Uuid, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT entry_id,seq,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes FROM chat.entries WHERE conversation_id=$1 AND signed_request_bytes=$2 FOR SHARE").bind(parsed.conversation_id).bind(accepted).fetch_optional(&mut **transaction).await?;
+    let (entry_id, seq, accepted_payload, accepted_payload_sha256, signed_request_bytes) =
+        entry.ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+    if signed_request_bytes != accepted
+        || accepted_payload_sha256.as_slice() != Sha256::digest(&accepted_payload).as_slice()
+    {
+        return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+    }
     let head: Option<(String,i64,i64,i64)> = sqlx::query_as("SELECT lifecycle,current_generation,current_state_version,next_entry_seq FROM chat.conversations WHERE conversation_id=$1 FOR SHARE").bind(parsed.conversation_id).fetch_optional(&mut **transaction).await?;
     let (lifecycle, generation, state_version, next_seq) =
         head.ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
@@ -524,8 +533,32 @@ async fn lock_leave_replay_post_state(
         super::auth::load_signed_operation_replay_completion(transaction, locked.authority())
             .await?
             .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?;
+    let response: Value = serde_json::from_slice(completed.response_bytes())
+        .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+    if !response_contains_entry(&response, entry_id) {
+        return Err(LeaveFacadeError::InvalidCanonicalMaterial);
+    }
     LeaveReplayPostStateProof::new(locked, &completed, entry_id, seq, generation, state_version)
         .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)
+}
+
+fn response_contains_entry(value: &Value, entry_id: Uuid) -> bool {
+    match value {
+        Value::Object(object) => {
+            object
+                .get("entryId")
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                == Some(entry_id)
+                || object
+                    .values()
+                    .any(|value| response_contains_entry(value, entry_id))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| response_contains_entry(value, entry_id)),
+        _ => false,
+    }
 }
 
 #[cfg(not(test))]
