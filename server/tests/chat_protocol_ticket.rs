@@ -74,7 +74,8 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use uuid::Uuid;
 
 use repository::ticket::{
-    consume_subscription_ticket, mint_subscription_ticket, ticket_hash, MintSubscriptionTicket,
+    consume_subscription_ticket, insert_event_cursor_receipt, mint_subscription_ticket,
+    revalidate_consumed_ticket, ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt,
     TicketRepositoryError, SUBSCRIBE_EVENTS_PATH,
 };
 
@@ -369,6 +370,175 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
         "a second consume of a one-use ticket must lose, got {again:?}"
     );
     c2.rollback().await.expect("rollback consume 2");
+}
+
+#[tokio::test]
+async fn retention_floor_cannot_advance_beneath_a_live_ticket_session() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = clock_now(&pool).await;
+    let device = seed_device(&pool, now - Duration::seconds(200)).await;
+    let session = seed_session(
+        &pool,
+        &device,
+        now - Duration::seconds(10),
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let opaque = fresh_blob();
+    let request = mint_request(
+        &device,
+        &session,
+        &opaque,
+        session.capability.clone(),
+        now,
+        now + Duration::seconds(60),
+    );
+    let mut mint = pool.begin().await.expect("begin mint");
+    mint_subscription_ticket(&mut mint, &request)
+        .await
+        .expect("mint before floor advance");
+    mint.commit().await.expect("commit ticket");
+
+    let advance = sqlx::query(
+        "UPDATE chat.event_retention SET retained_floor=$1,updated_at=clock_timestamp()",
+    )
+    .bind(session.snapshot_event_position + 1)
+    .execute(&pool)
+    .await;
+    let error = advance.expect_err("live session FK must pin the retained floor");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code().map(|code| code.into_owned())),
+        Some("23503".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn snapshot_cursor_receipt_is_persisted_with_exact_session_authority() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let now = clock_now(&pool).await;
+    let device = seed_device(&pool, now - Duration::seconds(200)).await;
+    let session = seed_session(
+        &pool,
+        &device,
+        now - Duration::seconds(10),
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let (protocol_instance_id, cursor_key_id, retained_floor): (Uuid, String, i64) =
+        sqlx::query_as(
+            "SELECT protocol_instance_id,cursor_key_id,retained_floor FROM chat.protocol_instances JOIN chat.event_retention USING(protocol_instance_id) WHERE singleton=TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load protocol fence");
+    let cursor_hash: [u8; 32] = session
+        .capability_hash
+        .clone()
+        .try_into()
+        .expect("fixture capability hash");
+    let mut transaction = pool.begin().await.expect("begin receipt");
+    insert_event_cursor_receipt(
+        &mut transaction,
+        &NewEventCursorReceipt {
+            cursor_hash,
+            inventory_session_id: session.inventory_session_id,
+            user_did: device.did.clone(),
+            device_id: device.device_id,
+            jkt: device.jkt.clone(),
+            auth_generation: device.auth_generation,
+            protocol_instance_id,
+            cursor_key_id,
+            event_position: session.snapshot_event_position,
+            predecessor_cursor_hash: None,
+            retained_floor_at_issue: retained_floor,
+            cursor_nonce: [7; 12],
+            cursor_ciphertext: vec![9; 32],
+            canonical_envelope_sha256: None,
+            created_at: session.created_at,
+            expires_at: session.expires_at,
+        },
+    )
+    .await
+    .expect("persist the initial receipt through the production primitive");
+    transaction.commit().await.expect("commit initial receipt");
+
+    let stored: (i64, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT event_position,predecessor_cursor_hash,canonical_envelope_sha256 FROM chat.event_cursor_receipts WHERE cursor_hash=$1",
+    )
+    .bind(cursor_hash.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("read initial receipt");
+    assert_eq!(stored.0, session.snapshot_event_position);
+    assert!(stored.1.is_none() && stored.2.is_none());
+}
+
+#[tokio::test]
+async fn idle_subscription_revalidation_stops_after_exact_device_revocation() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = clock_now(&pool).await;
+    let device = seed_device(&pool, now - Duration::seconds(200)).await;
+    let session = seed_session(
+        &pool,
+        &device,
+        now - Duration::seconds(10),
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let opaque = fresh_blob();
+    let request = mint_request(
+        &device,
+        &session,
+        &opaque,
+        session.capability.clone(),
+        now,
+        now + Duration::seconds(60),
+    );
+    let mut mint = pool.begin().await.expect("begin mint");
+    mint_subscription_ticket(&mut mint, &request)
+        .await
+        .expect("mint idle-stream ticket");
+    mint.commit().await.expect("commit ticket");
+    let mut consume = pool.begin().await.expect("begin consume");
+    let authority = consume_subscription_ticket(
+        &mut consume,
+        &ticket_hash(&opaque),
+        &session.capability,
+        SUBSCRIBE_EVENTS_PATH,
+        clock_now(&pool).await,
+    )
+    .await
+    .expect("consume ticket before revocation");
+    consume.commit().await.expect("commit consume");
+
+    sqlx::query(
+        "UPDATE chat.devices SET status='revoked',revoked_at=$3 WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .bind(clock_now(&pool).await)
+    .execute(&pool)
+    .await
+    .expect("revoke exact device without appending a durable event");
+
+    let mut live = pool.begin().await.expect("begin idle revalidation");
+    let result = revalidate_consumed_ticket(
+        &mut live,
+        &authority,
+        authority.event_position,
+        clock_now(&pool).await,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(TicketRepositoryError::DeviceBindingMismatch)
+    ));
+    live.rollback().await.expect("rollback rejected live pass");
 }
 
 #[tokio::test]

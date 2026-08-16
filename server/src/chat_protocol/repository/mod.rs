@@ -85,5 +85,7 @@ pub(crate) mod welcome_terminal;
 pub(crate) mod welcome;
 // `ticket` (Slice 4c) is the subscription-ticket mint + one-use consume surface
 // on the NEW `chat.subscription_tickets` table. Not yet wired to a handler.
+#[cfg(not(test))]
+pub(crate) mod subscription;
 #[allow(dead_code)]
 pub(crate) mod ticket;

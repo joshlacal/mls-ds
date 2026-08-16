@@ -2032,6 +2032,14 @@ impl CursorSealer {
         Ok(Self { key_id, secret })
     }
 
+    /// Returns the non-secret identifier for this sealer key.
+    ///
+    /// The key identifier is safe to compare with the durable protocol
+    /// instance fence. The sealing secret is intentionally not exposed.
+    pub(crate) fn key_id(&self) -> &[u8; 32] {
+        &self.key_id
+    }
+
     /// Seals a successor capability for lost-response replay.
     ///
     /// The binding must carry the exact successor hash of `plaintext` (the

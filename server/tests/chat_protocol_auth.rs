@@ -742,6 +742,52 @@ fn blob_upload_preparation_projection_requires_exact_media_metadata() {
 }
 
 #[test]
+fn blob_prepare_projection_exposes_signed_prior_conversation_identity() {
+    let signing = Ed25519SigningKey::from_bytes(&[61_u8; 32]);
+    let key_id = ed25519_key_id(signing.verifying_key().as_bytes()).unwrap();
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+        "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\u{0000}",
+        "blobId": CHAT_INSTANCE,
+        "conversationId": CHAT_INSTANCE,
+        "actorDid": DID,
+        "actorDeviceId": DEVICE_ID,
+        "keyId": key_id.as_str(),
+        "authGeneration": 1,
+        "prior": {
+            "conversationId": CHAT_INSTANCE,
+            "generation": 0,
+            "stateVersion": 0,
+            "groupId": STANDARD.encode([1_u8; 32]),
+            "epoch": 0,
+            "groupContextHash": STANDARD.encode([2_u8; 32]),
+            "confirmationTag": STANDARD.encode([3_u8; 32]),
+            "lifecycle": "active"
+        },
+        "ciphertextSha256": STANDARD.encode([4_u8; 32]),
+        "ciphertextSize": 17,
+        "mediaType": "image/png",
+        "plaintextSize": 1,
+        "purpose": "attachment",
+        "idempotencyKey": TOKEN_JTI,
+        "signedAt": "2026-07-22T14:05:09.123Z"
+    });
+    let raw = sign_chat_body(body, &signing);
+    let verified =
+        decode_and_verify_signed_mutation(&raw, signing.verifying_key().as_bytes()).unwrap();
+
+    match verified.projection() {
+        VerifiedMutationProjection::BlobUploadPreparation(projection) => {
+            assert_eq!(
+                projection.conversation_id().as_str(),
+                projection.prior_conversation_id().as_str()
+            );
+        }
+        _ => panic!("expected blob preparation projection"),
+    }
+}
+
+#[test]
 fn canonical_participant_changes_reject_reversal_and_duplicates_instead_of_sorting() {
     let low = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     let high = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";

@@ -68,6 +68,14 @@ mod chat_protocol {
         pub use crate::cursor::*;
     }
 
+    pub mod read_authority {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_authority.rs"
+        ));
+    }
+
     // The E2b-2/E2b-3 transition executor lives in `state_machine.rs` (included
     // below) and is now compiled unconditionally, so its `super::repository::*`
     // references must resolve inside this test crate too. The repository writer

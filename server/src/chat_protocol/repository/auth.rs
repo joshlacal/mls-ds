@@ -3458,6 +3458,30 @@ pub(super) async fn load_validated_completed_replenishment_replay(
     completed_replay(transaction, authority.pre_replay(), &material).await
 }
 
+/// Blob preparation/deletion replay release.  These operations have no
+/// transition post-state to hydrate, but the replay still uses the exact
+/// signed request material and the current actor identity lock before bytes
+/// are exposed.
+pub(super) async fn load_validated_completed_blob_replay(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &SignedOperationReplayAuthority,
+) -> Result<Option<CompletedIdempotentResponse>, AuthRepositoryError> {
+    if !matches!(
+        (authority.endpoint().as_str(), authority.mutation().kind()),
+        (
+            "blue.catbird.chat.prepareBlobUpload",
+            SignedMutationKind::BlobUploadPreparation
+        ) | (
+            "blue.catbird.chat.deleteBlob",
+            SignedMutationKind::BlobDeletion
+        )
+    ) {
+        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+    }
+    let material = request_material_for_signed_replay(authority)?;
+    completed_replay(transaction, authority.pre_replay(), &material).await
+}
+
 #[derive(Debug)]
 struct SignedPackageEffectManifestEntry {
     key_package_ref: Vec<u8>,

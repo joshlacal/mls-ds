@@ -564,6 +564,7 @@ async fn handle_socket(
                     let event_cursor = match &event {
                         StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
+                        StreamEvent::CleanTypingEvent { .. } => continue,
                         StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
                         StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor.clone(),
@@ -795,6 +796,9 @@ async fn send_event(
     let msg_type = match event {
         StreamEvent::MessageEvent { .. } => "#messageEvent",
         StreamEvent::TypingEvent { .. } => "#typingEvent",
+        StreamEvent::CleanTypingEvent { .. } => {
+            return Err("clean typing is served only by the clean-chat subscription".to_owned())
+        }
         StreamEvent::ReactionEvent { .. } => "#reactionEvent",
         StreamEvent::InfoEvent { .. } => "#infoEvent",
         StreamEvent::WelcomeReissueRequestedEvent { .. } => "#welcomeReissueRequestedEvent",

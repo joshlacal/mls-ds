@@ -56,6 +56,26 @@ pub enum StreamEvent {
         #[serde(rename = "isTyping")]
         is_typing: bool,
     },
+    /// Clean-chat ephemeral typing DTO. Unlike the legacy `TypingEvent`, this
+    /// event is uncursored and uses the generated `defs#typingEvent` wire tag.
+    /// It intentionally travels through the same per-conversation broadcast
+    /// channel as legacy events; the clean subscription compositor is the
+    /// only consumer that translates it into `SubscriptionMessage`.
+    #[serde(rename = "blue.catbird.chat.defs#typingEvent")]
+    CleanTypingEvent {
+        #[serde(rename = "actorDeviceId")]
+        actor_device_id: catbird_atproto::generated::blue_catbird::chat::DeviceId,
+        #[serde(rename = "actorDid")]
+        actor_did: catbird_atproto::generated::blue_catbird::chat::BareDid,
+        #[serde(rename = "conversationId")]
+        conversation_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
+        #[serde(rename = "expiresAt")]
+        expires_at: catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime,
+        #[serde(rename = "isTyping")]
+        is_typing: bool,
+        #[serde(rename = "typingId")]
+        typing_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
+    },
     #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
     ReactionEvent {
         cursor: String,
@@ -234,13 +254,16 @@ pub fn is_false(v: &bool) -> bool {
 /// live `sse_state.emit` path can broadcast the SAME cursor (subscriber
 /// dedupe via `replayed_cursors` HashSet relies on bit-equal cursors).
 ///
-/// Every variant carries a `cursor: String` field; this helper exists
-/// so callers don't have to enumerate the variants again. Update this
-/// function if you add a new `StreamEvent` variant.
+/// Durable/legacy variants carry a `cursor: String` field; the clean typing
+/// variant is deliberately uncursored and is left unchanged. This helper
+/// exists so callers don't have to enumerate the cursor-bearing variants
+/// again. Update this function if you add a new `StreamEvent` variant.
 pub fn set_stream_event_cursor(event: &mut StreamEvent, new_cursor: String) {
     match event {
         StreamEvent::MessageEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::TypingEvent { cursor, .. } => *cursor = new_cursor,
+        // Clean typing is explicitly uncursored; there is no cursor to set.
+        StreamEvent::CleanTypingEvent { .. } => {}
         StreamEvent::ReactionEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::InfoEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => *cursor = new_cursor,
@@ -252,6 +275,38 @@ pub fn set_stream_event_cursor(event: &mut StreamEvent, new_cursor: String) {
         StreamEvent::GroupResetEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => *cursor = new_cursor,
         StreamEvent::ResetRequestedEvent { cursor, .. } => *cursor = new_cursor,
+    }
+}
+
+impl StreamEvent {
+    /// Return the generated clean-chat typing DTO carried by this shared-bus
+    /// event. Legacy events intentionally return `None`; callers that build a
+    /// clean `SubscriptionMessage` should use this rather than reconstructing
+    /// the DTO from reduced legacy fields.
+    pub(crate) fn clean_typing_payload(
+        &self,
+    ) -> Option<catbird_atproto::generated::blue_catbird::chat::TypingEvent> {
+        match self {
+            Self::CleanTypingEvent {
+                actor_device_id,
+                actor_did,
+                conversation_id,
+                expires_at,
+                is_typing,
+                typing_id,
+            } => Some(
+                catbird_atproto::generated::blue_catbird::chat::TypingEvent {
+                    actor_device_id: actor_device_id.clone(),
+                    actor_did: actor_did.clone(),
+                    conversation_id: conversation_id.clone(),
+                    expires_at: expires_at.clone(),
+                    is_typing: *is_typing,
+                    typing_id: typing_id.clone(),
+                    extra_data: None,
+                },
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -284,6 +339,21 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 did: String,
                 #[serde(rename = "isTyping")]
                 is_typing: bool,
+            },
+            #[serde(rename = "blue.catbird.chat.defs#typingEvent")]
+            CleanTypingEvent {
+                #[serde(rename = "actorDeviceId")]
+                actor_device_id: catbird_atproto::generated::blue_catbird::chat::DeviceId,
+                #[serde(rename = "actorDid")]
+                actor_did: catbird_atproto::generated::blue_catbird::chat::BareDid,
+                #[serde(rename = "conversationId")]
+                conversation_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
+                #[serde(rename = "expiresAt")]
+                expires_at: catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime,
+                #[serde(rename = "isTyping")]
+                is_typing: bool,
+                #[serde(rename = "typingId")]
+                typing_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
             },
             #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
             ReactionEvent {
@@ -462,6 +532,21 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                 convo_id,
                 did,
                 is_typing,
+            },
+            RawStreamEvent::CleanTypingEvent {
+                actor_device_id,
+                actor_did,
+                conversation_id,
+                expires_at,
+                is_typing,
+                typing_id,
+            } => StreamEvent::CleanTypingEvent {
+                actor_device_id,
+                actor_did,
+                conversation_id,
+                expires_at,
+                is_typing,
+                typing_id,
             },
             RawStreamEvent::ReactionEvent {
                 cursor,
@@ -1122,6 +1207,12 @@ pub async fn subscribe_convo_events(
                                 let event_cursor = match &event {
                                     StreamEvent::MessageEvent { cursor, .. } => cursor,
                                     StreamEvent::TypingEvent { cursor, .. } => cursor,
+                                    // Clean-chat typing is ephemeral and has
+                                    // no legacy cursor. The clean compositor
+                                    // consumes it from this same bus; the
+                                    // legacy cursor-based SSE endpoint must
+                                    // not invent one or apply replay rules.
+                                    StreamEvent::CleanTypingEvent { .. } => continue,
                                     StreamEvent::ReactionEvent { cursor, .. } => cursor,
                                     StreamEvent::InfoEvent { cursor, .. } => cursor,
                                     StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor,
@@ -1297,6 +1388,29 @@ mod tests {
             "ephemeral:true should be included, got: {}",
             json
         );
+    }
+
+    #[test]
+    fn clean_typing_keeps_generated_dto_tag_and_all_fields() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "actorDeviceId": "device-a",
+            "actorDid": "did:plc:actor",
+            "conversationId": "convo-a",
+            "expiresAt": "2026-08-16T12:00:08.000Z",
+            "isTyping": true,
+            "typingId": "typing-a"
+        }))
+        .expect("generated clean typing DTO should deserialize on the shared bus");
+
+        let wire = serde_json::to_value(&event).expect("clean typing should serialize");
+        assert_eq!(wire["$type"], "blue.catbird.chat.defs#typingEvent");
+        assert_eq!(wire["actorDeviceId"], "device-a");
+        assert_eq!(wire["actorDid"], "did:plc:actor");
+        assert_eq!(wire["conversationId"], "convo-a");
+        assert_eq!(wire["expiresAt"], "2026-08-16T12:00:08.000Z");
+        assert_eq!(wire["isTyping"], true);
+        assert_eq!(wire["typingId"], "typing-a");
     }
 
     /// Round-trip every `StreamEvent` variant through

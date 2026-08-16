@@ -4053,6 +4053,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
         paging_device(&device),
         &c2,
         &request,
+        None,
         &fence.sealer,
     )
     .await
@@ -4116,6 +4117,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
         paging_device(&device),
         &c2,
         &request,
+        None,
         &fence.sealer,
     )
     .await

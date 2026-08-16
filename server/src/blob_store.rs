@@ -69,6 +69,19 @@ pub struct BlobStore {
 }
 
 impl BlobStore {
+    /// Construct a client for route-harness tests without contacting S3.
+    /// The client is inert until a route reaches an authorized object call.
+    pub fn for_route_tests() -> Self {
+        let config = Builder::new()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8333")
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("route-test", "route-test", None, None, "test"))
+            .force_path_style(true)
+            .build();
+        Self { s3: S3Client::from_conf(config) }
+    }
+
     pub async fn new() -> Self {
         let endpoint =
             std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8333".to_string());
