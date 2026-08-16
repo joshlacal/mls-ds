@@ -24,6 +24,33 @@
 
 mod common;
 
+mod chat_protocol {
+    pub mod dpop {
+        pub struct VerifiedReadAdmission;
+    }
+    pub mod read_authority {
+        pub enum OrdinaryReadEndpoint {}
+        pub enum ReadAuthorityError { Storage }
+        pub struct Attempt;
+        pub struct LockedDevice;
+        pub struct Admission;
+        impl Admission { pub fn into_attempt(self) -> Attempt { Attempt } }
+        pub fn into_single_read_admission(
+            _admission: super::dpop::VerifiedReadAdmission,
+            _endpoint: OrdinaryReadEndpoint,
+        ) -> Result<Admission, ()> { Err(()) }
+        pub async fn lock_read_device_authority_once(
+            _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            _attempt: Attempt,
+        ) -> Result<LockedDevice, ReadAuthorityError> { Err(ReadAuthorityError::Storage) }
+        impl LockedDevice {
+            pub fn user_did(&self) -> &str { "" }
+            pub fn device_id(&self) -> uuid::Uuid { uuid::Uuid::nil() }
+            pub fn auth_generation(&self) -> i64 { 0 }
+        }
+    }
+}
+
 mod repository {
     pub(crate) mod blobs {
         include!(concat!(
