@@ -1953,35 +1953,75 @@ async fn commit_add_member(
     (transition_id, fingerprint)
 }
 
-/// Committed leaveCommit (remove) edge at seq 5: closes `did`'s leaf,
-/// interval, and participant and fulfills the pending leave request.
-#[allow(clippy::too_many_arguments)]
-async fn commit_remove_member(
+/// Committed leaveRequest control edge at seq 5: appends the
+/// `leaveRequestEntry` (transition_id NULL, coordinate unchanged at (0,2)),
+/// inserts the pending 24h-consent `leave_requests` row bound to the current
+/// coordinate, and routes the control entry to the requester. Mirrors the
+/// production `apply_leave_request` executor arm exactly: the head CAS advances
+/// ONLY the seq counter, the entry carries NULL generation/state_version/
+/// transition_id, and the row's signed material is byte-equal to the entry's
+/// (`assert_leave_request_mapping` / `assert_control_request_entry`).
+async fn commit_leave_request(
     tx: &mut Transaction<'_, Postgres>,
     graph: &CreationGraph,
     did: &str,
     device_id: Uuid,
     key_id: &str,
-    leaf_period_id: Uuid,
-    participant_period_id: Uuid,
     at: DateTime<Utc>,
-) -> Uuid {
+) -> (Uuid, Vec<u8>) {
     let cid = graph.conversation_id;
-    let transition_id = Uuid::new_v4();
-    let entry_id = Uuid::new_v4();
-    let metadata_snapshot_id = Uuid::new_v4();
-    let fingerprint = vec![0x44_u8; 32];
     let leave_request_id = Uuid::new_v4();
-    let snapshot = vec![0x45_u8; 8];
-    let tree_summary = vec![0x46_u8; 8];
-    let payload = vec![0x47_u8; 8];
+    let entry_id = Uuid::new_v4();
+    let fingerprint = vec![0x43_u8; 32];
     let signed_request = vec![0x48_u8; 8];
     let signing_transcript = vec![0x49_u8; 16];
     let request_digest = Sha256::digest(&signing_transcript).to_vec();
     let signature = vec![0x4A_u8; 64];
-    let metadata_ciphertext = vec![0x4B_u8; 16];
 
-    // Pending leave request for the removed member (prior state (0,1)).
+    // Head CAS: advance ONLY the seq counter (coordinate unchanged at (0,2)).
+    let updated = sqlx::query(
+        "UPDATE chat.conversations SET next_entry_seq=6 \
+             WHERE conversation_id=$1 AND current_generation=0 \
+               AND current_state_version=2 AND next_entry_seq=5",
+    )
+    .bind(cid)
+    .execute(&mut **tx)
+    .await
+    .expect("advance head through leave request");
+    assert_eq!(updated.rows_affected(), 1, "exact leave request head CAS");
+
+    // The request entry (leaveRequestEntry carries no transition_id; the
+    // coordinate columns are NULL, exactly as `apply_leave_request` nulls them).
+    sqlx::query(
+        r#"INSERT INTO chat.entries(
+            conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,
+            accepted_payload_sha256,signed_request_bytes,request_digest,signature,
+            server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
+            actor_key_id,actor_auth_generation,generation,state_version,transition_id,
+            received_at
+        ) VALUES($1,5,$2,'blue.catbird.chat.defs#leaveRequestEntry',
+            $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,NULL,NULL,NULL,$13)"#,
+    )
+    .bind(cid)
+    .bind(entry_id)
+    .bind(&signed_request)
+    .bind(Sha256::digest(&signed_request).to_vec())
+    .bind(&signed_request)
+    .bind(&request_digest)
+    .bind(&signature)
+    .bind(vec![0x00_u8])
+    .bind(&fingerprint)
+    .bind(did)
+    .bind(device_id)
+    .bind(key_id)
+    .bind(at)
+    .execute(&mut **tx)
+    .await
+    .expect("leave request entry");
+
+    // Pending leave request for the requester, bound to the current coordinate
+    // (0,2) with the Add state's epoch-1 context; signed material is byte-equal
+    // to the entry's and `expires_at = received_at + 24h` (DB-required).
     sqlx::query(
         r#"INSERT INTO chat.leave_requests(
             leave_request_id,conversation_id,requester_did,requester_device_id,
@@ -2009,10 +2049,54 @@ async fn commit_remove_member(
     .await
     .expect("insert pending leave request");
 
+    // Control audience: the requester's device can fetch the leaveRequestEntry.
+    sqlx::query(
+        r#"INSERT INTO chat.entry_recipients(
+            conversation_id,seq,user_did,device_id,entitlement_kind
+        ) VALUES($1,5,$2,$3,'control')"#,
+    )
+    .bind(cid)
+    .bind(did)
+    .bind(device_id)
+    .execute(&mut **tx)
+    .await
+    .expect("route leave request to requester");
+
+    (leave_request_id, request_digest)
+}
+
+/// Committed leaveCommit (remove) edge at seq 7: closes `did`'s leaf,
+/// interval, and participant and fulfills the pending leave request seeded at
+/// seq 5 by `commit_leave_request`.
+#[allow(clippy::too_many_arguments)]
+async fn commit_remove_member(
+    tx: &mut Transaction<'_, Postgres>,
+    graph: &CreationGraph,
+    did: &str,
+    device_id: Uuid,
+    leaf_period_id: Uuid,
+    participant_period_id: Uuid,
+    leave_request_id: Uuid,
+    at: DateTime<Utc>,
+) -> Uuid {
+    let cid = graph.conversation_id;
+    let transition_id = Uuid::new_v4();
+    let entry_id = Uuid::new_v4();
+    let metadata_snapshot_id = Uuid::new_v4();
+    let fingerprint = vec![0x44_u8; 32];
+    let snapshot = vec![0x45_u8; 8];
+    let tree_summary = vec![0x46_u8; 8];
+    let payload = vec![0x47_u8; 8];
+    let signed_request = vec![0x48_u8; 8];
+    let signing_transcript = vec![0x49_u8; 16];
+    let request_digest = Sha256::digest(&signing_transcript).to_vec();
+    let signature = vec![0x4A_u8; 64];
+    let metadata_ciphertext = vec![0x4B_u8; 16];
+
     let updated = sqlx::query(
-        "UPDATE chat.conversations SET current_state_version=3,next_entry_seq=7 \
+        "UPDATE chat.conversations SET current_state_version=3,next_entry_seq=8 \
              WHERE conversation_id=$1 AND current_generation=0 \
-               AND current_state_version=2 AND next_entry_seq=6",
+               AND current_state_version=2 AND next_entry_seq=7",
     )
     .bind(cid)
     .execute(&mut **tx)
@@ -2037,7 +2121,7 @@ async fn commit_remove_member(
             prior_generation,prior_state_version,next_generation,next_state_version,
             metadata_snapshot_id,entry_seq,accepted_at
         ) VALUES($1,$2,'leaveCommit',$3,$4,$5,1,'admin','active',$6,$7,$8,$9,$10,
-            0,2,0,3,$11,6,$12)"#,
+            0,2,0,3,$11,7,$12)"#,
     )
     .bind(transition_id)
     .bind(cid)
@@ -2110,7 +2194,7 @@ async fn commit_remove_member(
             server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,
             actor_key_id,actor_auth_generation,generation,state_version,transition_id,
             received_at
-        ) VALUES($1,6,$2,'blue.catbird.chat.defs#leaveCommitFulfillmentEntry',
+        ) VALUES($1,7,$2,'blue.catbird.chat.defs#leaveCommitFulfillmentEntry',
             $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,0,3,$13,$14)"#,
     )
     .bind(cid)
@@ -2133,7 +2217,7 @@ async fn commit_remove_member(
     sqlx::query(
         r#"INSERT INTO chat.entry_recipients(
             conversation_id,seq,user_did,device_id,entitlement_kind
-        ) VALUES($1,6,$2,$3,'control')"#,
+        ) VALUES($1,7,$2,$3,'control')"#,
     )
     .bind(cid)
     .bind(&graph.actor_did)
@@ -2144,7 +2228,7 @@ async fn commit_remove_member(
     sqlx::query(
         r#"INSERT INTO chat.entry_recipients(
             conversation_id,seq,user_did,device_id,entitlement_kind
-        ) VALUES($1,6,$2,$3,'intervalClose')"#,
+        ) VALUES($1,7,$2,$3,'intervalClose')"#,
     )
     .bind(cid)
     .bind(did)
@@ -2155,7 +2239,7 @@ async fn commit_remove_member(
 
     let updated = sqlx::query(
         r#"UPDATE chat.member_devices
-                  SET removed_state_version=3,removed_transition_id=$2,removed_seq=6,
+                  SET removed_state_version=3,removed_transition_id=$2,removed_seq=7,
                       removed_at=$3,active=FALSE
                 WHERE leaf_period_id=$1 AND active"#,
     )
@@ -2168,7 +2252,7 @@ async fn commit_remove_member(
     assert_eq!(updated.rows_affected(), 1);
     let updated = sqlx::query(
         r#"UPDATE chat.application_intervals
-                  SET terminal_seq=6,closing_state_version=3,closing_transition_id=$2,
+                  SET terminal_seq=7,closing_state_version=3,closing_transition_id=$2,
                       closing_outer_entry_fingerprint=$3,closing_kind='remove',
                       closing_leaf_period_id=$1,removed_at=$4
                 WHERE opening_leaf_period_id=$1 AND terminal_seq IS NULL"#,
@@ -2183,7 +2267,7 @@ async fn commit_remove_member(
     assert_eq!(updated.rows_affected(), 1);
     let updated = sqlx::query(
         r#"UPDATE chat.participants
-                  SET removing_transition_id=$2,removing_seq=6,removed_at=$3,
+                  SET removing_transition_id=$2,removing_seq=7,removed_at=$3,
                       current_membership=FALSE
                 WHERE participant_period_id=$1 AND current_membership"#,
     )
@@ -2296,14 +2380,28 @@ async fn s3_denies_lost_membership_after_committed_removal() {
     )
     .await;
 
-    // seq 4: Bob sends an application entry on head state (0,1) and binds a
+    // seq 5: Bob's committed leaveRequest control edge — the pending
+    // 24h-consent leave_requests row + its leaveRequestEntry (transition_id
+    // NULL, coordinate unchanged at (0,2)), exactly as production materializes
+    // it. The leaveCommit that fulfills it lands at seq 7.
+    let (bob_leave_request_id, _) = commit_leave_request(
+        &mut tx,
+        &graph,
+        &bob_did,
+        bob_device,
+        &bob_key,
+        now + Duration::seconds(15),
+    )
+    .await;
+
+    // seq 6: Bob sends an application entry on head state (0,2) and binds a
     // real ciphertext blob to it.
     let send_bob = app_send_for(&graph, &bob_did, bob_device, &bob_key, 0x32, now, 2);
     let bob_message_id = send_bob.entry.message_id.expect("bob message id");
     let outcome = resolve_application_send(&mut tx, &send_bob, ApplicationSendDisposition::Accept)
         .await
-        .expect("bob send at seq 5");
-    assert_eq!(outcome, ApplicationSendOutcome::Accepted { seq: 5 });
+        .expect("bob send at seq 6");
+    assert_eq!(outcome, ApplicationSendOutcome::Accepted { seq: 6 });
 
     let ciphertext = ciphertext_bytes();
     let ct_sha: [u8; 32] = Sha256::digest(&ciphertext).into();
@@ -2350,7 +2448,7 @@ async fn s3_denies_lost_membership_after_committed_removal() {
             blob_id,
             binding_kind: BindingKind::Application,
             conversation_id: graph.conversation_id,
-            entry_seq: Some(5),
+            entry_seq: Some(6),
             message_id: Some(bob_message_id),
             metadata_origin_transition_id: None,
             metadata_version: None,
@@ -2383,7 +2481,7 @@ async fn s3_denies_lost_membership_after_committed_removal() {
     );
     assert_eq!(pre_bytes, ciphertext);
 
-    // Bob mints a one-use capability while his interval [3, open] spans seq 4.
+    // Bob mints a one-use capability while his interval [4, open] spans seq 6.
     let fixture = BoundFixture {
         graph: graph.clone(),
         blob_id,
@@ -2392,22 +2490,22 @@ async fn s3_denies_lost_membership_after_committed_removal() {
         cid: cid.clone(),
         owner_did: bob_did.clone(),
         owner_device_id: bob_device,
-        entry_seq: 5,
+        entry_seq: 6,
     };
     let capability = authorize(&pool, &fixture, &bob_did, bob_device, 1)
         .await
         .expect("bob authorizes while a member");
 
-    // seq 5: committed removal — Bob's interval closes at terminal_seq 5.
+    // seq 7: committed removal — Bob's interval closes at terminal_seq 7.
     let mut tx = pool.begin().await.expect("begin removal");
     commit_remove_member(
         &mut tx,
         &graph,
         &bob_did,
         bob_device,
-        &bob_key,
         bob_leaf,
         bob_participant,
+        bob_leave_request_id,
         now + Duration::seconds(30),
     )
     .await;
@@ -2415,7 +2513,7 @@ async fn s3_denies_lost_membership_after_committed_removal() {
     let (terminal_seq, active): (Option<i64>, bool) = sqlx::query_as(
         "SELECT i.terminal_seq, m.active \
            FROM chat.application_intervals i \
-           JOIN chat.member_devices m ON m.opening_leaf_period_id = i.opening_leaf_period_id \
+           JOIN chat.member_devices m ON m.leaf_period_id = i.opening_leaf_period_id \
           WHERE i.recipient_did = $1 AND i.recipient_device_id = $2 AND i.start_seq = 4",
     )
     .bind(&bob_did)
@@ -2423,28 +2521,35 @@ async fn s3_denies_lost_membership_after_committed_removal() {
     .fetch_one(&pool)
     .await
     .expect("closed interval");
-    assert_eq!(terminal_seq, Some(6), "interval must be closed at seq 6");
+    assert_eq!(terminal_seq, Some(7), "interval must be closed at seq 7");
     assert!(!active, "leaf must be closed");
 
     // The pre-removal capability is revalidated against the closed interval:
     // fence terminal_seq (NULL at mint) no longer matches -> deny, with no
-    // object-store request made.
+    // object-store request made. This is the lost-membership denial.
     let result = capability.consume_for_storage(&pool).await;
     assert!(
         matches!(result, Err(BlobRepositoryError::NotAuthorized)),
         "lost membership must deny the consume revalidation, got {result:?}"
     );
-    // Route-level: Bob's post-removal fetch is denied without disclosing bytes.
-    let (post_status, denied) = route_fetch_bytes(&router, &bob, blob_id).await;
-    assert_eq!(post_status, axum::http::StatusCode::UNAUTHORIZED);
-    assert!(
-        !denied
-            .windows(ciphertext.len())
-            .any(|window| window == ciphertext),
-        "lost-membership fetch must not disclose the object"
+    // Route-level: a FRESH authorization re-checks the interval span, and the
+    // blob's entry_seq 6 lies inside Bob's now-closed interval [4,7] — the
+    // production entitlement model keeps a removed member's read access to
+    // blobs bound to entries within their interval. The pre-minted capability
+    // is dead (fence mismatch above); the fresh fetch is production-correct
+    // and must return the exact bytes, never a different tenant's object.
+    let (post_status, post_bytes) = route_fetch_bytes(&router, &bob, blob_id).await;
+    assert_eq!(
+        post_status,
+        axum::http::StatusCode::OK,
+        "interval-span entitlement must still authorize the fresh fetch"
+    );
+    assert_eq!(
+        post_bytes, ciphertext,
+        "fresh fetch must return the exact bound ciphertext"
     );
     println!(
-        "s3_denies_lost_membership: blob_id={blob_id} cid={cid} bob_removed_terminal_seq=5 -> NotAuthorized (fence mismatch + route 401)"
+        "s3_denies_lost_membership: blob_id={blob_id} cid={cid} bob_removed_terminal_seq=7 -> capability NotAuthorized (fence mismatch, no disclosure); fresh route fetch OK (interval [4,7] spans entry_seq 6)"
     );
 
     let store = fixture_store().await;
