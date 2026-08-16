@@ -40,12 +40,27 @@ fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
         "chat.event_cursor_receipts",
         "cursor_nonce",
         "cursor_ciphertext",
+        "FOR UPDATE\"#",
+        "device.device_id = ticket.device_id",
     ] {
         assert!(
             source.contains(required),
             "missing G7 repository fragment: {required}"
         );
     }
+}
+
+#[test]
+fn g7_event_receipts_are_immutable_and_single_use_by_hash() {
+    let migration = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/20260729000001_chat_g7_inventory_entitlement.sql"
+    ))
+    .expect("read G7 migration");
+    assert!(migration.contains("cursor_hash BYTEA PRIMARY KEY"));
+    assert!(migration.contains("CREATE TRIGGER event_cursor_receipts_immutable"));
+    assert!(migration.contains("cursor_nonce BYTEA NOT NULL"));
+    assert!(migration.contains("cursor_ciphertext BYTEA NOT NULL"));
 }
 
 use std::sync::Arc;
@@ -55,6 +70,7 @@ use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Barrier;
+use tokio::time::{sleep, Duration as TokioDuration};
 use uuid::Uuid;
 
 use repository::ticket::{
@@ -531,4 +547,84 @@ async fn concurrent_consumes_never_double_claim() {
         wins, 1,
         "exactly one racing consume may claim the one-use ticket"
     );
+}
+
+#[tokio::test]
+async fn consume_serializes_with_exact_device_revocation() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = clock_now(&pool).await;
+    let device = seed_device(&pool, now - Duration::seconds(200)).await;
+    let session = seed_session(
+        &pool,
+        &device,
+        now - Duration::seconds(10),
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let opaque = fresh_blob();
+    let request = mint_request(
+        &device,
+        &session,
+        &opaque,
+        session.capability.clone(),
+        now,
+        now + Duration::seconds(60),
+    );
+    let mut mint = pool.begin().await.expect("begin mint");
+    mint_subscription_ticket(&mut mint, &request)
+        .await
+        .expect("mint");
+    mint.commit().await.expect("commit mint");
+
+    // Hold the exact device row while the consume transaction queues behind
+    // it. Once revocation commits, the consume CAS must lose rather than
+    // claiming a ticket under stale device authority.
+    let mut revoke = pool.begin().await.expect("begin revocation");
+    sqlx::query(
+        "SELECT device_id FROM chat.devices WHERE user_did = $1 AND device_id = $2 FOR UPDATE",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .fetch_one(&mut *revoke)
+    .await
+    .expect("lock exact device");
+
+    let consume_pool = pool.clone();
+    let consume_session = session;
+    let consume_opaque = opaque.clone();
+    let consume = tokio::spawn(async move {
+        let mut transaction = consume_pool.begin().await.expect("begin consume");
+        let result = consume_subscription_ticket(
+            &mut transaction,
+            &ticket_hash(&consume_opaque),
+            &consume_session.capability,
+            SUBSCRIBE_EVENTS_PATH,
+            now,
+        )
+        .await;
+        if result.is_ok() {
+            transaction.commit().await.expect("commit consume");
+        } else {
+            transaction.rollback().await.expect("rollback consume");
+        }
+        result
+    });
+    sleep(TokioDuration::from_millis(25)).await;
+    sqlx::query(
+        "UPDATE chat.devices SET status = 'revoked', revoked_at = $3 WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .bind(now + Duration::seconds(1))
+    .execute(&mut *revoke)
+    .await
+    .expect("revoke locked device");
+    revoke.commit().await.expect("commit revocation");
+
+    let result = consume.await.expect("join consume");
+    assert!(matches!(
+        result,
+        Err(TicketRepositoryError::DeviceBindingMismatch)
+    ));
 }

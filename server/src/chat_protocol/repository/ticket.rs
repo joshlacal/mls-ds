@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
+use std::fmt;
 use uuid::Uuid;
 
 /// The exact subscription path a clean-chat ticket authorizes.
@@ -52,7 +53,7 @@ impl From<sqlx::Error> for TicketRepositoryError {
 /// caller-supplied event position, cursor bytes, protocol, key, or retention
 /// floor cross this boundary: all of those values come from the locked
 /// inventory session row.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct MintSubscriptionTicket {
     pub(crate) ticket_hash: Vec<u8>,
     pub(crate) user_did: String,
@@ -64,6 +65,24 @@ pub(crate) struct MintSubscriptionTicket {
     pub(crate) subscription_path: String,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for MintSubscriptionTicket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MintSubscriptionTicket")
+            .field("ticket_hash", &"REDACTED")
+            .field("user_did", &self.user_did)
+            .field("device_id", &self.device_id)
+            .field("jkt", &"REDACTED")
+            .field("auth_generation", &self.auth_generation)
+            .field("inventory_session_id", &"REDACTED")
+            .field("event_cursor", &"REDACTED")
+            .field("subscription_path", &self.subscription_path)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// The durable fence and lifetime returned after minting.
@@ -255,6 +274,40 @@ pub(crate) async fn consume_subscription_ticket(
         return Err(TicketRepositoryError::PathMismatch);
     }
 
+    // Serialize consumption with both the ticket row and its exact device
+    // row. The device lock closes the revocation/auth-generation race between
+    // the active-device check and the consumed_at CAS.
+    if let Some(ticket) = sqlx::query(
+        r#"SELECT user_did, device_id, jkt, auth_generation
+             FROM chat.subscription_tickets
+            WHERE ticket_hash = $1
+            FOR UPDATE"#,
+    )
+    .bind(ticket_hash.as_slice())
+    .fetch_optional(&mut **transaction)
+    .await?
+    {
+        let user_did: String = ticket.try_get("user_did")?;
+        let device_id: Uuid = ticket.try_get("device_id")?;
+        let jkt: String = ticket.try_get("jkt")?;
+        let auth_generation: i64 = ticket.try_get("auth_generation")?;
+        let _device_lock = sqlx::query(
+            r#"SELECT device_id
+                 FROM chat.devices
+                WHERE user_did = $1
+                  AND device_id = $2
+                  AND dpop_jkt = $3
+                  AND auth_generation = $4
+                FOR UPDATE"#,
+        )
+        .bind(user_did)
+        .bind(device_id)
+        .bind(jkt)
+        .bind(auth_generation)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    }
+
     let updated = sqlx::query(
         r#"
         UPDATE chat.subscription_tickets AS ticket
@@ -386,25 +439,33 @@ pub(crate) struct NewEventCursorReceipt {
     pub(crate) expires_at: DateTime<Utc>,
 }
 
+impl NewEventCursorReceipt {
+    fn validate(&self) -> Result<(), TicketRepositoryError> {
+        if self.cursor_hash == [0; HASH_BYTES]
+            || self
+                .predecessor_cursor_hash
+                .is_some_and(|hash| hash == [0; HASH_BYTES])
+            || self
+                .canonical_envelope_sha256
+                .is_some_and(|hash| hash == [0; HASH_BYTES])
+            || self.cursor_nonce == [0; NONCE_BYTES]
+            || self.cursor_ciphertext.len() < 17
+            || self.cursor_ciphertext.len() > MAX_SEALED_CIPHERTEXT_BYTES
+            || self.created_at >= self.expires_at
+        {
+            return Err(TicketRepositoryError::InvalidReceipt);
+        }
+        Ok(())
+    }
+}
+
 /// Persist one sealed event-cursor receipt. Chain ordering, session binding,
 /// and immutable-history rules remain enforced by the G7 database triggers.
 pub(crate) async fn insert_event_cursor_receipt(
     transaction: &mut Transaction<'_, Postgres>,
     receipt: &NewEventCursorReceipt,
 ) -> Result<(), TicketRepositoryError> {
-    if receipt.cursor_hash == [0; HASH_BYTES]
-        || receipt
-            .predecessor_cursor_hash
-            .is_some_and(|hash| hash == [0; HASH_BYTES])
-        || receipt
-            .canonical_envelope_sha256
-            .is_some_and(|hash| hash == [0; HASH_BYTES])
-        || receipt.cursor_ciphertext.is_empty()
-        || receipt.cursor_ciphertext.len() > MAX_SEALED_CIPHERTEXT_BYTES
-        || receipt.created_at >= receipt.expires_at
-    {
-        return Err(TicketRepositoryError::InvalidReceipt);
-    }
+    receipt.validate()?;
 
     sqlx::query(
         r#"
@@ -495,5 +556,62 @@ mod tests {
         ));
         assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
         assert!(!source.contains(concat!("event_cursor_", "bytes")));
+    }
+
+    #[test]
+    fn mint_request_debug_redacts_bearer_material() {
+        let request = MintSubscriptionTicket {
+            ticket_hash: vec![0xA5; 32],
+            user_did: "did:plc:example".to_owned(),
+            device_id: Uuid::nil(),
+            jkt: "secret-jkt".to_owned(),
+            auth_generation: 7,
+            inventory_session_id: "session-capability-secret".to_owned(),
+            event_cursor: "event-capability-secret".to_owned(),
+            subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
+            created_at: Utc::now(),
+            expires_at: Utc::now(),
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("A5"));
+        assert!(!debug.contains("secret-jkt"));
+        assert!(!debug.contains("session-capability-secret"));
+        assert!(!debug.contains("event-capability-secret"));
+        assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn sealed_receipt_boundary_rejects_nonce_reuse_shapes() {
+        let now = Utc::now();
+        let mut receipt = NewEventCursorReceipt {
+            cursor_hash: [1; 32],
+            inventory_session_id: Uuid::new_v4(),
+            user_did: "did:plc:example".to_owned(),
+            device_id: Uuid::new_v4(),
+            jkt: "jkt".to_owned(),
+            auth_generation: 1,
+            protocol_instance_id: Uuid::new_v4(),
+            cursor_key_id: "key".to_owned(),
+            event_position: 1,
+            predecessor_cursor_hash: None,
+            retained_floor_at_issue: 0,
+            cursor_nonce: [1; 12],
+            cursor_ciphertext: vec![2; 17],
+            canonical_envelope_sha256: None,
+            created_at: now,
+            expires_at: now + chrono::Duration::minutes(1),
+        };
+        assert!(receipt.validate().is_ok());
+        receipt.cursor_nonce = [0; 12];
+        assert!(matches!(
+            receipt.validate(),
+            Err(TicketRepositoryError::InvalidReceipt)
+        ));
+        receipt.cursor_nonce = [1; 12];
+        receipt.cursor_ciphertext = vec![2; 16];
+        assert!(matches!(
+            receipt.validate(),
+            Err(TicketRepositoryError::InvalidReceipt)
+        ));
     }
 }
