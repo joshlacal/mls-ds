@@ -31,6 +31,8 @@ pub(crate) mod expiry_sweep;
 // they were already compiled, so this is behaviour-neutral for production; it
 // only additionally makes them available to the test configuration.
 pub(crate) mod delivery;
+#[cfg(not(test))]
+pub(crate) mod entry_read;
 // `device_directory` (Task 4 / seal 2b) is the read-only deviceView/
 // addressableDevice/ownDeviceView projection surface (key identity + pinned
 // capability + live key-package counts) the H1 device handlers need for their

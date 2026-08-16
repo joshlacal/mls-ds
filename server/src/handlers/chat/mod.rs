@@ -27,6 +27,8 @@ mod errors;
 #[cfg(not(test))]
 mod expiry_worker;
 mod get_devices;
+#[cfg(not(test))]
+mod get_entries;
 mod get_own_devices;
 mod rebind_device_authentication;
 #[cfg(not(test))]
@@ -103,6 +105,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::RequestLeafRecovery
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
+                | ChatEndpoint::GetEntries
         )
     }
     #[cfg(test)]
@@ -172,6 +175,10 @@ where
         .route(
             &xrpc_path(ChatEndpoint::SubmitTransition),
             post(submit_transition::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetEntries),
+            get(get_entries::handle),
         );
     router
 }

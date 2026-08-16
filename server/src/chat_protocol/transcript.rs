@@ -3044,6 +3044,98 @@ impl CanonicalControlEntryProducts {
     }
 }
 
+/// Reconstruct the generated control-entry JSON from the canonical persisted
+/// signed wrapper and server-fields DAG-CBOR. This is a read-only projection:
+/// persisted rows have already passed the transition executor's verification;
+/// this seam only re-applies the closed lexicon's generated JSON byte rules.
+pub(crate) fn persisted_control_entry_response_json(
+    entry_kind: &str,
+    entry_id: &str,
+    conversation_id: &str,
+    seq: u64,
+    received_at: &str,
+    signed_request_bytes: &[u8],
+    server_fields_bytes: &[u8],
+) -> Result<Vec<u8>, AuthPrimitiveError> {
+    let kind = ControlEntryKind::from_type_id(entry_kind)
+        .ok_or_else(|| AuthPrimitiveError::invalid("persisted control kind"))?;
+    let signed = decode_canonical_signed_mutation(signed_request_bytes)?;
+    if signed.kind() != kind.signed_kind() {
+        return Err(AuthPrimitiveError::invalid("persisted control signed kind"));
+    }
+    let raw_server_fields = decode_canonical_raw_cbor(server_fields_bytes)?;
+    let server_fields = match kind.server_field() {
+        None => {
+            if !matches!(raw_server_fields, RawCbor::Map(ref fields) if fields.is_empty()) {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            }
+            SchemaValue::Object(serde_json::Map::new())
+        }
+        Some(field) => {
+            let definition_name = if field == "recovery" {
+                "leafRecoveryView"
+            } else {
+                "conversationCloseTombstone"
+            };
+            let raw = cbor_schema_to_raw_json(
+                definition(definition_name)?,
+                &raw_server_fields,
+                Some(definition_name),
+                false,
+            )?;
+            SchemaValue::Object(serde_json::Map::from_iter([(
+                field.to_owned(),
+                raw_json_value(&raw),
+            )]))
+        }
+    };
+    let signed_request: SchemaValue = serde_json::from_slice(signed_request_bytes)
+        .map_err(|_| AuthPrimitiveError::invalid("persisted control signed JSON"))?;
+    let mut object = serde_json::Map::from_iter([
+        (
+            "$type".to_owned(),
+            SchemaValue::String(entry_kind.to_owned()),
+        ),
+        (
+            "conversationId".to_owned(),
+            SchemaValue::String(conversation_id.to_owned()),
+        ),
+        (
+            "entryId".to_owned(),
+            SchemaValue::String(entry_id.to_owned()),
+        ),
+        (
+            "receivedAt".to_owned(),
+            SchemaValue::String(received_at.to_owned()),
+        ),
+        ("seq".to_owned(), SchemaValue::Number(seq.into())),
+        ("signedRequest".to_owned(), signed_request),
+    ]);
+    let SchemaValue::Object(fields) = server_fields else {
+        unreachable!()
+    };
+    object.extend(fields);
+    serde_json::to_vec(&SchemaValue::Object(object))
+        .map_err(|_| AuthPrimitiveError::invalid("persisted control response JSON"))
+}
+
+fn raw_json_value(value: &RawJson) -> SchemaValue {
+    match value {
+        RawJson::String(value) => SchemaValue::String(value.clone()),
+        RawJson::Integer(value) => SchemaValue::Number((*value).into()),
+        RawJson::Bool(value) => SchemaValue::Bool(*value),
+        RawJson::Array(values) => SchemaValue::Array(values.iter().map(raw_json_value).collect()),
+        RawJson::Object(values) => SchemaValue::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), raw_json_value(value)))
+                .collect(),
+        ),
+    }
+}
+
 /// Seals an already verified mutation with repository-allocated row identity
 /// and the request's one trusted instant. No raw signed wrapper, signature, or
 /// caller-selected fingerprint enters this path.
