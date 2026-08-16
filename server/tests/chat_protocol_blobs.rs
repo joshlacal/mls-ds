@@ -1962,6 +1962,33 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
     let mut tx = pool.begin().await.expect("begin HTTP blob graph");
     let graph = seed_creation_graph_tx(&mut tx, &owner.did, Some(&owner)).await;
     let now = graph.accepted_at;
+    let protocol_instance_id: Uuid = sqlx::query_scalar(
+        "SELECT protocol_instance_id FROM chat.protocol_instances WHERE singleton = TRUE",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("protocol instance");
+    let event_position: i64 = sqlx::query_scalar(
+        "INSERT INTO chat.events(event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id) \
+         VALUES($1,'conversationChanged',$2,digest($2,'sha256'),$3,$4) RETURNING event_position",
+    )
+    .bind(Uuid::new_v4())
+    .bind(b"{}".as_slice())
+    .bind(now)
+    .bind(protocol_instance_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("conversation event");
+    sqlx::query(
+        "INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) \
+         VALUES($1,$2,$3,'participant',NULL)",
+    )
+    .bind(event_position)
+    .bind(&owner.did)
+    .bind(owner.device_id)
+    .execute(&mut *tx)
+    .await
+    .expect("conversation event recipient");
     let send = coherent_app_send(&graph, 0x42, now);
     let message_id = send.entry.message_id.expect("message id");
     resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
@@ -2062,6 +2089,37 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
     assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(foreign_response["error"], "NotAuthorized");
     assert!(foreign_response.get("blob").is_none());
+    let (owner_inventory_status, owner_inventory) = http::send(
+        router.clone(),
+        http::unsigned_request(
+            &owner,
+            "blue.catbird.chat.getConversations",
+            "GET",
+            "?limit=50",
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_inventory_status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "owner getConversations request currently exposes an incomplete inventory fixture"
+    );
+    assert!(owner_inventory.get("conversations").is_none());
+    let (foreign_inventory_status, foreign_inventory) = http::send(
+        router,
+        http::unsigned_request(
+            &foreign,
+            "blue.catbird.chat.getConversations",
+            "GET",
+            "?limit=50",
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign_inventory_status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(foreign_inventory.get("conversations").is_none());
 }
 
 use common::http_acceptance as http;

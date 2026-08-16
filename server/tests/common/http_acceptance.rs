@@ -318,6 +318,7 @@ pub fn websocket_request(nsid: &str, query: &str) -> Request<Body> {
         .method("GET")
         .uri(format!("/xrpc/{nsid}{query}"))
         .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
         .header("sec-websocket-key", "x3JJHMbDL1EzLkh9GBhXDw==")
         .header("sec-websocket-version", "13")
         .body(Body::empty())

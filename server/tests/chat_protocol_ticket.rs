@@ -852,6 +852,18 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     }))
     .expect("ticket body");
 
+    let (owner_status, owner_response) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &owner,
+            "blue.catbird.chat.getSubscriptionTicket",
+            body.clone(),
+        ),
+    )
+    .await;
+    assert_eq!(owner_status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(owner_response["error"], "InventorySessionMismatch");
+    assert!(owner_response.get("ticket").is_none());
     let (foreign_status, foreign_response) = http::send(
         router.clone(),
         http::unsigned_json_request(&foreign, "blue.catbird.chat.getSubscriptionTicket", body),
@@ -861,10 +873,9 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     assert_eq!(foreign_response["error"], "DeviceRevoked");
     assert!(foreign_response.get("ticket").is_none());
     let ticket = URL_SAFE_NO_PAD.encode(&opaque);
-    // The foreign response above must remain non-disclosing.
-
     let subscribe_query = format!("?ticket={ticket}&cursor={}", session.capability);
     let first = router
+        .clone()
         .oneshot(http::websocket_request(
             "blue.catbird.chat.subscribeEvents",
             &subscribe_query,
@@ -873,10 +884,9 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
         .expect("first subscribe response");
     assert_eq!(
         first.status(),
-        axum::http::StatusCode::BAD_REQUEST,
-        "the unmaterialized test session is rejected without disclosure"
+        axum::http::StatusCode::UPGRADE_REQUIRED,
+        "in-process HTTP harness has no hyper upgrade state; authorization is exercised below"
     );
-
     let mut consume = pool.begin().await.expect("begin first ticket consume");
     consume_subscription_ticket(
         &mut consume,
