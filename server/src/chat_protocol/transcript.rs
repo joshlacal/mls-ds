@@ -3079,9 +3079,22 @@ pub(crate) fn persisted_control_entry_response_json(
             } else {
                 "conversationCloseTombstone"
             };
+            let RawCbor::Map(fields) = &raw_server_fields else {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            };
+            if fields.len() != 1 {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            }
+            let field_value = fields
+                .get(field)
+                .ok_or_else(|| AuthPrimitiveError::invalid("persisted control server field"))?;
             let raw = cbor_schema_to_raw_json(
                 definition(definition_name)?,
-                &raw_server_fields,
+                field_value,
                 Some(definition_name),
                 false,
             )?;
