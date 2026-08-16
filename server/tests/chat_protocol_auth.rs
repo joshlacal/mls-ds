@@ -691,6 +691,57 @@ fn all_frozen_signed_mutation_contracts_have_owned_type_and_domain() {
 }
 
 #[test]
+fn blob_upload_preparation_projection_requires_exact_media_metadata() {
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+        "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\u{0000}",
+        "blobId": CHAT_INSTANCE,
+        "conversationId": CHAT_INSTANCE,
+        "actorDid": DID,
+        "actorDeviceId": DEVICE_ID,
+        "keyId": KEY_ID,
+        "authGeneration": 1,
+        "prior": {
+            "conversationId": CHAT_INSTANCE,
+            "generation": 0,
+            "stateVersion": 0,
+            "groupId": STANDARD.encode([1_u8; 32]),
+            "epoch": 0,
+            "groupContextHash": STANDARD.encode([2_u8; 32]),
+            "confirmationTag": STANDARD.encode([3_u8; 32]),
+            "lifecycle": "active"
+        },
+        "ciphertextSha256": STANDARD.encode([4_u8; 32]),
+        "ciphertextSize": 17,
+        "mediaType": "image/png",
+        "plaintextSize": 1,
+        "purpose": "attachment",
+        "idempotencyKey": TOKEN_JTI,
+        "signedAt": "2026-07-22T14:05:09.123Z"
+    });
+    let wrapper = |body: Value| {
+        json!({
+            "body": body,
+            "signature": STANDARD.encode([0_u8; 64])
+        })
+    };
+
+    assert!(
+        decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper(body.clone())).unwrap())
+            .is_ok()
+    );
+    for field in ["mediaType", "plaintextSize"] {
+        let mut missing = body.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            decode_canonical_signed_mutation(&serde_json::to_vec(&wrapper(missing)).unwrap())
+                .is_err(),
+            "accepted missing required {field}"
+        );
+    }
+}
+
+#[test]
 fn canonical_participant_changes_reject_reversal_and_duplicates_instead_of_sorting() {
     let low = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     let high = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
