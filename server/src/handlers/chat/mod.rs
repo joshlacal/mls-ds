@@ -53,7 +53,9 @@ mod welcome;
 
 use errors::ChatFailure;
 #[cfg(not(test))]
-pub use expiry_worker::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
+pub use expiry_worker::{
+    run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
+};
 pub use runtime::ChatRuntime;
 
 /// Build the isolated `blue.catbird.chat.*` router. Generic over the

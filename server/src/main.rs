@@ -933,10 +933,12 @@ async fn main() -> anyhow::Result<()> {
     if chat_runtime.cutover_enabled() {
         let chat_expiry_pool = db_pool.clone();
         let chat_expiry_runtime = chat_runtime.clone();
+        let chat_expiry_blob_store = blob_store.clone();
         tokio::spawn(async move {
-            catbird_server::handlers::chat::run_chat_expiry_sweeper(
+            catbird_server::handlers::chat::run_chat_expiry_sweeper_with_blob_store(
                 chat_expiry_pool,
                 chat_expiry_runtime,
+                chat_expiry_blob_store,
             )
             .await;
         });

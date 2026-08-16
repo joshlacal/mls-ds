@@ -173,6 +173,16 @@ async fn prepare_blob_upload_inner(
     };
     let blob_id = uuid_from_canonical(projection.blob_id(), PREPARE)?;
     let conversation_id = uuid_from_canonical(projection.conversation_id(), PREPARE)?;
+    // Preparation reserves storage only; it does not advance a conversation
+    // head. Still bind the signed prior to the explicit conversation id here.
+    // The send/bind compositor performs the stronger remaining coordinate/head
+    // check when the blob becomes message data.
+    if uuid_from_canonical(projection.prior_conversation_id(), PREPARE)? != conversation_id {
+        return Err(ChatFailure::protocol(
+            PREPARE,
+            ChatProtocolErrorCode::InvalidRequest,
+        ));
+    }
     let purpose = parse_purpose(projection.purpose())?;
     let media_type = BlobMediaType::parse(projection.media_type())
         .ok_or_else(|| ChatFailure::protocol(PREPARE, ChatProtocolErrorCode::InvalidRequest))?;

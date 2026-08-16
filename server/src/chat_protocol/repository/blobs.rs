@@ -356,7 +356,11 @@ pub(crate) fn derive_blob_cid(blob_id: Uuid, ciphertext_sha256: &[u8; 32]) -> St
     hex::encode(digest.finalize())
 }
 
-fn object_store_key_matches(blob_id: Uuid, ciphertext_sha256: &[u8; 32], key: &str) -> bool {
+pub(crate) fn object_store_key_matches(
+    blob_id: Uuid,
+    ciphertext_sha256: &[u8; 32],
+    key: &str,
+) -> bool {
     key == derive_blob_cid(blob_id, ciphertext_sha256)
 }
 
