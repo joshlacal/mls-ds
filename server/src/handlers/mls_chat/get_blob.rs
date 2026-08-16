@@ -4,11 +4,8 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-use tracing::{error, warn};
 
 use crate::{auth::AuthUser, blob_store::BlobStore, storage::DbPool};
-
-const NSID: &str = "blue.catbird.mlsChat.getBlob";
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -35,56 +32,26 @@ pub async fn get_blob(
     auth_user: AuthUser,
     Query(params): Query<GetBlobParams>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    if let Err(_e) = crate::auth::enforce_standard(&auth_user.claims, NSID) {
-        error!("❌ [getBlob] Unauthorized");
-        return Err(StatusCode::UNAUTHORIZED);
+    // The legacy blob table path has no transaction-bound device/interval
+    // capability and must not be treated as an authorization implementation.
+    // Keep the route fail-closed until it is composed from
+    // `authorize_blob_read -> PendingAuthorizedBlobFetch::publicize ->
+    // BlobStore::get_authorized`.
+    let _ = (pool, blob_store, auth_user, params);
+    Err::<axum::response::Response, _>(StatusCode::NOT_IMPLEMENTED)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn legacy_get_route_is_fail_closed() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/handlers/mls_chat/get_blob.rs"
+        ));
+        assert!(source.contains("NOT_IMPLEMENTED"));
+        assert!(!source.contains(&["blob_store", ".get(&"].concat()));
+        assert!(!source
+            .contains(&["crate::middleware::mls_auth::", "verify_group_membership("].concat()));
     }
-
-    // Look up blob metadata: existence, expiry, and owning conversation
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT convo_id FROM blobs WHERE id = $1 AND deleted_at IS NULL AND expires_at > now()",
-    )
-    .bind(&params.blob_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| {
-        error!("❌ [getBlob] DB error checking blob: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let convo_id = match row {
-        Some((cid,)) => cid,
-        None => {
-            warn!(
-                "❌ [getBlob] Blob not found or expired: {}",
-                crate::crypto::redact_for_log(&params.blob_id)
-            );
-            return Err(StatusCode::NOT_FOUND);
-        }
-    };
-
-    // Verify requester is a member of the blob's conversation
-    if let Err(e) =
-        crate::middleware::mls_auth::verify_group_membership(&auth_user.did, &convo_id, &pool).await
-    {
-        warn!(
-            "❌ [getBlob] {} not a member of convo {} for blob {}: {}",
-            crate::crypto::redact_for_log(&auth_user.did),
-            crate::crypto::redact_for_log(&convo_id),
-            crate::crypto::redact_for_log(&params.blob_id),
-            e
-        );
-        return Err(StatusCode::FORBIDDEN);
-    }
-
-    // Fetch from S3
-    let data = blob_store.get(&params.blob_id).await.map_err(|e| {
-        error!("❌ [getBlob] S3 fetch failed: {}", e);
-        StatusCode::NOT_FOUND
-    })?;
-
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        data,
-    ))
 }

@@ -230,6 +230,13 @@ fn random_ref() -> Vec<u8> {
     bytes
 }
 
+fn deterministic_object_key(blob_id: Uuid, ciphertext_sha256: &[u8]) -> String {
+    let hash: [u8; 32] = ciphertext_sha256
+        .try_into()
+        .expect("ciphertext hash is exactly 32 bytes");
+    repository::blobs::derive_blob_cid(blob_id, &hash)
+}
+
 async fn clock_now(tx: &mut Transaction<'_, Postgres>) -> DateTime<Utc> {
     sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut **tx)
@@ -375,7 +382,7 @@ async fn prepare_upload_delete_lifecycle_keeps_usage_reconciled() {
         ciphertext_size,
         &ticket_hash,
         now + Duration::seconds(30),
-        "objectstore/key/one",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete upload");
@@ -438,7 +445,7 @@ async fn upload_ticket_is_single_use_and_expires_after_five_minutes() {
         ciphertext_size,
         &ticket_hash,
         now + Duration::seconds(60),
-        "objectstore/key/single-use",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("first upload");
@@ -533,7 +540,7 @@ async fn unbound_blobs_expire_after_one_hour_and_release_quota() {
         completed_ct,
         &completed_ticket,
         now - Duration::minutes(129),
-        "objectstore/key/expiring",
+        &deterministic_object_key(completed_id, &completed.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -614,7 +621,7 @@ async fn two_senders_race_to_bind_one_blob_and_exactly_one_wins() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/race",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -709,7 +716,7 @@ async fn only_the_signing_owner_device_may_delete_a_completed_unbound_blob() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/owner-delete",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1105,7 +1112,7 @@ async fn descriptor_and_aad_bytes_are_stored_opaquely_without_inner_parsing() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/opaque",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1376,7 +1383,7 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
         ct,
         &ticket,
         uploaded_at,
-        "objectstore/key/attach",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1415,7 +1422,10 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
         .expect("exact device sees the attachment");
     assert_eq!(view.blob_id, blob_id);
     assert_eq!(view.entry_seq, 2);
-    assert_eq!(view.object_store_key, "objectstore/key/attach");
+    assert_eq!(
+        view.object_store_key,
+        deterministic_object_key(blob_id, &request.ciphertext_sha256)
+    );
     assert_eq!(view.descriptor_bytes, descriptor_bytes);
     assert_eq!(view.aad_bytes, aad_bytes);
 
@@ -1487,7 +1497,7 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
         ct,
         &ticket,
         uploaded_at,
-        "objectstore/key/pred",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");

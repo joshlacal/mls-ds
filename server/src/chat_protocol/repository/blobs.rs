@@ -32,8 +32,14 @@
 // never opens its own transaction. Caller-supplied timestamps only — never
 // `NOW()`.
 
+use std::{
+    fmt,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
 use chrono::{DateTime, Utc};
-use sqlx::{Postgres, Transaction};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 /// Ciphertext including the 16-byte AEAD tag is at most 10 MiB.
@@ -42,61 +48,321 @@ pub(crate) const MAX_CIPHERTEXT_BYTES: i64 = 10 * 1024 * 1024;
 pub(crate) const MAX_AUDIO_CIPHERTEXT_BYTES: i64 = 8 * 1024 * 1024;
 /// The AEAD tag width: `ciphertextSize == plaintextSize + 16` for every blob.
 pub(crate) const AEAD_TAG_BYTES: i64 = 16;
+/// Capability lifetime after authorization commits. Storage consumption must
+/// happen immediately; this is a second fence against queued/stale tokens.
+pub(crate) const AUTHORIZED_FETCH_TTL: chrono::Duration = chrono::Duration::seconds(30);
 
 /// Failures the blob writers surface to the composing caller.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum BlobRepositoryError {
     /// A database error escaped the transaction (including CHECK / FK / UNIQUE
     /// violations the caller did not specifically expect). The row-shape
     /// authority is the schema; an unexpected violation propagates verbatim.
+    #[error("database error: {0}")]
     Database(sqlx::Error),
     /// A compare-and-set matched no row: the stored row's compared columns did
     /// not equal the expected pre-state (a wrong status, a wrong owner, an
     /// already-terminalized blob, or a consumed ticket). Changing nothing is a
     /// conflict, not a silent success.
+    #[error("blob compare-and-set conflict")]
     CompareAndSetConflict,
     /// `chat.blobs` primary key collision — the caller reused a blob id.
+    #[error("blob already exists")]
     BlobAlreadyExists,
     /// `chat.blob_upload_tickets` collision — a duplicate ticket hash or a second
     /// ticket for one blob.
+    #[error("upload ticket conflict")]
     TicketConflict,
     /// A second binding raced for the same blob or the same application entry and
     /// lost the `chat.blob_bindings` PK / `_application_entry_uq` unique index.
+    #[error("blob binding conflict")]
     BindingConflict,
     /// The owner's maintained `chat.blob_usage` would exceed the 500 MiB / 100
     /// live-unbound ceilings (`blob_usage_caps_check`).
+    #[error("blob quota exceeded")]
     QuotaExceeded,
     /// A single device exceeded its active-blob ceiling
     /// (`assert_blob_device_active_cap`).
+    #[error("device active blob cap exceeded")]
     DeviceActiveCapExceeded,
     /// The requested media type is not permitted for the requested purpose
     /// (`blobs_media_type_check`): audio and `image/gif` are attachment-only, and
     /// the metadata-avatar contract is never widened.
+    #[error("media type not allowed for purpose")]
     MediaTypeNotAllowedForPurpose,
     /// `ciphertextSize != plaintextSize + 16` — the fixed AEAD-tag relation the
     /// delivery service enforces without decrypting.
+    #[error("ciphertext/plaintext size relation invalid")]
     CiphertextSizeRelation,
     /// Ciphertext exceeds the 10 MiB (or 8 MiB audio) ceiling.
+    #[error("ciphertext too large")]
     CiphertextTooLarge,
     /// Plaintext size is below the `>= 1` floor.
+    #[error("plaintext size invalid")]
     PlaintextSizeInvalid,
     /// The signed binding fragment/purpose does not match its kind: an
     /// application send accepts only `#applicationAttachmentBinding`
     /// (purpose=attachment) and a metadata snapshot only
     /// `#metadataAvatarBinding` (purpose=metadata).
+    #[error("blob purpose/binding mismatch")]
     PurposeBindingMismatch,
     /// A bound blob reachable through an application binding had a NULL
     /// `object_store_key`. The `blobs_status_shape_check` guarantees a `bound`
     /// blob carries its object key, so a NULL here is a storage-invariant
     /// violation (corruption), never a "missing optional" — it is surfaced as a
     /// hard error rather than silently coerced to an empty key.
+    #[error("object-store identity missing")]
     ObjectStoreKeyMissing,
+    #[error("object-store key is not the deterministic blob CID")]
+    ObjectStoreIdentityMismatch,
+    /// The caller's exact device/auth-generation is not an active device.
+    #[error("blob read not authorized")]
+    NotAuthorized,
+    /// A bound blob is outside its live unbound window or has terminalized.
+    #[error("blob expired")]
+    BlobExpired,
+    /// A post-commit capability was presented to a different transaction.
+    #[error("authorization transaction binding mismatch")]
+    TransactionBindingMismatch,
+    /// A post-commit capability was consumed more than once.
+    #[error("authorized fetch already consumed")]
+    FetchAlreadyConsumed,
+    /// Commit failed after an authorization snapshot was prepared.
+    #[error("authorization commit failed: {0}")]
+    Commit(sqlx::Error),
 }
 
 impl From<sqlx::Error> for BlobRepositoryError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(error)
     }
+}
+
+/// Request material for the repository-owned blob-read authorization.
+/// `auth_generation` is deliberately supplied by the verified request and is
+/// matched against the live device row inside the same transaction.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthorizeBlobReadRequest {
+    pub(crate) blob_id: Uuid,
+    pub(crate) caller_did: String,
+    pub(crate) caller_device_id: Uuid,
+    pub(crate) auth_generation: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobMembershipFence {
+    conversation_id: Uuid,
+    interval_start_seq: Option<i64>,
+    interval_terminal_seq: Option<i64>,
+    entry_seq: Option<i64>,
+}
+
+/// Physical identity sealed into an authorized read. Fields are private so a
+/// handler cannot extract an object-store key and bypass `BlobStore`.
+#[derive(Clone)]
+pub(crate) struct BlobStorageRequest {
+    object_store_key: String,
+    derived_cid: String,
+    expected_size: i64,
+    expected_sha256: [u8; 32],
+    media_type: String,
+}
+
+impl fmt::Debug for BlobStorageRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlobStorageRequest")
+            .field("expected_size", &self.expected_size)
+            .field("media_type", &self.media_type)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BlobStorageRequest {
+    pub(crate) fn object_store_key(&self) -> &str {
+        &self.object_store_key
+    }
+
+    pub(crate) fn derived_cid(&self) -> &str {
+        &self.derived_cid
+    }
+
+    pub(crate) fn expected_size(&self) -> i64 {
+        self.expected_size
+    }
+
+    pub(crate) fn expected_sha256(&self) -> &[u8; 32] {
+        &self.expected_sha256
+    }
+
+    pub(crate) fn media_type(&self) -> &str {
+        &self.media_type
+    }
+}
+
+/// The only value that may cross from authorization into a handler. It is
+/// intentionally not `Clone`: an authorized fetch must be moved to storage.
+/// The atomic guard additionally makes accidental borrowed re-use fail closed.
+#[must_use = "an authorized blob fetch must be consumed by BlobStore"]
+pub(crate) struct AuthorizedBlobFetch {
+    storage: BlobStorageRequest,
+    consumed: AtomicBool,
+    // Retain the binding digest and exact auth fence in the capability. They
+    // are not exposed to handlers, but make the capability's identity explicit
+    // and keep future storage adapters from weakening the binding.
+    binding_digest: [u8; 32],
+    blob_id: Uuid,
+    caller_did: String,
+    caller_device_id: Uuid,
+    auth_generation: i64,
+    revocation_id: Option<Uuid>,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    membership_fence: BlobMembershipFence,
+}
+
+impl std::fmt::Debug for AuthorizedBlobFetch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedBlobFetch")
+            .field("caller_device_id", &self.caller_device_id)
+            .field("auth_generation", &self.auth_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthorizedBlobFetch {
+    /// Revalidate and atomically consume the one-use capability immediately
+    /// before a storage adapter is allowed to read. The repository obtains
+    /// trusted database time and locks the exact device, binding, interval, or
+    /// membership rows; callers cannot substitute a timestamp or fence.
+    pub(crate) async fn consume_for_storage(
+        &self,
+        pool: &PgPool,
+    ) -> Result<BlobStorageRequest, BlobRepositoryError> {
+        consume_authorized_blob_fetch(pool, self).await
+    }
+
+    fn claim_once(&self) -> Result<(), BlobRepositoryError> {
+        self.consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| BlobRepositoryError::FetchAlreadyConsumed)
+    }
+
+    pub(crate) fn binding_digest(&self) -> [u8; 32] {
+        self.binding_digest
+    }
+}
+
+/// Capability material held while the caller-owned SQL transaction is still
+/// open. It cannot be turned into an `AuthorizedBlobFetch` until the exact
+/// transaction commits successfully.
+#[must_use = "publicize the pending capability only after committing its transaction"]
+pub(crate) struct PendingAuthorizedBlobFetch<'pool> {
+    transaction: BlobAuthorizationTransaction<'pool>,
+    storage: BlobStorageRequest,
+    binding_digest: [u8; 32],
+    blob_id: Uuid,
+    caller_did: String,
+    caller_device_id: Uuid,
+    auth_generation: i64,
+    revocation_id: Option<Uuid>,
+    issued_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    membership_fence: BlobMembershipFence,
+}
+
+impl std::fmt::Debug for PendingAuthorizedBlobFetch<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingAuthorizedBlobFetch")
+            .field("issued_at", &self.issued_at)
+            .field("caller_device_id", &self.caller_device_id)
+            .field("auth_generation", &self.auth_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingAuthorizedBlobFetch<'_> {
+    /// Consume the pending repository capability and commit its owning
+    /// transaction. This method is the only legal transition to a post-commit
+    /// `AuthorizedBlobFetch`.
+    pub(crate) async fn publicize(self) -> Result<AuthorizedBlobFetch, BlobRepositoryError> {
+        publicize_authorized_blob_fetch(self).await
+    }
+}
+
+/// G7 storage identity authority. Upload completion happens before a binding
+/// row exists, so the physical key is derived from the immutable blob id and
+/// ciphertext hash (the schema's blob identity columns), not a later mutable
+/// authorization snapshot. Every upload, completion CAS, authorization query,
+/// object metadata check, and test uses this same derivation.
+pub(crate) fn derive_blob_cid(blob_id: Uuid, ciphertext_sha256: &[u8; 32]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-G7-BLOB-CID-V1\0");
+    digest.update(blob_id.as_bytes());
+    digest.update(ciphertext_sha256);
+    hex::encode(digest.finalize())
+}
+
+fn object_store_key_matches(blob_id: Uuid, ciphertext_sha256: &[u8; 32], key: &str) -> bool {
+    key == derive_blob_cid(blob_id, ciphertext_sha256)
+}
+
+/// The only constructor for a blob authorization transaction. It begins from
+/// a pool directly, so a nested SQLx savepoint/transaction cannot be passed to
+/// the authority API by type. Callers must use the returned top-level owner.
+pub(crate) struct BlobAuthorizationTransaction<'pool> {
+    transaction: Option<Transaction<'pool, Postgres>>,
+}
+
+impl<'pool> BlobAuthorizationTransaction<'pool> {
+    pub(crate) async fn begin(pool: &'pool PgPool) -> Result<Self, BlobRepositoryError> {
+        Ok(Self {
+            transaction: Some(pool.begin().await?),
+        })
+    }
+
+    fn transaction_mut(
+        &mut self,
+    ) -> Result<&mut Transaction<'pool, Postgres>, BlobRepositoryError> {
+        self.transaction
+            .as_mut()
+            .ok_or(BlobRepositoryError::TransactionBindingMismatch)
+    }
+
+    async fn rollback(mut self) {
+        if let Some(transaction) = self.transaction.take() {
+            let _ = transaction.rollback().await;
+        }
+    }
+
+    async fn commit(mut self) -> Result<(), BlobRepositoryError> {
+        self.transaction
+            .take()
+            .ok_or(BlobRepositoryError::TransactionBindingMismatch)?
+            .commit()
+            .await
+            .map_err(BlobRepositoryError::Commit)
+    }
+}
+
+fn binding_digest(
+    descriptor_sha256: &[u8],
+    aad_sha256: &[u8],
+    ciphertext_sha256: &[u8],
+) -> Result<[u8; 32], BlobRepositoryError> {
+    if descriptor_sha256.len() != 32 || aad_sha256.len() != 32 || ciphertext_sha256.len() != 32 {
+        return Err(BlobRepositoryError::Database(sqlx::Error::Protocol(
+            "invalid blob binding digest length".to_owned(),
+        )));
+    }
+    let mut digest = Sha256::new();
+    digest.update(descriptor_sha256);
+    digest.update(aad_sha256);
+    digest.update(ciphertext_sha256);
+    Ok(digest.finalize().into())
 }
 
 /// True when `error` is a unique-violation (SQLSTATE 23505) raised by the named
@@ -425,6 +691,23 @@ pub(crate) async fn cas_complete_upload(
     uploaded_at: DateTime<Utc>,
     object_store_key: &str,
 ) -> Result<(), BlobRepositoryError> {
+    let ciphertext_sha256: Vec<u8> = sqlx::query_scalar(
+        "SELECT ciphertext_sha256 FROM chat.blobs WHERE blob_id = $1 AND owner_did = $2 AND owner_device_id = $3 AND status = 'prepared' FOR UPDATE",
+    )
+    .bind(blob_id)
+    .bind(owner_did)
+    .bind(owner_device_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(BlobRepositoryError::CompareAndSetConflict)?;
+    let ciphertext_sha256: [u8; 32] = ciphertext_sha256.as_slice().try_into().map_err(|_| {
+        BlobRepositoryError::Database(sqlx::Error::Protocol(
+            "invalid ciphertext hash length".to_owned(),
+        ))
+    })?;
+    if !object_store_key_matches(blob_id, &ciphertext_sha256, object_store_key) {
+        return Err(BlobRepositoryError::ObjectStoreIdentityMismatch);
+    }
     let result = sqlx::query(
         r#"
         UPDATE chat.blobs
@@ -617,7 +900,7 @@ pub(crate) async fn insert_blob_binding(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttachmentBlobView {
     pub(crate) blob_id: Uuid,
-    pub(crate) object_store_key: String,
+    object_store_key: String,
     pub(crate) ciphertext_size: i64,
     pub(crate) plaintext_size: i64,
     pub(crate) ciphertext_sha256: Vec<u8>,
@@ -713,6 +996,359 @@ pub(crate) async fn read_application_attachment(
         aad_bytes,
         entry_seq,
     }))
+}
+
+/// Authorize one private blob read from the live, locked database snapshot.
+///
+/// The query deliberately has two closed authorization arms:
+/// * application attachments require the caller's exact device interval to
+///   span the entry sequence; and
+/// * metadata avatars require an active membership row, allowing an immutable
+///   metadata snapshot to be reused without re-authorizing its producer.
+///
+/// In both arms the caller's DID alone is insufficient: `devices` must be
+/// active at the exact presented auth generation. Bound blobs also remain
+/// inside their live unbound window, so a stale/revoked/sibling/expired read
+/// produces `NotAuthorized` without returning any storage identity.
+pub(crate) async fn authorize_blob_read<'pool>(
+    mut transaction: BlobAuthorizationTransaction<'pool>,
+    request: &AuthorizeBlobReadRequest,
+) -> Result<PendingAuthorizedBlobFetch<'pool>, BlobRepositoryError> {
+    let issued_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+        .fetch_one(&mut **transaction.transaction_mut()?)
+        .await?;
+
+    let row: Option<(
+        Uuid,
+        Option<String>,
+        String,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        DateTime<Utc>,
+        Option<Uuid>,
+        Uuid,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT b.blob_id, b.object_store_key, b.media_type,
+               b.ciphertext_size, b.ciphertext_sha256,
+               binding.descriptor_sha256, binding.aad_sha256,
+               binding.binding_kind, b.unbound_expires_at,
+               device.revocation_id,
+               binding.conversation_id, interval.start_seq,
+               interval.terminal_seq, binding.entry_seq
+          FROM chat.blobs AS b
+          JOIN chat.blob_bindings AS binding ON binding.blob_id = b.blob_id
+          JOIN chat.devices AS device
+            ON device.user_did = $2 AND device.device_id = $3
+          LEFT JOIN LATERAL (
+                SELECT candidate.start_seq, candidate.terminal_seq
+                  FROM chat.application_intervals AS candidate
+                 WHERE candidate.conversation_id = binding.conversation_id
+                   AND candidate.recipient_did = $2
+                   AND candidate.recipient_device_id = $3
+                   AND binding.entry_seq >= candidate.start_seq
+                   AND (candidate.terminal_seq IS NULL
+                        OR binding.entry_seq <= candidate.terminal_seq)
+                 ORDER BY candidate.start_seq DESC
+                 LIMIT 1
+                 FOR SHARE
+          ) AS interval ON binding.binding_kind = 'application'
+         WHERE b.blob_id = $1
+           AND b.status = 'bound'
+           AND b.object_store_key IS NOT NULL
+           AND b.unbound_expires_at IS NOT NULL
+           AND $5 < b.unbound_expires_at
+           AND device.status = 'active'
+           AND device.auth_generation = $4
+           AND (
+                (binding.binding_kind = 'application'
+                 AND interval.start_seq IS NOT NULL)
+                OR
+                (binding.binding_kind = 'metadataAvatar'
+                 AND EXISTS (
+                     SELECT 1
+                       FROM chat.member_devices AS member
+                      WHERE member.conversation_id = binding.conversation_id
+                         AND member.user_did = $2
+                         AND member.device_id = $3
+                         AND member.active
+                         FOR SHARE
+                 ))
+           )
+        FOR SHARE OF b, binding, device
+        "#,
+    )
+    .bind(request.blob_id)
+    .bind(&request.caller_did)
+    .bind(request.caller_device_id)
+    .bind(request.auth_generation)
+    .bind(issued_at)
+    .fetch_optional(&mut **transaction.transaction_mut()?)
+    .await?;
+
+    let Some((
+        blob_id,
+        object_store_key,
+        media_type,
+        expected_size,
+        ciphertext_sha256,
+        descriptor_sha256,
+        aad_sha256,
+        _binding_kind,
+        _unbound_expires_at,
+        revocation_id,
+        conversation_id,
+        interval_start_seq,
+        interval_terminal_seq,
+        entry_seq,
+    )) = row
+    else {
+        // Do not distinguish sibling, revoked, missing, or expired rows at the
+        // handler boundary. All are a denial with no storage oracle.
+        return Err(BlobRepositoryError::NotAuthorized);
+    };
+    let object_store_key = object_store_key.ok_or(BlobRepositoryError::ObjectStoreKeyMissing)?;
+    let expected_sha256: [u8; 32] = ciphertext_sha256.as_slice().try_into().map_err(|_| {
+        BlobRepositoryError::Database(sqlx::Error::Protocol(
+            "invalid ciphertext hash length".to_owned(),
+        ))
+    })?;
+    let binding_digest = binding_digest(&descriptor_sha256, &aad_sha256, &ciphertext_sha256)?;
+    let derived_cid = derive_blob_cid(blob_id, &expected_sha256);
+    if object_store_key != derived_cid {
+        return Err(BlobRepositoryError::ObjectStoreIdentityMismatch);
+    }
+    let expires_at = issued_at
+        .checked_add_signed(AUTHORIZED_FETCH_TTL)
+        .ok_or(BlobRepositoryError::BlobExpired)?;
+
+    Ok(PendingAuthorizedBlobFetch {
+        transaction,
+        storage: BlobStorageRequest {
+            object_store_key,
+            derived_cid,
+            expected_size,
+            expected_sha256,
+            media_type,
+        },
+        binding_digest,
+        blob_id,
+        caller_did: request.caller_did.clone(),
+        caller_device_id: request.caller_device_id,
+        auth_generation: request.auth_generation,
+        revocation_id,
+        issued_at,
+        expires_at,
+        membership_fence: BlobMembershipFence {
+            conversation_id,
+            interval_start_seq,
+            interval_terminal_seq,
+            entry_seq,
+        },
+    })
+}
+
+/// Commit the top-level authority transaction and only then mint the opaque
+/// fetch capability. The transaction wrapper is the authority proof; there is
+/// deliberately no transaction-id assertion because a transaction id does
+/// not prove top-level commit across savepoints.
+pub(crate) async fn publicize_authorized_blob_fetch(
+    pending: PendingAuthorizedBlobFetch<'_>,
+) -> Result<AuthorizedBlobFetch, BlobRepositoryError> {
+    pending.transaction.commit().await?;
+    Ok(AuthorizedBlobFetch {
+        storage: pending.storage,
+        consumed: AtomicBool::new(false),
+        binding_digest: pending.binding_digest,
+        blob_id: pending.blob_id,
+        caller_did: pending.caller_did,
+        caller_device_id: pending.caller_device_id,
+        auth_generation: pending.auth_generation,
+        revocation_id: pending.revocation_id,
+        issued_at: pending.issued_at,
+        expires_at: pending.expires_at,
+        membership_fence: pending.membership_fence,
+    })
+}
+
+/// Revalidate one opaque capability against a fresh, trusted database snapshot
+/// immediately before storage access. The query locks the immutable blob and
+/// binding plus the exact device and matching interval/member row; revocation,
+/// generation, membership, interval, object identity, and live-window drift
+/// therefore deny before any object-store request is made.
+pub(crate) async fn consume_authorized_blob_fetch(
+    pool: &PgPool,
+    authorization: &AuthorizedBlobFetch,
+) -> Result<BlobStorageRequest, BlobRepositoryError> {
+    let mut transaction = BlobAuthorizationTransaction::begin(pool).await?;
+    let now: DateTime<Utc> = match sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+        .fetch_one(&mut **transaction.transaction_mut()?)
+        .await
+    {
+        Ok(now) => now,
+        Err(error) => {
+            transaction.rollback().await;
+            return Err(BlobRepositoryError::Database(error));
+        }
+    };
+    if now < authorization.issued_at || now >= authorization.expires_at {
+        transaction.rollback().await;
+        return Err(BlobRepositoryError::BlobExpired);
+    }
+
+    let row: Option<(
+        Option<String>,
+        String,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Option<Uuid>,
+        Uuid,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )> = match sqlx::query_as(
+        r#"
+        SELECT b.object_store_key, b.media_type, b.ciphertext_size,
+               b.ciphertext_sha256, binding.descriptor_sha256,
+               binding.aad_sha256, binding.binding_kind, device.revocation_id,
+               binding.conversation_id, interval.start_seq,
+               interval.terminal_seq, binding.entry_seq
+          FROM chat.blobs AS b
+          JOIN chat.blob_bindings AS binding ON binding.blob_id = b.blob_id
+          JOIN chat.devices AS device
+            ON device.user_did = $7 AND device.device_id = $8
+          LEFT JOIN LATERAL (
+                SELECT candidate.start_seq, candidate.terminal_seq
+                  FROM chat.application_intervals AS candidate
+                 WHERE candidate.conversation_id = binding.conversation_id
+                   AND candidate.recipient_did = $7
+                   AND candidate.recipient_device_id = $8
+                   AND binding.entry_seq >= candidate.start_seq
+                   AND (candidate.terminal_seq IS NULL
+                        OR binding.entry_seq <= candidate.terminal_seq)
+                 ORDER BY candidate.start_seq DESC
+                 LIMIT 1
+                 FOR SHARE
+          ) AS interval ON binding.binding_kind = 'application'
+         WHERE b.blob_id = $1
+           AND b.status = 'bound'
+           AND b.object_store_key = $2
+           AND b.media_type = $3
+           AND b.ciphertext_size = $4
+           AND b.ciphertext_sha256 = $5
+           AND b.unbound_expires_at > $6
+           AND device.status = 'active'
+           AND device.auth_generation = $9
+           AND device.revocation_id IS NOT DISTINCT FROM $10
+           AND binding.conversation_id = $14
+           AND (
+                (binding.binding_kind = 'application'
+                 AND interval.start_seq IS NOT DISTINCT FROM $11
+                 AND interval.terminal_seq IS NOT DISTINCT FROM $12
+                 AND binding.entry_seq IS NOT DISTINCT FROM $13)
+                OR
+                (binding.binding_kind = 'metadataAvatar'
+                 AND EXISTS (
+                     SELECT 1
+                       FROM chat.member_devices AS member
+                      WHERE member.conversation_id = binding.conversation_id
+                        AND member.user_did = $7
+                        AND member.device_id = $8
+                        AND member.active
+                        FOR SHARE
+                 ))
+           )
+        FOR SHARE OF b, binding, device
+        "#,
+    )
+    .bind(authorization.blob_id)
+    .bind(authorization.storage.object_store_key())
+    .bind(authorization.storage.media_type())
+    .bind(authorization.storage.expected_size())
+    .bind(authorization.storage.expected_sha256().as_slice())
+    .bind(now)
+    .bind(&authorization.caller_did)
+    .bind(authorization.caller_device_id)
+    .bind(authorization.auth_generation)
+    .bind(authorization.revocation_id)
+    .bind(authorization.membership_fence.interval_start_seq)
+    .bind(authorization.membership_fence.interval_terminal_seq)
+    .bind(authorization.membership_fence.entry_seq)
+    .bind(authorization.membership_fence.conversation_id)
+    .fetch_optional(&mut **transaction.transaction_mut()?)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            transaction.rollback().await;
+            return Err(BlobRepositoryError::Database(error));
+        }
+    };
+
+    let Some((
+        object_store_key,
+        media_type,
+        expected_size,
+        ciphertext_sha256,
+        descriptor_sha256,
+        aad_sha256,
+        _binding_kind,
+        revocation_id,
+        conversation_id,
+        interval_start_seq,
+        interval_terminal_seq,
+        entry_seq,
+    )) = row
+    else {
+        transaction.rollback().await;
+        return Err(BlobRepositoryError::NotAuthorized);
+    };
+    let object_store_key = object_store_key.ok_or(BlobRepositoryError::ObjectStoreKeyMissing)?;
+    let expected_sha256: [u8; 32] = ciphertext_sha256.as_slice().try_into().map_err(|_| {
+        BlobRepositoryError::Database(sqlx::Error::Protocol(
+            "invalid ciphertext hash length".to_owned(),
+        ))
+    })?;
+    let current_binding_digest =
+        binding_digest(&descriptor_sha256, &aad_sha256, &ciphertext_sha256)?;
+    let current_fence = BlobMembershipFence {
+        conversation_id,
+        interval_start_seq,
+        interval_terminal_seq,
+        entry_seq,
+    };
+    let derived_cid = derive_blob_cid(authorization.blob_id, &expected_sha256);
+    if object_store_key != derived_cid
+        || object_store_key != authorization.storage.object_store_key()
+        || media_type != authorization.storage.media_type()
+        || expected_size != authorization.storage.expected_size()
+        || expected_sha256 != *authorization.storage.expected_sha256()
+        || current_binding_digest != authorization.binding_digest
+        || revocation_id != authorization.revocation_id
+        || current_fence != authorization.membership_fence
+    {
+        transaction.rollback().await;
+        return Err(BlobRepositoryError::NotAuthorized);
+    }
+
+    // Mark the process-local capability consumed before releasing the locked
+    // snapshot. A commit failure burns the capability and fails closed; no
+    // storage adapter can observe a pre-commit authorization.
+    if let Err(error) = authorization.claim_once() {
+        transaction.rollback().await;
+        return Err(error);
+    }
+    transaction.commit().await?;
+    Ok(authorization.storage.clone())
 }
 
 // ===========================================================================
@@ -1012,4 +1648,499 @@ pub(crate) async fn expire_due_blobs(
         });
     }
     Ok(expired)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::repository::delivery::{
+        close_application_interval, ApplicationIntervalClose, IntervalCloseKind,
+    };
+    use crate::chat_protocol::repository::transition::{
+        cas_registration_revoke, close_leaf_period, insert_device_revocation, LeafClose,
+        NewDeviceRevocation, RegistrationRevoke,
+    };
+
+    fn test_fetch() -> AuthorizedBlobFetch {
+        let issued_at = Utc::now();
+        AuthorizedBlobFetch {
+            storage: BlobStorageRequest {
+                object_store_key: "opaque-object".to_owned(),
+                derived_cid: "derived-cid".to_owned(),
+                expected_size: 3,
+                expected_sha256: Sha256::digest(b"abc").into(),
+                media_type: "image/png".to_owned(),
+            },
+            consumed: AtomicBool::new(false),
+            binding_digest: [0x11; 32],
+            blob_id: Uuid::from_bytes([0x22; 16]),
+            caller_did: "did:plc:test".to_owned(),
+            caller_device_id: Uuid::new_v4(),
+            auth_generation: 7,
+            revocation_id: None,
+            issued_at,
+            expires_at: issued_at + AUTHORIZED_FETCH_TTL,
+            membership_fence: BlobMembershipFence {
+                conversation_id: Uuid::new_v4(),
+                interval_start_seq: Some(1),
+                interval_terminal_seq: None,
+                entry_seq: Some(1),
+            },
+        }
+    }
+
+    #[test]
+    fn authorization_capability_is_atomic_one_use() {
+        let fetch = test_fetch();
+        assert!(fetch.claim_once().is_ok());
+        assert!(matches!(
+            fetch.claim_once(),
+            Err(BlobRepositoryError::FetchAlreadyConsumed)
+        ));
+    }
+
+    #[test]
+    fn authorization_capability_uses_trusted_issue_window() {
+        let fetch = test_fetch();
+        assert!(fetch.issued_at < fetch.expires_at);
+        assert_eq!(fetch.expires_at - fetch.issued_at, AUTHORIZED_FETCH_TTL);
+    }
+
+    #[test]
+    fn deterministic_cid_rejects_object_swap() {
+        let blob_id = Uuid::from_bytes([0x42; 16]);
+        let hash = [0x11; 32];
+        let cid = derive_blob_cid(blob_id, &hash);
+        assert!(object_store_key_matches(blob_id, &hash, &cid));
+        assert!(!object_store_key_matches(blob_id, &hash, "attacker-object"));
+    }
+
+    #[test]
+    fn storage_request_debug_redacts_physical_identity() {
+        let request = BlobStorageRequest {
+            object_store_key: "secret-object-key".to_owned(),
+            derived_cid: "secret-derived-cid".to_owned(),
+            expected_size: 3,
+            expected_sha256: [0x77; 32],
+            media_type: "image/png".to_owned(),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("secret-object-key"));
+        assert!(!rendered.contains("secret-derived-cid"));
+        assert!(!rendered.contains("77"));
+    }
+
+    #[test]
+    fn one_use_race_has_exactly_one_winner() {
+        use std::sync::Arc;
+
+        let fetch = Arc::new(test_fetch());
+        let first = {
+            let fetch = Arc::clone(&fetch);
+            std::thread::spawn(move || fetch.claim_once().is_ok())
+        };
+        let second = {
+            let fetch = Arc::clone(&fetch);
+            std::thread::spawn(move || fetch.claim_once().is_ok())
+        };
+        assert_eq!(
+            first.join().unwrap() as u8 + second.join().unwrap() as u8,
+            1
+        );
+    }
+
+    #[test]
+    fn cid_is_bound_to_blob_and_ciphertext_hash() {
+        let blob_id = Uuid::from_bytes([1; 16]);
+        let first = derive_blob_cid(blob_id, &[2; 32]);
+        let second = derive_blob_cid(blob_id, &[3; 32]);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn authorization_sql_is_row_locked_and_fenced() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/blobs.rs"
+        ));
+        for required in [
+            "b.status = 'bound'",
+            "device.status = 'active'",
+            "device.auth_generation = $4",
+            "device.revocation_id",
+            "member.active",
+            "binding.entry_seq >= candidate.start_seq",
+            "candidate.terminal_seq",
+            "$5 < b.unbound_expires_at",
+            "clock_timestamp()::timestamptz",
+            "FOR SHARE",
+            "pool.begin().await",
+            "transaction: BlobAuthorizationTransaction",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing SQL/API fence: {required}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL; run explicitly with cargo test -- --ignored"]
+    async fn top_level_authority_rolls_back_on_explicit_abort() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for this ignored integration test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+        let authority = BlobAuthorizationTransaction::begin(&pool)
+            .await
+            .expect("pool.begin must create the authority transaction");
+        authority.rollback().await;
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("rollback must return the pool connection usable");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL and TEST_BLOB_* seeded fixture; run explicitly with cargo test -- --ignored"]
+    async fn authorize_commit_consume_is_one_fresh_repository_flow() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for this ignored integration test");
+        let blob_id = std::env::var("TEST_BLOB_ID")
+            .expect("TEST_BLOB_ID is required for this ignored integration test");
+        let caller_did = std::env::var("TEST_BLOB_CALLER_DID")
+            .expect("TEST_BLOB_CALLER_DID is required for this ignored integration test");
+        let caller_device_id = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
+            .expect("TEST_BLOB_CALLER_DEVICE_ID is required for this ignored integration test");
+        let auth_generation = std::env::var("TEST_BLOB_AUTH_GENERATION")
+            .expect("TEST_BLOB_AUTH_GENERATION is required for this ignored integration test");
+        let blob_id: Uuid = blob_id.parse().expect("TEST_BLOB_ID must be a UUID");
+        let caller_device_id: Uuid = caller_device_id
+            .parse()
+            .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
+        let auth_generation: i64 = auth_generation
+            .parse()
+            .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+        let authority = BlobAuthorizationTransaction::begin(&pool)
+            .await
+            .expect("begin top-level authority transaction");
+        let pending = authorize_blob_read(
+            authority,
+            &AuthorizeBlobReadRequest {
+                blob_id,
+                caller_did,
+                caller_device_id,
+                auth_generation,
+            },
+        )
+        .await
+        .expect("seeded fixture must authorize");
+        let authorization = pending
+            .publicize()
+            .await
+            .expect("authorization must be minted only after commit");
+        authorization
+            .consume_for_storage(&pool)
+            .await
+            .expect("fresh device/membership/interval fence must allow consume");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL, TEST_BLOB_* seeded application fixture, and TEST_BLOB_CLOSE_* canonical interval proof; run explicitly with cargo test -- --ignored"]
+    async fn seeded_post_authorization_interval_closure_denies_consumption() {
+        for variable in [
+            "TEST_DATABASE_URL",
+            "TEST_BLOB_ID",
+            "TEST_BLOB_CALLER_DID",
+            "TEST_BLOB_CALLER_DEVICE_ID",
+            "TEST_BLOB_AUTH_GENERATION",
+            "TEST_BLOB_CLOSE_INTERVAL_ID",
+            "TEST_BLOB_CLOSE_TERMINAL_SEQ",
+            "TEST_BLOB_CLOSE_STATE_VERSION",
+            "TEST_BLOB_CLOSE_TRANSITION_ID",
+            "TEST_BLOB_CLOSE_FINGERPRINT_HEX",
+            "TEST_BLOB_CLOSE_LEAF_PERIOD_ID",
+        ] {
+            assert!(
+                std::env::var(variable).is_ok(),
+                "{variable} is required for this ignored seeded interval-drift test"
+            );
+        }
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let blob_id: Uuid = std::env::var("TEST_BLOB_ID")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_ID must be a UUID");
+        let caller_did = std::env::var("TEST_BLOB_CALLER_DID").unwrap();
+        let caller_device_id: Uuid = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
+        let auth_generation: i64 = std::env::var("TEST_BLOB_AUTH_GENERATION")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+
+        let authority = BlobAuthorizationTransaction::begin(&pool)
+            .await
+            .expect("begin top-level authority transaction");
+        let authorization = authorize_blob_read(
+            authority,
+            &AuthorizeBlobReadRequest {
+                blob_id,
+                caller_did,
+                caller_device_id,
+                auth_generation,
+            },
+        )
+        .await
+        .expect("seeded application fixture must authorize before drift")
+        .publicize()
+        .await
+        .expect("authorization must be minted only after commit");
+
+        // Close through the repository's canonical interval CAS, carrying the
+        // exact signed close proof from the seeded fixture. This is the real
+        // member-removal/application-interval lifecycle edge; direct UPDATEs
+        // are intentionally not accepted by the production schema triggers.
+        let mut transaction = pool.begin().await.expect("begin interval close");
+        let removed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("database clock for canonical interval close");
+        close_application_interval(
+            &mut transaction,
+            &ApplicationIntervalClose {
+                membership_interval_id: std::env::var("TEST_BLOB_CLOSE_INTERVAL_ID")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_INTERVAL_ID must be a UUID"),
+                terminal_seq: std::env::var("TEST_BLOB_CLOSE_TERMINAL_SEQ")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_TERMINAL_SEQ must be an integer"),
+                closing_state_version: std::env::var("TEST_BLOB_CLOSE_STATE_VERSION")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_STATE_VERSION must be an integer"),
+                closing_transition_id: std::env::var("TEST_BLOB_CLOSE_TRANSITION_ID")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_TRANSITION_ID must be a UUID"),
+                closing_outer_entry_fingerprint: hex::decode(
+                    std::env::var("TEST_BLOB_CLOSE_FINGERPRINT_HEX").unwrap(),
+                )
+                .expect("TEST_BLOB_CLOSE_FINGERPRINT_HEX must be hex"),
+                closing_kind: IntervalCloseKind::Remove,
+                closing_leaf_period_id: std::env::var("TEST_BLOB_CLOSE_LEAF_PERIOD_ID")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_LEAF_PERIOD_ID must be a UUID"),
+                removed_at,
+            },
+        )
+        .await
+        .expect("seeded canonical interval close must commit");
+        close_leaf_period(
+            &mut transaction,
+            &LeafClose {
+                leaf_period_id: std::env::var("TEST_BLOB_CLOSE_LEAF_PERIOD_ID")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_LEAF_PERIOD_ID must be a UUID"),
+                removed_state_version: std::env::var("TEST_BLOB_CLOSE_STATE_VERSION")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_STATE_VERSION must be an integer"),
+                removed_transition_id: std::env::var("TEST_BLOB_CLOSE_TRANSITION_ID")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_TRANSITION_ID must be a UUID"),
+                removed_seq: std::env::var("TEST_BLOB_CLOSE_TERMINAL_SEQ")
+                    .unwrap()
+                    .parse()
+                    .expect("TEST_BLOB_CLOSE_TERMINAL_SEQ must be an integer"),
+                removed_at,
+            },
+        )
+        .await
+        .expect("seeded canonical member removal must apply");
+        transaction
+            .commit()
+            .await
+            .expect("interval closure must commit before consumption");
+
+        assert!(matches!(
+            authorization.consume_for_storage(&pool).await,
+            Err(BlobRepositoryError::NotAuthorized)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL, TEST_BLOB_* seeded fixture, and TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID; run explicitly with cargo test -- --ignored"]
+    async fn seeded_post_authorization_device_revocation_denies_consumption() {
+        for variable in [
+            "TEST_DATABASE_URL",
+            "TEST_BLOB_ID",
+            "TEST_BLOB_CALLER_DID",
+            "TEST_BLOB_CALLER_DEVICE_ID",
+            "TEST_BLOB_AUTH_GENERATION",
+            "TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID",
+        ] {
+            assert!(
+                std::env::var(variable).is_ok(),
+                "{variable} is required for this ignored seeded revocation-drift test"
+            );
+        }
+        let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let blob_id: Uuid = std::env::var("TEST_BLOB_ID")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_ID must be a UUID");
+        let caller_did = std::env::var("TEST_BLOB_CALLER_DID").unwrap();
+        let caller_device_id: Uuid = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
+        let auth_generation: i64 = std::env::var("TEST_BLOB_AUTH_GENERATION")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
+        let actor_device_id: Uuid = std::env::var("TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID")
+            .unwrap()
+            .parse()
+            .expect("TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID must be a UUID");
+        assert_ne!(
+            actor_device_id, caller_device_id,
+            "revocation actor must be a distinct active sibling device"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+
+        let authority = BlobAuthorizationTransaction::begin(&pool)
+            .await
+            .expect("begin top-level authority transaction");
+        let authorization = authorize_blob_read(
+            authority,
+            &AuthorizeBlobReadRequest {
+                blob_id,
+                caller_did: caller_did.clone(),
+                caller_device_id,
+                auth_generation,
+            },
+        )
+        .await
+        .expect("seeded fixture must authorize before revocation")
+        .publicize()
+        .await
+        .expect("authorization must be minted only after commit");
+
+        let (actor_key_id, actor_auth_generation, historical_jkt): (String, i64, String) =
+            sqlx::query_as(
+                "SELECT key.key_id, device.auth_generation, device.dpop_jkt
+                   FROM chat.devices AS device
+                   JOIN chat.device_keys AS key
+                     ON key.user_did = device.user_did AND key.device_id = device.device_id
+                  WHERE device.user_did = $1 AND device.device_id = $2",
+            )
+            .bind(&caller_did)
+            .bind(actor_device_id)
+            .fetch_one(&pool)
+            .await
+            .expect("revocation actor device must be seeded");
+        let accepted_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+                .fetch_one(&pool)
+                .await
+                .expect("database clock for revocation");
+        let revocation_id = Uuid::new_v4();
+        let accepted_request_bytes = vec![0x01];
+        let signing_transcript_bytes = vec![0x02];
+        let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
+        let signature = vec![0x03; 64];
+        let response_bytes = vec![0x04];
+        let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
+        let mut transaction = pool.begin().await.expect("begin revocation");
+        insert_device_revocation(
+            &mut transaction,
+            &NewDeviceRevocation {
+                revocation_id,
+                actor_did: caller_did.clone(),
+                actor_device_id,
+                actor_key_id: actor_key_id.clone(),
+                actor_auth_generation,
+                target_did: caller_did.clone(),
+                target_device_id: caller_device_id,
+                target_auth_generation: auth_generation,
+                accepted_request_bytes: accepted_request_bytes.clone(),
+                signing_transcript_bytes: signing_transcript_bytes.clone(),
+                request_digest: request_digest.to_vec(),
+                signature: signature.clone(),
+                signed_at: accepted_at,
+                accepted_at,
+            },
+        )
+        .await
+        .expect("insert canonical revocation row");
+        cas_registration_revoke(
+            &mut transaction,
+            &RegistrationRevoke {
+                target_did: caller_did.clone(),
+                target_device_id: caller_device_id,
+                expected_auth_generation: auth_generation,
+                revocation_id,
+                revoked_at: accepted_at,
+            },
+        )
+        .await
+        .expect("revoke device and key through canonical CAS");
+        sqlx::query(
+            "INSERT INTO chat.idempotency_records (
+                principal_did, endpoint_nsid, operation_id, request_digest,
+                accepted_request_bytes, signing_transcript_bytes, signature,
+                completed_status, response_bytes, response_sha256, event_position,
+                historical_jkt, current_jkt, completed_at
+             ) VALUES ($1, 'blue.catbird.chat.revokeDevice', $2, $3, $4, $5, $6,
+                       200, $7, $8, NULL, $9, NULL, $10)",
+        )
+        .bind(&caller_did)
+        .bind(revocation_id)
+        .bind(request_digest.as_slice())
+        .bind(&accepted_request_bytes)
+        .bind(&signing_transcript_bytes)
+        .bind(&signature)
+        .bind(&response_bytes)
+        .bind(response_sha256.as_slice())
+        .bind(historical_jkt)
+        .bind(accepted_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("canonical revocation completion receipt");
+        transaction
+            .commit()
+            .await
+            .expect("revocation must commit before consumption");
+
+        assert!(matches!(
+            authorization.consume_for_storage(&pool).await,
+            Err(BlobRepositoryError::NotAuthorized)
+        ));
+    }
 }
