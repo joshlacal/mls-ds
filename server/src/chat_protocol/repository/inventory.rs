@@ -1617,7 +1617,7 @@ pub(crate) async fn create_inventory_session(
     device: super::super::read_authority::LockedReadDeviceAuthority,
     request: CreateInventorySessionRequest,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<CreatedInventorySession, InventoryRepositoryError> {
     let created_at = request.created_at;
     let expires_at = request.expires_at;
@@ -3405,6 +3405,50 @@ fn verify_successor_capability(
         .map_err(InventoryRepositoryError::Sealer)
 }
 
+/// Resolve the one opaque snapshot capability needed by the subscription
+/// ticket compositor. The UUID session handle is not a bearer: this helper
+/// locks the exact session, verifies the exact device identity and live fence,
+/// then decrypts the sealed capability under the session's binding. The raw
+/// capability is returned only to the caller's transaction frame.
+#[cfg(not(test))]
+pub(crate) async fn snapshot_capability_for_ticket(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: &super::super::read_authority::LockedReadDeviceAuthority,
+    inventory_session_id: Uuid,
+    sealer: &CursorSealer,
+) -> Result<(String, DateTime<Utc>), InventoryRepositoryError> {
+    let row = lock_inventory_session_row(transaction, inventory_session_id)
+        .await?
+        .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    if row.user_did != device.user_did()
+        || row.device_id != device.device_id()
+        || row.jkt != device.jkt()
+        || row.auth_generation
+            != i64::try_from(device.auth_generation())
+                .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?
+    {
+        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
+    }
+    revalidate_session_fence(transaction, &row).await?;
+    let plaintext = verify_successor_capability(sealer, &row)?;
+    let capability = String::from_utf8(plaintext.to_vec())
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let decoded = URL_SAFE_NO_PAD.decode(&capability).ok();
+    if capability.len() != 43
+        || decoded.as_ref().is_none_or(|bytes| bytes.len() != 32)
+        || decoded
+            .as_ref()
+            .is_some_and(|bytes| URL_SAFE_NO_PAD.encode(bytes) != capability)
+        || now >= row.expires_at
+    {
+        return Err(InventoryRepositoryError::DurableRowInvalid);
+    }
+    Ok((capability, row.expires_at))
+}
+
 /// The `SealerBinding` for one served page receipt, derived from the receipt
 /// row's own columns (the session row + the request + the receipt's own
 /// created/expires instants).
@@ -3906,7 +3950,7 @@ struct SealedSuccessor {
 /// continuation receipt these differ from the session's creation instant).
 fn mint_and_seal_successor(
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
     request: &InventoryPublicRequestBinding,
     row: &InventorySessionFenceLockRow,
     receipt_created_at: u64,
@@ -4030,7 +4074,7 @@ async fn serve_page_receipt(
     request_cursor_hash: Option<[u8; 32]>,
     after_ordinal: Option<i64>,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<ServedPageOutcome, InventoryRepositoryError> {
     let page = read_retained_page(transaction, row, request, after_ordinal.unwrap_or(-1)).await?;
     // The receipt's OWN created/expires instants: the whole-second serve
@@ -4275,7 +4319,7 @@ pub(crate) async fn serve_initial_inventory_page(
     inventory_session_id: Uuid,
     request: &InventoryPublicRequestBinding,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let row = lock_inventory_session_row(transaction, inventory_session_id)
         .await?
@@ -4303,8 +4347,9 @@ async fn create_inventory_snapshot_attempt(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
     request: &InventoryPublicRequestBinding,
+    expected_inventory_session_id: Option<Uuid>,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     // Fresh B-read guard per attempt: two ordered FOR UPDATE statements, the
     // single locked-row constructor callsite, and the consuming verification.
@@ -4323,6 +4368,9 @@ async fn create_inventory_snapshot_attempt(
         device.jkt(),
         device.auth_generation(),
     );
+    if expected_inventory_session_id.is_some_and(|expected| expected != inventory_session_id) {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
 
     // Create-or-lock. On first sight the session row is created and fully
     // materialized; a concurrent winner's committed row (unique violation on
@@ -4409,8 +4457,9 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
     request: InventoryPublicRequestBinding,
+    expected_inventory_session_id: Option<Uuid>,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let attempts = admission
         .into_inventory_read_attempts(request.endpoint_nsid(), "GET")
@@ -4424,8 +4473,15 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
             .execute(&mut *transaction)
             .await
             .map_err(InventoryRepositoryError::Database)?;
-        match create_inventory_snapshot_attempt(&mut transaction, attempt, &request, sealer, random)
-            .await
+        match create_inventory_snapshot_attempt(
+            &mut transaction,
+            attempt,
+            &request,
+            expected_inventory_session_id,
+            sealer,
+            random,
+        )
+        .await
         {
             Ok(response) => {
                 transaction
@@ -4447,6 +4503,68 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
     Err(InventoryRepositoryError::RetryCeiling)
 }
 
+/// Serve a continuation page after authenticating the exact device for each
+/// bounded inventory attempt.  The cursor itself is only a sealed capability;
+/// this facade never decodes authority fields from it or accepts a caller
+/// selected device identity.  Final-page consumption is owned by
+/// `complete_inventory_page`, which performs the one-way compare-and-set in
+/// the same transaction as the page receipt.
+#[cfg(not(test))]
+pub(crate) async fn continue_inventory_page_for_admission(
+    pool: &sqlx::PgPool,
+    admission: super::super::dpop::VerifiedReadAdmission,
+    presented_page_cursor: &str,
+    request: InventoryPublicRequestBinding,
+    expected_inventory_session_id: Option<Uuid>,
+    sealer: &CursorSealer,
+) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+    let attempts = admission
+        .into_inventory_read_attempts(request.endpoint_nsid(), "GET")
+        .map_err(InventoryRepositoryError::ReadAdmission)?;
+    for attempt in attempts {
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(InventoryRepositoryError::Database)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *transaction)
+            .await
+            .map_err(InventoryRepositoryError::Database)?;
+        let device = super::super::read_authority::lock_read_device_authority_once(
+            &mut transaction,
+            attempt,
+        )
+        .await
+        .map_err(InventoryRepositoryError::ReadAuthority)?;
+        match complete_inventory_page(
+            &mut transaction,
+            device,
+            presented_page_cursor,
+            &request,
+            expected_inventory_session_id,
+            sealer,
+        )
+        .await
+        {
+            Ok(response) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(InventoryRepositoryError::Database)?;
+                return Ok(response);
+            }
+            Err(InventoryRepositoryError::SnapshotConflict) => {
+                let _ = transaction.rollback().await;
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+    }
+    Err(InventoryRepositoryError::RetryCeiling)
+}
+
 /// One continuation or final page serve, given the already-verified session
 /// row and the hash-located predecessor receipt.
 async fn serve_continuation_page(
@@ -4456,7 +4574,7 @@ async fn serve_continuation_page(
     request_cursor_hash: [u8; 32],
     after_ordinal: i64,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<ServedPageOutcome, InventoryRepositoryError> {
     revalidate_session_fence(transaction, row).await?;
     serve_page_receipt(
@@ -4494,7 +4612,7 @@ pub(crate) async fn issue_next_inventory_page_cursor(
     presented_page_cursor: &str,
     request: &InventoryPublicRequestBinding,
     sealer: &CursorSealer,
-    random: &mut dyn SecureRandom,
+    random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let presented = decode_capability_token(presented_page_cursor)?;
     let request_cursor_hash = presented.lookup_hash();
@@ -4537,6 +4655,7 @@ pub(crate) async fn complete_inventory_page(
     device: PagingDeviceAuthority,
     presented_page_cursor: &str,
     request: &InventoryPublicRequestBinding,
+    expected_inventory_session_id: Option<Uuid>,
     sealer: &CursorSealer,
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let presented = decode_capability_token(presented_page_cursor)?;
@@ -4548,6 +4667,9 @@ pub(crate) async fn complete_inventory_page(
     let row = lock_inventory_session_row(transaction, predecessor.inventory_session_id)
         .await?
         .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    if expected_inventory_session_id.is_some_and(|expected| expected != row.inventory_session_id) {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
     verify_paging_device_fence(transaction, device, &row).await?;
     verify_continuation_binding(request, &predecessor, &row)?;
     verify_presented_successor(sealer, &presented, &predecessor, request, &row)?;

@@ -14,6 +14,12 @@ use sqlx::{Postgres, Row, Transaction};
 use std::fmt;
 use uuid::Uuid;
 
+#[cfg(not(test))]
+use super::super::{
+    dpop::VerifiedReadAdmission, read_authority, repository::inventory, OsSecureRandom,
+    SecureRandom,
+};
+
 /// The exact subscription path a clean-chat ticket authorizes.
 pub(crate) const SUBSCRIBE_EVENTS_PATH: &str = "/xrpc/blue.catbird.chat.subscribeEvents";
 const CAPABILITY_ASCII_BYTES: usize = 43;
@@ -503,6 +509,76 @@ pub(crate) async fn insert_event_cursor_receipt(
 /// is owned by the compositor.
 pub(crate) fn ticket_hash(opaque_ticket: &[u8]) -> [u8; HASH_BYTES] {
     Sha256::digest(opaque_ticket).into()
+}
+
+/// Compose the clean-chat ticket endpoint from one POST read admission. The
+/// session UUID is only a row handle; the repository recovers and verifies the
+/// sealed snapshot capability before minting the one-use ticket. Both the
+/// recovered capability and the caller's event cursor must match exactly.
+#[cfg(not(test))]
+pub(crate) async fn mint_subscription_ticket_for_admission(
+    pool: &sqlx::PgPool,
+    admission: VerifiedReadAdmission,
+    inventory_session_id: Uuid,
+    event_cursor: &str,
+    sealer: &crate::chat_protocol::CursorSealer,
+) -> Result<(String, DateTime<Utc>), TicketRepositoryError> {
+    let attempt = admission
+        .into_single_read_attempt("blue.catbird.chat.getSubscriptionTicket", "POST")
+        .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?;
+    let mut transaction = pool.begin().await?;
+    let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
+        .await
+        .map_err(|_| TicketRepositoryError::DeviceBindingMismatch)?;
+    let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
+        &mut transaction,
+        &device,
+        inventory_session_id,
+        sealer,
+    )
+    .await
+    .map_err(|error| match error {
+        inventory::InventoryRepositoryError::SessionNotFound => {
+            TicketRepositoryError::SessionMissing
+        }
+        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
+            TicketRepositoryError::DeviceBindingMismatch
+        }
+        _ => TicketRepositoryError::SessionBindingMismatch,
+    })?;
+    if event_cursor != capability {
+        return Err(TicketRepositoryError::CursorMismatch);
+    }
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let expires_at = (now + chrono::Duration::seconds(30)).min(session_expires_at);
+    if now >= expires_at {
+        return Err(TicketRepositoryError::TicketExpired);
+    }
+    let mut opaque = [0_u8; HASH_BYTES];
+    let mut random = OsSecureRandom::new();
+    random
+        .fill(&mut opaque)
+        .map_err(|_| TicketRepositoryError::InvalidTicketHash)?;
+    let request = MintSubscriptionTicket {
+        ticket_hash: opaque.to_vec(),
+        user_did: device.user_did().to_owned(),
+        device_id: device.device_id(),
+        jkt: device.jkt().to_owned(),
+        auth_generation: i64::try_from(device.auth_generation())
+            .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?,
+        // The durable ticket repository intentionally takes the opaque G7
+        // capability in this field; the public UUID is validated above.
+        inventory_session_id: capability.clone(),
+        event_cursor: event_cursor.to_owned(),
+        subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
+        created_at: now,
+        expires_at,
+    };
+    mint_subscription_ticket(&mut transaction, &request).await?;
+    transaction.commit().await?;
+    Ok((URL_SAFE_NO_PAD.encode(opaque), expires_at))
 }
 
 /// Hash a canonical 32-byte random capability. This helper is intentionally

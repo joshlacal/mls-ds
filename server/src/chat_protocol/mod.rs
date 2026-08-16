@@ -74,6 +74,7 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
 }
 
 mod cursor;
+pub(crate) use cursor::{CursorCodecError, CursorSealer, OsSecureRandom, SecureRandom};
 /// Trusted-Nest token and DPoP cryptographic verification for clean chat.
 ///
 /// Successful values are deliberately pre-replay evidence. They are

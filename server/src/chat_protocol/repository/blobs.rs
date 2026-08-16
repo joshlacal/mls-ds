@@ -1661,7 +1661,6 @@ pub(crate) async fn expire_due_blobs(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::delivery::{
         close_application_interval, ApplicationIntervalClose, IntervalCloseKind,
     };
@@ -1669,6 +1668,7 @@ mod tests {
         cas_registration_revoke, close_leaf_period, insert_device_revocation, LeafClose,
         NewDeviceRevocation, RegistrationRevoke,
     };
+    use super::*;
 
     fn test_fetch() -> AuthorizedBlobFetch {
         let issued_at = Utc::now();

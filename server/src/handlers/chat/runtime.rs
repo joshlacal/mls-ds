@@ -13,12 +13,14 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use p256::ecdsa::VerifyingKey;
+use zeroize::Zeroizing;
 
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{
     dpop::TrustedNestVerifier,
     relationship_policy::ProductionRelationshipAuthority,
     validation::{CanonicalUuidV4, TrustedExternalBase},
+    CursorSealer,
 };
 use crate::realtime::{SseState, StreamEvent};
 
@@ -29,6 +31,8 @@ pub struct ChatRuntime {
     nest_verifier: Option<TrustedNestVerifier>,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
+    cursor_sealer: Option<CursorSealer>,
+    subscription_endpoint: Option<String>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -39,6 +43,11 @@ impl fmt::Debug for ChatRuntime {
             .field("nest_verifier_configured", &self.nest_verifier.is_some())
             .field("relationship_authority", &"fixed-production-authority")
             .field("sse_state", &"conversation-filtered")
+            .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
+            .field(
+                "subscription_endpoint_configured",
+                &self.subscription_endpoint.is_some(),
+            )
             .finish()
     }
 }
@@ -59,6 +68,11 @@ impl ChatRuntime {
     pub fn from_env(sse_state: Arc<SseState>) -> Result<Self, String> {
         let cutover_enabled = env_flag("CHAT_CUTOVER_ENABLED");
         let nest_verifier = build_verifier_from_env()?;
+        let cursor_sealer = build_cursor_sealer_from_env()?;
+        let subscription_endpoint = std::env::var("CHAT_SUBSCRIPTION_ENDPOINT")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         let relationship_authority = Arc::new(ProductionRelationshipAuthority::from_startup_guard(
             load_fixed_relationship_authority_startup_guard()
                 .map_err(|error| format!("fixed relationship authority rejected: {error:?}"))?,
@@ -71,11 +85,26 @@ impl ChatRuntime {
                     .to_owned(),
             );
         }
+        if cutover_enabled && cursor_sealer.is_none() {
+            return Err(
+                "CHAT_CUTOVER_ENABLED is set but the clean-chat cursor sealer is not configured \
+                 (set CHAT_CURSOR_KEY_ID and CHAT_CURSOR_SEALING_SECRET as canonical base64url 32-byte values)"
+                    .to_owned(),
+            );
+        }
+        if cutover_enabled && subscription_endpoint.is_none() {
+            return Err(
+                "CHAT_CUTOVER_ENABLED is set but CHAT_SUBSCRIPTION_ENDPOINT is not configured"
+                    .to_owned(),
+            );
+        }
         Ok(Self {
             cutover_enabled,
             nest_verifier,
             relationship_authority,
             sse_state,
+            cursor_sealer,
+            subscription_endpoint,
         })
     }
 
@@ -95,6 +124,13 @@ impl ChatRuntime {
 
     pub(crate) fn relationship_authority(&self) -> &Arc<ProductionRelationshipAuthority> {
         &self.relationship_authority
+    }
+    pub(crate) fn cursor_sealer(&self) -> Option<&CursorSealer> {
+        self.cursor_sealer.as_ref()
+    }
+
+    pub(crate) fn subscription_endpoint(&self) -> Option<&str> {
+        self.subscription_endpoint.as_deref()
     }
 
     pub(crate) async fn subscribe_typing(
@@ -202,6 +238,29 @@ fn build_verifier_from_env() -> Result<Option<TrustedNestVerifier>, String> {
     )
     .map_err(|_| "clean-chat Nest verifier configuration was rejected".to_owned())?;
     Ok(Some(verifier))
+}
+
+fn build_cursor_sealer_from_env() -> Result<Option<CursorSealer>, String> {
+    let key_id = match std::env::var("CHAT_CURSOR_KEY_ID") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let secret = require_var("CHAT_CURSOR_SEALING_SECRET")?;
+    let key_id = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(key_id.trim())
+        .map_err(|_| "CHAT_CURSOR_KEY_ID is not canonical base64url".to_owned())?;
+    let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(secret.trim())
+        .map_err(|_| "CHAT_CURSOR_SEALING_SECRET is not canonical base64url".to_owned())?;
+    let key_id: [u8; 32] = key_id
+        .try_into()
+        .map_err(|_| "CHAT_CURSOR_KEY_ID must decode to 32 bytes".to_owned())?;
+    let secret: [u8; 32] = secret
+        .try_into()
+        .map_err(|_| "CHAT_CURSOR_SEALING_SECRET must decode to 32 bytes".to_owned())?;
+    CursorSealer::new(key_id, Zeroizing::new(secret))
+        .map(Some)
+        .map_err(|_| "CHAT_CURSOR_SEALING_SECRET cannot be all zero".to_owned())
 }
 
 fn require_var(name: &str) -> Result<String, String> {

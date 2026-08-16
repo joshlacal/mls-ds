@@ -32,6 +32,10 @@ mod get_devices;
 #[cfg(not(test))]
 mod get_entries;
 mod get_own_devices;
+#[cfg(not(test))]
+mod inventory;
+#[cfg(not(test))]
+mod publish_typing;
 mod rebind_device_authentication;
 #[cfg(not(test))]
 mod recovery;
@@ -46,9 +50,9 @@ mod runtime;
 #[cfg(not(test))]
 mod send_message;
 #[cfg(not(test))]
-mod publish_typing;
-#[cfg(not(test))]
 mod submit_transition;
+#[cfg(not(test))]
+mod subscription;
 #[cfg(not(test))]
 mod welcome;
 
@@ -115,6 +119,10 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
                 | ChatEndpoint::GetEntries
+                | ChatEndpoint::GetConversations
+                | ChatEndpoint::GetPendingWelcomes
+                | ChatEndpoint::GetLeafRecoveryInbox
+                | ChatEndpoint::GetSubscriptionTicket
         )
     }
     #[cfg(test)]
@@ -153,8 +161,14 @@ where
         );
     #[cfg(not(test))]
     let router = router
-        .route(&xrpc_path(ChatEndpoint::SendMessage), post(send_message::handle))
-        .route(&xrpc_path(ChatEndpoint::PublishTyping), post(publish_typing::handle));
+        .route(
+            &xrpc_path(ChatEndpoint::SendMessage),
+            post(send_message::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PublishTyping),
+            post(publish_typing::handle),
+        );
     #[cfg(not(test))]
     let router = router.route(
         &xrpc_path(ChatEndpoint::GetConversationState),
@@ -197,6 +211,24 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
             get(get_entries::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::GetConversations),
+            get(inventory::conversations),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetPendingWelcomes),
+            get(inventory::welcomes),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetLeafRecoveryInbox),
+            get(inventory::recovery),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetSubscriptionTicket),
+            post(subscription::handle),
         );
     router
 }
