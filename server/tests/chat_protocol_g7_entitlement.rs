@@ -52,6 +52,7 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
+    pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
     pub mod cursor {
         pub use crate::cursor::*;
     }
@@ -1599,6 +1600,13 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/inventory.rs"
             ));
         }
+        pub mod ticket {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/ticket.rs"
+            ));
+        }
         pub mod recovery {
             #![allow(dead_code)]
             include!(concat!(
@@ -2203,6 +2211,167 @@ async fn real_read_admission(
     let authority = committed_read_authority(pool, endpoint).await;
     chat_protocol::dpop::seal_read_admission(authority)
         .expect("a committed existing-device receipt seals a read admission")
+}
+
+#[cfg(feature = "subscription-production-proof")]
+struct TicketSealRandom(u8);
+
+#[cfg(feature = "subscription-production-proof")]
+impl cursor::SecureRandom for TicketSealRandom {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), cursor::SecureRandomError> {
+        out.fill(self.0);
+        self.0 = self.0.wrapping_add(1);
+        Ok(())
+    }
+}
+
+/// Production facade regression: the returned bearer is decoded and consumed
+/// through the durable hash lookup. Persisting the raw bearer (the rejected
+/// implementation) makes this exact consume return TicketNotFound.
+#[cfg(feature = "subscription-production-proof")]
+#[tokio::test]
+#[ignore = "commit-write: private RAII PostgreSQL database"]
+async fn production_subscription_ticket_mint_decodes_and_consumes_once() {
+    let (pool, guard) = b_auth_pool().await;
+    let maintenance_url = guard.maintenance_url.clone();
+    let db_name = guard.db_name.clone();
+    let protocol_instance_id = Uuid::new_v4();
+    let cursor_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x5a_u8; 32])
+        .fetch_one(&pool)
+        .await
+        .expect("derive production-proof cursor key id");
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances(\
+             singleton,protocol_version,protocol_instance_id,cursor_key_id\
+         ) VALUES(TRUE,'1',$1,$2)",
+    )
+    .bind(protocol_instance_id)
+    .bind(&cursor_key_id)
+    .execute(&pool)
+    .await
+    .expect("seed production-proof protocol singleton");
+    seed_private_retention_fence(&pool, protocol_instance_id).await;
+    let now: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('second', transaction_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample database clock");
+    let expires_at = now + chrono::Duration::minutes(10);
+    let session_id = Uuid::new_v4();
+    let (protocol_instance_id, cursor_key_id, retained_floor, event_position): (
+        Uuid,
+        String,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        r#"SELECT protocol.protocol_instance_id, protocol.cursor_key_id,
+                      retention.retained_floor,
+                      coalesce(max(event.event_position),0)::bigint
+                 FROM chat.protocol_instances protocol
+                 JOIN chat.event_retention retention USING(protocol_instance_id)
+                 LEFT JOIN chat.events event USING(protocol_instance_id)
+                WHERE protocol.singleton=TRUE
+                GROUP BY protocol.protocol_instance_id, protocol.cursor_key_id,
+                         retention.retained_floor"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load protocol fence");
+    let key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&cursor_key_id)
+        .expect("fixture cursor key id base64")
+        .try_into()
+        .expect("fixture cursor key id length");
+    let sealer = cursor::CursorSealer::new(key_id, zeroize::Zeroizing::new([0x5a; 32]))
+        .expect("construct test sealer");
+    let capability_bytes = [0x6b; 32];
+    let capability = URL_SAFE_NO_PAD.encode(capability_bytes);
+    let capability_hash: [u8; 32] = Sha256::digest(capability_bytes).into();
+    let binding = cursor::SealerBinding::for_event_cursor_receipt(
+        session_id,
+        B_AUTH_DID.as_bytes(),
+        Uuid::parse_str(B_AUTH_DEVICE).unwrap(),
+        B_AUTH_JKT.as_bytes(),
+        1,
+        protocol_instance_id,
+        cursor_key_id.as_bytes(),
+        u64::try_from(event_position).unwrap(),
+        None,
+        u64::try_from(retained_floor).unwrap(),
+        u64::try_from(now.timestamp()).unwrap(),
+        u64::try_from(expires_at.timestamp()).unwrap(),
+    )
+    .expect("bind sealed snapshot cursor");
+    let sealed = sealer
+        .seal_successor(capability.as_bytes(), &binding, &mut TicketSealRandom(0x33))
+        .expect("seal snapshot cursor");
+    let empty_hash: [u8; 32] = Sha256::digest([]).into();
+    sqlx::query(
+        r#"INSERT INTO chat.inventory_sessions(
+              inventory_session_id,token_hash,user_did,device_id,jkt,auth_generation,
+              snapshot_event_position,snapshot_event_cursor_sha256,created_at,expires_at,
+              protocol_instance_id,cursor_key_id,cursor_format_version,snapshot_retained_floor,
+              snapshot_event_cursor_nonce,snapshot_event_cursor_ciphertext,
+              conversations_complete,welcomes_complete,recovery_complete,
+              conversation_item_count,conversation_items_sha256,welcome_item_count,welcome_items_sha256,
+              recovery_item_count,recovery_items_sha256,conversation_payload_bytes,welcome_payload_bytes,
+              recovery_payload_bytes,conversations_consumed,welcomes_consumed,recovery_consumed,
+              conversations_consumed_at,welcomes_consumed_at,recovery_consumed_at)
+            VALUES($1,$2,$3,$4,$5,1,$6,$2,$7,$8,$9,$10,1,$11,$12,$13,
+                   TRUE,TRUE,TRUE,0,$14,0,$14,0,$14,0,0,0,TRUE,TRUE,TRUE,$7,$7,$7)"#,
+    )
+    .bind(session_id)
+    .bind(capability_hash.as_slice())
+    .bind(B_AUTH_DID)
+    .bind(Uuid::parse_str(B_AUTH_DEVICE).unwrap())
+    .bind(B_AUTH_JKT)
+    .bind(event_position)
+    .bind(now)
+    .bind(expires_at)
+    .bind(protocol_instance_id)
+    .bind(&cursor_key_id)
+    .bind(retained_floor)
+    .bind(sealed.nonce.as_slice())
+    .bind(&sealed.ciphertext)
+    .bind(empty_hash.as_slice())
+    .execute(&pool)
+    .await
+    .expect("seed consumed sealed inventory session");
+
+    let admission = real_read_admission(&pool, "blue.catbird.chat.getSubscriptionTicket").await;
+    let (presented_ticket, _) =
+        chat_protocol::repository::ticket::mint_subscription_ticket_for_admission(
+            &pool,
+            admission,
+            session_id,
+            &capability,
+            &sealer,
+        )
+        .await
+        .expect("production facade mints ticket");
+    let decoded = URL_SAFE_NO_PAD
+        .decode(&presented_ticket)
+        .expect("returned ticket is canonical base64url");
+    let mut consume = pool.begin().await.expect("begin consume");
+    let consume_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *consume)
+        .await
+        .expect("sample ticket-consume database clock");
+    chat_protocol::repository::ticket::consume_subscription_ticket(
+        &mut consume,
+        &chat_protocol::repository::ticket::ticket_hash(&decoded),
+        &capability,
+        chat_protocol::repository::ticket::SUBSCRIBE_EVENTS_PATH,
+        consume_at,
+    )
+    .await
+    .expect("decoded production ticket consumes by its persisted hash");
+    consume.commit().await.expect("commit consume");
+
+    pool.close().await;
+    drop(guard);
+    assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
 async fn consumed_replay_rows(pool: &PgPool) -> i64 {

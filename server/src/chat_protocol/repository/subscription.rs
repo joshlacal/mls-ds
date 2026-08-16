@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 
 use super::ticket::{
-    insert_event_cursor_receipt, ConsumedTicket, NewEventCursorReceipt, TicketRepositoryError,
+    insert_event_cursor_receipt, revalidate_consumed_ticket, ConsumedTicket, NewEventCursorReceipt,
+    TicketRepositoryError,
 };
 use crate::{
     chat_protocol::{
@@ -45,9 +46,7 @@ pub(crate) async fn replay_high_water(
     .bind(ticket.protocol_instance_id)
     .fetch_one(&mut **transaction)
     .await?;
-    if observed_at >= ticket.expires_at {
-        return Err(TicketRepositoryError::TicketExpired);
-    }
+    revalidate_consumed_ticket(transaction, ticket, ticket.event_position, observed_at).await?;
     Ok(high_water.max(ticket.event_position))
 }
 
@@ -67,35 +66,10 @@ pub(crate) async fn visible_events(
     {
         return Err(TicketRepositoryError::InvalidReceipt);
     }
-    let fence: (uuid::Uuid, String, i64, bool) = sqlx::query_as(
-        r#"SELECT protocol.protocol_instance_id, protocol.cursor_key_id,
-                  retention.retained_floor,
-                  EXISTS(
-                    SELECT 1 FROM chat.devices device
-                     WHERE device.user_did=$1 AND device.device_id=$2
-                       AND device.status='active' AND device.revoked_at IS NULL
-                       AND device.dpop_jkt=$3 AND device.auth_generation=$4
-                  )
-             FROM chat.protocol_instances protocol
-             JOIN chat.event_retention retention USING(protocol_instance_id)
-            WHERE protocol.singleton=TRUE
-            FOR SHARE OF protocol, retention"#,
-    )
-    .bind(&ticket.user_did)
-    .bind(ticket.device_id)
-    .bind(&ticket.jkt)
-    .bind(ticket.auth_generation)
-    .fetch_one(&mut **transaction)
-    .await?;
-    if fence.0 != ticket.protocol_instance_id || fence.1 != ticket.cursor_key_id {
-        return Err(TicketRepositoryError::SessionIncomplete);
-    }
-    if !fence.3 {
-        return Err(TicketRepositoryError::DeviceBindingMismatch);
-    }
-    if after_position < fence.2 {
-        return Err(TicketRepositoryError::CursorExpired);
-    }
+    let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await?;
+    revalidate_consumed_ticket(transaction, ticket, after_position, observed_at).await?;
     let rows = sqlx::query(
         r#"SELECT event.event_position, event.payload_bytes,
                   event.payload_sha256, event.created_at

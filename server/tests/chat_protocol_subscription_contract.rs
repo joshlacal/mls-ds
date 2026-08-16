@@ -12,10 +12,11 @@ fn durable_subscription_uses_exact_device_global_event_authority() {
         "recipient.device_id = $2",
         "event.event_position > $4",
         "ORDER BY event.event_position",
-        "observed_at >= ticket.expires_at",
         "insert_event_cursor_receipt",
         "predecessor_cursor_hash: Some(previous_cursor_hash)",
         "canonical_envelope_sha256: Some(envelope_hash)",
+        "revalidate_consumed_ticket(transaction, ticket, ticket.event_position, observed_at)",
+        "revalidate_consumed_ticket(transaction, ticket, after_position, observed_at)",
     ] {
         assert!(
             source.contains(required),
@@ -24,6 +25,12 @@ fn durable_subscription_uses_exact_device_global_event_authority() {
     }
     assert!(!source.contains("event_stream"));
     assert!(!source.contains("subscribeConvoEvents"));
+}
+
+#[test]
+fn production_ticket_facade_hashes_the_returned_bearer_before_persistence() {
+    let source = include_str!("../src/chat_protocol/repository/ticket.rs");
+    assert!(source.contains("ticket_hash: ticket_hash(&opaque).to_vec()"));
 }
 
 #[test]

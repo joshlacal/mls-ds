@@ -3410,7 +3410,7 @@ fn verify_successor_capability(
 /// locks the exact session, verifies the exact device identity and live fence,
 /// then decrypts the sealed capability under the session's binding. The raw
 /// capability is returned only to the caller's transaction frame.
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "subscription-production-proof"))]
 pub(crate) async fn snapshot_capability_for_ticket(
     transaction: &mut Transaction<'_, Postgres>,
     device: &super::super::read_authority::LockedReadDeviceAuthority,

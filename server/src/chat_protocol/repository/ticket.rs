@@ -14,7 +14,7 @@ use sqlx::{Postgres, Row, Transaction};
 use std::fmt;
 use uuid::Uuid;
 
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "subscription-production-proof"))]
 use super::super::{
     dpop::VerifiedReadAdmission, read_authority, repository::inventory, OsSecureRandom,
     SecureRandom,
@@ -270,6 +270,60 @@ pub(crate) struct ConsumedTicket {
     pub(crate) snapshot_created_at: DateTime<Utc>,
     pub(crate) expires_at: DateTime<Utc>,
     pub(crate) consumed_at: DateTime<Utc>,
+}
+
+/// Revalidate a live subscription's exact authority without consuming a new
+/// ticket. Every idle/live loop calls this under fresh PostgreSQL locks before
+/// forwarding durable or ephemeral data, so revocation and auth-generation
+/// rebinds take effect even when the event high-water does not advance.
+pub(crate) async fn revalidate_consumed_ticket(
+    transaction: &mut Transaction<'_, Postgres>,
+    ticket: &ConsumedTicket,
+    cursor_position: i64,
+    observed_at: DateTime<Utc>,
+) -> Result<(), TicketRepositoryError> {
+    if observed_at >= ticket.expires_at {
+        return Err(TicketRepositoryError::TicketExpired);
+    }
+    let device_active: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS(
+               SELECT 1 FROM chat.devices
+                WHERE user_did=$1 AND device_id=$2
+                  AND status='active' AND revoked_at IS NULL
+                  AND dpop_jkt=$3 AND auth_generation=$4
+                FOR SHARE
+           )"#,
+    )
+    .bind(&ticket.user_did)
+    .bind(ticket.device_id)
+    .bind(&ticket.jkt)
+    .bind(ticket.auth_generation)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !device_active {
+        return Err(TicketRepositoryError::DeviceBindingMismatch);
+    }
+    let fence: Option<(Uuid, String, i64)> = sqlx::query_as(
+        r#"SELECT protocol.protocol_instance_id, protocol.cursor_key_id,
+                  retention.retained_floor
+             FROM chat.protocol_instances protocol
+             JOIN chat.event_retention retention USING(protocol_instance_id)
+            WHERE protocol.singleton=TRUE
+            FOR SHARE OF protocol, retention"#,
+    )
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some((protocol_instance_id, cursor_key_id, retained_floor)) = fence else {
+        return Err(TicketRepositoryError::SessionIncomplete);
+    };
+    if protocol_instance_id != ticket.protocol_instance_id || cursor_key_id != ticket.cursor_key_id
+    {
+        return Err(TicketRepositoryError::SessionIncomplete);
+    }
+    if cursor_position < retained_floor {
+        return Err(TicketRepositoryError::CursorExpired);
+    }
+    Ok(())
 }
 
 /// Atomically consume one matching unexpired ticket. This is a strict CAS on
@@ -579,7 +633,7 @@ pub(crate) fn ticket_hash(opaque_ticket: &[u8]) -> [u8; HASH_BYTES] {
 /// session UUID is only a row handle; the repository recovers and verifies the
 /// sealed snapshot capability before minting the one-use ticket. Both the
 /// recovered capability and the caller's event cursor must match exactly.
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "subscription-production-proof"))]
 pub(crate) async fn mint_subscription_ticket_for_admission(
     pool: &sqlx::PgPool,
     admission: VerifiedReadAdmission,
@@ -626,7 +680,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
         .fill(&mut opaque)
         .map_err(|_| TicketRepositoryError::InvalidTicketHash)?;
     let request = MintSubscriptionTicket {
-        ticket_hash: opaque.to_vec(),
+        ticket_hash: ticket_hash(&opaque).to_vec(),
         user_did: device.user_did().to_owned(),
         device_id: device.device_id(),
         jkt: device.jkt().to_owned(),

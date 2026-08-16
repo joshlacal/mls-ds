@@ -75,8 +75,8 @@ use uuid::Uuid;
 
 use repository::ticket::{
     consume_subscription_ticket, insert_event_cursor_receipt, mint_subscription_ticket,
-    ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt, TicketRepositoryError,
-    SUBSCRIBE_EVENTS_PATH,
+    revalidate_consumed_ticket, ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt,
+    TicketRepositoryError, SUBSCRIBE_EVENTS_PATH,
 };
 
 fn random_plc_did() -> String {
@@ -475,6 +475,70 @@ async fn snapshot_cursor_receipt_is_persisted_with_exact_session_authority() {
     .expect("read initial receipt");
     assert_eq!(stored.0, session.snapshot_event_position);
     assert!(stored.1.is_none() && stored.2.is_none());
+}
+
+#[tokio::test]
+async fn idle_subscription_revalidation_stops_after_exact_device_revocation() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = clock_now(&pool).await;
+    let device = seed_device(&pool, now - Duration::seconds(200)).await;
+    let session = seed_session(
+        &pool,
+        &device,
+        now - Duration::seconds(10),
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let opaque = fresh_blob();
+    let request = mint_request(
+        &device,
+        &session,
+        &opaque,
+        session.capability.clone(),
+        now,
+        now + Duration::seconds(60),
+    );
+    let mut mint = pool.begin().await.expect("begin mint");
+    mint_subscription_ticket(&mut mint, &request)
+        .await
+        .expect("mint idle-stream ticket");
+    mint.commit().await.expect("commit ticket");
+    let mut consume = pool.begin().await.expect("begin consume");
+    let authority = consume_subscription_ticket(
+        &mut consume,
+        &ticket_hash(&opaque),
+        &session.capability,
+        SUBSCRIBE_EVENTS_PATH,
+        clock_now(&pool).await,
+    )
+    .await
+    .expect("consume ticket before revocation");
+    consume.commit().await.expect("commit consume");
+
+    sqlx::query(
+        "UPDATE chat.devices SET status='revoked',revoked_at=$3 WHERE user_did=$1 AND device_id=$2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .bind(clock_now(&pool).await)
+    .execute(&pool)
+    .await
+    .expect("revoke exact device without appending a durable event");
+
+    let mut live = pool.begin().await.expect("begin idle revalidation");
+    let result = revalidate_consumed_ticket(
+        &mut live,
+        &authority,
+        authority.event_position,
+        clock_now(&pool).await,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(TicketRepositoryError::DeviceBindingMismatch)
+    ));
+    live.rollback().await.expect("rollback rejected live pass");
 }
 
 #[tokio::test]
