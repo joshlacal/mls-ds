@@ -542,7 +542,7 @@ mod tests {
         let capability = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert_eq!(
             capability_hash(capability).unwrap(),
-            Sha256::digest([0u8; 32]).into()
+            <[u8; 32]>::from(Sha256::digest([0u8; 32]))
         );
         assert!(capability_hash("not-a-capability").is_err());
         assert!(capability_hash("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_err());
