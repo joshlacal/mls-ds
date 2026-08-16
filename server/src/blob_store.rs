@@ -66,20 +66,47 @@ impl BoundedPayload {
 #[derive(Clone)]
 pub struct BlobStore {
     s3: S3Client,
+    bucket: String,
 }
 
 impl BlobStore {
     /// Construct a client for route-harness tests without contacting S3.
     /// The client is inert until a route reaches an authorized object call.
+    /// Its bucket is explicitly disposable and namespaced by the test DB.
     pub fn for_route_tests() -> Self {
+        let suffix = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .and_then(|url| url.rsplit('/').next().map(str::to_owned))
+            .unwrap_or_else(|| "default".to_owned());
+        let suffix: String = suffix
+            .chars()
+            .map(|character| {
+                if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+                {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let bucket = format!("catbird-blobs-route-test-{suffix}");
         let config = Builder::new()
             .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:8333")
             .region(Region::new("us-east-1"))
-            .credentials_provider(Credentials::new("route-test", "route-test", None, None, "test"))
+            .credentials_provider(Credentials::new(
+                "route-test",
+                "route-test",
+                None,
+                None,
+                "test",
+            ))
             .force_path_style(true)
             .build();
-        Self { s3: S3Client::from_conf(config) }
+        Self {
+            s3: S3Client::from_conf(config),
+            bucket,
+        }
     }
 
     pub async fn new() -> Self {
@@ -104,7 +131,10 @@ impl BlobStore {
         let _ = s3.create_bucket().bucket(BUCKET).send().await;
 
         info!("BlobStore initialized (endpoint={})", endpoint);
-        Self { s3 }
+        Self {
+            s3,
+            bucket: BUCKET.to_owned(),
+        }
     }
 
     #[instrument(skip(self, data))]
@@ -116,7 +146,7 @@ impl BlobStore {
 
         self.s3
             .put_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(blob_id)
             .body(ByteStream::from(data))
             .content_type("application/octet-stream")
@@ -158,7 +188,7 @@ impl BlobStore {
         let expected_size = size.to_string();
         self.s3
             .put_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(&cid)
             .body(ByteStream::from(data))
             .content_type(media_type)
@@ -177,7 +207,7 @@ impl BlobStore {
         let resp = self
             .s3
             .get_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(blob_id)
             .send()
             .await
@@ -219,7 +249,7 @@ impl BlobStore {
         let response = self
             .s3
             .get_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(storage.object_store_key())
             .send()
             .await
@@ -259,7 +289,7 @@ impl BlobStore {
     pub async fn delete(&self, blob_id: &str) -> Result<(), BlobStoreError> {
         self.s3
             .delete_object()
-            .bucket(BUCKET)
+            .bucket(&self.bucket)
             .key(blob_id)
             .send()
             .await

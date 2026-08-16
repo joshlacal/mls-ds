@@ -71,6 +71,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Barrier;
 use tokio::time::{sleep, Duration as TokioDuration};
+use tower_util::ServiceExt;
 use uuid::Uuid;
 
 use repository::ticket::{
@@ -803,41 +804,103 @@ async fn consume_serializes_with_exact_device_revocation() {
     ));
 }
 
-
 use common::http_acceptance as http;
 
 #[tokio::test]
-async fn http_subscription_ticket_denies_foreign_session_without_disclosure() {
+async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_device() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     http::ensure_fence(&pool).await;
     let owner = http::seed_device(&pool).await;
-    let other = http::seed_device(&pool).await;
-    let router = http::router(pool.clone()).await;
+    let foreign = http::seed_device(&pool).await;
+    let now = clock_now(&pool).await;
+    let owner_fixture = DeviceFixture {
+        did: owner.did.clone(),
+        device_id: owner.device_id,
+        jkt: owner.jkt.clone(),
+        auth_generation: 1,
+    };
+    let session = seed_session(
+        &pool,
+        &owner_fixture,
+        now,
+        now + Duration::minutes(10),
+        true,
+    )
+    .await;
+    let opaque = fresh_blob();
+    let minted = {
+        let request = mint_request(
+            &owner_fixture,
+            &session,
+            &opaque,
+            session.capability.clone(),
+            now,
+            now + Duration::seconds(60),
+        );
+        let mut transaction = pool.begin().await.expect("begin real ticket mint");
+        let minted = mint_subscription_ticket(&mut transaction, &request)
+            .await
+            .expect("mint a real owner ticket");
+        transaction.commit().await.expect("commit real ticket mint");
+        minted
+    };
+    assert_eq!(minted.inventory_session_id, session.inventory_session_id);
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
     let body = serde_json::to_vec(&serde_json::json!({
-        "inventorySessionId": Uuid::new_v4().to_string(),
-        "eventCursor": "not-a-session-cursor"
+        "inventorySessionId": session.inventory_session_id,
+        "eventCursor": session.capability.clone(),
     }))
     .expect("ticket body");
 
-    let (owner_status, owner_response) = http::send(
+    let (foreign_status, foreign_response) = http::send(
         router.clone(),
-        http::unsigned_json_request(
-            &owner,
-            "blue.catbird.chat.getSubscriptionTicket",
-            body.clone(),
-        ),
+        http::unsigned_json_request(&foreign, "blue.catbird.chat.getSubscriptionTicket", body),
     )
     .await;
-    let (other_status, other_response) = http::send(
-        router,
-        http::unsigned_json_request(
-            &other,
-            "blue.catbird.chat.getSubscriptionTicket",
-            body,
-        ),
+    assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(foreign_response["error"], "DeviceRevoked");
+    assert!(foreign_response.get("ticket").is_none());
+    let ticket = URL_SAFE_NO_PAD.encode(&opaque);
+    // The foreign response above must remain non-disclosing.
+
+    let subscribe_query = format!("?ticket={ticket}&cursor={}", session.capability);
+    let first = router
+        .oneshot(http::websocket_request(
+            "blue.catbird.chat.subscribeEvents",
+            &subscribe_query,
+        ))
+        .await
+        .expect("first subscribe response");
+    assert_eq!(
+        first.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "the unmaterialized test session is rejected without disclosure"
+    );
+
+    let mut consume = pool.begin().await.expect("begin first ticket consume");
+    consume_subscription_ticket(
+        &mut consume,
+        &ticket_hash(&opaque),
+        &session.capability,
+        SUBSCRIBE_EVENTS_PATH,
+        clock_now(&pool).await,
+    )
+    .await
+    .expect("first real ticket consume succeeds");
+    consume.commit().await.expect("commit first ticket consume");
+
+    let mut replay = pool.begin().await.expect("begin replay ticket consume");
+    let replayed = consume_subscription_ticket(
+        &mut replay,
+        &ticket_hash(&opaque),
+        &session.capability,
+        SUBSCRIBE_EVENTS_PATH,
+        clock_now(&pool).await,
     )
     .await;
-    assert_eq!(owner_status, other_status);
-    assert_eq!(owner_response, other_response);
-    assert!(owner_response.get("ticket").is_none());
+    assert!(
+        matches!(replayed, Err(TicketRepositoryError::TicketAlreadyConsumed)),
+        "a replayed real ticket must fail closed: {replayed:?}"
+    );
+    replay.rollback().await.expect("rollback replay consume");
 }

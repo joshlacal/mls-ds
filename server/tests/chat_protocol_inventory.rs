@@ -4654,19 +4654,17 @@ fn d2_receipt_sql_and_response_shapes_are_source_pinned() {
     assert!(assembly_body.contains("return Err(InventoryRepositoryError::InvalidMaterialization)"));
 }
 
-
 // ===========================================================================
 // HTTP-level authenticated acceptance (server/cutover Task 1).
 // ===========================================================================
 
 use common::http_acceptance as http;
-
 #[tokio::test]
 async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_drift() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     http::ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
-    let router = http::router(pool.clone()).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
     let query = format!("?userDids={}", device.did);
 
     let (status, body) = http::send(
@@ -4674,14 +4672,25 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
         http::unsigned_request(&device, "blue.catbird.chat.getDevices", "GET", &query),
     )
     .await;
-    assert_eq!(status, axum::http::StatusCode::OK, "valid exact-device read: {body}");
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "valid exact-device read: {body}"
+    );
 
     let wrong_did = http::random_did();
     let (status, body) = http::send(
         router.clone(),
         http::unsigned_request_as(
-            &device, "blue.catbird.chat.getDevices", "GET", &query,
-            &wrong_did, device.device_id, &device.jkt, &device.signing, &device.jwk,
+            &device,
+            "blue.catbird.chat.getDevices",
+            "GET",
+            &query,
+            &wrong_did,
+            device.device_id,
+            &device.jkt,
+            &device.signing,
+            &device.jwk,
         ),
     )
     .await;
@@ -4691,8 +4700,15 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     let (status, body) = http::send(
         router.clone(),
         http::unsigned_request_as(
-            &device, "blue.catbird.chat.getDevices", "GET", &query,
-            &device.did, Uuid::new_v4(), &device.jkt, &device.signing, &device.jwk,
+            &device,
+            "blue.catbird.chat.getDevices",
+            "GET",
+            &query,
+            &device.did,
+            Uuid::new_v4(),
+            &device.jkt,
+            &device.signing,
+            &device.jwk,
         ),
     )
     .await;
@@ -4705,11 +4721,105 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     let (status, body) = http::send(
         router,
         http::unsigned_request_as(
-            &device, "blue.catbird.chat.getDevices", "GET", &query,
-            &device.did, device.device_id, &wrong_jkt, &wrong_proof, &wrong_jwk,
+            &device,
+            "blue.catbird.chat.getDevices",
+            "GET",
+            &query,
+            &device.did,
+            device.device_id,
+            &wrong_jkt,
+            &wrong_proof,
+            &wrong_jwk,
         ),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "InvalidDPoP");
+}
+
+#[tokio::test]
+async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_stale() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fence = ensure_fence(&pool).await;
+    let device = http::seed_device(&pool).await;
+    let session_device = SessionDevice {
+        did: device.did.clone(),
+        device_id: device.device_id,
+        jkt: device.jkt.clone(),
+    };
+    let device_created_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read HTTP device creation time");
+    let now = whole_second(device_created_at) + Duration::seconds(1);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &session_device,
+        Uuid::new_v4(),
+        now,
+        now + Duration::minutes(15),
+        &mut DeterministicRandom::new(Uuid::new_v4().as_u128() as u64),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+
+    let query = format!("?inventorySessionId={}", session.session_id);
+    let mut drift = pool.begin().await.expect("begin generation drift fixture");
+    sqlx::query("SET LOCAL session_replication_role = 'replica'")
+        .execute(&mut *drift)
+        .await
+        .expect("allow the isolated stale-generation fixture");
+    sqlx::query(
+        "UPDATE chat.devices SET auth_generation = auth_generation + 1 WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .execute(&mut *drift)
+    .await
+    .expect("advance the live auth generation");
+    drift
+        .commit()
+        .await
+        .expect("commit generation drift fixture");
+    let live_generation: i64 = sqlx::query_scalar(
+        "SELECT auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read advanced live auth generation");
+    assert_eq!(live_generation, 2);
+    let session_generation: i64 = sqlx::query_scalar(
+        "SELECT auth_generation FROM chat.inventory_sessions WHERE inventory_session_id = $1",
+    )
+    .bind(session.session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retained session auth generation");
+    assert_eq!(session_generation, 1);
+    let (status, body) = http::send(
+        router,
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getPendingWelcomes",
+            "GET",
+            &query,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InventorySessionMismatch");
+    assert!(
+        body.get("items").is_none(),
+        "generation drift must not disclose session items"
+    );
 }
