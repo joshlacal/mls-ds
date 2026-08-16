@@ -3362,3 +3362,27 @@ fn acceptance_replay_allows_only_valid_recovery_terminal_progressions() {
         ));
     }
 }
+
+#[test]
+fn acceptance_replay_binds_recovery_to_transition_successor_coordinate() {
+    use chat_protocol::validation::acceptance_replay_coordinate_matches_successor;
+
+    assert!(acceptance_replay_coordinate_matches_successor(
+        Some(3),
+        Some(9),
+        3,
+        9
+    ));
+    assert!(!acceptance_replay_coordinate_matches_successor(
+        Some(3),
+        Some(9),
+        2,
+        8
+    ));
+    assert!(!acceptance_replay_coordinate_matches_successor(
+        None,
+        Some(9),
+        3,
+        9
+    ));
+}

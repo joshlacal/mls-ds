@@ -125,6 +125,18 @@ pub fn acceptance_replay_terminal_state_allowed(
     }
 }
 
+/// Recovery rows retained for an acceptance replay are bound to the
+/// successor produced by that acceptance transition, never its predecessor.
+pub fn acceptance_replay_coordinate_matches_successor(
+    transition_next_generation: Option<i64>,
+    transition_next_state_version: Option<i64>,
+    recovery_generation: i64,
+    recovery_state_version: i64,
+) -> bool {
+    transition_next_generation == Some(recovery_generation)
+        && transition_next_state_version == Some(recovery_state_version)
+}
+
 impl fmt::Display for BareDid {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)

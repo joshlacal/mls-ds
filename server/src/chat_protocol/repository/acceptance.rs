@@ -518,7 +518,7 @@ async fn lock_acceptance_replay_post_state(
     let transition = sqlx::query(
         r#"
         SELECT conversation_id,kind,actor_did,actor_device_id,actor_key_id,
-               actor_auth_generation,prior_generation,prior_state_version,
+               actor_auth_generation,next_generation,next_state_version,
                signed_request_bytes,request_digest,signature
           FROM chat.transitions
          WHERE transition_id=$1
@@ -534,8 +534,8 @@ async fn lock_acceptance_replay_post_state(
     let transition_actor_device: Uuid = transition.try_get("actor_device_id")?;
     let transition_actor_key: String = transition.try_get("actor_key_id")?;
     let transition_actor_auth_generation: i64 = transition.try_get("actor_auth_generation")?;
-    let transition_prior_generation: Option<i64> = transition.try_get("prior_generation")?;
-    let transition_prior_state_version: Option<i64> = transition.try_get("prior_state_version")?;
+    let transition_next_generation: Option<i64> = transition.try_get("next_generation")?;
+    let transition_next_state_version: Option<i64> = transition.try_get("next_state_version")?;
     let transition_request: Vec<u8> = transition.try_get("request_digest")?;
     let transition_signature: Vec<u8> = transition.try_get("signature")?;
     let accepted = mutation
@@ -632,8 +632,12 @@ async fn lock_acceptance_replay_post_state(
         || recovery.try_get::<String, _>("requester_key_id")? != transition_actor_key
         || recovery.try_get::<i64, _>("requester_auth_generation")?
             != transition_actor_auth_generation
-        || transition_prior_generation != Some(recovery.try_get("generation")?)
-        || transition_prior_state_version != Some(recovery_bound_state_version)
+        || !crate::chat_protocol::validation::acceptance_replay_coordinate_matches_successor(
+            transition_next_generation,
+            transition_next_state_version,
+            recovery.try_get("generation")?,
+            recovery_bound_state_version,
+        )
         || recovery
             .try_get::<Vec<u8>, _>("signed_request_bytes")?
             .as_slice()
