@@ -32,6 +32,8 @@ mod get_devices;
 #[cfg(not(test))]
 mod get_entries;
 mod get_own_devices;
+#[cfg(not(test))]
+mod leave;
 mod rebind_device_authentication;
 #[cfg(not(test))]
 mod recovery;
@@ -92,6 +94,9 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
+            | ChatEndpoint::RequestLeave
+            | ChatEndpoint::CancelLeave
+            | ChatEndpoint::CloseConversation
     ) {
         return true;
     }
@@ -152,6 +157,18 @@ where
     );
     #[cfg(not(test))]
     let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::RequestLeave),
+            post(leave::handle_request),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelLeave),
+            post(leave::handle_cancellation),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CloseConversation),
+            post(leave::handle_close),
+        )
         .route(
             &xrpc_path(ChatEndpoint::RequestReset),
             post(reset::handle_request),

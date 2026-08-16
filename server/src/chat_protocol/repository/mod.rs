@@ -52,6 +52,8 @@ pub(crate) mod inventory;
 // `#[allow(dead_code)]` until the H1 endpoint handlers (next seal) call in.
 #[allow(dead_code)]
 pub(crate) mod key_packages;
+#[cfg(not(test))]
+pub(crate) mod leave;
 pub(crate) mod prelude;
 #[allow(dead_code)]
 pub(crate) mod recovery;

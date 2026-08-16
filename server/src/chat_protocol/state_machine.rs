@@ -7753,8 +7753,20 @@ pub(crate) struct LeaveRequest {
 }
 
 impl LeaveRequest {
+    pub(crate) fn request_id(&self) -> &[u8; 16] {
+        &self.request_id
+    }
+
     pub(crate) fn requester(&self) -> &DeviceIdentity {
         &self.requester
+    }
+
+    pub(crate) fn bound_coordinate(&self) -> &PublicGroupSnapshotCoordinate {
+        &self.bound_coordinate
+    }
+
+    pub(crate) fn received_at(&self) -> &ServerTimestamp {
+        &self.received_at
     }
 
     pub(crate) fn status(&self) -> LeaveRequestStatus {

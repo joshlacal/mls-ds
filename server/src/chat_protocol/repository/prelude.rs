@@ -24,7 +24,7 @@ use super::{
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
 #[cfg(not(test))]
-use super::{recovery, reset, revocation, submit_transition, welcome_terminal};
+use super::{leave, recovery, reset, revocation, submit_transition, welcome_terminal};
 
 #[derive(Debug, Error)]
 pub(crate) enum PreludeError {
@@ -79,7 +79,7 @@ impl CanonicalDeviceIdentity {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalLockScope {
     principals: Vec<String>,
     devices: Vec<CanonicalDeviceIdentity>,
@@ -555,6 +555,10 @@ pub(in crate::chat_protocol::repository) struct LockedSignedOperationReplayAutho
 }
 
 impl LockedSignedOperationReplayAuthority {
+    pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
     pub(in crate::chat_protocol::repository) fn authority(
         &self,
     ) -> &auth::SignedOperationReplayAuthority {
@@ -575,6 +579,7 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     WelcomeRejection(welcome_terminal::WelcomeReplayPostStateProof),
     Recovery(recovery::RecoveryReplayPostStateProof),
     SubmitTransition(submit_transition::SubmitTransitionReplayPostStateProof),
+    Leave(leave::LeaveReplayPostStateProof),
 }
 
 #[cfg(not(test))]
@@ -588,6 +593,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.transaction_id(),
             Self::SubmitTransition(proof) => proof.transaction_id(),
+            Self::Leave(proof) => proof.transaction_id(),
         }
     }
 
@@ -600,6 +606,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.operation_id(),
             Self::SubmitTransition(proof) => proof.operation_id(),
+            Self::Leave(proof) => proof.operation_id(),
         }
     }
 
@@ -612,6 +619,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.principal_did(),
             Self::SubmitTransition(proof) => proof.principal_did(),
+            Self::Leave(proof) => proof.principal_did(),
         }
     }
 
@@ -624,6 +632,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.endpoint_nsid(),
             Self::SubmitTransition(proof) => proof.endpoint_nsid(),
+            Self::Leave(proof) => proof.endpoint_nsid(),
         }
     }
 
@@ -636,6 +645,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.mutation_kind(),
             Self::SubmitTransition(proof) => proof.mutation_kind(),
+            Self::Leave(proof) => proof.mutation_kind(),
         }
     }
 
@@ -648,6 +658,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.request_digest(),
             Self::SubmitTransition(proof) => proof.request_digest(),
+            Self::Leave(proof) => proof.request_digest(),
         }
     }
 
@@ -662,6 +673,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.accepted_request_sha256(),
             Self::SubmitTransition(proof) => proof.accepted_request_sha256(),
+            Self::Leave(proof) => proof.accepted_request_sha256(),
         }
     }
 
@@ -674,6 +686,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.signature(),
             Self::SubmitTransition(proof) => proof.signature(),
+            Self::Leave(proof) => proof.signature(),
         }
     }
 
@@ -686,6 +699,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.post_state_digest(),
             Self::SubmitTransition(proof) => proof.post_state_digest(),
+            Self::Leave(proof) => proof.post_state_digest(),
         }
     }
 
@@ -700,6 +714,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_status(),
             Self::SubmitTransition(proof) => proof.expected_status(),
+            Self::Leave(proof) => proof.expected_response_status(),
         }
     }
 
@@ -714,6 +729,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_response_sha256(),
             Self::SubmitTransition(proof) => proof.expected_response_sha256(),
+            Self::Leave(proof) => proof.expected_response_sha256(),
         }
     }
 
@@ -726,6 +742,7 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.validates_seal(),
             Self::SubmitTransition(proof) => proof.validates_seal(),
+            Self::Leave(proof) => proof.validates_seal(),
         }
     }
 
@@ -774,6 +791,22 @@ impl SignedOperationReplayPostStateProof {
                             | SignedMutationKind::LeaveCommitFulfillment
                     )
             }
+            Self::Leave(proof) => matches!(
+                (proof.endpoint_nsid(), proof.mutation_kind()),
+                (
+                    "blue.catbird.chat.requestLeave",
+                    SignedMutationKind::LeaveRequest,
+                ) | (
+                    "blue.catbird.chat.requestLeave",
+                    SignedMutationKind::ZeroLeafLeave,
+                ) | (
+                    "blue.catbird.chat.cancelLeave",
+                    SignedMutationKind::LeaveCancellation,
+                ) | (
+                    "blue.catbird.chat.closeConversation",
+                    SignedMutationKind::ConversationClose,
+                )
+            ),
         }
     }
 }

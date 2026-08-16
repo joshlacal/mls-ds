@@ -32,13 +32,14 @@ use crate::chat_protocol::state_machine::{
     apply_prepared_device_revocation_members, apply_prepared_device_revocation_prefix,
     batch_transaction_bindings_match, plan_transaction_bindings_match,
     prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
-    ConversationPersistencePlan, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
-    EventChainCursorError, EventFanout, ExecutionActor, ExecutionAuthority, ExecutorError,
-    LeafPersistenceColumns, LeafRecoveryKind, MetadataAuthorColumns, MetadataAvatarPersistence,
-    ParticipantRole, PlanAuthority, PlanKind, PreparedConversationExecution,
-    PreparedDeviceRevocationBatchMembers, PrincipalId, RecoveryOpenContext, RecoverySource,
-    ResetRequestRow, ServerTimestamp, SpineArtifacts, WelcomeDispositionInput,
-    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
+    ConversationKind, ConversationPersistencePlan, DeviceIdentity,
+    DeviceRevocationBatchPersistencePlan, EventChainCursorError, EventFanout, ExecutionActor,
+    ExecutionAuthority, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
+    LeaveRequestStatus, MetadataAuthorColumns, MetadataAvatarPersistence, ParticipantRole,
+    PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
+    PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
+    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
+    WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
     canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
@@ -2366,6 +2367,106 @@ pub(in crate::chat_protocol::repository) async fn apply_prepared_submit_transiti
 ) -> Result<AppliedTransition, ExecutorError> {
     crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
         .await
+}
+
+/// Prepare the transaction-bound executor for requestLeave, cancelLeave, the
+/// zero-leaf leave arm, and closeConversation.  The event payload is derived
+/// exclusively from the sealed persistence plan; callers cannot supply an
+/// arbitrary event body.
+pub(in crate::chat_protocol::repository) async fn prepare_leave_lifecycle_execution<'a, 'c, 'p>(
+    transaction: &'a mut Transaction<'c, Postgres>,
+    plan: &'p ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+) -> Result<PreparedConversationExecution<'a, 'c, 'p>, ExecutionContextHydrationError> {
+    if !matches!(
+        plan.effects().kind(),
+        PlanKind::LeaveRequest
+            | PlanKind::LeaveCancellation
+            | PlanKind::ZeroLeafLeave
+            | PlanKind::Close
+    ) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(canonical_leave_event_payload(plan)?),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_leave_lifecycle_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+fn canonical_leave_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    match plan.effects().kind() {
+        PlanKind::LeaveRequest => {
+            let request_id = plan.effects().leave_request_changes().iter().find_map(|change| {
+                matches!((change.before(), change.after()), (None, Some(after)) if after.status() == LeaveRequestStatus::Pending)
+                    .then(|| Uuid::from_bytes(*change.after().expect("matched").request_id()))
+            }).ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "leaveRequestId": request_id.hyphenated().to_string(),
+                "status": "pending"
+            })
+            .to_string()
+            .into_bytes())
+        }
+        PlanKind::LeaveCancellation => {
+            let request_id = plan.effects().leave_request_changes().iter().find_map(|change| {
+                matches!((change.before(), change.after()), (Some(before), Some(after)) if before.status() == LeaveRequestStatus::Pending && after.status() == LeaveRequestStatus::Cancelled)
+                    .then(|| Uuid::from_bytes(*change.after().expect("matched").request_id()))
+            }).ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "leaveRequestId": request_id.hyphenated().to_string(),
+                "status": "cancelled"
+            })
+            .to_string()
+            .into_bytes())
+        }
+        PlanKind::ZeroLeafLeave => Ok(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#conversationChangedEvent",
+            "conversationId": conversation_id.hyphenated().to_string()
+        })
+        .to_string()
+        .into_bytes()),
+        PlanKind::Close => {
+            let kind = match plan.state().kind {
+                ConversationKind::Direct => "direct",
+                ConversationKind::Group => "group",
+            };
+            let seq = plan
+                .effects()
+                .head_cas()
+                .and_then(|head| head.allocated_seq())
+                .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#conversationClosedEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "conversationKind": kind,
+                "terminalSeq": seq
+            })
+            .to_string()
+            .into_bytes())
+        }
+        _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
+    }
 }
 
 pub(crate) async fn apply_prepared_welcome_terminal_execution(
