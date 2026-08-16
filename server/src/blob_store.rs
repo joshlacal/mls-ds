@@ -6,6 +6,7 @@ use aws_sdk_s3::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tracing::{error, info, instrument};
 
 use crate::chat_protocol::repository::blobs::{
@@ -71,6 +72,33 @@ struct RouteTestObject {
     expected_cid: String,
     media_type: String,
 }
+
+/// A disposable-fixture-only barrier that exposes the production S3-delete /
+/// DB-reclaim boundary to an integration test. It has no effect unless
+/// explicitly installed on a cloned `BlobStore`.
+#[doc(hidden)]
+pub struct S3FixtureDeleteProbe {
+    deleted: Notify,
+    resume: Notify,
+}
+
+impl S3FixtureDeleteProbe {
+    pub fn new() -> Self {
+        Self {
+            deleted: Notify::new(),
+            resume: Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_deleted(&self) {
+        self.deleted.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.resume.notify_one();
+    }
+}
+
 #[derive(Clone)]
 pub struct BlobStore {
     s3: S3Client,
@@ -83,6 +111,7 @@ pub struct BlobStore {
     /// repository layer; the prefix is a physical-storage concern only).
     key_prefix: String,
     route_test_objects: Option<Arc<HashMap<String, RouteTestObject>>>,
+    fixture_delete_probe: Option<Arc<S3FixtureDeleteProbe>>,
 }
 
 impl BlobStore {
@@ -130,6 +159,7 @@ impl BlobStore {
             bucket,
             key_prefix: String::new(),
             route_test_objects: Some(Arc::new(HashMap::new())),
+            fixture_delete_probe: None,
         }
     }
 
@@ -187,6 +217,7 @@ impl BlobStore {
             bucket: BUCKET.to_owned(),
             key_prefix: String::new(),
             route_test_objects: None,
+            fixture_delete_probe: None,
         }
     }
 
@@ -239,7 +270,20 @@ impl BlobStore {
             bucket,
             key_prefix: prefix.to_owned(),
             route_test_objects: None,
+            fixture_delete_probe: None,
         }
+    }
+
+    /// Install a disposable-fixture barrier around the production S3 delete
+    /// call so an integration test can observe the DB row before reclaim
+    /// commits. This is inert unless explicitly installed by a fixture test.
+    #[doc(hidden)]
+    pub fn with_s3_fixture_delete_probe(
+        mut self,
+        probe: Arc<S3FixtureDeleteProbe>,
+    ) -> Self {
+        self.fixture_delete_probe = Some(probe);
+        self
     }
 
     #[instrument(skip(self, data))]
@@ -417,6 +461,10 @@ impl BlobStore {
                 error!("S3 delete failed for blob {}: {}", blob_id, e);
                 BlobStoreError::S3Error(e.to_string())
             })?;
+        if let Some(probe) = &self.fixture_delete_probe {
+            probe.deleted.notify_one();
+            probe.resume.notified().await;
+        }
 
         info!("Deleted blob {} from S3", blob_id);
         Ok(())

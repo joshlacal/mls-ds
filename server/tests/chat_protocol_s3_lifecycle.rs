@@ -349,7 +349,7 @@ use base64::{
     Engine as _,
 };
 use catbird_server::{
-    blob_store::BlobStore,
+    blob_store::{BlobStore, S3FixtureDeleteProbe},
     handlers::chat::ChatRuntime,
     realtime::SseState,
 };
@@ -2771,74 +2771,17 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
         unbound + Duration::hours(24) <= now,
         "fixture must already be past the 24h GC grace"
     );
-    // Transaction-boundary proof of the required ordering: use the production
-    // expiry claim to make the row pending, then hold the reclaim transaction
-    // open while the production BlobStore deletes the exact S3 object. The
-    // same transaction still observes the row as pending until the reclaim
-    // UPDATE/COMMIT, so the deletion is externally observable before commit.
-    let mut expire_tx = pool.begin().await.expect("begin ordering expiry claim");
-    let claimed = repository::blobs::expire_due_blobs(&mut expire_tx, now, 1)
-        .await
-        .expect("claim due blob for ordering proof");
-    assert_eq!(claimed.len(), 1, "ordering proof must claim the fixture blob");
-    expire_tx
-        .commit()
-        .await
-        .expect("commit ordering expiry claim");
-
-    let mut boundary_tx = pool.begin().await.expect("begin ordering reclaim");
-    let pending: (String, String, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT status, object_gc_status, object_deleted_at \
-           FROM chat.blobs WHERE blob_id = $1 FOR UPDATE",
-    )
-    .bind(blob_id)
-    .fetch_one(&mut *boundary_tx)
-    .await
-    .expect("pending ordering row");
-    assert_eq!(pending.0, "expired");
-    assert_eq!(pending.1, "pending");
-    assert!(pending.2.is_none());
-
-    store
-        .delete(&cid)
-        .await
-        .expect("ordering proof S3 delete");
-    assert!(
-        !object_exists(&client, &physical_key).await,
-        "S3 object must be gone before reclaim commit"
-    );
-    let still_pending: (String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT object_gc_status, object_store_key, object_deleted_at \
-           FROM chat.blobs WHERE blob_id = $1",
-    )
-    .bind(blob_id)
-    .fetch_one(&mut *boundary_tx)
-    .await
-    .expect("observe pending row during open reclaim transaction");
-    assert_eq!(still_pending.0, "pending");
-    assert_eq!(still_pending.1.as_deref(), Some(cid.as_str()));
-    assert!(still_pending.2.is_none());
-    println!(
-        "s3_expiry_gc_ordering: blob_id={blob_id} s3_object_absent=true db_gc_status=pending db_key_retained=true before_reclaim_commit"
-    );
-
-    // Restore the object and roll back this proof transaction so the real
-    // sweeper below exercises the same pending row and performs the cleanup.
-    store
-        .put_for_blob(blob_id, ciphertext.clone(), &ct_sha, MEDIA_STR)
-        .await
-        .expect("restore ordering proof object");
-    boundary_tx
-        .rollback()
-        .await
-        .expect("rollback ordering proof transaction");
-
 
     // Production sweeper (real `run_chat_expiry_sweeper_with_blob_store`).
+    // The fixture probe pauses inside BlobStore::delete after the S3 DELETE
+    // succeeds and before reclaim_due_blob_objects can commit its DB UPDATE.
     let runtime = cutover_runtime(&pool).await;
+    let delete_probe = Arc::new(S3FixtureDeleteProbe::new());
     let handle = tokio::spawn({
         let pool = pool.clone();
-        let store = store.clone();
+        let store = store
+            .clone()
+            .with_s3_fixture_delete_probe(delete_probe.clone());
         let runtime = runtime.clone();
         async move {
             catbird_server::handlers::chat::run_chat_expiry_sweeper_with_blob_store(
@@ -2847,6 +2790,34 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
             .await;
         }
     });
+
+    tokio::time::timeout(
+        StdDuration::from_secs(45),
+        delete_probe.wait_until_deleted(),
+    )
+    .await
+    .expect("production reclaim must reach the post-S3-delete probe");
+    assert!(
+        !object_exists(&client, &physical_key).await,
+        "production reclaim must delete S3 before its DB reclaim UPDATE"
+    );
+    let during_delete: (String, String, Option<String>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status, object_gc_status, object_store_key, object_deleted_at \
+             FROM chat.blobs WHERE blob_id = $1",
+        )
+        .bind(blob_id)
+        .fetch_one(&pool)
+        .await
+        .expect("observe production reclaim row while delete probe is paused");
+    assert_eq!(during_delete.0, "expired");
+    assert_eq!(during_delete.1, "pending");
+    assert_eq!(during_delete.2.as_deref(), Some(cid.as_str()));
+    assert!(during_delete.3.is_none());
+    println!(
+        "s3_expiry_gc_ordering: blob_id={blob_id} production_reclaim=true s3_object_absent=true db_gc_status=pending db_key_retained=true before_reclaim_commit"
+    );
+    delete_probe.release();
     let started = StdInstant::now();
     let deadline = started + StdDuration::from_secs(45);
     let (reclaimed_gc, reclaimed_deleted): (String, Option<DateTime<Utc>>) = loop {
@@ -2875,8 +2846,8 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
     handle.abort();
     let _ = handle.await;
 
-    // The exact S3 object was deleted BEFORE/DURING the DB reclamation and the
-    // row is terminal + reclaimed with the object key cleared.
+    // After the production reclaim resumes, the row is terminal + reclaimed
+    // with the exact object key cleared.
     assert!(
         !object_exists(&client, &physical_key).await,
         "exact S3 object must be gone once the row is reclaimed"
