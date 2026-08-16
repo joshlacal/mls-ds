@@ -12,6 +12,7 @@ fn durable_subscription_uses_exact_device_global_event_authority() {
         "recipient.device_id = $2",
         "event.event_position > $4",
         "ORDER BY event.event_position",
+        "observed_at >= ticket.expires_at",
         "insert_event_cursor_receipt",
         "predecessor_cursor_hash: Some(previous_cursor_hash)",
         "canonical_envelope_sha256: Some(envelope_hash)",

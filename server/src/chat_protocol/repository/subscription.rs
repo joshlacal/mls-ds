@@ -39,12 +39,15 @@ pub(crate) async fn replay_high_water(
     transaction: &mut Transaction<'_, Postgres>,
     ticket: &ConsumedTicket,
 ) -> Result<i64, TicketRepositoryError> {
-    let high_water: i64 = sqlx::query_scalar(
-        "SELECT coalesce(max(event_position),0)::bigint FROM chat.events WHERE protocol_instance_id=$1",
+    let (high_water, observed_at): (i64, DateTime<Utc>) = sqlx::query_as(
+        "SELECT coalesce(max(event_position),0)::bigint, transaction_timestamp() FROM chat.events WHERE protocol_instance_id=$1",
     )
     .bind(ticket.protocol_instance_id)
     .fetch_one(&mut **transaction)
     .await?;
+    if observed_at >= ticket.expires_at {
+        return Err(TicketRepositoryError::TicketExpired);
+    }
     Ok(high_water.max(ticket.event_position))
 }
 
