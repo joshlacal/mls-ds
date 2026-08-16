@@ -1967,7 +1967,7 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
     resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
         .await
         .expect("accept application entry");
-    let request = prepare_request(
+    let mut request = prepare_request(
         &owner.did,
         owner.device_id,
         &graph.actor_key_id,
@@ -1976,6 +1976,8 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
         1_000,
         now,
     );
+    let payload = vec![0x6D_u8; request.ciphertext_size as usize];
+    request.ciphertext_sha256 = Sha256::digest(&payload).to_vec();
     let blob_id = request.blob_id;
     prepare_blob(&mut tx, &request)
         .await
@@ -2021,22 +2023,39 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
     .expect("bind existing blob");
     set_constraints_immediate(&mut tx).await;
     tx.commit().await.expect("commit HTTP blob graph");
-
-    let router = http::router_for_authenticated_acceptance(pool).await;
+    let object_store_key = deterministic_object_key(blob_id, &request.ciphertext_sha256);
+    let expected_sha256: [u8; 32] = request
+        .ciphertext_sha256
+        .as_slice()
+        .try_into()
+        .expect("blob hash");
+    let router = http::router_for_authenticated_acceptance_with_blob_store(
+        pool,
+        catbird_server::blob_store::BlobStore::for_route_tests_with_object(
+            object_store_key,
+            payload.clone(),
+            expected_sha256,
+            deterministic_object_key(blob_id, &request.ciphertext_sha256),
+            "image/png".to_owned(),
+        ),
+    )
+    .await;
     let query = format!("?blobId={blob_id}");
-    let (owner_status, owner_response) = http::send(
+    let (owner_status, owner_bytes) = http::send_bytes(
         router.clone(),
         http::unsigned_request(&owner, "blue.catbird.chat.getBlob", "GET", &query),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         owner_status,
-        axum::http::StatusCode::UNAUTHORIZED,
-        "existing authorized blob must pass admission: {owner_response}"
+        axum::http::StatusCode::OK,
+        "owner response status={owner_status} body={:?}",
+        String::from_utf8_lossy(&owner_bytes)
     );
+    assert_eq!(owner_bytes, payload);
 
     let (foreign_status, foreign_response) = http::send(
-        router,
+        router.clone(),
         http::unsigned_request(&foreign, "blue.catbird.chat.getBlob", "GET", &query),
     )
     .await;

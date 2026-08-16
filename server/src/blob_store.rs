@@ -4,6 +4,8 @@ use aws_sdk_s3::{
     Client as S3Client,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{error, info, instrument};
 
 use crate::chat_protocol::repository::blobs::{
@@ -63,10 +65,17 @@ impl BoundedPayload {
     }
 }
 
+struct RouteTestObject {
+    data: Vec<u8>,
+    expected_sha256: [u8; 32],
+    expected_cid: String,
+    media_type: String,
+}
 #[derive(Clone)]
 pub struct BlobStore {
     s3: S3Client,
     bucket: String,
+    route_test_objects: Option<Arc<HashMap<String, RouteTestObject>>>,
 }
 
 impl BlobStore {
@@ -106,7 +115,35 @@ impl BlobStore {
         Self {
             s3: S3Client::from_conf(config),
             bucket,
+            route_test_objects: Some(Arc::new(HashMap::new())),
         }
+    }
+
+    pub fn for_route_tests_with_object(
+        object_store_key: String,
+        data: Vec<u8>,
+        expected_sha256: [u8; 32],
+        expected_cid: String,
+        media_type: String,
+    ) -> Self {
+        let mut store = Self::for_route_tests();
+        Arc::get_mut(
+            store
+                .route_test_objects
+                .as_mut()
+                .expect("unique route test objects"),
+        )
+        .expect("unique route test object map")
+        .insert(
+            object_store_key,
+            RouteTestObject {
+                data,
+                expected_sha256,
+                expected_cid,
+                media_type,
+            },
+        );
+        store
     }
 
     pub async fn new() -> Self {
@@ -134,6 +171,7 @@ impl BlobStore {
         Self {
             s3,
             bucket: BUCKET.to_owned(),
+            route_test_objects: None,
         }
     }
 
@@ -246,6 +284,21 @@ impl BlobStore {
         let expected_size = usize::try_from(storage.expected_size())
             .map_err(|_| BlobStoreError::InvalidExpectedSize)?;
 
+        if let Some(objects) = &self.route_test_objects {
+            let object = objects
+                .get(storage.object_store_key())
+                .ok_or(BlobStoreError::NotFound)?;
+            if object.data.len() != expected_size
+                || object.expected_sha256 != *storage.expected_sha256()
+                || object.expected_cid != storage.derived_cid()
+                || object.media_type != storage.media_type()
+            {
+                return Err(BlobStoreError::MetadataMismatch("blob identity"));
+            }
+            let mut payload = BoundedPayload::new(expected_size);
+            payload.push(&object.data);
+            return payload.finish(storage.expected_sha256());
+        }
         let response = self
             .s3
             .get_object()

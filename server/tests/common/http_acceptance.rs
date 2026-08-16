@@ -186,7 +186,7 @@ pub async fn ensure_fence(pool: &DbPool) {
 
 /// Build the route harness with the pre-cutover fence held by default.
 pub async fn router(pool: DbPool) -> Router {
-    build_router(pool, false).await
+    build_router(pool, false, None).await
 }
 
 /// The named authenticated acceptance cases exercise routes gated behind the
@@ -194,10 +194,21 @@ pub async fn router(pool: DbPool) -> Router {
 /// the process-level value is restored to the explicit pre-cutover value
 /// immediately afterward.
 pub async fn router_for_authenticated_acceptance(pool: DbPool) -> Router {
-    build_router(pool, true).await
+    build_router(pool, true, None).await
 }
 
-async fn build_router(pool: DbPool, cutover_enabled: bool) -> Router {
+pub async fn router_for_authenticated_acceptance_with_blob_store(
+    pool: DbPool,
+    blob_store: BlobStore,
+) -> Router {
+    build_router(pool, true, Some(blob_store)).await
+}
+
+async fn build_router(
+    pool: DbPool,
+    cutover_enabled: bool,
+    blob_store: Option<BlobStore>,
+) -> Router {
     let key_id: String = sqlx::query_scalar(
         "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
     )
@@ -234,7 +245,7 @@ async fn build_router(pool: DbPool, cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime,
-        blob_store: BlobStore::for_route_tests(),
+        blob_store: blob_store.unwrap_or_else(BlobStore::for_route_tests),
     })
 }
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {
@@ -323,4 +334,15 @@ pub async fn send(router: Router, request: Request<Body>) -> (axum::http::Status
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+pub async fn send_bytes(
+    router: Router,
+    request: Request<Body>,
+) -> (axum::http::StatusCode, Vec<u8>) {
+    let response = router.oneshot(request).await.expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, bytes.to_vec())
 }
