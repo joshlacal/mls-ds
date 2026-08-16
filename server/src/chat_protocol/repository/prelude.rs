@@ -24,7 +24,9 @@ use super::{
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
 #[cfg(not(test))]
-use super::{recovery, reset, revocation, submit_transition, welcome_terminal};
+use super::{
+    acceptance, creation, recovery, reset, revocation, submit_transition, welcome_terminal,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum PreludeError {
@@ -575,6 +577,8 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     WelcomeRejection(welcome_terminal::WelcomeReplayPostStateProof),
     Recovery(recovery::RecoveryReplayPostStateProof),
     SubmitTransition(submit_transition::SubmitTransitionReplayPostStateProof),
+    Creation(creation::CreationReplayPostStateProof),
+    Acceptance(acceptance::AcceptanceReplayPostStateProof),
 }
 
 #[cfg(not(test))]
@@ -588,6 +592,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.transaction_id(),
             Self::SubmitTransition(proof) => proof.transaction_id(),
+            Self::Creation(proof) => proof.transaction_id(),
+            Self::Acceptance(proof) => proof.transaction_id(),
         }
     }
 
@@ -600,6 +606,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.operation_id(),
             Self::SubmitTransition(proof) => proof.operation_id(),
+            Self::Creation(proof) => proof.operation_id(),
+            Self::Acceptance(proof) => proof.operation_id(),
         }
     }
 
@@ -612,6 +620,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.principal_did(),
             Self::SubmitTransition(proof) => proof.principal_did(),
+            Self::Creation(proof) => proof.principal_did(),
+            Self::Acceptance(proof) => proof.principal_did(),
         }
     }
 
@@ -624,6 +634,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.endpoint_nsid(),
             Self::SubmitTransition(proof) => proof.endpoint_nsid(),
+            Self::Creation(proof) => proof.endpoint_nsid(),
+            Self::Acceptance(proof) => proof.endpoint_nsid(),
         }
     }
 
@@ -636,6 +648,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.mutation_kind(),
             Self::SubmitTransition(proof) => proof.mutation_kind(),
+            Self::Creation(proof) => proof.mutation_kind(),
+            Self::Acceptance(proof) => proof.mutation_kind(),
         }
     }
 
@@ -648,6 +662,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.request_digest(),
             Self::SubmitTransition(proof) => proof.request_digest(),
+            Self::Creation(proof) => proof.request_digest(),
+            Self::Acceptance(proof) => proof.request_digest(),
         }
     }
 
@@ -662,6 +678,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.accepted_request_sha256(),
             Self::SubmitTransition(proof) => proof.accepted_request_sha256(),
+            Self::Creation(proof) => proof.accepted_request_sha256(),
+            Self::Acceptance(proof) => proof.accepted_request_sha256(),
         }
     }
 
@@ -674,6 +692,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.signature(),
             Self::SubmitTransition(proof) => proof.signature(),
+            Self::Creation(proof) => proof.signature(),
+            Self::Acceptance(proof) => proof.signature(),
         }
     }
 
@@ -686,6 +706,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.post_state_digest(),
             Self::SubmitTransition(proof) => proof.post_state_digest(),
+            Self::Creation(proof) => proof.post_state_digest(),
+            Self::Acceptance(proof) => proof.post_state_digest(),
         }
     }
 
@@ -700,6 +722,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_status(),
             Self::SubmitTransition(proof) => proof.expected_status(),
+            Self::Creation(proof) => proof.expected_status(),
+            Self::Acceptance(proof) => proof.expected_status(),
         }
     }
 
@@ -714,6 +738,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_response_sha256(),
             Self::SubmitTransition(proof) => proof.expected_response_sha256(),
+            Self::Creation(proof) => proof.expected_response_sha256(),
+            Self::Acceptance(proof) => proof.expected_response_sha256(),
         }
     }
 
@@ -726,6 +752,8 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.validates_seal(),
             Self::SubmitTransition(proof) => proof.validates_seal(),
+            Self::Creation(proof) => proof.validates_seal(),
+            Self::Acceptance(proof) => proof.validates_seal(),
         }
     }
 
@@ -773,6 +801,14 @@ impl SignedOperationReplayPostStateProof {
                             | SignedMutationKind::MetadataTransition
                             | SignedMutationKind::LeaveCommitFulfillment
                     )
+            }
+            Self::Creation(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.createConversation"
+                    && proof.mutation_kind() == SignedMutationKind::Creation
+            }
+            Self::Acceptance(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.acceptConversation"
+                    && proof.mutation_kind() == SignedMutationKind::ParticipantAcceptance
             }
         }
     }
@@ -1936,6 +1972,32 @@ impl PreparedBusinessPrelude {
         self.verify_exact_operation_claim(
             "blue.catbird.chat.submitTransition",
             mutation_kind,
+            operation_id,
+            mutation,
+        )
+    }
+
+    pub(crate) fn verify_creation_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.createConversation",
+            SignedMutationKind::Creation,
+            operation_id,
+            mutation,
+        )
+    }
+
+    pub(crate) fn verify_acceptance_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.acceptConversation",
+            SignedMutationKind::ParticipantAcceptance,
             operation_id,
             mutation,
         )

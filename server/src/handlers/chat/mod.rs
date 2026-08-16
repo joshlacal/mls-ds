@@ -20,9 +20,13 @@ use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
+#[cfg(not(test))]
+mod accept_conversation;
 mod context;
 #[cfg(not(test))]
 mod conversation_state;
+#[cfg(not(test))]
+mod create_conversation;
 mod device_views;
 mod enroll_device;
 mod errors;
@@ -109,6 +113,8 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
                 | ChatEndpoint::GetEntries
+                | ChatEndpoint::CreateConversation
+                | ChatEndpoint::AcceptConversation
         )
     }
     #[cfg(test)]
@@ -187,6 +193,16 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
             get(get_entries::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::CreateConversation),
+            post(create_conversation::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::AcceptConversation),
+            post(accept_conversation::handle),
         );
     router
 }

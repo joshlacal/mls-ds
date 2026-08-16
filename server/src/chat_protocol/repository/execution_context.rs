@@ -2368,6 +2368,127 @@ pub(in crate::chat_protocol::repository) async fn apply_prepared_submit_transiti
         .await
 }
 
+fn creation_authority_matches_plan(plan: &ConversationPersistencePlan) -> bool {
+    matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if plan.effects().kind() == PlanKind::Creation
+                && evidence.signed_authority().is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::Creation
+                })
+    )
+}
+
+fn acceptance_authority_matches_plan(plan: &ConversationPersistencePlan) -> bool {
+    matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if plan.effects().kind() == PlanKind::Acceptance
+                && evidence.signed_authority().is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::ParticipantAcceptance
+                })
+    )
+}
+
+fn canonical_conversation_changed_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    if !creation_authority_matches_plan(plan) && !acceptance_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    Ok(format!(
+        r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+        conversation_id.hyphenated(),
+    )
+    .into_bytes())
+}
+
+pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
+    'borrow,
+    'connection,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+    genesis_group_info_bytes: Vec<u8>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if is_recovery_plan(plan) || !creation_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_creation_primary_event_payload(plan)?;
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: Some(genesis_group_info_bytes),
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_creation_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+pub(in crate::chat_protocol::repository) async fn prepare_acceptance_execution<
+    'borrow,
+    'connection,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if is_recovery_plan(plan) || !acceptance_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_acceptance_primary_event_payload(plan)?;
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_acceptance_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+fn canonical_creation_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    canonical_conversation_changed_primary_event_payload(plan)
+}
+
+fn canonical_acceptance_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    canonical_conversation_changed_primary_event_payload(plan)
+}
+
 pub(crate) async fn apply_prepared_welcome_terminal_execution(
     prepared: PreparedConversationExecution<'_, '_, '_>,
 ) -> Result<AppliedTransition, ExecutorError> {

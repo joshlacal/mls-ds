@@ -6945,6 +6945,33 @@ impl LockedRecoveryReservationProjection {
         &self.request_id
     }
 
+    /// Exact request-bound target identity and package projection retained for
+    /// acceptance control-entry server fields. These accessors expose only
+    /// validated, transaction-bound values selected by the locked row.
+    pub(crate) fn conversation_id(&self) -> &[u8; 16] {
+        &self.conversation_id
+    }
+
+    pub(crate) fn target_key_id(&self) -> &[u8; 32] {
+        &self.target_key_id
+    }
+
+    pub(crate) fn target_auth_generation(&self) -> u64 {
+        self.target_auth_generation
+    }
+
+    pub(crate) fn key_package_wrapper(&self) -> &[u8] {
+        &self.key_package_wrapper
+    }
+
+    pub(crate) fn key_package_wrapper_sha256(&self) -> &[u8; 32] {
+        &self.key_package_wrapper_sha256
+    }
+
+    pub(crate) fn claimed_at(&self) -> ServerTimestamp {
+        self.claimed_at
+    }
+
     pub(crate) fn target(&self) -> &DeviceIdentity {
         &self.target
     }
