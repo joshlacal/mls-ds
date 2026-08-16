@@ -52,6 +52,8 @@ mod send_message;
 #[cfg(not(test))]
 mod submit_transition;
 #[cfg(not(test))]
+mod subscribe_events;
+#[cfg(not(test))]
 mod subscription;
 #[cfg(not(test))]
 mod welcome;
@@ -123,6 +125,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::GetPendingWelcomes
                 | ChatEndpoint::GetLeafRecoveryInbox
                 | ChatEndpoint::GetSubscriptionTicket
+                | ChatEndpoint::SubscribeEvents
         )
     }
     #[cfg(test)]
@@ -229,6 +232,10 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetSubscriptionTicket),
             post(subscription::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::SubscribeEvents),
+            get(subscribe_events::handle),
         );
     router
 }

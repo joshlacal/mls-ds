@@ -44,6 +44,7 @@ pub(crate) enum TicketRepositoryError {
     TicketNotFound,
     TicketExpired,
     TicketAlreadyConsumed,
+    CursorExpired,
 }
 
 impl From<sqlx::Error> for TicketRepositoryError {
@@ -254,12 +255,20 @@ pub(crate) async fn mint_subscription_ticket(
 /// cursor itself is intentionally represented only by its hash.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConsumedTicket {
+    pub(crate) user_did: String,
+    pub(crate) device_id: Uuid,
+    pub(crate) jkt: String,
+    pub(crate) auth_generation: i64,
     pub(crate) event_position: i64,
     pub(crate) event_cursor_hash: [u8; HASH_BYTES],
     pub(crate) inventory_session_id: Uuid,
     pub(crate) protocol_instance_id: Uuid,
     pub(crate) cursor_key_id: String,
     pub(crate) snapshot_retained_floor: i64,
+    pub(crate) snapshot_cursor_nonce: [u8; NONCE_BYTES],
+    pub(crate) snapshot_cursor_ciphertext: Vec<u8>,
+    pub(crate) snapshot_created_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
     pub(crate) consumed_at: DateTime<Utc>,
 }
 
@@ -284,7 +293,8 @@ pub(crate) async fn consume_subscription_ticket(
     // row. The device lock closes the revocation/auth-generation race between
     // the active-device check and the consumed_at CAS.
     if let Some(ticket) = sqlx::query(
-        r#"SELECT user_did, device_id, jkt, auth_generation
+        r#"SELECT user_did, device_id, jkt, auth_generation,
+                  event_position, protocol_instance_id, cursor_key_id
              FROM chat.subscription_tickets
             WHERE ticket_hash = $1
             FOR UPDATE"#,
@@ -297,6 +307,9 @@ pub(crate) async fn consume_subscription_ticket(
         let device_id: Uuid = ticket.try_get("device_id")?;
         let jkt: String = ticket.try_get("jkt")?;
         let auth_generation: i64 = ticket.try_get("auth_generation")?;
+        let event_position: i64 = ticket.try_get("event_position")?;
+        let protocol_instance_id: Uuid = ticket.try_get("protocol_instance_id")?;
+        let cursor_key_id: String = ticket.try_get("cursor_key_id")?;
         let _device_lock = sqlx::query(
             r#"SELECT device_id
                  FROM chat.devices
@@ -312,6 +325,31 @@ pub(crate) async fn consume_subscription_ticket(
         .bind(auth_generation)
         .fetch_optional(&mut **transaction)
         .await?;
+
+        // A ticket is minted against an inventory snapshot, but retention can
+        // advance before the WebSocket upgrade. Lock the singleton protocol
+        // fence and its live floor in this same consume transaction so the CAS
+        // cannot authorize a cursor the server can no longer replay.
+        let live_fence: Option<(Uuid, String, i64)> = sqlx::query_as(
+            r#"SELECT protocol.protocol_instance_id, protocol.cursor_key_id,
+                      retention.retained_floor
+                 FROM chat.protocol_instances protocol
+                 JOIN chat.event_retention retention
+                   USING (protocol_instance_id)
+                WHERE protocol.singleton = TRUE
+                FOR SHARE OF protocol, retention"#,
+        )
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let Some((live_protocol_id, live_cursor_key_id, live_retained_floor)) = live_fence else {
+            return Err(TicketRepositoryError::SessionIncomplete);
+        };
+        if live_protocol_id != protocol_instance_id || live_cursor_key_id != cursor_key_id {
+            return Err(TicketRepositoryError::SessionIncomplete);
+        }
+        if event_position < live_retained_floor {
+            return Err(TicketRepositoryError::CursorExpired);
+        }
     }
 
     let updated = sqlx::query(
@@ -336,10 +374,11 @@ pub(crate) async fn consume_subscription_ticket(
                    AND device.auth_generation = ticket.auth_generation
                    AND device.revoked_at IS NULL
            )
-        RETURNING ticket.event_position, ticket.event_cursor_sha256,
+        RETURNING ticket.user_did, ticket.device_id, ticket.jkt,
+                  ticket.auth_generation, ticket.event_position, ticket.event_cursor_sha256,
                   ticket.inventory_session_id, ticket.protocol_instance_id,
                   ticket.cursor_key_id, ticket.snapshot_retained_floor,
-                  ticket.consumed_at
+                  ticket.expires_at, ticket.consumed_at
         "#,
     )
     .bind(ticket_hash.as_slice())
@@ -349,13 +388,38 @@ pub(crate) async fn consume_subscription_ticket(
     .fetch_optional(&mut **transaction)
     .await?;
     if let Some(row) = updated {
+        let inventory = sqlx::query(
+            r#"SELECT snapshot_event_cursor_nonce, snapshot_event_cursor_ciphertext,
+                      created_at, expires_at
+                 FROM chat.inventory_sessions
+                WHERE inventory_session_id = $1
+                  AND token_hash = $2
+                  AND snapshot_event_cursor_sha256 = $2
+                FOR UPDATE"#,
+        )
+        .bind(row.try_get::<Uuid, _>("inventory_session_id")?)
+        .bind(cursor_hash.as_slice())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(TicketRepositoryError::SessionMissing)?;
         return Ok(ConsumedTicket {
+            user_did: row.try_get("user_did")?,
+            device_id: row.try_get("device_id")?,
+            jkt: row.try_get("jkt")?,
+            auth_generation: row.try_get("auth_generation")?,
             event_position: row.try_get("event_position")?,
             event_cursor_hash: fixed_hash(row.try_get("event_cursor_sha256")?)?,
             inventory_session_id: row.try_get("inventory_session_id")?,
             protocol_instance_id: row.try_get("protocol_instance_id")?,
             cursor_key_id: row.try_get("cursor_key_id")?,
             snapshot_retained_floor: row.try_get("snapshot_retained_floor")?,
+            snapshot_cursor_nonce: inventory
+                .try_get::<Vec<u8>, _>("snapshot_event_cursor_nonce")?
+                .try_into()
+                .map_err(|_| TicketRepositoryError::InvalidReceipt)?,
+            snapshot_cursor_ciphertext: inventory.try_get("snapshot_event_cursor_ciphertext")?,
+            snapshot_created_at: inventory.try_get("created_at")?,
+            expires_at: inventory.try_get("expires_at")?,
             consumed_at: row.try_get("consumed_at")?,
         });
     }

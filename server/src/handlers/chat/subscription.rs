@@ -94,7 +94,7 @@ fn map_ticket_error(error: TicketRepositoryError) -> ChatFailure {
         E::SessionIncomplete => {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InventoryIncomplete)
         }
-        E::TicketExpired => {
+        E::TicketExpired | E::CursorExpired => {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InventorySessionExpired)
         }
         E::DeviceBindingMismatch => {

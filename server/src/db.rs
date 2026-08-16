@@ -3215,6 +3215,7 @@ pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'sta
     match event {
         StreamEvent::MessageEvent { .. } => "messageEvent",
         StreamEvent::TypingEvent { .. } => "typingEvent",
+        StreamEvent::CleanTypingEvent { .. } => "cleanTypingEvent",
         StreamEvent::ReactionEvent { .. } => "reactionEvent",
         StreamEvent::InfoEvent { .. } => "infoEvent",
         StreamEvent::WelcomeReissueRequestedEvent { .. } => "welcomeReissueRequestedEvent",
@@ -3230,22 +3231,23 @@ pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'sta
 }
 
 /// Extract the cursor (ULID) from a StreamEvent. Every variant carries one.
-fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> &str {
+fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> Option<&str> {
     use crate::realtime::sse::StreamEvent;
     match event {
-        StreamEvent::MessageEvent { cursor, .. } => cursor,
-        StreamEvent::TypingEvent { cursor, .. } => cursor,
-        StreamEvent::ReactionEvent { cursor, .. } => cursor,
-        StreamEvent::InfoEvent { cursor, .. } => cursor,
-        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor,
-        StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
-        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
-        StreamEvent::ReadditionRequested { cursor, .. } => cursor,
-        StreamEvent::TreeChanged { cursor, .. } => cursor,
-        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
-        StreamEvent::GroupResetEvent { cursor, .. } => cursor,
-        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
-        StreamEvent::ResetRequestedEvent { cursor, .. } => cursor,
+        StreamEvent::MessageEvent { cursor, .. }
+        | StreamEvent::TypingEvent { cursor, .. }
+        | StreamEvent::ReactionEvent { cursor, .. }
+        | StreamEvent::InfoEvent { cursor, .. }
+        | StreamEvent::WelcomeReissueRequestedEvent { cursor, .. }
+        | StreamEvent::NewDeviceEvent { cursor, .. }
+        | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
+        | StreamEvent::ReadditionRequested { cursor, .. }
+        | StreamEvent::TreeChanged { cursor, .. }
+        | StreamEvent::MembershipChangeEvent { cursor, .. }
+        | StreamEvent::GroupResetEvent { cursor, .. }
+        | StreamEvent::CircuitBreakerTrippedEvent { cursor, .. }
+        | StreamEvent::ResetRequestedEvent { cursor, .. } => Some(cursor),
+        StreamEvent::CleanTypingEvent { .. } => None,
     }
 }
 
@@ -3279,7 +3281,8 @@ pub async fn store_event(
     convo_id: &str,
     event: &crate::realtime::sse::StreamEvent,
 ) -> Result<()> {
-    let cursor = stream_event_cursor(event);
+    let cursor = stream_event_cursor(event)
+        .context("uncursored clean typing cannot enter the legacy event store")?;
     let event_type = stream_event_type_str(event);
     let payload = serde_json::to_value(event).context("Failed to serialize StreamEvent")?;
 

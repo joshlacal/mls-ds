@@ -544,6 +544,7 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
         | StreamEvent::CircuitBreakerTrippedEvent { cursor, .. }
         | StreamEvent::ResetRequestedEvent { cursor, .. }
         | StreamEvent::InfoEvent { cursor, .. } => Some(cursor.clone()),
+        StreamEvent::CleanTypingEvent { .. } => None,
     }
 }
 

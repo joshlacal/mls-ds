@@ -933,6 +933,13 @@ async fn main() -> anyhow::Result<()> {
     // unconditionally still performs zero chat access — unlike the device-auth
     // cleanup worker above, which is unconditional and is its own known problem.)
     if chat_runtime.cutover_enabled() {
+        chat_runtime
+            .validate_protocol_fence(&db_pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!("clean-chat protocol fence rejected: {error}");
+                std::process::exit(1);
+            });
         let chat_expiry_pool = db_pool.clone();
         let chat_expiry_runtime = chat_runtime.clone();
         tokio::spawn(async move {

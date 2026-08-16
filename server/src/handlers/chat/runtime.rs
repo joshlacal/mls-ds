@@ -11,8 +11,12 @@
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use p256::ecdsa::VerifyingKey;
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
@@ -22,6 +26,7 @@ use crate::chat_protocol::{
     validation::{CanonicalUuidV4, TrustedExternalBase},
     CursorSealer,
 };
+use crate::db::DbPool;
 use crate::realtime::{SseState, StreamEvent};
 
 /// Shared, immutable clean-chat runtime, stored in `AppState` and extracted by
@@ -69,10 +74,7 @@ impl ChatRuntime {
         let cutover_enabled = env_flag("CHAT_CUTOVER_ENABLED");
         let nest_verifier = build_verifier_from_env()?;
         let cursor_sealer = build_cursor_sealer_from_env()?;
-        let subscription_endpoint = std::env::var("CHAT_SUBSCRIPTION_ENDPOINT")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
+        let subscription_endpoint = parse_subscription_endpoint_from_env()?;
         let relationship_authority = Arc::new(ProductionRelationshipAuthority::from_startup_guard(
             load_fixed_relationship_authority_startup_guard()
                 .map_err(|error| format!("fixed relationship authority rejected: {error:?}"))?,
@@ -133,6 +135,56 @@ impl ChatRuntime {
         self.subscription_endpoint.as_deref()
     }
 
+    /// Validate the process' clean-chat protocol fence against PostgreSQL.
+    ///
+    /// The protocol instance and event-retention rows form one immutable
+    /// deployment fence. A runtime with no configured sealer, a missing
+    /// singleton, a missing retention row, or a key-id mismatch must fail
+    /// closed before any clean-chat worker or route is started. The singleton
+    /// schema intentionally has no live key rotation: changing the cursor key
+    /// requires an explicit protocol migration/cutover that invalidates the
+    /// old runtime rather than accepting a second key here.
+    pub async fn validate_protocol_fence(&self, pool: &DbPool) -> Result<(), String> {
+        let sealer = self.cursor_sealer.as_ref().ok_or_else(|| {
+            "clean-chat protocol fence cannot be validated without a cursor sealer".to_owned()
+        })?;
+        let expected_key_id = URL_SAFE_NO_PAD.encode(sealer.key_id());
+
+        let protocol = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            "SELECT p.protocol_instance_id, p.cursor_key_id \
+             FROM chat.protocol_instances AS p \
+             WHERE p.singleton = TRUE",
+        )
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("failed to load clean-chat protocol instance fence: {error}"))?
+        .ok_or_else(|| "clean-chat protocol instance singleton is missing".to_owned())?;
+
+        if protocol.1 != expected_key_id {
+            return Err(format!(
+                "clean-chat cursor key id does not match the durable protocol fence \
+                 (runtime={expected_key_id}, database={})",
+                protocol.1
+            ));
+        }
+
+        let retention_exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM chat.event_retention \
+             WHERE protocol_instance_id = $1)",
+        )
+        .bind(protocol.0)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("failed to load clean-chat event-retention fence: {error}"))?;
+        if !retention_exists {
+            return Err(format!(
+                "clean-chat event-retention row is missing for protocol instance {}",
+                protocol.0
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn subscribe_typing(
         &self,
         conversation_id: &str,
@@ -144,27 +196,24 @@ impl ChatRuntime {
     }
 
     pub(crate) async fn publish_typing(&self, event: Value) {
-        let Some(conversation_id) = event.get("conversationId").and_then(Value::as_str) else {
+        // The clean handler already produced the generated DTO. Deserialize
+        // that exact payload instead of reducing it to the legacy cursor/DID
+        // shape: actor device, expiry, and typing id are protocol fields.
+        let Ok(typing) = serde_json::from_value::<
+            catbird_atproto::generated::blue_catbird::chat::TypingEvent,
+        >(event) else {
             return;
         };
-        let Some(did) = event.get("actorDid").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(is_typing) = event.get("isTyping").and_then(Value::as_bool) else {
-            return;
-        };
-        let cursor = self
-            .sse_state
-            .cursor_gen
-            .next(conversation_id, "typingEvent")
-            .await;
+        let conversation_id = typing.conversation_id.to_string();
         self.sse_state.enqueue(
-            conversation_id,
-            StreamEvent::TypingEvent {
-                cursor,
-                convo_id: conversation_id.to_owned(),
-                did: did.to_owned(),
-                is_typing,
+            &conversation_id,
+            StreamEvent::CleanTypingEvent {
+                actor_device_id: typing.actor_device_id,
+                actor_did: typing.actor_did,
+                conversation_id: typing.conversation_id,
+                expires_at: typing.expires_at,
+                is_typing: typing.is_typing,
+                typing_id: typing.typing_id,
             },
         );
     }
@@ -172,7 +221,7 @@ impl ChatRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatRuntime;
+    use super::{parse_subscription_endpoint, ChatRuntime};
     use crate::realtime::{SseState, StreamEvent};
     use serde_json::json;
     use std::sync::Arc;
@@ -184,17 +233,69 @@ mod tests {
         let mut other = runtime.subscribe_typing("convo-b").await;
         runtime
             .publish_typing(json!({
-                "conversationId": "convo-a", "actorDid": "did:plc:actor", "isTyping": true
+                "$type": "blue.catbird.chat.defs#typingEvent",
+                "conversationId": "convo-a",
+                "actorDid": "did:plc:actor",
+                "actorDeviceId": "device-a",
+                "isTyping": true,
+                "expiresAt": "2026-08-16T12:00:08.000Z",
+                "typingId": "typing-a"
             }))
             .await;
         assert!(
-            matches!(first.recv().await.unwrap(), StreamEvent::TypingEvent { ref convo_id, .. } if convo_id == "convo-a")
+            matches!(first.recv().await.unwrap(), StreamEvent::CleanTypingEvent {
+                ref conversation_id,
+                ref actor_did,
+                ref actor_device_id,
+                ref expires_at,
+                is_typing: true,
+                ref typing_id,
+            } if conversation_id == "convo-a"
+                && actor_did.to_string() == "did:plc:actor"
+                && actor_device_id == "device-a"
+                && expires_at.to_string() == "2026-08-16T12:00:08.000Z"
+                && typing_id == "typing-a")
         );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), other.recv())
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn protocol_fence_validation_fails_closed_without_a_cursor_sealer() {
+        let runtime = ChatRuntime::from_env(Arc::new(SseState::new(8))).unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://invalid/clean_chat")
+            .unwrap();
+
+        let error = runtime.validate_protocol_fence(&pool).await.unwrap_err();
+        assert!(error.contains("without a cursor sealer"), "{error}");
+    }
+
+    #[test]
+    fn subscription_endpoint_requires_the_canonical_secure_xrpc_uri() {
+        let endpoint = "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents";
+        assert_eq!(parse_subscription_endpoint(endpoint).unwrap(), endpoint);
+    }
+
+    #[test]
+    fn subscription_endpoint_rejects_noncanonical_or_unsafe_variants() {
+        for endpoint in [
+            "https://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            "ws://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            "wss://user:password@chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents?cursor=1",
+            "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents#fragment",
+            "wss://chat.example.test/xrpc/blue.catbird.chat.getSubscriptionTicket",
+            "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents/",
+        ] {
+            assert!(
+                parse_subscription_endpoint(endpoint).is_err(),
+                "endpoint should be rejected: {endpoint}"
+            );
+        }
     }
 }
 
@@ -261,6 +362,43 @@ fn build_cursor_sealer_from_env() -> Result<Option<CursorSealer>, String> {
     CursorSealer::new(key_id, Zeroizing::new(secret))
         .map(Some)
         .map_err(|_| "CHAT_CURSOR_SEALING_SECRET cannot be all zero".to_owned())
+}
+
+fn parse_subscription_endpoint_from_env() -> Result<Option<String>, String> {
+    let Ok(raw) = std::env::var("CHAT_SUBSCRIPTION_ENDPOINT") else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_subscription_endpoint(&raw).map(Some)
+}
+
+/// Parse the one canonical endpoint used by clean-chat subscription clients.
+///
+/// This deliberately accepts only the exact XRPC `wss` URI shape. In
+/// particular, credentials and URI decorations cannot smuggle a different
+/// authority or route into startup configuration.
+fn parse_subscription_endpoint(raw: &str) -> Result<String, String> {
+    let url =
+        Url::parse(raw).map_err(|_| "CHAT_SUBSCRIPTION_ENDPOINT is not a valid URI".to_owned())?;
+    if url.scheme() != "wss"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/xrpc/blue.catbird.chat.subscribeEvents"
+        || url.as_str() != raw
+    {
+        return Err(
+            "CHAT_SUBSCRIPTION_ENDPOINT must be the exact canonical wss URI \
+             wss://<host>/xrpc/blue.catbird.chat.subscribeEvents without credentials, \
+             query, or fragment"
+                .to_owned(),
+        );
+    }
+    Ok(raw.to_owned())
 }
 
 fn require_var(name: &str) -> Result<String, String> {
