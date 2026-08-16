@@ -41,6 +41,94 @@ mod repository {
             "/src/chat_protocol/repository/delivery.rs"
         ));
     }
+
+    // The included blob module's ignored drift fixtures import the canonical
+    // transition writer through `super::super::transition`. Keep this harness
+    // self-contained: those ignored fixtures are not executed here, while the
+    // production library continues to resolve the real transition module.
+    pub(crate) mod transition {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+
+        #[derive(Debug)]
+        pub(crate) struct HarnessTransitionError;
+
+        pub(crate) enum IntervalCloseKind {
+            Remove,
+        }
+
+        pub(crate) struct ApplicationIntervalClose {
+            pub(crate) membership_interval_id: Uuid,
+            pub(crate) terminal_seq: i64,
+            pub(crate) closing_state_version: i64,
+            pub(crate) closing_transition_id: Uuid,
+            pub(crate) closing_outer_entry_fingerprint: Vec<u8>,
+            pub(crate) closing_kind: IntervalCloseKind,
+            pub(crate) closing_leaf_period_id: Uuid,
+            pub(crate) removed_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct LeafClose {
+            pub(crate) leaf_period_id: Uuid,
+            pub(crate) removed_state_version: i64,
+            pub(crate) removed_transition_id: Uuid,
+            pub(crate) removed_seq: i64,
+            pub(crate) removed_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct NewDeviceRevocation {
+            pub(crate) revocation_id: Uuid,
+            pub(crate) actor_did: String,
+            pub(crate) actor_device_id: Uuid,
+            pub(crate) actor_key_id: String,
+            pub(crate) actor_auth_generation: i64,
+            pub(crate) target_did: String,
+            pub(crate) target_device_id: Uuid,
+            pub(crate) target_auth_generation: i64,
+            pub(crate) accepted_request_bytes: Vec<u8>,
+            pub(crate) signing_transcript_bytes: Vec<u8>,
+            pub(crate) request_digest: Vec<u8>,
+            pub(crate) signature: Vec<u8>,
+            pub(crate) signed_at: DateTime<Utc>,
+            pub(crate) accepted_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct RegistrationRevoke {
+            pub(crate) target_did: String,
+            pub(crate) target_device_id: Uuid,
+            pub(crate) expected_auth_generation: i64,
+            pub(crate) revocation_id: Uuid,
+            pub(crate) revoked_at: DateTime<Utc>,
+        }
+
+        pub(crate) async fn close_application_interval<T>(
+            _transaction: &mut T,
+            _close: &ApplicationIntervalClose,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn close_leaf_period<T>(
+            _transaction: &mut T,
+            _close: &LeafClose,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn insert_device_revocation<T>(
+            _transaction: &mut T,
+            _revocation: &NewDeviceRevocation,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn cas_registration_revoke<T>(
+            _transaction: &mut T,
+            _revoke: &RegistrationRevoke,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+    }
 }
 
 use chrono::{DateTime, Duration, Utc};
@@ -1423,7 +1511,7 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
     assert_eq!(view.blob_id, blob_id);
     assert_eq!(view.entry_seq, 2);
     assert_eq!(
-        view.object_store_key,
+        view.object_store_key_for_test(),
         deterministic_object_key(blob_id, &request.ciphertext_sha256)
     );
     assert_eq!(view.descriptor_bytes, descriptor_bytes);

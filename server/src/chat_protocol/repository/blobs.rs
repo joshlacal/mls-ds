@@ -909,6 +909,15 @@ pub(crate) struct AttachmentBlobView {
     pub(crate) entry_seq: i64,
 }
 
+impl AttachmentBlobView {
+    /// Test-only inspection hook for verifying the deterministic storage-key
+    /// contract without making the physical key part of the production API.
+    #[cfg(test)]
+    pub(crate) fn object_store_key_for_test(&self) -> &str {
+        &self.object_store_key
+    }
+}
+
 /// Read one application-attachment blob for an EXACT caller device. The binding
 /// qualifies ONLY through this device's `chat.application_intervals` spanning the
 /// binding's `entry_seq`. A same-DID sibling with no interval at that seq, a
@@ -1653,10 +1662,10 @@ pub(crate) async fn expire_due_blobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_protocol::repository::delivery::{
+    use super::super::delivery::{
         close_application_interval, ApplicationIntervalClose, IntervalCloseKind,
     };
-    use crate::chat_protocol::repository::transition::{
+    use super::super::transition::{
         cas_registration_revoke, close_leaf_period, insert_device_revocation, LeafClose,
         NewDeviceRevocation, RegistrationRevoke,
     };
