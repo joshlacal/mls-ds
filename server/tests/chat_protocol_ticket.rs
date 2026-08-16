@@ -14,9 +14,44 @@
 
 #![allow(dead_code)]
 
-mod common;
+#[path = "../src/chat_protocol/model.rs"]
+mod model;
+#[path = "../src/chat_protocol/validation.rs"]
+mod validation;
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
+
+use cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
+use zeroize::Zeroizing;
 
 mod repository {
+    pub(crate) mod inventory {
+        use crate::cursor::{
+            EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken,
+        };
+
+        #[allow(dead_code)]
+        pub(crate) struct LockedInventoryCursorEvidence;
+
+        impl LockedInventoryCursorEvidence {
+            #[allow(dead_code)]
+            #[allow(clippy::type_complexity)]
+            pub(crate) fn into_cursor_parts(
+                self,
+            ) -> (
+                InventorySessionBinding,
+                InventorySessionToken,
+                EventCursor,
+                InventoryPageDomain,
+                Vec<u8>,
+                u64,
+                u64,
+                u64,
+            ) {
+                unreachable!("ticket acceptance does not exercise inventory page cursors")
+            }
+        }
+    }
     pub(crate) mod ticket {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -24,6 +59,8 @@ mod repository {
         ));
     }
 }
+mod common;
+
 
 #[test]
 fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
@@ -66,7 +103,7 @@ fn g7_event_receipts_are_immutable_and_single_use_by_hash() {
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Barrier;
@@ -79,6 +116,16 @@ use repository::ticket::{
     revalidate_consumed_ticket, ticket_hash, MintSubscriptionTicket, NewEventCursorReceipt,
     TicketRepositoryError, SUBSCRIBE_EVENTS_PATH,
 };
+
+struct FixtureRandom(u8);
+
+impl SecureRandom for FixtureRandom {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), SecureRandomError> {
+        out.fill(self.0);
+        self.0 = self.0.wrapping_add(1);
+        Ok(())
+    }
+}
 
 fn random_plc_did() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -189,7 +236,33 @@ async fn seed_session(
     let capability = URL_SAFE_NO_PAD.encode(&capability_bytes);
     let capability_hash = Sha256::digest(&capability_bytes).to_vec();
     let empty_hash = Sha256::digest([]).to_vec();
-    let snapshot_event_position: i64 = 42;
+    let device_created_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .fetch_one(pool)
+    .await
+    .expect("read session device creation timestamp");
+    let device_session_floor = if device_created_at.timestamp_subsec_nanos() == 0 {
+        device_created_at
+    } else {
+        device_created_at
+            + Duration::seconds(1)
+            - Duration::nanoseconds(i64::from(device_created_at.timestamp_subsec_nanos()))
+    };
+    // Sealed inventory-session bindings use whole-second timestamps, matching
+    // the production `unix_seconds` validation. The session must also be no
+    // earlier than the device row for the deferred identity trigger.
+    let mut created_at = created_at
+        .with_nanosecond(0)
+        .expect("normalize session creation timestamp");
+    if created_at < device_session_floor {
+        created_at = device_session_floor;
+    }
+    let expires_at = expires_at
+        .with_nanosecond(0)
+        .expect("normalize session expiry timestamp");
 
     // Completion evidence is all-or-nothing per domain; a complete-with-zero
     // domain carries count 0 and the empty-string SHA-256.
@@ -220,6 +293,41 @@ async fn seed_session(
         .fetch_one(pool)
         .await
         .expect("read protocol fence");
+    let snapshot_event_position: i64 = sqlx::query_scalar(
+        "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read event head for sealed session");
+    let key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&cursor_key_id)
+        .expect("decode cursor key id")
+        .try_into()
+        .expect("cursor key id is 32 bytes");
+    let sealer = CursorSealer::new(key_id, Zeroizing::new([0xA5_u8; 32]))
+        .expect("construct HTTP acceptance cursor sealer");
+    let binding = SealerBinding::for_event_cursor_receipt(
+        inventory_session_id,
+        device.did.as_bytes(),
+        device.device_id,
+        device.jkt.as_bytes(),
+        u64::try_from(device.auth_generation).expect("generation fits u64"),
+        protocol_instance_id,
+        cursor_key_id.as_bytes(),
+        u64::try_from(snapshot_event_position).expect("event position fits u64"),
+        None,
+        u64::try_from(retained_floor).expect("retained floor fits u64"),
+        u64::try_from(created_at.timestamp()).expect("creation timestamp fits u64"),
+        u64::try_from(expires_at.timestamp()).expect("expiry timestamp fits u64"),
+    )
+    .expect("bind sealed session capability");
+    let sealed = sealer
+        .seal_successor(
+            capability.as_bytes(),
+            &binding,
+            &mut FixtureRandom(0x33),
+        )
+        .expect("seal session capability");
     sqlx::query(
         r#"
         INSERT INTO chat.inventory_sessions(
@@ -250,8 +358,8 @@ async fn seed_session(
     .bind(protocol_instance_id)
     .bind(&cursor_key_id)
     .bind(retained_floor)
-    .bind([7u8; 12].as_slice())
-    .bind([9u8; 32].as_slice())
+    .bind(&sealed.nonce)
+    .bind(&sealed.ciphertext)
     .bind(complete)
     .bind(conv_count)
     .bind(conv_hash)
@@ -300,7 +408,10 @@ fn mint_request(
         event_cursor: capability,
         subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
         created_at,
-        expires_at,
+        // The durable session uses canonical whole-second expiry; clamp the
+        // test request to that row fence when callers supply a fractional
+        // timestamp at the same second.
+        expires_at: expires_at.min(session.expires_at),
     }
 }
 
@@ -812,7 +923,7 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     http::ensure_fence(&pool).await;
     let owner = http::seed_device(&pool).await;
     let foreign = http::seed_device(&pool).await;
-    let now = clock_now(&pool).await;
+    let requested_at = clock_now(&pool).await;
     let owner_fixture = DeviceFixture {
         did: owner.did.clone(),
         device_id: owner.device_id,
@@ -822,11 +933,15 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     let session = seed_session(
         &pool,
         &owner_fixture,
-        now,
-        now + Duration::minutes(10),
+        requested_at,
+        requested_at + Duration::minutes(10),
         true,
     )
     .await;
+    while clock_now(&pool).await < session.created_at {
+        sleep(TokioDuration::from_millis(10)).await;
+    }
+    let now = clock_now(&pool).await;
     let opaque = fresh_blob();
     let minted = {
         let request = mint_request(
@@ -861,9 +976,12 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
         ),
     )
     .await;
-    assert_eq!(owner_status, axum::http::StatusCode::BAD_REQUEST);
-    assert_eq!(owner_response["error"], "InventorySessionMismatch");
-    assert!(owner_response.get("ticket").is_none());
+    assert_eq!(owner_status, axum::http::StatusCode::OK);
+    assert_eq!(
+        owner_response["endpoint"],
+        "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents"
+    );
+    assert_eq!(owner_response["ticket"].as_str().map(str::len), Some(43));
     let (foreign_status, foreign_response) = http::send(
         router.clone(),
         http::unsigned_json_request(&foreign, "blue.catbird.chat.getSubscriptionTicket", body),
