@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Postgres, Transaction};
@@ -29,21 +29,21 @@ use crate::chat_protocol::public_state::encode_public_tree_summary;
 use crate::chat_protocol::state_machine::apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test;
 use crate::chat_protocol::state_machine::executor::ExecutionContext;
 use crate::chat_protocol::state_machine::{
-    apply_prepared_device_revocation_members, apply_prepared_device_revocation_prefix,
-    batch_transaction_bindings_match, plan_transaction_bindings_match,
-    prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
-    ConversationPersistencePlan, DeviceIdentity, DeviceRevocationBatchPersistencePlan,
-    EventChainCursorError, EventFanout, ExecutionActor, ExecutionAuthority, ExecutorError,
-    LeafPersistenceColumns, LeafRecoveryKind, MetadataAuthorColumns, MetadataAvatarPersistence,
-    ParticipantRole, PlanAuthority, PlanKind, PreparedConversationExecution,
-    PreparedDeviceRevocationBatchMembers, PrincipalId, RecoveryOpenContext, RecoverySource,
-    ResetRequestRow, ServerTimestamp, SpineArtifacts, WelcomeDispositionInput,
-    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
+    AppliedTransition, ControlEntryContent, ConversationKind, ConversationPersistencePlan,
+    DeviceIdentity, DeviceRevocationBatchPersistencePlan, EventChainCursorError, EventFanout,
+    ExecutionActor, ExecutionAuthority, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
+    LeaveRequestStatus, MetadataAuthorColumns, MetadataAvatarPersistence, ParticipantRole,
+    PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
+    PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
+    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
+    WelcomeResponseContext, WelcomeStatus, apply_prepared_device_revocation_members,
+    apply_prepared_device_revocation_prefix, batch_transaction_bindings_match,
+    plan_transaction_bindings_match, prepare_device_revocation_batch_members,
 };
 use crate::chat_protocol::transcript::{
+    CanonicalValueRef, SignedMutationKind, VerifiedMutationProjection, VerifiedSignedMutation,
     canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
-    decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
-    VerifiedMutationProjection, VerifiedSignedMutation,
+    decode_and_verify_signed_mutation,
 };
 
 const STREAM_OUTBOX_COUNT: usize = 1;
@@ -2368,6 +2368,245 @@ pub(in crate::chat_protocol::repository) async fn apply_prepared_submit_transiti
         .await
 }
 
+fn creation_authority_matches_plan(plan: &ConversationPersistencePlan) -> bool {
+    matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if plan.effects().kind() == PlanKind::Creation
+                && evidence.signed_authority().is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::Creation
+                })
+    )
+}
+
+fn acceptance_authority_matches_plan(plan: &ConversationPersistencePlan) -> bool {
+    matches!(
+        plan.effects().authority(),
+        Some(PlanAuthority::Transition(evidence))
+            if plan.effects().kind() == PlanKind::Acceptance
+                && evidence.signed_authority().is_some_and(|authority| {
+                    authority.kind() == SignedMutationKind::ParticipantAcceptance
+                })
+    )
+}
+
+fn canonical_conversation_changed_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    if !creation_authority_matches_plan(plan) && !acceptance_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    Ok(format!(
+        r#"{{"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":"{}"}}"#,
+        conversation_id.hyphenated(),
+    )
+    .into_bytes())
+}
+
+pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
+    'borrow,
+    'connection,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+    genesis_group_info_bytes: Vec<u8>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if is_recovery_plan(plan) || !creation_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_creation_primary_event_payload(plan)?;
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: Some(genesis_group_info_bytes),
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_creation_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+pub(in crate::chat_protocol::repository) async fn prepare_acceptance_execution<
+    'borrow,
+    'connection,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'connection, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+) -> Result<
+    PreparedConversationExecution<'borrow, 'connection, 'plan>,
+    ExecutionContextHydrationError,
+> {
+    if is_recovery_plan(plan) || !acceptance_authority_matches_plan(plan) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    let primary_event_payload = canonical_acceptance_primary_event_payload(plan)?;
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(primary_event_payload),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_acceptance_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+fn canonical_creation_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    canonical_conversation_changed_primary_event_payload(plan)
+}
+
+fn canonical_acceptance_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    canonical_conversation_changed_primary_event_payload(plan)
+}
+
+/// Prepare the transaction-bound executor for requestLeave, cancelLeave, the
+/// zero-leaf leave arm, and closeConversation. The event payload is derived
+/// exclusively from the sealed persistence plan; callers cannot supply an
+/// arbitrary event body.
+pub(in crate::chat_protocol::repository) async fn prepare_leave_lifecycle_execution<'a, 'c, 'p>(
+    transaction: &'a mut Transaction<'c, Postgres>,
+    plan: &'p ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+) -> Result<PreparedConversationExecution<'a, 'c, 'p>, ExecutionContextHydrationError> {
+    if !matches!(
+        plan.effects().kind(),
+        PlanKind::LeaveRequest
+            | PlanKind::LeaveCancellation
+            | PlanKind::ZeroLeafLeave
+            | PlanKind::Close
+    ) {
+        return Err(ExecutionContextHydrationError::ArtifactMismatch);
+    }
+    hydrate_execution_context_after_authority_validation(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes: None,
+            primary_event_payload: Some(canonical_leave_event_payload(plan)?),
+            welcome_disposition_event_payloads: Vec::new(),
+        },
+    )
+    .await
+}
+
+pub(in crate::chat_protocol::repository) async fn apply_prepared_leave_lifecycle_execution(
+    prepared: PreparedConversationExecution<'_, '_, '_>,
+) -> Result<AppliedTransition, ExecutorError> {
+    crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
+        .await
+}
+
+fn canonical_leave_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Vec<u8>, ExecutionContextHydrationError> {
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    match plan.effects().kind() {
+        PlanKind::LeaveRequest => {
+            let request_id = plan
+                .effects()
+                .leave_request_changes()
+                .iter()
+                .find_map(|change| {
+                    matches!(
+                        (change.before(), change.after()),
+                        (None, Some(after)) if after.status() == LeaveRequestStatus::Pending
+                    )
+                    .then(|| Uuid::from_bytes(*change.after().expect("matched").request_id()))
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "leaveRequestId": request_id.hyphenated().to_string(),
+                "status": "pending"
+            })
+            .to_string()
+            .into_bytes())
+        }
+        PlanKind::LeaveCancellation => {
+            let request_id = plan
+                .effects()
+                .leave_request_changes()
+                .iter()
+                .find_map(|change| {
+                    matches!(
+                        (change.before(), change.after()),
+                        (Some(before), Some(after))
+                            if before.status() == LeaveRequestStatus::Pending
+                                && after.status() == LeaveRequestStatus::Cancelled
+                    )
+                    .then(|| Uuid::from_bytes(*change.after().expect("matched").request_id()))
+                })
+                .ok_or(ExecutionContextHydrationError::ArtifactMismatch)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#leaveRequestEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "leaveRequestId": request_id.hyphenated().to_string(),
+                "status": "cancelled"
+            })
+            .to_string()
+            .into_bytes())
+        }
+        PlanKind::ZeroLeafLeave => Ok(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#conversationChangedEvent",
+            "conversationId": conversation_id.hyphenated().to_string()
+        })
+        .to_string()
+        .into_bytes()),
+        PlanKind::Close => {
+            let kind = match plan.state().kind {
+                ConversationKind::Direct => "direct",
+                ConversationKind::Group => "group",
+            };
+            let seq = plan
+                .effects()
+                .head_cas()
+                .and_then(|head| head.allocated_seq())
+                .ok_or(ExecutionContextHydrationError::MissingAuthority)?;
+            Ok(serde_json::json!({
+                "$type": "blue.catbird.chat.defs#conversationClosedEvent",
+                "conversationId": conversation_id.hyphenated().to_string(),
+                "conversationKind": kind,
+                "terminalSeq": seq
+            })
+            .to_string()
+            .into_bytes())
+        }
+        _ => Err(ExecutionContextHydrationError::ArtifactMismatch),
+    }
+}
+
 pub(crate) async fn apply_prepared_welcome_terminal_execution(
     prepared: PreparedConversationExecution<'_, '_, '_>,
 ) -> Result<AppliedTransition, ExecutorError> {
@@ -3026,8 +3265,8 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
     feature = "chat-protocol-production-proof",
     not(feature = "server-bin")
 ))]
-pub(in crate::chat_protocol) fn run_welcome_terminal_context_family_semantic_proof(
-) -> Result<(), String> {
+pub(in crate::chat_protocol) fn run_welcome_terminal_context_family_semantic_proof()
+-> Result<(), String> {
     for (label, kind, before, after, expected) in [
         (
             "dedicated Welcome expiry",

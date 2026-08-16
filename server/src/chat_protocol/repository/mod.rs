@@ -6,12 +6,16 @@ pub(crate) mod auth;
 // semantics. Like `delivery`/`inventory`/`welcome`/`ticket` it is unconditionally
 // compiled so both the production build and the `#[path]`-including integration
 // harness resolve `super::repository::blobs`. Not yet wired to a handler (Task 4).
+#[cfg(not(test))]
+pub(crate) mod acceptance;
 #[allow(dead_code)]
 pub(crate) mod blobs;
 #[cfg(not(test))]
 pub(crate) mod conversation;
 #[cfg(not(test))]
 pub(crate) mod core;
+#[cfg(not(test))]
+pub(crate) mod creation;
 #[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) mod execution_context;
@@ -54,6 +58,8 @@ pub(crate) mod inventory;
 // `#[allow(dead_code)]` until the H1 endpoint handlers (next seal) call in.
 #[allow(dead_code)]
 pub(crate) mod key_packages;
+#[cfg(not(test))]
+pub(crate) mod leave;
 pub(crate) mod prelude;
 #[allow(dead_code)]
 pub(crate) mod recovery;

@@ -218,6 +218,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use catbird_atproto::generated::blue_catbird::chat as chat_dto;
 
 use chat_protocol::{
     public_state::{
@@ -240,12 +241,12 @@ use chat_protocol::{
         InvitationHydrationRow, LeafHydrationRow, LeafRecoveryCancellation,
         LeafRecoveryFulfillment, LeafRecoveryKind, LeafRecoveryRequestCommand, LeaveCancellation,
         LeaveFulfillment, LeaveFulfillmentTestMutation, LeaveRequestCommand, LeaveRequestStatus,
-        LockedRegistrationProjection, OpeningKind, PackageStatus, ParticipantHydrationRow,
-        ParticipantRole, ParticipantStatus, PersistedRegistrationRow, PersistedRegistrationStatus,
-        PersistedSignedRequestRow, PrincipalId, RecoveryExpiryPlanAuthority, RecoveryRequestStatus,
-        RecoverySource, RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation,
-        ResetRequestCommand, ResetRequestStatus, ServerTimestamp, StateMachineError,
-        TransitionEvidence, ZeroLeafLeave,
+        LockedRecoveryReservationProjection, LockedRegistrationProjection, OpeningKind,
+        PackageStatus, ParticipantHydrationRow, ParticipantRole, ParticipantStatus,
+        PersistedRegistrationRow, PersistedRegistrationStatus, PersistedSignedRequestRow,
+        PrincipalId, RecoveryExpiryPlanAuthority, RecoveryRequestStatus, RecoverySource,
+        RequestEntryKind, RequestEvidence, ReservationStatus, ResetActivation, ResetRequestCommand,
+        ResetRequestStatus, ServerTimestamp, StateMachineError, TransitionEvidence, ZeroLeafLeave,
     },
     transcript::{
         decode_and_verify_signed_mutation, decode_canonical_signed_mutation, SignedMutationKind,
@@ -3209,4 +3210,179 @@ fn hydration_rejects_noncanonical_collection_order_and_historical_pending_work()
         hydrate_rows(expected, historical),
         Err(StateMachineError::InvariantViolation)
     );
+}
+
+#[test]
+fn acceptance_reservation_projection_exposes_the_consumed_wrapper() {
+    let mut request_id = [0x12; 16];
+    request_id[6] = 0x40;
+    request_id[8] = 0x80;
+    let mut conversation_id = [0x13; 16];
+    conversation_id[6] = 0x40;
+    conversation_id[8] = 0x80;
+    let mut device_id = [0x11; 16];
+    device_id[6] = 0x40;
+    device_id[8] = 0x80;
+    let actor = DeviceIdentity::new(
+        PrincipalId::new(b"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_vec()).unwrap(),
+        device_id,
+    )
+    .unwrap();
+    let evidence = RequestEvidence::for_test(
+        RequestEntryKind::LeafRecoveryRequest,
+        1,
+        request_id,
+        actor,
+        conversation_id,
+        fixture_received_at(1),
+        2,
+    )
+    .unwrap();
+    let coordinate = PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        1,
+        2,
+        [0x21; 32],
+        3,
+        [0x22; 32],
+        [0x23; 32],
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let reservation = LockedRecoveryReservationProjection::for_test(
+        &evidence,
+        coordinate,
+        [0x24; 32],
+        fixture_received_at(2),
+    );
+
+    assert_eq!(reservation.key_package_wrapper(), &[0x42]);
+    assert_eq!(
+        reservation.key_package_wrapper_sha256(),
+        &<[u8; 32]>::from(sha2::Sha256::digest([0x42]))
+    );
+}
+
+#[test]
+fn creation_participant_validation_rejects_malformed_entries_without_collapsing_cardinality() {
+    use chat_protocol::validation::validate_creation_participant_dids;
+
+    let malformed = [Some("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), None];
+    assert!(validate_creation_participant_dids(&malformed).is_err());
+
+    let valid = [
+        Some("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+        Some("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+    ];
+    assert_eq!(
+        validate_creation_participant_dids(&valid).unwrap(),
+        vec![
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn existing_direct_creation_result_requires_and_round_trips_its_union_type() {
+    let mut result = serde_json::json!({
+        "conversationId": "123e4567-e89b-42d3-a456-426614174000",
+        "conversationKind": "direct",
+        "coordinates": {
+            "confirmationTag": {"$bytes": "AQID"},
+            "conversationId": "123e4567-e89b-42d3-a456-426614174000",
+            "epoch": 1,
+            "generation": 1,
+            "groupContextHash": {"$bytes": "BAUG"},
+            "groupId": {"$bytes": "BwgJ"},
+            "lifecycle": "active",
+            "stateVersion": 1
+        }
+    });
+    let missing_type = serde_json::to_string(&serde_json::json!({ "result": result.clone() }))
+        .expect("serialize missing type");
+    assert!(
+        serde_json::from_str::<chat_dto::create_conversation::CreateConversationOutput>(
+            &missing_type
+        )
+        .is_err()
+    );
+
+    result["$type"] = serde_json::json!("blue.catbird.chat.defs#existingDirectConversationResult");
+    let tagged = serde_json::to_string(&serde_json::json!({ "result": result }))
+        .expect("serialize tagged result");
+    let decoded =
+        serde_json::from_str::<chat_dto::create_conversation::CreateConversationOutput>(&tagged)
+            .expect("typed existing direct result");
+    let encoded = serde_json::to_value(decoded).expect("serialize typed result");
+    assert_eq!(
+        encoded["result"]["$type"],
+        "blue.catbird.chat.defs#existingDirectConversationResult"
+    );
+
+    let facade_bytes = chat_protocol::validation::encode_existing_direct_conversation_result(
+        Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap(),
+        encoded["result"]["coordinates"].clone(),
+    )
+    .expect("production existing-direct facade encoder");
+    let facade_value: serde_json::Value = serde_json::from_slice(&facade_bytes).unwrap();
+    assert_eq!(
+        facade_value["result"]["$type"],
+        "blue.catbird.chat.defs#existingDirectConversationResult"
+    );
+}
+
+#[test]
+fn acceptance_replay_allows_only_valid_recovery_terminal_progressions() {
+    use chat_protocol::validation::acceptance_replay_terminal_state_allowed;
+
+    for (request, reservation, package) in [
+        ("open", "active", "reserved"),
+        ("fulfilled", "consumed", "consumed"),
+        ("cancelled", "released", "available"),
+        ("superseded", "released", "available"),
+        ("superseded", "released", "revoked"),
+        ("expired", "expired", "available"),
+        ("expired", "expired", "expired"),
+    ] {
+        assert!(acceptance_replay_terminal_state_allowed(
+            request,
+            reservation,
+            package
+        ));
+    }
+    for invalid in [
+        ("open", "consumed", "consumed"),
+        ("fulfilled", "active", "reserved"),
+        ("superseded", "active", "reserved"),
+        ("expired", "released", "available"),
+        ("unknown", "active", "reserved"),
+    ] {
+        assert!(!acceptance_replay_terminal_state_allowed(
+            invalid.0, invalid.1, invalid.2
+        ));
+    }
+}
+
+#[test]
+fn acceptance_replay_binds_recovery_to_transition_successor_coordinate() {
+    use chat_protocol::validation::acceptance_replay_coordinate_matches_successor;
+
+    assert!(acceptance_replay_coordinate_matches_successor(
+        Some(3),
+        Some(9),
+        3,
+        9
+    ));
+    assert!(!acceptance_replay_coordinate_matches_successor(
+        Some(3),
+        Some(9),
+        2,
+        8
+    ));
+    assert!(!acceptance_replay_coordinate_matches_successor(
+        None,
+        Some(9),
+        3,
+        9
+    ));
 }

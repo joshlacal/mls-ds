@@ -309,6 +309,7 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
         relative_writer_paths,
         [
             Path::new("src/chat_protocol/repository/auth.rs").to_path_buf(),
+            Path::new("src/chat_protocol/repository/blobs.rs").to_path_buf(),
             Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf(),
         ]
         .into_iter()

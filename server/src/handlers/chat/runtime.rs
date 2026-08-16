@@ -11,7 +11,7 @@
 use serde_json::Value;
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use p256::ecdsa::VerifyingKey;
 
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;

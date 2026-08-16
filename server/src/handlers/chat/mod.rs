@@ -10,19 +10,23 @@
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{FromRef, State},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
+#[cfg(not(test))]
+mod accept_conversation;
 mod context;
 #[cfg(not(test))]
 mod conversation_state;
+#[cfg(not(test))]
+mod create_conversation;
 mod device_views;
 mod enroll_device;
 mod errors;
@@ -32,6 +36,10 @@ mod get_devices;
 #[cfg(not(test))]
 mod get_entries;
 mod get_own_devices;
+#[cfg(not(test))]
+mod leave;
+#[cfg(not(test))]
+mod publish_typing;
 mod rebind_device_authentication;
 #[cfg(not(test))]
 mod recovery;
@@ -46,15 +54,13 @@ mod runtime;
 #[cfg(not(test))]
 mod send_message;
 #[cfg(not(test))]
-mod publish_typing;
-#[cfg(not(test))]
 mod submit_transition;
 #[cfg(not(test))]
 mod welcome;
 
 use errors::ChatFailure;
 #[cfg(not(test))]
-pub use expiry_worker::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
+pub use expiry_worker::{ChatExpirySweepConfig, run_chat_expiry_sweeper};
 pub use runtime::ChatRuntime;
 
 /// Build the isolated `blue.catbird.chat.*` router. Generic over the
@@ -96,6 +102,9 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
+            | ChatEndpoint::RequestLeave
+            | ChatEndpoint::CancelLeave
+            | ChatEndpoint::CloseConversation
             | ChatEndpoint::SendMessage
             | ChatEndpoint::PublishTyping
     ) {
@@ -115,6 +124,8 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
                 | ChatEndpoint::GetEntries
+                | ChatEndpoint::CreateConversation
+                | ChatEndpoint::AcceptConversation
         )
     }
     #[cfg(test)]
@@ -151,10 +162,6 @@ where
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
         );
-    #[cfg(not(test))]
-    let router = router
-        .route(&xrpc_path(ChatEndpoint::SendMessage), post(send_message::handle))
-        .route(&xrpc_path(ChatEndpoint::PublishTyping), post(publish_typing::handle));
     #[cfg(not(test))]
     let router = router.route(
         &xrpc_path(ChatEndpoint::GetConversationState),
@@ -197,6 +204,38 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
             get(get_entries::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::RequestLeave),
+            post(leave::handle_request),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelLeave),
+            post(leave::handle_cancellation),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CloseConversation),
+            post(leave::handle_close),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::SendMessage),
+            post(send_message::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PublishTyping),
+            post(publish_typing::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::CreateConversation),
+            post(create_conversation::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::AcceptConversation),
+            post(accept_conversation::handle),
         );
     router
 }
