@@ -42,6 +42,11 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::chat_protocol::{
+    dpop::VerifiedReadAdmission,
+    read_authority::{self, OrdinaryReadEndpoint, ReadAuthorityError},
+};
+
 /// Ciphertext including the 16-byte AEAD tag is at most 10 MiB.
 pub(crate) const MAX_CIPHERTEXT_BYTES: i64 = 10 * 1024 * 1024;
 /// Audio ciphertext including the tag is at most 8 MiB.
@@ -73,6 +78,10 @@ pub(crate) enum BlobRepositoryError {
     /// ticket for one blob.
     #[error("upload ticket conflict")]
     TicketConflict,
+    #[error("upload ticket not found")]
+    UploadTicketNotFound,
+    #[error("upload ticket expired")]
+    UploadTicketExpired,
     /// A second binding raced for the same blob or the same application entry and
     /// lost the `chat.blob_bindings` PK / `_application_entry_uq` unique index.
     #[error("blob binding conflict")]
@@ -130,6 +139,47 @@ pub(crate) enum BlobRepositoryError {
     /// Commit failed after an authorization snapshot was prepared.
     #[error("authorization commit failed: {0}")]
     Commit(sqlx::Error),
+}
+
+/// The exact requester coordinates recovered from a consumed ordinary-read
+/// admission.  This is intentionally a small owned value: blob authorization
+/// starts its own top-level transaction and re-checks these coordinates under
+/// the blob/binding locks before minting the one-use storage capability.
+#[derive(Clone, Debug)]
+pub(crate) struct BlobReadActor {
+    pub(crate) did: String,
+    pub(crate) device_id: Uuid,
+    pub(crate) auth_generation: i64,
+}
+
+pub(crate) async fn read_actor_for_admission(
+    pool: &PgPool,
+    admission: VerifiedReadAdmission,
+    endpoint: OrdinaryReadEndpoint,
+) -> Result<BlobReadActor, BlobRepositoryError> {
+    let attempt = read_authority::into_single_read_admission(admission, endpoint)
+        .map_err(|_| BlobRepositoryError::NotAuthorized)?
+        .into_attempt();
+    let mut transaction = pool.begin().await?;
+    let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
+        .await
+        .map_err(|error| match error {
+            ReadAuthorityError::Storage => BlobRepositoryError::Database(sqlx::Error::Protocol(
+                "read authority storage failure".to_owned(),
+            )),
+            _ => BlobRepositoryError::NotAuthorized,
+        })?;
+    let actor = BlobReadActor {
+        did: device.user_did().to_owned(),
+        device_id: device.device_id(),
+        auth_generation: i64::try_from(device.auth_generation())
+            .map_err(|_| BlobRepositoryError::NotAuthorized)?,
+    };
+    transaction
+        .rollback()
+        .await
+        .map_err(BlobRepositoryError::Database)?;
+    Ok(actor)
 }
 
 impl From<sqlx::Error> for BlobRepositoryError {
@@ -447,6 +497,21 @@ pub(crate) enum BlobMediaType {
 }
 
 impl BlobMediaType {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "image/heic" => Self::ImageHeic,
+            "image/jpeg" => Self::ImageJpeg,
+            "image/png" => Self::ImagePng,
+            "image/webp" => Self::ImageWebp,
+            "image/gif" => Self::ImageGif,
+            "audio/aac" => Self::AudioAac,
+            "audio/mp4" => Self::AudioMp4,
+            "audio/ogg" => Self::AudioOgg,
+            "audio/opus" => Self::AudioOpus,
+            _ => return None,
+        })
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ImageHeic => "image/heic",
@@ -1163,6 +1228,108 @@ pub(crate) async fn authorize_blob_read<'pool>(
     })
 }
 
+pub(crate) async fn authorize_blob_fetch_for_actor(
+    pool: &PgPool,
+    actor: &BlobReadActor,
+    blob_id: Uuid,
+) -> Result<AuthorizedBlobFetch, BlobRepositoryError> {
+    let transaction = BlobAuthorizationTransaction::begin(pool).await?;
+    let pending = authorize_blob_read(
+        transaction,
+        &AuthorizeBlobReadRequest {
+            blob_id,
+            caller_did: actor.did.clone(),
+            caller_device_id: actor.device_id,
+            auth_generation: actor.auth_generation,
+        },
+    )
+    .await?;
+    pending.publicize().await
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BlobUsageView {
+    pub(crate) used_bytes: i64,
+    pub(crate) reserved_bytes: i64,
+    pub(crate) blob_count: i64,
+    pub(crate) live_unbound_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UploadTicketMaterial {
+    pub(crate) blob_id: Uuid,
+    pub(crate) owner_did: String,
+    pub(crate) owner_device_id: Uuid,
+    pub(crate) ciphertext_size: i64,
+    pub(crate) ciphertext_sha256: [u8; 32],
+    pub(crate) media_type: String,
+    pub(crate) purpose: BlobPurpose,
+}
+
+pub(crate) async fn load_upload_ticket(
+    pool: &PgPool,
+    ticket_hash: &[u8],
+) -> Result<UploadTicketMaterial, BlobRepositoryError> {
+    let row: Option<(Uuid, String, Uuid, i64, Vec<u8>, String, String)> = sqlx::query_as(
+        "SELECT b.blob_id, t.owner_did, t.owner_device_id, b.ciphertext_size,\
+                    b.ciphertext_sha256, b.media_type, b.purpose\
+               FROM chat.blob_upload_tickets t\
+               JOIN chat.blobs b ON b.blob_id=t.blob_id\
+              WHERE t.ticket_hash=$1 AND t.consumed_at IS NULL\
+                AND t.expires_at > clock_timestamp()",
+    )
+    .bind(ticket_hash)
+    .fetch_optional(pool)
+    .await?;
+    let Some((blob_id, owner_did, owner_device_id, ciphertext_size, hash, media, purpose)) = row
+    else {
+        // A consumed or expired ticket is intentionally indistinguishable at
+        // the storage boundary; the completion CAS remains the final fence.
+        return Err(BlobRepositoryError::UploadTicketNotFound);
+    };
+    let ciphertext_sha256: [u8; 32] = hash.as_slice().try_into().map_err(|_| {
+        BlobRepositoryError::Database(sqlx::Error::Protocol("invalid blob hash".to_owned()))
+    })?;
+    let purpose = match purpose.as_str() {
+        "attachment" => BlobPurpose::Attachment,
+        "metadata" => BlobPurpose::Metadata,
+        _ => {
+            return Err(BlobRepositoryError::Database(sqlx::Error::Protocol(
+                "invalid blob purpose".to_owned(),
+            )))
+        }
+    };
+    Ok(UploadTicketMaterial {
+        blob_id,
+        owner_did,
+        owner_device_id,
+        ciphertext_size,
+        ciphertext_sha256,
+        media_type: media,
+        purpose,
+    })
+}
+
+pub(crate) async fn read_blob_usage(
+    pool: &PgPool,
+    actor: &BlobReadActor,
+) -> Result<BlobUsageView, BlobRepositoryError> {
+    let row: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT used_ciphertext_bytes, reserved_ciphertext_bytes, blob_count, live_unbound_count\
+           FROM chat.blob_usage WHERE user_did = $1",
+    )
+    .bind(&actor.did)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or((0, 0, 0, 0));
+    Ok(BlobUsageView {
+        used_bytes: row.0,
+        reserved_bytes: row.1,
+        blob_count: row.2,
+        live_unbound_count: row.3,
+    })
+}
+
 /// Commit the top-level authority transaction and only then mint the opaque
 /// fetch capability. The transaction wrapper is the authority proof; there is
 /// deliberately no transaction-id assertion because a transaction id does
@@ -1661,7 +1828,6 @@ pub(crate) async fn expire_due_blobs(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::delivery::{
         close_application_interval, ApplicationIntervalClose, IntervalCloseKind,
     };
@@ -1669,6 +1835,7 @@ mod tests {
         cas_registration_revoke, close_leaf_period, insert_device_revocation, LeafClose,
         NewDeviceRevocation, RegistrationRevoke,
     };
+    use super::*;
 
     fn test_fetch() -> AuthorizedBlobFetch {
         let issued_at = Utc::now();

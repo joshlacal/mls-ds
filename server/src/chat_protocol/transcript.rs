@@ -1385,6 +1385,9 @@ impl VerifiedSignedMutation {
     pub fn auth_generation(&self) -> u64 {
         self.canonical.auth_generation()
     }
+    pub fn idempotency_key(&self) -> &CanonicalUuidV4 {
+        body_uuid(&self.canonical.body, "idempotencyKey")
+    }
     pub fn signed_at(&self) -> &CanonicalTimestamp {
         self.canonical.signed_at()
     }
@@ -1701,6 +1704,42 @@ impl<'a> CreationProjection<'a> {
     }
     pub fn metadata_snapshot(&self) -> ClosedObjectRef<'a> {
         body_object(&self.0.canonical.body, "metadataSnapshot")
+    }
+}
+
+impl<'a> BlobUploadPreparationProjection<'a> {
+    pub fn blob_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "blobId")
+    }
+    pub fn conversation_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "conversationId")
+    }
+    pub fn ciphertext_sha256(&self) -> &'a [u8] {
+        match self.0.canonical.body.get("ciphertextSha256") {
+            Some(DagValue::Bytes(value)) => value,
+            _ => unreachable!("verified blob hash"),
+        }
+    }
+    pub fn ciphertext_size(&self) -> u64 {
+        body_integer(&self.0.canonical.body, "ciphertextSize")
+    }
+    pub fn plaintext_size(&self) -> u64 {
+        body_integer(&self.0.canonical.body, "plaintextSize")
+    }
+    pub fn media_type(&self) -> &'a str {
+        body_text(&self.0.canonical.body, "mediaType")
+    }
+    pub fn purpose(&self) -> &'a str {
+        body_text(&self.0.canonical.body, "purpose")
+    }
+    pub fn prior(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "prior")
+    }
+}
+
+impl<'a> BlobDeletionProjection<'a> {
+    pub fn blob_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "blobId")
     }
 }
 impl<'a> CommitTransitionProjection<'a> {

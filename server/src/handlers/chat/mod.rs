@@ -10,16 +10,19 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRef, State},
+    extract::{DefaultBodyLimit, FromRef, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 
+use crate::blob_store::BlobStore;
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
+#[cfg(not(test))]
+mod blob_routes;
 mod context;
 #[cfg(not(test))]
 mod conversation_state;
@@ -64,6 +67,7 @@ where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
+    BlobStore: FromRef<S>,
 {
     let mut router = Router::new();
     for &endpoint in ChatEndpoint::ALL {
@@ -109,6 +113,11 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
                 | ChatEndpoint::GetEntries
+                | ChatEndpoint::GetBlob
+                | ChatEndpoint::GetBlobUsage
+                | ChatEndpoint::PrepareBlobUpload
+                | ChatEndpoint::UploadBlob
+                | ChatEndpoint::DeleteBlob
         )
     }
     #[cfg(test)]
@@ -123,6 +132,7 @@ where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
+    BlobStore: FromRef<S>,
 {
     let router = Router::new()
         .route(
@@ -187,6 +197,26 @@ where
         .route(
             &xrpc_path(ChatEndpoint::GetEntries),
             get(get_entries::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetBlob),
+            get(blob_routes::get_blob),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetBlobUsage),
+            get(blob_routes::get_blob_usage),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PrepareBlobUpload),
+            post(blob_routes::prepare_blob_upload),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::UploadBlob),
+            post(blob_routes::upload_blob).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::DeleteBlob),
+            post(blob_routes::delete_blob),
         );
     router
 }

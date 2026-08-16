@@ -430,6 +430,21 @@ pub(crate) enum PreparedReplenishmentOperation {
     Replay(CompletedIdempotentResponse),
 }
 
+/// The operation prelude for the two clean blob signed mutations.  Blob
+/// preparation/deletion are ordinary signed operations, but their durable
+/// effects live in the blob repository rather than the transition executor.
+/// Keeping this wrapper here preserves the same operation-claim and exact
+/// replay discipline as every other signed mutation.
+pub(crate) enum PreparedBlobOperation {
+    First(PreparedBlobPrelude),
+    Replay(CompletedIdempotentResponse),
+}
+
+pub(crate) struct PreparedBlobPrelude {
+    authority: VerifiedChatDeviceRequest,
+    business: PreparedBusinessPrelude,
+}
+
 macro_rules! redacted_endpoint_operation_debug {
     ($type:ty, $name:literal) => {
         impl fmt::Debug for $type {
@@ -453,6 +468,7 @@ redacted_endpoint_operation_debug!(
     PreparedReplenishmentOperation,
     "PreparedReplenishmentOperation"
 );
+redacted_endpoint_operation_debug!(PreparedBlobOperation, "PreparedBlobOperation");
 
 pub(crate) struct OperationReplayGuard {
     operation_lock: auth::CanonicalOperationReservationGuard,
@@ -2282,6 +2298,72 @@ pub(crate) async fn prepare_signed_operation(
             },
         },
     })
+}
+
+/// Prepare one of the blob signed operations.  The endpoint and mutation kind
+/// are closed by the caller; a mismatch is rejected before any blob write.
+pub(crate) async fn prepare_blob_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+    endpoint_nsid: &'static str,
+    mutation_kind: SignedMutationKind,
+) -> Result<PreparedBlobOperation, PreludeError> {
+    let prepared = prepare_signed_operation(transaction, admission).await?;
+    match prepared.into_state() {
+        PreparedSignedOperationState::Replay { authority, replay } => {
+            if authority.endpoint().as_str() != endpoint_nsid
+                || authority.mutation().kind() != mutation_kind
+            {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            validate_operation_replay_claim(transaction, &replay).await?;
+            auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+            let response = auth::load_validated_completed_blob_replay(transaction, &authority)
+                .await?
+                .ok_or(PreludeError::ClaimIntegrity)?;
+            Ok(PreparedBlobOperation::Replay(response))
+        }
+        PreparedSignedOperationState::First {
+            authority,
+            reservation,
+        } => {
+            if authority.endpoint().as_str() != endpoint_nsid
+                || authority.mutation().map(|value| value.kind()) != Some(mutation_kind)
+            {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
+            Ok(PreparedBlobOperation::First(PreparedBlobPrelude {
+                authority,
+                business,
+            }))
+        }
+    }
+}
+
+impl PreparedBlobPrelude {
+    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
+    pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
+        self.business.scope_authority()
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (
+        VerifiedChatDeviceRequest,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+    ) {
+        let PreparedBlobPrelude {
+            authority,
+            business,
+        } = self;
+        let (scope, completion) = business.into_execution_parts();
+        (authority, scope, completion)
+    }
 }
 
 async fn prepare_enrollment_bootstrap_prelude(
