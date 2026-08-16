@@ -224,15 +224,15 @@ impl BlobStore {
         let config = Builder::new()
             .behavior_version_latest()
             .endpoint_url(&endpoint)
-            .region(Region::new(region))
+            .region(Region::new(region.clone()))
             .credentials_provider(creds)
             .force_path_style(true)
             .build();
         let s3 = S3Client::from_conf(config);
         let _ = s3.create_bucket().bucket(&bucket).send().await;
         info!(
-            "BlobStore S3 fixture initialized (endpoint={}, bucket={}, prefix={})",
-            endpoint, bucket, prefix
+            "BlobStore S3 fixture initialized (endpoint={}, region={}, bucket={}, prefix={})",
+            endpoint, region, bucket, prefix
         );
         Self {
             s3,

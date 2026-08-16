@@ -11,8 +11,11 @@
 //! repository source through the established `include!` harness. The bucket
 //! follows Server T1's DB-namespaced route-test pattern
 //! (`catbird-blobs-route-test-<dbname>`); every object lives under the single
-//! disposable prefix `clean-chat-rc-<timestamp>/`, which the cleanup test lists,
-//! verifies, and deletes.
+//! disposable prefix `clean-chat-rc-<timestamp>-<uuid>/`, which the cleanup test
+//! lists, verifies, and deletes.
+//!
+//! The fixture refuses non-local S3 endpoints and records endpoint, region,
+//! bucket, and prefix as sanitized evidence.
 //!
 //! These tests require a running disposable MinIO fixture and the seeded
 //! Postgres test database; like the sibling
@@ -341,7 +344,10 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     Client as S3Client,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use catbird_server::{
     blob_store::BlobStore,
     handlers::chat::ChatRuntime,
@@ -373,9 +379,41 @@ const CIPHERTEXT_SIZE: i64 = PLAINTEXT_SIZE + 16;
 
 /// One shared disposable prefix for the whole fixture run. Printed so the
 /// report can record it; the cleanup test lists and deletes exactly this prefix.
+fn fixture_endpoint() -> String {
+    let endpoint = std::env::var("S3_ENDPOINT").expect("S3_ENDPOINT must be set");
+    assert!(
+        endpoint.starts_with("http://127.0.0.1:")
+            || endpoint.starts_with("http://localhost:")
+            || endpoint.starts_with("http://[::1]:"),
+        "S3 fixture endpoint must be local and disposable, got {endpoint}"
+    );
+    endpoint
+}
+
+fn fixture_region() -> String {
+    let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    assert!(
+        region
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.')),
+        "S3 fixture region contains unsafe characters"
+    );
+    region
+}
+
 static FIXTURE_PREFIX: LazyLock<String> = LazyLock::new(|| {
-    let prefix = format!("clean-chat-rc-{}/", Utc::now().format("%Y%m%dT%H%M%SZ"));
-    println!("S3_FIXTURE_PREFIX={prefix}");
+    let endpoint = fixture_endpoint();
+    let region = fixture_region();
+    let bucket = fixture_bucket();
+    let timestamp = Utc::now()
+        .timestamp_nanos_opt()
+        .expect("fixture timestamp in range");
+    let prefix = format!("clean-chat-rc-{timestamp}-{}", Uuid::new_v4().simple());
+    let prefix = format!("{prefix}/");
+    println!(
+        "S3_FIXTURE_EVIDENCE endpoint={endpoint} region={region} bucket={bucket} prefix={prefix}"
+    );
     prefix
 });
 
@@ -406,10 +444,10 @@ async fn fixture_store() -> BlobStore {
 /// A raw S3 client for direct object inspection/listing (the production
 /// `BlobStore` deliberately exposes no listing or raw-key surface).
 fn raw_s3_client() -> S3Client {
-    let endpoint = std::env::var("S3_ENDPOINT").expect("S3_ENDPOINT must be set");
+    let endpoint = fixture_endpoint();
     let access_key = std::env::var("S3_ACCESS_KEY").expect("S3_ACCESS_KEY must be set");
     let secret_key = std::env::var("S3_SECRET_KEY").expect("S3_SECRET_KEY must be set");
-    let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let region = fixture_region();
     let config = S3ConfigBuilder::new()
         .behavior_version_latest()
         .endpoint_url(&endpoint)
@@ -1353,6 +1391,65 @@ async fn s3_detects_tampered_object_body() {
         .put_for_blob(fixture.blob_id, fixture.ciphertext.clone(), &fixture.ct_sha, MEDIA_STR)
         .await
         .expect("restore");
+    store.delete(&fixture.cid).await.expect("cleanup delete");
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable local MinIO fixture (see file docs); run explicitly with --ignored"]
+async fn s3_rejects_wrong_size_object_before_body_fetch() {
+    let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let owner = http::seed_device(&pool).await;
+    let client = raw_s3_client();
+    let fixture = seed_bound_blob_route(&pool, &owner, Utc::now(), Duration::hours(1)).await;
+    let key = fixture_physical_key(&fixture.cid);
+    let bucket = fixture_bucket();
+
+    // Preserve the valid identity metadata but replace the object with a
+    // different-length body. This reaches BlobStore::get_authorized's
+    // content-length guard before the bounded body/hash checks.
+    let head = client
+        .head_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await
+        .expect("head original");
+    let metadata = head.metadata().cloned().expect("original metadata");
+    let wrong_size = vec![0x7C; CIPHERTEXT_SIZE as usize + 1];
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(&key)
+        .set_content_type(Some(MEDIA_STR.to_owned()))
+        .set_metadata(Some(metadata))
+        .body(ByteStream::from(wrong_size))
+        .send()
+        .await
+        .expect("store wrong-size object");
+
+    let router = route_router(pool.clone()).await;
+    let (route_status, denied) = route_fetch_bytes(&router, &owner, fixture.blob_id).await;
+    assert_eq!(
+        route_status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "wrong-size object must fail the content-length guard, got {route_status}"
+    );
+    assert!(
+        !denied
+            .windows(fixture.ciphertext.len())
+            .any(|window| window == fixture.ciphertext),
+        "wrong-size fetch must not return any object bytes"
+    );
+    println!(
+        "s3_rejects_wrong_size_object_before_body_fetch: blob_id={} cid={} -> MetadataMismatch(content-length) (expected={} actual={})",
+        fixture.blob_id,
+        fixture.cid,
+        CIPHERTEXT_SIZE,
+        CIPHERTEXT_SIZE + 1
+    );
+
+    let store = fixture_store().await;
     store.delete(&fixture.cid).await.expect("cleanup delete");
 }
 
@@ -2636,6 +2733,7 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
         prepared_at,
     };
     prepare_blob(&mut tx, &request).await.expect("gc prepare");
+
     let cid = deterministic_object_key(blob_id, &ct_sha);
     store
         .put_for_blob(blob_id, ciphertext.clone(), &ct_sha, MEDIA_STR)
@@ -2673,6 +2771,68 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
         unbound + Duration::hours(24) <= now,
         "fixture must already be past the 24h GC grace"
     );
+    // Transaction-boundary proof of the required ordering: use the production
+    // expiry claim to make the row pending, then hold the reclaim transaction
+    // open while the production BlobStore deletes the exact S3 object. The
+    // same transaction still observes the row as pending until the reclaim
+    // UPDATE/COMMIT, so the deletion is externally observable before commit.
+    let mut expire_tx = pool.begin().await.expect("begin ordering expiry claim");
+    let claimed = repository::blobs::expire_due_blobs(&mut expire_tx, now, 1)
+        .await
+        .expect("claim due blob for ordering proof");
+    assert_eq!(claimed.len(), 1, "ordering proof must claim the fixture blob");
+    expire_tx
+        .commit()
+        .await
+        .expect("commit ordering expiry claim");
+
+    let mut boundary_tx = pool.begin().await.expect("begin ordering reclaim");
+    let pending: (String, String, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status, object_gc_status, object_deleted_at \
+           FROM chat.blobs WHERE blob_id = $1 FOR UPDATE",
+    )
+    .bind(blob_id)
+    .fetch_one(&mut *boundary_tx)
+    .await
+    .expect("pending ordering row");
+    assert_eq!(pending.0, "expired");
+    assert_eq!(pending.1, "pending");
+    assert!(pending.2.is_none());
+
+    store
+        .delete(&cid)
+        .await
+        .expect("ordering proof S3 delete");
+    assert!(
+        !object_exists(&client, &physical_key).await,
+        "S3 object must be gone before reclaim commit"
+    );
+    let still_pending: (String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT object_gc_status, object_store_key, object_deleted_at \
+           FROM chat.blobs WHERE blob_id = $1",
+    )
+    .bind(blob_id)
+    .fetch_one(&mut *boundary_tx)
+    .await
+    .expect("observe pending row during open reclaim transaction");
+    assert_eq!(still_pending.0, "pending");
+    assert_eq!(still_pending.1.as_deref(), Some(cid.as_str()));
+    assert!(still_pending.2.is_none());
+    println!(
+        "s3_expiry_gc_ordering: blob_id={blob_id} s3_object_absent=true db_gc_status=pending db_key_retained=true before_reclaim_commit"
+    );
+
+    // Restore the object and roll back this proof transaction so the real
+    // sweeper below exercises the same pending row and performs the cleanup.
+    store
+        .put_for_blob(blob_id, ciphertext.clone(), &ct_sha, MEDIA_STR)
+        .await
+        .expect("restore ordering proof object");
+    boundary_tx
+        .rollback()
+        .await
+        .expect("rollback ordering proof transaction");
+
 
     // Production sweeper (real `run_chat_expiry_sweeper_with_blob_store`).
     let runtime = cutover_runtime(&pool).await;
