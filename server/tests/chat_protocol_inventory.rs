@@ -4653,3 +4653,63 @@ fn d2_receipt_sql_and_response_shapes_are_source_pinned() {
     assert!(assembly_body.contains("if out.len() > MAX_RESPONSE_BYTES"));
     assert!(assembly_body.contains("return Err(InventoryRepositoryError::InvalidMaterialization)"));
 }
+
+
+// ===========================================================================
+// HTTP-level authenticated acceptance (server/cutover Task 1).
+// ===========================================================================
+
+use common::http_acceptance as http;
+
+#[tokio::test]
+async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_drift() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let device = http::seed_device(&pool).await;
+    let router = http::router(pool.clone()).await;
+    let query = format!("?userDids={}", device.did);
+
+    let (status, body) = http::send(
+        router.clone(),
+        http::unsigned_request(&device, "blue.catbird.chat.getDevices", "GET", &query),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "valid exact-device read: {body}");
+
+    let wrong_did = http::random_did();
+    let (status, body) = http::send(
+        router.clone(),
+        http::unsigned_request_as(
+            &device, "blue.catbird.chat.getDevices", "GET", &query,
+            &wrong_did, device.device_id, &device.jkt, &device.signing, &device.jwk,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "DeviceNotRegistered");
+
+    let (status, body) = http::send(
+        router.clone(),
+        http::unsigned_request_as(
+            &device, "blue.catbird.chat.getDevices", "GET", &query,
+            &device.did, Uuid::new_v4(), &device.jkt, &device.signing, &device.jwk,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "DeviceNotRegistered");
+
+    let wrong_proof = http::random_p256();
+    let wrong_jwk = http::public_jwk(&wrong_proof);
+    let wrong_jkt = http::jwk_thumbprint(&wrong_jwk);
+    let (status, body) = http::send(
+        router,
+        http::unsigned_request_as(
+            &device, "blue.catbird.chat.getDevices", "GET", &query,
+            &device.did, device.device_id, &wrong_jkt, &wrong_proof, &wrong_jwk,
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "InvalidDPoP");
+}

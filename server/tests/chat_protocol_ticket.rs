@@ -802,3 +802,42 @@ async fn consume_serializes_with_exact_device_revocation() {
         Err(TicketRepositoryError::DeviceBindingMismatch)
     ));
 }
+
+
+use common::http_acceptance as http;
+
+#[tokio::test]
+async fn http_subscription_ticket_denies_foreign_session_without_disclosure() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let owner = http::seed_device(&pool).await;
+    let other = http::seed_device(&pool).await;
+    let router = http::router(pool.clone()).await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "inventorySessionId": Uuid::new_v4().to_string(),
+        "eventCursor": "not-a-session-cursor"
+    }))
+    .expect("ticket body");
+
+    let (owner_status, owner_response) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &owner,
+            "blue.catbird.chat.getSubscriptionTicket",
+            body.clone(),
+        ),
+    )
+    .await;
+    let (other_status, other_response) = http::send(
+        router,
+        http::unsigned_json_request(
+            &other,
+            "blue.catbird.chat.getSubscriptionTicket",
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(owner_status, other_status);
+    assert_eq!(owner_response, other_response);
+    assert!(owner_response.get("ticket").is_none());
+}

@@ -49,6 +49,66 @@ mod chat_protocol {
             pub fn auth_generation(&self) -> i64 { 0 }
         }
     }
+    pub mod snapshot {
+        #[derive(PartialEq, Eq)]
+        pub enum PublicGroupSnapshotLifecycle { Active }
+    }
+    pub mod state_machine {
+        #[derive(PartialEq, Eq)]
+        pub enum WelcomeStatus { Pending, Acknowledged, Rejected, Expired }
+        use super::snapshot::PublicGroupSnapshotLifecycle;
+        pub struct Principal;
+        static PRINCIPAL: Principal = Principal;
+        impl Principal { pub fn as_bytes(&self) -> &'static [u8] { &[] } }
+        pub struct Recipient;
+        static RECIPIENT: Recipient = Recipient;
+        impl Recipient {
+            pub fn principal(&self) -> &'static Principal { &PRINCIPAL }
+            pub fn device_id(&self) -> &'static [u8; 16] { &[0; 16] }
+        }
+        pub struct Coordinate;
+        impl Coordinate {
+            pub fn lifecycle(&self) -> PublicGroupSnapshotLifecycle { PublicGroupSnapshotLifecycle::Active }
+            pub fn generation(&self) -> u64 { 0 }
+            pub fn state_version(&self) -> u64 { 0 }
+            pub fn epoch(&self) -> u64 { 0 }
+            pub fn group_id(&self) -> &[u8] { &[] }
+            pub fn group_context_hash(&self) -> &[u8] { &[] }
+            pub fn confirmation_tag(&self) -> &[u8] { &[] }
+            pub fn conversation_id(&self) -> &[u8; 16] { &[0; 16] }
+        }
+        pub struct WelcomeCasBinding;
+        impl WelcomeCasBinding {
+            pub fn conversation_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn recipient(&self) -> &'static Recipient { &RECIPIENT }
+            pub fn expires_at(&self) -> Timestamp { Timestamp }
+            pub fn verify_seal(&self) -> bool { false }
+            pub fn transaction_id(&self) -> &str { "" }
+            pub fn expected_status(&self) -> WelcomeStatus { WelcomeStatus::Pending }
+            pub fn successor_status(&self) -> WelcomeStatus { WelcomeStatus::Pending }
+            pub fn coordinate(&self) -> Coordinate { Coordinate }
+            pub fn transition_seq(&self) -> u64 { 0 }
+            pub fn welcome_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn recovery_request_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn opaque_welcome_sha256(&self) -> &[u8; 32] { &[0; 32] }
+            pub fn key_package_ref(&self) -> &[u8] { &[] }
+            pub fn locked_at(&self) -> Timestamp { Timestamp }
+        }
+        pub struct WelcomeWork;
+        impl WelcomeWork {
+            pub fn status(&self) -> WelcomeStatus { WelcomeStatus::Expired }
+            pub fn coordinate(&self) -> Coordinate { Coordinate }
+            pub fn expires_at(&self) -> Timestamp { Timestamp }
+            pub fn welcome_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn recovery_request_id(&self) -> &[u8; 16] { &[0; 16] }
+            pub fn transition_seq(&self) -> u64 { 0 }
+            pub fn sha256(&self) -> &[u8; 32] { &[0; 32] }
+            pub fn recipient(&self) -> &'static Recipient { &RECIPIENT }
+            pub fn key_package_ref(&self) -> &[u8] { &[] }
+        }
+        pub struct Timestamp;
+        impl Timestamp { pub fn unix_millis(&self) -> i64 { 0 } }
+    }
 }
 
 mod repository {
@@ -1769,4 +1829,29 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
     );
 
     tx.rollback().await.expect("rollback");
+}
+
+use common::http_acceptance as http;
+
+#[tokio::test]
+async fn http_blob_usage_accepts_exact_device_and_blob_fetch_is_redacted() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let device = http::seed_device(&pool).await;
+    let router = http::router(pool.clone()).await;
+    let missing = Uuid::new_v4();
+
+    let (status, denied) = http::send(
+        router,
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getBlob",
+            "GET",
+            &format!("?blobId={missing}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(denied["error"], "NotAuthorized");
+    assert!(denied.get("blob").is_none());
 }
