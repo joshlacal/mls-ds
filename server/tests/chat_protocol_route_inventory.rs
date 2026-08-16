@@ -17,6 +17,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use catbird_server::{
     chat_protocol::error::ChatEndpoint,
     handlers::chat::{chat_router, ChatRuntime},
+    realtime::SseState,
     storage::DbPool,
 };
 use p256::ecdsa::SigningKey;
@@ -58,7 +59,7 @@ fn runtime() -> Arc<ChatRuntime> {
     });
     let _guard = LOCK.lock().expect("runtime env lock");
     std::env::remove_var("CHAT_CUTOVER_ENABLED");
-    Arc::new(ChatRuntime::from_env().expect("clean-chat runtime"))
+    Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"))
 }
 
 fn router() -> Router {
@@ -70,6 +71,20 @@ fn router() -> Router {
         pool,
         runtime: runtime(),
     })
+}
+
+fn live_router() -> Router {
+    let _ = runtime();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://127.0.0.1/clean_chat_route_inventory")
+        .expect("lazy pool");
+    std::env::set_var("CHAT_CUTOVER_ENABLED", "true");
+    let runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("live clean-chat runtime"),
+    );
+    std::env::remove_var("CHAT_CUTOVER_ENABLED");
+    chat_router::<TestState>().with_state(TestState { pool, runtime })
 }
 
 fn is_get(endpoint: ChatEndpoint) -> bool {
@@ -129,4 +144,23 @@ async fn clean_endpoint_method_mismatch_is_not_silently_accepted() {
             endpoint.nsid()
         );
     }
+}
+
+#[tokio::test]
+async fn leave_routes_reach_production_authentication_before_database_work() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/xrpc/blue.catbird.chat.requestLeave")
+        .body(Body::empty())
+        .expect("request");
+    let response = live_router()
+        .oneshot(request)
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("XRPC error body");
+    assert_eq!(body["error"], "InvalidDPoP");
 }

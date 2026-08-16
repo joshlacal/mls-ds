@@ -8,18 +8,19 @@
 //! cutover is enabled the verifier configuration is mandatory and its absence
 //! is a hard startup error.
 
+use serde_json::Value;
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use p256::ecdsa::VerifyingKey;
 
-#[cfg(not(test))]
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{
     dpop::TrustedNestVerifier,
     relationship_policy::ProductionRelationshipAuthority,
     validation::{CanonicalUuidV4, TrustedExternalBase},
 };
+use crate::realtime::{SseState, StreamEvent};
 
 /// Shared, immutable clean-chat runtime, stored in `AppState` and extracted by
 /// every chat handler as `State<Arc<ChatRuntime>>`.
@@ -27,6 +28,7 @@ pub struct ChatRuntime {
     cutover_enabled: bool,
     nest_verifier: Option<TrustedNestVerifier>,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
+    sse_state: Arc<SseState>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -36,6 +38,7 @@ impl fmt::Debug for ChatRuntime {
             .field("cutover_enabled", &self.cutover_enabled)
             .field("nest_verifier_configured", &self.nest_verifier.is_some())
             .field("relationship_authority", &"fixed-production-authority")
+            .field("sse_state", &"conversation-filtered")
             .finish()
     }
 }
@@ -53,8 +56,7 @@ impl ChatRuntime {
     ///
     /// Returns `Err` when cutover is enabled without a fully configured
     /// verifier, or when any verifier field is malformed.
-    #[cfg(not(test))]
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env(sse_state: Arc<SseState>) -> Result<Self, String> {
         let cutover_enabled = env_flag("CHAT_CUTOVER_ENABLED");
         let nest_verifier = build_verifier_from_env()?;
         let relationship_authority = Arc::new(ProductionRelationshipAuthority::from_startup_guard(
@@ -73,6 +75,7 @@ impl ChatRuntime {
             cutover_enabled,
             nest_verifier,
             relationship_authority,
+            sse_state,
         })
     }
 
@@ -92,6 +95,70 @@ impl ChatRuntime {
 
     pub(crate) fn relationship_authority(&self) -> &Arc<ProductionRelationshipAuthority> {
         &self.relationship_authority
+    }
+
+    pub(crate) async fn subscribe_typing(
+        &self,
+        conversation_id: &str,
+    ) -> tokio::sync::broadcast::Receiver<StreamEvent> {
+        self.sse_state
+            .get_channel(conversation_id)
+            .await
+            .subscribe()
+    }
+
+    pub(crate) async fn publish_typing(&self, event: Value) {
+        let Some(conversation_id) = event.get("conversationId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(did) = event.get("actorDid").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(is_typing) = event.get("isTyping").and_then(Value::as_bool) else {
+            return;
+        };
+        let cursor = self
+            .sse_state
+            .cursor_gen
+            .next(conversation_id, "typingEvent")
+            .await;
+        self.sse_state.enqueue(
+            conversation_id,
+            StreamEvent::TypingEvent {
+                cursor,
+                convo_id: conversation_id.to_owned(),
+                did: did.to_owned(),
+                is_typing,
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatRuntime;
+    use crate::realtime::{SseState, StreamEvent};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn sse_typing_fanout_is_filtered_by_conversation() {
+        let runtime = ChatRuntime::from_env(Arc::new(SseState::new(8))).unwrap();
+        let mut first = runtime.subscribe_typing("convo-a").await;
+        let mut other = runtime.subscribe_typing("convo-b").await;
+        runtime
+            .publish_typing(json!({
+                "conversationId": "convo-a", "actorDid": "did:plc:actor", "isTyping": true
+            }))
+            .await;
+        assert!(
+            matches!(first.recv().await.unwrap(), StreamEvent::TypingEvent { ref convo_id, .. } if convo_id == "convo-a")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), other.recv())
+                .await
+                .is_err()
+        );
     }
 }
 

@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, NaiveDateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
-use uuid::{Variant, Version};
+use uuid::{Uuid, Variant, Version};
 
 use super::model::AuthPrimitiveError;
 
@@ -51,6 +51,90 @@ impl BareDid {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Validate the participant slots from a createConversation manifest without
+/// silently dropping malformed entries. The signed manifest's cardinality is
+/// part of its authorization scope, so every slot must contain one canonical
+/// DID and the returned list preserves source order and multiplicity.
+pub fn validate_creation_participant_dids<S: AsRef<str>>(
+    participants: &[Option<S>],
+) -> Result<Vec<String>, AuthPrimitiveError> {
+    if participants.is_empty() {
+        return Err(AuthPrimitiveError::invalid(
+            "createConversation requires participants",
+        ));
+    }
+    participants
+        .iter()
+        .map(|did| {
+            let did = did
+                .as_ref()
+                .ok_or_else(|| AuthPrimitiveError::invalid("missing participant userDid"))?;
+            let did = did.as_ref();
+            BareDid::parse(did)?;
+            Ok(did.to_owned())
+        })
+        .collect()
+}
+
+/// Encode the existing-direct creation result through the generated closed
+/// union. Keeping this at the DTO boundary makes omission of the required
+/// discriminator an immediate serialization error rather than a wire drift.
+pub fn encode_existing_direct_conversation_result(
+    conversation_id: Uuid,
+    coordinates: serde_json::Value,
+) -> Result<Vec<u8>, AuthPrimitiveError> {
+    let value = serde_json::json!({
+        "result": {
+            "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+            "conversationKind": "direct",
+            "conversationId": conversation_id.hyphenated().to_string(),
+            "coordinates": coordinates,
+        }
+    });
+    let value_bytes = serde_json::to_vec(&value)
+        .map_err(|_| AuthPrimitiveError::invalid("cannot encode existing direct result"))?;
+    let output: catbird_atproto::generated::blue_catbird::chat::create_conversation::CreateConversationOutput<jacquard_common::DefaultStr> =
+        serde_json::from_slice(&value_bytes)
+            .map_err(|_| AuthPrimitiveError::invalid("invalid existing direct result"))?;
+    serde_json::to_vec(&output)
+        .map_err(|_| AuthPrimitiveError::invalid("cannot encode existing direct result"))
+}
+
+/// Allowed durable evolution after an acceptance response is committed. The
+/// replay proof may observe later recovery fulfillment, cancellation,
+/// supersession, or expiry, but never an arbitrary cross-state combination.
+pub fn acceptance_replay_terminal_state_allowed(
+    recovery_status: &str,
+    reservation_status: &str,
+    package_status: &str,
+) -> bool {
+    match recovery_status {
+        "open" => reservation_status == "active" && package_status == "reserved",
+        "fulfilled" => reservation_status == "consumed" && package_status == "consumed",
+        "cancelled" => reservation_status == "released" && package_status == "available",
+        "superseded" => {
+            reservation_status == "released" && matches!(package_status, "available" | "revoked")
+        }
+        "expired" => {
+            matches!(reservation_status, "expired")
+                && matches!(package_status, "available" | "expired")
+        }
+        _ => false,
+    }
+}
+
+/// Recovery rows retained for an acceptance replay are bound to the
+/// successor produced by that acceptance transition, never its predecessor.
+pub fn acceptance_replay_coordinate_matches_successor(
+    transition_next_generation: Option<i64>,
+    transition_next_state_version: Option<i64>,
+    recovery_generation: i64,
+    recovery_state_version: i64,
+) -> bool {
+    transition_next_generation == Some(recovery_generation)
+        && transition_next_state_version == Some(recovery_state_version)
 }
 
 impl fmt::Display for BareDid {
@@ -202,6 +286,11 @@ impl CanonicalTimestamp {
 pub struct TrustedRequestInstant(CanonicalTimestamp);
 
 impl TrustedRequestInstant {
+    pub(crate) fn from_datetime(value: DateTime<Utc>) -> Result<Self, AuthPrimitiveError> {
+        let text = value.to_rfc3339_opts(SecondsFormat::Millis, true);
+        Ok(Self(CanonicalTimestamp::parse(&text)?))
+    }
+
     pub(crate) fn capture() -> Result<Self, AuthPrimitiveError> {
         let text = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         Ok(Self(CanonicalTimestamp::parse(&text)?))
