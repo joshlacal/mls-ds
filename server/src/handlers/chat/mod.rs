@@ -44,6 +44,10 @@ mod reset;
 mod revoke_device;
 mod runtime;
 #[cfg(not(test))]
+mod send_message;
+#[cfg(not(test))]
+mod publish_typing;
+#[cfg(not(test))]
 mod submit_transition;
 #[cfg(not(test))]
 mod welcome;
@@ -92,6 +96,8 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
+            | ChatEndpoint::SendMessage
+            | ChatEndpoint::PublishTyping
     ) {
         return true;
     }
@@ -145,6 +151,10 @@ where
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
         );
+    #[cfg(not(test))]
+    let router = router
+        .route(&xrpc_path(ChatEndpoint::SendMessage), post(send_message::handle))
+        .route(&xrpc_path(ChatEndpoint::PublishTyping), post(publish_typing::handle));
     #[cfg(not(test))]
     let router = router.route(
         &xrpc_path(ChatEndpoint::GetConversationState),

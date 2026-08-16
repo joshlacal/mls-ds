@@ -35,6 +35,8 @@ pub(crate) mod expiry_sweep;
 pub(crate) mod delivery;
 #[cfg(not(test))]
 pub(crate) mod entry_read;
+#[cfg(not(test))]
+pub(crate) mod message_delivery;
 // `device_directory` (Task 4 / seal 2b) is the read-only deviceView/
 // addressableDevice/ownDeviceView projection surface (key identity + pinned
 // capability + live key-package counts) the H1 device handlers need for their

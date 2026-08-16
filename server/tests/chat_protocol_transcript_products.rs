@@ -419,6 +419,43 @@ fn sign_application_wrapper(
     serde_json::to_vec(&wrapper).unwrap()
 }
 
+#[test]
+fn clean_send_and_typing_operation_ids_are_read_from_signed_identity_fields() {
+    let signing_key = SigningKey::from_bytes(&[0x61_u8; 32]);
+    let send = decode_canonical_signed_mutation(&sign_application_wrapper(
+        &signing_key,
+        APPLICATION_CONVERSATION_ID,
+        APPLICATION_MESSAGE_ID,
+    ))
+    .unwrap();
+    assert_eq!(
+        uuid::Uuid::from_bytes(*send.operation_id().unwrap().as_bytes()),
+        uuid::Uuid::parse_str(APPLICATION_MESSAGE_ID).unwrap()
+    );
+
+    let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
+    let typing = json!({
+        "body": {
+            "$type": "blue.catbird.chat.defs#typingBody",
+            "signatureDomain": "CATBIRD-CHAT-TYPING\u{0}",
+            "typingId": "61616161-6161-4161-8161-616161616161",
+            "actorDid": APPLICATION_ACTOR_DID,
+            "actorDeviceId": APPLICATION_ACTOR_DEVICE_ID,
+            "keyId": key_id.as_str(),
+            "authGeneration": 1,
+            "coordinates": application_coordinates(APPLICATION_CONVERSATION_ID),
+            "isTyping": true,
+            "signedAt": "2026-07-22T12:34:55.000Z"
+        },
+        "signature": STANDARD.encode([0_u8; 64])
+    });
+    let typing = decode_canonical_signed_mutation(&serde_json::to_vec(&typing).unwrap()).unwrap();
+    assert_eq!(
+        uuid::Uuid::from_bytes(*typing.operation_id().unwrap().as_bytes()),
+        uuid::Uuid::parse_str("61616161-6161-4161-8161-616161616161").unwrap()
+    );
+}
+
 struct SyntheticApplication {
     canonical_entry: Vec<u8>,
     raw_wrapper: Vec<u8>,

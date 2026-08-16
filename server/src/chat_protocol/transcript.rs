@@ -1218,6 +1218,24 @@ impl CanonicalSignedMutation {
     pub fn signed_at(&self) -> &CanonicalTimestamp {
         body_timestamp(&self.body, "signedAt")
     }
+
+    /// Return the exact client-generated operation identity for this signed
+    /// mutation. Clean application sends and typing publications deliberately
+    /// use their protocol identities (`messageId` and `typingId`) rather than
+    /// the generic `idempotencyKey`; every other idempotent mutation carries
+    /// the generic field. The value comes from the canonical projection, never
+    /// from reparsing accepted wrapper JSON.
+    pub fn operation_id(&self) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
+        let field = match self.kind {
+            SignedMutationKind::ApplicationSend => "messageId",
+            SignedMutationKind::Typing => "typingId",
+            _ => "idempotencyKey",
+        };
+        match self.body.get(field) {
+            Some(DagValue::Uuid(value)) => Ok(value),
+            _ => Err(AuthPrimitiveError::invalid("signed operation identity")),
+        }
+    }
 }
 
 fn exact_wrapper_fields(
@@ -1433,6 +1451,13 @@ fn body_text<'a>(body: &'a BTreeMap<String, DagValue>, name: &str) -> &'a str {
     match body.get(name) {
         Some(DagValue::Text(value)) => value,
         _ => unreachable!("strict contract text"),
+    }
+}
+
+fn body_bool(body: &BTreeMap<String, DagValue>, name: &str) -> bool {
+    match body.get(name) {
+        Some(DagValue::Bool(value)) => *value,
+        _ => unreachable!("strict contract boolean"),
     }
 }
 
@@ -1656,6 +1681,45 @@ projection_body!(
     WelcomeAcknowledgementProjection,
     WelcomeRejectionProjection
 );
+
+impl<'a> ApplicationSendProjection<'a> {
+    pub fn message_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "messageId")
+    }
+
+    pub fn prior(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "prior")
+    }
+
+    pub fn aad(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "aad")
+    }
+
+    pub fn application_message(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "applicationMessage")
+    }
+
+    pub fn blob_bindings(&self) -> CanonicalArrayRef<'a> {
+        match self.0.canonical.body.get("blobBindings") {
+            Some(DagValue::Array(value)) => CanonicalArrayRef(value),
+            _ => unreachable!("strict contract blob bindings array"),
+        }
+    }
+}
+
+impl<'a> TypingProjection<'a> {
+    pub fn typing_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "typingId")
+    }
+
+    pub fn coordinates(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "coordinates")
+    }
+
+    pub fn is_typing(&self) -> bool {
+        body_bool(&self.0.canonical.body, "isTyping")
+    }
+}
 
 macro_rules! transition_projection {
     ($name:ident, $id:literal) => {

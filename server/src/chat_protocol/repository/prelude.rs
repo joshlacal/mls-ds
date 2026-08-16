@@ -406,6 +406,7 @@ fn endpoint_has_operation_claim(endpoint: &str) -> bool {
             | "blue.catbird.chat.requestLeave"
             | "blue.catbird.chat.requestReset"
             | "blue.catbird.chat.revokeDevice"
+            | "blue.catbird.chat.sendMessage"
             | "blue.catbird.chat.submitTransition"
     )
 }
@@ -781,6 +782,56 @@ impl SignedOperationReplayPostStateProof {
 pub(crate) struct PreparedBusinessPrelude {
     authority: ScopeBoundBusinessAuthority,
     operation: OperationClaimGuard,
+}
+
+/// First-execution capability shared by the application-send and typing
+/// compositors. The verified mutation, the complete locked actor/key scope,
+/// and its operation-completion guard remain paired until the compositor
+/// consumes them.
+pub(crate) struct PreparedChatOperation {
+    authority: VerifiedChatDeviceRequest,
+    scope: ScopeBoundBusinessAuthority,
+    completion: OperationCompletionGuard,
+}
+
+/// Ephemeral typing authority: the actor/device projection is locked in the
+/// caller transaction, but no operation claim or completion guard is created.
+pub(crate) struct PreparedTypingOperation {
+    authority: VerifiedChatDeviceRequest,
+    scope: ScopeBoundBusinessAuthority,
+}
+
+impl PreparedTypingOperation {
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (VerifiedChatDeviceRequest, ScopeBoundBusinessAuthority) {
+        (self.authority, self.scope)
+    }
+}
+
+impl PreparedChatOperation {
+    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
+    pub(crate) fn scope(&self) -> &ScopeBoundBusinessAuthority {
+        &self.scope
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (
+        VerifiedChatDeviceRequest,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+    ) {
+        (self.authority, self.scope, self.completion)
+    }
+}
+
+pub(crate) enum PreparedChatAdmission {
+    First(PreparedChatOperation),
+    Replay(CompletedIdempotentResponse),
 }
 
 #[must_use]
@@ -2284,6 +2335,74 @@ pub(crate) async fn prepare_signed_operation(
     })
 }
 
+/// Prepare one ordinary signed send/typing admission using the same sealed
+/// actor/device/key prelude as every durable clean-chat mutation. Replay bytes
+/// remain opaque until the exact operation claim and locked identity are
+/// validated in this transaction.
+pub(crate) async fn prepare_chat_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedChatAdmission, PreludeError> {
+    match prepare_signed_operation(transaction, admission)
+        .await?
+        .into_state()
+    {
+        PreparedSignedOperationState::Replay { authority, replay } => {
+            validate_operation_replay_claim(transaction, &replay).await?;
+            if !replay.binding.matches_signed_replay_authority(&authority)? {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+            let completed = auth::load_signed_operation_replay_completion(transaction, &authority)
+                .await?
+                .ok_or(PreludeError::ClaimIntegrity)?;
+            Ok(PreparedChatAdmission::Replay(completed))
+        }
+        PreparedSignedOperationState::First {
+            authority,
+            reservation,
+        } => {
+            let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let (scope, completion) = business.into_execution_parts();
+            Ok(PreparedChatAdmission::First(PreparedChatOperation {
+                authority,
+                scope,
+                completion,
+            }))
+        }
+    }
+}
+
+pub(crate) async fn prepare_typing_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedTypingOperation, PreludeError> {
+    let authority = admission.into_first_authority()?;
+    let scope = CanonicalLockScope::new(
+        vec![authority.subject().as_str().to_owned()],
+        vec![CanonicalDeviceIdentity::new(
+            authority.subject().as_str(),
+            Uuid::from_bytes(*authority.device_id().as_bytes()),
+        )],
+    )?;
+    let business = auth::lock_canonical_business_authority_scope(
+        transaction,
+        &authority,
+        None,
+        &scope.principals,
+        &scope
+            .devices
+            .iter()
+            .map(|identity| (identity.did.clone(), identity.device_id))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(PreparedTypingOperation {
+        authority,
+        scope: ScopeBoundBusinessAuthority { locked: business },
+    })
+}
+
 async fn prepare_enrollment_bootstrap_prelude(
     transaction: &mut Transaction<'_, Postgres>,
     authority: VerifiedChatDeviceRequest,
@@ -2629,7 +2748,7 @@ pub(crate) async fn prepare_identity_scope_prelude(
     let business = auth::lock_canonical_business_authority_scope(
         transaction,
         authority,
-        &reservation.operation_lock,
+        Some(&reservation.operation_lock),
         &scope.principals,
         &device_pairs,
     )
