@@ -25,8 +25,32 @@ mod repository {
     }
 }
 
+#[test]
+fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
+    let source = include_str!("../src/chat_protocol/repository/ticket.rs");
+    assert!(!source.contains(concat!("snapshot_event_cursor_", "bytes")));
+    assert!(!source.contains(concat!("event_cursor_", "bytes")));
+    for required in [
+        "token_hash = $1",
+        "snapshot_event_cursor_sha256 = $1",
+        "event_cursor_sha256",
+        "protocol_instance_id",
+        "cursor_key_id",
+        "snapshot_retained_floor",
+        "chat.event_cursor_receipts",
+        "cursor_nonce",
+        "cursor_ciphertext",
+    ] {
+        assert!(
+            source.contains(required),
+            "missing G7 repository fragment: {required}"
+        );
+    }
+}
+
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -127,7 +151,8 @@ async fn seed_device(pool: &PgPool, at: DateTime<Utc>) -> DeviceFixture {
 struct SessionFixture {
     inventory_session_id: Uuid,
     snapshot_event_position: i64,
-    cursor_bytes: Vec<u8>,
+    capability: String,
+    capability_hash: Vec<u8>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
@@ -142,9 +167,9 @@ async fn seed_session(
     complete: bool,
 ) -> SessionFixture {
     let inventory_session_id = Uuid::new_v4();
-    let token_hash = Sha256::digest(fresh_blob()).to_vec();
-    let cursor_bytes = fresh_blob();
-    let cursor_sha256 = Sha256::digest(&cursor_bytes).to_vec();
+    let capability_bytes = fresh_blob();
+    let capability = URL_SAFE_NO_PAD.encode(&capability_bytes);
+    let capability_hash = Sha256::digest(&capability_bytes).to_vec();
     let empty_hash = Sha256::digest([]).to_vec();
     let snapshot_event_position: i64 = 42;
 
@@ -170,30 +195,44 @@ async fn seed_session(
         (None, None, None, None, None, None)
     };
 
+    let (protocol_instance_id, cursor_key_id, retained_floor): (Uuid, String, i64) =
+        sqlx::query_as(
+            "SELECT protocol_instance_id, cursor_key_id, retained_floor FROM chat.protocol_instances JOIN chat.event_retention USING (protocol_instance_id) WHERE singleton = TRUE",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read protocol fence");
     sqlx::query(
         r#"
         INSERT INTO chat.inventory_sessions(
             inventory_session_id, token_hash, user_did, device_id, jkt, auth_generation,
-            snapshot_event_position, snapshot_event_cursor_bytes, snapshot_event_cursor_sha256,
-            created_at, expires_at,
+            snapshot_event_position, snapshot_event_cursor_sha256, created_at, expires_at,
+            protocol_instance_id, cursor_key_id, cursor_format_version, snapshot_retained_floor,
+            snapshot_event_cursor_nonce, snapshot_event_cursor_ciphertext,
             conversations_complete, welcomes_complete, recovery_complete,
             conversation_item_count, conversation_items_sha256,
             welcome_item_count, welcome_items_sha256,
-            recovery_item_count, recovery_items_sha256
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$12,$13,$14,$15,$16,$17,$18)
+            recovery_item_count, recovery_items_sha256,
+            conversations_consumed, welcomes_consumed, recovery_consumed,
+            conversations_consumed_at, welcomes_consumed_at, recovery_consumed_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,$13,$14,$15,$16,$16,$16,$17,$18,$19,$20,$21,$22,$23,$23,$23,$24,$24,$24)
         "#,
     )
     .bind(inventory_session_id)
-    .bind(&token_hash)
+    .bind(&capability_hash)
     .bind(&device.did)
     .bind(device.device_id)
     .bind(&device.jkt)
     .bind(device.auth_generation)
     .bind(snapshot_event_position)
-    .bind(&cursor_bytes)
-    .bind(&cursor_sha256)
+    .bind(&capability_hash)
     .bind(created_at)
     .bind(expires_at)
+    .bind(protocol_instance_id)
+    .bind(&cursor_key_id)
+    .bind(retained_floor)
+    .bind([7u8; 12].as_slice())
+    .bind([9u8; 32].as_slice())
     .bind(complete)
     .bind(conv_count)
     .bind(conv_hash)
@@ -201,6 +240,12 @@ async fn seed_session(
     .bind(wel_hash)
     .bind(rec_count)
     .bind(rec_hash)
+    .bind(complete)
+    .bind(complete)
+    .bind(complete)
+    .bind(if complete { Some(created_at) } else { None })
+    .bind(if complete { Some(created_at) } else { None })
+    .bind(if complete { Some(created_at) } else { None })
     .execute(pool)
     .await
     .expect("insert inventory session");
@@ -208,7 +253,8 @@ async fn seed_session(
     SessionFixture {
         inventory_session_id,
         snapshot_event_position,
-        cursor_bytes,
+        capability,
+        capability_hash,
         created_at,
         expires_at,
     }
@@ -218,7 +264,7 @@ fn mint_request(
     device: &DeviceFixture,
     session: &SessionFixture,
     opaque_ticket: &[u8],
-    cursor_bytes: Vec<u8>,
+    capability: String,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> MintSubscriptionTicket {
@@ -228,8 +274,8 @@ fn mint_request(
         device_id: device.device_id,
         jkt: device.jkt.clone(),
         auth_generation: device.auth_generation,
-        inventory_session_id: session.inventory_session_id,
-        event_cursor_bytes: cursor_bytes,
+        inventory_session_id: session.capability.clone(),
+        event_cursor: capability,
         subscription_path: SUBSCRIBE_EVENTS_PATH.to_owned(),
         created_at,
         expires_at,
@@ -255,7 +301,7 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
         &device,
         &session,
         &opaque,
-        session.cursor_bytes.clone(),
+        session.capability.clone(),
         now,
         now + Duration::seconds(60),
     );
@@ -268,14 +314,17 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
         .await
         .expect("mint COMMIT past deferred binding");
     assert_eq!(minted.event_position, session.snapshot_event_position);
-    assert_eq!(minted.event_cursor_bytes, session.cursor_bytes);
+    assert_eq!(
+        minted.event_cursor_hash.as_slice(),
+        session.capability_hash.as_slice()
+    );
 
     // Consume once — succeeds and returns the continuation fence.
     let mut c1 = pool.begin().await.expect("begin consume 1");
     let consumed = consume_subscription_ticket(
         &mut c1,
         &ticket_hash(&opaque),
-        &session.cursor_bytes,
+        &session.capability,
         SUBSCRIBE_EVENTS_PATH,
         clock_now(&pool).await,
     )
@@ -290,7 +339,7 @@ async fn mint_binds_the_session_fence_and_ticket_is_consumable_once() {
     let again = consume_subscription_ticket(
         &mut c2,
         &ticket_hash(&opaque),
-        &session.cursor_bytes,
+        &session.capability,
         SUBSCRIBE_EVENTS_PATH,
         clock_now(&pool).await,
     )
@@ -321,7 +370,7 @@ async fn mint_rejects_incomplete_session() {
         &device,
         &session,
         &opaque,
-        session.cursor_bytes.clone(),
+        session.capability.clone(),
         now,
         now + Duration::seconds(60),
     );
@@ -353,14 +402,14 @@ async fn mint_rejects_cursor_that_does_not_match_the_session() {
         &device,
         &session,
         &opaque,
-        b"a-different-cursor".to_vec(),
+        URL_SAFE_NO_PAD.encode([8u8; 32]),
         now,
         now + Duration::seconds(60),
     );
     let mut tx = pool.begin().await.expect("begin mint");
     let result = mint_subscription_ticket(&mut tx, &request).await;
     assert!(
-        matches!(result, Err(TicketRepositoryError::CursorMismatch)),
+        matches!(result, Err(TicketRepositoryError::CapabilityMismatch)),
         "mint must reject a cursor that is not byte-equal to the session, got {result:?}"
     );
     tx.rollback().await.expect("rollback");
@@ -386,7 +435,7 @@ async fn consume_rejects_an_expired_ticket() {
         &device,
         &session,
         &opaque,
-        session.cursor_bytes.clone(),
+        session.capability.clone(),
         now - Duration::seconds(130),
         now - Duration::seconds(70),
     );
@@ -400,7 +449,7 @@ async fn consume_rejects_an_expired_ticket() {
     let result = consume_subscription_ticket(
         &mut c,
         &ticket_hash(&opaque),
-        &session.cursor_bytes,
+        &session.capability,
         SUBSCRIBE_EVENTS_PATH,
         now,
     )
@@ -431,7 +480,7 @@ async fn concurrent_consumes_never_double_claim() {
         &device,
         &session,
         &opaque,
-        session.cursor_bytes.clone(),
+        session.capability.clone(),
         now,
         now + Duration::seconds(60),
     );
@@ -444,7 +493,7 @@ async fn concurrent_consumes_never_double_claim() {
     // Two workers race to consume the one ticket; exactly one wins.
     let barrier = Arc::new(Barrier::new(2));
     let hash = ticket_hash(&opaque);
-    let cursor = session.cursor_bytes.clone();
+    let cursor = session.capability.clone();
     let mut handles = Vec::new();
     for _ in 0..2 {
         let pool = pool.clone();
