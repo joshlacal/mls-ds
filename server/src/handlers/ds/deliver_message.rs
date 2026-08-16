@@ -114,6 +114,8 @@ pub async fn deliver_message(
             seq,
             created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
             message_type: Some(msg.message_type.as_deref().unwrap_or("app").to_string().into()),
+            receipt_wire: None,
+            reset_generation: None,
             extra_data: Default::default(),
         };
 

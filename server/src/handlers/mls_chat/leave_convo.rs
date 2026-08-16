@@ -222,6 +222,8 @@ pub async fn leave_convo(
                     // NOTE: legacy code emitted "app" here, but this is a
                     // commit; preserving original wire compatibility for now.
                     message_type: Some("app".into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 

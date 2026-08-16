@@ -453,6 +453,8 @@ impl Message {
             seq: self.seq,
             created_at: crate::sqlx_jacquard::chrono_to_datetime(self.created_at),
             message_type: Some(self.message_type.clone().into()),
+            receipt_wire: None,
+            reset_generation: None,
             extra_data: Default::default(),
         })
     }

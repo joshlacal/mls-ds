@@ -446,6 +446,8 @@ impl<'de> serde::Deserialize<'de> for StreamEvent {
                     seq: message.seq,
                     created_at: message.created_at,
                     message_type: message.message_type.map(Into::into),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 },
                 ephemeral,
@@ -981,6 +983,8 @@ pub async fn subscribe_convo_events(
                             seq,
                             created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
                             message_type: Some("commit".into()),
+                            receipt_wire: None,
+                            reset_generation: None,
                             extra_data: Default::default(),
                         };
 
@@ -1257,6 +1261,8 @@ mod tests {
             seq: 0,
             created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
             message_type: Some("app".into()),
+            receipt_wire: None,
+            reset_generation: None,
             extra_data: Default::default(),
         }
     }

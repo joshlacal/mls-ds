@@ -790,6 +790,8 @@ mod tests {
                 seq: 0,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
                 message_type: Some("app".into()),
+                receipt_wire: None,
+                reset_generation: None,
                 extra_data: Default::default(),
             },
             ephemeral: false,
@@ -858,6 +860,8 @@ mod tests {
                 seq: 0,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                 message_type: Some("app".into()),
+                receipt_wire: None,
+                reset_generation: None,
                 extra_data: Default::default(),
             };
 

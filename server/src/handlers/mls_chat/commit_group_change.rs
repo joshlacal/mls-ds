@@ -1264,6 +1264,8 @@ pub async fn commit_group_change(
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 
@@ -2106,6 +2108,8 @@ pub async fn commit_group_change(
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 
@@ -3221,6 +3225,8 @@ pub async fn commit_group_change(
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 
@@ -3597,6 +3603,8 @@ pub async fn commit_group_change(
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
                     message_type: Some("commit".into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 
