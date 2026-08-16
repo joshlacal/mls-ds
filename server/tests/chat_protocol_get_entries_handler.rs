@@ -74,3 +74,41 @@ async fn get_entries_uses_real_auth_admission() {
     let body: Value = serde_json::from_slice(&bytes).expect("XRPC error body");
     assert_eq!(body["error"], "InvalidDPoP");
 }
+
+async fn response_for_after_seq(after_seq: &str) -> (StatusCode, Value) {
+    let uri = format!(
+        "/xrpc/blue.catbird.chat.getEntries?conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&afterSeq={after_seq}&limit=10"
+    );
+    let request = Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request");
+    let response = router().oneshot(request).await.expect("route response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("XRPC error body");
+    (status, body)
+}
+
+#[tokio::test]
+async fn get_entries_accepts_maximum_safe_after_seq() {
+    let (status, body) = response_for_after_seq("9007199254740991").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "InvalidDPoP");
+}
+
+#[tokio::test]
+async fn get_entries_rejects_unsafe_after_seq() {
+    let (status, body) = response_for_after_seq("9007199254740992").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidRequest");
+}
+
+#[tokio::test]
+async fn get_entries_rejects_after_seq_integer_overflow() {
+    let (status, body) = response_for_after_seq("18446744073709551616").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "InvalidRequest");
+}

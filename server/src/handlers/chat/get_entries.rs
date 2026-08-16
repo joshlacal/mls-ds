@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::chat_protocol::{
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::entry_read::{get_entries_for_admission, EntryReadFacadeError},
-    validation::{CanonicalHttpMethod, CanonicalUuidV4},
+    validation::{CanonicalHttpMethod, CanonicalUuidV4, MAX_SAFE_INTEGER},
 };
 use crate::storage::DbPool;
 
@@ -38,9 +38,10 @@ async fn get_entries(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
+    context::require_cutover(runtime, ENDPOINT)?;
+    let (conversation_id, after_seq, limit) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let admission = context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers).await?;
-    let (conversation_id, after_seq, limit) = parse_query(query)?;
     let response = get_entries_for_admission(pool, admission, conversation_id, after_seq, limit)
         .await
         .map_err(facade_failure)?;
@@ -58,7 +59,7 @@ fn parse_query(query: Option<&str>) -> Result<(Uuid, u64, i64), ChatFailure> {
         let value = parts.next().unwrap_or_default();
         match key {
             "conversationId" => conversation_id = Some(value),
-            "afterSeq" => after_seq = value.parse::<u64>().ok(),
+            "afterSeq" => after_seq = Some(value),
             "limit" => {
                 limit_seen = true;
                 limit = value.parse::<i64>().ok();
@@ -71,6 +72,9 @@ fn parse_query(query: Option<&str>) -> Result<(Uuid, u64, i64), ChatFailure> {
         .and_then(|value| Uuid::from_slice(value.as_bytes()).ok())
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let after_seq = after_seq
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (0..=MAX_SAFE_INTEGER).contains(value))
+        .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let limit = match (limit_seen, limit) {
         (true, None) => {
