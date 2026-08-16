@@ -4830,7 +4830,7 @@ async fn conversation_arm_columns(
 /// leaves, and the current metadata snapshot. Any missing/extra field or a
 /// state without its metadata snapshot fails before materialization.
 #[cfg(not(test))]
-async fn load_conversation_state_source(
+pub(crate) async fn load_conversation_state_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
 ) -> Result<super::super::read_projection::ConversationProjectionSource, InventoryRepositoryError> {

@@ -9,6 +9,8 @@ pub(crate) mod auth;
 #[allow(dead_code)]
 pub(crate) mod blobs;
 #[cfg(not(test))]
+pub(crate) mod conversation;
+#[cfg(not(test))]
 pub(crate) mod core;
 #[cfg(not(test))]
 #[allow(dead_code)]

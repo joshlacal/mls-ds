@@ -21,6 +21,8 @@ use crate::chat_protocol::validation::ValidatedChatNsid;
 use crate::storage::DbPool;
 
 mod context;
+#[cfg(not(test))]
+mod conversation_state;
 mod device_views;
 mod enroll_device;
 mod errors;
@@ -97,7 +99,8 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
     {
         matches!(
             endpoint,
-            ChatEndpoint::RequestReset
+            ChatEndpoint::GetConversationState
+                | ChatEndpoint::RequestReset
                 | ChatEndpoint::ActivateReset
                 | ChatEndpoint::RevokeDevice
                 | ChatEndpoint::AcknowledgeWelcome
@@ -142,6 +145,11 @@ where
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
         );
+    #[cfg(not(test))]
+    let router = router.route(
+        &xrpc_path(ChatEndpoint::GetConversationState),
+        get(conversation_state::handle),
+    );
     #[cfg(not(test))]
     let router = router
         .route(

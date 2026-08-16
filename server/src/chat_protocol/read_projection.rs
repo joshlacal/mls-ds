@@ -2181,7 +2181,7 @@ fn require_terminal_shape(
     }
 }
 
-fn conversation_coordinates_dto(
+pub(crate) fn conversation_coordinates_dto(
     coordinates: &CheckedConversationCoordinates,
 ) -> chat_dto::ConversationCoordinates<DefaultStr> {
     chat_dto::ConversationCoordinates {
