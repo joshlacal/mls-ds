@@ -102,13 +102,24 @@ fn canonical_lock_projection_requires_only_the_actor_key() {
         .0;
     assert!(block.contains("key.enrollment_auth_generation"));
     assert!(!block.contains("actor_key.enrollment_auth_generation"));
-    assert!(block.contains("operation: &CanonicalOperationReservationGuard"));
+    assert!(block.contains("operation: Option<&CanonicalOperationReservationGuard>"));
     assert!(block.contains("operation.transaction_id != transaction_id"));
     assert!(block
         .contains("authority.repository_receipt().operation_id() != Some(operation.operation_id)"));
     assert!(!block.contains("scope.identities.iter().any"));
     assert!(block.contains("let actor_key = locked_keys"));
     assert!(block.contains("actor_key.revoked_at.is_some()"));
+
+    let prelude_source = include_str!("../../src/chat_protocol/repository/prelude.rs");
+    let typing_admission = prelude_source
+        .split_once("pub(crate) async fn prepare_typing_admission")
+        .unwrap()
+        .1
+        .split_once("pub(crate) async fn")
+        .unwrap()
+        .0;
+    assert!(typing_admission.contains("\n        None,"));
+    assert!(prelude_source.contains("Some(&reservation.operation_lock)"));
 }
 
 #[test]

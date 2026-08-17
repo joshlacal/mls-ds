@@ -1218,6 +1218,24 @@ impl CanonicalSignedMutation {
     pub fn signed_at(&self) -> &CanonicalTimestamp {
         body_timestamp(&self.body, "signedAt")
     }
+
+    /// Return the exact client-generated operation identity for this signed
+    /// mutation. Clean application sends and typing publications deliberately
+    /// use their protocol identities (`messageId` and `typingId`) rather than
+    /// the generic `idempotencyKey`; every other idempotent mutation carries
+    /// the generic field. The value comes from the canonical projection, never
+    /// from reparsing accepted wrapper JSON.
+    pub fn operation_id(&self) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
+        let field = match self.kind {
+            SignedMutationKind::ApplicationSend => "messageId",
+            SignedMutationKind::Typing => "typingId",
+            _ => "idempotencyKey",
+        };
+        match self.body.get(field) {
+            Some(DagValue::Uuid(value)) => Ok(value),
+            _ => Err(AuthPrimitiveError::invalid("signed operation identity")),
+        }
+    }
 }
 
 fn exact_wrapper_fields(
@@ -1385,6 +1403,9 @@ impl VerifiedSignedMutation {
     pub fn auth_generation(&self) -> u64 {
         self.canonical.auth_generation()
     }
+    pub fn idempotency_key(&self) -> &CanonicalUuidV4 {
+        body_uuid(&self.canonical.body, "idempotencyKey")
+    }
     pub fn signed_at(&self) -> &CanonicalTimestamp {
         self.canonical.signed_at()
     }
@@ -1433,6 +1454,13 @@ fn body_text<'a>(body: &'a BTreeMap<String, DagValue>, name: &str) -> &'a str {
     match body.get(name) {
         Some(DagValue::Text(value)) => value,
         _ => unreachable!("strict contract text"),
+    }
+}
+
+fn body_bool(body: &BTreeMap<String, DagValue>, name: &str) -> bool {
+    match body.get(name) {
+        Some(DagValue::Bool(value)) => *value,
+        _ => unreachable!("strict contract boolean"),
     }
 }
 
@@ -1657,6 +1685,45 @@ projection_body!(
     WelcomeRejectionProjection
 );
 
+impl<'a> ApplicationSendProjection<'a> {
+    pub fn message_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "messageId")
+    }
+
+    pub fn prior(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "prior")
+    }
+
+    pub fn aad(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "aad")
+    }
+
+    pub fn application_message(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "applicationMessage")
+    }
+
+    pub fn blob_bindings(&self) -> CanonicalArrayRef<'a> {
+        match self.0.canonical.body.get("blobBindings") {
+            Some(DagValue::Array(value)) => CanonicalArrayRef(value),
+            _ => unreachable!("strict contract blob bindings array"),
+        }
+    }
+}
+
+impl<'a> TypingProjection<'a> {
+    pub fn typing_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "typingId")
+    }
+
+    pub fn coordinates(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "coordinates")
+    }
+
+    pub fn is_typing(&self) -> bool {
+        body_bool(&self.0.canonical.body, "isTyping")
+    }
+}
+
 macro_rules! transition_projection {
     ($name:ident, $id:literal) => {
         impl<'a> $name<'a> {
@@ -1701,6 +1768,55 @@ impl<'a> CreationProjection<'a> {
     }
     pub fn metadata_snapshot(&self) -> ClosedObjectRef<'a> {
         body_object(&self.0.canonical.body, "metadataSnapshot")
+    }
+}
+
+impl<'a> BlobUploadPreparationProjection<'a> {
+    pub fn blob_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "blobId")
+    }
+    pub fn conversation_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "conversationId")
+    }
+    pub fn ciphertext_sha256(&self) -> &'a [u8] {
+        match self.0.canonical.body.get("ciphertextSha256") {
+            Some(DagValue::Bytes(value)) => value,
+            _ => unreachable!("verified blob hash"),
+        }
+    }
+    pub fn ciphertext_size(&self) -> u64 {
+        body_integer(&self.0.canonical.body, "ciphertextSize")
+    }
+    pub fn plaintext_size(&self) -> u64 {
+        body_integer(&self.0.canonical.body, "plaintextSize")
+    }
+    pub fn media_type(&self) -> &'a str {
+        body_text(&self.0.canonical.body, "mediaType")
+    }
+    pub fn purpose(&self) -> &'a str {
+        body_text(&self.0.canonical.body, "purpose")
+    }
+    pub fn prior(&self) -> ClosedObjectRef<'a> {
+        body_object(&self.0.canonical.body, "prior")
+    }
+    /// The signed prior coordinate is not a conversation-state mutation for
+    /// blob preparation, but its conversation identity must still agree with
+    /// the request's explicit conversationId. The later bind/send authority
+    /// validates the remaining coordinate fields against the locked head.
+    pub fn prior_conversation_id(&self) -> &'a CanonicalUuidV4 {
+        match self.0.canonical.body.get("prior") {
+            Some(DagValue::Map(value)) => match value.get("conversationId") {
+                Some(DagValue::Uuid(value)) => value,
+                _ => unreachable!("verified blob prior conversation id"),
+            },
+            _ => unreachable!("verified blob prior conversation id"),
+        }
+    }
+}
+
+impl<'a> BlobDeletionProjection<'a> {
+    pub fn blob_id(&self) -> &'a CanonicalUuidV4 {
+        body_uuid(&self.0.canonical.body, "blobId")
     }
 }
 impl<'a> CommitTransitionProjection<'a> {
@@ -3041,6 +3157,111 @@ impl CanonicalControlEntryProducts {
 
     pub(crate) fn canonical_response_json(&self) -> &[u8] {
         &self.canonical_response_json
+    }
+}
+
+/// Reconstruct the generated control-entry JSON from the canonical persisted
+/// signed wrapper and server-fields DAG-CBOR. This is a read-only projection:
+/// persisted rows have already passed the transition executor's verification;
+/// this seam only re-applies the closed lexicon's generated JSON byte rules.
+pub(crate) fn persisted_control_entry_response_json(
+    entry_kind: &str,
+    entry_id: &str,
+    conversation_id: &str,
+    seq: u64,
+    received_at: &str,
+    signed_request_bytes: &[u8],
+    server_fields_bytes: &[u8],
+) -> Result<Vec<u8>, AuthPrimitiveError> {
+    let kind = ControlEntryKind::from_type_id(entry_kind)
+        .ok_or_else(|| AuthPrimitiveError::invalid("persisted control kind"))?;
+    let signed = decode_canonical_signed_mutation(signed_request_bytes)?;
+    if signed.kind() != kind.signed_kind() {
+        return Err(AuthPrimitiveError::invalid("persisted control signed kind"));
+    }
+    let raw_server_fields = decode_canonical_raw_cbor(server_fields_bytes)?;
+    let server_fields = match kind.server_field() {
+        None => {
+            if !matches!(raw_server_fields, RawCbor::Map(ref fields) if fields.is_empty()) {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            }
+            SchemaValue::Object(serde_json::Map::new())
+        }
+        Some(field) => {
+            let definition_name = if field == "recovery" {
+                "leafRecoveryView"
+            } else {
+                "conversationCloseTombstone"
+            };
+            let RawCbor::Map(fields) = &raw_server_fields else {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            };
+            if fields.len() != 1 {
+                return Err(AuthPrimitiveError::invalid(
+                    "persisted control server fields",
+                ));
+            }
+            let field_value = fields
+                .get(field)
+                .ok_or_else(|| AuthPrimitiveError::invalid("persisted control server field"))?;
+            let raw = cbor_schema_to_raw_json(
+                definition(definition_name)?,
+                field_value,
+                Some(definition_name),
+                false,
+            )?;
+            SchemaValue::Object(serde_json::Map::from_iter([(
+                field.to_owned(),
+                raw_json_value(&raw),
+            )]))
+        }
+    };
+    let signed_request: SchemaValue = serde_json::from_slice(signed_request_bytes)
+        .map_err(|_| AuthPrimitiveError::invalid("persisted control signed JSON"))?;
+    let mut object = serde_json::Map::from_iter([
+        (
+            "$type".to_owned(),
+            SchemaValue::String(entry_kind.to_owned()),
+        ),
+        (
+            "conversationId".to_owned(),
+            SchemaValue::String(conversation_id.to_owned()),
+        ),
+        (
+            "entryId".to_owned(),
+            SchemaValue::String(entry_id.to_owned()),
+        ),
+        (
+            "receivedAt".to_owned(),
+            SchemaValue::String(received_at.to_owned()),
+        ),
+        ("seq".to_owned(), SchemaValue::Number(seq.into())),
+        ("signedRequest".to_owned(), signed_request),
+    ]);
+    let SchemaValue::Object(fields) = server_fields else {
+        unreachable!()
+    };
+    object.extend(fields);
+    serde_json::to_vec(&SchemaValue::Object(object))
+        .map_err(|_| AuthPrimitiveError::invalid("persisted control response JSON"))
+}
+
+fn raw_json_value(value: &RawJson) -> SchemaValue {
+    match value {
+        RawJson::String(value) => SchemaValue::String(value.clone()),
+        RawJson::Integer(value) => SchemaValue::Number((*value).into()),
+        RawJson::Bool(value) => SchemaValue::Bool(*value),
+        RawJson::Array(values) => SchemaValue::Array(values.iter().map(raw_json_value).collect()),
+        RawJson::Object(values) => SchemaValue::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), raw_json_value(value)))
+                .collect(),
+        ),
     }
 }
 

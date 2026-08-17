@@ -1289,8 +1289,8 @@ pub(crate) async fn authorize_signed_operation_only(
         {
             return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
         }
-        let material = request_material_for_canonical(&pre_replay, &canonical)?
-            .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?;
+        let material = request_material_for_canonical(&pre_replay, &canonical)?;
+        let operation_id = operation_id_from_canonical(&canonical)?;
         let generation = i64::try_from(canonical.auth_generation())
             .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
         let exact_self_revocation = canonical_is_exact_self_target_revocation(&canonical)?;
@@ -1300,7 +1300,9 @@ pub(crate) async fn authorize_signed_operation_only(
                 if !completed_request_material_matches_without_response(
                     &mut transaction,
                     &pre_replay,
-                    &material,
+                    material
+                        .as_ref()
+                        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?,
                 )
                 .await?
                 {
@@ -1308,7 +1310,9 @@ pub(crate) async fn authorize_signed_operation_only(
                 }
                 let signing_public_key = completed_self_revocation_signing_public_key(
                     &mut transaction,
-                    &material,
+                    material
+                        .as_ref()
+                        .ok_or(AuthRepositoryError::UnsupportedAuthorizationShape)?,
                     pre_replay.subject().as_str(),
                     canonical_uuid(pre_replay.device_id()),
                     pre_replay.dpop_jkt().as_str(),
@@ -1345,7 +1349,7 @@ pub(crate) async fn authorize_signed_operation_only(
         )?;
         let receipt = RepositoryAuthorityReceipt::existing(
             replay_ids,
-            Some(material.operation_id),
+            Some(operation_id),
             &state,
             RepositoryAuthorityClass::ExistingDevice,
         );
@@ -1983,17 +1987,19 @@ impl CanonicalAuthorityScopePrewriteSnapshot {
 pub(super) async fn lock_canonical_business_authority_scope(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
-    operation: &CanonicalOperationReservationGuard,
+    operation: Option<&CanonicalOperationReservationGuard>,
     principals: &[String],
     devices: &[(String, Uuid)],
 ) -> Result<LockedCanonicalAuthorityScope, AuthRepositoryError> {
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await?;
-    if operation.transaction_id != transaction_id
-        || authority.repository_receipt().operation_id() != Some(operation.operation_id)
-    {
-        return Err(AuthRepositoryError::RequestBindingMismatch);
+    if let Some(operation) = operation {
+        if operation.transaction_id != transaction_id
+            || authority.repository_receipt().operation_id() != Some(operation.operation_id)
+        {
+            return Err(AuthRepositoryError::RequestBindingMismatch);
+        }
     }
     let locked_principals: Vec<String> = sqlx::query_scalar(
         r#"
@@ -3452,6 +3458,30 @@ pub(super) async fn load_validated_completed_replenishment_replay(
     completed_replay(transaction, authority.pre_replay(), &material).await
 }
 
+/// Blob preparation/deletion replay release.  These operations have no
+/// transition post-state to hydrate, but the replay still uses the exact
+/// signed request material and the current actor identity lock before bytes
+/// are exposed.
+pub(super) async fn load_validated_completed_blob_replay(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &SignedOperationReplayAuthority,
+) -> Result<Option<CompletedIdempotentResponse>, AuthRepositoryError> {
+    if !matches!(
+        (authority.endpoint().as_str(), authority.mutation().kind()),
+        (
+            "blue.catbird.chat.prepareBlobUpload",
+            SignedMutationKind::BlobUploadPreparation
+        ) | (
+            "blue.catbird.chat.deleteBlob",
+            SignedMutationKind::BlobDeletion
+        )
+    ) {
+        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
+    }
+    let material = request_material_for_signed_replay(authority)?;
+    completed_replay(transaction, authority.pre_replay(), &material).await
+}
+
 #[derive(Debug)]
 struct SignedPackageEffectManifestEntry {
     key_package_ref: Vec<u8>,
@@ -4098,17 +4128,10 @@ fn request_material_for_bootstrap_replay(
 fn operation_id_from_canonical(
     canonical: &CanonicalSignedMutation,
 ) -> Result<Uuid, AuthRepositoryError> {
-    let raw = canonical
-        .accepted_wrapper_bytes()
-        .ok_or(AuthRepositoryError::MissingAcceptedRequestBytes)?;
-    let value: serde_json::Value = serde_json::from_slice(raw)
-        .map_err(|_| AuthRepositoryError::MissingAcceptedRequestBytes)?;
-    let text = value
-        .get("body")
-        .and_then(|body| body.get("idempotencyKey"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or(AuthRepositoryError::MissingAcceptedRequestBytes)?;
-    Ok(canonical_uuid(&CanonicalUuidV4::parse(text)?))
+    canonical
+        .operation_id()
+        .map(|operation_id| canonical_uuid(operation_id))
+        .map_err(AuthRepositoryError::Primitive)
 }
 
 fn canonical_is_exact_self_target_revocation(
@@ -4214,6 +4237,7 @@ fn endpoint_has_idempotency_record(endpoint: &str) -> bool {
             | "blue.catbird.chat.requestLeave"
             | "blue.catbird.chat.requestReset"
             | "blue.catbird.chat.revokeDevice"
+            | "blue.catbird.chat.sendMessage"
             | "blue.catbird.chat.submitTransition"
     )
 }
@@ -4232,7 +4256,7 @@ fn endpoint_accepts_signed_mutation(endpoint: &str) -> bool {
 }
 
 fn endpoint_accepts_operation_only_signed_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
-    endpoint_has_idempotency_record(endpoint) && endpoint_accepts_kind(endpoint, kind)
+    endpoint_accepts_kind(endpoint, kind)
 }
 
 fn endpoint_accepts_kind(endpoint: &str, kind: SignedMutationKind) -> bool {
@@ -4455,9 +4479,17 @@ mod tests {
             "blue.catbird.chat.submitTransition",
             SignedMutationKind::ZeroLeafLeave,
         ));
-        assert!(!endpoint_accepts_operation_only_signed_kind(
+        assert!(endpoint_accepts_operation_only_signed_kind(
             "blue.catbird.chat.sendMessage",
             SignedMutationKind::ApplicationSend,
+        ));
+        assert!(endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.publishTyping",
+            SignedMutationKind::Typing,
+        ));
+        assert!(!endpoint_accepts_operation_only_signed_kind(
+            "blue.catbird.chat.sendMessage",
+            SignedMutationKind::Typing,
         ));
         assert!(!endpoint_accepts_operation_only_signed_kind(
             "blue.catbird.chat.enrollDevice",
@@ -4698,6 +4730,84 @@ mod tests {
         assert_eq!(
             operation_id_from_canonical(&canonical).unwrap(),
             Uuid::parse_str(operation_id).unwrap(),
+        );
+    }
+
+    #[test]
+    fn clean_send_and_typing_operation_ids_use_their_signed_identity_fields() {
+        let coordinates = json!({
+            "conversationId": "11111111-1111-4111-8111-111111111111",
+            "generation": 1,
+            "stateVersion": 2,
+            "groupId": STANDARD.encode([0x22_u8; 32]),
+            "epoch": 1,
+            "groupContextHash": STANDARD.encode([0x23_u8; 32]),
+            "confirmationTag": STANDARD.encode([0x24_u8; 32]),
+            "lifecycle": "active"
+        });
+        let send = json!({
+            "body": {
+                "$type": "blue.catbird.chat.defs#applicationSendBody",
+                "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+                "messageId": "51515151-5151-4151-9151-515151515151",
+                "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                "actorDeviceId": "70707070-7070-4070-b070-707070707070",
+                "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+                "authGeneration": 1,
+                "prior": coordinates,
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode([0x11_u8; 16]),
+                    "generation": 1,
+                    "messageId": STANDARD.encode([0x51_u8; 16]),
+                    "prior": {
+                        "conversationId": STANDARD.encode([0x11_u8; 16]),
+                        "generation": 1,
+                        "stateVersion": 2,
+                        "groupId": STANDARD.encode([0x22_u8; 32]),
+                        "epoch": 1,
+                        "groupContextHash": STANDARD.encode([0x23_u8; 32]),
+                        "confirmationTag": STANDARD.encode([0x24_u8; 32]),
+                        "lifecycle": "active"
+                    }
+                },
+                "applicationMessage": {
+                    "framing": "mlsMessage",
+                    "contentType": "privateMessageApplication",
+                    "bytes": STANDARD.encode([0x31_u8; 8]),
+                    "sha256": STANDARD.encode(Sha256::digest([0x31_u8; 8]))
+                },
+                "blobBindings": [],
+                "signedAt": "2026-07-22T12:34:55.000Z"
+            },
+            "signature": STANDARD.encode([0_u8; 64])
+        });
+        let typing = json!({
+            "body": {
+                "$type": "blue.catbird.chat.defs#typingBody",
+                "signatureDomain": "CATBIRD-CHAT-TYPING\u{0000}",
+                "typingId": "61616161-6161-4161-8161-616161616161",
+                "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                "actorDeviceId": "70707070-7070-4070-b070-707070707070",
+                "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+                "authGeneration": 1,
+                "coordinates": coordinates,
+                "isTyping": true,
+                "signedAt": "2026-07-22T12:34:55.000Z"
+            },
+            "signature": STANDARD.encode([0_u8; 64])
+        });
+
+        let send = decode_canonical_signed_mutation(&serde_json::to_vec(&send).unwrap()).unwrap();
+        let typing =
+            decode_canonical_signed_mutation(&serde_json::to_vec(&typing).unwrap()).unwrap();
+        assert_eq!(
+            operation_id_from_canonical(&send).unwrap(),
+            Uuid::parse_str("51515151-5151-4151-9151-515151515151").unwrap()
+        );
+        assert_eq!(
+            operation_id_from_canonical(&typing).unwrap(),
+            Uuid::parse_str("61616161-6161-4161-8161-616161616161").unwrap()
         );
     }
 

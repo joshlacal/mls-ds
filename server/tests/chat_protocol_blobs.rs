@@ -24,6 +24,190 @@
 
 mod common;
 
+mod chat_protocol {
+    pub mod dpop {
+        pub struct VerifiedReadAdmission;
+    }
+    pub mod read_authority {
+        pub enum OrdinaryReadEndpoint {}
+        pub enum ReadAuthorityError {
+            Storage,
+        }
+        pub struct Attempt;
+        pub struct LockedDevice;
+        pub struct Admission;
+        impl Admission {
+            pub fn into_attempt(self) -> Attempt {
+                Attempt
+            }
+        }
+        pub fn into_single_read_admission(
+            _admission: super::dpop::VerifiedReadAdmission,
+            _endpoint: OrdinaryReadEndpoint,
+        ) -> Result<Admission, ()> {
+            Err(())
+        }
+        pub async fn lock_read_device_authority_once(
+            _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            _attempt: Attempt,
+        ) -> Result<LockedDevice, ReadAuthorityError> {
+            Err(ReadAuthorityError::Storage)
+        }
+        impl LockedDevice {
+            pub fn user_did(&self) -> &str {
+                ""
+            }
+            pub fn device_id(&self) -> uuid::Uuid {
+                uuid::Uuid::nil()
+            }
+            pub fn auth_generation(&self) -> i64 {
+                0
+            }
+        }
+    }
+    pub mod snapshot {
+        #[derive(PartialEq, Eq)]
+        pub enum PublicGroupSnapshotLifecycle {
+            Active,
+        }
+    }
+    pub mod state_machine {
+        #[derive(PartialEq, Eq)]
+        pub enum WelcomeStatus {
+            Pending,
+            Acknowledged,
+            Rejected,
+            Expired,
+        }
+        use super::snapshot::PublicGroupSnapshotLifecycle;
+        pub struct Principal;
+        static PRINCIPAL: Principal = Principal;
+        impl Principal {
+            pub fn as_bytes(&self) -> &'static [u8] {
+                &[]
+            }
+        }
+        pub struct Recipient;
+        static RECIPIENT: Recipient = Recipient;
+        impl Recipient {
+            pub fn principal(&self) -> &'static Principal {
+                &PRINCIPAL
+            }
+            pub fn device_id(&self) -> &'static [u8; 16] {
+                &[0; 16]
+            }
+        }
+        pub struct Coordinate;
+        impl Coordinate {
+            pub fn lifecycle(&self) -> PublicGroupSnapshotLifecycle {
+                PublicGroupSnapshotLifecycle::Active
+            }
+            pub fn generation(&self) -> u64 {
+                0
+            }
+            pub fn state_version(&self) -> u64 {
+                0
+            }
+            pub fn epoch(&self) -> u64 {
+                0
+            }
+            pub fn group_id(&self) -> &[u8] {
+                &[]
+            }
+            pub fn group_context_hash(&self) -> &[u8] {
+                &[]
+            }
+            pub fn confirmation_tag(&self) -> &[u8] {
+                &[]
+            }
+            pub fn conversation_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+        }
+        pub struct WelcomeCasBinding;
+        impl WelcomeCasBinding {
+            pub fn conversation_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+            pub fn recipient(&self) -> &'static Recipient {
+                &RECIPIENT
+            }
+            pub fn expires_at(&self) -> Timestamp {
+                Timestamp
+            }
+            pub fn verify_seal(&self) -> bool {
+                false
+            }
+            pub fn transaction_id(&self) -> &str {
+                ""
+            }
+            pub fn expected_status(&self) -> WelcomeStatus {
+                WelcomeStatus::Pending
+            }
+            pub fn successor_status(&self) -> WelcomeStatus {
+                WelcomeStatus::Pending
+            }
+            pub fn coordinate(&self) -> Coordinate {
+                Coordinate
+            }
+            pub fn transition_seq(&self) -> u64 {
+                0
+            }
+            pub fn welcome_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+            pub fn recovery_request_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+            pub fn opaque_welcome_sha256(&self) -> &[u8; 32] {
+                &[0; 32]
+            }
+            pub fn key_package_ref(&self) -> &[u8] {
+                &[]
+            }
+            pub fn locked_at(&self) -> Timestamp {
+                Timestamp
+            }
+        }
+        pub struct WelcomeWork;
+        impl WelcomeWork {
+            pub fn status(&self) -> WelcomeStatus {
+                WelcomeStatus::Expired
+            }
+            pub fn coordinate(&self) -> Coordinate {
+                Coordinate
+            }
+            pub fn expires_at(&self) -> Timestamp {
+                Timestamp
+            }
+            pub fn welcome_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+            pub fn recovery_request_id(&self) -> &[u8; 16] {
+                &[0; 16]
+            }
+            pub fn transition_seq(&self) -> u64 {
+                0
+            }
+            pub fn sha256(&self) -> &[u8; 32] {
+                &[0; 32]
+            }
+            pub fn recipient(&self) -> &'static Recipient {
+                &RECIPIENT
+            }
+            pub fn key_package_ref(&self) -> &[u8] {
+                &[]
+            }
+        }
+        pub struct Timestamp;
+        impl Timestamp {
+            pub fn unix_millis(&self) -> i64 {
+                0
+            }
+        }
+    }
+}
+
 mod repository {
     pub(crate) mod blobs {
         include!(concat!(
@@ -40,6 +224,94 @@ mod repository {
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/repository/delivery.rs"
         ));
+    }
+
+    // The included blob module's ignored drift fixtures import the canonical
+    // transition writer through `super::super::transition`. Keep this harness
+    // self-contained: those ignored fixtures are not executed here, while the
+    // production library continues to resolve the real transition module.
+    pub(crate) mod transition {
+        use chrono::{DateTime, Utc};
+        use uuid::Uuid;
+
+        #[derive(Debug)]
+        pub(crate) struct HarnessTransitionError;
+
+        pub(crate) enum IntervalCloseKind {
+            Remove,
+        }
+
+        pub(crate) struct ApplicationIntervalClose {
+            pub(crate) membership_interval_id: Uuid,
+            pub(crate) terminal_seq: i64,
+            pub(crate) closing_state_version: i64,
+            pub(crate) closing_transition_id: Uuid,
+            pub(crate) closing_outer_entry_fingerprint: Vec<u8>,
+            pub(crate) closing_kind: IntervalCloseKind,
+            pub(crate) closing_leaf_period_id: Uuid,
+            pub(crate) removed_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct LeafClose {
+            pub(crate) leaf_period_id: Uuid,
+            pub(crate) removed_state_version: i64,
+            pub(crate) removed_transition_id: Uuid,
+            pub(crate) removed_seq: i64,
+            pub(crate) removed_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct NewDeviceRevocation {
+            pub(crate) revocation_id: Uuid,
+            pub(crate) actor_did: String,
+            pub(crate) actor_device_id: Uuid,
+            pub(crate) actor_key_id: String,
+            pub(crate) actor_auth_generation: i64,
+            pub(crate) target_did: String,
+            pub(crate) target_device_id: Uuid,
+            pub(crate) target_auth_generation: i64,
+            pub(crate) accepted_request_bytes: Vec<u8>,
+            pub(crate) signing_transcript_bytes: Vec<u8>,
+            pub(crate) request_digest: Vec<u8>,
+            pub(crate) signature: Vec<u8>,
+            pub(crate) signed_at: DateTime<Utc>,
+            pub(crate) accepted_at: DateTime<Utc>,
+        }
+
+        pub(crate) struct RegistrationRevoke {
+            pub(crate) target_did: String,
+            pub(crate) target_device_id: Uuid,
+            pub(crate) expected_auth_generation: i64,
+            pub(crate) revocation_id: Uuid,
+            pub(crate) revoked_at: DateTime<Utc>,
+        }
+
+        pub(crate) async fn close_application_interval<T>(
+            _transaction: &mut T,
+            _close: &ApplicationIntervalClose,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn close_leaf_period<T>(
+            _transaction: &mut T,
+            _close: &LeafClose,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn insert_device_revocation<T>(
+            _transaction: &mut T,
+            _revocation: &NewDeviceRevocation,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
+
+        pub(crate) async fn cas_registration_revoke<T>(
+            _transaction: &mut T,
+            _revoke: &RegistrationRevoke,
+        ) -> Result<(), HarnessTransitionError> {
+            Ok(())
+        }
     }
 }
 
@@ -230,6 +502,13 @@ fn random_ref() -> Vec<u8> {
     bytes
 }
 
+fn deterministic_object_key(blob_id: Uuid, ciphertext_sha256: &[u8]) -> String {
+    let hash: [u8; 32] = ciphertext_sha256
+        .try_into()
+        .expect("ciphertext hash is exactly 32 bytes");
+    repository::blobs::derive_blob_cid(blob_id, &hash)
+}
+
 async fn clock_now(tx: &mut Transaction<'_, Postgres>) -> DateTime<Utc> {
     sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&mut **tx)
@@ -375,7 +654,7 @@ async fn prepare_upload_delete_lifecycle_keeps_usage_reconciled() {
         ciphertext_size,
         &ticket_hash,
         now + Duration::seconds(30),
-        "objectstore/key/one",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete upload");
@@ -438,7 +717,7 @@ async fn upload_ticket_is_single_use_and_expires_after_five_minutes() {
         ciphertext_size,
         &ticket_hash,
         now + Duration::seconds(60),
-        "objectstore/key/single-use",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("first upload");
@@ -533,7 +812,7 @@ async fn unbound_blobs_expire_after_one_hour_and_release_quota() {
         completed_ct,
         &completed_ticket,
         now - Duration::minutes(129),
-        "objectstore/key/expiring",
+        &deterministic_object_key(completed_id, &completed.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -614,7 +893,7 @@ async fn two_senders_race_to_bind_one_blob_and_exactly_one_wins() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/race",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -709,7 +988,7 @@ async fn only_the_signing_owner_device_may_delete_a_completed_unbound_blob() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/owner-delete",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1105,7 +1384,7 @@ async fn descriptor_and_aad_bytes_are_stored_opaquely_without_inner_parsing() {
         ct,
         &ticket,
         now + Duration::seconds(10),
-        "objectstore/key/opaque",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1206,33 +1485,59 @@ struct CreationGraph {
 async fn seed_creation_graph_tx(
     tx: &mut Transaction<'_, Postgres>,
     actor_did: &str,
+    existing: Option<&http::Device>,
 ) -> CreationGraph {
     let now = clock_now(tx).await;
-    sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+    let actor_device_id = existing.map_or_else(Uuid::new_v4, |device| device.device_id);
+    let (actor_key_id, actor_public_key): (String, Vec<u8>) = if let Some(device) = existing {
+        sqlx::query_as(
+            "SELECT key_id, signing_public_key FROM chat.device_keys WHERE user_did = $1 AND device_id = $2",
+        )
+        .bind(&device.did)
+        .bind(device.device_id)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("existing HTTP device key")
+    } else {
+        let public_key = random_ref();
+        let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+            .bind(&public_key)
+            .fetch_one(&mut **tx)
+            .await
+            .expect("key id");
+        (key_id, public_key)
+    };
+    if existing.is_none() {
+        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+            .bind(actor_did)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .expect("principal");
+        sqlx::query(
+            "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+             VALUES($1,$2,'creator','active',$3,1,chat.protocol_capabilities(),$4,$4)",
+        )
         .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(&actor_key_id)
         .bind(now)
         .execute(&mut **tx)
         .await
-        .expect("principal");
-    let actor_device_id = Uuid::new_v4();
-    let actor_public_key = random_ref();
-    let actor_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+        .expect("device");
+        sqlx::query(
+            "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+             VALUES($1,$2,$3,$4,1,$5)",
+        )
+        .bind(actor_did)
+        .bind(actor_device_id)
+        .bind(&actor_key_id)
         .bind(&actor_public_key)
-        .fetch_one(&mut **tx)
+        .bind(now)
+        .execute(&mut **tx)
         .await
-        .expect("key id");
-    sqlx::query(
-        "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
-         VALUES($1,$2,'creator','active',$3,1,chat.protocol_capabilities(),$4,$4)",
-    )
-    .bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(now)
-    .execute(&mut **tx).await.expect("device");
-    sqlx::query(
-        "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
-         VALUES($1,$2,$3,$4,1,$5)",
-    )
-    .bind(actor_did).bind(actor_device_id).bind(&actor_key_id).bind(&actor_public_key).bind(now)
-    .execute(&mut **tx).await.expect("device key");
+        .expect("device key");
+    }
 
     let conversation_id = Uuid::new_v4();
     let creation_transition_id = Uuid::new_v4();
@@ -1340,7 +1645,7 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
     let owner = random_plc_did();
-    let graph = seed_creation_graph_tx(&mut tx, &owner).await;
+    let graph = seed_creation_graph_tx(&mut tx, &owner, None).await;
     let now = graph.accepted_at;
 
     // Append the accepted application entry at seq 2.
@@ -1376,7 +1681,7 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
         ct,
         &ticket,
         uploaded_at,
-        "objectstore/key/attach",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1415,7 +1720,10 @@ async fn application_binding_is_readable_by_the_exact_device_and_denied_to_a_sib
         .expect("exact device sees the attachment");
     assert_eq!(view.blob_id, blob_id);
     assert_eq!(view.entry_seq, 2);
-    assert_eq!(view.object_store_key, "objectstore/key/attach");
+    assert_eq!(
+        view.object_store_key_for_test(),
+        deterministic_object_key(blob_id, &request.ciphertext_sha256)
+    );
     assert_eq!(view.descriptor_bytes, descriptor_bytes);
     assert_eq!(view.aad_bytes, aad_bytes);
 
@@ -1458,7 +1766,7 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(2).await;
     let mut tx = pool.begin().await.expect("begin");
     let owner = random_plc_did();
-    let graph = seed_creation_graph_tx(&mut tx, &owner).await;
+    let graph = seed_creation_graph_tx(&mut tx, &owner, None).await;
     let now = graph.accepted_at;
     let binding_seq: i64 = 5;
 
@@ -1487,7 +1795,7 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
         ct,
         &ticket,
         uploaded_at,
-        "objectstore/key/pred",
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
     )
     .await
     .expect("complete");
@@ -1644,4 +1952,197 @@ async fn attachment_read_predicate_matches_the_exact_device_interval_span() {
     );
 
     tx.rollback().await.expect("rollback");
+}
+#[tokio::test]
+async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let owner = http::seed_device(&pool).await;
+    let foreign = http::seed_device(&pool).await;
+    let mut tx = pool.begin().await.expect("begin HTTP blob graph");
+    let graph = seed_creation_graph_tx(&mut tx, &owner.did, Some(&owner)).await;
+    let now = graph.accepted_at;
+    let protocol_instance_id: Uuid = sqlx::query_scalar(
+        "SELECT protocol_instance_id FROM chat.protocol_instances WHERE singleton = TRUE",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .expect("protocol instance");
+    let event_position: i64 = sqlx::query_scalar(
+        "INSERT INTO chat.events(event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id) \
+         VALUES($1,'conversationChanged',$2,digest($2,'sha256'),$3,$4) RETURNING event_position",
+    )
+    .bind(Uuid::new_v4())
+    .bind(b"{}".as_slice())
+    .bind(now)
+    .bind(protocol_instance_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("conversation event");
+    sqlx::query(
+        "INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) \
+         VALUES($1,$2,$3,'participant',NULL)",
+    )
+    .bind(event_position)
+    .bind(&owner.did)
+    .bind(owner.device_id)
+    .execute(&mut *tx)
+    .await
+    .expect("conversation event recipient");
+    let send = coherent_app_send(&graph, 0x42, now);
+    let message_id = send.entry.message_id.expect("message id");
+    resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("accept application entry");
+    let mut request = prepare_request(
+        &owner.did,
+        owner.device_id,
+        &graph.actor_key_id,
+        BlobPurpose::Attachment,
+        BlobMediaType::ImagePng,
+        1_000,
+        now,
+    );
+    let payload = vec![0x6D_u8; request.ciphertext_size as usize];
+    request.ciphertext_sha256 = Sha256::digest(&payload).to_vec();
+    let blob_id = request.blob_id;
+    prepare_blob(&mut tx, &request)
+        .await
+        .expect("prepare existing blob");
+    complete_upload(
+        &mut tx,
+        blob_id,
+        &owner.did,
+        owner.device_id,
+        request.ciphertext_size,
+        &request.ticket_hash,
+        now + Duration::seconds(10),
+        &deterministic_object_key(blob_id, &request.ciphertext_sha256),
+    )
+    .await
+    .expect("complete existing blob");
+    bind_application_blob(
+        &mut tx,
+        &NewBlobBinding {
+            blob_id,
+            binding_kind: BindingKind::Application,
+            conversation_id: graph.conversation_id,
+            entry_seq: Some(2),
+            message_id: Some(message_id),
+            metadata_origin_transition_id: None,
+            metadata_version: None,
+            owner_did: owner.did.clone(),
+            owner_device_id: owner.device_id,
+            descriptor_bytes: vec![0xAB; 8],
+            descriptor_sha256: Sha256::digest([0xAB; 8]).to_vec(),
+            aad_bytes: vec![0xCD; 8],
+            aad_sha256: Sha256::digest([0xCD; 8]).to_vec(),
+            ciphertext_sha256: request.ciphertext_sha256.clone(),
+            plaintext_size: request.plaintext_size,
+            ciphertext_size: request.ciphertext_size,
+            purpose: BlobPurpose::Attachment,
+            bound_at: now + Duration::seconds(20),
+            uploaded_at: now + Duration::seconds(10),
+            unbound_expires_at: now + Duration::hours(1) + Duration::seconds(10),
+        },
+    )
+    .await
+    .expect("bind existing blob");
+    set_constraints_immediate(&mut tx).await;
+    tx.commit().await.expect("commit HTTP blob graph");
+    let object_store_key = deterministic_object_key(blob_id, &request.ciphertext_sha256);
+    let expected_sha256: [u8; 32] = request
+        .ciphertext_sha256
+        .as_slice()
+        .try_into()
+        .expect("blob hash");
+    let router = http::router_for_authenticated_acceptance_with_blob_store(
+        pool,
+        catbird_server::blob_store::BlobStore::for_route_tests_with_object(
+            object_store_key,
+            payload.clone(),
+            expected_sha256,
+            deterministic_object_key(blob_id, &request.ciphertext_sha256),
+            "image/png".to_owned(),
+        ),
+    )
+    .await;
+    let query = format!("?blobId={blob_id}");
+    let (owner_status, owner_bytes) = http::send_bytes(
+        router.clone(),
+        http::unsigned_request(&owner, "blue.catbird.chat.getBlob", "GET", &query),
+    )
+    .await;
+    assert_eq!(
+        owner_status,
+        axum::http::StatusCode::OK,
+        "owner response status={owner_status} body={:?}",
+        String::from_utf8_lossy(&owner_bytes)
+    );
+    assert_eq!(owner_bytes, payload);
+
+    let (foreign_status, foreign_response) = http::send(
+        router.clone(),
+        http::unsigned_request(&foreign, "blue.catbird.chat.getBlob", "GET", &query),
+    )
+    .await;
+    assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(foreign_response["error"], "NotAuthorized");
+    assert!(foreign_response.get("blob").is_none());
+    let (owner_inventory_status, owner_inventory) = http::send(
+        router.clone(),
+        http::unsigned_request(
+            &owner,
+            "blue.catbird.chat.getConversations",
+            "GET",
+            "?limit=50",
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_inventory_status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "owner getConversations request currently exposes an incomplete inventory fixture"
+    );
+    assert!(owner_inventory.get("conversations").is_none());
+    let (foreign_inventory_status, foreign_inventory) = http::send(
+        router,
+        http::unsigned_request(
+            &foreign,
+            "blue.catbird.chat.getConversations",
+            "GET",
+            "?limit=50",
+        ),
+    )
+    .await;
+    assert_eq!(
+        foreign_inventory_status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(foreign_inventory.get("conversations").is_none());
+}
+
+use common::http_acceptance as http;
+
+#[tokio::test]
+async fn http_blob_usage_accepts_exact_device_and_blob_fetch_is_redacted() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    http::ensure_fence(&pool).await;
+    let device = http::seed_device(&pool).await;
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    let missing = Uuid::new_v4();
+
+    let (status, denied) = http::send(
+        router,
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getBlob",
+            "GET",
+            &format!("?blobId={missing}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(denied["error"], "NotAuthorized");
+    assert!(denied.get("blob").is_none());
 }

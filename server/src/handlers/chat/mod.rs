@@ -10,24 +10,41 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRef, State},
+    Router,
+    extract::{DefaultBodyLimit, FromRef, State},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
+use crate::blob_store::BlobStore;
 use crate::storage::DbPool;
 
+#[cfg(not(test))]
+mod accept_conversation;
+#[cfg(not(test))]
+mod blob_routes;
 mod context;
+#[cfg(not(test))]
+mod conversation_state;
+#[cfg(not(test))]
+mod create_conversation;
 mod device_views;
 mod enroll_device;
 mod errors;
 #[cfg(not(test))]
 mod expiry_worker;
 mod get_devices;
+#[cfg(not(test))]
+mod get_entries;
 mod get_own_devices;
+#[cfg(not(test))]
+mod inventory;
+#[cfg(not(test))]
+mod leave;
+#[cfg(not(test))]
+mod publish_typing;
 mod rebind_device_authentication;
 #[cfg(not(test))]
 mod recovery;
@@ -40,13 +57,21 @@ mod reset;
 mod revoke_device;
 mod runtime;
 #[cfg(not(test))]
+mod send_message;
+#[cfg(not(test))]
 mod submit_transition;
+#[cfg(not(test))]
+mod subscribe_events;
+#[cfg(not(test))]
+mod subscription;
 #[cfg(not(test))]
 mod welcome;
 
 use errors::ChatFailure;
 #[cfg(not(test))]
-pub use expiry_worker::{run_chat_expiry_sweeper, ChatExpirySweepConfig};
+pub use expiry_worker::{
+    ChatExpirySweepConfig, run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store,
+};
 pub use runtime::ChatRuntime;
 
 /// Build the isolated `blue.catbird.chat.*` router. Generic over the
@@ -60,6 +85,7 @@ where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
+    BlobStore: FromRef<S>,
 {
     let mut router = Router::new();
     for &endpoint in ChatEndpoint::ALL {
@@ -88,6 +114,23 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
+            | ChatEndpoint::RequestLeave
+            | ChatEndpoint::CancelLeave
+            | ChatEndpoint::CloseConversation
+            | ChatEndpoint::SendMessage
+            | ChatEndpoint::PublishTyping
+            | ChatEndpoint::CreateConversation
+            | ChatEndpoint::AcceptConversation
+            | ChatEndpoint::GetConversations
+            | ChatEndpoint::GetPendingWelcomes
+            | ChatEndpoint::GetLeafRecoveryInbox
+            | ChatEndpoint::GetSubscriptionTicket
+            | ChatEndpoint::SubscribeEvents
+            | ChatEndpoint::GetBlob
+            | ChatEndpoint::GetBlobUsage
+            | ChatEndpoint::PrepareBlobUpload
+            | ChatEndpoint::UploadBlob
+            | ChatEndpoint::DeleteBlob
     ) {
         return true;
     }
@@ -95,7 +138,8 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
     {
         matches!(
             endpoint,
-            ChatEndpoint::RequestReset
+            ChatEndpoint::GetConversationState
+                | ChatEndpoint::RequestReset
                 | ChatEndpoint::ActivateReset
                 | ChatEndpoint::RevokeDevice
                 | ChatEndpoint::AcknowledgeWelcome
@@ -103,6 +147,9 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
                 | ChatEndpoint::RequestLeafRecovery
                 | ChatEndpoint::CancelLeafRecovery
                 | ChatEndpoint::SubmitTransition
+                | ChatEndpoint::GetEntries
+                | ChatEndpoint::CreateConversation
+                | ChatEndpoint::AcceptConversation
         )
     }
     #[cfg(test)]
@@ -117,6 +164,7 @@ where
     S: Clone + Send + Sync + 'static,
     DbPool: FromRef<S>,
     Arc<ChatRuntime>: FromRef<S>,
+    BlobStore: FromRef<S>,
 {
     let router = Router::new()
         .route(
@@ -139,6 +187,11 @@ where
             &xrpc_path(ChatEndpoint::GetOwnDevices),
             get(get_own_devices::handle),
         );
+    #[cfg(not(test))]
+    let router = router.route(
+        &xrpc_path(ChatEndpoint::GetConversationState),
+        get(conversation_state::handle),
+    );
     #[cfg(not(test))]
     let router = router
         .route(
@@ -172,6 +225,84 @@ where
         .route(
             &xrpc_path(ChatEndpoint::SubmitTransition),
             post(submit_transition::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetEntries),
+            get(get_entries::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::RequestLeave),
+            post(leave::handle_request),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelLeave),
+            post(leave::handle_cancellation),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CloseConversation),
+            post(leave::handle_close),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::SendMessage),
+            post(send_message::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PublishTyping),
+            post(publish_typing::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::CreateConversation),
+            post(create_conversation::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::AcceptConversation),
+            post(accept_conversation::handle),
+        );
+    #[cfg(not(test))]
+    let router = router
+        .route(
+            &xrpc_path(ChatEndpoint::GetConversations),
+            get(inventory::conversations),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetPendingWelcomes),
+            get(inventory::welcomes),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetLeafRecoveryInbox),
+            get(inventory::recovery),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetSubscriptionTicket),
+            post(subscription::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::SubscribeEvents),
+            get(subscribe_events::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetBlobUsage),
+            get(blob_routes::get_blob_usage),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PrepareBlobUpload),
+            post(blob_routes::prepare_blob_upload),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::UploadBlob),
+            post(blob_routes::upload_blob).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::DeleteBlob),
+            post(blob_routes::delete_blob),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetBlob),
+            get(blob_routes::get_blob),
         );
     router
 }

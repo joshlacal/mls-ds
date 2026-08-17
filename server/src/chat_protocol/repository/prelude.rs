@@ -18,13 +18,15 @@ use super::{
             DeviceEnrollmentProjection, KeyPackageReplenishmentProjection, SignedMutationKind,
             VerifiedMutationProjection, VerifiedSignedMutation,
         },
-        validation::{basic_credential_identity, BareDid},
+        validation::{BareDid, basic_credential_identity},
     },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
 #[cfg(not(test))]
-use super::{recovery, reset, revocation, submit_transition, welcome_terminal};
+use super::{
+    acceptance, creation, leave, recovery, reset, revocation, submit_transition, welcome_terminal,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum PreludeError {
@@ -79,7 +81,7 @@ impl CanonicalDeviceIdentity {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalLockScope {
     principals: Vec<String>,
     devices: Vec<CanonicalDeviceIdentity>,
@@ -406,6 +408,7 @@ fn endpoint_has_operation_claim(endpoint: &str) -> bool {
             | "blue.catbird.chat.requestLeave"
             | "blue.catbird.chat.requestReset"
             | "blue.catbird.chat.revokeDevice"
+            | "blue.catbird.chat.sendMessage"
             | "blue.catbird.chat.submitTransition"
     )
 }
@@ -428,6 +431,16 @@ pub(crate) enum PreparedRebindOperation {
 pub(crate) enum PreparedReplenishmentOperation {
     First(PreparedReplenishmentPrelude),
     Replay(CompletedIdempotentResponse),
+}
+
+pub(crate) enum PreparedBlobOperation {
+    First(PreparedBlobPrelude),
+    Replay(CompletedIdempotentResponse),
+}
+
+pub(crate) struct PreparedBlobPrelude {
+    authority: VerifiedChatDeviceRequest,
+    business: PreparedBusinessPrelude,
 }
 
 macro_rules! redacted_endpoint_operation_debug {
@@ -453,6 +466,7 @@ redacted_endpoint_operation_debug!(
     PreparedReplenishmentOperation,
     "PreparedReplenishmentOperation"
 );
+redacted_endpoint_operation_debug!(PreparedBlobOperation, "PreparedBlobOperation");
 
 pub(crate) struct OperationReplayGuard {
     operation_lock: auth::CanonicalOperationReservationGuard,
@@ -555,6 +569,10 @@ pub(in crate::chat_protocol::repository) struct LockedSignedOperationReplayAutho
 }
 
 impl LockedSignedOperationReplayAuthority {
+    pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
     pub(in crate::chat_protocol::repository) fn authority(
         &self,
     ) -> &auth::SignedOperationReplayAuthority {
@@ -575,6 +593,9 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     WelcomeRejection(welcome_terminal::WelcomeReplayPostStateProof),
     Recovery(recovery::RecoveryReplayPostStateProof),
     SubmitTransition(submit_transition::SubmitTransitionReplayPostStateProof),
+    Creation(creation::CreationReplayPostStateProof),
+    Acceptance(acceptance::AcceptanceReplayPostStateProof),
+    Leave(leave::LeaveReplayPostStateProof),
 }
 
 #[cfg(not(test))]
@@ -588,6 +609,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.transaction_id(),
             Self::SubmitTransition(proof) => proof.transaction_id(),
+            Self::Creation(proof) => proof.transaction_id(),
+            Self::Acceptance(proof) => proof.transaction_id(),
+            Self::Leave(proof) => proof.transaction_id(),
         }
     }
 
@@ -600,6 +624,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.operation_id(),
             Self::SubmitTransition(proof) => proof.operation_id(),
+            Self::Creation(proof) => proof.operation_id(),
+            Self::Acceptance(proof) => proof.operation_id(),
+            Self::Leave(proof) => proof.operation_id(),
         }
     }
 
@@ -612,6 +639,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.principal_did(),
             Self::SubmitTransition(proof) => proof.principal_did(),
+            Self::Creation(proof) => proof.principal_did(),
+            Self::Acceptance(proof) => proof.principal_did(),
+            Self::Leave(proof) => proof.principal_did(),
         }
     }
 
@@ -624,6 +654,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.endpoint_nsid(),
             Self::SubmitTransition(proof) => proof.endpoint_nsid(),
+            Self::Creation(proof) => proof.endpoint_nsid(),
+            Self::Acceptance(proof) => proof.endpoint_nsid(),
+            Self::Leave(proof) => proof.endpoint_nsid(),
         }
     }
 
@@ -636,6 +669,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.mutation_kind(),
             Self::SubmitTransition(proof) => proof.mutation_kind(),
+            Self::Creation(proof) => proof.mutation_kind(),
+            Self::Acceptance(proof) => proof.mutation_kind(),
+            Self::Leave(proof) => proof.mutation_kind(),
         }
     }
 
@@ -648,6 +684,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.request_digest(),
             Self::SubmitTransition(proof) => proof.request_digest(),
+            Self::Creation(proof) => proof.request_digest(),
+            Self::Acceptance(proof) => proof.request_digest(),
+            Self::Leave(proof) => proof.request_digest(),
         }
     }
 
@@ -662,6 +701,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.accepted_request_sha256(),
             Self::SubmitTransition(proof) => proof.accepted_request_sha256(),
+            Self::Creation(proof) => proof.accepted_request_sha256(),
+            Self::Acceptance(proof) => proof.accepted_request_sha256(),
+            Self::Leave(proof) => proof.accepted_request_sha256(),
         }
     }
 
@@ -674,6 +716,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.signature(),
             Self::SubmitTransition(proof) => proof.signature(),
+            Self::Creation(proof) => proof.signature(),
+            Self::Acceptance(proof) => proof.signature(),
+            Self::Leave(proof) => proof.signature(),
         }
     }
 
@@ -686,6 +731,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.post_state_digest(),
             Self::SubmitTransition(proof) => proof.post_state_digest(),
+            Self::Creation(proof) => proof.post_state_digest(),
+            Self::Acceptance(proof) => proof.post_state_digest(),
+            Self::Leave(proof) => proof.post_state_digest(),
         }
     }
 
@@ -700,6 +748,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_status(),
             Self::SubmitTransition(proof) => proof.expected_status(),
+            Self::Creation(proof) => proof.expected_status(),
+            Self::Acceptance(proof) => proof.expected_status(),
+            Self::Leave(proof) => proof.expected_response_status(),
         }
     }
 
@@ -714,6 +765,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.expected_response_sha256(),
             Self::SubmitTransition(proof) => proof.expected_response_sha256(),
+            Self::Creation(proof) => proof.expected_response_sha256(),
+            Self::Acceptance(proof) => proof.expected_response_sha256(),
+            Self::Leave(proof) => proof.expected_response_sha256(),
         }
     }
 
@@ -726,6 +780,9 @@ impl SignedOperationReplayPostStateProof {
             }
             Self::Recovery(proof) => proof.validates_seal(),
             Self::SubmitTransition(proof) => proof.validates_seal(),
+            Self::Creation(proof) => proof.validates_seal(),
+            Self::Acceptance(proof) => proof.validates_seal(),
+            Self::Leave(proof) => proof.validates_seal(),
         }
     }
 
@@ -774,6 +831,30 @@ impl SignedOperationReplayPostStateProof {
                             | SignedMutationKind::LeaveCommitFulfillment
                     )
             }
+            Self::Creation(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.createConversation"
+                    && proof.mutation_kind() == SignedMutationKind::Creation
+            }
+            Self::Acceptance(proof) => {
+                proof.endpoint_nsid() == "blue.catbird.chat.acceptConversation"
+                    && proof.mutation_kind() == SignedMutationKind::ParticipantAcceptance
+            }
+            Self::Leave(proof) => matches!(
+                (proof.endpoint_nsid(), proof.mutation_kind()),
+                (
+                    "blue.catbird.chat.requestLeave",
+                    SignedMutationKind::LeaveRequest,
+                ) | (
+                    "blue.catbird.chat.requestLeave",
+                    SignedMutationKind::ZeroLeafLeave,
+                ) | (
+                    "blue.catbird.chat.cancelLeave",
+                    SignedMutationKind::LeaveCancellation,
+                ) | (
+                    "blue.catbird.chat.closeConversation",
+                    SignedMutationKind::ConversationClose,
+                )
+            ),
         }
     }
 }
@@ -781,6 +862,56 @@ impl SignedOperationReplayPostStateProof {
 pub(crate) struct PreparedBusinessPrelude {
     authority: ScopeBoundBusinessAuthority,
     operation: OperationClaimGuard,
+}
+
+/// First-execution capability shared by the application-send and typing
+/// compositors. The verified mutation, the complete locked actor/key scope,
+/// and its operation-completion guard remain paired until the compositor
+/// consumes them.
+pub(crate) struct PreparedChatOperation {
+    authority: VerifiedChatDeviceRequest,
+    scope: ScopeBoundBusinessAuthority,
+    completion: OperationCompletionGuard,
+}
+
+/// Ephemeral typing authority: the actor/device projection is locked in the
+/// caller transaction, but no operation claim or completion guard is created.
+pub(crate) struct PreparedTypingOperation {
+    authority: VerifiedChatDeviceRequest,
+    scope: ScopeBoundBusinessAuthority,
+}
+
+impl PreparedTypingOperation {
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (VerifiedChatDeviceRequest, ScopeBoundBusinessAuthority) {
+        (self.authority, self.scope)
+    }
+}
+
+impl PreparedChatOperation {
+    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
+
+    pub(crate) fn scope(&self) -> &ScopeBoundBusinessAuthority {
+        &self.scope
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (
+        VerifiedChatDeviceRequest,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+    ) {
+        (self.authority, self.scope, self.completion)
+    }
+}
+
+pub(crate) enum PreparedChatAdmission {
+    First(PreparedChatOperation),
+    Replay(CompletedIdempotentResponse),
 }
 
 #[must_use]
@@ -1941,6 +2072,32 @@ impl PreparedBusinessPrelude {
         )
     }
 
+    pub(crate) fn verify_creation_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.createConversation",
+            SignedMutationKind::Creation,
+            operation_id,
+            mutation,
+        )
+    }
+
+    pub(crate) fn verify_acceptance_operation(
+        self,
+        operation_id: Uuid,
+        mutation: &VerifiedSignedMutation,
+    ) -> Result<Self, PreludeError> {
+        self.verify_exact_operation_claim(
+            "blue.catbird.chat.acceptConversation",
+            SignedMutationKind::ParticipantAcceptance,
+            operation_id,
+            mutation,
+        )
+    }
+
     fn verify_exact_operation_claim(
         self,
         endpoint_nsid: &str,
@@ -2282,6 +2439,123 @@ pub(crate) async fn prepare_signed_operation(
             },
         },
     })
+}
+
+/// Prepare one ordinary signed send/typing admission using the same sealed
+/// actor/device/key prelude as every durable clean-chat mutation. Replay bytes
+/// remain opaque until the exact operation claim and locked identity are
+/// validated in this transaction.
+pub(crate) async fn prepare_chat_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedChatAdmission, PreludeError> {
+    match prepare_signed_operation(transaction, admission)
+        .await?
+        .into_state()
+    {
+        PreparedSignedOperationState::Replay { authority, replay } => {
+            validate_operation_replay_claim(transaction, &replay).await?;
+            if !replay.binding.matches_signed_replay_authority(&authority)? {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+            let completed = auth::load_signed_operation_replay_completion(transaction, &authority)
+                .await?
+                .ok_or(PreludeError::ClaimIntegrity)?;
+            Ok(PreparedChatAdmission::Replay(completed))
+        }
+        PreparedSignedOperationState::First {
+            authority,
+            reservation,
+        } => {
+            let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let (scope, completion) = business.into_execution_parts();
+            Ok(PreparedChatAdmission::First(PreparedChatOperation {
+                authority,
+                scope,
+                completion,
+            }))
+        }
+    }
+}
+
+pub(crate) async fn prepare_typing_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+) -> Result<PreparedTypingOperation, PreludeError> {
+    let authority = admission.into_first_authority()?;
+    let scope = CanonicalLockScope::new(
+        vec![authority.subject().as_str().to_owned()],
+        vec![CanonicalDeviceIdentity::new(
+            authority.subject().as_str(),
+            Uuid::from_bytes(*authority.device_id().as_bytes()),
+        )],
+    )?;
+    let business = auth::lock_canonical_business_authority_scope(
+        transaction,
+        &authority,
+        None,
+        &scope.principals,
+        &scope
+            .devices
+            .iter()
+            .map(|identity| (identity.did.clone(), identity.device_id))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    Ok(PreparedTypingOperation {
+        authority,
+        scope: ScopeBoundBusinessAuthority { locked: business },
+    })
+}
+
+pub(crate) async fn prepare_blob_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: auth::SignedOperationAdmission,
+    endpoint_nsid: &'static str,
+    mutation_kind: SignedMutationKind,
+) -> Result<PreparedBlobOperation, PreludeError> {
+    let prepared = prepare_signed_operation(transaction, admission).await?;
+    match prepared.into_state() {
+        PreparedSignedOperationState::Replay { authority, replay } => {
+            if authority.endpoint().as_str() != endpoint_nsid
+                || authority.mutation().kind() != mutation_kind
+            {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            validate_operation_replay_claim(transaction, &replay).await?;
+            auth::lock_signed_operation_replay_identity(transaction, &authority).await?;
+            let response = auth::load_validated_completed_blob_replay(transaction, &authority)
+                .await?
+                .ok_or(PreludeError::ClaimIntegrity)?;
+            Ok(PreparedBlobOperation::Replay(response))
+        }
+        PreparedSignedOperationState::First { authority, reservation } => {
+            if authority.endpoint().as_str() != endpoint_nsid
+                || authority.mutation().map(|value| value.kind()) != Some(mutation_kind)
+            {
+                return Err(PreludeError::ClaimIntegrity);
+            }
+            let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
+            Ok(PreparedBlobOperation::First(PreparedBlobPrelude { authority, business }))
+        }
+    }
+}
+
+impl PreparedBlobPrelude {
+    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest { &self.authority }
+
+    pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
+        self.business.scope_authority()
+    }
+
+    pub(crate) fn into_execution_parts(
+        self,
+    ) -> (VerifiedChatDeviceRequest, ScopeBoundBusinessAuthority, OperationCompletionGuard) {
+        let PreparedBlobPrelude { authority, business } = self;
+        let (scope, completion) = business.into_execution_parts();
+        (authority, scope, completion)
+    }
 }
 
 async fn prepare_enrollment_bootstrap_prelude(
@@ -2629,7 +2903,7 @@ pub(crate) async fn prepare_identity_scope_prelude(
     let business = auth::lock_canonical_business_authority_scope(
         transaction,
         authority,
-        &reservation.operation_lock,
+        Some(&reservation.operation_lock),
         &scope.principals,
         &device_pairs,
     )

@@ -607,6 +607,8 @@ async fn fetch_app_messages_in_snapshot(
                 seq: m.seq,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(m.created_at),
                 message_type: Some(m.message_type.into()),
+                receipt_wire: None,
+                reset_generation: None,
                 extra_data: Some(extra),
             }
         })
@@ -887,6 +889,8 @@ async fn fetch_commits_in_snapshot(
                 seq: c.seq,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(c.created_at),
                 message_type: Some(c.message_type.into()),
+                receipt_wire: None,
+                reset_generation: None,
                 extra_data: Some(extra),
             }
         })
@@ -971,6 +975,8 @@ mod tests {
             seq,
             created_at: crate::sqlx_jacquard::chrono_to_datetime(Utc::now()),
             message_type: Some("app".into()),
+            receipt_wire: None,
+            reset_generation: None,
             extra_data: None,
         }
     }

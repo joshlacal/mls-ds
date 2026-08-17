@@ -109,34 +109,38 @@ use crate::chat_protocol::{
 /// inventory is authoritative (`getSubscriptionTicket` and `publishTyping`
 /// are POST, everything else GET).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::chat_protocol) enum OrdinaryReadEndpoint {
+pub(crate) enum OrdinaryReadEndpoint {
     GetConversationState,
     GetEntries,
     GetPendingWelcomes,
     GetLeafRecoveryInbox,
     GetBlob,
+    GetBlobUsage,
+    UploadBlob,
     GetSubscriptionTicket,
     SubscribeEvents,
     PublishTyping,
 }
 
 impl OrdinaryReadEndpoint {
-    pub(in crate::chat_protocol) const fn nsid(self) -> &'static str {
+    pub(crate) const fn nsid(self) -> &'static str {
         match self {
             Self::GetConversationState => "blue.catbird.chat.getConversationState",
             Self::GetEntries => "blue.catbird.chat.getEntries",
             Self::GetPendingWelcomes => "blue.catbird.chat.getPendingWelcomes",
             Self::GetLeafRecoveryInbox => "blue.catbird.chat.getLeafRecoveryInbox",
             Self::GetBlob => "blue.catbird.chat.getBlob",
+            Self::GetBlobUsage => "blue.catbird.chat.getBlobUsage",
+            Self::UploadBlob => "blue.catbird.chat.uploadBlob",
             Self::GetSubscriptionTicket => "blue.catbird.chat.getSubscriptionTicket",
             Self::SubscribeEvents => "blue.catbird.chat.subscribeEvents",
             Self::PublishTyping => "blue.catbird.chat.publishTyping",
         }
     }
 
-    pub(in crate::chat_protocol) const fn canonical_method(self) -> &'static str {
+    pub(crate) const fn canonical_method(self) -> &'static str {
         match self {
-            Self::GetSubscriptionTicket | Self::PublishTyping => "POST",
+            Self::GetSubscriptionTicket | Self::PublishTyping | Self::UploadBlob => "POST",
             _ => "GET",
         }
     }

@@ -57,15 +57,26 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use transcript::{
-    decode_and_verify_signed_mutation, decode_canonical_signed_mutation, ControlEntryKind,
-    SignedMutationKind,
+    decode_and_verify_enrollment_body, decode_and_verify_signed_mutation,
+    decode_canonical_signed_mutation, decode_rebind_bootstrap, ControlEntryKind,
+    SignedMutationKind, VerifiedMutationProjection,
 };
 use validation::ed25519_key_id;
 
 const FIXTURE: &str = include_str!("fixtures/mls_chat_signing_domain_vectors.json");
 const REGENERATE_ENV: &str = "CATBIRD_REGENERATE_SIGNING_DOMAIN_VECTORS";
+const CANONICAL_LEXICON: &[u8] =
+    include_bytes!("../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
+const CANONICAL_LEXICON_PATH: &str = "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json";
+const CANONICAL_SOURCE_LEXICON_PATH: &str =
+    "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json";
+const CANONICAL_SOURCE_LEXICON_REVISION: &str = "8ec8acaa1137b68b57b78ebfaea9404d5923305b";
+const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
+const CANONICAL_SOURCE_LEXICON_SHA256: &str =
+    "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -79,6 +90,36 @@ fn fixture_path() -> PathBuf {
 
 fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&SIGNING_SEED)
+}
+
+fn canonical_lexicon_sha256() -> String {
+    hex::encode(Sha256::digest(CANONICAL_LEXICON))
+}
+
+fn frozen_case(body_name: &str) -> Value {
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
+    fixture["cases"]
+        .as_array()
+        .expect("fixture cases")
+        .iter()
+        .find(|case| case["bodyName"] == body_name)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing frozen case {body_name}"))
+}
+
+fn frozen_wrapper(body_name: &str) -> (Value, Vec<u8>, [u8; 32]) {
+    let case = frozen_case(body_name);
+    let wrapper = case["wrapper"].clone();
+    let wrapper_bytes = serde_json::to_vec(&wrapper).expect("wrapper serializes");
+    let public_key: [u8; 32] = hex::decode(
+        case["publicKeyHex"]
+            .as_str()
+            .expect("fixture public key hex"),
+    )
+    .expect("fixture public key hex decodes")
+    .try_into()
+    .expect("fixture public key is 32 bytes");
+    (case, wrapper_bytes, public_key)
 }
 
 /// The body names with no control entry, derived rather than transcribed: every
@@ -98,9 +139,48 @@ fn unpinned_body_names() -> Vec<&'static str> {
         .collect()
 }
 
+fn existing_contract_fixture_body_names() -> BTreeSet<String> {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/mls_chat_contract_vectors.json"))
+            .expect("existing contract fixture parses");
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json"
+    ))
+    .expect("canonical chat lexicon parses");
+    let mut names = BTreeSet::new();
+    for case in fixture["controlEntryFingerprints"]["cases"]
+        .as_array()
+        .expect("control cases")
+    {
+        let signed_name = case["signedRequestRef"]
+            .as_str()
+            .expect("signed request ref")
+            .rsplit('#')
+            .next()
+            .expect("signed request name");
+        names.insert(
+            contract["defs"][signed_name]["properties"]["body"]["refs"][0]
+                .as_str()
+                .expect("signed body ref")
+                .trim_start_matches('#')
+                .to_owned(),
+        );
+    }
+    names.insert(
+        fixture["signedMutator"]["body"]["$type"]
+            .as_str()
+            .expect("signed mutator body type")
+            .rsplit('#')
+            .next()
+            .expect("signed mutator body name")
+            .to_owned(),
+    );
+    names
+}
+
 /// Signs `body` through the server's own projection and returns the wrapper
 /// bytes together with the canonical products the server derived.
-fn sign_through_production(body: &Value) -> (Vec<u8>, Value) {
+fn sign_through_production(body: &Value) -> (Value, Vec<u8>, Value) {
     let key = signing_key();
     let mut wrapper = json!({ "body": body, "signature": STANDARD.encode([0_u8; 64]) });
 
@@ -125,7 +205,7 @@ fn sign_through_production(body: &Value) -> (Vec<u8>, Value) {
         "canonicalRequestDigestHex": hex::encode(verified.request_digest()),
         "signatureHex": hex::encode(verified.signature()),
     });
-    (wrapper_bytes, products)
+    (wrapper, wrapper_bytes, products)
 }
 
 /// The top-level fields the server encoded as raw sixteen-byte UUIDs, read back
@@ -154,7 +234,7 @@ fn uuid_byte_fields(body: &Value, canonical_projection_hex: &str) -> Vec<String>
 }
 
 fn case(body_name: &str, mutation_field: &str, body: Value) -> Value {
-    let (_, products) = sign_through_production(&body);
+    let (wrapper, wrapper_bytes, products) = sign_through_production(&body);
 
     let mut mutated_body = body.clone();
     let original = body[mutation_field]
@@ -177,6 +257,11 @@ fn case(body_name: &str, mutation_field: &str, body: Value) -> Value {
     record.insert("bodyName".to_owned(), json!(body_name));
     record.insert("signingDomain".to_owned(), body["signatureDomain"].clone());
     record.insert("body".to_owned(), body.clone());
+    record.insert("wrapper".to_owned(), wrapper);
+    record.insert(
+        "wrapperJsonHex".to_owned(),
+        json!(hex::encode(wrapper_bytes)),
+    );
     record.insert(
         "uuidByteFields".to_owned(),
         json!(uuid_byte_fields(
@@ -247,6 +332,13 @@ fn generate() -> Value {
         "signatureAlgorithm": "Ed25519",
         "publicKeyHex": hex::encode(public_key),
         "keyId": key_id.as_str(),
+        "provenance": {
+            "sourceLexicon": CANONICAL_SOURCE_LEXICON_PATH,
+            "sourceLexiconMirror": CANONICAL_LEXICON_PATH,
+            "sourceLexiconRevision": CANONICAL_SOURCE_LEXICON_REVISION,
+            "sourceCorpusRevision": CANONICAL_SOURCE_CORPUS_REVISION,
+            "sourceLexiconSha256": canonical_lexicon_sha256()
+        },
         "cases": cases,
     })
 }
@@ -278,7 +370,41 @@ fn the_eleven_signing_domain_vectors_are_server_products_and_match_the_fixture()
 fn every_signing_domain_now_has_a_server_vector() {
     // The accounting the vendoring clients rely on: fourteen domains were
     // already pinned by `mls_chat_contract_vectors.json`, these eleven are the
-    // remainder, and together they are the whole enum.
+    // remainder, and together they are the whole enum. Keep the expected set
+    // explicit so adding an enum arm or silently dropping a fixture fails here.
+    let expected = BTreeSet::from([
+        "deviceEnrollmentBody",
+        "keyPackageReplenishmentBody",
+        "deviceAuthenticationRebindBody",
+        "deviceRevocationBody",
+        "blobUploadPreparationBody",
+        "blobDeletionBody",
+        "creationBody",
+        "commitTransitionBody",
+        "policyTransitionBody",
+        "participantAcceptanceBody",
+        "applicationSendBody",
+        "typingBody",
+        "metadataTransitionBody",
+        "resetRequestBody",
+        "resetActivationBody",
+        "leafRecoveryRequestBody",
+        "leafRecoveryCancellationBody",
+        "leafRecoveryFulfillmentBody",
+        "conversationCloseBody",
+        "leaveRequestBody",
+        "zeroLeafLeaveBody",
+        "leaveCancellationBody",
+        "leaveCommitFulfillmentBody",
+        "welcomeAcknowledgementBody",
+        "welcomeRejectionBody",
+    ]);
+    let enum_kinds: BTreeSet<&'static str> = SignedMutationKind::ALL
+        .into_iter()
+        .map(SignedMutationKind::body_name)
+        .collect();
+    assert_eq!(enum_kinds, expected, "the enum operation set drifted");
+
     let control: BTreeSet<&'static str> = ControlEntryKind::ALL
         .into_iter()
         .map(|kind| kind.signed_kind().body_name())
@@ -306,11 +432,32 @@ fn every_signing_domain_now_has_a_server_vector() {
             "welcomeRejectionBody",
         ]
     );
+
+    let mut fixture_kinds = existing_contract_fixture_body_names();
+    assert_eq!(
+        fixture_kinds.len(),
+        14,
+        "the existing corpus must cover 14 kinds"
+    );
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("the vector fixture parses");
+    for case in fixture["cases"].as_array().expect("eleven cases") {
+        fixture_kinds.insert(
+            case["bodyName"]
+                .as_str()
+                .expect("case body name")
+                .to_owned(),
+        );
+    }
+    assert_eq!(
+        fixture_kinds,
+        expected.iter().map(|name| (*name).to_owned()).collect(),
+        "the two server fixtures must cover every SignedMutationKind"
+    );
 }
 
 #[test]
 fn each_frozen_case_verifies_and_its_declared_mutation_breaks_the_signature() {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
 
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
     let cases = fixture["cases"].as_array().expect("cases");
@@ -369,4 +516,202 @@ fn the_domains_are_distinct_and_none_collides_with_a_control_domain() {
         );
     }
     assert_eq!(seen.len(), 11);
+}
+
+#[test]
+fn every_frozen_wrapper_strictly_decodes_to_its_declared_products() {
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
+    let public_key: [u8; 32] = hex::decode(fixture["publicKeyHex"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    for case in fixture["cases"].as_array().unwrap() {
+        let name = case["bodyName"].as_str().unwrap();
+        let wrapper = case["wrapper"].as_object().expect("exact wrapper object");
+        assert_eq!(
+            wrapper.len(),
+            2,
+            "{name}: wrapper must have exactly two fields"
+        );
+        let body = wrapper.get("body").expect("wrapper body");
+        let signature = wrapper
+            .get("signature")
+            .and_then(Value::as_str)
+            .expect("wrapper signature base64");
+        assert_eq!(body, &case["body"], "{name}: wrapper body drift");
+        assert_eq!(
+            hex::encode(
+                STANDARD
+                    .decode(signature)
+                    .expect("wrapper signature decodes")
+            ),
+            case["signatureHex"],
+            "{name}: wrapper signature drift"
+        );
+
+        let wrapper_bytes = serde_json::to_vec(&Value::Object(wrapper.clone())).unwrap();
+        assert_eq!(
+            hex::encode(&wrapper_bytes),
+            case["wrapperJsonHex"],
+            "{name}: exact wrapper bytes drift"
+        );
+        let verified = decode_and_verify_signed_mutation(&wrapper_bytes, &public_key)
+            .unwrap_or_else(|error| panic!("{name}: strict wrapper decode failed: {error:?}"));
+        let kind = SignedMutationKind::ALL
+            .into_iter()
+            .find(|kind| kind.body_name() == name)
+            .expect("fixture body names a live mutation kind");
+        assert_eq!(verified.kind(), kind, "{name}: kind");
+        assert_eq!(verified.type_id(), case["body"]["$type"], "{name}: type");
+        assert_eq!(
+            verified.domain(),
+            case["signingDomain"].as_str().unwrap().as_bytes()
+        );
+        assert_eq!(
+            hex::encode(verified.canonical_projection()),
+            case["canonicalUnsignedDagCborHex"],
+            "{name}: canonical projection"
+        );
+        assert_eq!(
+            hex::encode(verified.transcript_bytes()),
+            case["transcriptHex"],
+            "{name}: signing transcript"
+        );
+        assert_eq!(
+            hex::encode(verified.request_digest()),
+            case["canonicalRequestDigestHex"],
+            "{name}: request digest"
+        );
+        assert_eq!(
+            hex::encode(verified.signature()),
+            case["signatureHex"],
+            "{name}: signature"
+        );
+    }
+}
+
+#[test]
+fn frozen_fixture_records_the_canonical_lexicon_provenance() {
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
+    assert_eq!(
+        fixture["provenance"]["sourceLexicon"],
+        CANONICAL_SOURCE_LEXICON_PATH
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceLexiconMirror"],
+        CANONICAL_LEXICON_PATH
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceLexiconRevision"],
+        CANONICAL_SOURCE_LEXICON_REVISION
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceCorpusRevision"],
+        CANONICAL_SOURCE_CORPUS_REVISION
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceLexiconSha256"], CANONICAL_SOURCE_LEXICON_SHA256,
+        "lexicon drift must invalidate the pinned fixture"
+    );
+    assert_eq!(
+        canonical_lexicon_sha256(),
+        CANONICAL_SOURCE_LEXICON_SHA256,
+        "the server mirror must match the canonical PetrelCatbird source"
+    );
+}
+
+#[test]
+fn enrollment_vector_round_trips_through_strict_authority_and_derives_key_hash() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("deviceEnrollmentBody");
+    let enrollment = decode_and_verify_enrollment_body(&wrapper_bytes)
+        .expect("the frozen enrollment wrapper must pass strict authority verification");
+    let body = &case["body"];
+    let expected_key_hash: [u8; 32] = Sha256::digest(public_key).into();
+    let derived_key_id = ed25519_key_id(&public_key).unwrap();
+
+    assert_eq!(
+        enrollment.subject().as_str(),
+        body["actorDid"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.device_id().as_str(),
+        body["deviceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.dpop_jkt().as_str(),
+        body["dpopJkt"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.key_id().as_str(),
+        body["keyId"].as_str().unwrap()
+    );
+    assert_eq!(enrollment.key_id(), &derived_key_id);
+    assert_eq!(enrollment.signing_key_sha256(), &expected_key_hash);
+    assert_eq!(
+        hex::encode(enrollment.enrollment_transcript_sha256()),
+        case["canonicalRequestDigestHex"]
+    );
+    assert_eq!(
+        enrollment.accepted_wrapper_bytes(),
+        wrapper_bytes.as_slice()
+    );
+}
+
+#[test]
+fn rebind_vector_round_trips_through_stored_key_and_retains_both_jkts() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("deviceAuthenticationRebindBody");
+    let body = &case["body"];
+    let bootstrap = decode_rebind_bootstrap(&wrapper_bytes)
+        .expect("the frozen rebind wrapper must pass strict bootstrap decoding");
+
+    assert_eq!(
+        bootstrap.subject().as_str(),
+        body["actorDid"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.device_id().as_str(),
+        body["actorDeviceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.current_dpop_jkt().as_str(),
+        body["currentDpopJkt"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.new_dpop_jkt().as_str(),
+        body["newDpopJkt"].as_str().unwrap()
+    );
+    bootstrap
+        .verify_signature_with_stored_key(&public_key)
+        .expect("the bootstrap signature must verify against the stored key");
+    let mutation = bootstrap
+        .verify_mutation_with_stored_key(&public_key)
+        .expect("stored-key verification must yield the exact mutation");
+    assert_eq!(mutation.key_id(), bootstrap.key_id());
+    assert_eq!(
+        hex::encode(mutation.request_digest()),
+        case["canonicalRequestDigestHex"]
+    );
+    assert_eq!(bootstrap.accepted_wrapper_bytes(), wrapper_bytes.as_slice());
+}
+
+#[test]
+fn application_send_vector_operation_id_is_message_id_not_generic_idempotency() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("applicationSendBody");
+    let mutation = decode_and_verify_signed_mutation(&wrapper_bytes, &public_key)
+        .expect("the frozen application-send wrapper must pass strict verification");
+    let canonical = decode_canonical_signed_mutation(&wrapper_bytes)
+        .expect("the frozen application-send wrapper must pass strict decoding");
+    let body = &case["body"];
+    let expected = body["messageId"].as_str().expect("message ID");
+
+    assert_eq!(mutation.kind(), SignedMutationKind::ApplicationSend);
+    assert!(body.get("idempotencyKey").is_none());
+    assert_eq!(canonical.operation_id().unwrap().as_str(), expected);
+    match mutation.projection() {
+        VerifiedMutationProjection::ApplicationSend(application) => {
+            assert_eq!(application.message_id().as_str(), expected);
+        }
+        _ => panic!("unexpected application-send projection"),
+    }
 }

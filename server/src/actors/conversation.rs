@@ -2592,6 +2592,8 @@ async fn handle_notify_new_message(
         seq,
         created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
         message_type: Some("app".into()),
+        receipt_wire: None,
+        reset_generation: None,
         extra_data: Default::default(),
     };
 
@@ -2678,6 +2680,8 @@ async fn handle_notify_system_message(
                     seq,
                     created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
                     message_type: Some(_message_type.to_string().into()),
+                    receipt_wire: None,
+                    reset_generation: None,
                     extra_data: Default::default(),
                 };
 

@@ -913,8 +913,7 @@ impl A0CanonicalEvidence {
                         .expect("serialize A0 marker legacy ledger digest"),
                     serde_json::to_string(catalog)
                         .expect("serialize A0 marker legacy catalog digest"),
-                    serde_json::to_string(revision)
-                        .expect("serialize A0 marker approved revision"),
+                    serde_json::to_string(revision).expect("serialize A0 marker approved revision"),
                     serde_json::to_string(manifest)
                         .expect("serialize A0 marker approved manifest digest"),
                 )
@@ -8754,9 +8753,11 @@ async fn forward_reconcile_exact_fingerprinted_legacy_local_chat_protocol_test_d
         let post_ledger_hash = a0_assert_exact_ledger(&mut target).await;
         let post_catalog_hash = a0_assert_post_clean_catalog(&mut target).await;
         let durable_completeness =
-            crate::common::chat_protocol::validate_durable_operation_claim_completeness(&mut target)
-                .await
-                .expect("A0 recovery durable operation-claim completeness");
+            crate::common::chat_protocol::validate_durable_operation_claim_completeness(
+                &mut target,
+            )
+            .await
+            .expect("A0 recovery durable operation-claim completeness");
         let final_identity = a0_read_target_identity(&mut target).await;
         assert_eq!(
             final_identity.database_oid, target_identity.database_oid,

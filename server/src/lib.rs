@@ -41,6 +41,10 @@
 compile_error!(
     "`chat-protocol-production-proof` is a non-shipping test surface and cannot coexist with `server-bin`"
 );
+#[cfg(all(feature = "subscription-production-proof", feature = "server-bin"))]
+compile_error!(
+    "`subscription-production-proof` is a non-shipping test surface and cannot coexist with `server-bin`"
+);
 
 pub mod actors;
 pub mod atproto_bytes;

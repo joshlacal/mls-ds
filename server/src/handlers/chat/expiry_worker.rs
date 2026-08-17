@@ -1,6 +1,6 @@
 //! Background expiry sweeper for the clean-chat protocol.
 //!
-//! Two clean-chat work families terminalize on a deterministic deadline that no
+//! Three clean-chat work families terminalize on a deterministic deadline that no
 //! client request is guaranteed to reach:
 //!
 //!   * an OPEN `chat.leaf_recovery_requests` row past its `expires_at` (~5 min
@@ -11,10 +11,14 @@
 //!     KeyPackage it consumed — it holds the recipient's reserved key package and
 //!     never produces the `welcomeExpired` recovery-work item the recipient needs
 //!     to be re-added.
+//!   * a PREPARED or COMPLETED-UNBOUND `chat.blobs` row past its upload/unbound
+//!     deadline — it pins quota; completed rows also retain a physical object
+//!     until the delayed, exact-CID object-GC pass.
 //!
-//! Both are cleared today only as a side effect of some other member's
-//! coordinate-changing transition (or, for both, by the owner's own next signed
-//! request, which self-heals via the `PendingDue` / `OpenDue` classifications).
+//! These rows are cleared today only as a side effect of some other member's
+//! coordinate-changing transition (or, for the recovery and welcome families,
+//! by the owner's own next signed request, which self-heals via the `PendingDue`
+//! / `OpenDue` classifications).
 //! On a quiet conversation neither happens. This worker is the missing
 //! server-side driver.
 //!
@@ -41,11 +45,20 @@
 
 use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::query_as;
 use tokio::time::interval;
+use uuid::Uuid;
 
 use super::runtime::ChatRuntime;
-use crate::chat_protocol::repository::expiry_sweep::{
-    due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome, WelcomeSweepOutcome,
+use crate::blob_store::BlobStore;
+use crate::chat_protocol::repository::{
+    blobs::{self, object_store_key_matches, ExpiredBlob},
+    expiry_sweep::{
+        due_leaf_recovery_targets, due_welcome_delivery_targets, sweep_one_welcome,
+        WelcomeSweepOutcome,
+    },
 };
 use crate::handlers::chat::recovery_scheduler::{expire_one, RecoveryExpiryServiceOutcome};
 use crate::storage::DbPool;
@@ -116,15 +129,20 @@ pub(crate) struct SweepCycleCounts {
     pub(crate) welcome_expired: usize,
     pub(crate) welcome_skipped: usize,
     pub(crate) welcome_errors: usize,
+    pub(crate) blob_due: usize,
+    pub(crate) blob_expired: usize,
+    pub(crate) blob_gc_due: usize,
+    pub(crate) blob_gc_reclaimed: usize,
+    pub(crate) blob_errors: usize,
 }
 
 impl SweepCycleCounts {
     fn swept_anything(&self) -> bool {
-        self.recovery_due > 0 || self.welcome_due > 0
+        self.recovery_due > 0 || self.welcome_due > 0 || self.blob_due > 0 || self.blob_gc_due > 0
     }
 
     fn had_errors(&self) -> bool {
-        self.recovery_errors > 0 || self.welcome_errors > 0
+        self.recovery_errors > 0 || self.welcome_errors > 0 || self.blob_errors > 0
     }
 }
 
@@ -135,6 +153,25 @@ impl SweepCycleCounts {
 /// no error path can end the loop, because an expiry worker that dies silently is
 /// worse than none.
 pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
+    run_chat_expiry_sweeper_inner(pool, runtime, None).await;
+}
+
+/// Production entry point. The clean-chat worker receives the already-created
+/// object store from `main` so terminal blob rows can reclaim their exact CID
+/// after the database expiry transaction commits.
+pub async fn run_chat_expiry_sweeper_with_blob_store(
+    pool: DbPool,
+    runtime: Arc<ChatRuntime>,
+    blob_store: BlobStore,
+) {
+    run_chat_expiry_sweeper_inner(pool, runtime, Some(blob_store)).await;
+}
+
+async fn run_chat_expiry_sweeper_inner(
+    pool: DbPool,
+    runtime: Arc<ChatRuntime>,
+    blob_store: Option<BlobStore>,
+) {
     if !runtime.cutover_enabled() {
         tracing::info!(
             "clean-chat expiry sweeper not running: CHAT_CUTOVER_ENABLED is off (no chat.* access)"
@@ -151,7 +188,7 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
     let mut timer = interval(Duration::from_secs(config.interval_secs));
     loop {
         timer.tick().await;
-        let counts = run_sweep_cycle(&pool, config).await;
+        let counts = run_sweep_cycle(&pool, config, blob_store.as_ref()).await;
         if counts.had_errors() {
             tracing::warn!(
                 recovery_due = counts.recovery_due,
@@ -162,6 +199,11 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
                 welcome_expired = counts.welcome_expired,
                 welcome_skipped = counts.welcome_skipped,
                 welcome_errors = counts.welcome_errors,
+                blob_due = counts.blob_due,
+                blob_expired = counts.blob_expired,
+                blob_gc_due = counts.blob_gc_due,
+                blob_gc_reclaimed = counts.blob_gc_reclaimed,
+                blob_errors = counts.blob_errors,
                 "clean-chat expiry sweep cycle completed with errors"
             );
         } else if counts.swept_anything() {
@@ -172,6 +214,10 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
                 welcome_due = counts.welcome_due,
                 welcome_expired = counts.welcome_expired,
                 welcome_skipped = counts.welcome_skipped,
+                blob_due = counts.blob_due,
+                blob_expired = counts.blob_expired,
+                blob_gc_due = counts.blob_gc_due,
+                blob_gc_reclaimed = counts.blob_gc_reclaimed,
                 "clean-chat expiry sweep cycle completed"
             );
         } else {
@@ -185,6 +231,7 @@ pub async fn run_chat_expiry_sweeper(pool: DbPool, runtime: Arc<ChatRuntime>) {
 pub(crate) async fn run_sweep_cycle(
     pool: &DbPool,
     config: ChatExpirySweepConfig,
+    blob_store: Option<&BlobStore>,
 ) -> SweepCycleCounts {
     let mut counts = SweepCycleCounts::default();
 
@@ -270,5 +317,152 @@ pub(crate) async fn run_sweep_cycle(
         }
     }
 
+    match expire_blob_rows(pool, config.batch).await {
+        Ok(expired) => {
+            counts.blob_due = expired.len();
+            counts.blob_expired = expired.len();
+            for blob in &expired {
+                tracing::info!(
+                    blob_id = %blob.blob_id,
+                    prior_status = ?blob.prior_status,
+                    "clean-chat expiry sweeper terminalized an overdue blob"
+                );
+            }
+        }
+        Err(error) => {
+            counts.blob_errors += 1;
+            tracing::warn!(error = ?error, "clean-chat expiry sweeper could not expire blobs");
+        }
+    }
+
+    if let Some(blob_store) = blob_store {
+        match reclaim_due_blob_objects(pool, blob_store, config.batch).await {
+            Ok(gc) => {
+                counts.blob_gc_due = gc.due;
+                counts.blob_gc_reclaimed = gc.reclaimed;
+                counts.blob_errors += gc.errors;
+            }
+            Err(error) => {
+                counts.blob_errors += 1;
+                tracing::warn!(error = ?error, "clean-chat expiry sweeper could not reclaim blob objects");
+            }
+        }
+    }
+
     counts
+}
+
+async fn expire_blob_rows(pool: &DbPool, batch: i64) -> Result<Vec<ExpiredBlob>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let expired = blobs::expire_due_blobs(&mut transaction, now, batch)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    transaction.commit().await?;
+    Ok(expired)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BlobGcCounts {
+    due: usize,
+    reclaimed: usize,
+    errors: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum BlobGcError {
+    #[error("blob object GC database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[async_trait]
+trait BlobObjectDeleter: Send + Sync {
+    async fn delete_exact(&self, object_store_key: &str) -> Result<(), String>;
+}
+
+#[async_trait]
+impl BlobObjectDeleter for BlobStore {
+    async fn delete_exact(&self, object_store_key: &str) -> Result<(), String> {
+        self.delete(object_store_key)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn reclaim_due_blob_objects(
+    pool: &DbPool,
+    blob_store: &BlobStore,
+    batch: i64,
+) -> Result<BlobGcCounts, BlobGcError> {
+    reclaim_due_blob_objects_with_deleter(pool, blob_store, batch).await
+}
+
+/// Delete physical objects while holding row locks, then mark those same rows
+/// reclaimed in the same transaction. A failed S3 delete leaves the row
+/// `pending` with its exact key for a later retry. If the DB commit fails after
+/// S3 deletion, retry is safe because S3 DELETE is idempotent. A row is already
+/// terminal and cannot be rebound, so this ordering cannot delete a live blob.
+async fn reclaim_due_blob_objects_with_deleter<D: BlobObjectDeleter + ?Sized>(
+    pool: &DbPool,
+    deleter: &D,
+    batch: i64,
+) -> Result<BlobGcCounts, BlobGcError> {
+    let mut transaction = pool.begin().await?;
+    let rows: Vec<(Uuid, String, Vec<u8>)> = query_as(
+        "SELECT blob_id, object_store_key, ciphertext_sha256 \
+           FROM chat.blobs \
+          WHERE object_gc_status = 'pending' \
+            AND object_gc_after <= clock_timestamp() \
+          ORDER BY object_gc_after, blob_id \
+          FOR UPDATE SKIP LOCKED \
+          LIMIT $1",
+    )
+    .bind(batch)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut counts = BlobGcCounts {
+        due: rows.len(),
+        ..BlobGcCounts::default()
+    };
+    for (blob_id, object_store_key, hash) in rows {
+        let expected_hash: [u8; 32] = match hash.as_slice().try_into() {
+            Ok(hash) => hash,
+            Err(_) => {
+                counts.errors += 1;
+                continue;
+            }
+        };
+        if !object_store_key_matches(blob_id, &expected_hash, &object_store_key) {
+            counts.errors += 1;
+            tracing::error!(
+                blob_id = %blob_id,
+                object_store_key = %object_store_key,
+                "refusing to delete a blob object with a non-deterministic key"
+            );
+            continue;
+        }
+        if let Err(error) = deleter.delete_exact(&object_store_key).await {
+            counts.errors += 1;
+            tracing::warn!(blob_id = %blob_id, error = %error, "blob object deletion failed; retaining pending GC row");
+            continue;
+        }
+        sqlx::query(
+            "UPDATE chat.blobs \
+                SET object_gc_status = 'reclaimed', \
+                    object_store_key = NULL, \
+                    object_deleted_at = clock_timestamp() \
+              WHERE blob_id = $1 \
+                AND object_gc_status = 'pending' \
+                AND object_store_key = $2",
+        )
+        .bind(blob_id)
+        .bind(&object_store_key)
+        .execute(&mut *transaction)
+        .await?;
+        counts.reclaimed += 1;
+    }
+    transaction.commit().await?;
+    Ok(counts)
 }

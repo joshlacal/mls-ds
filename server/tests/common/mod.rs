@@ -13,6 +13,7 @@ use sqlx::PgPool;
 
 pub mod chat_protocol;
 pub mod fresh_db;
+pub mod http_acceptance;
 
 /// Mint a private, freshly migrated database for one test case.
 ///

@@ -309,6 +309,7 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
         relative_writer_paths,
         [
             Path::new("src/chat_protocol/repository/auth.rs").to_path_buf(),
+            Path::new("src/chat_protocol/repository/blobs.rs").to_path_buf(),
             Path::new("src/chat_protocol/repository/prelude.rs").to_path_buf(),
         ]
         .into_iter()
@@ -722,6 +723,21 @@ async fn operation_claims_reserve_one_global_operation_identity() {
         row.get::<bool, _>("receipt_operation_id_is_global"),
         "completed receipts must preserve the same global operation-ID namespace"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires 20260816000001 migration; held from protected DB until migration pass"]
+async fn clean_send_is_durably_claimable_but_typing_is_ephemeral() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(1).await;
+    let row = sqlx::query(
+        "SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conname = 'operation_claims_endpoint_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("operation claim endpoint constraint exists");
+    let definition: String = row.get("definition");
+    assert!(definition.contains("blue.catbird.chat.sendMessage"));
+    assert!(!definition.contains("blue.catbird.chat.publishTyping"));
 }
 
 async fn insert_claim_and_receipt(

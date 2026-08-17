@@ -232,6 +232,8 @@ fn blob_upload_preparation(key_id: &str) -> Value {
         "prior": coordinates(),
         "ciphertextSha256": STANDARD.encode(Sha256::digest(b"catbird-chat-vector-blob")),
         "ciphertextSize": 4096,
+        "mediaType": "image/png",
+        "plaintextSize": 1024,
         "purpose": "attachment",
         "idempotencyKey": "00000000-0000-4000-8000-000000000015",
         "signedAt": SIGNED_AT

@@ -3310,7 +3310,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
     }
 }
 
-#[cfg(not(test))]
 impl ProductionRelationshipAuthority {
     pub(crate) fn from_startup_guard(guard: RelationshipAuthorityStartupGuard) -> Self {
         let (config, transport) = guard.into_parts();

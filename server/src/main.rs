@@ -915,10 +915,12 @@ async fn main() -> anyhow::Result<()> {
     // config becomes mandatory and its absence fails startup loudly rather than
     // silently 500-ing requests.
     let chat_runtime = Arc::new(
-        catbird_server::handlers::chat::ChatRuntime::from_env().unwrap_or_else(|error| {
-            tracing::error!("clean-chat runtime configuration rejected: {error}");
-            std::process::exit(1);
-        }),
+        catbird_server::handlers::chat::ChatRuntime::from_env(sse_state.clone()).unwrap_or_else(
+            |error| {
+                tracing::error!("clean-chat runtime configuration rejected: {error}");
+                std::process::exit(1);
+            },
+        ),
     );
 
     // Clean-chat expiry sweeper. Overdue OPEN leaf-recovery requests and overdue
@@ -931,12 +933,21 @@ async fn main() -> anyhow::Result<()> {
     // unconditionally still performs zero chat access — unlike the device-auth
     // cleanup worker above, which is unconditional and is its own known problem.)
     if chat_runtime.cutover_enabled() {
+        chat_runtime
+            .validate_protocol_fence(&db_pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!("clean-chat protocol fence rejected: {error}");
+                std::process::exit(1);
+            });
         let chat_expiry_pool = db_pool.clone();
         let chat_expiry_runtime = chat_runtime.clone();
+        let chat_expiry_blob_store = blob_store.clone();
         tokio::spawn(async move {
-            catbird_server::handlers::chat::run_chat_expiry_sweeper(
+            catbird_server::handlers::chat::run_chat_expiry_sweeper_with_blob_store(
                 chat_expiry_pool,
                 chat_expiry_runtime,
+                chat_expiry_blob_store,
             )
             .await;
         });
