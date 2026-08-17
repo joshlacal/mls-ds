@@ -60,8 +60,9 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use transcript::{
-    decode_and_verify_signed_mutation, decode_canonical_signed_mutation, ControlEntryKind,
-    SignedMutationKind,
+    decode_and_verify_enrollment_body, decode_and_verify_signed_mutation,
+    decode_canonical_signed_mutation, decode_rebind_bootstrap, ControlEntryKind,
+    SignedMutationKind, VerifiedMutationProjection,
 };
 use validation::ed25519_key_id;
 
@@ -70,6 +71,12 @@ const REGENERATE_ENV: &str = "CATBIRD_REGENERATE_SIGNING_DOMAIN_VECTORS";
 const CANONICAL_LEXICON: &[u8] =
     include_bytes!("../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
 const CANONICAL_LEXICON_PATH: &str = "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json";
+const CANONICAL_SOURCE_LEXICON_PATH: &str =
+    "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json";
+const CANONICAL_SOURCE_LEXICON_REVISION: &str = "8ec8acaa1137b68b57b78ebfaea9404d5923305b";
+const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
+const CANONICAL_SOURCE_LEXICON_SHA256: &str =
+    "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -87,6 +94,32 @@ fn signing_key() -> SigningKey {
 
 fn canonical_lexicon_sha256() -> String {
     hex::encode(Sha256::digest(CANONICAL_LEXICON))
+}
+
+fn frozen_case(body_name: &str) -> Value {
+    let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
+    fixture["cases"]
+        .as_array()
+        .expect("fixture cases")
+        .iter()
+        .find(|case| case["bodyName"] == body_name)
+        .cloned()
+        .unwrap_or_else(|| panic!("missing frozen case {body_name}"))
+}
+
+fn frozen_wrapper(body_name: &str) -> (Value, Vec<u8>, [u8; 32]) {
+    let case = frozen_case(body_name);
+    let wrapper = case["wrapper"].clone();
+    let wrapper_bytes = serde_json::to_vec(&wrapper).expect("wrapper serializes");
+    let public_key: [u8; 32] = hex::decode(
+        case["publicKeyHex"]
+            .as_str()
+            .expect("fixture public key hex"),
+    )
+    .expect("fixture public key hex decodes")
+    .try_into()
+    .expect("fixture public key is 32 bytes");
+    (case, wrapper_bytes, public_key)
 }
 
 /// The body names with no control entry, derived rather than transcribed: every
@@ -300,7 +333,10 @@ fn generate() -> Value {
         "publicKeyHex": hex::encode(public_key),
         "keyId": key_id.as_str(),
         "provenance": {
-            "sourceLexicon": CANONICAL_LEXICON_PATH,
+            "sourceLexicon": CANONICAL_SOURCE_LEXICON_PATH,
+            "sourceLexiconMirror": CANONICAL_LEXICON_PATH,
+            "sourceLexiconRevision": CANONICAL_SOURCE_LEXICON_REVISION,
+            "sourceCorpusRevision": CANONICAL_SOURCE_CORPUS_REVISION,
             "sourceLexiconSha256": canonical_lexicon_sha256()
         },
         "cases": cases,
@@ -560,11 +596,122 @@ fn frozen_fixture_records_the_canonical_lexicon_provenance() {
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
     assert_eq!(
         fixture["provenance"]["sourceLexicon"],
+        CANONICAL_SOURCE_LEXICON_PATH
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceLexiconMirror"],
         CANONICAL_LEXICON_PATH
     );
     assert_eq!(
-        fixture["provenance"]["sourceLexiconSha256"],
-        canonical_lexicon_sha256(),
+        fixture["provenance"]["sourceLexiconRevision"],
+        CANONICAL_SOURCE_LEXICON_REVISION
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceCorpusRevision"],
+        CANONICAL_SOURCE_CORPUS_REVISION
+    );
+    assert_eq!(
+        fixture["provenance"]["sourceLexiconSha256"], CANONICAL_SOURCE_LEXICON_SHA256,
         "lexicon drift must invalidate the pinned fixture"
     );
+    assert_eq!(
+        canonical_lexicon_sha256(),
+        CANONICAL_SOURCE_LEXICON_SHA256,
+        "the server mirror must match the canonical PetrelCatbird source"
+    );
+}
+
+#[test]
+fn enrollment_vector_round_trips_through_strict_authority_and_derives_key_hash() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("deviceEnrollmentBody");
+    let enrollment = decode_and_verify_enrollment_body(&wrapper_bytes)
+        .expect("the frozen enrollment wrapper must pass strict authority verification");
+    let body = &case["body"];
+    let expected_key_hash: [u8; 32] = Sha256::digest(public_key).into();
+    let derived_key_id = ed25519_key_id(&public_key).unwrap();
+
+    assert_eq!(
+        enrollment.subject().as_str(),
+        body["actorDid"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.device_id().as_str(),
+        body["deviceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.dpop_jkt().as_str(),
+        body["dpopJkt"].as_str().unwrap()
+    );
+    assert_eq!(
+        enrollment.key_id().as_str(),
+        body["keyId"].as_str().unwrap()
+    );
+    assert_eq!(enrollment.key_id(), &derived_key_id);
+    assert_eq!(enrollment.signing_key_sha256(), &expected_key_hash);
+    assert_eq!(
+        hex::encode(enrollment.enrollment_transcript_sha256()),
+        case["canonicalRequestDigestHex"]
+    );
+    assert_eq!(
+        enrollment.accepted_wrapper_bytes(),
+        wrapper_bytes.as_slice()
+    );
+}
+
+#[test]
+fn rebind_vector_round_trips_through_stored_key_and_retains_both_jkts() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("deviceAuthenticationRebindBody");
+    let body = &case["body"];
+    let bootstrap = decode_rebind_bootstrap(&wrapper_bytes)
+        .expect("the frozen rebind wrapper must pass strict bootstrap decoding");
+
+    assert_eq!(
+        bootstrap.subject().as_str(),
+        body["actorDid"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.device_id().as_str(),
+        body["actorDeviceId"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.current_dpop_jkt().as_str(),
+        body["currentDpopJkt"].as_str().unwrap()
+    );
+    assert_eq!(
+        bootstrap.new_dpop_jkt().as_str(),
+        body["newDpopJkt"].as_str().unwrap()
+    );
+    bootstrap
+        .verify_signature_with_stored_key(&public_key)
+        .expect("the bootstrap signature must verify against the stored key");
+    let mutation = bootstrap
+        .verify_mutation_with_stored_key(&public_key)
+        .expect("stored-key verification must yield the exact mutation");
+    assert_eq!(mutation.key_id(), bootstrap.key_id());
+    assert_eq!(
+        hex::encode(mutation.request_digest()),
+        case["canonicalRequestDigestHex"]
+    );
+    assert_eq!(bootstrap.accepted_wrapper_bytes(), wrapper_bytes.as_slice());
+}
+
+#[test]
+fn application_send_vector_operation_id_is_message_id_not_generic_idempotency() {
+    let (case, wrapper_bytes, public_key) = frozen_wrapper("applicationSendBody");
+    let mutation = decode_and_verify_signed_mutation(&wrapper_bytes, &public_key)
+        .expect("the frozen application-send wrapper must pass strict verification");
+    let canonical = decode_canonical_signed_mutation(&wrapper_bytes)
+        .expect("the frozen application-send wrapper must pass strict decoding");
+    let body = &case["body"];
+    let expected = body["messageId"].as_str().expect("message ID");
+
+    assert_eq!(mutation.kind(), SignedMutationKind::ApplicationSend);
+    assert!(body.get("idempotencyKey").is_none());
+    assert_eq!(canonical.operation_id().unwrap().as_str(), expected);
+    match mutation.projection() {
+        VerifiedMutationProjection::ApplicationSend(application) => {
+            assert_eq!(application.message_id().as_str(), expected);
+        }
+        _ => panic!("unexpected application-send projection"),
+    }
 }
