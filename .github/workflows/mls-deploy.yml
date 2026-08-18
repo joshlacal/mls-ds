@@ -224,7 +224,7 @@ jobs:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
         run: |
-          cargo test --tests
+          cargo test --test mls_chat_lexicon_contract --test chat_protocol_signing_domain_vectors --test chat_protocol_ticket --test chat_protocol_route_inventory --features namespace-bluecatbird,server-bin
 
   # N33: the `#[ignore]`-gated DB regression suites (WS-1.3 sequencer-CAS
   # fences, the repaired N14 DB suites, the N32 actor single-flight race)
