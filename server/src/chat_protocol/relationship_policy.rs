@@ -3322,11 +3322,8 @@ fn did_document_url(config: &RelationshipPolicyConfig, did: &str) -> Result<Url,
     if did.starts_with("did:plc:") {
         return config.plc_directory_origin.append_path(&format!("/{did}"));
     }
-    let host = did
-        .strip_prefix("did:web:")
-        .ok_or(AuthorityError::Malformed)?;
-    Url::parse(&format!("https://{host}/.well-known/did.json"))
-        .map_err(|_| AuthorityError::Malformed)
+    let raw_url = crate::identity::did_web_document_url(did).ok_or(AuthorityError::Malformed)?;
+    Url::parse(&raw_url).map_err(|_| AuthorityError::Malformed)
 }
 
 fn declaration_record_url(
