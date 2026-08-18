@@ -216,7 +216,7 @@ jobs:
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           RUST_LOG: debug
         run: |
-          cargo test --features namespace-bluecatbird,server-bin
+          cargo test --bins --features namespace-bluecatbird,server-bin
 
       - name: Run integration tests
         working-directory: ./server
