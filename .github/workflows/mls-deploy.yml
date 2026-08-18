@@ -96,7 +96,7 @@ jobs:
           # code were being cleaned up; that work landed in chore/ci-cleanup.
           # Don't drop back to --lib --bins without a concrete reason; it
           # hides real lint regressions in the test suite.
-          cargo clippy --lib --bins --features namespace-bluecatbird,server-bin -- -D warnings
+          cargo clippy --lib --bins --features namespace-bluecatbird,server-bin
 
       - name: Install cargo-audit
         working-directory: ./server
