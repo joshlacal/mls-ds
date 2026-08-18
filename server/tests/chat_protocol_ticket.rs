@@ -14,12 +14,12 @@
 
 #![allow(dead_code)]
 
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
 
 use cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
 use zeroize::Zeroizing;
@@ -60,7 +60,6 @@ mod repository {
     }
 }
 mod common;
-
 
 #[test]
 fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {
@@ -247,8 +246,7 @@ async fn seed_session(
     let device_session_floor = if device_created_at.timestamp_subsec_nanos() == 0 {
         device_created_at
     } else {
-        device_created_at
-            + Duration::seconds(1)
+        device_created_at + Duration::seconds(1)
             - Duration::nanoseconds(i64::from(device_created_at.timestamp_subsec_nanos()))
     };
     // Sealed inventory-session bindings use whole-second timestamps, matching
@@ -293,12 +291,11 @@ async fn seed_session(
         .fetch_one(pool)
         .await
         .expect("read protocol fence");
-    let snapshot_event_position: i64 = sqlx::query_scalar(
-        "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read event head for sealed session");
+    let snapshot_event_position: i64 =
+        sqlx::query_scalar("SELECT coalesce(max(event_position), 0)::bigint FROM chat.events")
+            .fetch_one(pool)
+            .await
+            .expect("read event head for sealed session");
     let key_id: [u8; 32] = URL_SAFE_NO_PAD
         .decode(&cursor_key_id)
         .expect("decode cursor key id")
@@ -322,11 +319,7 @@ async fn seed_session(
     )
     .expect("bind sealed session capability");
     let sealed = sealer
-        .seal_successor(
-            capability.as_bytes(),
-            &binding,
-            &mut FixtureRandom(0x33),
-        )
+        .seal_successor(capability.as_bytes(), &binding, &mut FixtureRandom(0x33))
         .expect("seal session capability");
     sqlx::query(
         r#"

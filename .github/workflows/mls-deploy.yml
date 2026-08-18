@@ -191,6 +191,7 @@ jobs:
         working-directory: ./server
         env:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
+          PGOPTIONS: "-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed"
         run: |
           sqlx migrate run
 
@@ -266,6 +267,7 @@ jobs:
         working-directory: ./server
         env:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
+          PGOPTIONS: "-c chat.operation_claim_activation_approved=handlers-and-legacy-apis-sealed"
         run: |
           sqlx migrate run
 

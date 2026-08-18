@@ -10,15 +10,15 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
     extract::{DefaultBodyLimit, FromRef, State},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Router,
 };
 
+use crate::blob_store::BlobStore;
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::validation::ValidatedChatNsid;
-use crate::blob_store::BlobStore;
 use crate::storage::DbPool;
 
 #[cfg(not(test))]
@@ -70,7 +70,7 @@ mod welcome;
 use errors::ChatFailure;
 #[cfg(not(test))]
 pub use expiry_worker::{
-    ChatExpirySweepConfig, run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store,
+    run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
 };
 pub use runtime::ChatRuntime;
 

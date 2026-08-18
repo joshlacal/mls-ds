@@ -278,10 +278,7 @@ impl BlobStore {
     /// call so an integration test can observe the DB row before reclaim
     /// commits. This is inert unless explicitly installed by a fixture test.
     #[doc(hidden)]
-    pub fn with_s3_fixture_delete_probe(
-        mut self,
-        probe: Arc<S3FixtureDeleteProbe>,
-    ) -> Self {
+    pub fn with_s3_fixture_delete_probe(mut self, probe: Arc<S3FixtureDeleteProbe>) -> Self {
         self.fixture_delete_probe = Some(probe);
         self
     }

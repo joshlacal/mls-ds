@@ -452,7 +452,13 @@ fn raw_s3_client() -> S3Client {
         .behavior_version_latest()
         .endpoint_url(&endpoint)
         .region(Region::new(region))
-        .credentials_provider(Credentials::new(&access_key, &secret_key, None, None, "env"))
+        .credentials_provider(Credentials::new(
+            &access_key,
+            &secret_key,
+            None,
+            None,
+            "env",
+        ))
         .force_path_style(true)
         .build();
     S3Client::from_conf(config)
@@ -771,7 +777,11 @@ fn app_send_for(
     }
 }
 
-fn coherent_app_send(graph: &CreationGraph, salt: u8, received_at: DateTime<Utc>) -> ApplicationSend {
+fn coherent_app_send(
+    graph: &CreationGraph,
+    salt: u8,
+    received_at: DateTime<Utc>,
+) -> ApplicationSend {
     app_send_for(
         graph,
         &graph.actor_did,
@@ -1082,7 +1092,10 @@ async fn s3_positive_lifecycle_prepare_store_complete_bind_authorize_fetch() {
     // The physical object exists under the disposable prefix with the exact
     // atomic identity metadata; the bare CID is NOT addressable.
     assert!(object_exists(&client, &fixture_physical_key(&cid)).await);
-    assert!(!object_exists(&client, &cid).await, "bare CID not addressable");
+    assert!(
+        !object_exists(&client, &cid).await,
+        "bare CID not addressable"
+    );
     let head = client
         .head_object()
         .bucket(&fixture_bucket())
@@ -1105,15 +1118,18 @@ async fn s3_positive_lifecycle_prepare_store_complete_bind_authorize_fetch() {
         metadata.get("media-type").map(String::as_str),
         Some(MEDIA_STR)
     );
-    let (status, db_key): (String, Option<String>) = sqlx::query_as(
-        "SELECT status, object_store_key FROM chat.blobs WHERE blob_id = $1",
-    )
-    .bind(blob_id)
-    .fetch_one(&pool)
-    .await
-    .expect("blob row");
+    let (status, db_key): (String, Option<String>) =
+        sqlx::query_as("SELECT status, object_store_key FROM chat.blobs WHERE blob_id = $1")
+            .bind(blob_id)
+            .fetch_one(&pool)
+            .await
+            .expect("blob row");
     assert_eq!(status, "bound");
-    assert_eq!(db_key.as_deref(), Some(cid.as_str()), "DB stores the bare CID");
+    assert_eq!(
+        db_key.as_deref(),
+        Some(cid.as_str()),
+        "DB stores the bare CID"
+    );
 
     // Authorize + publicize + fetch exactly once through the production handler
     // and production `BlobStore::get_authorized` against real MinIO.
@@ -1235,9 +1251,15 @@ async fn s3_denies_wrong_devices_without_disclosing_the_object() {
 async fn s3_rejects_replayed_capability() {
     let pool: PgPool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let fixture = seed_bound_blob(&pool).await;
-    let capability = authorize(&pool, &fixture, &fixture.owner_did, fixture.owner_device_id, 1)
-        .await
-        .expect("authorize exact device");
+    let capability = authorize(
+        &pool,
+        &fixture,
+        &fixture.owner_did,
+        fixture.owner_device_id,
+        1,
+    )
+    .await
+    .expect("authorize exact device");
 
     // First consume through the exact production capability path succeeds and
     // seals the physical identity.
@@ -1289,13 +1311,12 @@ async fn s3_rejects_expired_capability_window() {
         Duration::hours(1),
     )
     .await;
-    let (unbound_expires_at, status): (Option<DateTime<Utc>>, String) = sqlx::query_as(
-        "SELECT unbound_expires_at, status FROM chat.blobs WHERE blob_id = $1",
-    )
-    .bind(fixture.blob_id)
-    .fetch_one(&pool)
-    .await
-    .expect("blob row");
+    let (unbound_expires_at, status): (Option<DateTime<Utc>>, String) =
+        sqlx::query_as("SELECT unbound_expires_at, status FROM chat.blobs WHERE blob_id = $1")
+            .bind(fixture.blob_id)
+            .fetch_one(&pool)
+            .await
+            .expect("blob row");
     assert_eq!(status, "bound");
     let unbound_expires_at = unbound_expires_at.expect("unbound window");
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
@@ -1309,7 +1330,14 @@ async fn s3_rejects_expired_capability_window() {
 
     // Repository-level: authorization is denied before any storage identity is
     // revealed.
-    let result = authorize(&pool, &fixture, &fixture.owner_did, fixture.owner_device_id, 1).await;
+    let result = authorize(
+        &pool,
+        &fixture,
+        &fixture.owner_did,
+        fixture.owner_device_id,
+        1,
+    )
+    .await;
     assert!(
         matches!(result, Err(BlobRepositoryError::NotAuthorized)),
         "expired window must deny authorization, got {result:?}"
@@ -1388,7 +1416,12 @@ async fn s3_detects_tampered_object_body() {
     // Cleanup: restore the exact object, then delete it through production.
     let store = fixture_store().await;
     store
-        .put_for_blob(fixture.blob_id, fixture.ciphertext.clone(), &fixture.ct_sha, MEDIA_STR)
+        .put_for_blob(
+            fixture.blob_id,
+            fixture.ciphertext.clone(),
+            &fixture.ct_sha,
+            MEDIA_STR,
+        )
         .await
         .expect("restore");
     store.delete(&fixture.cid).await.expect("cleanup delete");
@@ -1521,7 +1554,11 @@ async fn s3_denies_revoked_device_generation() {
     .execute(&mut *tx)
     .await
     .expect("rotate target device generation");
-    assert_eq!(updated.rows_affected(), 1, "exactly the target device rotated");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "exactly the target device rotated"
+    );
     tx.commit().await.expect("commit revocation graph");
 
     // Repository-level: the pre-rotation auth generation no longer matches the
@@ -1607,7 +1644,11 @@ async fn commit_add_member(
     .execute(&mut **tx)
     .await
     .expect("advance generation through acceptance");
-    assert_eq!(updated.rows_affected(), 1, "exact acceptance generation CAS");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "exact acceptance generation CAS"
+    );
     sqlx::query(
         r#"INSERT INTO chat.transitions(
             transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,
@@ -2664,11 +2705,12 @@ async fn cutover_runtime(pool: &PgPool) -> Arc<ChatRuntime> {
     // The clean-chat runtime requires the cursor sealer configuration that the
     // route harness also installs (fence row + sealing secret).
     http::ensure_fence(pool).await;
-    let key_id: String =
-        sqlx::query_scalar("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")
-            .fetch_one(pool)
-            .await
-            .expect("cursor key");
+    let key_id: String = sqlx::query_scalar(
+        "SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("cursor key");
     std::env::set_var("CHAT_NEST_ISSUER", "did:web:api.catbird.blue");
     std::env::set_var("CHAT_NEST_AUDIENCE", "did:web:chat.catbird.blue");
     std::env::set_var("CHAT_NEST_KEY_ID", http::NEST_KEY_ID);
@@ -2680,16 +2722,18 @@ async fn cutover_runtime(pool: &PgPool) -> Arc<ChatRuntime> {
     std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
     std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
     std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
-    std::env::set_var("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0xA5_u8; 32]));
+    std::env::set_var(
+        "CHAT_CURSOR_SEALING_SECRET",
+        URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+    );
     std::env::set_var(
         "CHAT_SUBSCRIPTION_ENDPOINT",
         "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
     );
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
     std::env::set_var("CHAT_EXPIRY_SWEEP_INTERVAL_SECS", "1");
-    let runtime = Arc::new(
-        ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("cutover runtime"),
-    );
+    let runtime =
+        Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("cutover runtime"));
     std::env::set_var("CHAT_CUTOVER_ENABLED", "0");
     runtime
 }
@@ -2801,15 +2845,14 @@ async fn s3_expiry_gc_deletes_exact_object_then_reclaims_idempotently() {
         !object_exists(&client, &physical_key).await,
         "production reclaim must delete S3 before its DB reclaim UPDATE"
     );
-    let during_delete: (String, String, Option<String>, Option<DateTime<Utc>>) =
-        sqlx::query_as(
-            "SELECT status, object_gc_status, object_store_key, object_deleted_at \
+    let during_delete: (String, String, Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT status, object_gc_status, object_store_key, object_deleted_at \
              FROM chat.blobs WHERE blob_id = $1",
-        )
-        .bind(blob_id)
-        .fetch_one(&pool)
-        .await
-        .expect("observe production reclaim row while delete probe is paused");
+    )
+    .bind(blob_id)
+    .fetch_one(&pool)
+    .await
+    .expect("observe production reclaim row while delete probe is paused");
     assert_eq!(during_delete.0, "expired");
     assert_eq!(during_delete.1, "pending");
     assert_eq!(during_delete.2.as_deref(), Some(cid.as_str()));

@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Postgres, Transaction};
@@ -29,21 +29,22 @@ use crate::chat_protocol::public_state::encode_public_tree_summary;
 use crate::chat_protocol::state_machine::apply_device_revocation_batch_unscoped_for_test as apply_device_revocation_contexts_unscoped_for_test;
 use crate::chat_protocol::state_machine::executor::ExecutionContext;
 use crate::chat_protocol::state_machine::{
-    AppliedTransition, ControlEntryContent, ConversationKind, ConversationPersistencePlan,
-    DeviceIdentity, DeviceRevocationBatchPersistencePlan, EventChainCursorError, EventFanout,
-    ExecutionActor, ExecutionAuthority, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
+    apply_prepared_device_revocation_members, apply_prepared_device_revocation_prefix,
+    batch_transaction_bindings_match, plan_transaction_bindings_match,
+    prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
+    ConversationKind, ConversationPersistencePlan, DeviceIdentity,
+    DeviceRevocationBatchPersistencePlan, EventChainCursorError, EventFanout, ExecutionActor,
+    ExecutionAuthority, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
     LeaveRequestStatus, MetadataAuthorColumns, MetadataAvatarPersistence, ParticipantRole,
     PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
     PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
     SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext, WelcomeStatus, apply_prepared_device_revocation_members,
-    apply_prepared_device_revocation_prefix, batch_transaction_bindings_match,
-    plan_transaction_bindings_match, prepare_device_revocation_batch_members,
+    WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
-    CanonicalValueRef, SignedMutationKind, VerifiedMutationProjection, VerifiedSignedMutation,
     canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
-    decode_and_verify_signed_mutation,
+    decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
+    VerifiedMutationProjection, VerifiedSignedMutation,
 };
 
 const STREAM_OUTBOX_COUNT: usize = 1;
@@ -3265,8 +3266,8 @@ pub(crate) async fn apply_device_revocation_batch_sequential(
     feature = "chat-protocol-production-proof",
     not(feature = "server-bin")
 ))]
-pub(in crate::chat_protocol) fn run_welcome_terminal_context_family_semantic_proof()
--> Result<(), String> {
+pub(in crate::chat_protocol) fn run_welcome_terminal_context_family_semantic_proof(
+) -> Result<(), String> {
     for (label, kind, before, after, expected) in [
         (
             "dedicated Welcome expiry",

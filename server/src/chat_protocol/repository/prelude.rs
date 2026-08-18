@@ -18,7 +18,7 @@ use super::{
             DeviceEnrollmentProjection, KeyPackageReplenishmentProjection, SignedMutationKind,
             VerifiedMutationProjection, VerifiedSignedMutation,
         },
-        validation::{BareDid, basic_credential_identity},
+        validation::{basic_credential_identity, BareDid},
     },
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
@@ -2530,20 +2530,28 @@ pub(crate) async fn prepare_blob_operation(
                 .ok_or(PreludeError::ClaimIntegrity)?;
             Ok(PreparedBlobOperation::Replay(response))
         }
-        PreparedSignedOperationState::First { authority, reservation } => {
+        PreparedSignedOperationState::First {
+            authority,
+            reservation,
+        } => {
             if authority.endpoint().as_str() != endpoint_nsid
                 || authority.mutation().map(|value| value.kind()) != Some(mutation_kind)
             {
                 return Err(PreludeError::ClaimIntegrity);
             }
             let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
-            Ok(PreparedBlobOperation::First(PreparedBlobPrelude { authority, business }))
+            Ok(PreparedBlobOperation::First(PreparedBlobPrelude {
+                authority,
+                business,
+            }))
         }
     }
 }
 
 impl PreparedBlobPrelude {
-    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest { &self.authority }
+    pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest {
+        &self.authority
+    }
 
     pub(crate) fn scope_authority(&self) -> &ScopeBoundBusinessAuthority {
         self.business.scope_authority()
@@ -2551,8 +2559,15 @@ impl PreparedBlobPrelude {
 
     pub(crate) fn into_execution_parts(
         self,
-    ) -> (VerifiedChatDeviceRequest, ScopeBoundBusinessAuthority, OperationCompletionGuard) {
-        let PreparedBlobPrelude { authority, business } = self;
+    ) -> (
+        VerifiedChatDeviceRequest,
+        ScopeBoundBusinessAuthority,
+        OperationCompletionGuard,
+    ) {
+        let PreparedBlobPrelude {
+            authority,
+            business,
+        } = self;
         let (scope, completion) = business.into_execution_parts();
         (authority, scope, completion)
     }

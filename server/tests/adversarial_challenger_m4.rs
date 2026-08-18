@@ -231,7 +231,11 @@ fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs
     })
 }
 
-fn rebind_body(current_dpop_jkt: &str, new_dpop_jkt: &str, signing_key: &Ed25519SigningKey) -> Value {
+fn rebind_body(
+    current_dpop_jkt: &str,
+    new_dpop_jkt: &str,
+    signing_key: &Ed25519SigningKey,
+) -> Value {
     let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
     json!({
         "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
@@ -292,28 +296,86 @@ fn challenge_1_unknown_fields_rejection_across_all_structures() {
     let mut bad_header = valid_token_header.clone();
     bad_header["unknown_header_field"] = json!("malicious_value");
     let bad_token = sign_jwt(bad_header, valid_claims.clone(), &nest_signing);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &bad_token, 1_700_000_060, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {bad_token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in Token Header");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &bad_token,
+        1_700_000_060,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {bad_token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in Token Header"
+    );
 
     // 1.2: Unknown field in ConfirmationClaim (cnf)
     let mut bad_claims = valid_claims.clone();
     bad_claims["cnf"] = json!({"jkt": proof_jkt, "unknown_cnf_field": "injected"});
     let bad_token = sign_jwt(valid_token_header.clone(), bad_claims, &nest_signing);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &bad_token, 1_700_000_060, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {bad_token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in cnf claim");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &bad_token,
+        1_700_000_060,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {bad_token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in cnf claim"
+    );
 
     // 1.3: Unknown field in OrdinaryClaims
     let mut bad_claims = valid_claims.clone();
     bad_claims["injected_claim"] = json!(true);
     let bad_token = sign_jwt(valid_token_header.clone(), bad_claims, &nest_signing);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &bad_token, 1_700_000_060, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {bad_token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in OrdinaryClaims");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &bad_token,
+        1_700_000_060,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {bad_token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in OrdinaryClaims"
+    );
 
     // 1.4: Unknown field in DPoP Header
-    let valid_token = sign_jwt(valid_token_header.clone(), valid_claims.clone(), &nest_signing);
+    let valid_token = sign_jwt(
+        valid_token_header.clone(),
+        valid_claims.clone(),
+        &nest_signing,
+    );
     let bad_proof = sign_jwt(
         json!({"typ":"dpop+jwt","alg":"ES256","jwk":proof_jwk,"extra_dpop_header":"malicious"}),
         json!({
@@ -325,8 +387,18 @@ fn challenge_1_unknown_fields_rejection_across_all_structures() {
         }),
         &proof_signing,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &bad_proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in DPoP Header");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &bad_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in DPoP Header"
+    );
 
     // 1.5: Unknown field in PublicP256Jwk
     let mut bad_jwk = proof_jwk.clone();
@@ -342,8 +414,18 @@ fn challenge_1_unknown_fields_rejection_across_all_structures() {
         }),
         &proof_signing,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &bad_proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in PublicP256Jwk");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &bad_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in PublicP256Jwk"
+    );
 
     // 1.6: Unknown field in DpopClaims
     let bad_proof = sign_jwt(
@@ -358,8 +440,18 @@ fn challenge_1_unknown_fields_rejection_across_all_structures() {
         }),
         &proof_signing,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &bad_proof, &endpoint, &method, &now).is_err(),
-        "Must reject unknown field in DpopClaims");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &bad_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject unknown field in DpopClaims"
+    );
 }
 
 #[test]
@@ -408,9 +500,27 @@ fn challenge_1_jkt_mismatch_and_key_substitution() {
     );
 
     // Proof presented signed by key B (jkt_b)
-    let proof_b = dpop_proof(&proof_signing_b, &jwk_b, "GET", &origin.htu(&endpoint), &token, 1_700_000_060, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof_b, &endpoint, &method, &now).is_err(),
-        "Must reject when DPoP proof key JKT != token cnf.jkt");
+    let proof_b = dpop_proof(
+        &proof_signing_b,
+        &jwk_b,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        1_700_000_060,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof_b,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject when DPoP proof key JKT != token cnf.jkt"
+    );
 
     // Proof presented with jwk_a in header but signed by key B
     let fake_proof = sign_jwt(
@@ -424,8 +534,18 @@ fn challenge_1_jkt_mismatch_and_key_substitution() {
         }),
         &proof_signing_b,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &fake_proof, &endpoint, &method, &now).is_err(),
-        "Must reject DPoP proof when signature does not match embedded JWK");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &fake_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject DPoP proof when signature does not match embedded JWK"
+    );
 }
 
 #[test]
@@ -472,55 +592,217 @@ fn challenge_1_token_expiration_lifetime_and_clock_skew() {
 
     // 1. Token not yet active (now < iat)
     let token = make_token(now_ts + 1, now_ts + 120);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &token, now_ts, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with now < iat");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with now < iat"
+    );
 
     // 2. Token expired (now == exp boundary: now >= exp is invalid)
     let token = make_token(now_ts - 120, now_ts);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &token, now_ts, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with now == exp (expired boundary)");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with now == exp (expired boundary)"
+    );
 
     // 3. Token expired (now > exp)
     let token = make_token(now_ts - 125, now_ts - 5);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &token, now_ts, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with now > exp");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with now > exp"
+    );
 
     // 4. Token lifetime > 120s (exp - iat = 121)
     let token = make_token(now_ts - 10, now_ts + 111);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &token, now_ts, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with lifetime > 120s");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with lifetime > 120s"
+    );
 
     // 5. Reversed lifetime (exp < iat)
     let token = make_token(now_ts + 50, now_ts - 50);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &token, now_ts, &[1; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {token}"), &proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with exp < iat");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with exp < iat"
+    );
 
     // 6. Proof skew testing against now_ts (1700000050)
     let valid_token = make_token(now_ts - 10, now_ts + 110);
     // 6a. proof_iat == now + 60 (accepted boundary)
-    let proof_p60 = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &valid_token, now_ts + 60, &[2; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &proof_p60, &endpoint, &method, &now).is_ok(),
-        "Proof at now + 60s boundary must pass");
+    let proof_p60 = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &valid_token,
+        now_ts + 60,
+        &[2; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &proof_p60,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_ok(),
+        "Proof at now + 60s boundary must pass"
+    );
 
     // 6b. proof_iat == now - 60 (accepted boundary)
-    let proof_m60 = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &valid_token, now_ts - 60, &[3; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &proof_m60, &endpoint, &method, &now).is_ok(),
-        "Proof at now - 60s boundary must pass");
+    let proof_m60 = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &valid_token,
+        now_ts - 60,
+        &[3; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &proof_m60,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_ok(),
+        "Proof at now - 60s boundary must pass"
+    );
 
     // 6c. proof_iat == now + 61 (rejected skew)
-    let proof_p61 = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &valid_token, now_ts + 61, &[4; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &proof_p61, &endpoint, &method, &now).is_err(),
-        "Proof at now + 61s skew must be rejected");
+    let proof_p61 = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &valid_token,
+        now_ts + 61,
+        &[4; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &proof_p61,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Proof at now + 61s skew must be rejected"
+    );
 
     // 6d. proof_iat == now - 61 (rejected skew)
-    let proof_m61 = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &valid_token, now_ts - 61, &[5; 12]);
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &proof_m61, &endpoint, &method, &now).is_err(),
-        "Proof at now - 61s skew must be rejected");
+    let proof_m61 = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &valid_token,
+        now_ts - 61,
+        &[5; 12],
+    );
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &proof_m61,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Proof at now - 61s skew must be rejected"
+    );
 }
 
 #[test]
@@ -561,27 +843,65 @@ fn challenge_1_signature_tampering_and_algorithm_confusion() {
         }),
         &nest_signing,
     );
-    let valid_proof = dpop_proof(&proof_signing, &proof_jwk, "GET", &origin.htu(&endpoint), &valid_token, 1_700_000_060, &[1; 12]);
+    let valid_proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "GET",
+        &origin.htu(&endpoint),
+        &valid_token,
+        1_700_000_060,
+        &[1; 12],
+    );
 
     // 1. Corrupt token signature
     let (token_body, _) = valid_token.rsplit_once('.').unwrap();
     let corrupt_token_sig = format!("{token_body}.{}", URL_SAFE_NO_PAD.encode([0xAA_u8; 64]));
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {corrupt_token_sig}"), &valid_proof, &endpoint, &method, &now).is_err(),
-        "Must reject corrupted token signature");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {corrupt_token_sig}"),
+            &valid_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject corrupted token signature"
+    );
 
     // 2. Corrupt proof signature
     let (proof_body, _) = valid_proof.rsplit_once('.').unwrap();
     let corrupt_proof_sig = format!("{proof_body}.{}", URL_SAFE_NO_PAD.encode([0xBB_u8; 64]));
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &corrupt_proof_sig, &endpoint, &method, &now).is_err(),
-        "Must reject corrupted proof signature");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &corrupt_proof_sig,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject corrupted proof signature"
+    );
 
     // 3. Algorithm confusion: alg = "none"
     let none_alg_token = format!("{}.{}.",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"alg":"none","typ":"JWT","kid":"nest-key-1"})).unwrap()),
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"iss":ISSUER,"sub":DID,"aud":AUDIENCE,"lxm":endpoint.as_str(),"iat":1_700_000_000_i64,"exp":1_700_000_120_i64,"jti":TOKEN_JTI,"cnf":{"jkt":proof_jkt},"device_id":DEVICE_ID,"chat_instance":CHAT_INSTANCE})).unwrap())
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {none_alg_token}"), &valid_proof, &endpoint, &method, &now).is_err(),
-        "Must reject alg: 'none'");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {none_alg_token}"),
+            &valid_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject alg: 'none'"
+    );
 
     // 4. Algorithm confusion: typ = "dpop+jwt" on token, or typ = "JWT" on proof
     let bad_typ_token = sign_jwt(
@@ -589,16 +909,36 @@ fn challenge_1_signature_tampering_and_algorithm_confusion() {
         json!({"iss":ISSUER,"sub":DID,"aud":AUDIENCE,"lxm":endpoint.as_str(),"iat":1_700_000_000_i64,"exp":1_700_000_120_i64,"jti":TOKEN_JTI,"cnf":{"jkt":proof_jkt},"device_id":DEVICE_ID,"chat_instance":CHAT_INSTANCE}),
         &nest_signing,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {bad_typ_token}"), &valid_proof, &endpoint, &method, &now).is_err(),
-        "Must reject token with typ != 'JWT'");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {bad_typ_token}"),
+            &valid_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject token with typ != 'JWT'"
+    );
 
     let bad_typ_proof = sign_jwt(
         json!({"typ":"JWT","alg":"ES256","jwk":proof_jwk}),
         json!({"htm":"GET","htu":origin.htu(&endpoint),"ath":URL_SAFE_NO_PAD.encode(Sha256::digest(valid_token.as_bytes())),"iat":1_700_000_060_i64,"jti":URL_SAFE_NO_PAD.encode([1_u8; 12])}),
         &proof_signing,
     );
-    assert!(verify_ordinary_request_auth(&trust, &format!("DPoP {valid_token}"), &bad_typ_proof, &endpoint, &method, &now).is_err(),
-        "Must reject proof with typ != 'dpop+jwt'");
+    assert!(
+        verify_ordinary_request_auth(
+            &trust,
+            &format!("DPoP {valid_token}"),
+            &bad_typ_proof,
+            &endpoint,
+            &method,
+            &now
+        )
+        .is_err(),
+        "Must reject proof with typ != 'dpop+jwt'"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -611,34 +951,56 @@ fn challenge_2_enrollment_grant_expiry_formula_and_overflow_invariants() {
     // 1. iat + 120 is strictly smaller
     let iat = NumericDate::new(1_000).unwrap();
     let auth_time = NumericDate::new(1_000).unwrap();
-    assert_eq!(enrollment_grant_expiry(iat, auth_time).unwrap().get(), 1_120);
+    assert_eq!(
+        enrollment_grant_expiry(iat, auth_time).unwrap().get(),
+        1_120
+    );
 
     // 2. auth_time + 300 is strictly smaller
     let iat = NumericDate::new(1_200).unwrap();
     let auth_time = NumericDate::new(1_000).unwrap();
-    assert_eq!(enrollment_grant_expiry(iat, auth_time).unwrap().get(), 1_300);
+    assert_eq!(
+        enrollment_grant_expiry(iat, auth_time).unwrap().get(),
+        1_300
+    );
 
     // 3. Exact boundary equality (1180 + 120 == 1000 + 300 == 1300)
     let iat = NumericDate::new(1_180).unwrap();
     let auth_time = NumericDate::new(1_000).unwrap();
-    assert_eq!(enrollment_grant_expiry(iat, auth_time).unwrap().get(), 1_300);
+    assert_eq!(
+        enrollment_grant_expiry(iat, auth_time).unwrap().get(),
+        1_300
+    );
 
     // 4. Arithmetic overflow safety: MAX_SAFE_INTEGER = 9_007_199_254_740_991
     let max_safe = NumericDate::new(validation::MAX_SAFE_INTEGER).unwrap();
-    assert!(max_safe.checked_add(1).is_err(), "checked_add past MAX_SAFE_INTEGER must fail");
+    assert!(
+        max_safe.checked_add(1).is_err(),
+        "checked_add past MAX_SAFE_INTEGER must fail"
+    );
 
     let overflow_iat = NumericDate::new(validation::MAX_SAFE_INTEGER - 50).unwrap();
-    assert!(enrollment_grant_expiry(overflow_iat, auth_time).is_err(),
-        "enrollment_grant_expiry with overflowing iat must error safely");
+    assert!(
+        enrollment_grant_expiry(overflow_iat, auth_time).is_err(),
+        "enrollment_grant_expiry with overflowing iat must error safely"
+    );
 
     let overflow_auth = NumericDate::new(validation::MAX_SAFE_INTEGER - 150).unwrap();
-    assert!(enrollment_grant_expiry(iat, overflow_auth).is_err(),
-        "enrollment_grant_expiry with overflowing auth_time must error safely");
+    assert!(
+        enrollment_grant_expiry(iat, overflow_auth).is_err(),
+        "enrollment_grant_expiry with overflowing auth_time must error safely"
+    );
 
     // 5. Negative numbers and i64::MAX reject at construction
-    assert!(NumericDate::new(-1).is_err(), "Negative NumericDate must error");
+    assert!(
+        NumericDate::new(-1).is_err(),
+        "Negative NumericDate must error"
+    );
     assert!(NumericDate::new(i64::MIN).is_err(), "i64::MIN must error");
-    assert!(NumericDate::new(i64::MAX).is_err(), "i64::MAX past MAX_SAFE_INTEGER must error");
+    assert!(
+        NumericDate::new(i64::MAX).is_err(),
+        "i64::MAX past MAX_SAFE_INTEGER must error"
+    );
 }
 
 #[test]
@@ -697,23 +1059,74 @@ fn challenge_2_enrollment_claims_auth_time_window_validation() {
     // Correct exp for iat=1700000290, auth_time=1700000000 is min(1700000410, 1700000300) = 1700000300
     // Try token with exp = 1700000350
     let bad_exp_token = make_enrollment_token(1_700_000_290, 1_700_000_350, 1_700_000_000);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "POST", &origin.htu(&endpoint), &bad_exp_token, 1_700_000_295, &[1; 12]);
-    assert!(verify_enrollment_request_auth(&trust, &format!("DPoP {bad_exp_token}"), &proof, decode_and_verify_enrollment_body(&enrollment_raw).unwrap(), &now).is_err(),
-        "Must reject enrollment token where exp does not equal formula min(iat+120, auth_time+300)");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "POST",
+        &origin.htu(&endpoint),
+        &bad_exp_token,
+        1_700_000_295,
+        &[1; 12],
+    );
+    assert!(
+        verify_enrollment_request_auth(
+            &trust,
+            &format!("DPoP {bad_exp_token}"),
+            &proof,
+            decode_and_verify_enrollment_body(&enrollment_raw).unwrap(),
+            &now
+        )
+        .is_err(),
+        "Must reject enrollment token where exp does not equal formula min(iat+120, auth_time+300)"
+    );
 
     // Case 2: auth_time in future (auth_time > now_ts)
     let future_auth_token = make_enrollment_token(now_ts, now_ts + 120, now_ts + 10);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "POST", &origin.htu(&endpoint), &future_auth_token, now_ts, &[1; 12]);
-    assert!(verify_enrollment_request_auth(&trust, &format!("DPoP {future_auth_token}"), &proof, decode_and_verify_enrollment_body(&enrollment_raw).unwrap(), &now).is_err(),
-        "Must reject enrollment where auth_time is in future");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "POST",
+        &origin.htu(&endpoint),
+        &future_auth_token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_enrollment_request_auth(
+            &trust,
+            &format!("DPoP {future_auth_token}"),
+            &proof,
+            decode_and_verify_enrollment_body(&enrollment_raw).unwrap(),
+            &now
+        )
+        .is_err(),
+        "Must reject enrollment where auth_time is in future"
+    );
 
     // Case 3: auth_time outside 300s window (now_ts - auth_time = 301)
     let old_auth = now_ts - 301;
     let old_auth_exp = std::cmp::min(now_ts + 60, old_auth + 300);
     let old_auth_token = make_enrollment_token(now_ts - 10, old_auth_exp, old_auth);
-    let proof = dpop_proof(&proof_signing, &proof_jwk, "POST", &origin.htu(&endpoint), &old_auth_token, now_ts, &[1; 12]);
-    assert!(verify_enrollment_request_auth(&trust, &format!("DPoP {old_auth_token}"), &proof, decode_and_verify_enrollment_body(&enrollment_raw).unwrap(), &now).is_err(),
-        "Must reject enrollment where now - auth_time > 300s");
+    let proof = dpop_proof(
+        &proof_signing,
+        &proof_jwk,
+        "POST",
+        &origin.htu(&endpoint),
+        &old_auth_token,
+        now_ts,
+        &[1; 12],
+    );
+    assert!(
+        verify_enrollment_request_auth(
+            &trust,
+            &format!("DPoP {old_auth_token}"),
+            &proof,
+            decode_and_verify_enrollment_body(&enrollment_raw).unwrap(),
+            &now
+        )
+        .is_err(),
+        "Must reject enrollment where now - auth_time > 300s"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -734,7 +1147,8 @@ fn challenge_3_rebind_ed25519_signature_and_jkt_binding_invariants() {
     let new_jkt = jwk_thumbprint(&new_jwk);
 
     let origin = TrustedExternalBase::parse("https://chat.example.net", &BTreeSet::new()).unwrap();
-    let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication").unwrap();
+    let endpoint =
+        ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication").unwrap();
     let now = TrustedRequestInstant::from_canonical_for_test(
         CanonicalTimestamp::parse("2023-11-14T22:14:20.000Z").unwrap(),
     );
@@ -770,16 +1184,32 @@ fn challenge_3_rebind_ed25519_signature_and_jkt_binding_invariants() {
         }),
         &nest_signing,
     );
-    let proof = dpop_proof(&new_proof_signing, &new_jwk, "POST", &origin.htu(&endpoint), &token, 1_700_000_060, &[17; 12]);
+    let proof = dpop_proof(
+        &new_proof_signing,
+        &new_jwk,
+        "POST",
+        &origin.htu(&endpoint),
+        &token,
+        1_700_000_060,
+        &[17; 12],
+    );
 
-    let pre_replay = verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, bootstrap, &now).unwrap();
+    let pre_replay =
+        verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, bootstrap, &now)
+            .unwrap();
 
     // Stored key verification against legitimate public key passes
-    assert!(pre_replay.verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes()).is_ok());
+    assert!(pre_replay
+        .verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes())
+        .is_ok());
 
     // Stored key verification against attacker/wrong public key FAILS
-    assert!(pre_replay.verify_rebind_stored_signing_key(attacker_device_signing.verifying_key().as_bytes()).is_err(),
-        "Rebind signature MUST fail verification against wrong stored public key");
+    assert!(
+        pre_replay
+            .verify_rebind_stored_signing_key(attacker_device_signing.verifying_key().as_bytes())
+            .is_err(),
+        "Rebind signature MUST fail verification against wrong stored public key"
+    );
 
     // 2. Attacker generates their own signature with wrong Ed25519 key
     let attacker_raw = sign_chat_body(
@@ -787,9 +1217,20 @@ fn challenge_3_rebind_ed25519_signature_and_jkt_binding_invariants() {
         &attacker_device_signing,
     );
     let attacker_bootstrap = decode_rebind_bootstrap(&attacker_raw).unwrap();
-    let attacker_pre_replay = verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, attacker_bootstrap, &now).unwrap();
-    assert!(attacker_pre_replay.verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes()).is_err(),
-        "Attacker rebind signed with foreign key MUST be rejected by stored device key");
+    let attacker_pre_replay = verify_rebind_request_auth(
+        &trust,
+        &format!("DPoP {token}"),
+        &proof,
+        attacker_bootstrap,
+        &now,
+    )
+    .unwrap();
+    assert!(
+        attacker_pre_replay
+            .verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes())
+            .is_err(),
+        "Attacker rebind signed with foreign key MUST be rejected by stored device key"
+    );
 
     // 3. Rebind body has new_jkt mismatched from token's cnf.jkt
     let other_key = signing_key_p256(77);
@@ -800,8 +1241,17 @@ fn challenge_3_rebind_ed25519_signature_and_jkt_binding_invariants() {
         &legitimate_device_signing,
     );
     let mismatched_bootstrap = decode_rebind_bootstrap(&mismatched_raw).unwrap();
-    assert!(verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, mismatched_bootstrap, &now).is_err(),
-        "Must reject rebind when body new_dpop_jkt does not match token cnf.jkt");
+    assert!(
+        verify_rebind_request_auth(
+            &trust,
+            &format!("DPoP {token}"),
+            &proof,
+            mismatched_bootstrap,
+            &now
+        )
+        .is_err(),
+        "Must reject rebind when body new_dpop_jkt does not match token cnf.jkt"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -848,7 +1298,10 @@ fn test_runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
         std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
         std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
         std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
-        std::env::set_var("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0x22_u8; 32]));
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            URL_SAFE_NO_PAD.encode([0x22_u8; 32]),
+        );
         std::env::set_var(
             "CHAT_SUBSCRIPTION_ENDPOINT",
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
@@ -860,7 +1313,8 @@ fn test_runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    let rt = Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"));
+    let rt =
+        Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"));
     std::env::remove_var("CHAT_CUTOVER_ENABLED");
     rt
 }
@@ -895,10 +1349,18 @@ fn is_get_endpoint(endpoint: ChatEndpoint) -> bool {
 
 #[tokio::test]
 async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
-    assert_eq!(ChatEndpoint::ALL.len(), 32, "Must contain exactly 32 endpoints");
+    assert_eq!(
+        ChatEndpoint::ALL.len(),
+        32,
+        "Must contain exactly 32 endpoints"
+    );
 
     for endpoint in ChatEndpoint::ALL {
-        let method = if is_get_endpoint(*endpoint) { "GET" } else { "POST" };
+        let method = if is_get_endpoint(*endpoint) {
+            "GET"
+        } else {
+            "POST"
+        };
         let body = if *endpoint == ChatEndpoint::GetSubscriptionTicket {
             Body::from(
                 r#"{"inventorySessionId":"00000000-0000-4000-8000-000000000001","eventCursor":"route-test"}"#,
@@ -913,7 +1375,10 @@ async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
             .body(body)
             .expect("request");
 
-        let response = test_router(false).oneshot(request).await.expect("route response");
+        let response = test_router(false)
+            .oneshot(request)
+            .await
+            .expect("route response");
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
@@ -937,9 +1402,11 @@ async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
             "CutoverRequired"
         };
         assert_eq!(
-            body["error"], expected_error,
+            body["error"],
+            expected_error,
             "Endpoint {} must reject with error '{}' before database work",
-            endpoint.nsid(), expected_error
+            endpoint.nsid(),
+            expected_error
         );
     }
 }
@@ -948,14 +1415,21 @@ async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
 async fn challenge_4_all_32_endpoints_method_enforcement() {
     for endpoint in ChatEndpoint::ALL {
         // Send opposite method
-        let wrong_method = if is_get_endpoint(*endpoint) { "POST" } else { "GET" };
+        let wrong_method = if is_get_endpoint(*endpoint) {
+            "POST"
+        } else {
+            "GET"
+        };
         let request = Request::builder()
             .method(wrong_method)
             .uri(format!("/xrpc/{}", endpoint.nsid()))
             .body(Body::empty())
             .expect("request");
 
-        let response = test_router(false).oneshot(request).await.expect("route response");
+        let response = test_router(false)
+            .oneshot(request)
+            .await
+            .expect("route response");
         assert_eq!(
             response.status(),
             StatusCode::METHOD_NOT_ALLOWED,

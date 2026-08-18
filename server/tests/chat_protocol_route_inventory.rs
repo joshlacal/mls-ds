@@ -13,7 +13,10 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use catbird_server::{
     blob_store::BlobStore,
     chat_protocol::error::ChatEndpoint,
@@ -65,7 +68,10 @@ fn runtime() -> Arc<ChatRuntime> {
         std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
         std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
         std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
-        std::env::set_var("CHAT_CURSOR_SEALING_SECRET", URL_SAFE_NO_PAD.encode([0x22_u8; 32]));
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            URL_SAFE_NO_PAD.encode([0x22_u8; 32]),
+        );
         std::env::set_var(
             "CHAT_SUBSCRIPTION_ENDPOINT",
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
@@ -152,7 +158,11 @@ async fn every_clean_endpoint_is_registered_and_cutover_gated() {
             .await
             .expect("response body");
         let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!("{} returned non-JSON body {:?}: {error}", endpoint.nsid(), bytes)
+            panic!(
+                "{} returned non-JSON body {:?}: {error}",
+                endpoint.nsid(),
+                bytes
+            )
         });
         let expected = if *endpoint == ChatEndpoint::UploadBlob {
             "InvalidRequest"
