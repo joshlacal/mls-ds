@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{FromRef, State},
+    extract::{DefaultBodyLimit, FromRef, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Router,

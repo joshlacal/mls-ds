@@ -28,13 +28,12 @@ use uuid::Uuid;
 use self::outbound_body::{collect_bounded, ResponseBodyBudget};
 use super::validation::TrustedRequestInstant;
 
+use super::repository::relationship::RelationshipAuthorityStartupGuard;
+
 #[cfg(not(test))]
 use super::repository::{
     core::AllocatedProjectionRevisionGuard,
-    relationship::{
-        RelationshipAuthorityStartupGuard, RelationshipProjectionLoadGuard,
-        TrafficProjectionLoadGuard,
-    },
+    relationship::{RelationshipProjectionLoadGuard, TrafficProjectionLoadGuard},
 };
 
 #[cfg(not(test))]

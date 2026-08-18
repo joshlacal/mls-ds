@@ -42,6 +42,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
+#![allow(private_interfaces)]
 #![allow(deprecated)]
 
 #[cfg(all(feature = "server-bin", feature = "chat-protocol-production-proof"))]
