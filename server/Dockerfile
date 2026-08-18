@@ -23,6 +23,7 @@ RUN mkdir -p server/src codegen/src \
 # Copy source and build for real
 COPY server server
 COPY codegen codegen
+COPY lexicon lexicon
 RUN cargo build --release -p catbird-server
 
 # ---------- runtime ----------
