@@ -5,8 +5,7 @@
 //! is collected outside a mutation transaction and becomes usable only after
 //! the complete, exact projection is fenced again under that transaction.
 
-#[path = "../util/outbound_body.rs"]
-mod outbound_body;
+use crate::util::outbound_body;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};

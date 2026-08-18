@@ -35,6 +35,13 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
 #![allow(clippy::should_implement_trait)]
+#![allow(clippy::duplicate_mod)]
+#![allow(clippy::manual_map)]
+#![allow(clippy::unnecessary_to_owned)]
+#![allow(clippy::redundant_closure)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 #![allow(deprecated)]
 
 #[cfg(all(feature = "server-bin", feature = "chat-protocol-production-proof"))]
