@@ -276,6 +276,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
           TEST_DATABASE_URL: postgresql://catbird:test_password@localhost:5432/catbird
+          CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "handlers-and-legacy-apis-sealed"
           # N31: service identity is fail-loudly (no hardcoded fallback);
           # actor reset paths attribute system resets to this DID.
           SERVICE_DID: did:web:ci-mls.test

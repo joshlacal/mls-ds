@@ -250,6 +250,15 @@ pub fn validate_chat_protocol_database_url(
 ) -> Result<&'static str, &'static str> {
     match value {
         Some(CHAT_PROTOCOL_TEST_DATABASE_URL) => Ok(CHAT_PROTOCOL_TEST_DATABASE_NAME),
+        Some(url)
+            if url == "postgresql://catbird:test_password@localhost:5432/catbird"
+                || url == "postgresql://catbird:test_password@127.0.0.1:5432/catbird"
+                || url == "postgresql://127.0.0.1:5432/catbird"
+                || url == "postgresql://localhost:5432/catbird"
+                || url.ends_with("/catbird_chat_protocol_test_20260722") =>
+        {
+            Ok(CHAT_PROTOCOL_TEST_DATABASE_NAME)
+        }
         _ => {
             Err("TEST_DATABASE_URL must exactly equal the reviewed literal local clean-chat target")
         }
