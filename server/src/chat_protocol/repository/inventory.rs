@@ -2337,7 +2337,6 @@ const OWN_DEVICE_SNAPSHOT_TTL_MINUTES: i64 = 10;
 /// distinct variant: it collapses into `Invariant` exactly like every other
 /// terminal condition, so the wire cannot distinguish "wrong JKT" from "wrong
 /// generation" from "internal projection fault".
-#[cfg(not(test))]
 #[derive(Debug)]
 pub(crate) enum ExistingDeviceReadFacadeError {
     /// A database fault. Carries no protocol vocabulary.
@@ -2634,7 +2633,6 @@ fn read_facade_addressable_device(
 /// against the two ordered requester locks, holds those locks through the
 /// bounded audience/directory read, and ends the read-only transaction before
 /// returning consuming canonical JSON bytes.
-#[cfg(not(test))]
 pub(crate) async fn read_addressable_devices_for_admission(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
@@ -2664,7 +2662,6 @@ pub(crate) async fn read_addressable_devices_for_admission(
     outcome
 }
 
-#[cfg(not(test))]
 async fn read_addressable_devices_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
@@ -2706,7 +2703,6 @@ async fn read_addressable_devices_in_transaction(
 }
 
 /// One attempt's terminal disposition inside the fixed three-attempt loop.
-#[cfg(not(test))]
 enum OwnDeviceSnapshotOutcome {
     /// The device fence lost its race. Roll back, drop this attempt's proof, and
     /// use the next fixed array element.
@@ -2726,7 +2722,6 @@ enum OwnDeviceSnapshotOutcome {
 /// the loop is over the fixed `[ReadAdmissionAttempt; 3]` array, a fourth
 /// iteration is unrepresentable, and every retry rolls back the prior
 /// transaction and drops the prior row proof before taking the next element.
-#[cfg(not(test))]
 pub(crate) async fn create_own_device_snapshot_for_admission(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
