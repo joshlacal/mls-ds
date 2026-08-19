@@ -53,7 +53,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::realtime::{sse::StreamEvent, SseState};
+use crate::realtime::SseState;
 
 /// Bounded retry sequence (per §7 R3): 1h, 6h, 24h. After the 3rd attempt the
 /// row is `escalated_at` and stops being scanned.
@@ -383,75 +383,6 @@ async fn process_due_row(
         "reset-reminder broadcast: re-emitted crypto_session_reset_requested"
     );
 
-    // Step 3c: SSE rebroadcast. Persists `event_stream` row (cursor-based
-    // replay) and broadcasts to live subscribers. Gated by
-    // `EMIT_RESET_REQUESTED_EVENT` per Stage 1 conventions; flag-off
-    // suppresses SSE only — the delivery_events row above is durable
-    // either way.
-    let emit_flag = std::env::var("EMIT_RESET_REQUESTED_EVENT")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
-    if !emit_flag {
-        info!(
-            convo_id = %crate::crypto::redact_for_log(&row.conversation_id),
-            crypto_session_id = %row.crypto_session_id,
-            attempt = next_attempt_count,
-            "reset-reminder: EMIT_RESET_REQUESTED_EVENT=false — \
-             delivery_events row persisted, SSE broadcast suppressed"
-        );
-        return Ok(());
-    }
-
-    let trigger_str = reminder_payload
-        .get("trigger")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let reason_str = reminder_payload
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let expected_new_mls_group_id = reminder_payload
-        .get("expected_new_mls_group_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let cursor = sse_state
-        .cursor_gen
-        .next(&row.conversation_id, "resetRequestedEvent")
-        .await;
-    let event = StreamEvent::ResetRequestedEvent {
-        cursor,
-        convo_id: row.conversation_id.clone(),
-        crypto_session_id: row.crypto_session_id.clone(),
-        generation: row.generation,
-        trigger: trigger_str,
-        request_event_id: row.request_event_id.clone(),
-        expected_new_mls_group_id,
-        reason: reason_str,
-        // Preserve the ORIGINAL request's `requested_at` so re-emitted
-        // reminders are distinguishable from the first ping. Clients
-        // compute reset-age from this timestamp; using `Utc::now()`
-        // would make every reminder look like a freshly-issued reset.
-        requested_at: row
-            .requested_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-    };
-
-    if let Err(e) = crate::db::store_event(pool, &row.conversation_id, &event).await {
-        warn!(
-            convo_id = %crate::crypto::redact_for_log(&row.conversation_id),
-            error = ?e,
-            "reset-reminder: store_event failed; broadcast still attempted"
-        );
-    }
-    if let Err(e) = sse_state.emit(&row.conversation_id, event).await {
-        warn!(
-            convo_id = %crate::crypto::redact_for_log(&row.conversation_id),
-            error = %e,
-            "reset-reminder: SSE emit failed"
-        );
-    }
-
+    let _ = (pool, sse_state, reminder_payload);
     Ok(())
 }

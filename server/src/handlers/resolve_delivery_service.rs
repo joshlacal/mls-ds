@@ -16,7 +16,7 @@ pub struct ResolveDeliveryServiceOutput<'a> {
     supported_cipher_suites: Option<Vec<jacquard_common::CowStr<'a>>>,
 }
 
-/// GET /xrpc/blue.catbird.mlsChat.resolveDeliveryService
+/// GET /xrpc/blue.catbird.chat.resolveDeliveryService
 ///
 /// Client-facing endpoint to resolve a user's delivery service endpoint.
 #[tracing::instrument(skip(pool, _auth_user, query))]

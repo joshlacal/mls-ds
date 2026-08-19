@@ -11,7 +11,7 @@ use super::messages::{
 };
 use crate::config::QuorumConfig;
 use crate::notifications::NotificationService;
-use crate::realtime::{SseState, StreamEvent, StreamMessageView};
+use crate::realtime::SseState;
 use tokio::sync::mpsc;
 
 /// Service DID used as `last_reset_by` for system-initiated auto-resets
@@ -503,7 +503,7 @@ impl ConversationActorState {
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
             let commit_shape =
-                crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&commit_bytes)
+                crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
                     .context("Invalid commit framing")?;
             if commit_shape.epoch != self.current_epoch as u64 {
                 anyhow::bail!(
@@ -731,7 +731,7 @@ impl ConversationActorState {
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
             let commit_shape =
-                crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&commit_bytes)
+                crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
                     .context("Invalid commit framing")?;
             if commit_shape.epoch != self.current_epoch as u64 {
                 anyhow::bail!(
@@ -1501,26 +1501,6 @@ impl ConversationActorState {
             .await
             {
                 error!("[actor:record_reset_vote] failed to latch breaker: {}", e);
-            }
-            // Emit SSE CircuitBreakerTrippedEvent for observability.
-            let tripped_at =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let cb_cursor = self
-                .sse_state
-                .cursor_gen
-                .next(&self.convo_id, "circuitBreakerTrippedEvent")
-                .await;
-            let cb_event = StreamEvent::CircuitBreakerTrippedEvent {
-                cursor: cb_cursor.clone(),
-                convo_id: self.convo_id.clone(),
-                reset_count: recent_reset_count as i32,
-                tripped_at,
-            };
-            if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &cb_event).await {
-                error!("[actor:record_reset_vote] store cb event: {:?}", e);
-            }
-            if let Err(e) = self.sse_state.emit(&self.convo_id, cb_event).await {
-                error!("[actor:record_reset_vote] SSE emit cb: {}", e);
             }
 
             return Ok(RecordResetVoteOutcome {
@@ -2503,28 +2483,6 @@ impl ConversationActorState {
         self.current_epoch = 0;
         self.unread_counts.clear();
 
-        // Emit SSE GroupResetEvent.
-        let cursor = self
-            .sse_state
-            .cursor_gen
-            .next(&self.convo_id, "groupResetEvent")
-            .await;
-        let event = StreamEvent::GroupResetEvent {
-            cursor: cursor.clone(),
-            convo_id: self.convo_id.clone(),
-            new_group_id: new_group_id.clone(),
-            reset_generation: reset_count,
-            reset_by: last_reset_by.to_string(),
-            cipher_suite: cipher_suite.unwrap_or_default(),
-            reason: Some(event_reason.to_string()),
-        };
-        if let Err(e) = crate::db::store_event(&self.db_pool, &self.convo_id, &event).await {
-            error!("[actor:do_reset_group] store GroupResetEvent: {:?}", e);
-        }
-        if let Err(e) = self.sse_state.emit(&self.convo_id, event).await {
-            error!("[actor:do_reset_group] SSE emit GroupReset: {}", e);
-        }
-
         // Spec invariant: post-reset rows must have group_info=NULL until a
         // bootstrapResetGroup call populates it.
         info!(
@@ -2537,11 +2495,11 @@ impl ConversationActorState {
     }
 }
 
-/// Helper function to handle serialized notification delivery (Push + SSE + Envelopes)
+/// Helper function to handle serialized notification delivery (Push + Envelopes)
 /// This is called sequentially by the background worker.
 async fn handle_notify_new_message(
     pool: &sqlx::PgPool,
-    sse_state: &SseState,
+    _sse_state: &SseState,
     broadcaster_pool: &BroadcasterPool,
     notification_service: Option<&crate::notifications::NotificationService>,
     convo_id: &str,
@@ -2581,39 +2539,7 @@ async fn handle_notify_new_message(
         }
     }
 
-    // 2. SSE Emission
-    let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
-
-    let message_view: StreamMessageView = crate::generated::blue_catbird::mlsChat::MessageView {
-        id: msg_id.to_string().into(),
-        convo_id: convo_id.to_string().into(),
-        ciphertext: bytes::Bytes::from(ciphertext.to_vec()),
-        epoch,
-        seq,
-        created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
-        message_type: Some("app".into()),
-        receipt_wire: None,
-        reset_generation: None,
-        extra_data: Default::default(),
-    };
-
-    let event = StreamEvent::MessageEvent {
-        cursor: cursor.clone(),
-        message: message_view,
-        ephemeral: is_ephemeral,
-    };
-
-    if !is_ephemeral {
-        if let Err(e) = crate::db::store_event(pool, convo_id, &event).await {
-            error!("❌ [actor:worker] Failed to store event: {:?}", e);
-        }
-    }
-
-    if let Err(e) = sse_state.emit(convo_id, event).await {
-        error!("❌ [actor:worker] Failed to emit SSE event: {}", e);
-    }
-
-    // 3. Push Notifications (Serialized!)
+    // 2. Push Notifications (Serialized!)
     if !is_ephemeral {
         if let Some(ns) = notification_service {
             // This await is CRITICAL. It ensures we don't start the next push
@@ -2630,16 +2556,12 @@ async fn handle_notify_new_message(
 
 async fn handle_notify_system_message(
     pool: &sqlx::PgPool,
-    sse_state: &SseState,
+    _sse_state: &SseState,
     broadcaster_pool: &BroadcasterPool,
     convo_id: &str,
     msg_id: &str,
     _message_type: &str,
 ) {
-    // For commits, we just need to ensure envelopes and SSE are sent.
-    // We don't typically send push for commits unless they are important?
-    // For now, mirroring legacy behavior which is likely just SSE/Envelopes.
-
     let members_result = sqlx::query_scalar::<_, String>(
         "SELECT member_did FROM members WHERE convo_id = $1 AND left_at IS NULL",
     )
@@ -2655,63 +2577,6 @@ async fn handle_notify_system_message(
             error!(
                 "❌ [actor:worker] Failed to fan out system message envelopes: {:?}",
                 e
-            );
-        }
-    }
-
-    // 2. SSE — fetch the commit message row and emit it to live subscribers
-    let msg_row = sqlx::query_as::<_, (Vec<u8>, i32, i64, chrono::DateTime<chrono::Utc>)>(
-        "SELECT ciphertext, epoch, seq, created_at FROM messages WHERE id = $1",
-    )
-    .bind(msg_id)
-    .fetch_optional(pool)
-    .await;
-
-    match msg_row {
-        Ok(Some((ciphertext, epoch, seq, created_at))) => {
-            let cursor = sse_state.cursor_gen.next(convo_id, "messageEvent").await;
-
-            let message_view: StreamMessageView =
-                crate::generated::blue_catbird::mlsChat::MessageView {
-                    id: msg_id.to_string().into(),
-                    convo_id: convo_id.to_string().into(),
-                    ciphertext: bytes::Bytes::from(ciphertext),
-                    epoch: epoch.into(),
-                    seq,
-                    created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
-                    message_type: Some(_message_type.to_string().into()),
-                    receipt_wire: None,
-                    reset_generation: None,
-                    extra_data: Default::default(),
-                };
-
-            let event = StreamEvent::MessageEvent {
-                cursor: cursor.clone(),
-                message: message_view,
-                ephemeral: false,
-            };
-
-            if let Err(e) = crate::db::store_event(pool, convo_id, &event).await {
-                error!("❌ [actor:worker] Failed to store system event: {:?}", e);
-            }
-
-            if let Err(e) = sse_state.emit(convo_id, event).await {
-                error!(
-                    "❌ [actor:worker] Failed to emit system message SSE event: {}",
-                    e
-                );
-            }
-        }
-        Ok(None) => {
-            error!(
-                "❌ [actor:worker] System message {} not found in DB",
-                msg_id
-            );
-        }
-        Err(e) => {
-            error!(
-                "❌ [actor:worker] Failed to fetch system message {}: {:?}",
-                msg_id, e
             );
         }
     }

@@ -1,5 +1,8 @@
 use sha2::{Digest, Sha256};
 
+pub mod commit_inspect;
+pub use commit_inspect::{inspect_commit_shape, CommitInspectError, CommitShape};
+
 /// Hash a value for logging/privacy (8-byte truncated SHA256)
 pub fn hash_for_log(input: &str) -> String {
     let mut hasher = Sha256::new();

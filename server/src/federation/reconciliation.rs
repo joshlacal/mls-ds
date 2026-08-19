@@ -368,7 +368,7 @@ async fn apply_remote_events(
 ) -> Result<(), sqlx::Error> {
     for event in events {
         let wire_epoch = if event.message_type == "commit" {
-            crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(&event.ciphertext)
+            crate::crypto::commit_inspect::inspect_commit_shape(&event.ciphertext)
                 .ok()
                 .map(|shape| shape.epoch as i64)
         } else {

@@ -134,6 +134,7 @@ const EXTERNAL_BASE: &str = "https://chat.example.net";
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
+    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -145,6 +146,12 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Arc<ChatRuntime> {
         state.runtime.clone()
+    }
+}
+
+impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
+    fn from_ref(state: &TestState) -> catbird_server::blob_store::BlobStore {
+        state.blob_store.clone()
     }
 }
 
@@ -166,6 +173,18 @@ fn ensure_verifier_env() {
         std::env::set_var("CHAT_NEST_VERIFYING_KEY", STANDARD.encode(point.as_bytes()));
         std::env::set_var("CHAT_INSTANCE_ID", CHAT_INSTANCE);
         std::env::set_var("CHAT_EXTERNAL_BASE", EXTERNAL_BASE);
+        std::env::set_var(
+            "CHAT_CURSOR_KEY_ID",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+        );
     });
 }
 
@@ -182,13 +201,17 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    Arc::new(ChatRuntime::from_env().expect("build clean-chat runtime"))
+    Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("build clean-chat runtime"),
+    )
 }
 
 fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: runtime(cutover_enabled),
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     })
 }
 

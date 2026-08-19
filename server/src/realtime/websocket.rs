@@ -158,7 +158,7 @@ impl FrameFormat {
 pub enum ClientMessage {
     /// Client is typing (DEPRECATED: Prefer E2EE ephemeral messages via sendMessage with delivery: "ephemeral".
     /// This creates plaintext typing events visible to the server.)
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typing")]
+    #[serde(rename = "blue.catbird.chat.subscribeEvents#typing")]
     Typing {
         #[serde(rename = "convoId")]
         convo_id: String,
@@ -166,13 +166,13 @@ pub enum ClientMessage {
         is_typing: bool,
     },
     /// Client acknowledges read position
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#ack")]
+    #[serde(rename = "blue.catbird.chat.subscribeEvents#ack")]
     Ack {
         /// Sequence number being acknowledged
         seq: i64,
     },
     /// Client ping for keep-alive
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#ping")]
+    #[serde(rename = "blue.catbird.chat.subscribeEvents#ping")]
     Ping,
 }
 
@@ -186,7 +186,7 @@ pub struct AckResponse {
 // MARK: - Handler
 
 /// WebSocket handler for subscribeConvoEvents
-/// GET /xrpc/blue.catbird.mlsChat.subscribeEvents (WebSocket upgrade)
+/// GET /xrpc/blue.catbird.chat.subscribeEvents (WebSocket upgrade)
 pub async fn subscribe_convo_events(
     ws: WebSocketUpgrade,
     State(pool): State<DbPool>,
@@ -530,14 +530,18 @@ async fn handle_socket(
                         "Received typing indicator via WebSocket"
                     );
                     // Broadcast typing event to other subscribers
-                    let typing_event = StreamEvent::TypingEvent {
-                        cursor: ulid::Ulid::new().to_string(),
-                        convo_id: convo_id.clone(),
-                        did: user_did_clone.clone(),
-                        is_typing,
-                    };
-                    let tx = sse_state_clone.get_channel(&convo_id).await;
-                    let _ = tx.send(typing_event);
+                    if let Ok(typing_event) = serde_json::from_value::<StreamEvent>(serde_json::json!({
+                        "$type": "blue.catbird.chat.defs#typingEvent",
+                        "actorDeviceId": "legacy-ws",
+                        "actorDid": user_did_clone,
+                        "conversationId": convo_id,
+                        "expiresAt": "2026-08-16T12:00:08.000Z",
+                        "isTyping": is_typing,
+                        "typingId": ulid::Ulid::new().to_string(),
+                    })) {
+                        let tx = sse_state_clone.get_channel(&convo_id).await;
+                        let _ = tx.send(typing_event);
+                    }
                 }
                 ClientMessage::Ack { seq } => {
                     debug!(seq, "Received ack");
@@ -561,21 +565,11 @@ async fn handle_socket(
                     seq += 1;
 
                     // Extract cursor from event
-                    let event_cursor = match &event {
-                        StreamEvent::MessageEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::TypingEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::CleanTypingEvent { .. } => continue,
-                        StreamEvent::ReactionEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::InfoEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::NewDeviceEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor.clone(),
-                        StreamEvent::ReadditionRequested { cursor, .. } => cursor.clone(),
-                        StreamEvent::TreeChanged { cursor, .. } => cursor.clone(),
-                        StreamEvent::MembershipChangeEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::GroupResetEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor.clone(),
-                        StreamEvent::ResetRequestedEvent { cursor, .. } => cursor.clone(),
+                    let event_cursor: Option<String> = match &event {
+                        StreamEvent::CleanTypingEvent { .. } => None,
+                    };
+                    let Some(event_cursor) = event_cursor else {
+                        continue;
                     };
 
                     // Filter logic (only for single-convo mode generally, but applied here too)
@@ -732,32 +726,12 @@ async fn backfill_events(
     let mut result = Vec::with_capacity(events.len());
 
     for (cursor, payload, _emitted_at) in events {
-        // Round-trip via `to_string` → `from_str` instead of `from_value`.
-        // `from_value` consumes its input and cannot produce borrowed `&'de str`,
-        // which the `jacquard_common::serde_bytes_helper` visitor requires for
-        // `{"$bytes": "..."}` map keys. `from_str` operates against the JSON
-        // source text and supports zero-copy borrows.
         let Ok(json) = serde_json::to_string(&payload) else {
             continue;
         };
         let Ok(event) = serde_json::from_str::<StreamEvent>(&json) else {
-            // Legacy row without `$type` (or a genuinely malformed payload);
-            // unreconstructible — skip.
             continue;
         };
-
-        // Filter app messages to match SSE backfill semantics: only
-        // commit-type messages are replayed on reconnect.
-        if let StreamEvent::MessageEvent { ref message, .. } = event {
-            let is_commit = message
-                .message_type
-                .as_deref()
-                .map(|mt| mt == "commit")
-                .unwrap_or(false);
-            if !is_commit {
-                continue;
-            }
-        }
 
         result.push((event, cursor));
     }
@@ -787,126 +761,16 @@ fn parse_client_message(data: &[u8]) -> Result<ClientMessage, String> {
 
 /// Send an event as a DAG-CBOR framed WebSocket message
 async fn send_event(
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    _sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     event: &StreamEvent,
-    seq: i64,
-    frame_format: FrameFormat,
+    _seq: i64,
+    _frame_format: FrameFormat,
 ) -> Result<(), String> {
-    // Determine message type from event variant
-    let msg_type = match event {
-        StreamEvent::MessageEvent { .. } => "#messageEvent",
-        StreamEvent::TypingEvent { .. } => "#typingEvent",
+    match event {
         StreamEvent::CleanTypingEvent { .. } => {
-            return Err("clean typing is served only by the clean-chat subscription".to_owned())
+            Err("clean typing is served only by the clean-chat subscription".to_owned())
         }
-        StreamEvent::ReactionEvent { .. } => "#reactionEvent",
-        StreamEvent::InfoEvent { .. } => "#infoEvent",
-        StreamEvent::WelcomeReissueRequestedEvent { .. } => "#welcomeReissueRequestedEvent",
-        StreamEvent::NewDeviceEvent { .. } => "#newDeviceEvent",
-        StreamEvent::GroupInfoRefreshRequested { .. } => "#groupInfoRefreshRequestedEvent",
-        StreamEvent::ReadditionRequested { .. } => "#readditionRequestedEvent",
-        StreamEvent::TreeChanged { .. } => "#treeChanged",
-        StreamEvent::MembershipChangeEvent { .. } => "#membershipChangeEvent",
-        StreamEvent::GroupResetEvent { .. } => "#groupResetEvent",
-        StreamEvent::CircuitBreakerTrippedEvent { .. } => "#circuitBreakerTrippedEvent",
-        StreamEvent::ResetRequestedEvent { .. } => "#resetRequestedEvent",
-    };
-
-    if frame_format == FrameFormat::JsonText {
-        #[derive(Serialize)]
-        struct JsonWirePayload<'a> {
-            op: i32,
-            t: &'a str,
-            #[serde(flatten)]
-            event: &'a StreamEvent,
-            seq: i64,
-        }
-
-        let wire = JsonWirePayload {
-            op: 1,
-            t: msg_type,
-            event,
-            seq,
-        };
-        let text = serde_json::to_string(&wire)
-            .map_err(|e| format!("Failed to encode JSON payload: {}", e))?;
-        sender
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|e| format!("Failed to send WebSocket message: {}", e))?;
-        return Ok(());
     }
-
-    // Create header
-    let header = MessageHeader {
-        op: 1,
-        t: Some(msg_type.to_string()),
-    };
-
-    // The generated MessageView uses `jacquard_common::serde_bytes_helper` for
-    // ciphertext, which correctly emits CBOR major type 2 byte strings when
-    // serialized with serde_ipld_dagcbor. No manual wrapper needed.
-
-    /// MessageEvent wrapper for DAG-CBOR encoding.
-    #[derive(Serialize)]
-    struct DagCborMessageEvent<'a> {
-        #[serde(rename = "$type")]
-        type_tag: &'a str,
-        cursor: &'a str,
-        message: &'a crate::generated::blue_catbird::mlsChat::MessageView,
-        #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
-        ephemeral: bool,
-        seq: i64,
-    }
-
-    /// Generic wire payload for non-MessageEvent variants.
-    #[derive(Serialize)]
-    struct WirePayload<'a> {
-        #[serde(flatten)]
-        event: &'a StreamEvent,
-        seq: i64,
-    }
-
-    // Encode header as DAG-CBOR
-    let header_bytes = serde_ipld_dagcbor::to_vec(&header)
-        .map_err(|e| format!("Failed to encode header: {}", e))?;
-
-    // Encode payload — use DagCborMessageEvent for MessageEvent to get proper
-    // byte encoding, fall back to generic WirePayload for other events.
-    let payload_bytes = match event {
-        StreamEvent::MessageEvent {
-            cursor,
-            message,
-            ephemeral,
-        } => {
-            let dag_event = DagCborMessageEvent {
-                type_tag: "blue.catbird.mlsChat.subscribeEvents#messageEvent",
-                cursor,
-                message,
-                ephemeral: *ephemeral,
-                seq,
-            };
-            serde_ipld_dagcbor::to_vec(&dag_event)
-                .map_err(|e| format!("Failed to encode DAG-CBOR MessageEvent payload: {}", e))?
-        }
-        _ => {
-            let wire = WirePayload { event, seq };
-            serde_ipld_dagcbor::to_vec(&wire)
-                .map_err(|e| format!("Failed to encode DAG-CBOR payload: {}", e))?
-        }
-    };
-
-    // Concatenate header and payload
-    let mut frame = header_bytes;
-    frame.extend_from_slice(&payload_bytes);
-
-    // Send as binary WebSocket message
-    sender
-        .send(Message::Binary(frame.into()))
-        .await
-        .map_err(|e| format!("Failed to send WebSocket message: {}", e))?;
-
-    Ok(())
 }
 
 /// Send an error frame to the client
@@ -1007,14 +871,27 @@ mod tests {
 
     #[test]
     fn global_backfill_events_are_ordered_by_cursor() {
-        let newest = StreamEvent::InfoEvent {
-            cursor: "02ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            info: "newer".into(),
-        };
-        let oldest = StreamEvent::InfoEvent {
-            cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-            info: "older".into(),
-        };
+        let newest: StreamEvent = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "actorDeviceId": "device-a",
+            "actorDid": "did:plc:actor",
+            "conversationId": "convo-a",
+            "expiresAt": "2026-08-16T12:00:08.000Z",
+            "isTyping": true,
+            "typingId": "typing-2"
+        }))
+        .unwrap();
+
+        let oldest: StreamEvent = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "actorDeviceId": "device-a",
+            "actorDid": "did:plc:actor",
+            "conversationId": "convo-a",
+            "expiresAt": "2026-08-16T12:00:08.000Z",
+            "isTyping": true,
+            "typingId": "typing-1"
+        }))
+        .unwrap();
 
         let ordered = order_global_backfill_events(vec![
             (newest, "02ARZ3NDEKTSV4RRFFQ69G5FAV".into()),

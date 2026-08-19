@@ -278,7 +278,7 @@ pub struct FederationConfig {
     /// Issue mode validates this document against both configured signing
     /// keys before startup can complete.
     pub receipt_did_document_json: Option<String>,
-    /// Fallback DS endpoint for users without a `blue.catbird.mlsChat.profile` record.
+    /// Fallback DS endpoint for users without a `blue.catbird.chat.profile` record.
     pub default_ds_endpoint: Option<String>,
     pub endpoint_cache_ttl_secs: u64,
     pub outbound_timeout_secs: u64,

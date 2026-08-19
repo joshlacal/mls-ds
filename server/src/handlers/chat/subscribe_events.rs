@@ -200,7 +200,6 @@ async fn stream(
                             return;
                         }
                     }
-                    Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,

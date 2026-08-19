@@ -195,62 +195,49 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
     use DeviceAuthEndpointClass::{Bootstrap, Canary, Enrollment, Mutation, Read};
 
     Some(match nsid {
-        "blue.catbird.mlsChat.beginDeviceAuthBinding"
-        | "blue.catbird.mlsChat.completeDeviceAuthBinding" => Enrollment,
+        // Enrollment
+        "blue.catbird.chat.enrollDevice"
+        | "blue.catbird.chat.rebindDeviceAuthentication" => Enrollment,
 
-        "blue.catbird.mlsChat.registerDevice"
-        | "blue.catbird.mlsChat.registerDeviceToken"
-        | "blue.catbird.mlsChat.publishKeyPackages"
-        | "blue.catbird.mlsChat.reconcileKeyPackages" => Bootstrap,
+        // Bootstrap
+        "blue.catbird.chat.replenishKeyPackages" => Bootstrap,
 
-        "blue.catbird.mlsChat.getKeyPackageStatus"
-        | "blue.catbird.mlsChat.getPendingDevices"
-        | "blue.catbird.mlsChat.listDevices"
-        | "blue.catbird.mlsChat.getConvos"
-        | "blue.catbird.mlsChat.getMessages"
-        | "blue.catbird.mlsChat.getGroupHealth"
-        | "blue.catbird.mlsChat.getGroupState"
-        | "blue.catbird.mlsChat.getWelcomeReissueStatus"
-        | "blue.catbird.mlsChat.getConvoSettings"
-        | "blue.catbird.mlsChat.checkBlocks"
-        | "blue.catbird.mlsChat.getBlockStatus"
-        | "blue.catbird.mlsChat.getDeliveryStatus"
-        | "blue.catbird.mlsChat.getBlob"
-        | "blue.catbird.mlsChat.getBlobUsage"
-        | "blue.catbird.mlsChat.getGroupMetadataBlob"
-        | "blue.catbird.mlsChat.getSubscriptionTicket"
-        | "blue.catbird.mlsChat.subscribeEvents"
-        | "blue.catbird.mlsChat.getGroupInfo"
-        | "blue.catbird.mlsChat.getKeyPackageStats" => Read,
+        // Read
+        "blue.catbird.chat.getBlob"
+        | "blue.catbird.chat.getBlobUsage"
+        | "blue.catbird.chat.getConversationState"
+        | "blue.catbird.chat.getConversations"
+        | "blue.catbird.chat.getDevices"
+        | "blue.catbird.chat.getEntries"
+        | "blue.catbird.chat.getLeafRecoveryInbox"
+        | "blue.catbird.chat.getOwnDevices"
+        | "blue.catbird.chat.getPendingWelcomes"
+        | "blue.catbird.chat.getSubscriptionTicket"
+        | "blue.catbird.chat.subscribeEvents" => Read,
 
-        // Low-impact mutation used to prove enforcement before the complete
-        // state-transition set moves from Enroll to Require.
-        "blue.catbird.mlsChat.updateCursor" => Canary,
+        // Canary
+        "blue.catbird.chat.publishTyping" => Canary,
 
-        "blue.catbird.mlsChat.getKeyPackages"
-        | "blue.catbird.mlsChat.invalidateKeyPackage"
-        | "blue.catbird.mlsChat.reissueWelcome"
-        | "blue.catbird.mlsChat.reissueWelcomeRespond"
-        | "blue.catbird.mlsChat.removeDevice"
-        | "blue.catbird.mlsChat.createConvo"
-        | "blue.catbird.mlsChat.sendMessage"
-        | "blue.catbird.mlsChat.bootstrapResetGroup"
-        | "blue.catbird.mlsChat.commitGroupChange"
-        | "blue.catbird.mlsChat.addMembers"
-        | "blue.catbird.mlsChat.removeMembers"
-        | "blue.catbird.mlsChat.processExternalCommit"
-        | "blue.catbird.mlsChat.publishGroupInfo"
-        | "blue.catbird.mlsChat.reportRecoveryFailure"
-        | "blue.catbird.mlsChat.resetGroup"
-        | "blue.catbird.mlsChat.leaveConvo"
-        | "blue.catbird.mlsChat.updateConvo"
-        | "blue.catbird.mlsChat.optIn"
-        | "blue.catbird.mlsChat.reportSpam"
-        | "blue.catbird.mlsChat.deleteBlob"
-        | "blue.catbird.mlsChat.putGroupMetadataBlob"
-        | "blue.catbird.mlsChat.uploadBlob"
-        | "blue.catbird.mlsChat.requestFailover" => Mutation,
-        "blue.catbird.mlsChat.syncKeyPackages" => Bootstrap,
+        // Mutation
+        "blue.catbird.chat.acceptConversation"
+        | "blue.catbird.chat.acknowledgeWelcome"
+        | "blue.catbird.chat.activateReset"
+        | "blue.catbird.chat.cancelLeafRecovery"
+        | "blue.catbird.chat.cancelLeave"
+        | "blue.catbird.chat.closeConversation"
+        | "blue.catbird.chat.createConversation"
+        | "blue.catbird.chat.deleteBlob"
+        | "blue.catbird.chat.prepareBlobUpload"
+        | "blue.catbird.chat.rejectWelcome"
+        | "blue.catbird.chat.reportRecoveryFailure"
+        | "blue.catbird.chat.requestLeafRecovery"
+        | "blue.catbird.chat.requestLeave"
+        | "blue.catbird.chat.requestReset"
+        | "blue.catbird.chat.revokeDevice"
+        | "blue.catbird.chat.sendMessage"
+        | "blue.catbird.chat.submitTransition"
+        | "blue.catbird.chat.uploadBlob" => Mutation,
+
         _ => return None,
     })
 }

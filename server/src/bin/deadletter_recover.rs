@@ -209,7 +209,7 @@ async fn recover_reset(pool: &PgPool, args: &Args) -> Result<serde_json::Value> 
     .bind(&request_id)
     .bind(&args.convo_id)
     .bind(json!({
-        "$type": "blue.catbird.mlsChat.subscribeEvents#groupResetEvent",
+        "$type": "blue.catbird.chat.subscribeEvents#resetRequestedEvent",
         "cursor": request_id,
         "convoId": args.convo_id,
         "newGroupId": new_group_id,

@@ -527,146 +527,7 @@ where
 /// defensively (mirrors the inline `continue` at
 /// `bootstrap_reset_group.rs:569`). `kp_hashes` empty ⇒ no-op `Ok(())`.
 ///
-/// Caller owns the transaction's commit/rollback — this only stages
-/// the per-row INSERTs.
-///
-/// Note: jacquard generates a separate `KeyPackageHashEntry` struct
-/// per lexicon module. This helper takes the
-/// `bootstrap_reset_group::KeyPackageHashEntry` form to match the
-/// test contract; call sites holding the `commit_group_change` form
-/// (e.g. `addMembers`, `processExternalCommit` arms) must convert at
-/// the boundary. A future refactor can hoist the helper to a trait if
-/// the duplication becomes onerous.
-pub async fn store_welcomes_per_device_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    convo_id: &str,
-    welcome_bytes: &[u8],
-    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry],
-    sender_did: &str,
-) -> sqlx::Result<()> {
-    for entry in kp_hashes {
-        let recipient = crate::sqlx_jacquard::did_to_string(&entry.did);
-        let hash_hex: &str = &entry.hash;
-        let hash_bytes = match hex::decode(hash_hex) {
-            Ok(b) => b,
-            Err(_) => continue, // Defensive: skip malformed hex (mirrors bootstrap_reset_group:569).
-        };
-        let recipient_device_id =
-            resolve_device_id_for_key_package_hash(&mut **tx, &recipient, hash_hex).await?;
-        let welcome_id = Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO welcome_messages \
-                (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), false) \
-             ON CONFLICT (convo_id, recipient_did, COALESCE(key_package_hash, '\\x00'::bytea)) WHERE consumed = false \
-             DO UPDATE SET \
-                recipient_device_id = COALESCE(welcome_messages.recipient_device_id, EXCLUDED.recipient_device_id)",
-        )
-        .bind(&welcome_id)
-        .bind(convo_id)
-        .bind(&recipient)
-        .bind(recipient_device_id.as_deref())
-        .bind(welcome_bytes)
-        .bind(Some(hash_bytes))
-        .bind(sender_did)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
 
-/// Insert one `members` row per `KeyPackageHashEntry` with per-device
-/// representation: `member_did = "{user_did}#{device_id}"` when the
-/// `(owner_did, key_package_hash)` lookup in `key_packages` resolves a
-/// `device_id`, otherwise falling back to user-flat semantics
-/// (`member_did = user_did`, `device_id = NULL`).
-///
-/// This mirrors the schema's per-device design documented in
-/// `migrations/20250101000000_greenfield_schema.sql:108-110`:
-/// `member_did` is the device-specific MLS identity, `user_did` is the
-/// bare DID linking devices belonging to the same user.
-///
-/// Lookup notes (the gotchas Task 6's tests pin down):
-///   - `key_packages.key_package_hash` is `TEXT` (hex string), NOT
-///     `BYTEA` like `welcome_messages.key_package_hash`. Bind
-///     `entry.hash` directly — don't `hex::decode`. Decoding gives you
-///     bytes the lookup can never match, silently shunting every row
-///     into the user-flat fallback.
-///   - There's no UNIQUE on `(owner_did, key_package_hash)` in
-///     `key_packages`, so the lookup adds `ORDER BY created_at DESC
-///     LIMIT 1` to keep the device_id deterministic across reruns.
-///   - `members.member_did` is plain `TEXT`, not jacquard's `Did`,
-///     so the `#`-bearing device-form DID is a legitimate column value
-///     even though `Did` rejects `#` at the type level.
-///
-/// ON CONFLICT clears `left_at` and `needs_rejoin`, mirroring the
-/// existing inline addMembers re-add pattern at
-/// `commit_group_change.rs:597-616` so post-leave rejoins are
-/// idempotent.
-///
-/// Empty `kp_hashes` slice ⇒ no-op `Ok(())` (consistent with the
-/// welcomes helper).
-///
-/// Caller owns the transaction's commit/rollback.
-///
-/// Note: jacquard generates a separate `KeyPackageHashEntry` struct
-/// per lexicon module — this helper takes the
-/// `bootstrap_reset_group::KeyPackageHashEntry` form to match the
-/// welcomes helper and Task 6's test contract; call sites holding the
-/// `commit_group_change` form (e.g. `addMembers`) convert at the
-/// boundary via a mechanical field copy (see Task 3 commit a60b8af).
-pub async fn insert_members_per_device_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    convo_id: &str,
-    kp_hashes: &[crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry],
-    joined_at: chrono::DateTime<chrono::Utc>,
-    is_admin: bool,
-) -> sqlx::Result<()> {
-    for entry in kp_hashes {
-        let user_did = crate::sqlx_jacquard::did_to_string(&entry.did);
-        let hash_hex: &str = &entry.hash;
-
-        // Look up device_id. `key_packages.key_package_hash` is TEXT (hex string),
-        // so bind `hash_hex` directly — DO NOT `hex::decode`. ORDER BY ... DESC
-        // LIMIT 1 keeps the result deterministic given there's no UNIQUE on
-        // (owner_did, key_package_hash). `query_scalar` over `Option<String>`
-        // returns Result<Option<Option<String>>> — outer is "row exists",
-        // inner is "value non-null"; flatten to a plain Option<String>.
-        let device_id_opt: Option<String> = sqlx::query_scalar(
-            "SELECT device_id FROM key_packages \
-             WHERE owner_did = $1 AND key_package_hash = $2 \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(&user_did)
-        .bind(hash_hex)
-        .fetch_optional(&mut **tx)
-        .await?
-        .flatten();
-
-        let member_did = match &device_id_opt {
-            Some(d) => format!("{}#{}", user_did, d),
-            None => user_did.clone(),
-        };
-
-        sqlx::query(
-            r#"INSERT INTO members
-                 (convo_id, member_did, user_did, device_id, joined_at, is_admin)
-               VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (convo_id, member_did) DO UPDATE SET
-                 left_at = NULL,
-                 needs_rejoin = false"#,
-        )
-        .bind(convo_id)
-        .bind(&member_did)
-        .bind(&user_did)
-        .bind(device_id_opt.as_deref())
-        .bind(joined_at)
-        .bind(is_admin)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
 
 /// Snapshot of the post-bump health counters returned by
 /// [`record_commit_409`]. Used by the inline trigger path
@@ -3206,47 +3067,21 @@ pub async fn create_envelope(
 /// Short event_type string (column value in `event_stream`) for a StreamEvent variant.
 ///
 /// Matches the suffix of the `$type` tag emitted over the wire (e.g.
-/// `"messageEvent"` for `blue.catbird.mlsChat.subscribeEvents#messageEvent`).
+/// `"messageAvailableEvent"` for `blue.catbird.chat.subscribeEvents#messageAvailableEvent`).
 /// Used for filtering queries (`compact_cursors`, ad-hoc inspection) and to
 /// preserve backward compatibility with the `event_type` column that pre-dates
 /// the stored `$type` tag in the payload.
 pub fn stream_event_type_str(event: &crate::realtime::sse::StreamEvent) -> &'static str {
     use crate::realtime::sse::StreamEvent;
     match event {
-        StreamEvent::MessageEvent { .. } => "messageEvent",
-        StreamEvent::TypingEvent { .. } => "typingEvent",
         StreamEvent::CleanTypingEvent { .. } => "cleanTypingEvent",
-        StreamEvent::ReactionEvent { .. } => "reactionEvent",
-        StreamEvent::InfoEvent { .. } => "infoEvent",
-        StreamEvent::WelcomeReissueRequestedEvent { .. } => "welcomeReissueRequestedEvent",
-        StreamEvent::NewDeviceEvent { .. } => "newDeviceEvent",
-        StreamEvent::GroupInfoRefreshRequested { .. } => "groupInfoRefreshRequestedEvent",
-        StreamEvent::ReadditionRequested { .. } => "readditionRequestedEvent",
-        StreamEvent::TreeChanged { .. } => "treeChanged",
-        StreamEvent::MembershipChangeEvent { .. } => "membershipChangeEvent",
-        StreamEvent::GroupResetEvent { .. } => "groupResetEvent",
-        StreamEvent::CircuitBreakerTrippedEvent { .. } => "circuitBreakerTrippedEvent",
-        StreamEvent::ResetRequestedEvent { .. } => "resetRequestedEvent",
     }
 }
 
-/// Extract the cursor (ULID) from a StreamEvent. Every variant carries one.
+/// Extract the cursor (ULID) from a StreamEvent. Clean typing is uncursored.
 fn stream_event_cursor(event: &crate::realtime::sse::StreamEvent) -> Option<&str> {
     use crate::realtime::sse::StreamEvent;
     match event {
-        StreamEvent::MessageEvent { cursor, .. }
-        | StreamEvent::TypingEvent { cursor, .. }
-        | StreamEvent::ReactionEvent { cursor, .. }
-        | StreamEvent::InfoEvent { cursor, .. }
-        | StreamEvent::WelcomeReissueRequestedEvent { cursor, .. }
-        | StreamEvent::NewDeviceEvent { cursor, .. }
-        | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
-        | StreamEvent::ReadditionRequested { cursor, .. }
-        | StreamEvent::TreeChanged { cursor, .. }
-        | StreamEvent::MembershipChangeEvent { cursor, .. }
-        | StreamEvent::GroupResetEvent { cursor, .. }
-        | StreamEvent::CircuitBreakerTrippedEvent { cursor, .. }
-        | StreamEvent::ResetRequestedEvent { cursor, .. } => Some(cursor),
         StreamEvent::CleanTypingEvent { .. } => None,
     }
 }
@@ -4583,103 +4418,7 @@ mod tests {
         assert_eq!(members.len(), 2);
     }
 
-    #[tokio::test]
-    #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
-    async fn preserves_unconsumed_welcome_atomicity_rollback_clears_members_and_welcomes() {
-        let pool = setup_test_db().await;
-        let suffix = Uuid::new_v4().simple().to_string();
-        let owner_did = format!("did:plc:atomic{}", &suffix[..12]);
-        let convo = create_conversation(&pool, &owner_did)
-            .await
-            .expect("create conversation");
-        let hash_a = "7a7b7c7d7e7f80818283848586878889909192939495969798999a9b9c9d9e9f".to_string();
-        let hash_b = "9f9e9d9c9b9a99989796959493929190898887868584838281807f7e7d7c7b7a".to_string();
 
-        sqlx::query("INSERT INTO users (did) VALUES ($1) ON CONFLICT DO NOTHING")
-            .bind(&owner_did)
-            .execute(&pool)
-            .await
-            .expect("seed user");
-
-        for (device_id, hash_hex) in [("device-a", hash_a.as_str()), ("device-b", hash_b.as_str())]
-        {
-            sqlx::query(
-                "INSERT INTO key_packages \
-                    (id, owner_did, device_id, cipher_suite, key_package, key_package_hash, created_at, expires_at, state) \
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', 'available')",
-            )
-            .bind(Uuid::new_v4().to_string())
-            .bind(&owner_did)
-            .bind(device_id)
-            .bind("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
-            .bind::<&[u8]>(&[0xA5])
-            .bind(hash_hex)
-            .execute(&pool)
-            .await
-            .expect("seed key package");
-        }
-
-        let entries = vec![
-            crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
-                did: crate::sqlx_jacquard::string_to_did(&owner_did),
-                hash: hash_a.clone().into(),
-                extra_data: Default::default(),
-            },
-            crate::generated::blue_catbird::mlsChat::bootstrap_reset_group::KeyPackageHashEntry {
-                did: crate::sqlx_jacquard::string_to_did(&owner_did),
-                hash: hash_b.clone().into(),
-                extra_data: Default::default(),
-            },
-        ];
-
-        let mut tx = pool.begin().await.expect("begin tx");
-        insert_members_per_device_in_tx(&mut tx, &convo.id, &entries, Utc::now(), true)
-            .await
-            .expect("stage members");
-        store_welcomes_per_device_in_tx(
-            &mut tx,
-            &convo.id,
-            b"welcome-atomic",
-            &entries,
-            &owner_did,
-        )
-        .await
-        .expect("stage welcomes");
-        tx.rollback().await.expect("rollback staged tx");
-
-        let member_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM members WHERE convo_id = $1 AND left_at IS NULL",
-        )
-        .bind(&convo.id)
-        .fetch_one(&pool)
-        .await
-        .expect("count members after rollback");
-        let welcome_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM welcome_messages WHERE convo_id = $1")
-                .bind(&convo.id)
-                .fetch_one(&pool)
-                .await
-                .expect("count welcomes after rollback");
-
-        assert_eq!(member_count, 0, "rollback must clear staged members");
-        assert_eq!(
-            welcome_count, 0,
-            "rollback must not leak partial or orphan Welcome rows"
-        );
-
-        let _ = sqlx::query("DELETE FROM key_packages WHERE owner_did = $1")
-            .bind(&owner_did)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM users WHERE did = $1")
-            .bind(&owner_did)
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM conversations WHERE id = $1")
-            .bind(&convo.id)
-            .execute(&pool)
-            .await;
-    }
 
     // ── W4: roster-ghost removal ──────────────────────────────────────────
 

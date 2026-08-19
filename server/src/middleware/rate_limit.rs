@@ -275,12 +275,12 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
     // Extract base endpoint name from path
     let endpoint_name = endpoint
         .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.mlsChat.")
+        .trim_start_matches("blue.catbird.chat.")
         .trim_start_matches("blue.catbird.mlsDS.");
 
     let limit = if matches!(
         endpoint_name,
-        "beginDeviceAuthBinding" | "completeDeviceAuthBinding"
+        "enrollDevice" | "rebindDeviceAuthentication"
     ) {
         std::env::var("RATE_LIMIT_DEVICE_AUTH_BINDING")
             .ok()
@@ -291,51 +291,29 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100) // High frequency messaging
-    } else if endpoint_name.contains("getKeyPackages") {
-        std::env::var("RATE_LIMIT_GET_KEY_PACKAGES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30) // Key-package claims are consumptive and enumerate device buckets
-    } else if endpoint_name.contains("getMessages") || endpoint_name.contains("getConvos") {
+    } else if endpoint_name.contains("getEntries")
+        || endpoint_name.contains("getConversations")
+        || endpoint_name.contains("getConversationState")
+    {
         std::env::var("RATE_LIMIT_GET_MESSAGES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(500) // High frequency polling/sync operations
-    } else if endpoint_name.contains("updateCursor") {
+    } else if endpoint_name.contains("publishTyping") {
         std::env::var("RATE_LIMIT_UPDATE_CURSOR")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(300) // Cursor updates called frequently
-    } else if endpoint_name.contains("publishKeyPackage") {
+            .unwrap_or(300) // Ephemeral typing events
+    } else if endpoint_name.contains("replenishKeyPackages") {
         std::env::var("RATE_LIMIT_PUBLISH_KEY_PACKAGE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(50) // Increased from 20 for recovery scenarios (per-device)
-    } else if endpoint_name.contains("registerDevice") {
-        std::env::var("RATE_LIMIT_REGISTER_DEVICE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30) // Device registration – generous for daemon startup retries
-    } else if endpoint_name.contains("syncKeyPackages") {
-        std::env::var("RATE_LIMIT_SYNC_KEY_PACKAGES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30) // Key package sync for recovery (per-device)
-    } else if endpoint_name.contains("addMembers") || endpoint_name.contains("removeMember") {
-        std::env::var("RATE_LIMIT_ADD_MEMBERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10) // Admin operations
-    } else if endpoint_name.contains("createConvo") {
+            .unwrap_or(50) // Key packages replenished (per-device)
+    } else if endpoint_name.contains("createConversation") {
         std::env::var("RATE_LIMIT_CREATE_CONVO")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5) // Expensive operations
-    } else if endpoint_name.contains("reportMember") {
-        std::env::var("RATE_LIMIT_REPORT_MEMBER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5) // Prevent report spam
     } else {
         std::env::var("RATE_LIMIT_DID_DEFAULT")
             .ok()
@@ -405,15 +383,10 @@ pub static IP_LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::default);
 fn should_use_device_rate_limit(endpoint: &str) -> bool {
     let endpoint_name = endpoint
         .trim_start_matches("/xrpc/")
-        .trim_start_matches("blue.catbird.mlsChat.")
+        .trim_start_matches("blue.catbird.chat.")
         .trim_start_matches("blue.catbird.mlsDS.");
 
-    // Device-specific operations get per-device limits
-    // This allows a fresh device (app reinstall) to upload key packages
-    // even if the user's other devices have exhausted the quota.
-    // Note: registerDevice is intentionally excluded — it doesn't verify
-    // recovery claims and shouldn't bypass the pre-auth IP rate limit.
-    endpoint_name.contains("publishKeyPackage") || endpoint_name.contains("syncKeyPackages")
+    endpoint_name.contains("replenishKeyPackages")
 }
 
 /// Check if request is in recovery mode
@@ -601,7 +574,7 @@ mod tests {
 
         assert!(is_recovery_mode_request(
             &headers,
-            "/xrpc/blue.catbird.mlsChat.publishKeyPackages"
+            "/xrpc/blue.catbird.chat.replenishKeyPackages"
         ));
     }
 
@@ -612,24 +585,16 @@ mod tests {
 
         assert!(!is_recovery_mode_request(
             &headers,
-            "/xrpc/blue.catbird.mlsChat.commitGroupChange"
+            "/xrpc/blue.catbird.chat.sendMessage"
         ));
-    }
-
-    #[test]
-    fn get_key_packages_has_dedicated_tight_quota() {
-        let (limit, window) = get_endpoint_quota("/xrpc/blue.catbird.mlsChat.getKeyPackages");
-
-        assert_eq!(limit, 30);
-        assert_eq!(window, Duration::from_secs(60));
     }
 
     #[test]
     fn device_auth_binding_has_dedicated_tight_quota() {
         let (begin_limit, begin_window) =
-            get_endpoint_quota("/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding");
+            get_endpoint_quota("/xrpc/blue.catbird.chat.enrollDevice");
         let (complete_limit, complete_window) =
-            get_endpoint_quota("/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding");
+            get_endpoint_quota("/xrpc/blue.catbird.chat.rebindDeviceAuthentication");
 
         assert_eq!(begin_limit, 10);
         assert_eq!(complete_limit, 10);
@@ -640,7 +605,7 @@ mod tests {
     #[test]
     fn test_trusted_proxy_uses_forwarded_ip() {
         let request = HttpRequest::builder()
-            .uri("/xrpc/blue.catbird.mlsChat.getMessages")
+            .uri("/xrpc/blue.catbird.chat.getEntries")
             .header("cf-connecting-ip", "203.0.113.10")
             .body(Body::empty())
             .expect("request");
@@ -660,7 +625,7 @@ mod tests {
     #[test]
     fn test_untrusted_proxy_ignores_forwarded_ip() {
         let request = HttpRequest::builder()
-            .uri("/xrpc/blue.catbird.mlsChat.getMessages")
+            .uri("/xrpc/blue.catbird.chat.getEntries")
             .header("cf-connecting-ip", "203.0.113.10")
             .body(Body::empty())
             .expect("request");

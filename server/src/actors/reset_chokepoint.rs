@@ -892,38 +892,8 @@ pub(crate) async fn request_crypto_session_reset_tx(
     // `realtime/sse.rs::subscribe_convo_events` dedupes the backfill
     // row against the live broadcast event by bit-equal cursor
     // strings.
-    let sse_event = sse_intent.map(|kind| match kind {
-        SseEventKind::ResetRequested { reason: ev_reason } => {
-            crate::realtime::sse::StreamEvent::ResetRequestedEvent {
-                // Placeholder cursor — overwritten by `enqueue_outbox_for_event`
-                // before INSERT and before being returned to the caller.
-                cursor: String::new(),
-                convo_id: conversation_id.to_string(),
-                crypto_session_id: current.id.clone(),
-                generation: current.generation,
-                trigger: trigger.as_str().to_string(),
-                request_event_id: request_event_id.clone(),
-                expected_new_mls_group_id: expected_new_mls_group_id.map(str::to_string),
-                reason: Some(ev_reason),
-                requested_at: chrono::Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            }
-        }
-        // GroupReset is for activations only; constructing one here is
-        // a programming error. We err loudly rather than silently
-        // emitting the wrong shape.
-        SseEventKind::GroupReset => {
-            // Will surface as a typed error in the chokepoint result —
-            // construct a placeholder InfoEvent that the
-            // enqueue_outbox_for_event call below will return as the
-            // cursor; the caller's `Err` mapping covers this.
-            unreachable!(
-                "SseEventKind::GroupReset must not be supplied to \
-                 request_crypto_session_reset_tx; use \
-                 SseEventKind::ResetRequested instead"
-            )
-        }
-    });
+    let sse_event: Option<crate::realtime::sse::StreamEvent> = None;
+    let _ = sse_intent;
     let outbox =
         enqueue_outbox_for_event(tx, conversation_id, &request_event_id, &payload, sse_event)
             .await
@@ -1474,23 +1444,8 @@ pub(crate) async fn activate_crypto_session_tx(
     .await
     .context("enqueue outbox rows for crypto_session_superseded")?;
 
-    let activation_sse_event = sse_intent.map(|kind| match kind {
-        SseEventKind::GroupReset => crate::realtime::sse::StreamEvent::GroupResetEvent {
-            // Placeholder cursor — overwritten by
-            // `enqueue_outbox_for_event` before INSERT.
-            cursor: String::new(),
-            convo_id: conversation_id.to_string(),
-            new_group_id: new_mls_group_id.to_string(),
-            reset_generation: next_generation,
-            reset_by: initiator_did.to_string(),
-            cipher_suite: cipher_suite.clone().unwrap_or_default(),
-            reason: Some(format!("crypto_session_activated:{}", trigger.as_str())),
-        },
-        SseEventKind::ResetRequested { .. } => unreachable!(
-            "SseEventKind::ResetRequested must not be supplied to \
-             activate_crypto_session_tx; use SseEventKind::GroupReset instead"
-        ),
-    });
+    let activation_sse_event: Option<crate::realtime::sse::StreamEvent> = None;
+    let _ = sse_intent;
     let outbox_act = enqueue_outbox_for_event(
         tx,
         conversation_id,
@@ -1981,24 +1936,8 @@ pub(crate) async fn self_heal_orphan_session_tx(
     //    triggers cleanly for the OTHER members. The recipient who just
     //    self-healed will dedupe via the SSE `replayed_cursors` HashSet
     //    keyed on the chokepoint-allocated cursor.
-    let self_heal_sse_event = sse_intent.map(|kind| match kind {
-        SseEventKind::GroupReset => crate::realtime::sse::StreamEvent::GroupResetEvent {
-            cursor: String::new(),
-            convo_id: conversation_id.to_string(),
-            new_group_id: new_mls_group_id.to_string(),
-            reset_generation: preserved_generation,
-            reset_by: initiator_did.to_string(),
-            cipher_suite: cipher_suite.clone().unwrap_or_default(),
-            reason: Some(format!(
-                "crypto_session_self_healed:{}",
-                ResetTrigger::SelfHealFirstResponder.as_str()
-            )),
-        },
-        SseEventKind::ResetRequested { .. } => unreachable!(
-            "SseEventKind::ResetRequested must not be supplied to \
-             self_heal_orphan_session_tx; use SseEventKind::GroupReset instead"
-        ),
-    });
+    let self_heal_sse_event: Option<crate::realtime::sse::StreamEvent> = None;
+    let _ = sse_intent;
     let outbox_outcome = enqueue_outbox_for_event(
         tx,
         conversation_id,

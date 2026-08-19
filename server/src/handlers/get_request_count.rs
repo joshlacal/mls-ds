@@ -11,7 +11,7 @@ pub struct GetRequestCountOutput {
 }
 
 /// Get the count of pending chat requests for the authenticated user
-/// GET /xrpc/blue.catbird.mlsChat.getRequestCount
+/// GET /xrpc/blue.catbird.chat.getRequestCount
 #[tracing::instrument(skip(pool))]
 pub async fn get_request_count(
     State(pool): State<DbPool>,

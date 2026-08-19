@@ -148,7 +148,7 @@ pub async fn submit_commit(
         // or none do.
         let commit_data_bytes = commit.commit_data.as_ref();
         let commit_shape =
-            crate::handlers::mls_chat::commit_inspect::inspect_commit_shape(commit_data_bytes)
+            crate::crypto::commit_inspect::inspect_commit_shape(commit_data_bytes)
                 .map_err(|e| FederationError::InvalidCommitFraming {
                     reason: e.to_string(),
                 })?;

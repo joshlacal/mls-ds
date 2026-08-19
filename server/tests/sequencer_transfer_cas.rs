@@ -196,13 +196,10 @@ async fn transferred_conversation_reports_new_sequencer_in_convo_view() {
     .await
     .expect("load transferred conversation");
 
-    let view = convo
-        .to_convo_view(vec![], Some(local_ds))
-        .expect("to_convo_view");
     assert_eq!(
-        view.sequencer_did.as_ref().map(|d| d.as_str()),
+        convo.sequencer_ds.as_deref(),
         Some(accepting_ds.as_str()),
-        "convoView.sequencerDid must report the NEW sequencer after transfer"
+        "conversations.sequencer_ds must report the NEW sequencer after transfer"
     );
 
     common::cleanup(&pool, &convo_id).await;

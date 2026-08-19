@@ -122,16 +122,11 @@ fn is_production_environment() -> bool {
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const BLOB_UPLOAD_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
-const GROUP_METADATA_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 // MLS JSON encodes `bytes` fields as base64. A valid 10 MiB ciphertext or
 // GroupInfo therefore needs nearly 13.34 MiB on the wire before the small JSON
 // envelope is counted. Keep the ordinary 4 MiB default, but preserve the
 // existing MLS contracts on routes that carry one or more large artifacts.
 const SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 15 * 1024 * 1024;
-const DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-const TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES: usize = 44 * 1024 * 1024;
-const DEVICE_REGISTRATION_BODY_LIMIT_BYTES: usize = 20 * 1024 * 1024;
-const KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 // Clean-chat enroll/replenish carry up to 100 KeyPackages
 // (`blue.catbird.chat.defs#keyPackageArtifact.bytes` maxLength 65536 ×
 // `keyPackages` maxLength 100), which base64-expand (4/3) to ~8.4 MiB of JSON
@@ -145,8 +140,7 @@ const MAX_REQUEST_BODY_READ_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_BLOB_UPLOAD_TOTAL_TIMEOUT_MS: u64 = 300_000;
 const MAX_REQUEST_BODY_TOTAL_TIMEOUT_MS: u64 = 600_000;
-const BLOB_UPLOAD_PATH: &str = "/xrpc/blue.catbird.mlsChat.uploadBlob";
-const GROUP_METADATA_PATH: &str = "/xrpc/blue.catbird.mlsChat.putGroupMetadataBlob";
+const BLOB_UPLOAD_PATH: &str = "/xrpc/blue.catbird.chat.uploadBlob";
 static INGRESS_BODY_BUDGET: Lazy<Arc<Semaphore>> =
     Lazy::new(|| Arc::new(Semaphore::new(INGRESS_BODY_BUDGET_MIB)));
 
@@ -222,36 +216,11 @@ impl IngressBodyPolicy {
 fn request_body_limit(path: &str) -> usize {
     match path {
         BLOB_UPLOAD_PATH => BLOB_UPLOAD_BODY_LIMIT_BYTES,
-        GROUP_METADATA_PATH => GROUP_METADATA_BODY_LIMIT_BYTES,
-        // commitGroupChange may carry commit, Welcome, and GroupInfo in one
-        // request. Its aliases delegate to the same handler and contract.
-        "/xrpc/blue.catbird.mlsChat.commitGroupChange"
-        | "/xrpc/blue.catbird.mlsChat.addMembers"
-        | "/xrpc/blue.catbird.mlsChat.removeMembers"
-        | "/xrpc/blue.catbird.mlsChat.processExternalCommit"
-        | "/xrpc/blue.catbird.mlsChat.publishGroupInfo" => TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
-        // Conversation bootstrap may carry both a Welcome and GroupInfo.
-        "/xrpc/blue.catbird.mlsChat.createConvo"
-        | "/xrpc/blue.catbird.mlsChat.bootstrapResetGroup" => DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
-        // Device registration may include the initial KeyPackage batch and a
-        // Welcome. The publish/sync pair carries only the cardinality-limited
-        // batch shape. These are HTTP envelopes; decoded per-item limits remain
-        // an API/lexicon contract and are not invented by this middleware.
-        "/xrpc/blue.catbird.mlsChat.registerDevice" => DEVICE_REGISTRATION_BODY_LIMIT_BYTES,
-        "/xrpc/blue.catbird.mlsChat.publishKeyPackages"
-        | "/xrpc/blue.catbird.mlsChat.syncKeyPackages" => KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES,
-        "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
+        "/xrpc/blue.catbird.chat.enrollDevice"
+        | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
             CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
         }
-        // These routes carry one potentially large MLS byte string. Federation
-        // peers receive the same allowance as local clients so forwarding does
-        // not truncate an otherwise valid message, Welcome, or commit.
-        "/xrpc/blue.catbird.mlsChat.sendMessage"
-        | "/xrpc/blue.catbird.mlsChat.updateConvo"
-        | "/xrpc/blue.catbird.mlsChat.resetGroup"
-        | "/xrpc/blue.catbird.mlsChat.leaveConvo"
-        | "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond"
-        | "/xrpc/blue.catbird.mlsDS.deliverMessage"
+        "/xrpc/blue.catbird.mlsDS.deliverMessage"
         | "/xrpc/blue.catbird.mlsDS.deliverWelcome"
         | "/xrpc/blue.catbird.mlsDS.submitCommit" => SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES,
         _ => DEFAULT_REQUEST_BODY_LIMIT_BYTES,
@@ -396,34 +365,20 @@ async fn buffer_limited_request_body(
 
 fn merge_application_routers(
     base_router: Router,
-    mls_chat_router: Router,
     ds_router: Router,
     db_pool: PgPool,
     ingress_body_policy: IngressBodyPolicy,
 ) -> Router {
-    // Axum layers affect only routes already present on a Router. Merge every
-    // route family first so the policy cannot silently omit MLS or federation.
-    // Each subsequent call wraps the preceding service, so the reverse-looking
-    // construction below intentionally yields this request order:
-    // trace -> sanitized log -> response normalization -> pre-auth rate limit
-    // -> non-bypassable ingress memory budget -> route-aware bounded body
-    // buffer -> default/route extractor limit
-    // -> idempotency/JWT/cache -> handler.
-    //
-    // The bounded buffer runs before idempotency so declared and unknown-length
-    // bodies cannot evade quotas through early errors or cache hits. It mirrors
-    // uploadBlob's 11 MiB and metadata's 2 MiB route-local extractor overrides.
     base_router
-        .merge(mls_chat_router)
         .merge(ds_router)
         .layer(axum::middleware::from_fn_with_state(
             middleware::idempotency::IdempotencyLayer::new(db_pool),
             middleware::idempotency::idempotency_middleware,
         ))
         // The path-aware outer buffer enforces the narrower effective limit.
-        // Configure the extractor ceiling to the largest valid route so it
-        // cannot re-reject a body already accepted by that policy.
-        .layer(DefaultBodyLimit::max(TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES))
+        // Configure the extractor ceiling to the largest valid route (15 MiB for DS single artifact)
+        // so it cannot re-reject a body already accepted by that policy.
+        .layer(DefaultBodyLimit::max(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn_with_state(
             ingress_body_policy.clone(),
             buffer_limited_request_body,
@@ -1090,229 +1045,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // mlsChat consolidated endpoints (PDSS federation prep)
-    // All endpoints use IntoRouter for type-safe routing from lexicon-generated types.
-    use catbird_server::generated::blue_catbird::mlsChat::{
-        begin_device_auth_binding::BeginDeviceAuthBindingRequest,
-        bootstrap_reset_group::BootstrapResetGroupRequest, check_blocks::CheckBlocksRequest,
-        commit_group_change::CommitGroupChangeRequest,
-        complete_device_auth_binding::CompleteDeviceAuthBindingRequest,
-        create_convo::CreateConvoRequest, delete_blob::DeleteBlobRequest,
-        get_blob_usage::GetBlobUsageRequest, get_block_status::GetBlockStatusRequest,
-        get_convo_settings::GetConvoSettingsRequest, get_convos::GetConvosRequest,
-        get_group_state::GetGroupStateRequest, get_key_package_status::GetKeyPackageStatusRequest,
-        get_key_packages::GetKeyPackagesRequest, get_messages::GetMessagesRequest,
-        get_pending_devices::GetPendingDevicesRequest,
-        get_subscription_ticket::GetSubscriptionTicketRequest, leave_convo::LeaveConvoRequest,
-        list_devices::ListDevicesRequest, opt_in::OptInRequest,
-        publish_key_packages::PublishKeyPackagesRequest, register_device::RegisterDeviceRequest,
-        remove_device::RemoveDeviceRequest, report_spam::ReportSpamRequest,
-        send_message::SendMessageRequest, update_convo::UpdateConvoRequest,
-        update_cursor::UpdateCursorRequest,
-    };
-    use jacquard_axum::IntoRouter;
-
-    let mls_chat_router = Router::new()
-        // Identity & Devices
-        .merge(RegisterDeviceRequest::into_router(
-            handlers::mls_chat::register_device_post,
-        ))
-        .merge(BeginDeviceAuthBindingRequest::into_router(
-            handlers::mls_chat::begin_device_auth_binding,
-        ))
-        .merge(CompleteDeviceAuthBindingRequest::into_router(
-            handlers::mls_chat::complete_device_auth_binding,
-        ))
-        // Compat shim: legacy registerDeviceToken endpoint. Folded into
-        // registerDevice (action=updateToken) but old iOS Petrel-generated
-        // code still calls the retired NSID. Route handler updates the
-        // push_token on the existing device row so push delivery keeps
-        // working until clients update.
-        .route(
-            "/xrpc/blue.catbird.mlsChat.registerDeviceToken",
-            post(handlers::mls_chat::register_device_token),
-        )
-        .merge(PublishKeyPackagesRequest::into_router(
-            handlers::mls_chat::publish_key_packages_post,
-        ))
-        .merge(ListDevicesRequest::into_router(
-            handlers::mls_chat::list_devices,
-        ))
-        .merge(GetPendingDevicesRequest::into_router(
-            handlers::mls_chat::get_pending_devices,
-        ))
-        .merge(GetKeyPackageStatusRequest::into_router(
-            handlers::mls_chat::get_key_package_status,
-        ))
-        .merge(GetKeyPackagesRequest::into_router(
-            handlers::mls_chat::get_key_packages,
-        ))
-        // Phase B local compatibility routes. Generated Phase A Rust
-        // request types are not present in this checkout, so these use small
-        // serde JSON shims until lexicon codegen lands.
-        .route(
-            "/xrpc/blue.catbird.mlsChat.reconcileKeyPackages",
-            post(handlers::mls_chat::reconcile_key_packages),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.invalidateKeyPackage",
-            post(handlers::mls_chat::invalidate_key_package),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.reissueWelcome",
-            post(handlers::mls_chat::reissue_welcome),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond",
-            post(handlers::mls_chat::reissue_welcome_respond),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getWelcomeReissueStatus",
-            get(handlers::mls_chat::get_welcome_reissue_status),
-        )
-        .merge(RemoveDeviceRequest::into_router(
-            handlers::mls_chat::remove_device,
-        ))
-        // Conversations & Messaging
-        .merge(CreateConvoRequest::into_router(
-            handlers::mls_chat::create_convo,
-        ))
-        .merge(BootstrapResetGroupRequest::into_router(
-            handlers::mls_chat::bootstrap_reset_group::bootstrap_reset_group,
-        ))
-        .merge(GetConvosRequest::into_router(
-            handlers::mls_chat::get_convos,
-        ))
-        .merge(SendMessageRequest::into_router(
-            handlers::mls_chat::send_message,
-        ))
-        .merge(GetMessagesRequest::into_router(
-            handlers::mls_chat::get_messages,
-        ))
-        .merge(UpdateCursorRequest::into_router(
-            handlers::mls_chat::update_cursor,
-        ))
-        // Group State
-        .merge(GetGroupStateRequest::into_router(
-            handlers::mls_chat::get_group_state,
-        ))
-        .merge(CommitGroupChangeRequest::into_router(
-            handlers::mls_chat::commit_group_change,
-        ))
-        // Conversation Management
-        .merge(UpdateConvoRequest::into_router(
-            handlers::mls_chat::update_convo,
-        ))
-        .merge(GetConvoSettingsRequest::into_router(
-            handlers::mls_chat::get_convo_settings,
-        ))
-        .merge(LeaveConvoRequest::into_router(
-            handlers::mls_chat::leave_convo,
-        ))
-        // Moderation & Blocks
-        .merge(ReportSpamRequest::into_router(
-            handlers::mls_chat::report_spam_post,
-        ))
-        .merge(CheckBlocksRequest::into_router(
-            handlers::mls_chat::check_blocks::check_blocks_post,
-        ))
-        .merge(GetBlockStatusRequest::into_router(
-            handlers::mls_chat::get_block_status::get_block_status_post,
-        ))
-        .merge(OptInRequest::into_router(handlers::mls_chat::opt_in_post))
-        // Subscriptions
-        .merge(GetSubscriptionTicketRequest::into_router(
-            handlers::mls_chat::get_subscription_ticket,
-        ))
-        // WebSocket subscription endpoints (lexicon + legacy NSIDs)
-        .route(
-            "/xrpc/blue.catbird.mlsChat.subscribeEvents",
-            get(realtime::websocket::subscribe_convo_events),
-        )
-        // Group Reset
-        .route(
-            "/xrpc/blue.catbird.mlsChat.resetGroup",
-            post(handlers::mls_chat::reset_group),
-        )
-        // Recovery Failure Reporting
-        .route(
-            "/xrpc/blue.catbird.mlsChat.reportRecoveryFailure",
-            post(handlers::mls_chat::report_recovery_failure),
-        )
-        // Federation
-        .route(
-            "/xrpc/blue.catbird.mlsChat.requestFailover",
-            post(handlers::mls_chat::request_failover),
-        )
-        // Group Health
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getGroupHealth",
-            get(handlers::mls_chat::get_group_health),
-        )
-        // Delivery Status
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getDeliveryStatus",
-            get(handlers::mls_chat::get_delivery_status),
-        )
-        // Blob Storage
-        .route(
-            "/xrpc/blue.catbird.mlsChat.uploadBlob",
-            post(handlers::mls_chat::upload_blob).layer(DefaultBodyLimit::max(11 * 1024 * 1024)), // 11MB (10MB + overhead)
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getBlob",
-            get(handlers::mls_chat::get_blob),
-        )
-        .merge(GetBlobUsageRequest::into_router(
-            handlers::mls_chat::get_blob_usage,
-        ))
-        .merge(DeleteBlobRequest::into_router(
-            handlers::mls_chat::delete_blob,
-        ))
-        // Group Metadata Blob Storage
-        .route(
-            "/xrpc/blue.catbird.mlsChat.putGroupMetadataBlob",
-            post(handlers::mls_chat::put_group_metadata_blob)
-                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)), // 2MB (1MB + overhead)
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getGroupMetadataBlob",
-            get(handlers::mls_chat::get_group_metadata_blob),
-        )
-        // ── Spec §11 route aliases ──
-        // POST aliases: spec-named endpoints that delegate to consolidated handlers.
-        // The request body already contains the `action` field for dispatch.
-        .route(
-            "/xrpc/blue.catbird.mlsChat.addMembers",
-            post(handlers::mls_chat::commit_group_change),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.removeMembers",
-            post(handlers::mls_chat::commit_group_change),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.processExternalCommit",
-            post(handlers::mls_chat::commit_group_change),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.publishGroupInfo",
-            post(handlers::mls_chat::commit_group_change),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.syncKeyPackages",
-            post(handlers::mls_chat::publish_key_packages_post),
-        )
-        // GET aliases: spec-named endpoints that delegate to consolidated handlers
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getGroupInfo",
-            get(handlers::mls_chat::get_group_state),
-        )
-        .route(
-            "/xrpc/blue.catbird.mlsChat.getKeyPackageStats",
-            get(handlers::mls_chat::get_key_package_status),
-        )
-        .with_state(app_state.clone());
-
     // DS-to-DS federation routes (mlsDS namespace)
     let ds_router = Router::new()
         .route(
@@ -1373,12 +1105,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(app_state.clone());
 
-    // Final outermost layer: ensure every response has a Content-Type header.
-    // Handlers that return bare `StatusCode::X` (120+ call sites across the mls_chat
-    // handlers) produce empty-body, header-less responses. Clients like Petrel's
-    // generated XRPC layer validate Content-Type and throw on empty headers before
-    // they can inspect the status code. Applying this to the merged app covers all
-    // three sub-routers without having to patch every handler.
     // Clean-cutover chat router (`blue.catbird.chat.*`), isolated from the
     // superseded mlsChat namespace. Merged into base so it inherits the shared
     // idempotency/body-budget/content-type/logging middleware stack.
@@ -1388,7 +1114,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = merge_application_routers(
         base_router,
-        mls_chat_router,
         ds_router,
         db_pool.clone(),
         IngressBodyPolicy::from_env(),
@@ -1562,11 +1287,6 @@ mod tests {
         assert!(SINGLE_MLS_ARTIFACT_BODY_LIMIT_BYTES > base64_bytes);
 
         for path in [
-            "/xrpc/blue.catbird.mlsChat.sendMessage",
-            "/xrpc/blue.catbird.mlsChat.updateConvo",
-            "/xrpc/blue.catbird.mlsChat.resetGroup",
-            "/xrpc/blue.catbird.mlsChat.leaveConvo",
-            "/xrpc/blue.catbird.mlsChat.reissueWelcomeRespond",
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
             "/xrpc/blue.catbird.mlsDS.deliverWelcome",
             "/xrpc/blue.catbird.mlsDS.submitCommit",
@@ -1577,34 +1297,12 @@ mod tests {
             );
         }
         for path in [
-            "/xrpc/blue.catbird.mlsChat.createConvo",
-            "/xrpc/blue.catbird.mlsChat.bootstrapResetGroup",
+            "/xrpc/blue.catbird.chat.enrollDevice",
+            "/xrpc/blue.catbird.chat.replenishKeyPackages",
         ] {
             assert_eq!(
                 request_body_limit(path),
-                DOUBLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
-            );
-        }
-        assert_eq!(
-            request_body_limit("/xrpc/blue.catbird.mlsChat.registerDevice"),
-            DEVICE_REGISTRATION_BODY_LIMIT_BYTES
-        );
-        for path in [
-            "/xrpc/blue.catbird.mlsChat.publishKeyPackages",
-            "/xrpc/blue.catbird.mlsChat.syncKeyPackages",
-        ] {
-            assert_eq!(request_body_limit(path), KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES);
-        }
-        for path in [
-            "/xrpc/blue.catbird.mlsChat.commitGroupChange",
-            "/xrpc/blue.catbird.mlsChat.addMembers",
-            "/xrpc/blue.catbird.mlsChat.removeMembers",
-            "/xrpc/blue.catbird.mlsChat.processExternalCommit",
-            "/xrpc/blue.catbird.mlsChat.publishGroupInfo",
-        ] {
-            assert_eq!(
-                request_body_limit(path),
-                TRIPLE_MLS_ARTIFACT_BODY_LIMIT_BYTES
+                CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
             );
         }
     }
@@ -1612,10 +1310,8 @@ mod tests {
     #[test]
     fn large_route_caps_fit_weighted_global_budget() {
         for (path, expected_permits) in [
-            ("/xrpc/blue.catbird.mlsChat.sendMessage", 15),
-            ("/xrpc/blue.catbird.mlsChat.registerDevice", 20),
-            ("/xrpc/blue.catbird.mlsChat.createConvo", 32),
-            ("/xrpc/blue.catbird.mlsChat.commitGroupChange", 44),
+            ("/xrpc/blue.catbird.mlsDS.deliverMessage", 15),
+            ("/xrpc/blue.catbird.chat.enrollDevice", 12),
         ] {
             let limit = request_body_limit(path);
             let request = Request::post(path)
@@ -1639,8 +1335,8 @@ mod tests {
         assert_eq!(policy.total_timeout("/ordinary"), Duration::from_secs(2));
         for path in [
             BLOB_UPLOAD_PATH,
-            "/xrpc/blue.catbird.mlsChat.sendMessage",
-            "/xrpc/blue.catbird.mlsChat.commitGroupChange",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+            "/xrpc/blue.catbird.chat.enrollDevice",
         ] {
             assert_eq!(policy.total_timeout(path), Duration::from_secs(3), "{path}");
         }
@@ -1649,17 +1345,15 @@ mod tests {
     #[tokio::test]
     async fn body_limit_covers_every_merged_router() {
         let base_router = Router::new().route("/base", post(consume_body));
-        let mls_chat_router = Router::new().route("/mls", post(consume_body));
         let ds_router = Router::new().route("/ds", post(consume_body));
         let app = merge_application_routers(
             base_router,
-            mls_chat_router,
             ds_router,
             lazy_test_pool(),
             test_ingress_policy(),
         );
 
-        for path in ["/base", "/mls", "/ds"] {
+        for path in ["/base", "/ds"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -1684,7 +1378,6 @@ mod tests {
             Router::new().route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body));
         let app = merge_application_routers(
             base_router,
-            Router::new(),
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1721,19 +1414,18 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency_policy_preserves_optional_contract_and_enrollment_bypass() {
-        let mls_chat_router = Router::new()
-            .route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body))
+        let base_router = Router::new()
+            .route("/xrpc/blue.catbird.chat.testPolicy", post(consume_body))
             .route(
-                "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
+                "/xrpc/blue.catbird.chat.enrollDevice",
                 post(consume_body),
             )
             .route(
-                "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+                "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
                 post(consume_body),
             );
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1742,7 +1434,7 @@ mod tests {
         let protected = app
             .clone()
             .oneshot(
-                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                Request::post("/xrpc/blue.catbird.chat.testPolicy")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1753,7 +1445,7 @@ mod tests {
         let invalid_present_key = app
             .clone()
             .oneshot(
-                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                Request::post("/xrpc/blue.catbird.chat.testPolicy")
                     .header("Idempotency-Key", "   ")
                     .body(Body::empty())
                     .expect("request"),
@@ -1763,8 +1455,8 @@ mod tests {
         assert_eq!(invalid_present_key.status(), StatusCode::BAD_REQUEST);
 
         for path in [
-            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
-            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+            "/xrpc/blue.catbird.chat.enrollDevice",
+            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
         ] {
             let response = app
                 .clone()
@@ -1782,11 +1474,10 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_mls_write_is_rejected_before_idempotency() {
-        let mls_chat_router =
-            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.testPolicy", post(consume_body));
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1795,7 +1486,7 @@ mod tests {
         let body_length = DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1;
         let response = app
             .oneshot(
-                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                Request::post("/xrpc/blue.catbird.chat.testPolicy")
                     .header(axum::http::header::CONTENT_LENGTH, body_length)
                     .body(Body::from(vec![0_u8; body_length]))
                     .expect("request"),
@@ -1808,11 +1499,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_length_mls_write_is_bounded_before_idempotency() {
-        let mls_chat_router =
-            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.testPolicy", post(consume_body));
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1820,7 +1510,7 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                Request::post("/xrpc/blue.catbird.chat.testPolicy")
                     .body(Body::from(vec![0_u8; DEFAULT_REQUEST_BODY_LIMIT_BYTES + 1]))
                     .expect("request"),
             )
@@ -1832,11 +1522,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_length_body_is_consumed_before_idempotency_early_return() {
-        let mls_chat_router =
-            Router::new().route("/xrpc/blue.catbird.mlsChat.testPolicy", post(consume_body));
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.testPolicy", post(consume_body));
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1850,7 +1539,7 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::post("/xrpc/blue.catbird.mlsChat.testPolicy")
+                Request::post("/xrpc/blue.catbird.chat.testPolicy")
                     .body(body)
                     .expect("request"),
             )
@@ -1863,13 +1552,12 @@ mod tests {
 
     #[tokio::test]
     async fn route_specific_upload_limit_reaches_idempotency_above_default() {
-        let mls_chat_router = Router::new().route(
+        let base_router = Router::new().route(
             BLOB_UPLOAD_PATH,
             post(consume_body).layer(DefaultBodyLimit::max(11 * 1024 * 1024)),
         );
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),
@@ -1889,12 +1577,11 @@ mod tests {
 
     #[tokio::test]
     async fn valid_large_mls_wire_body_is_not_rejected_by_default_limit() {
-        let path = "/xrpc/blue.catbird.mlsChat.sendMessage";
-        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let path = "/xrpc/blue.catbird.mlsDS.deliverMessage";
+        let ds_router = Router::new().route(path, post(consume_body));
         let app = merge_application_routers(
             Router::new(),
-            mls_chat_router,
-            Router::new(),
+            ds_router,
             lazy_test_pool(),
             test_ingress_policy(),
         );
@@ -1915,12 +1602,11 @@ mod tests {
 
     #[tokio::test]
     async fn large_mls_route_still_rejects_above_its_wire_budget() {
-        let path = "/xrpc/blue.catbird.mlsChat.sendMessage";
-        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let path = "/xrpc/blue.catbird.mlsDS.deliverMessage";
+        let ds_router = Router::new().route(path, post(consume_body));
         let app = merge_application_routers(
             Router::new(),
-            mls_chat_router,
-            Router::new(),
+            ds_router,
             lazy_test_pool(),
             test_ingress_policy(),
         );
@@ -1940,40 +1626,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_route_uses_narrower_body_limit_before_idempotency() {
-        let mls_chat_router = Router::new().route(GROUP_METADATA_PATH, post(consume_body));
-        let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
-            Router::new(),
-            lazy_test_pool(),
-            test_ingress_policy(),
-        );
-
-        let response = app
-            .oneshot(
-                Request::post(GROUP_METADATA_PATH)
-                    .body(Body::from(vec![0_u8; GROUP_METADATA_BODY_LIMIT_BYTES + 1]))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    #[tokio::test]
     async fn recovery_mode_cannot_bypass_ingress_budget_or_poll_body() {
-        let path = "/xrpc/blue.catbird.mlsChat.publishKeyPackages";
-        let mls_chat_router = Router::new().route(path, post(consume_body));
+        let path = "/xrpc/blue.catbird.chat.replenishKeyPackages";
+        let base_router = Router::new().route(path, post(consume_body));
         let exhausted_budget = Arc::new(Semaphore::new(1));
         let _held = exhausted_budget
             .clone()
             .try_acquire_owned()
             .expect("reserve test budget");
         let app = merge_application_routers(
-            Router::new(),
-            mls_chat_router,
+            base_router,
             Router::new(),
             lazy_test_pool(),
             IngressBodyPolicy::new(exhausted_budget, Duration::from_secs(1)),
@@ -2012,7 +1674,6 @@ mod tests {
         let app = merge_application_routers(
             Router::new().route("/safe", safe_routes),
             Router::new(),
-            Router::new(),
             lazy_test_pool(),
             IngressBodyPolicy::new(exhausted_budget, Duration::from_millis(20)),
         );
@@ -2045,10 +1706,10 @@ mod tests {
 
     #[tokio::test]
     async fn progressing_body_may_exceed_one_idle_window_in_total() {
-        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let path = "/xrpc/blue.catbird.chat.enrollDevice";
+        let base_router = Router::new().route(path, post(consume_body));
         let app = merge_application_routers(
-            Router::new(),
-            Router::new().route(path, post(consume_body)),
+            base_router,
             Router::new(),
             lazy_test_pool(),
             IngressBodyPolicy::new(
@@ -2081,11 +1742,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_frames_do_not_reset_idle_timeout() {
-        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
-        let budget = Arc::new(Semaphore::new(4));
+        let path = "/xrpc/blue.catbird.chat.enrollDevice";
+        let budget = Arc::new(Semaphore::new(12));
+        let base_router = Router::new().route(path, post(consume_body));
         let app = merge_application_routers(
-            Router::new(),
-            Router::new().route(path, post(consume_body)),
+            base_router,
             Router::new(),
             lazy_test_pool(),
             IngressBodyPolicy::with_timeouts(
@@ -2108,16 +1769,18 @@ mod tests {
         .expect("response");
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-        assert_eq!(budget.available_permits(), 4);
+        assert_eq!(budget.available_permits(), 12);
     }
 
     #[tokio::test]
     async fn progress_trickle_hits_total_timeout_and_releases_budget() {
-        let path = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
-        let budget = Arc::new(Semaphore::new(4));
+        let path = "/xrpc/blue.catbird.chat.enrollDevice";
+        let budget = Arc::new(Semaphore::new(12));
+        let base_router = Router::new()
+            .route("/normal", get(|| async { StatusCode::OK }))
+            .route(path, post(consume_body));
         let app = merge_application_routers(
-            Router::new().route("/normal", get(|| async { StatusCode::OK })),
-            Router::new().route(path, post(consume_body)),
+            base_router,
             Router::new(),
             lazy_test_pool(),
             IngressBodyPolicy::with_timeouts(
@@ -2144,7 +1807,7 @@ mod tests {
         .expect("response");
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-        assert_eq!(budget.available_permits(), 4);
+        assert_eq!(budget.available_permits(), 12);
 
         let normal = app
             .oneshot(
@@ -2163,9 +1826,11 @@ mod tests {
             DEFAULT_REQUEST_BODY_LIMIT_BYTES / 1024 / 1024,
         ));
         let policy = IngressBodyPolicy::new(budget.clone(), Duration::from_millis(20));
+        let base_router = Router::new()
+            .route("/normal", get(|| async { StatusCode::OK }))
+            .route("/slow", post(consume_body));
         let app = merge_application_routers(
-            Router::new().route("/normal", get(|| async { StatusCode::OK })),
-            Router::new().route("/slow", post(consume_body)),
+            base_router,
             Router::new(),
             lazy_test_pool(),
             policy,
@@ -2199,9 +1864,9 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_body_replaces_stale_framing_headers() {
+        let base_router = Router::new().route("/normalized", post(require_normalized_framing));
         let app = merge_application_routers(
-            Router::new(),
-            Router::new().route("/normalized", post(require_normalized_framing)),
+            base_router,
             Router::new(),
             lazy_test_pool(),
             test_ingress_policy(),

@@ -198,14 +198,14 @@ mod tests {
     #[tokio::test]
     async fn allow_and_enrollment_never_consume_dpop_or_call_the_verifier() {
         for (mode, nsid) in [
-            (DeviceAuthMode::Require, "blue.catbird.mlsChat.getConvos"),
+            (DeviceAuthMode::Require, "blue.catbird.chat.getConversations"),
             (
                 DeviceAuthMode::Require,
-                "blue.catbird.mlsChat.beginDeviceAuthBinding",
+                "blue.catbird.chat.enrollDevice",
             ),
             (
                 DeviceAuthMode::Enroll,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
             ),
         ] {
             let calls = Arc::new(Mutex::new(0));
@@ -245,7 +245,7 @@ mod tests {
             let outcomes_for_recorder = outcomes.clone();
             let result = enforce_device_auth_policy_with(
                 DeviceAuthMode::Observe,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
                 &headers,
                 &mut extensions,
                 |_| async { panic!("malformed header must not reach verifier") },
@@ -269,7 +269,7 @@ mod tests {
             let outcomes_for_recorder = outcomes.clone();
             let result = enforce_device_auth_policy_with(
                 DeviceAuthMode::Observe,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
                 &proof_headers(),
                 &mut extensions,
                 move |_| async move { verification },
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(
             enforce_device_auth_policy_with(
                 DeviceAuthMode::Observe,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
                 &proof_headers(),
                 &mut extensions,
                 |_| async { Ok(verified()) },
@@ -335,7 +335,7 @@ mod tests {
             let mut extensions = Extensions::new();
             let result = enforce_device_auth_policy_with(
                 DeviceAuthMode::Require,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
                 &proof_headers(),
                 &mut extensions,
                 move |_| async move { verification },
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(
             enforce_device_auth_policy_with(
                 DeviceAuthMode::Require,
-                "blue.catbird.mlsChat.commitGroupChange",
+                "blue.catbird.chat.sendMessage",
                 &proof_headers(),
                 &mut extensions,
                 |_| async { Ok(verified()) },
@@ -372,7 +372,7 @@ mod tests {
         let mut extensions = Extensions::new();
         let result = enforce_device_auth_policy_with(
             DeviceAuthMode::Observe,
-            "blue.catbird.mlsChat.futureMutation",
+            "blue.catbird.chat.futureMutation",
             &proof_headers(),
             &mut extensions,
             |_| async { panic!("unknown endpoint must not reach verifier") },

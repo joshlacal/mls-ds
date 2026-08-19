@@ -11,7 +11,7 @@ use crate::util::outbound_body::{
     decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES, PROFILE_OR_DEVICE_MAX_BYTES,
 };
 
-const PROFILE_COLLECTION: &str = "blue.catbird.mlsChat.profile";
+const PROFILE_COLLECTION: &str = "blue.catbird.chat.profile";
 const PROFILE_RKEY: &str = "self";
 const AUTHORITY_PAGE_SIZE: usize = 100;
 const AUTHORITY_PAGE_SIZE_PARAM: &str = "100";
@@ -83,7 +83,7 @@ impl DsResolver {
     /// Resolve a user's DS endpoint.
     ///
     /// Ordering (ADR-010 D2): self → fresh cache → `#atproto_mls` DID-document
-    /// service entry → legacy `blue.catbird.mlsChat.profile` repo record →
+    /// service entry → `blue.catbird.chat.profile` repo record →
     /// expired-cache degraded mode → default DS → not found.
     ///
     /// An unexpired cache row counts as "fresh resolution" (the TTL defines
@@ -141,7 +141,7 @@ impl DsResolver {
             }
         }
 
-        // Legacy fallback: repo record (blue.catbird.mlsChat.profile)
+        // Profile record fallback (blue.catbird.chat.profile)
         match self.resolve_from_repo(user_did).await {
             Ok(endpoint) => {
                 if let Err(e) = self.cache_endpoint(&endpoint).await {
@@ -310,7 +310,7 @@ impl DsResolver {
         })
     }
 
-    /// Resolve DS endpoint from the user's repo record (blue.catbird.mlsChat.profile).
+    /// Resolve DS endpoint from the user's repo record (blue.catbird.chat.profile).
     async fn resolve_from_repo(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
         let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
 
@@ -462,7 +462,7 @@ impl DsResolver {
                         async move {
                             let mut request = http.get(list_records_url).query(&[
                                 ("repo", did.as_str()),
-                                ("collection", "blue.catbird.mlsChat.device"),
+                                ("collection", "blue.catbird.chat.device"),
                                 ("limit", AUTHORITY_PAGE_SIZE_PARAM),
                             ]);
                             if let Some(cursor) = cursor.as_deref() {

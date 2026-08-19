@@ -1323,7 +1323,7 @@ where
             endpoint_nsid_from_path(endpoint),
             crate::middleware::device_auth::installed_device_auth_mode(),
         ) {
-            if endpoint_nsid.starts_with("blue.catbird.mlsChat.") {
+            if endpoint_nsid.starts_with("blue.catbird.chat.") {
                 let pool = crate::storage::DbPool::from_ref(state);
                 crate::middleware::device_auth::enforce_device_auth_policy(
                     mode,
@@ -1872,16 +1872,16 @@ mod tests {
             jti_ttl_seconds: 120,
         };
         let mut claims = claims("did:plc:alice", None);
-        claims.lxm = Some("blue.catbird.mlsChat.sendMessage".to_string());
+        claims.lxm = Some("blue.catbird.chat.sendMessage".to_string());
         assert!(matches!(
-            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            enforce_standard_with_policy(&claims, "blue.catbird.chat.getConversations", policy,),
             Err(AuthError::LxmMismatch)
         ));
 
-        claims.lxm = Some("blue.catbird.mlsChat.getConvos".to_string());
+        claims.lxm = Some("blue.catbird.chat.getConversations".to_string());
         claims.jti = None;
         assert!(matches!(
-            enforce_standard_with_policy(&claims, "blue.catbird.mlsChat.getConvos", policy,),
+            enforce_standard_with_policy(&claims, "blue.catbird.chat.getConversations", policy,),
             Err(AuthError::MissingJti)
         ));
     }
@@ -1893,7 +1893,7 @@ mod tests {
             exp: i64::MAX,
             iat: None,
             sub: sub.map(str::to_string),
-            lxm: Some("blue.catbird.mlsChat.getConvos".to_string()),
+            lxm: Some("blue.catbird.chat.getConversations".to_string()),
             jti: Some("test-jti".to_string()),
         }
     }
@@ -2012,7 +2012,7 @@ mod tests {
     #[test]
     fn delegated_subjects_have_independent_endpoint_rate_limits() {
         let limiter = crate::middleware::rate_limit::DidRateLimiter::new();
-        let endpoint = "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
+        let endpoint = "/xrpc/blue.catbird.chat.rebindDeviceAuthentication";
         let trusted_gateway = Some("did:web:api.catbird.blue");
         let alice = claims("did:web:api.catbird.blue", Some("did:plc:alice"));
         let bob = claims("did:web:api.catbird.blue", Some("did:plc:bob"));

@@ -1,8 +1,8 @@
-//! Idempotency middleware for mlsChat write endpoints.
+//! Idempotency middleware for chat write endpoints.
 //!
 //! Security and behavior:
 //! - Applies replay caching when an optional `Idempotency-Key` is present on
-//!   write requests to `/xrpc/blue.catbird.mlsChat.*`
+//!   write requests to `/xrpc/blue.catbird.chat.*`
 //! - Verifies bearer JWT before cache lookup
 //! - Caches only successful JSON responses scoped by effective caller DID + endpoint + key
 //! - Caps cacheable response bodies to 256 KiB
@@ -28,11 +28,11 @@ use crate::{
 const DEFAULT_TTL_SECONDS: i64 = 86400;
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "Idempotency-Replayed";
-const MLS_CHAT_XRPC_PREFIX: &str = "/xrpc/blue.catbird.mlsChat.";
-const BEGIN_DEVICE_AUTH_BINDING_ENDPOINT: &str =
-    "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding";
-const COMPLETE_DEVICE_AUTH_BINDING_ENDPOINT: &str =
-    "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding";
+const CHAT_XRPC_PREFIX: &str = "/xrpc/blue.catbird.chat.";
+const ENROLL_DEVICE_ENDPOINT: &str =
+    "/xrpc/blue.catbird.chat.enrollDevice";
+const REBIND_DEVICE_AUTH_ENDPOINT: &str =
+    "/xrpc/blue.catbird.chat.rebindDeviceAuthentication";
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -68,14 +68,14 @@ struct CachedResponse {
 }
 
 fn should_apply(endpoint: &str, method: &Method) -> bool {
-    endpoint.starts_with(MLS_CHAT_XRPC_PREFIX)
+    endpoint.starts_with(CHAT_XRPC_PREFIX)
         && matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
         // Enrollment has stronger, request-bound replay semantics: every
         // attempt needs a fresh DPoP proof and complete consumes a one-time
         // challenge. Returning a cached response here would bypass both the
         // DPoP verifier and the handler's database rechecks.
-        && endpoint != BEGIN_DEVICE_AUTH_BINDING_ENDPOINT
-        && endpoint != COMPLETE_DEVICE_AUTH_BINDING_ENDPOINT
+        && endpoint != ENROLL_DEVICE_ENDPOINT
+        && endpoint != REBIND_DEVICE_AUTH_ENDPOINT
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -463,9 +463,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_only_to_mls_chat_write_endpoints() {
+    fn apply_only_to_chat_write_endpoints() {
         assert!(should_apply(
-            "/xrpc/blue.catbird.mlsChat.sendMessage",
+            "/xrpc/blue.catbird.chat.sendMessage",
             &Method::POST
         ));
         assert!(!should_apply(
@@ -473,7 +473,7 @@ mod tests {
             &Method::POST
         ));
         assert!(!should_apply(
-            "/xrpc/blue.catbird.mlsChat.getConvos",
+            "/xrpc/blue.catbird.chat.getConversations",
             &Method::GET
         ));
     }
@@ -481,19 +481,19 @@ mod tests {
     #[test]
     fn excludes_device_auth_enrollment_from_pre_verification_cache() {
         for endpoint in [
-            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBinding",
-            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding",
+            "/xrpc/blue.catbird.chat.enrollDevice",
+            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
         ] {
             assert!(!should_apply(endpoint, &Method::POST));
             assert!(!should_apply(endpoint, &Method::PUT));
         }
 
         assert!(should_apply(
-            "/xrpc/blue.catbird.mlsChat.beginDeviceAuthBindingExtra",
+            "/xrpc/blue.catbird.chat.enrollDeviceExtra",
             &Method::POST
         ));
         assert!(should_apply(
-            "/xrpc/blue.catbird.mlsChat.completeDeviceAuthBinding/extra",
+            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication/extra",
             &Method::POST
         ));
     }
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn cache_scope_uses_effective_delegated_subject_and_exact_lxm() {
-        let endpoint = "blue.catbird.mlsChat.sendMessage";
+        let endpoint = "blue.catbird.chat.sendMessage";
         let direct = claims("did:plc:alice", None, endpoint);
         assert_eq!(
             resolve_cache_principal(&direct, endpoint, None).expect("direct principal"),
@@ -561,7 +561,7 @@ mod tests {
         let wrong_lxm = claims(
             "did:web:nest.example",
             Some("did:plc:alice"),
-            "blue.catbird.mlsChat.createConvo",
+            "blue.catbird.chat.createConversation",
         );
         assert!(
             resolve_cache_principal(&wrong_lxm, endpoint, Some("did:web:nest.example")).is_err()

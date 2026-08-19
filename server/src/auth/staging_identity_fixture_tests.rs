@@ -11,8 +11,8 @@ use std::{
 const GATEWAY_DID: &str = "did:web:dev-api.catbird.blue";
 const MLS_DID: &str = "did:web:dev-api.catbird.blue:mls";
 const USER_DID: &str = "did:plc:wave1-staging-user";
-const ENDPOINT: &str = "blue.catbird.mlsChat.getConvos";
-const OTHER_ENDPOINT: &str = "blue.catbird.mlsChat.sendMessage";
+const ENDPOINT: &str = "blue.catbird.chat.getConversations";
+const OTHER_ENDPOINT: &str = "blue.catbird.chat.sendMessage";
 const GATEWAY_KID: &str = "catbird-key-1";
 
 fn strict_fixture_policy() -> AuthEnforcementPolicy {

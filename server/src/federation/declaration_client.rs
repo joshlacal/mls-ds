@@ -106,9 +106,9 @@ impl DeviceRecordClient {
             })?;
 
         // com.atproto.repo.listRecords
-        // Using "blue.catbird.mlsChat.device" collection
+        // Using "blue.catbird.chat.device" collection
         let url = format!(
-            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.mlsChat.device&limit=100",
+            "{}/xrpc/com.atproto.repo.listRecords?repo={}&collection=blue.catbird.chat.device&limit=100",
             pds_endpoint,
             urlencoding::encode(did)
         );
@@ -165,7 +165,7 @@ impl DeviceRecordClient {
 
     /// Fetch the current chat policy for a user from their PDS.
     ///
-    /// Reads the single `blue.catbird.mlsChat.policy/self` record via
+    /// Reads the single `blue.catbird.chat.policy/self` record via
     /// `com.atproto.repo.getRecord`.
     pub async fn get_chat_policy(&self, did: &str) -> Result<MLSChatPolicy, FederationError> {
         let pds_endpoint = self.resolver.resolve_did_to_pds(did).await?;
@@ -188,7 +188,7 @@ impl DeviceRecordClient {
             })?;
 
         let url = format!(
-            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.mlsChat.policy&rkey=self",
+            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.policy&rkey=self",
             pds_endpoint,
             urlencoding::encode(did)
         );
@@ -293,10 +293,10 @@ mod tests {
 
     fn device_record(index: usize) -> Value {
         json!({
-            "uri": format!("at://{TEST_DID}/blue.catbird.mlsChat.device/{index}"),
+            "uri": format!("at://{TEST_DID}/blue.catbird.chat.device/{index}"),
             "cid": format!("cid-{index}"),
             "value": {
-                "$type": "blue.catbird.mlsChat.device",
+                "$type": "blue.catbird.chat.device",
                 "mlsSignaturePublicKey": { "$bytes": "AQID" },
                 "algorithm": "ed25519",
                 "createdAt": "2026-07-16T00:00:00Z"

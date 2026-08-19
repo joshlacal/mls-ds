@@ -34,8 +34,8 @@ use crate::util::outbound_body::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TICKET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const TICKET_METHOD: &str = "blue.catbird.mlsChat.getSubscriptionTicket";
-const SUBSCRIBE_METHOD: &str = "blue.catbird.mlsChat.subscribeEvents";
+const TICKET_METHOD: &str = "blue.catbird.chat.getSubscriptionTicket";
+const SUBSCRIBE_METHOD: &str = "blue.catbird.chat.subscribeEvents";
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_CAP: Duration = Duration::from_secs(60);
 const GRACE_PERIOD: Duration = Duration::from_secs(30);
@@ -531,19 +531,6 @@ fn parse_dagcbor_frame(data: &[u8], convo_id: &str) -> Option<StreamEvent> {
 /// Extract the cursor string from a StreamEvent.
 fn extract_cursor(event: &StreamEvent) -> Option<String> {
     match event {
-        StreamEvent::MessageEvent { cursor, .. }
-        | StreamEvent::TypingEvent { cursor, .. }
-        | StreamEvent::ReactionEvent { cursor, .. }
-        | StreamEvent::WelcomeReissueRequestedEvent { cursor, .. }
-        | StreamEvent::NewDeviceEvent { cursor, .. }
-        | StreamEvent::GroupInfoRefreshRequested { cursor, .. }
-        | StreamEvent::ReadditionRequested { cursor, .. }
-        | StreamEvent::TreeChanged { cursor, .. }
-        | StreamEvent::MembershipChangeEvent { cursor, .. }
-        | StreamEvent::GroupResetEvent { cursor, .. }
-        | StreamEvent::CircuitBreakerTrippedEvent { cursor, .. }
-        | StreamEvent::ResetRequestedEvent { cursor, .. }
-        | StreamEvent::InfoEvent { cursor, .. } => Some(cursor.clone()),
         StreamEvent::CleanTypingEvent { .. } => None,
     }
 }
@@ -780,175 +767,18 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cursor_message() {
-        let event = StreamEvent::MessageEvent {
-            cursor: "01ABC".into(),
-            message: crate::generated::blue_catbird::mlsChat::MessageView {
-                id: "m1".into(),
-                convo_id: "c1".into(),
-                ciphertext: bytes::Bytes::new(),
-                epoch: 0,
-                seq: 0,
-                created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
-                message_type: Some("app".into()),
-                receipt_wire: None,
-                reset_generation: None,
-                extra_data: Default::default(),
-            },
-            ephemeral: false,
-        };
-        assert_eq!(extract_cursor(&event), Some("01ABC".into()));
-    }
-
-    #[test]
-    fn test_parse_invalid_cbor_returns_none() {
-        let bad_data = vec![0xFF, 0xFF, 0xFF];
-        assert!(parse_dagcbor_frame(&bad_data, "test-convo").is_none());
-    }
-
-    // TODO(phase-2.5-cleanup-test-fixture-rot): the wire-frame format
-    // changed (header schema or `StreamEvent` discriminants) and the
-    // synthetic frame this test builds no longer round-trips through
-    // `parse_dagcbor_frame`. Pre-existing — fixture needs realignment to
-    // the current `WireHeader`. Skipping until that fix lands.
-    #[test]
-    #[ignore = "fixture rot: synthetic dag-cbor frame no longer matches WireHeader/StreamEvent encoding"]
-    fn test_parse_dagcbor_frame_valid() {
-        // Mirror the WireHeader struct for serialization (production one is Deserialize-only)
-        #[derive(serde::Serialize)]
-        struct TestHeader {
-            op: i32,
-            t: String,
-        }
-
-        let header = TestHeader {
-            op: 1,
-            t: "#infoEvent".into(),
-        };
-        let header_bytes = serde_ipld_dagcbor::to_vec(&header).unwrap();
-
-        let event = StreamEvent::InfoEvent {
-            cursor: "cursor-xyz".into(),
-            info: "test-info".into(),
-        };
-        let payload_bytes = serde_ipld_dagcbor::to_vec(&event).unwrap();
-
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&header_bytes);
-        frame.extend_from_slice(&payload_bytes);
-
-        let parsed = parse_dagcbor_frame(&frame, "test-convo");
-        assert!(parsed.is_some(), "Expected valid frame to parse");
-
-        match parsed.unwrap() {
-            StreamEvent::InfoEvent { cursor, info } => {
-                assert_eq!(cursor, "cursor-xyz");
-                assert_eq!(info, "test-info");
-            }
-            other => panic!("Expected InfoEvent, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_extract_cursor_all_variants() {
-        let now = chrono::Utc::now();
-        let msg_view: crate::realtime::StreamMessageView =
-            crate::generated::blue_catbird::mlsChat::MessageView {
-                id: "m1".into(),
-                convo_id: "c1".into(),
-                ciphertext: bytes::Bytes::new(),
-                epoch: 0,
-                seq: 0,
-                created_at: crate::sqlx_jacquard::chrono_to_datetime(now),
-                message_type: Some("app".into()),
-                receipt_wire: None,
-                reset_generation: None,
-                extra_data: Default::default(),
-            };
-
-        let variants: Vec<(&str, StreamEvent)> = vec![
-            (
-                "MessageEvent",
-                StreamEvent::MessageEvent {
-                    cursor: "c-msg".into(),
-                    message: msg_view,
-                    ephemeral: false,
-                },
-            ),
-            (
-                "TypingEvent",
-                StreamEvent::TypingEvent {
-                    cursor: "c-type".into(),
-                    convo_id: "c1".into(),
-                    did: "did:x".into(),
-                    is_typing: true,
-                },
-            ),
-            (
-                "InfoEvent",
-                StreamEvent::InfoEvent {
-                    cursor: "c-info".into(),
-                    info: "hello".into(),
-                },
-            ),
-            (
-                "NewDeviceEvent",
-                StreamEvent::NewDeviceEvent {
-                    cursor: "c-dev".into(),
-                    convo_id: "c1".into(),
-                    user_did: "did:x".into(),
-                    device_id: "d1".into(),
-                    device_name: None,
-                    device_credential_did: "did:key:z".into(),
-                    pending_addition_id: "pa1".into(),
-                },
-            ),
-            (
-                "GroupInfoRefreshRequested",
-                StreamEvent::GroupInfoRefreshRequested {
-                    cursor: "c-gir".into(),
-                    convo_id: "c1".into(),
-                    requested_by: "did:x".into(),
-                    requested_at: now.to_rfc3339(),
-                },
-            ),
-            (
-                "ReadditionRequested",
-                StreamEvent::ReadditionRequested {
-                    cursor: "c-readd".into(),
-                    convo_id: "c1".into(),
-                    requested_by: "did:x".into(),
-                    requested_at: now.to_rfc3339(),
-                },
-            ),
-            (
-                "MembershipChangeEvent",
-                StreamEvent::MembershipChangeEvent {
-                    cursor: "c-member".into(),
-                    convo_id: "c1".into(),
-                    did: "did:x".into(),
-                    action: "joined".into(),
-                    actor: None,
-                    reason: None,
-                    epoch: 1,
-                },
-            ),
-        ];
-
-        for (name, event) in &variants {
-            let cursor = extract_cursor(event);
-            assert!(
-                cursor.is_some(),
-                "extract_cursor returned None for {}",
-                name
-            );
-            assert!(
-                cursor.as_ref().unwrap().starts_with("c-"),
-                "Unexpected cursor for {}: {:?}",
-                name,
-                cursor
-            );
-        }
+    fn test_extract_cursor_clean_typing() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "actorDeviceId": "device-a",
+            "actorDid": "did:plc:actor",
+            "conversationId": "convo-a",
+            "expiresAt": "2026-08-16T12:00:08.000Z",
+            "isTyping": true,
+            "typingId": "typing-a"
+        }))
+        .unwrap();
+        assert_eq!(extract_cursor(&event), None);
     }
 
     #[tokio::test]

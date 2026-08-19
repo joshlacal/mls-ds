@@ -47,7 +47,7 @@ pub struct TicketClaims {
 }
 
 /// Get a short-lived ticket for WebSocket subscription authentication
-/// POST /xrpc/blue.catbird.mlsChat.getSubscriptionTicket
+/// POST /xrpc/blue.catbird.chat.getSubscriptionTicket
 #[tracing::instrument(skip(pool))]
 pub async fn get_subscription_ticket(
     State(pool): State<DbPool>,
@@ -164,7 +164,7 @@ fn derive_ws_endpoint(self_endpoint: &str) -> String {
     } else {
         base.to_string()
     };
-    format!("{ws_base}/xrpc/blue.catbird.mlsChat.subscribeEvents")
+    format!("{ws_base}/xrpc/blue.catbird.chat.subscribeEvents")
 }
 
 /// Generate a unique JTI (JWT ID) for replay prevention
@@ -244,15 +244,15 @@ mod tests {
     fn test_derive_ws_endpoint() {
         assert_eq!(
             derive_ws_endpoint("https://ds.example.test"),
-            "wss://ds.example.test/xrpc/blue.catbird.mlsChat.subscribeEvents"
+            "wss://ds.example.test/xrpc/blue.catbird.chat.subscribeEvents"
         );
         assert_eq!(
             derive_ws_endpoint("https://ds.example.test/"),
-            "wss://ds.example.test/xrpc/blue.catbird.mlsChat.subscribeEvents"
+            "wss://ds.example.test/xrpc/blue.catbird.chat.subscribeEvents"
         );
         assert_eq!(
             derive_ws_endpoint("http://localhost:3001"),
-            "ws://localhost:3001/xrpc/blue.catbird.mlsChat.subscribeEvents"
+            "ws://localhost:3001/xrpc/blue.catbird.chat.subscribeEvents"
         );
     }
 

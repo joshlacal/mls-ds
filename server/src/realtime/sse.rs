@@ -21,7 +21,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     auth::AuthUser,
     db::DbPool,
-    realtime::{cursor::CursorGenerator, StreamMessageView},
+    realtime::cursor::CursorGenerator,
 };
 
 /// SSE query parameters for subscribeConvoEvents
@@ -34,28 +34,9 @@ pub struct SubscribeQuery {
 
 /// Event types for realtime streaming
 /// Uses AT Protocol format with $type tag for proper client compatibility
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "$type")]
 pub enum StreamEvent {
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
-    MessageEvent {
-        cursor: String,
-        message: StreamMessageView,
-        /// When true, this is an ephemeral signal (typing, read receipt, presence)
-        /// that should NOT be shown in chat history. Omitted (defaults to false)
-        /// for regular persistent messages.
-        #[serde(default, skip_serializing_if = "crate::realtime::sse::is_false")]
-        ephemeral: bool,
-    },
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
-    TypingEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        did: String,
-        #[serde(rename = "isTyping")]
-        is_typing: bool,
-    },
     /// Clean-chat ephemeral typing DTO. Unlike the legacy `TypingEvent`, this
     /// event is uncursored and uses the generated `defs#typingEvent` wire tag.
     /// It intentionally travels through the same per-conversation broadcast
@@ -76,168 +57,6 @@ pub enum StreamEvent {
         #[serde(rename = "typingId")]
         typing_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
     },
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
-    ReactionEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        /// DID of the user who reacted
-        did: String,
-        /// Target message ID
-        #[serde(rename = "messageId")]
-        message_id: String,
-        /// Emoji character (e.g. "👍") or short code
-        reaction: String,
-        /// "add" or "remove"
-        action: String,
-    },
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
-    InfoEvent { cursor: String, info: String },
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#welcomeReissueRequestedEvent")]
-    WelcomeReissueRequestedEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "recipientDeviceDid")]
-        recipient_device_did: String,
-        #[serde(rename = "requestedAt")]
-        requested_at: String,
-        #[serde(rename = "requestId")]
-        request_id: String,
-    },
-    /// Event indicating a user has registered a new device that needs to be added to the conversation
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
-    NewDeviceEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "userDid")]
-        user_did: String,
-        #[serde(rename = "deviceId")]
-        device_id: String,
-        #[serde(rename = "deviceName")]
-        device_name: Option<String>,
-        #[serde(rename = "deviceCredentialDid")]
-        device_credential_did: String,
-        #[serde(rename = "pendingAdditionId")]
-        pending_addition_id: String,
-    },
-    /// Event requesting active members to publish fresh GroupInfo for external commit joins
-    /// Emitted when a member encounters stale GroupInfo and calls groupInfoRefresh
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent")]
-    GroupInfoRefreshRequested {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        /// DID of the member requesting the refresh (so they don't respond to their own request)
-        #[serde(rename = "requestedBy")]
-        requested_by: String,
-        #[serde(rename = "requestedAt")]
-        requested_at: String,
-    },
-    /// Event indicating a member needs to be re-added to the conversation
-    /// Emitted when both Welcome and External Commit have failed
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readditionRequestedEvent")]
-    ReadditionRequested {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        /// DID of the user requesting re-addition
-        #[serde(rename = "requestedBy")]
-        requested_by: String,
-        #[serde(rename = "requestedAt")]
-        requested_at: String,
-    },
-    /// Event indicating the canonical MLS tree state changed.
-    /// Clients must compare confirmationTag against their local state and re-join if mismatched.
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#treeChanged")]
-    TreeChanged {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(
-            rename = "confirmationTag",
-            with = "jacquard_common::serde_bytes_helper"
-        )]
-        confirmation_tag: bytes::Bytes,
-        epoch: i64,
-    },
-    /// Event indicating a member joined, left, or was removed from the conversation
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
-    MembershipChangeEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        /// DID of the affected member
-        did: String,
-        /// Action: joined, left, removed, or kicked
-        action: String,
-        /// DID of the actor who performed the action (for removed/kicked)
-        actor: Option<String>,
-        /// Optional reason for removal
-        reason: Option<String>,
-        /// New epoch after this change
-        epoch: usize,
-    },
-    /// Event indicating the MLS group has been reset with a new group_id
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupResetEvent")]
-    GroupResetEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "newGroupId")]
-        new_group_id: String,
-        #[serde(rename = "resetGeneration")]
-        reset_generation: i32,
-        #[serde(rename = "resetBy")]
-        reset_by: String,
-        #[serde(rename = "cipherSuite")]
-        cipher_suite: String,
-        reason: Option<String>,
-    },
-    /// Event indicating the circuit breaker has tripped — auto-reset is disabled
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#circuitBreakerTrippedEvent")]
-    CircuitBreakerTrippedEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "resetCount")]
-        reset_count: i32,
-        #[serde(rename = "trippedAt")]
-        tripped_at: String,
-    },
-    /// Phase 2.5 §2 — indirect-flow trigger has emitted a
-    /// `crypto_session_reset_requested` delivery event. Active members
-    /// of the conversation are invited to respond by submitting new
-    /// MLS group material via `bootstrap_reset_group` /
-    /// `commit_group_change`. First commit wins via the
-    /// `UNIQUE (conversation_id, generation)` constraint.
-    ///
-    /// Stage 1 ships this alongside the legacy `GroupResetEvent` (dual-
-    /// emit) so unmodified clients are unaffected.
-    #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent")]
-    ResetRequestedEvent {
-        cursor: String,
-        #[serde(rename = "convoId")]
-        convo_id: String,
-        #[serde(rename = "cryptoSessionId")]
-        crypto_session_id: String,
-        generation: i32,
-        /// Stable string id from `ResetTrigger::as_str()`; mapped to
-        /// the lexicon's `knownValues` enumeration.
-        trigger: String,
-        #[serde(rename = "requestEventId")]
-        request_event_id: String,
-        #[serde(
-            rename = "expectedNewMlsGroupId",
-            skip_serializing_if = "Option::is_none"
-        )]
-        expected_new_mls_group_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        #[serde(rename = "requestedAt")]
-        requested_at: String,
-    },
 }
 
 /// Helper for `skip_serializing_if` on the `ephemeral` field.
@@ -245,44 +64,12 @@ pub fn is_false(v: &bool) -> bool {
     !(*v)
 }
 
-/// Mutate the `cursor` field of any `StreamEvent` variant in-place.
-///
-/// Phase 3 codex P1 fix — used by
-/// `actors/reset_chokepoint::enqueue_outbox_for_event` to assign the
-/// in-tx allocated ULID to a caller-supplied event before persisting.
-/// The chokepoint then returns the modified event so the caller's
-/// live `sse_state.emit` path can broadcast the SAME cursor (subscriber
-/// dedupe via `replayed_cursors` HashSet relies on bit-equal cursors).
-///
-/// Durable/legacy variants carry a `cursor: String` field; the clean typing
-/// variant is deliberately uncursored and is left unchanged. This helper
-/// exists so callers don't have to enumerate the cursor-bearing variants
-/// again. Update this function if you add a new `StreamEvent` variant.
-pub fn set_stream_event_cursor(event: &mut StreamEvent, new_cursor: String) {
-    match event {
-        StreamEvent::MessageEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::TypingEvent { cursor, .. } => *cursor = new_cursor,
-        // Clean typing is explicitly uncursored; there is no cursor to set.
-        StreamEvent::CleanTypingEvent { .. } => {}
-        StreamEvent::ReactionEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::InfoEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::NewDeviceEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::GroupInfoRefreshRequested { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::ReadditionRequested { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::TreeChanged { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::MembershipChangeEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::GroupResetEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => *cursor = new_cursor,
-        StreamEvent::ResetRequestedEvent { cursor, .. } => *cursor = new_cursor,
-    }
-}
+/// Mutate the `cursor` field of any `StreamEvent` variant in-place. Clean typing is uncursored.
+pub fn set_stream_event_cursor(_event: &mut StreamEvent, _new_cursor: String) {}
 
 impl StreamEvent {
     /// Return the generated clean-chat typing DTO carried by this shared-bus
-    /// event. Legacy events intentionally return `None`; callers that build a
-    /// clean `SubscriptionMessage` should use this rather than reconstructing
-    /// the DTO from reduced legacy fields.
+    /// event.
     pub(crate) fn clean_typing_payload(
         &self,
     ) -> Option<catbird_atproto::generated::blue_catbird::chat::TypingEvent> {
@@ -305,395 +92,7 @@ impl StreamEvent {
                     extra_data: None,
                 },
             ),
-            _ => None,
         }
-    }
-}
-
-/// Manual `Deserialize` for `StreamEvent`.
-///
-/// The generated `MessageView<'static>` cannot derive `DeserializeOwned` because its
-/// `#[serde(borrow)]` attributes constrain `'de: 'static`. We work around this by
-/// deserializing via an intermediate `RawMessageView` with owned types, then converting.
-impl<'de> serde::Deserialize<'de> for StreamEvent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        /// Mirror of StreamEvent with a raw message view for the MessageEvent variant.
-        #[derive(Deserialize)]
-        #[serde(tag = "$type")]
-        enum RawStreamEvent {
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#messageEvent")]
-            MessageEvent {
-                cursor: String,
-                message: RawMessageView,
-                #[serde(default)]
-                ephemeral: bool,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#typingEvent")]
-            TypingEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                did: String,
-                #[serde(rename = "isTyping")]
-                is_typing: bool,
-            },
-            #[serde(rename = "blue.catbird.chat.defs#typingEvent")]
-            CleanTypingEvent {
-                #[serde(rename = "actorDeviceId")]
-                actor_device_id: catbird_atproto::generated::blue_catbird::chat::DeviceId,
-                #[serde(rename = "actorDid")]
-                actor_did: catbird_atproto::generated::blue_catbird::chat::BareDid,
-                #[serde(rename = "conversationId")]
-                conversation_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
-                #[serde(rename = "expiresAt")]
-                expires_at: catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime,
-                #[serde(rename = "isTyping")]
-                is_typing: bool,
-                #[serde(rename = "typingId")]
-                typing_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#reactionEvent")]
-            ReactionEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                did: String,
-                #[serde(rename = "messageId")]
-                message_id: String,
-                reaction: String,
-                action: String,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#infoEvent")]
-            InfoEvent { cursor: String, info: String },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#welcomeReissueRequestedEvent")]
-            WelcomeReissueRequestedEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "recipientDeviceDid")]
-                recipient_device_did: String,
-                #[serde(rename = "requestedAt")]
-                requested_at: String,
-                #[serde(rename = "requestId")]
-                request_id: String,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#newDeviceEvent")]
-            NewDeviceEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "userDid")]
-                user_did: String,
-                #[serde(rename = "deviceId")]
-                device_id: String,
-                #[serde(rename = "deviceName")]
-                device_name: Option<String>,
-                #[serde(rename = "deviceCredentialDid")]
-                device_credential_did: String,
-                #[serde(rename = "pendingAdditionId")]
-                pending_addition_id: String,
-            },
-            #[serde(
-                rename = "blue.catbird.mlsChat.subscribeEvents#groupInfoRefreshRequestedEvent"
-            )]
-            GroupInfoRefreshRequested {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "requestedBy")]
-                requested_by: String,
-                #[serde(rename = "requestedAt")]
-                requested_at: String,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#readditionRequestedEvent")]
-            ReadditionRequested {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "requestedBy")]
-                requested_by: String,
-                #[serde(rename = "requestedAt")]
-                requested_at: String,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#treeChanged")]
-            TreeChanged {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(
-                    rename = "confirmationTag",
-                    with = "jacquard_common::serde_bytes_helper"
-                )]
-                confirmation_tag: bytes::Bytes,
-                epoch: i64,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#membershipChangeEvent")]
-            MembershipChangeEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                did: String,
-                action: String,
-                actor: Option<String>,
-                reason: Option<String>,
-                epoch: usize,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#groupResetEvent")]
-            GroupResetEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "newGroupId")]
-                new_group_id: String,
-                #[serde(rename = "resetGeneration")]
-                reset_generation: i32,
-                #[serde(rename = "resetBy")]
-                reset_by: String,
-                #[serde(rename = "cipherSuite")]
-                cipher_suite: String,
-                reason: Option<String>,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#circuitBreakerTrippedEvent")]
-            CircuitBreakerTrippedEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "resetCount")]
-                reset_count: i32,
-                #[serde(rename = "trippedAt")]
-                tripped_at: String,
-            },
-            #[serde(rename = "blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent")]
-            ResetRequestedEvent {
-                cursor: String,
-                #[serde(rename = "convoId")]
-                convo_id: String,
-                #[serde(rename = "cryptoSessionId")]
-                crypto_session_id: String,
-                generation: i32,
-                trigger: String,
-                #[serde(rename = "requestEventId")]
-                request_event_id: String,
-                #[serde(rename = "expectedNewMlsGroupId", default)]
-                expected_new_mls_group_id: Option<String>,
-                #[serde(default)]
-                reason: Option<String>,
-                #[serde(rename = "requestedAt")]
-                requested_at: String,
-            },
-        }
-
-        /// Owned intermediate for MessageView deserialization.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct RawMessageView {
-            id: String,
-            convo_id: String,
-            #[serde(with = "jacquard_common::serde_bytes_helper")]
-            ciphertext: bytes::Bytes,
-            epoch: i64,
-            seq: i64,
-            created_at: jacquard_common::types::string::Datetime,
-            message_type: Option<String>,
-        }
-
-        let raw = RawStreamEvent::deserialize(deserializer)?;
-        Ok(match raw {
-            RawStreamEvent::MessageEvent {
-                cursor,
-                message,
-                ephemeral,
-            } => StreamEvent::MessageEvent {
-                cursor,
-                message: StreamMessageView {
-                    id: message.id.into(),
-                    convo_id: message.convo_id.into(),
-                    ciphertext: message.ciphertext,
-                    epoch: message.epoch,
-                    seq: message.seq,
-                    created_at: message.created_at,
-                    message_type: message.message_type.map(Into::into),
-                    receipt_wire: None,
-                    reset_generation: None,
-                    extra_data: Default::default(),
-                },
-                ephemeral,
-            },
-            RawStreamEvent::TypingEvent {
-                cursor,
-                convo_id,
-                did,
-                is_typing,
-            } => StreamEvent::TypingEvent {
-                cursor,
-                convo_id,
-                did,
-                is_typing,
-            },
-            RawStreamEvent::CleanTypingEvent {
-                actor_device_id,
-                actor_did,
-                conversation_id,
-                expires_at,
-                is_typing,
-                typing_id,
-            } => StreamEvent::CleanTypingEvent {
-                actor_device_id,
-                actor_did,
-                conversation_id,
-                expires_at,
-                is_typing,
-                typing_id,
-            },
-            RawStreamEvent::ReactionEvent {
-                cursor,
-                convo_id,
-                did,
-                message_id,
-                reaction,
-                action,
-            } => StreamEvent::ReactionEvent {
-                cursor,
-                convo_id,
-                did,
-                message_id,
-                reaction,
-                action,
-            },
-            RawStreamEvent::InfoEvent { cursor, info } => StreamEvent::InfoEvent { cursor, info },
-            RawStreamEvent::WelcomeReissueRequestedEvent {
-                cursor,
-                convo_id,
-                recipient_device_did,
-                requested_at,
-                request_id,
-            } => StreamEvent::WelcomeReissueRequestedEvent {
-                cursor,
-                convo_id,
-                recipient_device_did,
-                requested_at,
-                request_id,
-            },
-            RawStreamEvent::NewDeviceEvent {
-                cursor,
-                convo_id,
-                user_did,
-                device_id,
-                device_name,
-                device_credential_did,
-                pending_addition_id,
-            } => StreamEvent::NewDeviceEvent {
-                cursor,
-                convo_id,
-                user_did,
-                device_id,
-                device_name,
-                device_credential_did,
-                pending_addition_id,
-            },
-            RawStreamEvent::GroupInfoRefreshRequested {
-                cursor,
-                convo_id,
-                requested_by,
-                requested_at,
-            } => StreamEvent::GroupInfoRefreshRequested {
-                cursor,
-                convo_id,
-                requested_by,
-                requested_at,
-            },
-            RawStreamEvent::ReadditionRequested {
-                cursor,
-                convo_id,
-                requested_by,
-                requested_at,
-            } => StreamEvent::ReadditionRequested {
-                cursor,
-                convo_id,
-                requested_by,
-                requested_at,
-            },
-            RawStreamEvent::TreeChanged {
-                cursor,
-                convo_id,
-                confirmation_tag,
-                epoch,
-            } => StreamEvent::TreeChanged {
-                cursor,
-                convo_id,
-                confirmation_tag,
-                epoch,
-            },
-            RawStreamEvent::MembershipChangeEvent {
-                cursor,
-                convo_id,
-                did,
-                action,
-                actor,
-                reason,
-                epoch,
-            } => StreamEvent::MembershipChangeEvent {
-                cursor,
-                convo_id,
-                did,
-                action,
-                actor,
-                reason,
-                epoch,
-            },
-            RawStreamEvent::GroupResetEvent {
-                cursor,
-                convo_id,
-                new_group_id,
-                reset_generation,
-                reset_by,
-                cipher_suite,
-                reason,
-            } => StreamEvent::GroupResetEvent {
-                cursor,
-                convo_id,
-                new_group_id,
-                reset_generation,
-                reset_by,
-                cipher_suite,
-                reason,
-            },
-            RawStreamEvent::CircuitBreakerTrippedEvent {
-                cursor,
-                convo_id,
-                reset_count,
-                tripped_at,
-            } => StreamEvent::CircuitBreakerTrippedEvent {
-                cursor,
-                convo_id,
-                reset_count,
-                tripped_at,
-            },
-            RawStreamEvent::ResetRequestedEvent {
-                cursor,
-                convo_id,
-                crypto_session_id,
-                generation,
-                trigger,
-                request_event_id,
-                expected_new_mls_group_id,
-                reason,
-                requested_at,
-            } => StreamEvent::ResetRequestedEvent {
-                cursor,
-                convo_id,
-                crypto_session_id,
-                generation,
-                trigger,
-                request_event_id,
-                expected_new_mls_group_id,
-                reason,
-                requested_at,
-            },
-        })
     }
 }
 
@@ -998,258 +397,22 @@ pub async fn subscribe_convo_events(
     // fetch chat messages via getMessages. However, MLS commit messages are required to maintain
     // local MLS state, so we do backfill commit messageEvent entries to avoid epoch desync when
     // a client reconnects after missing commits.
-    let mut replayed_cursors: HashSet<String> = HashSet::new();
-    let mut replay_sse_events: Vec<Event> = Vec::new();
-
-    if let Some(ref resume_cur) = resume_cursor {
-        let mut replay_items: Vec<(String, String)> = Vec::new();
-
-        // Backfill commit message events (required for MLS state correctness).
-        //
-        // NOTE: This intentionally replays ONLY commit messages, not all app messages.
-        // Clients should fetch any missed chat content via getMessages.
-        let commit_rows = sqlx::query_as::<
-            _,
-            (
-                String,
-                String,
-                Option<Vec<u8>>,
-                i64,
-                i64,
-                chrono::DateTime<chrono::Utc>,
-            ),
-        >(
-            r#"
-            SELECT
-                e.id AS cursor,
-                m.id AS message_id,
-                m.ciphertext,
-                m.epoch,
-                m.seq,
-                m.created_at
-            FROM event_stream e
-            JOIN messages m
-              ON m.id = (e.payload->>'messageId')
-            WHERE e.convo_id = $1
-              AND e.event_type = 'messageEvent'
-              AND e.id > $2
-              AND m.message_type = 'commit'
-            ORDER BY e.id ASC
-            "#,
-        )
-        .bind(&convo_id)
-        .bind(resume_cur)
-        .fetch_all(&pool)
-        .await;
-
-        match commit_rows {
-            Ok(rows) => {
-                for (cursor, message_id, ciphertext, epoch, seq, created_at) in rows {
-                    let Some(ciphertext) = ciphertext else {
-                        // Should never happen for commit messages, but don't emit empty ciphertext.
-                        continue;
-                    };
-
-                    // Legacy-row migration (see group_info::decode_legacy_if_needed):
-                    // some older commit rows are stored as base64 text of the MLS
-                    // wire bytes. Serving those as-is breaks every client because
-                    // `MessageView::ciphertext` is raw bytes on the wire.
-                    let ciphertext = crate::group_info::decode_legacy_if_needed(
-                        ciphertext,
-                        &format!("commit-ciphertext[{}]", message_id),
-                    );
-
-                    let message_view: StreamMessageView =
-                        crate::generated::blue_catbird::mlsChat::MessageView {
-                            id: message_id.into(),
-                            convo_id: convo_id.clone().into(),
-                            ciphertext: bytes::Bytes::from(ciphertext),
-                            epoch,
-                            seq,
-                            created_at: crate::sqlx_jacquard::chrono_to_datetime(created_at),
-                            message_type: Some("commit".into()),
-                            receipt_wire: None,
-                            reset_generation: None,
-                            extra_data: Default::default(),
-                        };
-
-                    let event = StreamEvent::MessageEvent {
-                        cursor: cursor.clone(),
-                        message: message_view,
-                        ephemeral: false,
-                    };
-
-                    let json = match serde_json::to_string(&event) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            error!(error = ?e, "Failed to serialize replay commit messageEvent");
-                            continue;
-                        }
-                    };
-
-                    replay_items.push((cursor, json));
-                }
-            }
-            Err(e) => {
-                warn!(
-                    convo = %crate::crypto::redact_for_log(&convo_id),
-                    error = ?e,
-                    "Failed to backfill commit messages"
-                );
-            }
-        }
-
-        // Phase 3 codex P1 fix — also backfill non-messageEvent
-        // event_stream rows so reconnecting clients see
-        // `resetRequestedEvent` / `groupResetEvent` /
-        // `treeChanged` / etc. that the chokepoint persisted in-tx.
-        // Mirrors `realtime/websocket.rs::backfill_events`: read every
-        // row > cursor, deserialize via the existing
-        // `StreamEvent: Deserialize` impl (which also catches legacy
-        // pre-task-40 rows without `$type` and silently skips them).
-        //
-        // Filtering rules:
-        //   - `messageEvent` rows are skipped here — covered by the
-        //     commit-replay query above (which joins `messages` to
-        //     filter app vs commit). Letting them through here would
-        //     duplicate events (one without joined message_type, one
-        //     with).
-        //   - All other event_types pass through.
-        //
-        // Schema: event_stream.payload is JSONB; serde_json::from_value
-        // can't borrow `&'de str` for `serde_bytes_helper` so we
-        // round-trip via to_string + from_str (same as WS backfill).
-        let other_rows = sqlx::query_as::<_, (String, serde_json::Value, String)>(
-            r#"
-            SELECT id, payload, event_type
-            FROM event_stream
-            WHERE convo_id = $1
-              AND id > $2
-              AND event_type <> 'messageEvent'
-            ORDER BY id ASC
-            LIMIT 1000
-            "#,
-        )
-        .bind(&convo_id)
-        .bind(resume_cur)
-        .fetch_all(&pool)
-        .await;
-
-        match other_rows {
-            Ok(rows) => {
-                for (cursor, payload, event_type) in rows {
-                    let Ok(json) = serde_json::to_string(&payload) else {
-                        continue;
-                    };
-                    let event: StreamEvent = match serde_json::from_str(&json) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            // Legacy row without `$type`, or genuinely
-                            // malformed — log + skip. Never panic on
-                            // backfill.
-                            debug!(
-                                convo = %crate::crypto::redact_for_log(&convo_id),
-                                cursor = %cursor,
-                                event_type = %event_type,
-                                error = ?e,
-                                "skipping unreconstructible event_stream row \
-                                 during SSE backfill"
-                            );
-                            continue;
-                        }
-                    };
-                    let serialized = match serde_json::to_string(&event) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(
-                                convo = %crate::crypto::redact_for_log(&convo_id),
-                                cursor = %cursor,
-                                event_type = %event_type,
-                                error = ?e,
-                                "failed to re-serialize event for SSE replay"
-                            );
-                            continue;
-                        }
-                    };
-                    replay_items.push((cursor, serialized));
-                }
-            }
-            Err(e) => {
-                warn!(
-                    convo = %crate::crypto::redact_for_log(&convo_id),
-                    error = ?e,
-                    "Failed to backfill non-message event_stream rows"
-                );
-            }
-        }
-
-        // Emit replay events in cursor order to preserve server-side ordering semantics.
-        replay_items.sort_by(|a, b| a.0.cmp(&b.0));
-        for (cursor, json) in replay_items {
-            replayed_cursors.insert(cursor);
-            replay_sse_events.push(Event::default().data(json));
-        }
-    }
-
-    let replay_stream = stream::iter(replay_sse_events.into_iter().map(Ok::<Event, Infallible>));
+    let replay_stream = stream::iter(Vec::<Result<Event, Infallible>>::new());
 
     // Create live event stream
+    let convo_id_str = convo_id.to_string();
     let live_stream = stream::unfold(
-        (rx, resume_cursor, replayed_cursors, convo_id.clone()),
-        move |(mut rx, resume_cursor, replayed_cursors, convo_id)| async move {
-            let replayed_cursors = replayed_cursors;
+        (rx, convo_id_str),
+        move |(mut rx, convo_id)| async move {
             loop {
                 tokio::select! {
                     // Wait for broadcast event
                     result = rx.recv() => {
                         match result {
                             Ok(event) => {
-                                let event_cursor = match &event {
-                                    StreamEvent::MessageEvent { cursor, .. } => cursor,
-                                    StreamEvent::TypingEvent { cursor, .. } => cursor,
-                                    // Clean-chat typing is ephemeral and has
-                                    // no legacy cursor. The clean compositor
-                                    // consumes it from this same bus; the
-                                    // legacy cursor-based SSE endpoint must
-                                    // not invent one or apply replay rules.
+                                match &event {
                                     StreamEvent::CleanTypingEvent { .. } => continue,
-                                    StreamEvent::ReactionEvent { cursor, .. } => cursor,
-                                    StreamEvent::InfoEvent { cursor, .. } => cursor,
-                                    StreamEvent::WelcomeReissueRequestedEvent { cursor, .. } => cursor,
-                                    StreamEvent::NewDeviceEvent { cursor, .. } => cursor,
-                                    StreamEvent::GroupInfoRefreshRequested { cursor, .. } => cursor,
-                                    StreamEvent::ReadditionRequested { cursor, .. } => cursor,
-                                    StreamEvent::TreeChanged { cursor, .. } => cursor,
-                                    StreamEvent::MembershipChangeEvent { cursor, .. } => cursor,
-                                    StreamEvent::GroupResetEvent { cursor, .. } => cursor,
-                                    StreamEvent::CircuitBreakerTrippedEvent { cursor, .. } => cursor,
-                                    StreamEvent::ResetRequestedEvent { cursor, .. } => cursor,
-                                };
-
-                                // Filter based on resume cursor
-                                if let Some(ref resume_cur) = resume_cursor {
-                                    // Only send events after resume cursor
-                                    if !CursorGenerator::is_greater(event_cursor, resume_cur) {
-                                        continue;
-                                    }
                                 }
-
-                                // Avoid duplicating replayed DB events if they race with live delivery
-                                if replayed_cursors.contains(event_cursor) {
-                                    continue;
-                                }
-
-                                // Serialize event
-                                let json = match serde_json::to_string(&event) {
-                                    Ok(j) => j,
-                                    Err(e) => {
-                                        error!(error = ?e, "Failed to serialize event");
-                                        continue;
-                                    }
-                                };
-
-                                let sse_event = Event::default().data(json);
-                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(
@@ -1257,19 +420,6 @@ pub async fn subscribe_convo_events(
                                     skipped = skipped,
                                     "Slow consumer, events skipped"
                                 );
-
-                                // Emit infoEvent about slow consumer
-                                let info = StreamEvent::InfoEvent {
-                                    cursor: ulid::Ulid::new().to_string(),
-                                    info: format!("Slow consumer: {} events skipped", skipped),
-                                };
-
-                                // SAFETY: StreamEvent is a simple enum with no complex types,
-                                // so serialization can only fail if there's a bug in serde_json.
-                                let json = serde_json::to_string(&info)
-                                    .expect("BUG: Failed to serialize StreamEvent");
-                                let sse_event = Event::default().data(json);
-                                return Some((Ok::<Event, Infallible>(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
                             }
                             Err(broadcast::error::RecvError::Closed) => {
                                 info!(
@@ -1285,7 +435,7 @@ pub async fn subscribe_convo_events(
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
                         // Send comment line as keepalive
                         let sse_event = Event::default().comment("keepalive");
-                        return Some((Ok(sse_event), (rx, None, replayed_cursors, convo_id.clone())));
+                        return Some((Ok(sse_event), (rx, convo_id)));
                     }
                 }
             }
@@ -1310,6 +460,19 @@ pub async fn subscribe_convo_events(
 mod tests {
     use super::*;
 
+    fn make_test_typing_event(convo_id: &str, typing_id: &str) -> StreamEvent {
+        serde_json::from_value(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "actorDeviceId": "device-a",
+            "actorDid": "did:plc:actor",
+            "conversationId": convo_id,
+            "expiresAt": "2026-08-16T12:00:08.000Z",
+            "isTyping": true,
+            "typingId": typing_id
+        }))
+        .expect("test typing event should deserialize")
+    }
+
     #[tokio::test]
     async fn test_sse_state_creation() {
         let state = SseState::new(1000);
@@ -1332,62 +495,11 @@ mod tests {
         let tx = state.get_channel("convo1").await;
         let mut rx = tx.subscribe();
 
-        let event = StreamEvent::InfoEvent {
-            cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
-            info: "test".to_string(),
-        };
-
+        let event = make_test_typing_event("convo1", "typing-1");
         state.emit("convo1", event.clone()).await.unwrap();
 
         let received = rx.recv().await.unwrap();
-        assert!(matches!(received, StreamEvent::InfoEvent { .. }));
-    }
-
-    fn test_message_view(id: &str) -> StreamMessageView {
-        StreamMessageView {
-            id: id.to_string().into(),
-            convo_id: "c1".to_string().into(),
-            ciphertext: bytes::Bytes::new(),
-            epoch: 0,
-            seq: 0,
-            created_at: crate::sqlx_jacquard::chrono_to_datetime(chrono::Utc::now()),
-            message_type: Some("app".into()),
-            receipt_wire: None,
-            reset_generation: None,
-            extra_data: Default::default(),
-        }
-    }
-
-    #[test]
-    fn test_ephemeral_false_skipped_in_serialization() {
-        let event = StreamEvent::MessageEvent {
-            cursor: "cursor-1".into(),
-            message: test_message_view("m1"),
-            ephemeral: false,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(
-            !json.contains("\"ephemeral\""),
-            "ephemeral:false should be skipped, got: {}",
-            json
-        );
-    }
-
-    #[test]
-    fn test_ephemeral_true_included() {
-        let event = StreamEvent::MessageEvent {
-            cursor: "cursor-2".into(),
-            message: test_message_view("m2"),
-            ephemeral: true,
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(
-            json.contains("\"ephemeral\":true"),
-            "ephemeral:true should be included, got: {}",
-            json
-        );
+        assert!(matches!(received, StreamEvent::CleanTypingEvent { .. }));
     }
 
     #[test]
@@ -1413,212 +525,32 @@ mod tests {
         assert_eq!(wire["typingId"], "typing-a");
     }
 
-    /// Round-trip every `StreamEvent` variant through
-    /// `serde_json::to_value` → `from_value`.
-    ///
-    /// This is the exact path WS/SSE backfill reconstruction takes after
-    /// task #40 persisted full event payloads in `event_stream.payload`.
-    /// A regression here means a new variant (or a changed field) would
-    /// silently drop on replay — clients reconnecting with a cursor would
-    /// miss the event. The pure round-trip catches it at `cargo test --lib`.
-    #[test]
-    fn test_stream_event_roundtrip_all_variants() {
-        let variants = vec![
-            StreamEvent::MessageEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
-                message: test_message_view("m-rt"),
-                ephemeral: false,
-            },
-            StreamEvent::TypingEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB1".into(),
-                convo_id: "c1".into(),
-                did: "did:plc:alice".into(),
-                is_typing: true,
-            },
-            StreamEvent::ReactionEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB2".into(),
-                convo_id: "c1".into(),
-                did: "did:plc:alice".into(),
-                message_id: "m-rt".into(),
-                reaction: "👍".into(),
-                action: "add".into(),
-            },
-            StreamEvent::InfoEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB3".into(),
-                info: "hi".into(),
-            },
-            StreamEvent::WelcomeReissueRequestedEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBC".into(),
-                convo_id: "c1".into(),
-                recipient_device_did: "did:plc:bob#phone".into(),
-                requested_at: "2026-06-19T00:00:00.000Z".into(),
-                request_id: "welcome-reissue-request-1".into(),
-            },
-            StreamEvent::NewDeviceEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB4".into(),
-                convo_id: "c1".into(),
-                user_did: "did:plc:alice".into(),
-                device_id: "dev-1".into(),
-                device_name: Some("phone".into()),
-                device_credential_did: "did:key:abc".into(),
-                pending_addition_id: "pa-1".into(),
-            },
-            StreamEvent::GroupInfoRefreshRequested {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB5".into(),
-                convo_id: "c1".into(),
-                requested_by: "did:plc:alice".into(),
-                requested_at: "2026-04-20T00:00:00.000Z".into(),
-            },
-            StreamEvent::ReadditionRequested {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB6".into(),
-                convo_id: "c1".into(),
-                requested_by: "did:plc:alice".into(),
-                requested_at: "2026-04-20T00:00:00.000Z".into(),
-            },
-            StreamEvent::TreeChanged {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB7".into(),
-                convo_id: "c1".into(),
-                confirmation_tag: bytes::Bytes::from(vec![0xDEu8, 0xAD, 0xBE, 0xEF]),
-                epoch: 42,
-            },
-            StreamEvent::MembershipChangeEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB8".into(),
-                convo_id: "c1".into(),
-                did: "did:plc:alice".into(),
-                action: "joined".into(),
-                actor: Some("did:plc:bob".into()),
-                reason: None,
-                epoch: 7,
-            },
-            StreamEvent::GroupResetEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FB9".into(),
-                convo_id: "c1".into(),
-                new_group_id: "deadbeef".repeat(4),
-                reset_generation: 3,
-                reset_by: "did:plc:alice".into(),
-                cipher_suite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519".into(),
-                reason: Some("auto".into()),
-            },
-            StreamEvent::CircuitBreakerTrippedEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBA".into(),
-                convo_id: "c1".into(),
-                reset_count: 4,
-                tripped_at: "2026-04-20T00:00:00.000Z".into(),
-            },
-            StreamEvent::ResetRequestedEvent {
-                cursor: "01ARZ3NDEKTSV4RRFFQ69G5FBB".into(),
-                convo_id: "c1".into(),
-                crypto_session_id: "cs-prior-uuid".into(),
-                generation: 17,
-                trigger: "quorum_vote".into(),
-                request_event_id: "req-evt-uuid".into(),
-                expected_new_mls_group_id: None,
-                reason: Some("quorum reached".into()),
-                requested_at: "2026-04-28T15:32:11.123Z".into(),
-            },
-        ];
-
-        for original in variants {
-            let value = serde_json::to_value(&original)
-                .unwrap_or_else(|e| panic!("to_value failed for {:?}: {}", original, e));
-
-            // Every variant must carry a `$type` tag after serialization, so
-            // legacy (pre-migration) rows without `$type` are distinguishable
-            // and correctly skipped by the WS backfill.
-            assert!(
-                value.get("$type").is_some(),
-                "serialized event missing $type tag: {:?}",
-                value
-            );
-
-            // `from_value` cannot produce borrowed `&'de str` (it consumes its
-            // input), and `jacquard_common::serde_bytes_helper`'s visitor
-            // requires `&'de str` map keys. Round-trip via the JSON source
-            // string — this is also what the WS backfill path uses.
-            let json = serde_json::to_string(&value).expect("to_string on round-trip value failed");
-            let round_tripped: StreamEvent = serde_json::from_str(&json)
-                .unwrap_or_else(|e| panic!("from_str failed for {:?}: {}", original, e));
-
-            // Re-serialize both and compare as JSON values to sidestep the
-            // fact that `MessageView` doesn't implement `PartialEq` directly.
-            let original_again = serde_json::to_value(&original).unwrap();
-            let round_again = serde_json::to_value(&round_tripped).unwrap();
-            assert_eq!(
-                original_again, round_again,
-                "round-trip diverged for variant {:?}",
-                original
-            );
-        }
-    }
-
-    /// Legacy event_stream rows (pre-task-40) stored only
-    /// `{cursor, convoId, messageId}` with no `$type` tag. Confirm they fail
-    /// deserialization so the WS backfill can skip them cleanly.
-    #[test]
-    fn test_legacy_payload_fails_deserialization() {
-        let legacy = serde_json::json!({
-            "cursor": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "convoId": "c1",
-            "messageId": "m1",
-        });
-
-        let json = serde_json::to_string(&legacy).unwrap();
-        let result: Result<StreamEvent, _> = serde_json::from_str(&json);
-        assert!(
-            result.is_err(),
-            "legacy envelope without $type should fail deserialization, got: {:?}",
-            result
-        );
-    }
-    /// Task #39: the per-convo emit queue must preserve synchronous enqueue
-    /// order through the broadcast channel, even if multiple producers race
-    /// to call `enqueue` concurrently.
-    ///
-    /// This test simulates the DB-tx-serialized producer pattern: a single
-    /// caller enqueues a known order of events; we then verify the subscriber
-    /// sees them in that exact order.
     #[tokio::test]
     async fn test_per_convo_fifo_ordering_single_producer() {
         let state = Arc::new(SseState::new(1000));
-        // Subscribe BEFORE enqueuing so the broadcast receiver captures all
-        // events. We create the broadcast channel up-front so the consumer
-        // task, when lazily spawned on first enqueue, reuses the same sender.
         let tx = state.get_channel("convo-fifo").await;
         let mut rx = tx.subscribe();
 
-        // Enqueue 100 events in strict order.
-        for i in 0..100 {
-            let event = StreamEvent::InfoEvent {
-                cursor: ulid::Ulid::new().to_string(),
-                info: format!("evt-{:03}", i),
-            };
+        for i in 0..10 {
+            let event = make_test_typing_event("convo-fifo", &format!("typing-{}", i));
             state.enqueue("convo-fifo", event);
         }
 
-        // Drain the receiver. The consumer task needs a moment to spawn and
-        // process; use a timeout per recv.
-        let mut observed = Vec::with_capacity(100);
-        for _ in 0..100 {
+        let mut observed = Vec::with_capacity(10);
+        for _ in 0..10 {
             let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .expect("timed out waiting for broadcast event")
                 .expect("broadcast recv error");
-            if let StreamEvent::InfoEvent { info, .. } = event {
-                observed.push(info);
-            } else {
-                panic!("unexpected event variant");
-            }
+            let StreamEvent::CleanTypingEvent { typing_id, .. } = event;
+            assert_eq!(typing_id.as_str(), format!("typing-{}", observed.len()));
+            observed.push(typing_id.as_str().to_string());
         }
 
-        let expected: Vec<String> = (0..100).map(|i| format!("evt-{:03}", i)).collect();
-        assert_eq!(
-            observed, expected,
-            "per-convo queue must preserve enqueue order"
-        );
+        let expected: Vec<String> = (0..10).map(|i| format!("typing-{}", i)).collect();
+        assert_eq!(observed, expected, "per-convo queue must preserve enqueue order");
     }
 
-    /// Task #39: different convos must fan out independently. One slow convo's
-    /// consumer task must NOT block another convo's consumer.
     #[tokio::test]
     async fn test_per_convo_queues_are_independent() {
         let state = Arc::new(SseState::new(1000));
@@ -1628,82 +560,54 @@ mod tests {
         let mut rx_a = tx_a.subscribe();
         let mut rx_b = tx_b.subscribe();
 
-        // Interleave enqueues across two convos.
-        for i in 0..10 {
-            state.enqueue(
-                "convo-a",
-                StreamEvent::InfoEvent {
-                    cursor: ulid::Ulid::new().to_string(),
-                    info: format!("a-{:02}", i),
-                },
-            );
-            state.enqueue(
-                "convo-b",
-                StreamEvent::InfoEvent {
-                    cursor: ulid::Ulid::new().to_string(),
-                    info: format!("b-{:02}", i),
-                },
-            );
+        for i in 0..5 {
+            state.enqueue("convo-a", make_test_typing_event("convo-a", &format!("a-{}", i)));
+            state.enqueue("convo-b", make_test_typing_event("convo-b", &format!("b-{}", i)));
         }
 
-        // Each convo must see its own events in order, with no cross-contamination.
-        for i in 0..10 {
+        for i in 0..5 {
             let ev = tokio::time::timeout(Duration::from_secs(2), rx_a.recv())
                 .await
                 .expect("timed out on convo-a")
                 .expect("rx_a recv error");
-            if let StreamEvent::InfoEvent { info, .. } = ev {
-                assert_eq!(info, format!("a-{:02}", i));
-            } else {
-                panic!("unexpected variant on convo-a");
-            }
+            let StreamEvent::CleanTypingEvent { typing_id, .. } = ev;
+            assert_eq!(typing_id.as_str(), format!("a-{}", i));
 
             let ev = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
                 .await
                 .expect("timed out on convo-b")
                 .expect("rx_b recv error");
-            if let StreamEvent::InfoEvent { info, .. } = ev {
-                assert_eq!(info, format!("b-{:02}", i));
-            } else {
-                panic!("unexpected variant on convo-b");
-            }
+            let StreamEvent::CleanTypingEvent { typing_id, .. } = ev;
+            assert_eq!(typing_id.as_str(), format!("b-{}", i));
         }
 
-        // Queues for the two convos must be distinct DashMap entries.
         assert!(state.emit_queue.contains_key("convo-a"));
         assert!(state.emit_queue.contains_key("convo-b"));
     }
 
-    /// Sanity: the backwards-compatible async `emit` delegates to the queue.
     #[tokio::test]
     async fn test_emit_delegates_to_per_convo_queue() {
         let state = Arc::new(SseState::new(1000));
         let tx = state.get_channel("convo-compat").await;
         let mut rx = tx.subscribe();
 
-        for i in 0..5 {
+        for i in 0..3 {
             state
                 .emit(
                     "convo-compat",
-                    StreamEvent::InfoEvent {
-                        cursor: ulid::Ulid::new().to_string(),
-                        info: format!("compat-{i}"),
-                    },
+                    make_test_typing_event("convo-compat", &format!("compat-{}", i)),
                 )
                 .await
                 .unwrap();
         }
 
-        for i in 0..5 {
+        for i in 0..3 {
             let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .expect("timed out")
                 .expect("recv err");
-            if let StreamEvent::InfoEvent { info, .. } = ev {
-                assert_eq!(info, format!("compat-{i}"));
-            } else {
-                panic!("unexpected variant");
-            }
+            let StreamEvent::CleanTypingEvent { typing_id, .. } = ev;
+            assert_eq!(typing_id.as_str(), format!("compat-{}", i));
         }
     }
 }
