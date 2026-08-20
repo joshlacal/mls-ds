@@ -21,6 +21,7 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
+    blob_store: catbird_server::blob_store::BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -35,10 +36,16 @@ impl FromRef<TestState> for Arc<ChatRuntime> {
     }
 }
 
+impl FromRef<TestState> for catbird_server::blob_store::BlobStore {
+    fn from_ref(state: &TestState) -> Self {
+        state.blob_store.clone()
+    }
+}
+
 fn router() -> Router {
     static INIT: Once = Once::new();
     static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK.lock().expect("runtime env lock");
+    let _guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     INIT.call_once(|| {
         let key = SigningKey::from_bytes((&[0x5a_u8; 32]).into()).expect("signing key");
         std::env::set_var("CHAT_NEST_ISSUER", "did:web:api.catbird.blue");
@@ -50,20 +57,39 @@ fn router() -> Router {
         );
         std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
         std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
+        std::env::set_var(
+            "CHAT_CURSOR_KEY_ID",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+        );
     });
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
-    let runtime = Arc::new(ChatRuntime::from_env().expect("clean-chat runtime"));
+    let runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("clean-chat runtime"),
+    );
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect_lazy("postgres://127.0.0.1/clean_chat_get_entries")
         .expect("lazy pool");
-    chat_router::<TestState>().with_state(TestState { pool, runtime })
+    chat_router::<TestState>().with_state(TestState {
+        pool,
+        runtime,
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
+    })
 }
 
 #[tokio::test]
 async fn get_entries_uses_real_auth_admission() {
     let request = Request::builder()
-        .uri("/xrpc/blue.catbird.chat.getEntries?conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&afterSeq=0&limit=10")
+        .uri("/xrpc/blue.catbird.chat.getEntries?actorDeviceId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&afterSeq=0&limit=10")
         .body(Body::empty())
         .expect("request");
     let response = router().oneshot(request).await.expect("route response");
@@ -72,12 +98,12 @@ async fn get_entries_uses_real_auth_admission() {
         .await
         .expect("response body");
     let body: Value = serde_json::from_slice(&bytes).expect("XRPC error body");
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }
 
 async fn response_for_after_seq(after_seq: &str) -> (StatusCode, Value) {
     let uri = format!(
-        "/xrpc/blue.catbird.chat.getEntries?conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&afterSeq={after_seq}&limit=10"
+        "/xrpc/blue.catbird.chat.getEntries?actorDeviceId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a&afterSeq={after_seq}&limit=10"
     );
     let request = Request::builder()
         .uri(uri)
@@ -96,7 +122,7 @@ async fn response_for_after_seq(after_seq: &str) -> (StatusCode, Value) {
 async fn get_entries_accepts_maximum_safe_after_seq() {
     let (status, body) = response_for_after_seq("9007199254740991").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }
 
 #[tokio::test]

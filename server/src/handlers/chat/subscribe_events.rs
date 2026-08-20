@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        RawQuery, State,
     },
     response::{IntoResponse, Response},
 };
@@ -39,19 +39,26 @@ const BATCH_SIZE: i64 = 128;
 // The generated subscription parameter module is feature-gated by
 // catbird-atproto's client-side `streaming` feature. Keep the server extractor
 // exact and minimal while all emitted protocol objects remain generated DTOs.
-#[derive(Debug, Deserialize)]
-pub(super) struct SubscribeEventsQuery {
-    cursor: String,
-    ticket: String,
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub struct SubscribeEventsQuery {
+    pub cursor: String,
+    pub ticket: String,
 }
 
 pub(super) async fn handle(
+    RawQuery(query): RawQuery,
     ws: WebSocketUpgrade,
     State(pool): State<DbPool>,
     State(runtime): State<Arc<ChatRuntime>>,
-    Query(query): Query<SubscribeEventsQuery>,
 ) -> Response {
-    match authorize(&pool, &runtime, &query).await {
+    if let Err(failure) = context::require_cutover(&runtime, ENDPOINT) {
+        return failure.into_response();
+    }
+    let parsed = match parse_query(query.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(failure) => return failure.into_response(),
+    };
+    match authorize(&pool, &runtime, &parsed).await {
         Ok((ticket, replay_through)) => ws
             .on_upgrade(move |socket| {
                 stream(
@@ -59,13 +66,88 @@ pub(super) async fn handle(
                     pool,
                     runtime,
                     ticket,
-                    query.cursor.to_string(),
+                    parsed.cursor,
                     replay_through,
                 )
             })
             .into_response(),
         Err(failure) => failure.into_response(),
     }
+}
+
+pub fn parse_query(query: Option<&str>) -> Result<SubscribeEventsQuery, ChatFailure> {
+    let mut cursor = None;
+    let mut ticket = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+        match key.as_str() {
+            "cursor" if cursor.is_none() => {
+                if value.is_empty() || value.len() > 512 {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::CursorExpired,
+                    ));
+                }
+                cursor = Some(value);
+            }
+            "ticket" if ticket.is_none() => {
+                if value.len() < 32 || value.len() > 4096 {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::InvalidTicket,
+                    ));
+                }
+                ticket = Some(value);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidTicket,
+                ));
+            }
+        }
+    }
+    let cursor =
+        cursor.ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+    let ticket =
+        ticket.ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+    Ok(SubscribeEventsQuery { cursor, ticket })
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = (bytes[index + 1] as char).to_digit(16)?;
+                let lo = (bytes[index + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                index += 3;
+            }
+            byte if byte.is_ascii() => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 async fn authorize(

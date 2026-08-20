@@ -584,6 +584,7 @@ impl LockedSignedOperationReplayAuthority {
 /// replay. Every payload has a private constructor in the endpoint repository;
 /// sibling modules cannot implement an open proof contract or synthesize one
 /// from loose request facts.
+
 #[cfg(not(test))]
 pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProof {
     ResetRequest(reset::ResetReplayPostStateProof),
@@ -597,6 +598,7 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     Acceptance(acceptance::AcceptanceReplayPostStateProof),
     Leave(leave::LeaveReplayPostStateProof),
 }
+
 
 #[cfg(not(test))]
 impl SignedOperationReplayPostStateProof {
@@ -2776,6 +2778,7 @@ pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_a
         binding: replay.binding,
     })
 }
+
 
 #[cfg(not(test))]
 pub(in crate::chat_protocol::repository) async fn release_signed_operation_replay(

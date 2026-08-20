@@ -158,7 +158,7 @@ async fn implemented_task6_routes_reach_admission_when_cutover_is_open() {
         let path = format!("/xrpc/blue.catbird.chat.{endpoint}");
         let (status, body) = send(router(true), post(&path)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} is still stubbed");
-        assert_eq!(body["error"], "InvalidDPoP", "{path} is still stubbed");
+        assert_eq!(body["error"], "NotAuthorized", "{path} is still stubbed");
     }
 }
 

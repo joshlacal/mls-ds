@@ -29,7 +29,7 @@ use crate::{
             prelude::{self, PreparedBlobOperation},
         },
         transcript::SignedMutationKind,
-        validation::CanonicalHttpMethod,
+        validation::{CanonicalHttpMethod, CanonicalUuidV4},
     },
     sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
@@ -51,7 +51,8 @@ pub(super) async fn get_blob(
     RawQuery(query): RawQuery,
 ) -> Response {
     let result = async {
-        let actor_device_id = context::actor_device_id_from_query(query.as_deref(), GET_BLOB)?;
+        context::require_cutover(&runtime, GET_BLOB)?;
+        let (actor_device_id, blob_id) = parse_get_blob_query(query.as_deref())?;
         let admission = context::admit_unsigned_read(
             &pool,
             &runtime,
@@ -61,8 +62,6 @@ pub(super) async fn get_blob(
             &actor_device_id,
         )
         .await?;
-        let blob_id = parse_uuid_query(query.as_deref(), "blobId")
-            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::BlobNotFound))?;
         let actor =
             blobs::read_actor_for_admission(&pool, admission, OrdinaryReadEndpoint::GetBlob)
                 .await
@@ -93,7 +92,8 @@ pub(super) async fn get_blob_usage(
     RawQuery(query): RawQuery,
 ) -> Response {
     let result = async {
-        let actor_device_id = context::actor_device_id_from_query(query.as_deref(), GET_USAGE)?;
+        context::require_cutover(&runtime, GET_USAGE)?;
+        let actor_device_id = parse_get_blob_usage_query(query.as_deref())?;
         let admission = context::admit_unsigned_read(
             &pool,
             &runtime,
@@ -301,6 +301,7 @@ async fn upload_blob_inner(
     query: Option<&str>,
     body: Bytes,
 ) -> Result<Response, ChatFailure> {
+    context::require_cutover(runtime, UPLOAD)?;
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
@@ -310,10 +311,7 @@ async fn upload_blob_inner(
             ChatProtocolErrorCode::InvalidRequest,
         ));
     }
-    let ticket = query_param(query, "uploadTicket")
-        .filter(|value| (32..=512).contains(&value.len()))
-        .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
-    let actor_device_id = context::actor_device_id_from_query(query, UPLOAD)?;
+    let (actor_device_id, ticket) = parse_upload_blob_query(query)?;
     let admission = context::admit_unsigned_read(
         pool,
         runtime,
@@ -493,17 +491,150 @@ fn random_ticket() -> String {
     hex::encode(bytes)
 }
 
-fn query_param(query: Option<&str>, wanted: &str) -> Option<String> {
-    query?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
-        (key == wanted).then(|| value.to_owned())
-    })
+fn parse_get_blob_query(query: Option<&str>) -> Result<(String, Uuid), ChatFailure> {
+    let mut actor_device_id = None;
+    let mut blob_id = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            "blobId" if blob_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+                let uuid = Uuid::parse_str(canonical.as_str())
+                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+                blob_id = Some(uuid);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    GET_BLOB,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
+        }
+    }
+    let actor_device_id = actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+    let blob_id = blob_id
+        .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+    Ok((actor_device_id, blob_id))
 }
 
-fn parse_uuid_query(query: Option<&str>, wanted: &str) -> Option<Uuid> {
-    let value = query_param(query, wanted)?;
-    let uuid = Uuid::parse_str(&value).ok()?;
-    (uuid.get_version_num() == 4 && uuid.hyphenated().to_string() == value).then_some(uuid)
+fn parse_get_blob_usage_query(query: Option<&str>) -> Result<String, ChatFailure> {
+    let mut actor_device_id = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    GET_USAGE,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
+        }
+    }
+    actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))
+}
+
+fn parse_upload_blob_query(query: Option<&str>) -> Result<(String, String), ChatFailure> {
+    let mut actor_device_id = None;
+    let mut upload_ticket = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            "uploadTicket" if upload_ticket.is_none() => {
+                if !(32..=512).contains(&value.len()) {
+                    return Err(ChatFailure::protocol(
+                        UPLOAD,
+                        ChatProtocolErrorCode::InvalidRequest,
+                    ));
+                }
+                upload_ticket = Some(value);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    UPLOAD,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
+        }
+    }
+    let actor_device_id = actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+    let upload_ticket = upload_ticket
+        .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+    Ok((actor_device_id, upload_ticket))
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = (bytes[index + 1] as char).to_digit(16)?;
+                let lo = (bytes[index + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                index += 3;
+            }
+            byte if byte.is_ascii() => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn uuid_from_canonical(

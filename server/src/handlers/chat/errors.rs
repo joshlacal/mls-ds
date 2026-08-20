@@ -25,7 +25,7 @@ use crate::chat_protocol::error::{
 /// through the associated functions so that no code can manufacture an
 /// undeclared `(endpoint, code)` pair.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ChatFailure {
+pub struct ChatFailure {
     endpoint: ChatEndpoint,
     exposure: ErrorExposure,
     retry_after_secs: Option<u64>,

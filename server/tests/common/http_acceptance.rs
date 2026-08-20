@@ -21,7 +21,7 @@ use tower_util::ServiceExt;
 use uuid::Uuid;
 
 pub const ISSUER: &str = "did:web:api.catbird.blue";
-pub const AUDIENCE: &str = "did:web:chat.catbird.blue";
+pub const AUDIENCE: &str = "did:web:chat.catbird.blue#atproto_mls";
 pub const CHAT_INSTANCE: &str = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
 pub const EXTERNAL_BASE: &str = "https://chat.example.net";
 pub const NEST_KEY_ID: &str = "http-acceptance";
@@ -158,6 +158,28 @@ pub fn seed_device(pool: &DbPool) -> impl Future<Output = Device> + '_ {
             .expect("key id");
         sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'http-test','active',$3,1,chat.protocol_capabilities(),$4,$4)").bind(&did).bind(device_id).bind(&jkt).bind(now).execute(pool).await.expect("device");
         sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)").bind(&did).bind(device_id).bind(&key_id).bind(&key).bind(now).execute(pool).await.expect("device key");
+
+        let point = signing.verifying_key().to_encoded_point(false);
+        let jwk_val = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        });
+        let jwk_parsed: catbird_server::auth::PublicKeyJwk = serde_json::from_value(jwk_val).unwrap();
+        let doc = catbird_server::auth::DidDocument {
+            id: did.clone(),
+            verification_method: vec![catbird_server::auth::VerificationMethod {
+                id: format!("{did}#atproto"),
+                key_type: "JsonWebKey2020".to_string(),
+                controller: did.clone(),
+                public_key_jwk: Some(jwk_parsed),
+                public_key_multibase: None,
+            }],
+            service: None,
+        };
+        catbird_server::auth::cache_test_did_document(doc).await;
+
         Device {
             did,
             device_id,
@@ -169,6 +191,36 @@ pub fn seed_device(pool: &DbPool) -> impl Future<Output = Device> + '_ {
 }
 
 pub async fn ensure_fence(pool: &DbPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS auth_jti_nonce (
+            issuer_did TEXT NOT NULL,
+            jti TEXT NOT NULL,
+            endpoint_nsid TEXT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (issuer_did, jti)
+        )",
+    )
+    .execute(pool)
+    .await
+    .expect("auth_jti_nonce table");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chat.service_auth_admissions (
+            admission_id UUID PRIMARY KEY,
+            issuer_did TEXT NOT NULL,
+            endpoint_nsid TEXT NOT NULL,
+            device_id UUID NOT NULL,
+            jti_sha256 BYTEA NOT NULL,
+            token_sha256 BYTEA NOT NULL,
+            token_iat TIMESTAMPTZ NOT NULL,
+            token_exp TIMESTAMPTZ NOT NULL,
+            consumed_at TIMESTAMPTZ NOT NULL,
+            CONSTRAINT service_auth_admissions_jti_once UNIQUE (issuer_did, jti_sha256)
+        )",
+    )
+    .execute(pool)
+    .await
+    .expect("service_auth_admissions table");
     let key: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
         .bind(vec![0x51_u8; 32])
         .fetch_one(pool)
@@ -235,7 +287,31 @@ async fn build_router(
             "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
         );
     });
+    let point = nest_key().verifying_key().to_encoded_point(false);
+    let jwk_val = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+        "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+    });
+    let jwk: catbird_server::auth::PublicKeyJwk = serde_json::from_value(jwk_val).unwrap();
+    let doc = catbird_server::auth::DidDocument {
+        id: ISSUER.to_string(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{ISSUER}#atproto"),
+            key_type: "JsonWebKey2020".to_string(),
+            controller: ISSUER.to_string(),
+            public_key_jwk: Some(jwk),
+            public_key_multibase: None,
+        }],
+        service: None,
+    };
+    catbird_server::auth::cache_test_did_document(doc).await;
     std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
+    std::env::set_var(
+        "CHAT_SUBSCRIPTION_ENDPOINT",
+        "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+    );
     std::env::set_var(
         "CHAT_CUTOVER_ENABLED",
         if cutover_enabled { "1" } else { "0" },
@@ -248,6 +324,7 @@ async fn build_router(
         blob_store: blob_store.unwrap_or_else(BlobStore::for_route_tests),
     })
 }
+
 pub fn unsigned_request(device: &Device, nsid: &str, method: &str, query: &str) -> Request<Body> {
     unsigned_request_as(
         device,
@@ -268,51 +345,40 @@ pub fn unsigned_request_as(
     method: &str,
     query: &str,
     subject: &str,
-    device_id: Uuid,
-    token_jkt: &str,
-    proof_key: &SigningKey,
-    proof_jwk: &Value,
+    _device_id: Uuid,
+    _token_jkt: &str,
+    _proof_key: &SigningKey,
+    _proof_jwk: &Value,
 ) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
-        serde_json::json!({"alg":"ES256","typ":"JWT","kid":NEST_KEY_ID}),
-        serde_json::json!({"iss":ISSUER,"sub":subject,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+120,"jti":Uuid::new_v4().to_string(),"cnf":{"jkt":token_jkt},"device_id":device_id.to_string(),"chat_instance":CHAT_INSTANCE}),
-        &nest_key(),
+        serde_json::json!({"alg":"ES256","typ":"JWT","kid":format!("{subject}#atproto")}),
+        serde_json::json!({"iss":subject,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
+        &device.signing,
     );
-    let proof = dpop_proof(proof_key, proof_jwk, method, &htu(nsid), &token, now);
     Request::builder()
         .method(method)
         .uri(format!("/xrpc/{nsid}{query}"))
-        .header("authorization", format!("DPoP {token}"))
-        .header("dpop", proof)
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .expect("request")
 }
+
 pub fn unsigned_json_request(device: &Device, nsid: &str, body: Vec<u8>) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
-        serde_json::json!({"alg":"ES256","typ":"JWT","kid":NEST_KEY_ID}),
-        serde_json::json!({"iss":ISSUER,"sub":device.did,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+120,"jti":Uuid::new_v4().to_string(),"cnf":{"jkt":device.jkt},"device_id":device.device_id.to_string(),"chat_instance":CHAT_INSTANCE}),
-        &nest_key(),
-    );
-    let proof = dpop_proof(
+        serde_json::json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", device.did)}),
+        serde_json::json!({"iss":device.did,"aud":AUDIENCE,"lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()}),
         &device.signing,
-        &device.jwk,
-        "POST",
-        &htu(nsid),
-        &token,
-        now,
     );
     Request::builder()
         .method("POST")
         .uri(format!("/xrpc/{nsid}"))
         .header("content-type", "application/json")
-        .header("authorization", format!("DPoP {token}"))
-        .header("dpop", proof)
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::from(body))
         .expect("JSON request")
 }
-
 pub fn websocket_request(nsid: &str, query: &str) -> Request<Body> {
     Request::builder()
         .method("GET")

@@ -41,13 +41,12 @@ async fn get_conversation_state(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
-    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
+    context::require_cutover(runtime, ENDPOINT)?;
+    let (actor_device_id, conversation_id) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let admission =
         context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
             .await?;
-    let conversation_id = parse_conversation_id(query)
-        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
 
     let response = read_conversation_state_for_admission(pool, admission, conversation_id)
         .await
@@ -76,21 +75,47 @@ fn facade_failure(error: ConversationStateReadError) -> ChatFailure {
     }
 }
 
-/// Parse exactly one canonical `conversationId` query parameter. Unknown
-/// parameters and duplicate/malformed values are rejected so a client cannot
-/// smuggle a second audience into the authenticated request.
-fn parse_conversation_id(query: Option<&str>) -> Option<uuid::Uuid> {
-    let mut found = None;
-    for pair in query?.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        if key != "conversationId" || found.is_some() {
-            return None;
+fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure> {
+    let mut actor_device_id = None;
+    let mut conversation_id = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            "conversationId" if conversation_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let uuid = uuid::Uuid::parse_str(canonical.as_str())
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                conversation_id = Some(uuid);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
         }
-        let value = percent_decode(value)?;
-        let canonical = CanonicalUuidV4::parse(&value).ok()?;
-        found = uuid::Uuid::parse_str(canonical.as_str()).ok();
     }
-    found
+    let actor_device_id = actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+    let conversation_id = conversation_id
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+    Ok((actor_device_id, conversation_id))
 }
 
 fn percent_decode(value: &str) -> Option<String> {

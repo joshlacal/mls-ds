@@ -702,6 +702,14 @@ impl AuthMiddleware {
         Ok(doc)
     }
 
+    pub async fn cache_did_document(&self, doc: DidDocument) {
+        let cached = CachedDidDoc {
+            doc: doc.clone(),
+            cached_at: Utc::now(),
+        };
+        self.did_cache.insert(doc.id.clone(), cached).await;
+    }
+
     /// Resolve did:plc DID via PLC directory
     async fn resolve_plc_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         let _plc_id = did
@@ -894,6 +902,10 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
 });
 
 static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
+
+pub async fn cache_test_did_document(doc: DidDocument) {
+    AUTH_MIDDLEWARE.cache_did_document(doc).await;
+}
 
 /// Keep the binary startup gate and library request gate on identical flag semantics.
 #[doc(hidden)]

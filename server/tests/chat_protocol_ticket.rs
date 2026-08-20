@@ -221,6 +221,30 @@ struct SessionFixture {
     expires_at: DateTime<Utc>,
 }
 
+fn derive_inventory_session_uuid(
+    user_did: &str,
+    device_id: Uuid,
+    jkt: Option<&str>,
+    auth_generation: u64,
+) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+    digest.update((user_did.len() as u64).to_be_bytes());
+    digest.update(user_did.as_bytes());
+    digest.update(device_id.as_bytes());
+    let jkt_str = jkt.unwrap_or_default();
+    digest.update((jkt_str.len() as u64).to_be_bytes());
+    digest.update(jkt_str.as_bytes());
+    digest.update(auth_generation.to_be_bytes());
+    let bytes: [u8; 32] = digest.finalize().into();
+    let mut uuid_bytes = [0u8; 16];
+    uuid_bytes.copy_from_slice(&bytes[..16]);
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
+    Uuid::from_bytes(uuid_bytes)
+}
+
 /// Seed one inventory session. When `complete` is true all three shared domains
 /// are marked complete with zero materialized items (count 0, hash SHA256("")).
 async fn seed_session(
@@ -230,7 +254,12 @@ async fn seed_session(
     expires_at: DateTime<Utc>,
     complete: bool,
 ) -> SessionFixture {
-    let inventory_session_id = Uuid::new_v4();
+    let inventory_session_id = derive_inventory_session_uuid(
+        &device.did,
+        device.device_id,
+        Some(device.jkt.as_str()),
+        device.auth_generation as u64,
+    );
     let capability_bytes = fresh_blob();
     let capability = URL_SAFE_NO_PAD.encode(&capability_bytes);
     let capability_hash = Sha256::digest(&capability_bytes).to_vec();
@@ -319,7 +348,7 @@ async fn seed_session(
     )
     .expect("bind sealed session capability");
     let sealed = sealer
-        .seal_successor(capability.as_bytes(), &binding, &mut FixtureRandom(0x33))
+        .seal_successor(capability_bytes.as_slice(), &binding, &mut FixtureRandom(0x33))
         .expect("seal session capability");
     sqlx::query(
         r#"
@@ -936,26 +965,11 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     }
     let now = clock_now(&pool).await;
     let opaque = fresh_blob();
-    let minted = {
-        let request = mint_request(
-            &owner_fixture,
-            &session,
-            &opaque,
-            session.capability.clone(),
-            now,
-            now + Duration::seconds(60),
-        );
-        let mut transaction = pool.begin().await.expect("begin real ticket mint");
-        let minted = mint_subscription_ticket(&mut transaction, &request)
-            .await
-            .expect("mint a real owner ticket");
-        transaction.commit().await.expect("commit real ticket mint");
-        minted
-    };
-    assert_eq!(minted.inventory_session_id, session.inventory_session_id);
+
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
     let body = serde_json::to_vec(&serde_json::json!({
-        "inventorySessionId": session.inventory_session_id,
+        "actorDeviceId": owner.device_id.hyphenated().to_string(),
+        "inventorySessionId": session.capability.clone(),
         "eventCursor": session.capability.clone(),
     }))
     .expect("ticket body");
@@ -981,10 +995,12 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     )
     .await;
     assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
-    assert_eq!(foreign_response["error"], "DeviceRevoked");
+    assert_eq!(foreign_response["error"], "DeviceNotRegistered");
     assert!(foreign_response.get("ticket").is_none());
-    let ticket = URL_SAFE_NO_PAD.encode(&opaque);
-    let subscribe_query = format!("?ticket={ticket}&cursor={}", session.capability);
+    let ticket_str = owner_response["ticket"].as_str().expect("minted ticket string");
+    let opaque_bytes = URL_SAFE_NO_PAD.decode(ticket_str.as_bytes()).expect("decode ticket");
+    let opaque_hash = ticket_hash(&opaque_bytes);
+    let subscribe_query = format!("?ticket={ticket_str}&cursor={}", session.capability);
     let first = router
         .clone()
         .oneshot(http::websocket_request(
@@ -1001,7 +1017,7 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     let mut consume = pool.begin().await.expect("begin first ticket consume");
     consume_subscription_ticket(
         &mut consume,
-        &ticket_hash(&opaque),
+        &opaque_hash,
         &session.capability,
         SUBSCRIBE_EVENTS_PATH,
         clock_now(&pool).await,
@@ -1013,7 +1029,7 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     let mut replay = pool.begin().await.expect("begin replay ticket consume");
     let replayed = consume_subscription_ticket(
         &mut replay,
-        &ticket_hash(&opaque),
+        &opaque_hash,
         &session.capability,
         SUBSCRIBE_EVENTS_PATH,
         clock_now(&pool).await,

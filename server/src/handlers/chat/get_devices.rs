@@ -23,9 +23,8 @@ use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::inventory::{
     read_addressable_devices_for_admission, ExistingDeviceReadFacadeError,
 };
-use crate::chat_protocol::validation::CanonicalHttpMethod;
+use crate::chat_protocol::validation::{BareDid, CanonicalHttpMethod, CanonicalUuidV4};
 use crate::storage::DbPool;
-
 use super::context;
 use super::errors::ChatFailure;
 use super::runtime::ChatRuntime;
@@ -50,13 +49,13 @@ async fn get_devices(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
-    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
+    context::require_cutover(runtime, ENDPOINT)?;
+    let (actor_device_id, dids) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let admission =
         context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
             .await?;
 
-    let dids = parse_user_dids(query);
     let response = read_addressable_devices_for_admission(pool, admission, &dids)
         .await
         .map_err(facade_failure)?;
@@ -83,30 +82,61 @@ fn facade_failure(error: ExistingDeviceReadFacadeError) -> ChatFailure {
     }
 }
 
-/// Collect the repeated `userDids` query parameter values in wire order. These
-/// are public request values, not authority: bounds enforcement (too many /
-/// zero) belongs to the facade's bounded audience read, so this only decodes.
-fn parse_user_dids(query: Option<&str>) -> Vec<String> {
-    let Some(query) = query else {
-        return Vec::new();
-    };
-    let mut dids = Vec::new();
-    for pair in query.split('&') {
-        let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or("");
-        if key != "userDids" {
-            continue;
-        }
-        if let Some(raw) = parts.next() {
-            dids.push(percent_decode(raw));
+fn parse_query(query: Option<&str>) -> Result<(String, Vec<String>), ChatFailure> {
+    let mut actor_device_id = None;
+    let mut user_dids: Vec<String> = Vec::new();
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            "userDids" => {
+                let did = BareDid::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let did_str = did.as_str().to_string();
+                if let Some(prev) = user_dids.last() {
+                    if prev.as_bytes() >= did_str.as_bytes() {
+                        return Err(ChatFailure::protocol(
+                            ENDPOINT,
+                            ChatProtocolErrorCode::InvalidRequest,
+                        ));
+                    }
+                }
+                user_dids.push(did_str);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
         }
     }
-    dids
+    let actor_device_id = actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+    if user_dids.is_empty() || user_dids.len() > 5 {
+        return Err(ChatFailure::protocol(
+            ENDPOINT,
+            ChatProtocolErrorCode::InvalidRequest,
+        ));
+    }
+    Ok((actor_device_id, user_dids))
 }
 
-/// Minimal `application/x-www-form-urlencoded` value decode (`+` → space, `%XX`
-/// → byte). Invalid escapes are passed through literally.
-fn percent_decode(value: &str) -> String {
+fn percent_decode(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -117,21 +147,17 @@ fn percent_decode(value: &str) -> String {
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                let hi = (bytes[index + 1] as char).to_digit(16);
-                let lo = (bytes[index + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    index += 3;
-                } else {
-                    out.push(bytes[index]);
-                    index += 1;
-                }
+                let hi = (bytes[index + 1] as char).to_digit(16)?;
+                let lo = (bytes[index + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                index += 3;
             }
-            byte => {
+            byte if byte.is_ascii() => {
                 out.push(byte);
                 index += 1;
             }
+            _ => return None,
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
 }

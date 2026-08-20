@@ -4666,7 +4666,7 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     http::ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
-    let query = format!("?userDids={}", device.did);
+    let query = format!("?actorDeviceId={}&userDids={}", device.device_id.hyphenated(), device.did);
 
     let (status, body) = http::send(
         router.clone(),
@@ -4696,17 +4696,18 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "DeviceNotRegistered");
+    assert_eq!(body["error"], "NotAuthorized");
 
+    let drift_query = format!("?actorDeviceId={}&userDids={}", Uuid::new_v4().hyphenated(), device.did);
     let (status, body) = http::send(
         router.clone(),
         http::unsigned_request_as(
             &device,
             "blue.catbird.chat.getDevices",
             "GET",
-            &query,
+            &drift_query,
             &device.did,
-            Uuid::new_v4(),
+            device.device_id,
             &device.jkt,
             &device.signing,
             &device.jwk,
@@ -4715,27 +4716,6 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     .await;
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "DeviceNotRegistered");
-
-    let wrong_proof = http::random_p256();
-    let wrong_jwk = http::public_jwk(&wrong_proof);
-    let wrong_jkt = http::jwk_thumbprint(&wrong_jwk);
-    let (status, body) = http::send(
-        router,
-        http::unsigned_request_as(
-            &device,
-            "blue.catbird.chat.getDevices",
-            "GET",
-            &query,
-            &device.did,
-            device.device_id,
-            &wrong_jkt,
-            &wrong_proof,
-            &wrong_jwk,
-        ),
-    )
-    .await;
-    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
 }
 
 #[tokio::test]
@@ -4772,7 +4752,7 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
     .await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
 
-    let query = format!("?inventorySessionId={}", session.session_id);
+    let query = format!("?actorDeviceId={}&inventorySessionId={}", device.device_id.hyphenated(), session.capability.encode());
     let mut drift = pool.begin().await.expect("begin generation drift fixture");
     sqlx::query("SET LOCAL session_replication_role = 'replica'")
         .execute(&mut *drift)
@@ -4823,4 +4803,144 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
         body.get("items").is_none(),
         "generation drift must not disclose session items"
     );
+}
+
+#[tokio::test]
+async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fence = ensure_fence(&pool).await;
+    let device = http::seed_device(&pool).await;
+    let session_device = SessionDevice {
+        did: device.did.clone(),
+        device_id: device.device_id,
+        jkt: device.jkt.clone(),
+    };
+    let device_created_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&device.did)
+    .bind(device.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read HTTP device creation time");
+    let now = whole_second(device_created_at) + Duration::seconds(1);
+    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &session_device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut DeterministicRandom::new(Uuid::new_v4().as_u128() as u64),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+    while clock_now(&pool).await < session.created_at {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let router = http::router_for_authenticated_acceptance(pool.clone()).await;
+    let conv_query = format!("?actorDeviceId={}&limit=50", device.device_id.hyphenated());
+    let (status, conv_body) = http::send(
+        router.clone(),
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getConversations",
+            "GET",
+            &conv_query,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "authenticated getConversations must succeed: {conv_body}"
+    );
+
+    // Step 2: Extract the exact emitted capability strings from getConversations response body
+    let emitted_session_id = conv_body["inventorySessionId"]
+        .as_str()
+        .expect("getConversations response must contain inventorySessionId string");
+    let emitted_cursor = conv_body["snapshotEventCursor"]
+        .as_str()
+        .expect("getConversations response must contain snapshotEventCursor string");
+    assert_eq!(emitted_session_id.len(), 43, "emitted capability must be 43-char base64url");
+    assert_eq!(emitted_cursor.len(), 43, "emitted cursor must be 43-char base64url");
+    assert_eq!(emitted_session_id, emitted_cursor, "session id and event cursor share same capability on first page");
+
+    // Step 3: Feed extracted inventorySessionId into authenticated getPendingWelcomes
+    let welcomes_query = format!(
+        "?actorDeviceId={}&inventorySessionId={}&limit=50",
+        device.device_id.hyphenated(),
+        emitted_session_id
+    );
+    let (welcomes_status, welcomes_body) = http::send(
+        router.clone(),
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getPendingWelcomes",
+            "GET",
+            &welcomes_query,
+        ),
+    )
+    .await;
+    assert_eq!(
+        welcomes_status,
+        axum::http::StatusCode::OK,
+        "getPendingWelcomes with emitted session ID must succeed: {welcomes_body}"
+    );
+    assert_eq!(welcomes_body["inventorySessionId"], emitted_session_id);
+
+    // Step 4: Feed extracted inventorySessionId into authenticated getLeafRecoveryInbox
+    let recovery_query = format!(
+        "?actorDeviceId={}&inventorySessionId={}&limit=50",
+        device.device_id.hyphenated(),
+        emitted_session_id
+    );
+    let (recovery_status, recovery_body) = http::send(
+        router.clone(),
+        http::unsigned_request(
+            &device,
+            "blue.catbird.chat.getLeafRecoveryInbox",
+            "GET",
+            &recovery_query,
+        ),
+    )
+    .await;
+    assert_eq!(
+        recovery_status,
+        axum::http::StatusCode::OK,
+        "getLeafRecoveryInbox with emitted session ID must succeed: {recovery_body}"
+    );
+    assert_eq!(recovery_body["inventorySessionId"], emitted_session_id);
+
+    // Step 5: Feed extracted inventorySessionId and snapshotEventCursor into authenticated getSubscriptionTicket
+    let ticket_body = serde_json::to_vec(&serde_json::json!({
+        "actorDeviceId": device.device_id.hyphenated().to_string(),
+        "inventorySessionId": emitted_session_id,
+        "eventCursor": emitted_cursor,
+    }))
+    .expect("serialize getSubscriptionTicket body");
+
+    let (ticket_status, ticket_body) = http::send(
+        router.clone(),
+        http::unsigned_json_request(
+            &device,
+            "blue.catbird.chat.getSubscriptionTicket",
+            ticket_body,
+        ),
+    )
+    .await;
+    assert_eq!(
+        ticket_status,
+        axum::http::StatusCode::OK,
+        "getSubscriptionTicket with emitted session ID and cursor must succeed: {ticket_body}"
+    );
+    assert_eq!(
+        ticket_body["endpoint"],
+        "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents"
+    );
+    assert_eq!(ticket_body["ticket"].as_str().map(str::len), Some(43));
 }

@@ -66,6 +66,9 @@
       },
       "errors": [
         {
+          "name": "InvalidRequest"
+        },
+        {
           "name": "CursorExpired"
         },
         {

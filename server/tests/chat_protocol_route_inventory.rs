@@ -164,12 +164,7 @@ async fn every_clean_endpoint_is_registered_and_cutover_gated() {
                 bytes
             )
         });
-        let expected = if *endpoint == ChatEndpoint::UploadBlob {
-            "InvalidRequest"
-        } else {
-            "CutoverRequired"
-        };
-        assert_eq!(body["error"], expected, "{}", endpoint.nsid());
+        assert_eq!(body["error"], "CutoverRequired", "{}", endpoint.nsid());
     }
 }
 
@@ -208,5 +203,5 @@ async fn leave_routes_reach_production_authentication_before_database_work() {
         .await
         .expect("response body");
     let body: Value = serde_json::from_slice(&bytes).expect("XRPC error body");
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }

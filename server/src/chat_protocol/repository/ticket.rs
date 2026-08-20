@@ -637,7 +637,7 @@ pub(crate) fn ticket_hash(opaque_ticket: &[u8]) -> [u8; HASH_BYTES] {
 pub(crate) async fn mint_subscription_ticket_for_admission(
     pool: &sqlx::PgPool,
     admission: VerifiedReadAdmission,
-    inventory_session_id: Uuid,
+    inventory_session_capability: &str,
     event_cursor: &str,
     sealer: &crate::chat_protocol::CursorSealer,
 ) -> Result<(String, DateTime<Utc>), TicketRepositoryError> {
@@ -648,6 +648,12 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
         .await
         .map_err(|_| TicketRepositoryError::DeviceBindingMismatch)?;
+    let inventory_session_id = inventory::derive_inventory_session_uuid(
+        device.user_did(),
+        device.device_id(),
+        device.jkt(),
+        device.auth_generation(),
+    );
     let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
         &mut transaction,
         &device,
@@ -664,7 +670,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
         }
         _ => TicketRepositoryError::SessionBindingMismatch,
     })?;
-    if event_cursor != capability {
+    if event_cursor != capability || inventory_session_capability != capability {
         return Err(TicketRepositoryError::CursorMismatch);
     }
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")

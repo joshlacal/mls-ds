@@ -25,7 +25,6 @@ use super::super::cursor::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-#[cfg(not(test))]
 use jacquard_common::deps::smol_str::SmolStr;
 use zeroize::Zeroizing;
 
@@ -85,7 +84,7 @@ pub(crate) enum InventoryRepositoryError {
     RetryCeiling,
     #[cfg(not(test))]
     #[error(transparent)]
-    Projection(#[from] super::super::read_projection::ProjectionError),
+    Projection(#[from] crate::chat_protocol::read_projection::ProjectionError),
     #[cfg(not(test))]
     #[error("clean-chat inventory read authority failed")]
     ReadAuthority(super::super::read_authority::ReadAuthorityError),
@@ -3104,7 +3103,7 @@ const PAGE_ENVELOPE_HEADROOM: usize = 1024;
 /// is a row handle, never a bearer: every page call still requires the DPoP
 /// admission for the exact device, and the bearer is the random sealed
 /// capability.
-fn derive_inventory_session_uuid(
+pub(crate) fn derive_inventory_session_uuid(
     user_did: &str,
     device_id: Uuid,
     jkt: Option<&str>,
@@ -3148,7 +3147,7 @@ fn canonical_datetime(value: DateTime<Utc>) -> String {
 }
 
 /// The checked cipher-suite constant of the sealed protocol (single value).
-#[cfg(not(test))]
+
 const INVENTORY_CIPHER_SUITE_V1: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
 /// The generated key-package artifact framing/content-type constants (single
 /// value; no durable columns carry them).
@@ -3430,19 +3429,14 @@ pub(crate) async fn snapshot_capability_for_ticket(
     }
     revalidate_session_fence(transaction, &row).await?;
     let plaintext = verify_successor_capability(sealer, &row)?;
-    let capability = String::from_utf8(plaintext.to_vec())
-        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    if plaintext.len() != 32 {
+        return Err(InventoryRepositoryError::DurableRowInvalid);
+    }
+    let capability = URL_SAFE_NO_PAD.encode(&plaintext);
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut **transaction)
         .await?;
-    let decoded = URL_SAFE_NO_PAD.decode(&capability).ok();
-    if capability.len() != 43
-        || decoded.as_ref().is_none_or(|bytes| bytes.len() != 32)
-        || decoded
-            .as_ref()
-            .is_some_and(|bytes| URL_SAFE_NO_PAD.encode(bytes) != capability)
-        || now >= row.expires_at
-    {
+    if now >= row.expires_at {
         return Err(InventoryRepositoryError::DurableRowInvalid);
     }
     Ok((capability, row.expires_at))
@@ -3544,6 +3538,19 @@ fn append_json_string(out: &mut Vec<u8>, value: &str) {
             _ => out.push(byte),
         }
     }
+}
+
+fn capability_hash(encoded: &str) -> Result<[u8; 32], InventoryRepositoryError> {
+    if encoded.len() != 43 {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| InventoryRepositoryError::SessionPresentationMismatch)?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != encoded {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    Ok(Sha256::digest(decoded).into())
 }
 
 /// One page of retained canonical item bytes, bounded by the exact limit and
@@ -4346,7 +4353,7 @@ async fn create_inventory_snapshot_attempt(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
     request: &InventoryPublicRequestBinding,
-    expected_inventory_session_id: Option<Uuid>,
+    expected_inventory_session_capability: Option<&str>,
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
@@ -4367,16 +4374,21 @@ async fn create_inventory_snapshot_attempt(
         device.jkt(),
         device.auth_generation(),
     );
-    if expected_inventory_session_id.is_some_and(|expected| expected != inventory_session_id) {
-        return Err(InventoryRepositoryError::SessionPresentationMismatch);
-    }
-
     // Create-or-lock. On first sight the session row is created and fully
     // materialized; a concurrent winner's committed row (unique violation on
     // the session identity) and every later call take the replay path over the
     // retained bytes. The device is consumed by the create path's fence
     // verification; the replay path consumes it in the serve verification.
     let existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
+    if let Some(expected_cap) = expected_inventory_session_capability {
+        let expected_hash = capability_hash(expected_cap)?;
+        let Some(existing_row) = &existing else {
+            return Err(InventoryRepositoryError::SessionNotFound);
+        };
+        if existing_row.snapshot_event_cursor_sha256 != expected_hash.as_slice() {
+            return Err(InventoryRepositoryError::SessionPresentationMismatch);
+        }
+    }
     let device = if existing.is_none() {
         let created_at = current_whole_second(transaction).await?;
         let expires_at = created_at + chrono::Duration::minutes(15);
@@ -4456,7 +4468,7 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
     request: InventoryPublicRequestBinding,
-    expected_inventory_session_id: Option<Uuid>,
+    expected_inventory_session_capability: Option<&str>,
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
@@ -4476,7 +4488,7 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
             &mut transaction,
             attempt,
             &request,
-            expected_inventory_session_id,
+            expected_inventory_session_capability,
             sealer,
             random,
         )
@@ -4514,7 +4526,7 @@ pub(crate) async fn continue_inventory_page_for_admission(
     admission: super::super::dpop::VerifiedReadAdmission,
     presented_page_cursor: &str,
     request: InventoryPublicRequestBinding,
-    expected_inventory_session_id: Option<Uuid>,
+    expected_inventory_session_capability: Option<&str>,
     sealer: &CursorSealer,
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let attempts = admission
@@ -4540,7 +4552,7 @@ pub(crate) async fn continue_inventory_page_for_admission(
             device,
             presented_page_cursor,
             &request,
-            expected_inventory_session_id,
+            expected_inventory_session_capability,
             sealer,
         )
         .await
@@ -4654,7 +4666,7 @@ pub(crate) async fn complete_inventory_page(
     device: PagingDeviceAuthority,
     presented_page_cursor: &str,
     request: &InventoryPublicRequestBinding,
-    expected_inventory_session_id: Option<Uuid>,
+    expected_inventory_session_capability: Option<&str>,
     sealer: &CursorSealer,
 ) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
     let presented = decode_capability_token(presented_page_cursor)?;
@@ -4666,8 +4678,11 @@ pub(crate) async fn complete_inventory_page(
     let row = lock_inventory_session_row(transaction, predecessor.inventory_session_id)
         .await?
         .ok_or(InventoryRepositoryError::SessionNotFound)?;
-    if expected_inventory_session_id.is_some_and(|expected| expected != row.inventory_session_id) {
-        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    if let Some(expected_cap) = expected_inventory_session_capability {
+        let expected_hash = capability_hash(expected_cap)?;
+        if row.snapshot_event_cursor_sha256 != expected_hash.as_slice() {
+            return Err(InventoryRepositoryError::SessionPresentationMismatch);
+        }
     }
     verify_paging_device_fence(transaction, device, &row).await?;
     verify_continuation_binding(request, &predecessor, &row)?;
@@ -4950,12 +4965,13 @@ async fn conversation_arm_columns(
 /// generation state + producing transition seq, current participants, active
 /// leaves, and the current metadata snapshot. Any missing/extra field or a
 /// state without its metadata snapshot fails before materialization.
+
 #[cfg(not(test))]
 pub(crate) async fn load_conversation_state_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
-) -> Result<super::super::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
-    use super::super::read_projection::{
+) -> Result<crate::chat_protocol::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
+    use crate::chat_protocol::read_projection::{
         CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
         CheckedMetadataAuthorProof, CheckedMetadataAvatarBinding, CheckedMetadataCryptoContext,
         CheckedMetadataSnapshot, CheckedParticipantView, ConversationProjectionSource,
@@ -5145,7 +5161,7 @@ pub(crate) async fn load_conversation_state_source(
     .map_err(InventoryRepositoryError::Projection)
 }
 
-#[cfg(not(test))]
+
 #[derive(Debug, FromRow)]
 struct ConversationStateSourceRow {
     kind: String,
@@ -5160,7 +5176,7 @@ struct ConversationStateSourceRow {
     snapshot_seq: i64,
 }
 
-#[cfg(not(test))]
+
 #[derive(Debug, FromRow)]
 struct ConversationParticipantRow {
     user_did: String,
@@ -5172,7 +5188,7 @@ struct ConversationParticipantRow {
     created_by_device_id: Uuid,
 }
 
-#[cfg(not(test))]
+
 #[derive(Debug, FromRow)]
 struct ConversationLeafRow {
     user_did: String,
@@ -5183,7 +5199,7 @@ struct ConversationLeafRow {
     join_key_package_ref: Option<Vec<u8>>,
 }
 
-#[cfg(not(test))]
+
 #[derive(Debug, FromRow)]
 struct ConversationMetadataRow {
     origin_transition_id: Uuid,

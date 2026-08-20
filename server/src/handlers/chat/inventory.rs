@@ -103,10 +103,9 @@ async fn serve(
     context::require_cutover(runtime, endpoint)?;
     let parsed =
         QueryParams::parse(query, domain).map_err(|code| ChatFailure::protocol(endpoint, code))?;
-    let actor_device_id = context::actor_device_id_from_query(query, endpoint)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
     let admission =
-        context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &actor_device_id)
+        context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &parsed.actor_device_id)
             .await?;
     let sealer = runtime
         .cursor_sealer()
@@ -126,7 +125,7 @@ async fn serve(
             admission,
             cursor,
             request,
-            parsed.inventory_session_id,
+            parsed.inventory_session_id.as_deref(),
             sealer,
         )
         .await
@@ -136,7 +135,7 @@ async fn serve(
             pool,
             admission,
             request,
-            parsed.inventory_session_id,
+            parsed.inventory_session_id.as_deref(),
             sealer,
             &mut random,
         )
@@ -147,13 +146,15 @@ async fn serve(
 }
 
 struct QueryParams {
+    actor_device_id: String,
     limit: u16,
     page_cursor: Option<String>,
-    inventory_session_id: Option<Uuid>,
+    inventory_session_id: Option<String>,
 }
 
 impl QueryParams {
     fn parse(query: Option<&str>, domain: InventoryDomain) -> Result<Self, ChatProtocolErrorCode> {
+        let mut actor_device_id = None;
         let mut limit = None;
         let mut page_cursor = None;
         let mut inventory_session_id = None;
@@ -168,6 +169,11 @@ impl QueryParams {
             let key = percent_decode(raw_key).ok_or(ChatProtocolErrorCode::InvalidRequest)?;
             let value = percent_decode(raw_value).ok_or(ChatProtocolErrorCode::InvalidRequest)?;
             match key.as_str() {
+                "actorDeviceId" if actor_device_id.is_none() => {
+                    let canonical = CanonicalUuidV4::parse(&value)
+                        .map_err(|_| ChatProtocolErrorCode::InvalidRequest)?;
+                    actor_device_id = Some(canonical.as_str().to_string());
+                }
                 "limit" if limit.is_none() => {
                     let parsed = value
                         .parse::<u16>()
@@ -184,11 +190,13 @@ impl QueryParams {
                     page_cursor = Some(value);
                 }
                 "inventorySessionId" if inventory_session_id.is_none() => {
-                    inventory_session_id = Some(parse_canonical_uuid(&value)?);
+                    inventory_session_id = Some(parse_canonical_capability(&value)?);
                 }
                 _ => return Err(ChatProtocolErrorCode::InvalidRequest),
             }
         }
+        let actor_device_id = actor_device_id.ok_or(ChatProtocolErrorCode::InvalidRequest)?;
+        let limit = limit.unwrap_or(50);
         let inventory_session_id = match domain {
             InventoryDomain::Conversations => {
                 if inventory_session_id.is_some() {
@@ -201,17 +209,26 @@ impl QueryParams {
             }
         };
         Ok(Self {
-            limit: limit.unwrap_or(50),
+            actor_device_id,
+            limit,
             page_cursor,
             inventory_session_id,
         })
     }
 }
 
-fn parse_canonical_uuid(value: &str) -> Result<Uuid, ChatProtocolErrorCode> {
-    let canonical =
-        CanonicalUuidV4::parse(value).map_err(|_| ChatProtocolErrorCode::InvalidRequest)?;
-    Uuid::parse_str(canonical.as_str()).map_err(|_| ChatProtocolErrorCode::InvalidRequest)
+fn parse_canonical_capability(value: &str) -> Result<String, ChatProtocolErrorCode> {
+    if value.len() != 43 {
+        return Err(ChatProtocolErrorCode::InvalidRequest);
+    }
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ChatProtocolErrorCode::InvalidRequest)?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(ChatProtocolErrorCode::InvalidRequest);
+    }
+    Ok(value.to_owned())
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -291,15 +308,18 @@ fn map_repository_error(endpoint: ChatEndpoint, error: InventoryRepositoryError)
 mod tests {
     use super::*;
 
-    const SESSION: &str = "018f0c4e-7a2b-4b15-8c21-4e6ad3d6a901";
+    const ACTOR: &str = "018f0c4e-7a2b-4b15-8c21-4e6ad3d6a901";
+    const SESSION: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
 
     #[test]
     fn defaults_limit_and_rejects_session_for_conversations() {
-        let parsed = QueryParams::parse(None, InventoryDomain::Conversations).unwrap();
+        let query = format!("actorDeviceId={ACTOR}");
+        let parsed = QueryParams::parse(Some(&query), InventoryDomain::Conversations).unwrap();
         assert_eq!(parsed.limit, 50);
+        assert_eq!(parsed.actor_device_id, ACTOR);
         assert!(parsed.inventory_session_id.is_none());
         assert!(QueryParams::parse(
-            Some("inventorySessionId=018f0c4e-7a2b-4b15-8c21-4e6ad3d6a901"),
+            Some(&format!("actorDeviceId={ACTOR}&limit=50&inventorySessionId={SESSION}")),
             InventoryDomain::Conversations
         )
         .is_err());
@@ -307,15 +327,15 @@ mod tests {
 
     #[test]
     fn requires_canonical_session_for_domain_pages() {
-        let query = format!("inventorySessionId={SESSION}&limit=1");
+        let query = format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1");
         let parsed = QueryParams::parse(Some(&query), InventoryDomain::Welcomes).unwrap();
         assert_eq!(parsed.limit, 1);
         assert_eq!(
-            parsed.inventory_session_id,
-            Some(Uuid::parse_str(SESSION).unwrap())
+            parsed.inventory_session_id.as_deref(),
+            Some(SESSION)
         );
         assert!(QueryParams::parse(
-            Some("inventorySessionId=018F0C4E-7A2B-4B15-8C21-4E6AD3D6A901"),
+            Some(&format!("actorDeviceId={ACTOR}&inventorySessionId=not-a-valid-capability&limit=1")),
             InventoryDomain::Recovery,
         )
         .is_err());
@@ -323,9 +343,13 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_unknown_and_oversized_query_values() {
-        let oversized = format!("pageCursor={}", "a".repeat(513));
-        for query in ["limit=1&limit=2", "unexpected=x", "pageCursor="] {
-            assert!(QueryParams::parse(Some(query), InventoryDomain::Recovery).is_err());
+        let oversized = format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&pageCursor={}", "a".repeat(513));
+        for query in [
+            format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&limit=2"),
+            format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&unexpected=x"),
+            format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&pageCursor="),
+        ] {
+            assert!(QueryParams::parse(Some(&query), InventoryDomain::Recovery).is_err());
         }
         assert!(QueryParams::parse(Some(&oversized), InventoryDomain::Recovery).is_err());
     }

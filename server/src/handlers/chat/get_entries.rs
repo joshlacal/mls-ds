@@ -39,8 +39,7 @@ async fn get_entries(
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
     context::require_cutover(runtime, ENDPOINT)?;
-    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
-    let (conversation_id, after_seq, limit) = parse_query(query)?;
+    let (actor_device_id, conversation_id, after_seq, limit) = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let admission =
         context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
@@ -51,51 +50,104 @@ async fn get_entries(
     Ok(context::json_ok(response.into_response_bytes()))
 }
 
-fn parse_query(query: Option<&str>) -> Result<(Uuid, u64, i64), ChatFailure> {
+fn parse_query(query: Option<&str>) -> Result<(String, Uuid, u64, i64), ChatFailure> {
+    let mut actor_device_id = None;
     let mut conversation_id = None;
     let mut after_seq = None;
     let mut limit = None;
-    let mut limit_seen = false;
-    for pair in query.unwrap_or_default().split('&') {
-        let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or_default();
-        let value = parts.next().unwrap_or_default();
-        match key {
-            "conversationId" => conversation_id = Some(value),
-            "afterSeq" => after_seq = Some(value),
-            "limit" => {
-                limit_seen = true;
-                limit = value.parse::<i64>().ok();
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
             }
-            _ => {}
+            "conversationId" if conversation_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let uuid = Uuid::parse_str(canonical.as_str())
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                conversation_id = Some(uuid);
+            }
+            "afterSeq" if after_seq.is_none() => {
+                let parsed = value
+                    .parse::<i64>()
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                if !(0..=MAX_SAFE_INTEGER).contains(&parsed) {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::InvalidRequest,
+                    ));
+                }
+                let seq = u64::try_from(parsed)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                after_seq = Some(seq);
+            }
+            "limit" if limit.is_none() => {
+                let parsed = value
+                    .parse::<i64>()
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                if !(1..=100).contains(&parsed) {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::InvalidRequest,
+                    ));
+                }
+                limit = Some(parsed);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
         }
     }
+    let actor_device_id = actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let conversation_id = conversation_id
-        .and_then(|value| CanonicalUuidV4::parse(value).ok())
-        .and_then(|value| Uuid::from_slice(value.as_bytes()).ok())
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let after_seq = after_seq
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| (0..=MAX_SAFE_INTEGER).contains(value))
-        .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-    let limit = match (limit_seen, limit) {
-        (true, None) => {
-            return Err(ChatFailure::protocol(
-                ENDPOINT,
-                ChatProtocolErrorCode::InvalidRequest,
-            ));
+    let limit = limit.unwrap_or(100);
+    Ok((actor_device_id, conversation_id, after_seq, limit))
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = (bytes[index + 1] as char).to_digit(16)?;
+                let lo = (bytes[index + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                index += 3;
+            }
+            byte if byte.is_ascii() => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => return None,
         }
-        (false, None) => 100,
-        (_, Some(value)) if (1..=100).contains(&value) => value,
-        (_, Some(_)) => {
-            return Err(ChatFailure::protocol(
-                ENDPOINT,
-                ChatProtocolErrorCode::InvalidRequest,
-            ));
-        }
-    };
-    Ok((conversation_id, after_seq, limit))
+    }
+    String::from_utf8(out).ok()
 }
 
 fn facade_failure(error: EntryReadFacadeError) -> ChatFailure {

@@ -25,11 +25,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::chat_protocol::error::ChatEndpoint;
+use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::inventory::{
     create_own_device_snapshot_for_admission, ExistingDeviceReadFacadeError,
 };
-use crate::chat_protocol::validation::CanonicalHttpMethod;
+use crate::chat_protocol::validation::{CanonicalHttpMethod, CanonicalUuidV4};
 use crate::storage::DbPool;
 
 use super::context;
@@ -58,7 +58,8 @@ async fn get_own_devices(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
-    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
+    context::require_cutover(runtime, ENDPOINT)?;
+    let actor_device_id = parse_query(query)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let admission =
         context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
@@ -100,4 +101,85 @@ fn retry_ceiling_response() -> Response {
         .headers_mut()
         .insert(RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECONDS));
     response
+}
+
+fn parse_query(query: Option<&str>) -> Result<String, ChatFailure> {
+    let mut actor_device_id = None;
+    let mut page_cursor = None;
+    let mut limit = None;
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let key = percent_decode(raw_key)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let value = percent_decode(raw_value)
+            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        match key.as_str() {
+            "actorDeviceId" if actor_device_id.is_none() => {
+                let canonical = CanonicalUuidV4::parse(&value)
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                actor_device_id = Some(canonical.as_str().to_string());
+            }
+            "pageCursor" if page_cursor.is_none() => {
+                if value.is_empty() || value.len() > 512 {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::InvalidRequest,
+                    ));
+                }
+                page_cursor = Some(value);
+            }
+            "limit" if limit.is_none() => {
+                let parsed = value
+                    .parse::<u16>()
+                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                if !(1..=100).contains(&parsed) {
+                    return Err(ChatFailure::protocol(
+                        ENDPOINT,
+                        ChatProtocolErrorCode::InvalidRequest,
+                    ));
+                }
+                limit = Some(parsed);
+            }
+            _ => {
+                return Err(ChatFailure::protocol(
+                    ENDPOINT,
+                    ChatProtocolErrorCode::InvalidRequest,
+                ));
+            }
+        }
+    }
+    actor_device_id
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hi = (bytes[index + 1] as char).to_digit(16)?;
+                let lo = (bytes[index + 2] as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                index += 3;
+            }
+            byte if byte.is_ascii() => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(out).ok()
 }

@@ -472,6 +472,7 @@ fn leave_view_json(
     )
 }
 
+
 #[cfg(not(test))]
 async fn lock_leave_replay_post_state(
     transaction: &mut Transaction<'_, Postgres>,
@@ -565,6 +566,7 @@ fn response_contains_entry(value: &Value, entry_id: Uuid) -> bool {
     }
 }
 
+
 #[cfg(not(test))]
 pub(in crate::chat_protocol::repository) struct LeaveReplayPostStateProof {
     transaction_id: Box<str>,
@@ -580,6 +582,7 @@ pub(in crate::chat_protocol::repository) struct LeaveReplayPostStateProof {
     expected_response_sha256: [u8; 32],
     seal: [u8; 32],
 }
+
 
 #[cfg(not(test))]
 impl LeaveReplayPostStateProof {

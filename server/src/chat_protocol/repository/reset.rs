@@ -659,6 +659,7 @@ struct ResetReplaySuccessorRow {
 
 /// Reset-owned, private-constructor replay proof. Prelude can inspect the
 /// complete binding but cannot mint one or substitute loose endpoint facts.
+
 #[cfg(not(test))]
 pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
     transaction_id: Box<str>,
@@ -674,6 +675,7 @@ pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
     expected_response_sha256: [u8; 32],
     seal_digest: [u8; 32],
 }
+
 
 #[cfg(not(test))]
 impl ResetReplayPostStateProof {
@@ -3474,7 +3476,7 @@ fn digest_generation_state(digest: &mut Sha256, row: &ResetReplaySuccessorRow) {
     digest.update(row.created_at.timestamp_millis().to_be_bytes());
 }
 
-#[cfg(not(test))]
+
 #[allow(clippy::too_many_arguments)]
 fn reset_replay_seal(
     transaction_id: &str,
@@ -3504,6 +3506,7 @@ fn reset_replay_seal(
     digest.update(expected_response_sha256);
     digest.finalize().into()
 }
+
 
 #[cfg(not(test))]
 fn digest_uuid(digest: &mut Sha256, value: Uuid) {
