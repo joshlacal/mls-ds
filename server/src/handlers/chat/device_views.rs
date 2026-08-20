@@ -56,7 +56,6 @@ pub(super) fn device_view_from_directory(
         available_package_count: view.available_package_count,
         created_at: chrono_to_datetime(view.created_at),
         device_id: device_id_string(view),
-        dpop_jkt: SmolStr::from(view.dpop_jkt.as_str()),
         key_id: SmolStr::from(view.key_id.as_str()),
         reserved_package_count: view.reserved_package_count,
         signature_public_key: Bytes::from(view.signing_public_key.clone()),

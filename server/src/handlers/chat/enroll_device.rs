@@ -118,7 +118,6 @@ async fn enroll(
             available_package_count: batch_count,
             created_at: chrono_to_datetime(trusted_at),
             device_id: SmolStr::from(effect.device_id().to_string()),
-            dpop_jkt: SmolStr::from(effect.current_jkt()),
             key_id: SmolStr::from(key_id.as_str()),
             reserved_package_count: 0,
             signature_public_key: JacquardBytes::from(expected_signature_key.clone()),

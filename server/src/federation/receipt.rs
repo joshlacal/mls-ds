@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 /// The DID document itself is published by the edge/operations layer. The
 /// server validates this fixed identifier before enabling receipt issuance so
 /// configuration cannot silently select the service-auth verification method.
-pub const RECEIPT_VERIFICATION_METHOD: &str = "did:web:mlschat.catbird.blue#mls-receipt-1";
+pub const RECEIPT_VERIFICATION_METHOD: &str = "did:web:chat.catbird.blue#mls-receipt-1";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ReceiptConfigError {
@@ -325,7 +325,7 @@ mod tests {
         multikey.extend_from_slice(key.to_encoded_point(true).as_bytes());
         let public_key_multibase = multibase::encode(multibase::Base::Base58Btc, multikey);
         serde_json::json!({
-            "id": "did:web:mlschat.catbird.blue",
+            "id": "did:web:chat.catbird.blue",
             "verificationMethod": [{
                 "id": method_id,
                 "type": "Multikey",
@@ -340,8 +340,8 @@ mod tests {
     fn receipt_did_document_requires_fixed_method() {
         let receipt_key = SigningKey::random(&mut OsRng);
         let document = did_document(
-            "did:web:mlschat.catbird.blue#atproto",
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue#atproto",
+            "did:web:chat.catbird.blue",
             receipt_key.verifying_key(),
         );
 
@@ -371,7 +371,7 @@ mod tests {
         let receipt_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             receipt_key.verifying_key(),
         );
         let mut document: serde_json::Value = serde_json::from_str(&document).unwrap();
@@ -396,7 +396,7 @@ mod tests {
         let shared_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             shared_key.verifying_key(),
         );
 
@@ -416,7 +416,7 @@ mod tests {
         let signer_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             published_key.verifying_key(),
         );
 
@@ -432,7 +432,7 @@ mod tests {
         let service_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             receipt_key.verifying_key(),
         );
 
@@ -454,7 +454,7 @@ mod tests {
             None,
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect_err("missing dedicated receipt key must fail closed");
@@ -470,7 +470,7 @@ mod tests {
             Some("not-a-private-key"),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect_err("malformed dedicated receipt key must fail closed");
@@ -485,9 +485,9 @@ mod tests {
         let error = configured_receipt_signer(
             Some("issue"),
             Some(&pem(&receipt_key)),
-            Some("did:web:mlschat.catbird.blue#service-auth"),
+            Some("did:web:chat.catbird.blue#service-auth"),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect_err("a different verification method must fail closed");
@@ -521,7 +521,7 @@ mod tests {
             Some(&shared_pem),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&shared_pem),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect_err("receipt and service-auth keys must be distinct");
@@ -535,7 +535,7 @@ mod tests {
         let service_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             receipt_key.verifying_key(),
         );
         let signer = configured_receipt_signer(
@@ -543,7 +543,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             Some(&document),
         )
         .expect("valid receipt configuration")
@@ -561,7 +561,7 @@ mod tests {
             None,
             None,
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect("disabled mode is valid");
@@ -574,7 +574,7 @@ mod tests {
         let receipt_key = SigningKey::random(&mut OsRng);
         let document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             receipt_key.verifying_key(),
         );
         let missing = configured_receipt_signer(
@@ -582,7 +582,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             None,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             Some(&document),
         )
         .expect_err("missing service key cannot prove key separation");
@@ -593,7 +593,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some("not-a-private-key"),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             Some(&document),
         )
         .expect_err("malformed service key cannot prove key separation");
@@ -609,7 +609,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             None,
         )
         .expect_err("issue mode without the published document must fail startup");
@@ -623,7 +623,7 @@ mod tests {
         let wrong_key = SigningKey::random(&mut OsRng);
         let wrong_key_document = did_document(
             RECEIPT_VERIFICATION_METHOD,
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             wrong_key.verifying_key(),
         );
         let wrong_key_error = configured_receipt_signer(
@@ -631,7 +631,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             Some(&wrong_key_document),
         )
         .expect_err("a document publishing another key must fail startup");
@@ -652,7 +652,7 @@ mod tests {
             Some(&pem(&receipt_key)),
             Some(RECEIPT_VERIFICATION_METHOD),
             Some(&pem(&service_key)),
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             Some(&tampered_controller),
         )
         .expect_err("a tampered controller must fail startup");
@@ -671,13 +671,13 @@ mod tests {
             0x0102_0304,
             0x0102_0304_0506_0708,
             &[0xabu8; 32],
-            "did:web:mlschat.catbird.blue",
+            "did:web:chat.catbird.blue",
             0x0102_0304_0506_0708,
         );
 
         assert_eq!(
             hex::encode(bytes),
-            "434154424952442d524543454950542d56313a0100000063010203040102030405060708abababababababababababababababababababababababababababababababab1c0000006469643a7765623a6d6c73636861742e636174626972642e626c75650102030405060708"
+            "434154424952442d524543454950542d56313a0100000063010203040102030405060708abababababababababababababababababababababababababababababababab190000006469643a7765623a636861742e636174626972642e626c75650102030405060708"
         );
     }
 

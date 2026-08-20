@@ -28,6 +28,7 @@ use crate::chat_protocol::error::{
 pub(crate) struct ChatFailure {
     endpoint: ChatEndpoint,
     exposure: ErrorExposure,
+    retry_after_secs: Option<u64>,
 }
 
 impl ChatFailure {
@@ -36,10 +37,20 @@ impl ChatFailure {
     /// internal invariant violation (never a vocabulary leak) and the defect is
     /// logged for the coordinator (ruling OQ-11).
     pub(crate) fn protocol(endpoint: ChatEndpoint, code: ChatProtocolErrorCode) -> Self {
+        Self::protocol_with_retry(endpoint, code, None)
+    }
+
+    /// Attempt to expose `code` with an optional retry-after interval in seconds.
+    pub(crate) fn protocol_with_retry(
+        endpoint: ChatEndpoint,
+        code: ChatProtocolErrorCode,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
         match EndpointProtocolError::new(endpoint, code) {
             Ok(error) => Self {
                 endpoint,
                 exposure: ErrorExposure::Protocol(error),
+                retry_after_secs,
             },
             Err(undeclared) => {
                 tracing::error!(
@@ -51,6 +62,7 @@ impl ChatFailure {
                 Self {
                     endpoint,
                     exposure: ErrorExposure::InvariantViolation,
+                    retry_after_secs: None,
                 }
             }
         }
@@ -62,6 +74,7 @@ impl ChatFailure {
         Self {
             endpoint,
             exposure: ErrorExposure::InvariantViolation,
+            retry_after_secs: None,
         }
     }
 
@@ -71,6 +84,7 @@ impl ChatFailure {
         Self {
             endpoint,
             exposure: ErrorExposure::StorageFailure,
+            retry_after_secs: None,
         }
     }
 
@@ -91,11 +105,17 @@ impl IntoResponse for ChatFailure {
             Some(error) => {
                 let code = error.code();
                 let status = protocol_http_status(code);
-                (
+                let mut response = (
                     status,
                     Json(json!({ "error": code.as_str(), "message": code.as_str() })),
                 )
-                    .into_response()
+                    .into_response();
+                if let Some(retry_after) = self.retry_after_secs {
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+                        response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+                    }
+                }
+                response
             }
             // Internal exposure: never a protocol code, never an internal
             // string. A bare generic transport error name only. The endpoint is
@@ -121,15 +141,39 @@ impl IntoResponse for ChatFailure {
 /// everything else the XRPC default 400.
 fn protocol_http_status(code: ChatProtocolErrorCode) -> StatusCode {
     use ChatProtocolErrorCode::{
-        DeviceNotRegistered, DeviceRevoked, InvalidDPoP, InvalidSignature, NotAuthorized,
-        RateLimited, RelationshipPolicyUnavailable,
+        AccountSessionExpired, DeviceBindingMismatch, DeviceNotRegistered, DeviceRevoked,
+        InvalidSignature, NotAuthorized, RateLimited, RelationshipPolicyUnavailable,
     };
     match code {
-        InvalidDPoP | InvalidSignature | NotAuthorized | DeviceRevoked | DeviceNotRegistered => {
-            StatusCode::UNAUTHORIZED
-        }
+        AccountSessionExpired
+        | DeviceBindingMismatch
+        | InvalidSignature
+        | NotAuthorized
+        | DeviceRevoked
+        | DeviceNotRegistered => StatusCode::UNAUTHORIZED,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         RelationshipPolicyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::header::RETRY_AFTER;
+
+    #[test]
+    fn rate_limited_failure_sets_retry_after_header() {
+        let failure = ChatFailure::protocol_with_retry(
+            ChatEndpoint::SendMessage,
+            ChatProtocolErrorCode::RateLimited,
+            Some(42),
+        );
+        let response = failure.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
     }
 }

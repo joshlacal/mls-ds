@@ -213,7 +213,7 @@ pub(crate) struct LockedInventorySessionGuard {
     token_hash: [u8; 32],
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: u64,
     snapshot_event_position: u64,
     snapshot_event_cursor_bytes: Vec<u8>,
@@ -293,7 +293,7 @@ struct InventorySessionLockMaterial {
     token_hash: [u8; 32],
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: u64,
     snapshot_event_position: u64,
     snapshot_event_cursor_bytes: Vec<u8>,
@@ -304,7 +304,7 @@ struct InventorySessionLockMaterial {
     welcomes: InventoryCompletionEvidence,
     recovery: InventoryCompletionEvidence,
     device_status: String,
-    current_dpop_jkt: String,
+    current_dpop_jkt: Option<String>,
     current_auth_generation: u64,
     device_revoked_at: Option<DateTime<Utc>>,
     key_id: String,
@@ -369,7 +369,7 @@ impl LockedInventorySessionGuard {
             || expected_token_hash.is_some_and(|expected| expected != token_hash)
             || BareDid::parse(&user_did).is_err()
             || !uuid_is_canonical_v4(device_id)
-            || KeyThumbprint::parse(&jkt).is_err()
+            || jkt.as_deref().is_some_and(|value| KeyThumbprint::parse(value).is_err())
             || !(1..=MAX_PROTOCOL_INTEGER).contains(&auth_generation)
             || snapshot_event_position > MAX_PROTOCOL_INTEGER
             || snapshot_event_cursor_bytes.is_empty()
@@ -427,7 +427,7 @@ impl LockedInventorySessionGuard {
             &token_hash,
             &user_did,
             device_id,
-            &jkt,
+            jkt.as_deref(),
             auth_generation,
             snapshot_event_position,
             &snapshot_event_cursor_bytes,
@@ -607,7 +607,7 @@ struct InventorySessionRow {
     token_hash: Vec<u8>,
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: i64,
     snapshot_event_position: i64,
     snapshot_event_cursor_bytes: Vec<u8>,
@@ -628,7 +628,7 @@ struct InventorySessionRow {
 #[derive(Debug, FromRow)]
 struct ActiveDeviceKeyRow {
     device_status: String,
-    current_dpop_jkt: String,
+    current_dpop_jkt: Option<String>,
     current_auth_generation: i64,
     device_revoked_at: Option<DateTime<Utc>>,
     key_id: String,
@@ -1182,7 +1182,7 @@ pub(crate) struct InventorySessionLockFixture {
     pub(crate) token_hash: [u8; 32],
     pub(crate) user_did: String,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: String,
+    pub(crate) jkt: Option<String>,
     pub(crate) auth_generation: u64,
     pub(crate) snapshot_event_position: u64,
     pub(crate) snapshot_event_cursor_bytes: Vec<u8>,
@@ -1193,7 +1193,7 @@ pub(crate) struct InventorySessionLockFixture {
     pub(crate) welcomes: InventoryCompletionEvidence,
     pub(crate) recovery: InventoryCompletionEvidence,
     pub(crate) device_status: String,
-    pub(crate) current_dpop_jkt: String,
+    pub(crate) current_dpop_jkt: Option<String>,
     pub(crate) current_auth_generation: u64,
     pub(crate) device_revoked_at: Option<DateTime<Utc>>,
     pub(crate) key_id: String,
@@ -1263,7 +1263,7 @@ fn locked_inventory_session_digest(
     token_hash: &[u8; 32],
     user_did: &str,
     device_id: Uuid,
-    jkt: &str,
+    jkt: Option<&str>,
     auth_generation: u64,
     snapshot_event_position: u64,
     snapshot_event_cursor_bytes: &[u8],
@@ -1293,7 +1293,7 @@ fn locked_inventory_session_digest(
     digest.update(token_hash);
     update_text(&mut digest, user_did);
     digest.update(device_id.as_bytes());
-    update_text(&mut digest, jkt);
+    update_text(&mut digest, jkt.unwrap_or_default());
     digest.update(auth_generation.to_be_bytes());
     digest.update(snapshot_event_position.to_be_bytes());
     update_bytes(&mut digest, snapshot_event_cursor_bytes);
@@ -1435,7 +1435,7 @@ pub(crate) struct DeviceView {
     pub(crate) device_id: Uuid,
     pub(crate) device_name: String,
     pub(crate) status: String,
-    pub(crate) dpop_jkt: String,
+    pub(crate) dpop_jkt: Option<String>,
     pub(crate) auth_generation: i64,
     pub(crate) created_at: DateTime<Utc>,
 }
@@ -1632,7 +1632,7 @@ pub(crate) async fn create_inventory_session(
     // device is consumed by the fence verification below.
     let user_did = device.user_did().to_owned();
     let device_id = device.device_id();
-    let jkt = device.jkt().to_owned();
+    let jkt = device.jkt().map(str::to_owned);
     let auth_generation = device.auth_generation();
 
     // 1. Capture + lock the event fence: the protocol singleton, the retention
@@ -1703,7 +1703,7 @@ pub(crate) async fn create_inventory_session(
         request.inventory_session_id,
         user_did.as_bytes(),
         device_id,
-        jkt.as_bytes(),
+        jkt.as_deref().unwrap_or("").as_bytes(),
         auth_generation,
         protocol.protocol_instance_id,
         protocol.cursor_key_id.as_bytes(),
@@ -1741,7 +1741,7 @@ pub(crate) async fn create_inventory_session(
     .bind(capability_hash.as_slice())
     .bind(&user_did)
     .bind(device_id)
-    .bind(&jkt)
+    .bind(jkt.as_deref())
     .bind(i64::try_from(auth_generation).map_err(|_| InventoryRepositoryError::DurableRowInvalid)?)
     .bind(
         i64::try_from(snapshot_event_position)
@@ -2057,7 +2057,7 @@ pub(crate) struct CreateDeviceInventorySessionRequest<'a> {
     pub(crate) device_inventory_session_id: Uuid,
     pub(crate) user_did: &'a str,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: &'a str,
+    pub(crate) jkt: Option<&'a str>,
     pub(crate) auth_generation: u64,
     pub(crate) fence_revision: u64,
     pub(crate) created_at: DateTime<Utc>,
@@ -2124,7 +2124,7 @@ pub(crate) async fn create_device_inventory_session(
     if device.device_status != "active"
         || device.device_revoked_at.is_some()
         || device.key_revoked_at.is_some()
-        || device.current_dpop_jkt != request.jkt
+        || device.current_dpop_jkt.as_deref() != request.jkt
         || database_protocol_integer(device.current_auth_generation)
             .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?
             != request.auth_generation
@@ -2417,7 +2417,7 @@ struct LockedReadRequesterDeviceRow {
     user_did: String,
     device_id: Uuid,
     status: String,
-    dpop_jkt: String,
+    dpop_jkt: Option<String>,
     auth_generation: i64,
 }
 
@@ -2442,7 +2442,7 @@ struct VerifiedRequesterLock {
     verified: super::super::dpop::VerifiedExistingDeviceReadRow,
     row_user_did: String,
     row_device_id: Uuid,
-    row_dpop_jkt: String,
+    row_dpop_jkt: Option<String>,
     row_auth_generation: i64,
 }
 
@@ -2514,7 +2514,7 @@ async fn lock_and_verify_read_requester(
         device.user_did.clone().into_boxed_str(),
         device.device_id,
         device.status.clone().into_boxed_str(),
-        device.dpop_jkt.clone().into_boxed_str(),
+        device.dpop_jkt.clone().map(String::into_boxed_str),
         device.auth_generation,
         key.key_id.into_boxed_str(),
         signing_public_key_sha256,
@@ -2579,7 +2579,6 @@ fn read_facade_device_view(
         available_package_count: view.available_package_count,
         created_at: crate::sqlx_jacquard::chrono_to_datetime(view.created_at),
         device_id: SmolStr::from(view.device_id.to_string()),
-        dpop_jkt: SmolStr::from(view.dpop_jkt.as_str()),
         key_id: SmolStr::from(view.key_id.as_str()),
         reserved_package_count: view.reserved_package_count,
         signature_public_key: Bytes::from(view.signing_public_key.clone()),
@@ -2844,7 +2843,7 @@ async fn materialize_own_device_snapshot(
         device_inventory_session_id: Uuid::new_v4(),
         user_did: &lock.row_user_did,
         device_id: lock.row_device_id,
-        jkt: &lock.row_dpop_jkt,
+        jkt: lock.row_dpop_jkt.as_deref(),
         auth_generation,
         fence_revision: 0,
         created_at,
@@ -3108,7 +3107,7 @@ const PAGE_ENVELOPE_HEADROOM: usize = 1024;
 fn derive_inventory_session_uuid(
     user_did: &str,
     device_id: Uuid,
-    jkt: &str,
+    jkt: Option<&str>,
     auth_generation: u64,
 ) -> Uuid {
     let mut digest = Sha256::new();
@@ -3116,8 +3115,9 @@ fn derive_inventory_session_uuid(
     digest.update((user_did.len() as u64).to_be_bytes());
     digest.update(user_did.as_bytes());
     digest.update(device_id.as_bytes());
-    digest.update((jkt.len() as u64).to_be_bytes());
-    digest.update(jkt.as_bytes());
+    let jkt_str = jkt.unwrap_or_default();
+    digest.update((jkt_str.len() as u64).to_be_bytes());
+    digest.update(jkt_str.as_bytes());
     digest.update(auth_generation.to_be_bytes());
     let bytes: [u8; 32] = digest.finalize().into();
     let mut uuid_bytes = [0u8; 16];
@@ -3165,7 +3165,7 @@ struct InventorySessionFenceLockRow {
     inventory_session_id: Uuid,
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: i64,
     snapshot_event_position: i64,
     snapshot_event_cursor_sha256: Vec<u8>,
@@ -3218,7 +3218,7 @@ async fn verify_locked_inventory_fence(
 ) -> Result<super::super::read_authority::VerifiedInventoryFence, InventoryRepositoryError> {
     if row.user_did != device.user_did()
         || row.device_id != device.device_id()
-        || row.jkt != device.jkt()
+        || row.jkt.as_deref() != device.jkt()
         || row.auth_generation
             != i64::try_from(device.auth_generation())
                 .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?
@@ -3272,7 +3272,7 @@ pub(crate) type PagingDeviceAuthority = super::super::read_authority::LockedRead
 pub(crate) struct PagingDeviceAuthority {
     pub(crate) user_did: String,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: String,
+    pub(crate) jkt: Option<String>,
     pub(crate) auth_generation: i64,
 }
 
@@ -3303,7 +3303,7 @@ async fn verify_paging_device_fence(
     let _ = transaction;
     if row.user_did != device.user_did
         || row.device_id != device.device_id
-        || row.jkt != device.jkt
+        || row.jkt.as_deref() != device.jkt.as_deref()
         || row.auth_generation != device.auth_generation
         || row.legacy_cursor_invalidated_at.is_some()
         || row.cursor_format_version != 1
@@ -3376,7 +3376,7 @@ fn verify_successor_capability(
         row.inventory_session_id,
         row.user_did.as_bytes(),
         row.device_id,
-        row.jkt.as_bytes(),
+        row.jkt.as_deref().unwrap_or("").as_bytes(),
         u64::try_from(row.auth_generation)
             .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?,
         row.protocol_instance_id,
@@ -3421,7 +3421,7 @@ pub(crate) async fn snapshot_capability_for_ticket(
         .ok_or(InventoryRepositoryError::SessionNotFound)?;
     if row.user_did != device.user_did()
         || row.device_id != device.device_id()
-        || row.jkt != device.jkt()
+        || row.jkt.as_deref() != device.jkt()
         || row.auth_generation
             != i64::try_from(device.auth_generation())
                 .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?
@@ -3466,7 +3466,7 @@ fn page_receipt_binding(
         row.inventory_session_id,
         row.user_did.as_bytes(),
         row.device_id,
-        row.jkt.as_bytes(),
+        row.jkt.as_deref().unwrap_or("").as_bytes(),
         u64::try_from(row.auth_generation).map_err(|_| SealerError::InvalidField)?,
         row.protocol_instance_id,
         row.cursor_key_id.as_bytes(),
@@ -3716,7 +3716,7 @@ struct ServedPageReceiptRow {
     canonical_filter_sha256: Vec<u8>,
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: i64,
     protocol_instance_id: Uuid,
     cursor_key_id: String,
@@ -3885,7 +3885,7 @@ async fn insert_page_receipt_unserved(
     .bind(request.canonical_filter_sha256().as_slice())
     .bind(&row.user_did)
     .bind(row.device_id)
-    .bind(&row.jkt)
+    .bind(row.jkt.as_deref())
     .bind(row.auth_generation)
     .bind(row.protocol_instance_id)
     .bind(&row.cursor_key_id)

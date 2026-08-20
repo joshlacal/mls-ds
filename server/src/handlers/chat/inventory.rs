@@ -103,8 +103,11 @@ async fn serve(
     context::require_cutover(runtime, endpoint)?;
     let parsed =
         QueryParams::parse(query, domain).map_err(|code| ChatFailure::protocol(endpoint, code))?;
+    let actor_device_id = context::actor_device_id_from_query(query, endpoint)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
-    let admission = context::admit_unsigned_read(pool, runtime, endpoint, method, headers).await?;
+    let admission =
+        context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &actor_device_id)
+            .await?;
     let sealer = runtime
         .cursor_sealer()
         .ok_or_else(|| ChatFailure::invariant(endpoint))?;
@@ -255,7 +258,9 @@ fn map_repository_error(endpoint: ChatEndpoint, error: InventoryRepositoryError)
                 ChatFailure::invariant(endpoint)
             }
         },
-        E::ReadAdmission(_) => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP),
+        E::ReadAdmission(_) => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::DeviceBindingMismatch)
+        }
         E::Cursor(crate::chat_protocol::CursorCodecError::Expired)
         | E::Cursor(crate::chat_protocol::CursorCodecError::BelowRetentionFloor) => {
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CursorExpired)

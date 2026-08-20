@@ -984,7 +984,7 @@ fn enrollment_guard_fixture() -> (
         authority_digest,
         scope_digest,
         jkt_shape: BootstrapCompletionJktShape::Enrollment {
-            current: "new-jkt".to_owned(),
+            current: Some("new-jkt".to_owned()),
         },
     };
     (guard, binding, scope_receipt, scope_digest, instant)

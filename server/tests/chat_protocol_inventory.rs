@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 mod common;
+pub use catbird_server::{auth, identity, util};
 
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -2739,7 +2740,7 @@ async fn get_own_devices_uses_separate_device_fence() {
             device_inventory_session_id: session_id,
             user_did: &requester.did,
             device_id: requester.device_id,
-            jkt: &requester.jkt,
+            jkt: Some(&requester.jkt),
             auth_generation: 1,
             fence_revision: 0,
             created_at: now,
@@ -3852,7 +3853,7 @@ fn paging_device(device: &SessionDevice) -> repository::inventory::PagingDeviceA
     repository::inventory::PagingDeviceAuthority {
         user_did: device.did.clone(),
         device_id: device.device_id,
-        jkt: device.jkt.clone(),
+        jkt: Some(device.jkt.clone()),
         auth_generation: 1,
     }
 }
@@ -4161,7 +4162,7 @@ async fn production_paging_entrypoints_serve_and_replay_the_full_receipt_chain()
     let foreign = repository::inventory::PagingDeviceAuthority {
         user_did: device.did.clone(),
         device_id: Uuid::new_v4(),
-        jkt: device.jkt.clone(),
+        jkt: Some(device.jkt.clone()),
         auth_generation: 1,
     };
     let mut tx = pool.begin().await.expect("begin the foreign attempt");

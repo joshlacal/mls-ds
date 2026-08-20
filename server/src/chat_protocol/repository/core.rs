@@ -1262,7 +1262,7 @@ struct ScopeBoundG6DeviceFact {
     did: String,
     device_id: Uuid,
     status: String,
-    dpop_jkt: String,
+    dpop_jkt: Option<String>,
     auth_generation: i64,
 }
 
@@ -1277,7 +1277,7 @@ pub(crate) struct LockedG6ScopeAuthority {
     discovery_digest: [u8; 32],
     actor_did: String,
     actor_device_id: Uuid,
-    actor_dpop_jkt: String,
+    actor_dpop_jkt: Option<String>,
     actor_auth_generation: i64,
     actor_key_id: String,
     actor_signing_public_key: Vec<u8>,
@@ -1360,7 +1360,7 @@ impl LockedG6RepositoryPrelude {
 pub(crate) struct LockedG6DeviceFact {
     device: DeviceIdentity,
     status: String,
-    dpop_jkt: String,
+    dpop_jkt: Option<String>,
     auth_generation: i64,
     initial_event_tail: Option<i64>,
 }
@@ -1374,8 +1374,8 @@ impl LockedG6DeviceFact {
         &self.status
     }
 
-    pub(crate) fn dpop_jkt(&self) -> &str {
-        &self.dpop_jkt
+    pub(crate) fn dpop_jkt(&self) -> Option<&str> {
+        self.dpop_jkt.as_deref()
     }
 
     pub(crate) fn auth_generation(&self) -> i64 {
@@ -1397,7 +1397,7 @@ pub(crate) struct LockedG6Prelude {
     authority_scope_digest: [u8; 32],
     actor_did: String,
     actor_device_id: Uuid,
-    actor_dpop_jkt: String,
+    actor_dpop_jkt: Option<String>,
     actor_auth_generation: i64,
     actor_key_id: String,
     actor_signing_public_key: Vec<u8>,
@@ -1432,8 +1432,8 @@ impl LockedG6Prelude {
         self.actor_device_id
     }
 
-    pub(crate) fn actor_dpop_jkt(&self) -> &str {
-        &self.actor_dpop_jkt
+    pub(crate) fn actor_dpop_jkt(&self) -> Option<&str> {
+        self.actor_dpop_jkt.as_deref()
     }
 
     pub(crate) fn actor_auth_generation(&self) -> i64 {
@@ -1503,7 +1503,7 @@ impl LockedG6Prelude {
                 |(device, dpop_jkt, auth_generation, initial_event_tail)| LockedG6DeviceFact {
                     device,
                     status: "active".to_owned(),
-                    dpop_jkt,
+                    dpop_jkt: Some(dpop_jkt),
                     auth_generation,
                     initial_event_tail,
                 },
@@ -1534,7 +1534,7 @@ impl LockedG6Prelude {
             authority_scope_digest,
             actor_did,
             actor_device_id,
-            actor_dpop_jkt,
+            actor_dpop_jkt: Some(actor_dpop_jkt),
             actor_auth_generation,
             actor_key_id,
             actor_signing_public_key,
@@ -1837,9 +1837,7 @@ pub(crate) async fn seal_g6_scope_authority(
         return Err(LockedG6PreludeError::AudienceMismatch);
     }
 
-    let actor_dpop_jkt = scope
-        .actor_dpop_jkt()
-        .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
+    let actor_dpop_jkt = scope.actor_dpop_jkt().map(|s| s.to_owned());
     let actor_auth_generation = scope
         .actor_auth_generation()
         .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
@@ -1849,8 +1847,12 @@ pub(crate) async fn seal_g6_scope_authority(
     let actor_signing_public_key = scope
         .actor_signing_public_key()
         .ok_or(LockedG6PreludeError::PreludeBindingMismatch)?;
-    if KeyThumbprint::parse(actor_dpop_jkt).is_err()
-        || KeyThumbprint::parse(actor_key_id).is_err()
+    if let Some(jkt) = &actor_dpop_jkt {
+        if KeyThumbprint::parse(jkt).is_err() {
+            return Err(LockedG6PreludeError::PreludeBindingMismatch);
+        }
+    }
+    if KeyThumbprint::parse(actor_key_id).is_err()
         || actor_signing_public_key.len() != 32
         || !(1..=i64::try_from(MAX_PROTOCOL_INTEGER).unwrap()).contains(&actor_auth_generation)
     {
@@ -1864,8 +1866,12 @@ pub(crate) async fn seal_g6_scope_authority(
             "revoked" => device.revoked_at().is_some(),
             _ => false,
         };
+        if let Some(jkt) = device.dpop_jkt() {
+            if KeyThumbprint::parse(jkt).is_err() {
+                return Err(LockedG6PreludeError::AudienceMismatch);
+            }
+        }
         if !valid_status
-            || KeyThumbprint::parse(device.dpop_jkt()).is_err()
             || !(1..=i64::try_from(MAX_PROTOCOL_INTEGER).unwrap())
                 .contains(&device.auth_generation())
         {
@@ -1875,7 +1881,7 @@ pub(crate) async fn seal_g6_scope_authority(
             did: device.user_did().to_owned(),
             device_id: device.device_id(),
             status: device.status().to_owned(),
-            dpop_jkt: device.dpop_jkt().to_owned(),
+            dpop_jkt: device.dpop_jkt().map(|s| s.to_owned()),
             auth_generation: device.auth_generation(),
         });
     }
@@ -1907,7 +1913,7 @@ pub(crate) async fn seal_g6_scope_authority(
         discovery_digest: discovery.discovery_digest,
         actor_did: scope.actor_did().to_owned(),
         actor_device_id: scope.actor_device_id(),
-        actor_dpop_jkt: actor_dpop_jkt.to_owned(),
+        actor_dpop_jkt,
         actor_auth_generation,
         actor_key_id: actor_key_id.to_owned(),
         actor_signing_public_key: actor_signing_public_key.to_vec(),
@@ -2220,8 +2226,9 @@ fn locked_g6_scope_digest(
         digest.update(fact.device.device_id());
         digest.update((fact.status.len() as u64).to_be_bytes());
         digest.update(fact.status.as_bytes());
-        digest.update((fact.dpop_jkt.len() as u64).to_be_bytes());
-        digest.update(fact.dpop_jkt.as_bytes());
+        let jkt_str = fact.dpop_jkt.as_deref().unwrap_or_default();
+        digest.update((jkt_str.len() as u64).to_be_bytes());
+        digest.update(jkt_str.as_bytes());
         digest.update(fact.auth_generation.to_be_bytes());
         match fact.initial_event_tail {
             Some(value) => {

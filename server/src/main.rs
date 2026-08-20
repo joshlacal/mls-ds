@@ -216,8 +216,7 @@ impl IngressBodyPolicy {
 fn request_body_limit(path: &str) -> usize {
     match path {
         BLOB_UPLOAD_PATH => BLOB_UPLOAD_BODY_LIMIT_BYTES,
-        "/xrpc/blue.catbird.chat.enrollDevice"
-        | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
+        "/xrpc/blue.catbird.chat.enrollDevice" | "/xrpc/blue.catbird.chat.replenishKeyPackages" => {
             CHAT_KEY_PACKAGE_BATCH_BODY_LIMIT_BYTES
         }
         "/xrpc/blue.catbird.mlsDS.deliverMessage"
@@ -1190,10 +1189,6 @@ mod tests {
         );
         // Small signed-body procedures fall through to the default tier.
         assert_eq!(
-            request_body_limit("/xrpc/blue.catbird.chat.rebindDeviceAuthentication"),
-            DEFAULT_REQUEST_BODY_LIMIT_BYTES
-        );
-        assert_eq!(
             request_body_limit("/xrpc/blue.catbird.chat.revokeDevice"),
             DEFAULT_REQUEST_BODY_LIMIT_BYTES
         );
@@ -1202,10 +1197,10 @@ mod tests {
     #[tokio::test]
     async fn receipt_did_route_serves_only_the_startup_validated_document() {
         let document = serde_json::json!({
-            "id": "did:web:mlschat.catbird.blue",
+            "id": "did:web:chat.catbird.blue",
             "verificationMethod": [{
                 "id": federation::RECEIPT_VERIFICATION_METHOD,
-                "controller": "did:web:mlschat.catbird.blue",
+                "controller": "did:web:chat.catbird.blue",
                 "type": "Multikey",
                 "publicKeyMultibase": "zPublishedByOperations"
             }]
@@ -1415,15 +1410,9 @@ mod tests {
     #[tokio::test]
     async fn idempotency_policy_preserves_optional_contract_and_enrollment_bypass() {
         let base_router = Router::new()
-            .route("/xrpc/blue.catbird.chat.testPolicy", post(consume_body))
-            .route(
-                "/xrpc/blue.catbird.chat.enrollDevice",
-                post(consume_body),
-            )
-            .route(
-                "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
-                post(consume_body),
-            );
+            .route("/xrpc/blue.catbird.chat.sendMessage", post(consume_body))
+            .route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body))
+            .route("/xrpc/blue.catbird.mlsDS.deliverMessage", post(consume_body));
         let app = merge_application_routers(
             base_router,
             Router::new(),
@@ -1431,32 +1420,10 @@ mod tests {
             test_ingress_policy(),
         );
 
-        let protected = app
-            .clone()
-            .oneshot(
-                Request::post("/xrpc/blue.catbird.chat.testPolicy")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(protected.status(), StatusCode::NO_CONTENT);
-
-        let invalid_present_key = app
-            .clone()
-            .oneshot(
-                Request::post("/xrpc/blue.catbird.chat.testPolicy")
-                    .header("Idempotency-Key", "   ")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(invalid_present_key.status(), StatusCode::BAD_REQUEST);
-
         for path in [
             "/xrpc/blue.catbird.chat.enrollDevice",
-            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
+            "/xrpc/blue.catbird.chat.sendMessage",
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
         ] {
             let response = app
                 .clone()
@@ -1829,12 +1796,7 @@ mod tests {
         let base_router = Router::new()
             .route("/normal", get(|| async { StatusCode::OK }))
             .route("/slow", post(consume_body));
-        let app = merge_application_routers(
-            base_router,
-            Router::new(),
-            lazy_test_pool(),
-            policy,
-        );
+        let app = merge_application_routers(base_router, Router::new(), lazy_test_pool(), policy);
         let stalled_body = Body::from_stream(futures::stream::pending::<
             Result<Bytes, std::convert::Infallible>,
         >());

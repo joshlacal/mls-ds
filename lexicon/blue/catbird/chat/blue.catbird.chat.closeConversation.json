@@ -5,21 +5,85 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedConversationClose"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCloseResult"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedConversationClose"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCloseResult"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "ConversationCloseNotAllowed"},
-        {"name": "ConversationNotFound"},
-        {"name": "CoordinateOverflow"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "NotParticipant"},
-        {"name": "StaleCoordinates"}
+        {
+          "name": "ConversationCloseNotAllowed"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CoordinateOverflow"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

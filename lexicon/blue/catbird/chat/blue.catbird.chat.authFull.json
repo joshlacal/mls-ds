@@ -1,0 +1,50 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.authFull",
+  "defs": {
+    "main": {
+      "type": "permission-set",
+      "title": "Use Catbird Encrypted Chat",
+      "detail": "Allows this client to use the MLS chat AppView through the account's PDS. Account service authentication and device-signed mutation authority remain independently enforced.",
+      "permissions": [
+        {
+          "type": "permission",
+          "resource": "rpc",
+          "inheritAud": true,
+          "lxm": [
+            "blue.catbird.chat.acceptConversation",
+            "blue.catbird.chat.acknowledgeWelcome",
+            "blue.catbird.chat.activateReset",
+            "blue.catbird.chat.cancelLeafRecovery",
+            "blue.catbird.chat.cancelLeave",
+            "blue.catbird.chat.closeConversation",
+            "blue.catbird.chat.createConversation",
+            "blue.catbird.chat.deleteBlob",
+            "blue.catbird.chat.enrollDevice",
+            "blue.catbird.chat.getBlob",
+            "blue.catbird.chat.getBlobUsage",
+            "blue.catbird.chat.getConversationState",
+            "blue.catbird.chat.getConversations",
+            "blue.catbird.chat.getDevices",
+            "blue.catbird.chat.getEntries",
+            "blue.catbird.chat.getLeafRecoveryInbox",
+            "blue.catbird.chat.getOwnDevices",
+            "blue.catbird.chat.getPendingWelcomes",
+            "blue.catbird.chat.getSubscriptionTicket",
+            "blue.catbird.chat.prepareBlobUpload",
+            "blue.catbird.chat.publishTyping",
+            "blue.catbird.chat.rejectWelcome",
+            "blue.catbird.chat.replenishKeyPackages",
+            "blue.catbird.chat.requestLeafRecovery",
+            "blue.catbird.chat.requestLeave",
+            "blue.catbird.chat.requestReset",
+            "blue.catbird.chat.revokeDevice",
+            "blue.catbird.chat.sendMessage",
+            "blue.catbird.chat.submitTransition",
+            "blue.catbird.chat.uploadBlob"
+          ]
+        }
+      ]
+    }
+  }
+}

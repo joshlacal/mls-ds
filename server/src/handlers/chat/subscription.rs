@@ -52,7 +52,15 @@ async fn issue(
         .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
     let method =
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let admission = context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers).await?;
+    let admission = context::admit_unsigned_read(
+        pool,
+        runtime,
+        ENDPOINT,
+        method,
+        headers,
+        input.actor_device_id.as_ref(),
+    )
+    .await?;
     let sealer = runtime
         .cursor_sealer()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;

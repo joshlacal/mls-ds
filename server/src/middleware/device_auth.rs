@@ -198,15 +198,12 @@ mod tests {
     #[tokio::test]
     async fn allow_and_enrollment_never_consume_dpop_or_call_the_verifier() {
         for (mode, nsid) in [
-            (DeviceAuthMode::Require, "blue.catbird.chat.getConversations"),
             (
                 DeviceAuthMode::Require,
-                "blue.catbird.chat.enrollDevice",
+                "blue.catbird.chat.getConversations",
             ),
-            (
-                DeviceAuthMode::Enroll,
-                "blue.catbird.chat.sendMessage",
-            ),
+            (DeviceAuthMode::Require, "blue.catbird.chat.enrollDevice"),
+            (DeviceAuthMode::Enroll, "blue.catbird.chat.sendMessage"),
         ] {
             let calls = Arc::new(Mutex::new(0));
             let calls_for_verifier = calls.clone();

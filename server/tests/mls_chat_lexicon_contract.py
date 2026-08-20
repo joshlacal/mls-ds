@@ -42,7 +42,8 @@ VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.
 # where the generator writes them. Keeping the two paths distinct is what lets a
 # regeneration that has not been re-snapshotted into the repo be noticed here.
 CRYPTO_WIRE_ROOT = STACK_ROOT / "docs/generated-artifacts/mls-chat-v1/crypto-wire"
-PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_PROTOCOL.md"
+PROTOCOL_PATH = STACK_ROOT / "workspace-root/docs/mls-v2/CHAT_PROTOCOL.md"
+STANDARD_APPVIEW_ADR_PATH = STACK_ROOT / "workspace-root/docs/design-docs/adr-001-mls-standard-appview-auth.md"
 APPLICATION_PROTOCOL_PATH = STACK_ROOT / "docs/CHAT_APPLICATION_PROTOCOL.md"
 APPLICATION_MANIFEST_PATH = STACK_ROOT / "docs/generated-artifacts/chat-application-v1/manifest.json"
 APPLICATION_MANIFEST_INPUT_ENV = "CATBIRD_CHAT_APPLICATION_FIXTURE_INPUT"
@@ -213,7 +214,6 @@ SUITE = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
 ENDPOINTS: dict[str, str] = {
     "enrollDevice": "procedure",
     "replenishKeyPackages": "procedure",
-    "rebindDeviceAuthentication": "procedure",
     "revokeDevice": "procedure",
     "getDevices": "query",
     "getOwnDevices": "query",
@@ -248,7 +248,6 @@ ENDPOINTS: dict[str, str] = {
 SIGNED_PROJECTIONS: dict[str, tuple[str, str]] = {
     "signedDeviceEnrollment": ("deviceEnrollmentBody", "CATBIRD-CHAT-DEVICE-ENROLL\0"),
     "signedKeyPackageReplenishment": ("keyPackageReplenishmentBody", "CATBIRD-CHAT-DEVICE-REPLENISH\0"),
-    "signedDeviceAuthenticationRebind": ("deviceAuthenticationRebindBody", "CATBIRD-CHAT-DEVICE-REBIND\0"),
     "signedDeviceRevocation": ("deviceRevocationBody", "CATBIRD-CHAT-DEVICE-REVOKE\0"),
     "signedBlobUploadPreparation": ("blobUploadPreparationBody", "CATBIRD-CHAT-BLOB-PREPARE\0"),
     "signedBlobDeletion": ("blobDeletionBody", "CATBIRD-CHAT-BLOB-DELETE\0"),
@@ -687,14 +686,17 @@ def validate_schema_ast(documents: dict[str, dict[str, Any]]) -> None:
 
 
 def validate_manifest(documents: dict[str, dict[str, Any]]) -> None:
-    expected = {f"{PREFIX}.defs.json"} | {f"{PREFIX}.{name}.json" for name in ENDPOINTS}
+    expected = {f"{PREFIX}.defs.json", f"{PREFIX}.authFull.json"} | {
+        f"{PREFIX}.{name}.json" for name in ENDPOINTS
+    }
     assert set(documents) == expected, f"manifest mismatch: missing={sorted(expected-set(documents))}, extra={sorted(set(documents)-expected)}"
     encoded = json.dumps(documents, sort_keys=True)
     for forbidden in (
         RETIRED_PREFIX, "registerDevice", "getMessages", '"close"',
         "prepareConversation", "cancelConversationPreparation", "bootstrapProof",
         "bootstrapCommit", "authorizeAndBootstrapReset", "minItems", "maxItems",
-        '#blobBinding"',
+        '#blobBinding"', "dpopJkt", "currentDpopJkt", "newDpopJkt",
+        "rebindDeviceAuthentication",
     ):
         assert forbidden not in encoded, f"superseded contract token remains: {forbidden}"
     for filename, document in documents.items():
@@ -708,53 +710,17 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     defs = defs_document["defs"]
     security_profile = defs_document.get("description", "")
     for phrase in (
-        "one trusted instant T",
         "signedAt in [T-300 seconds,T+60 seconds]",
-        "exact already-completed idempotent replay",
-        "fresh valid DPoP/JTI",
-        "expiry derives from server receivedAt, never signedAt",
-        "typing TTL and every server timestamp derive from T",
-        "configured trusted external base",
-        "never Host, Forwarded, or X-Forwarded headers",
-        "lowercase ASCII/IDNA A-label",
-        "no userinfo or trailing dot",
-        "port 443 is omitted",
-        "explicitly allowed nondefault port",
-        "exact /xrpc/{NSID}",
-        "canonical request digest is raw 32-byte SHA-256",
-        "exact domain-prefixed canonical Ed25519 signing transcript",
-        "never raw JSON, generated DTO bytes, or a signature-containing wrapper",
-        "except sendMessage uses messageId",
-        "exact digest and exact signature must both match",
-        "Nest is the trusted token exchanger/gateway",
-        "at most 120 seconds",
-        "Exact required claims are iss, sub, aud, lxm, iat, exp, jti, cnf.jkt, device_id, and chat_instance",
-        "Token/grant jti, device_id, and chat_instance are canonical lowercase UUIDv4 strings",
-        "token/grant jti is consumed once in the configured issuer token namespace",
-        "Proof jti is canonical base64url without padding decoding to 12-32 bytes",
-        "replay uniqueness is exactly (JKT,decoded jti bytes) in a separate namespace",
-        "htu and htm remain validated audit claims",
-        "First enrollment additionally requires a one-use fresh-auth grant",
-        "enrollment-purpose-bound OAuth authorization_code flow",
-        "successful callback/code exchange and issuer, subject, scope, and DPoP validation",
-        "restore, refresh, cookie exchange, or an existing session alone never creates evidence",
-        "Capability states are unpinned, pinned/pending, and terminal-success",
-        "strict canonical decode, bounds, and capability/body binding checks",
-        "verifies the body's Ed25519 signature under its supplied immutable signing key",
-        "neither pins nor burns the capability",
-        "ambiguous response loss after delivery-service commit",
-        "delivery-service exact idempotent replay returns its stored result",
-        "Nest-stored terminal result without a new downstream grant",
-        "key_id, signing_key_sha256, enrollment_transcript_sha256, auth_time, and auth_txn",
-        "auth_txn is a server-generated per-grant canonical lowercase UUIDv4 distinct from provider state and client input",
-        "auth_time is Nest callback-completion time, not upstream auth_time",
-        "Enrollment grant exp = min(iat + 120, auth_time + 300) using checked NumericDate arithmetic",
-        "ordinary tokens require exp <= iat + 120",
-        "delivery service independently accepts the Nest issuer attestation",
-        "prompt=login and an ephemeral browser are best-effort only",
-        "does not claim user reauthentication",
-        "0 <= T-auth_time <= 300 seconds",
-        "rebind bootstrap authenticates signed newDpopJkt",
+        "standard ATProto inter-service authentication",
+        "issuer is the account DID",
+        "audience is the exact MLS service reference",
+        "lxm is the endpoint NSID",
+        "jti is one-use",
+        "client-generated device UUIDv4",
+        "immutable Ed25519 keyId",
+        "authGeneration",
+        "exact completed idempotent replay",
+        "actorDid#deviceId",
     ):
         assert phrase in security_profile, f"missing request security invariant: {phrase}"
 
@@ -1122,32 +1088,21 @@ def validate_core_definitions(documents: dict[str, dict[str, Any]]) -> None:
     assert "does not derive or verify the secret confirmation MAC" in reset_description
 
     enrollment_description = defs["deviceEnrollmentBody"].get("description", "")
-    assert "one-use at-most-120-second Nest fresh-auth grant" in enrollment_description
-    assert "enrollment-purpose-bound OAuth authorization_code flow" in enrollment_description
-    assert "successful callback/code exchange and issuer, subject, scope, and DPoP validation" in enrollment_description
-    assert "restore, refresh, cookie exchange, or an existing session alone never creates evidence" in enrollment_description
-    assert "Capability states are unpinned, pinned/pending, and terminal-success" in enrollment_description
-    assert "strict canonical decode, bounds, and capability/body binding checks" in enrollment_description
-    assert "verifies the body's Ed25519 signature under its supplied immutable signing key" in enrollment_description
-    assert "neither pins nor burns the capability" in enrollment_description
-    assert "ambiguous response loss after delivery-service commit" in enrollment_description
-    assert "delivery-service exact idempotent replay returns its stored result" in enrollment_description
-    assert "Nest-stored terminal result without a new downstream grant" in enrollment_description
-    assert "key_id, signing_key_sha256, enrollment_transcript_sha256, auth_time, and auth_txn" in enrollment_description
-    assert "server-generated per-grant canonical lowercase UUIDv4 auth_txn distinct from provider state and client input" in enrollment_description
-    assert "auth_time equal to Nest callback-completion time and not upstream auth_time" in enrollment_description
-    assert "Enrollment grant exp = min(iat + 120, auth_time + 300) using checked NumericDate arithmetic" in enrollment_description
-    assert "ordinary tokens require exp <= iat + 120" in enrollment_description
-    assert "delivery service independently accepts the Nest issuer attestation" in enrollment_description
-    assert "prompt=login and an ephemeral browser are best-effort only" in enrollment_description
-    assert "does not claim user reauthentication" in enrollment_description
-    assert "0 <= T-auth_time <= 300 seconds" in enrollment_description
-    assert "raw SHA-256 of this exact canonical signing transcript" in enrollment_description
-    assert "grant cnf.jkt, proof RFC7638 JKT, and body dpopJkt are byte-equal" in enrollment_description
-    rebind_description = defs["deviceAuthenticationRebindBody"].get("description", "")
-    assert "bootstrap exception for loss of the old DPoP key" in rebind_description
-    assert "token/proof bound to newDpopJkt" in rebind_description
-    assert "under only the recorded new JKT" in rebind_description
+    for phrase in (
+        "standard ATProto service auth for actorDid",
+        "Ed25519-signed canonical body",
+        "absent device row and tombstone",
+        "expectedAuthGeneration zero",
+        "client-generated canonical UUIDv4 deviceId",
+        "keyId matching signaturePublicKey",
+        "BasicCredential identity is exactly actorDid#deviceId",
+        "strictly ordered by computed raw KeyPackageRef",
+        "not_before < T < not_after",
+        "at most 2595600 seconds",
+        "atomically persists the device, immutable signing key, packages, and exact idempotent response",
+    ):
+        assert phrase in enrollment_description
+    assert "deviceAuthenticationRebindBody" not in defs
 
     metadata_exporter = defs["metadataExporterContext"]
     assert required(metadata_exporter) == {
@@ -1326,11 +1281,11 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
         main = document["defs"]["main"]
         assert main["type"] == kind
         errors = [entry["name"] for entry in main.get("errors", [])]
-        assert errors == sorted(set(errors)), f"{name} errors must be unique and sorted"
-        if name == "subscribeEvents":
-            assert "InvalidDPoP" not in errors, "WebSocket subscription is ticket-authenticated"
-        else:
-            assert "InvalidDPoP" in errors, f"{name} must expose fresh DPoP failure"
+        assert len(errors) == len(set(errors)), f"{name} errors must be unique"
+        assert "InvalidDPoP" not in errors, f"{name} must not expose retired custom DPoP"
+        if name != "subscribeEvents":
+            assert "AccountSessionExpired" in errors
+            assert "ProtocolUpgradeRequired" in errors
         if kind == "procedure":
             if name == "uploadBlob":
                 assert main["input"]["encoding"] == "application/octet-stream"
@@ -1356,7 +1311,6 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     refs = {
         "enrollDevice": "signedDeviceEnrollment",
         "replenishKeyPackages": "signedKeyPackageReplenishment",
-        "rebindDeviceAuthentication": "signedDeviceAuthenticationRebind",
         "revokeDevice": "signedDeviceRevocation",
         "prepareBlobUpload": "signedBlobUploadPreparation",
         "deleteBlob": "signedBlobDeletion",
@@ -1460,7 +1414,8 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
     get_conversations = endpoint_document(documents, "getConversations")
     params = endpoint_input(get_conversations)
-    assert set(params["properties"]) == {"pageCursor", "limit"}
+    assert set(params["properties"]) == {"actorDeviceId", "pageCursor", "limit"}
+    assert "actorDeviceId" in required(params)
     assert "afterCursor" not in params["properties"]
     output = endpoint_output(get_conversations)
     assert {"items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"} <= required(output)
@@ -1487,7 +1442,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
     own_devices = endpoint_document(documents, "getOwnDevices")
     own_device_params = endpoint_input(own_devices)
-    assert set(own_device_params["properties"]) == {"pageCursor", "limit"}
+    assert set(own_device_params["properties"]) == {"actorDeviceId", "pageCursor", "limit"}
     own_device_output = endpoint_output(own_devices)
     assert {"items", "hasMore", "snapshotExpiresAt"} <= required(own_device_output)
     assert "inventorySessionId" not in own_device_output["properties"]
@@ -1522,38 +1477,15 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
     devices = endpoint_input(endpoint_document(documents, "getDevices"))["properties"]["userDids"]
     assert devices["minLength"] == 1 and devices["maxLength"] == 5
     ticket_input = endpoint_input(endpoint_document(documents, "getSubscriptionTicket"))
-    assert required(ticket_input) == {"inventorySessionId", "eventCursor"}
+    assert required(ticket_input) == {"actorDeviceId", "inventorySessionId", "eventCursor"}
     subscribe = endpoint_document(documents, "subscribeEvents")
-    assert "sole non-DPoP endpoint" in subscribe.get("description", "")
+    assert "one-use short-lived getSubscriptionTicket token" in subscribe.get("description", "")
     assert "consumed atomically" in subscribe.get("description", "")
 
     enroll_description = endpoint_document(documents, "enrollDevice").get("description", "")
-    assert "one-use at-most-120-second Nest fresh-auth enrollment grant" in enroll_description
-    assert "enrollment-purpose-bound OAuth authorization_code flow" in enroll_description
-    assert "successful callback/code exchange and issuer/subject/scope/DPoP validation" in enroll_description
-    assert "restore, refresh, cookie exchange, or an existing session alone never creates evidence" in enroll_description
-    assert "Capability states are unpinned, pinned/pending, and terminal-success" in enroll_description
-    assert "strict canonical decode, bounds, and capability/body binding checks" in enroll_description
-    assert "signature-invalid attempts neither pin nor burn it" in enroll_description
-    assert "ambiguous response loss after delivery-service commit" in enroll_description
-    assert "without a new downstream grant" in enroll_description
-    assert "key_id, signing_key_sha256, enrollment_transcript_sha256, auth_time, and auth_txn" in enroll_description
-    assert "server-generated per-attempt canonical lowercase UUIDv4 auth_txn distinct from provider state and client input" in enroll_description
-    assert "auth_time equal to Nest callback-completion time" in enroll_description
-    assert "exp = min(iat + 120, auth_time + 300) using checked NumericDate arithmetic" in enroll_description
-    assert "ordinary tokens require exp <= iat + 120" in enroll_description
-    assert "delivery service independently requires 0 <= T-auth_time <= 300 seconds" in enroll_description
-    assert "delivery-service exact completed replay under a fresh grant" in enroll_description
-    assert "After terminal-success, Nest answers an exact client retry" in enroll_description
-    assert "issues no downstream grant" in enroll_description
-    assert "prompt=login and an ephemeral browser are best-effort only" in enroll_description
-    assert "no user reauthentication is claimed" in enroll_description
-    assert "0 <= T-auth_time <= 300 seconds" in enroll_description
-    assert "generic bearer/session token is forbidden" in enroll_description
-    rebind_description = endpoint_document(documents, "rebindDeviceAuthentication").get("description", "")
-    assert "token/proof bound to signed newDpopJkt" in rebind_description
-    assert "old DPoP key may be lost" in rebind_description
-    assert "under only the recorded new JKT" in rebind_description
+    assert "standard ATProto service-authenticated AppView request" in enroll_description
+    assert "canonical Ed25519-signed body" in enroll_description
+    assert "Existing login is sufficient" in enroll_description
 
     submit_description = endpoint_document(documents, "submitTransition").get("description", "")
     assert "Generic signedCommitTransition has zero Add proposals and zero membership changes" in submit_description
@@ -1562,6 +1494,7 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
 
 def validate_normative_prose() -> None:
     prose = PROTOCOL_PATH.read_text(encoding="utf-8")
+    prose += "\n" + STANDARD_APPVIEW_ADR_PATH.read_text(encoding="utf-8")
     for required_phrase in (
         "not currently an IANA-assigned stable MLS ciphersuite codepoint",
         "requires a new internal chat protocol version",
@@ -1600,47 +1533,21 @@ def validate_normative_prose() -> None:
         "one trusted server instant `T`",
         "`signedAt` must be in the inclusive interval `[T-300s,T+60s]`",
         "may bypass only the `signedAt` age check",
-        "still requires a fresh valid DPoP proof and unconsumed JTI",
+        "PDS service-auth JWT -> mls-ds",
         "derived from server `receivedAt`, never client `signedAt`",
         "typing TTL and every server-authored timestamp derive from `T`",
         "metadataVersion",
         "deliberately stronger defense-in-depth nonce rule",
         "post-acceptance `next` coordinate, never `prior`",
-        "Nest is the explicit trusted clean-chat token exchanger/gateway",
-        "whose exact required claims are `iss`, canonical DID `sub`",
-        "Token/grant `jti`, `device_id`, and `chat_instance` are canonical lowercase RFC-4122-variant UUIDv4 strings",
-        "`exp-iat` is at most 120 seconds",
-        "consumes token/grant `jti` once in the configured issuer's token namespace",
-        "Proof replay uniqueness is exactly `(JKT, decoded jti bytes)`",
-        "namespace separate from token/grant JTI consumption",
-        "one-use fresh-auth enrollment grant",
-        "enrollment-purpose-bound OAuth `authorization_code` flow",
-        "callback completes the code exchange and validates issuer, subject, scopes, DPoP token type, and DPoP binding",
-        "Session restore, token refresh, browser-cookie exchange, or an existing Nest session alone never creates this evidence",
-        "distinct from provider-visible OAuth state and all client input",
-        "`auth_time` is Nest's callback-completion time, never an upstream `auth_time`",
-        "opens one encrypted enrollment capability through `auth_time + 300s`, bound to purpose `blue.catbird.chat.enrollDevice`",
-        "The capability state is `unpinned`, `pinned/pending`, or `terminal-success`",
-        "strict canonical decode, bounds, and capability/body binding checks",
-        "verifies the body's Ed25519 signature under its supplied immutable signing key",
-        "neither pins nor burns the capability",
-        "ambiguous response loss where the delivery service may already have committed",
-        "delivery service's exact idempotent replay returns its stored result",
-        "Nest-stored terminal result without minting a new downstream grant",
-        "`key_id`, `signing_key_sha256`, `enrollment_transcript_sha256`, NumericDate `auth_time`, and per-attempt `auth_txn`",
-        "`exp = min(iat + 120, auth_time + 300)` using checked NumericDate arithmetic",
-        "ordinary clean tokens continue to require `exp <= iat + 120`",
-        "delivery service independently trusts the Nest issuer's signed attestation",
-        "`0 <= T-auth_time <= 300s`",
-        "Nest requests `prompt=login` and clients prefer an ephemeral browser as best effort",
-        "none of these hints is a server security predicate",
-        "does not claim user reauthentication",
-        "generic BFF cookie/session-derived gateway token",
-        "canonical enrollment-transcript-digest equality",
-        "Rebind is the second explicit bootstrap exception",
-        "completed rebind replay uses only the recorded new JKT",
-        "Nest currently owns the per-session DPoP private key",
-        "does not protect theft of the upstream Nest session or compromise of Nest itself",
+        "did:web:chat.catbird.blue#atproto_mls",
+        "Nest does not mint MLS authorization, fabricate a device identifier, inspect canonical signed bodies, or rotate MLS device bindings",
+        "whose `iss` is the account DID, `aud` exactly equals the service reference, and `lxm` exactly equals the requested NSID",
+        "`iat` and `exp` must form a short-lived interval, `jti` is consumed once",
+        "signature must resolve through the issuer DID's `#atproto` verification method",
+        "authenticated service principal, signed body, and locked device row must agree",
+        "Authenticated reads carry `actorDeviceId` in their Lexicon input",
+        "A missing device row produces automatic enrollment",
+        "Only a PDS account-session failure or an actual chat-permission denial may initiate login or permission-upgrade UI",
         "canonical request digest is the raw 32-byte SHA-256",
         "same bytes verified by Ed25519",
         "signature is stored and compared separately",
@@ -3532,102 +3439,24 @@ def validate_vectors(documents: dict[str, dict[str, Any]], vectors: dict[str, An
     assert mutated_request_digest != request_digest
     assert len(bytes.fromhex(mutator["signatureHex"])) == 64
 
-    auth = vectors["cleanAuth"]
-    for retired_field in (
-        "interactiveAuthorizationOnly",
-        "sessionRefreshOrCookieAllowed",
-        "exactRetryRetainsOriginalAuthTime",
-        "exactRetryGetsFreshAuthTxnAndTokenProofJtis",
-        "confirmedSuccessClosesAuthCapability",
-    ):
-        assert retired_field not in auth
-    assert auth["maxTokenLifetimeSeconds"] == 120
-    assert set(auth["requiredTokenClaims"]) == {
-        "iss", "sub", "aud", "lxm", "iat", "exp", "jti", "cnf.jkt",
-        "device_id", "chat_instance",
-    }
-    assert auth["tokenJtiGrammar"] == "canonicalLowercaseUuidV4"
-    assert auth["chatInstanceGrammar"] == "canonicalLowercaseUuidV4"
-    assert auth["proofJtiGrammar"] == "canonicalBase64urlNoPadDecoded12To32Bytes"
-    assert auth["proofReplayKey"] == ["jkt", "decodedJtiBytes"]
-    assert auth["tokenReplayNamespace"] != auth["proofReplayNamespace"]
-    assert auth["htuHtmWidenReplayKey"] is False
-    assert set(auth["enrollmentGrantBindings"]) == {
-        "sub", "lxm", "device_id", "key_id", "signing_key_sha256",
-        "dpopJkt", "enrollment_transcript_sha256", "auth_time", "auth_txn",
-    }
-    assert auth["purposeBoundAuthorizationCodeOnly"] is True
-    assert auth["refreshRestoreCookieEvidenceAllowed"] is False
-    assert auth["authEvidencePurpose"] == "blue.catbird.chat.enrollDevice"
-    assert auth["authCapabilityStates"] == ["unpinned", "pinnedPending", "terminalSuccess"]
-    assert auth["authTxnSource"] == "nestServerGeneratedPerGrantAttemptDistinctFromProviderStateAndClientInput"
-    assert auth["authTimeSource"] == "nestCallbackCompletionNotUpstreamAuthTime"
-    assert auth["maxEvidenceLifetimeSeconds"] == 300
-    assert auth["authCapabilityExpiresAt"] == "authTimePlus300Seconds"
-    assert auth["prePinChecks"] == [
-        "strictCanonicalDecode", "bounds", "capabilityBodyBindings",
-        "bodyEd25519SignatureUnderSuppliedImmutableSigningKey",
+    auth = vectors["standardServiceAuth"]
+    assert auth["serviceRef"] == "did:web:chat.catbird.blue#atproto_mls"
+    assert auth["maxTokenLifetimeSeconds"] == 60
+    assert auth["requiredTokenClaims"] == ["iss", "aud", "lxm", "iat", "exp", "jti"]
+    assert auth["exactAudienceRequired"] is True
+    assert auth["exactMethodLxmRequired"] is True
+    assert auth["issuerVerificationMethod"] == "#atproto"
+    assert auth["jtiConsumedOnce"] is True
+    assert auth["delegatedNestTokensAccepted"] is False
+    assert auth["customCleanChatDpopAccepted"] is False
+    assert auth["accountAuthorityFields"] == ["iss", "aud", "lxm", "iat", "exp", "jti"]
+    assert auth["deviceAuthorityFields"] == [
+        "actorDid", "actorDeviceId", "keyId", "authGeneration", "signature",
     ]
-    assert auth["invalidPrePinAttemptBurnsOrPinsCapability"] is False
-    assert auth["authCapabilityFirstBodyPinFields"] == [
-        "canonicalRequestDigest", "signature", "sub", "device_id", "dpopJkt",
-        "key_id", "signing_key_sha256", "enrollment_transcript_sha256",
-    ]
-    assert auth["pinnedPendingRetryRetainsOriginalAuthTime"] is True
-    assert auth["pinnedPendingRetryGetsFreshAuthTxnAndTokenProofJtis"] is True
-    assert auth["ambiguousResponseLossAfterDsCommitRemainsPinnedPendingUntilNestDurablyRecordsSuccess"] is True
-    assert auth["deliveryServiceExactReplayReturnsStoredResultWithoutReexecution"] is True
-    assert auth["changedBodyCanReuseAuthCapability"] is False
-    assert auth["nestDurableSuccessStoresTerminalResultBinding"] is True
-    assert auth["nestDurableSuccessClosesAuthCapability"] is True
-    assert auth["terminalExactClientRetrySource"] == "nestStoredTerminalResultBindingNoDownstreamGrant"
-    assert auth["terminalSuccessCanMintDownstreamGrant"] is False
-    assert auth["expiredCapabilityRequiresNewAuthorizationCodeFlow"] is True
-    assert auth["enrollmentGrantExpFormula"] == "min(iatPlus120,authTimePlus300)"
-    assert auth["enrollmentGrantExpArithmetic"] == "checkedNumericDate"
-
-    def checked_enrollment_exp(iat: int, auth_time: int) -> int | None:
-        if type(iat) is not int or type(auth_time) is not int:
-            return None
-        if not (0 <= iat <= SAFE_INTEGER_MAX and 0 <= auth_time <= SAFE_INTEGER_MAX):
-            return None
-        if iat > SAFE_INTEGER_MAX - 120 or auth_time > SAFE_INTEGER_MAX - 300:
-            return None
-        return min(iat + 120, auth_time + 300)
-
-    for case in auth["enrollmentGrantExpirationCases"]:
-        iat_bound = case["iat"] + 120
-        auth_bound = case["authTime"] + 300
-        expected_bound = (
-            "equal" if iat_bound == auth_bound
-            else "iatPlus120" if iat_bound < auth_bound
-            else "authTimePlus300"
-        )
-        assert case["limitingBound"] == expected_bound
-        assert checked_enrollment_exp(case["iat"], case["authTime"]) == case["expectedExp"]
-    for case in auth["invalidEnrollmentGrantNumericDates"]:
-        assert checked_enrollment_exp(case["iat"], case["authTime"]) is None
-    for case in auth["ordinaryTokenExpirationCases"]:
-        valid = (
-            type(case["iat"]) is int
-            and type(case["exp"]) is int
-            and 0 <= case["iat"] <= SAFE_INTEGER_MAX - 120
-            and 0 <= case["exp"] <= case["iat"] + 120
-        )
-        assert valid is case["valid"]
-
-    assert auth["deliveryServiceAuthTimeAgeCheckIndependent"] is True
-    assert auth["promptLoginRequestedBestEffort"] is True
-    assert auth["ephemeralBrowserPreferredBestEffort"] is True
-    assert auth["promptOrUpstreamAuthTimeIsSecurityPredicate"] is False
-    assert auth["freshAuthorizationAttestsCredentialEntryOrUserPresence"] is False
-    assert auth["userReauthenticationClaimed"] is False
-    assert auth["maxAuthTimeAgeSeconds"] == 300
-    assert auth["authTxnGrammar"] == "canonicalLowercaseUuidV4"
-    assert auth["authTxnConsumedOnce"] is True
-    assert auth["rebindFirstExecutionProofJkt"] == "newDpopJkt"
-    assert auth["rebindCompletedReplayProofJkt"] == "recordedNewDpopJkt"
-    assert auth["nestOwnsSessionDpopPrivateKey"] is True
+    assert auth["enrollmentGeneration"] == 0
+    assert auth["clientDeviceIdAuthoritative"] is True
+    assert auth["basicCredentialIdentity"] == "actorDid#deviceId"
+    assert auth["exactReplayReturnsStoredResult"] is True
 
     entry_fingerprint = vectors["applicationEntryFingerprint"]
     assert entry_fingerprint["domain"] == "CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\0"

@@ -323,7 +323,6 @@ impl CanonicalDeviceRevocationResponse {
                 available_package_count: device.available_package_count,
                 created_at: crate::sqlx_jacquard::chrono_to_datetime(device.created_at),
                 device_id: SmolStr::from(device.device_id.to_string()),
-                dpop_jkt: SmolStr::from(device.dpop_jkt.as_str()),
                 key_id: SmolStr::from(device.key_id.as_str()),
                 reserved_package_count: device.reserved_package_count,
                 signature_public_key: Bytes::from(device.signing_public_key.clone()),
@@ -586,7 +585,7 @@ struct RevokedTargetPostStateRow {
     signing_public_key: Vec<u8>,
     auth_generation: i64,
     enrollment_auth_generation: i64,
-    dpop_jkt: String,
+    dpop_jkt: Option<String>,
     status: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -711,7 +710,7 @@ fn device_revocation_replay_post_state_digest(
     for value in [
         device.key_id.as_bytes(),
         device.signing_public_key.as_slice(),
-        device.dpop_jkt.as_bytes(),
+        device.dpop_jkt.as_deref().unwrap_or_default().as_bytes(),
         device.status.as_bytes(),
         device.capabilities_json.as_bytes(),
     ] {

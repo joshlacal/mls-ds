@@ -967,7 +967,7 @@ impl PreparedEnrollmentBootstrapPrelude {
             scope,
             operation,
         } = self;
-        let current = scope.new_jkt().to_owned();
+        let current = scope.new_jkt().map(|s| s.to_owned());
         let authority_digest = bootstrap_completion_digest(
             &operation.transaction_id,
             &operation.binding,
@@ -976,7 +976,7 @@ impl PreparedEnrollmentBootstrapPrelude {
             scope.trusted_instant(),
             scope.subject(),
             scope.device_id(),
-            &current,
+            current.as_deref().unwrap_or(""),
             None,
             None,
             None,
@@ -1082,8 +1082,8 @@ impl EnrollmentBootstrapEffectAuthority<'_> {
     pub(crate) fn trusted_instant(&self) -> DateTime<Utc> {
         self.scope.trusted_instant()
     }
-    pub(crate) fn current_jkt(&self) -> &str {
-        self.authority.dpop_jkt().as_str()
+    pub(crate) fn current_jkt(&self) -> Option<&str> {
+        self.authority.dpop_jkt().map(|k| k.as_str())
     }
     pub(crate) fn basic_credential_identity(&self) -> Vec<u8> {
         basic_credential_identity(self.authority.subject(), self.authority.device_id())
@@ -1568,7 +1568,7 @@ impl BootstrapCompletionGuard {
         }
         let shape_matches = match &self.jkt_shape {
             BootstrapCompletionJktShape::Enrollment { current } => {
-                historical_jkt.is_none() && current == current_jkt
+                historical_jkt.is_none() && current.as_deref().unwrap_or("") == current_jkt
             }
             BootstrapCompletionJktShape::Rebind {
                 historical,
@@ -1595,7 +1595,7 @@ impl BootstrapCompletionGuard {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BootstrapCompletionJktShape {
-    Enrollment { current: String },
+    Enrollment { current: Option<String> },
     Rebind { historical: String, current: String },
 }
 
@@ -3097,7 +3097,8 @@ pub(crate) async fn complete_operation(
         .ok_or(PreludeError::NonCanonicalOperation)?;
     let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
     let historical_jkt = (binding.endpoint_nsid == "blue.catbird.chat.revokeDevice")
-        .then(|| authority.dpop_jkt().as_str());
+        .then(|| authority.dpop_jkt().map(|k| k.as_str()))
+        .flatten();
     let inserted = sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
@@ -3160,7 +3161,7 @@ pub(crate) async fn complete_enrollment_bootstrap_operation(
         response_bytes,
         event_position,
         None,
-        Some(&current),
+        current.as_deref(),
     )
     .await
 }
@@ -3232,17 +3233,17 @@ async fn validate_bootstrap_completion(
     if !guard.operation.binding.matches_authority(authority)? {
         return Err(PreludeError::ForeignTransaction);
     }
-    let (historical_jkt, _current_jkt) = match &guard.jkt_shape {
-        BootstrapCompletionJktShape::Enrollment { current } => (None, Some(current.as_str())),
+    let (historical_jkt, current_jkt) = match &guard.jkt_shape {
+        BootstrapCompletionJktShape::Enrollment { current } => (None, current.as_deref().unwrap_or("")),
         BootstrapCompletionJktShape::Rebind {
             historical,
             current,
-        } => (Some(historical.as_str()), Some(current.as_str())),
+        } => (Some(historical.as_str()), current.as_str()),
     };
     let subject = authority.subject().as_str();
     let device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
     let trusted_instant = authority.trusted_instant().datetime();
-    let dpop_jkt = authority.dpop_jkt().as_str();
+    let dpop_jkt = authority.dpop_jkt().map(|k| k.as_str()).unwrap_or(current_jkt);
     let receipt = authority.repository_receipt();
     let fresh_digest = bootstrap_completion_digest(
         &transaction_id,

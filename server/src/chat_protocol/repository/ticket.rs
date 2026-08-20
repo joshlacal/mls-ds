@@ -65,7 +65,7 @@ pub(crate) struct MintSubscriptionTicket {
     pub(crate) ticket_hash: Vec<u8>,
     pub(crate) user_did: String,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: String,
+    pub(crate) jkt: Option<String>,
     pub(crate) auth_generation: i64,
     pub(crate) inventory_session_id: String,
     pub(crate) event_cursor: String,
@@ -151,7 +151,7 @@ pub(crate) async fn mint_subscription_ticket(
     let durable_cursor_hash = fixed_hash(session.try_get("snapshot_event_cursor_sha256")?)?;
     let user_did: String = session.try_get("user_did")?;
     let device_id: Uuid = session.try_get("device_id")?;
-    let jkt: String = session.try_get("jkt")?;
+    let jkt: Option<String> = session.try_get("jkt")?;
     let auth_generation: i64 = session.try_get("auth_generation")?;
     if durable_token_hash != inventory_hash
         || durable_cursor_hash != inventory_hash
@@ -192,7 +192,7 @@ pub(crate) async fn mint_subscription_ticket(
             WHERE user_did = $1
               AND device_id = $2
               AND status = 'active'
-              AND dpop_jkt = $3
+              AND dpop_jkt IS NOT DISTINCT FROM $3
               AND auth_generation = $4
               AND revoked_at IS NULL
               AND created_at <= $5
@@ -200,7 +200,7 @@ pub(crate) async fn mint_subscription_ticket(
     )
     .bind(&request.user_did)
     .bind(request.device_id)
-    .bind(&request.jkt)
+    .bind(request.jkt.as_deref())
     .bind(request.auth_generation)
     .bind(request.created_at)
     .fetch_optional(&mut **transaction)
@@ -226,7 +226,7 @@ pub(crate) async fn mint_subscription_ticket(
     .bind(ticket_hash.as_slice())
     .bind(&request.user_did)
     .bind(request.device_id)
-    .bind(&request.jkt)
+    .bind(request.jkt.as_deref())
     .bind(request.auth_generation)
     .bind(session_id)
     .bind(event_position)
@@ -257,7 +257,7 @@ pub(crate) async fn mint_subscription_ticket(
 pub(crate) struct ConsumedTicket {
     pub(crate) user_did: String,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: String,
+    pub(crate) jkt: Option<String>,
     pub(crate) auth_generation: i64,
     pub(crate) event_position: i64,
     pub(crate) event_cursor_hash: [u8; HASH_BYTES],
@@ -290,13 +290,13 @@ pub(crate) async fn revalidate_consumed_ticket(
                SELECT 1 FROM chat.devices
                 WHERE user_did=$1 AND device_id=$2
                   AND status='active' AND revoked_at IS NULL
-                  AND dpop_jkt=$3 AND auth_generation=$4
+                  AND dpop_jkt IS NOT DISTINCT FROM $3 AND auth_generation=$4
                 FOR SHARE
            )"#,
     )
     .bind(&ticket.user_did)
     .bind(ticket.device_id)
-    .bind(&ticket.jkt)
+    .bind(ticket.jkt.as_deref())
     .bind(ticket.auth_generation)
     .fetch_one(&mut **transaction)
     .await?;
@@ -359,7 +359,7 @@ pub(crate) async fn consume_subscription_ticket(
     {
         let user_did: String = ticket.try_get("user_did")?;
         let device_id: Uuid = ticket.try_get("device_id")?;
-        let jkt: String = ticket.try_get("jkt")?;
+        let jkt: Option<String> = ticket.try_get("jkt")?;
         let auth_generation: i64 = ticket.try_get("auth_generation")?;
         let event_position: i64 = ticket.try_get("event_position")?;
         let protocol_instance_id: Uuid = ticket.try_get("protocol_instance_id")?;
@@ -369,13 +369,13 @@ pub(crate) async fn consume_subscription_ticket(
                  FROM chat.devices
                 WHERE user_did = $1
                   AND device_id = $2
-                  AND dpop_jkt = $3
+                  AND dpop_jkt IS NOT DISTINCT FROM $3
                   AND auth_generation = $4
                 FOR UPDATE"#,
         )
         .bind(user_did)
         .bind(device_id)
-        .bind(jkt)
+        .bind(jkt.as_deref())
         .bind(auth_generation)
         .fetch_optional(&mut **transaction)
         .await?;
@@ -424,7 +424,7 @@ pub(crate) async fn consume_subscription_ticket(
                  WHERE device.user_did = ticket.user_did
                    AND device.device_id = ticket.device_id
                    AND device.status = 'active'
-                   AND device.dpop_jkt = ticket.jkt
+                   AND device.dpop_jkt IS NOT DISTINCT FROM ticket.jkt
                    AND device.auth_generation = ticket.auth_generation
                    AND device.revoked_at IS NULL
            )
@@ -497,7 +497,7 @@ pub(crate) async fn consume_subscription_ticket(
     let bound_path: String = row.try_get("subscription_path")?;
     let bound_user_did: String = row.try_get("user_did")?;
     let bound_device_id: Uuid = row.try_get("device_id")?;
-    let bound_jkt: String = row.try_get("jkt")?;
+    let bound_jkt: Option<String> = row.try_get("jkt")?;
     let bound_auth_generation: i64 = row.try_get("auth_generation")?;
     let has_g7_binding: bool = row
         .try_get::<Option<Uuid>, _>("protocol_instance_id")?
@@ -523,14 +523,14 @@ pub(crate) async fn consume_subscription_ticket(
                   WHERE user_did = $1
                     AND device_id = $2
                     AND status = 'active'
-                    AND dpop_jkt = $3
+                    AND dpop_jkt IS NOT DISTINCT FROM $3
                     AND auth_generation = $4
                     AND revoked_at IS NULL
              )"#,
     )
     .bind(bound_user_did)
     .bind(bound_device_id)
-    .bind(bound_jkt)
+    .bind(bound_jkt.as_deref())
     .bind(bound_auth_generation)
     .fetch_one(&mut **transaction)
     .await?
@@ -549,7 +549,7 @@ pub(crate) struct NewEventCursorReceipt {
     pub(crate) inventory_session_id: Uuid,
     pub(crate) user_did: String,
     pub(crate) device_id: Uuid,
-    pub(crate) jkt: String,
+    pub(crate) jkt: Option<String>,
     pub(crate) auth_generation: i64,
     pub(crate) protocol_instance_id: Uuid,
     pub(crate) cursor_key_id: String,
@@ -605,7 +605,7 @@ pub(crate) async fn insert_event_cursor_receipt(
     .bind(receipt.inventory_session_id)
     .bind(&receipt.user_did)
     .bind(receipt.device_id)
-    .bind(&receipt.jkt)
+    .bind(receipt.jkt.as_deref())
     .bind(receipt.auth_generation)
     .bind(receipt.protocol_instance_id)
     .bind(&receipt.cursor_key_id)
@@ -683,7 +683,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
         ticket_hash: ticket_hash(&opaque).to_vec(),
         user_did: device.user_did().to_owned(),
         device_id: device.device_id(),
-        jkt: device.jkt().to_owned(),
+        jkt: device.jkt().map(str::to_owned),
         auth_generation: i64::try_from(device.auth_generation())
             .map_err(|_| TicketRepositoryError::SessionBindingMismatch)?,
         // The durable ticket repository intentionally takes the opaque G7
@@ -758,7 +758,7 @@ mod tests {
             ticket_hash: vec![0xA5; 32],
             user_did: "did:plc:example".to_owned(),
             device_id: Uuid::nil(),
-            jkt: "secret-jkt".to_owned(),
+            jkt: Some("secret-jkt".to_owned()),
             auth_generation: 7,
             inventory_session_id: "session-capability-secret".to_owned(),
             event_cursor: "event-capability-secret".to_owned(),
@@ -782,7 +782,7 @@ mod tests {
             inventory_session_id: Uuid::new_v4(),
             user_did: "did:plc:example".to_owned(),
             device_id: Uuid::new_v4(),
-            jkt: "jkt".to_owned(),
+            jkt: Some("jkt".to_owned()),
             auth_generation: 1,
             protocol_instance_id: Uuid::new_v4(),
             cursor_key_id: "key".to_owned(),

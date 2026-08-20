@@ -5,55 +5,187 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedTransition"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["coordinates", "entry", "welcomes"], "properties": {
-        "coordinates": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCoordinates"},
-        "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationEntry"},
-        "welcomes": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#welcomeView"}, "minLength": 0, "maxLength": 1}
-      }}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedTransition"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "coordinates",
+            "entry",
+            "welcomes"
+          ],
+          "properties": {
+            "coordinates": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCoordinates"
+            },
+            "entry": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationEntry"
+            },
+            "welcomes": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#welcomeView"
+              },
+              "minLength": 0,
+              "maxLength": 1
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "AdminRequired"},
-        {"name": "BlockedRelationship"},
-        {"name": "CommitterSelfRemovalForbidden"},
-        {"name": "ConversationLeafLimitReached"},
-        {"name": "ConversationNotFound"},
-        {"name": "CoordinateOverflow"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotLeaf"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "DirectParticipantMutationForbidden"},
-        {"name": "DuplicateDeviceLeaf"},
-        {"name": "ExternalCommitForbidden"},
-        {"name": "GroupInvitesDisabled"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidCommit"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidLeaveManifest"},
-        {"name": "InvalidMetadataSnapshot"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "InvalidWelcomeMapping"},
-        {"name": "InvitationLimitReached"},
-        {"name": "LastAdminRequired"},
-        {"name": "LeafRecoveryExpired"},
-        {"name": "LeafRecoveryNotFound"},
-        {"name": "LeafRecoverySuperseded"},
-        {"name": "LeaveRequestExpired"},
-        {"name": "LeaveRequestNotFound"},
-        {"name": "LeaveRequestStale"},
-        {"name": "MetadataNonceReuse"},
-        {"name": "MetadataVersionOverflow"},
-        {"name": "MissingMetadataSnapshot"},
-        {"name": "NotAuthorized"},
-        {"name": "NotFollowedByRecipient"},
-        {"name": "NotMember"},
-        {"name": "ParticipantLeafLimitReached"},
-        {"name": "ParticipantLimitReached"},
-        {"name": "RelationshipPolicyUnavailable"},
-        {"name": "StaleCoordinates"},
-        {"name": "StandaloneProposalForbidden"},
-        {"name": "UnsupportedMlsProfile"}
+        {
+          "name": "AdminRequired"
+        },
+        {
+          "name": "BlockedRelationship"
+        },
+        {
+          "name": "CommitterSelfRemovalForbidden"
+        },
+        {
+          "name": "ConversationLeafLimitReached"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CoordinateOverflow"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotLeaf"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "DirectParticipantMutationForbidden"
+        },
+        {
+          "name": "DuplicateDeviceLeaf"
+        },
+        {
+          "name": "ExternalCommitForbidden"
+        },
+        {
+          "name": "GroupInvitesDisabled"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidCommit"
+        },
+        {
+          "name": "InvalidLeaveManifest"
+        },
+        {
+          "name": "InvalidMetadataSnapshot"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "InvalidWelcomeMapping"
+        },
+        {
+          "name": "InvitationLimitReached"
+        },
+        {
+          "name": "LastAdminRequired"
+        },
+        {
+          "name": "LeafRecoveryExpired"
+        },
+        {
+          "name": "LeafRecoveryNotFound"
+        },
+        {
+          "name": "LeafRecoverySuperseded"
+        },
+        {
+          "name": "LeaveRequestExpired"
+        },
+        {
+          "name": "LeaveRequestNotFound"
+        },
+        {
+          "name": "LeaveRequestStale"
+        },
+        {
+          "name": "MetadataNonceReuse"
+        },
+        {
+          "name": "MetadataVersionOverflow"
+        },
+        {
+          "name": "MissingMetadataSnapshot"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "NotFollowedByRecipient"
+        },
+        {
+          "name": "NotMember"
+        },
+        {
+          "name": "ParticipantLeafLimitReached"
+        },
+        {
+          "name": "ParticipantLimitReached"
+        },
+        {
+          "name": "RelationshipPolicyUnavailable"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "StandaloneProposalForbidden"
+        },
+        {
+          "name": "UnsupportedMlsProfile"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

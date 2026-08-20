@@ -18,11 +18,7 @@ use std::{
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    auth::AuthUser,
-    db::DbPool,
-    realtime::cursor::CursorGenerator,
-};
+use crate::{auth::AuthUser, db::DbPool, realtime::cursor::CursorGenerator};
 
 /// SSE query parameters for subscribeConvoEvents
 #[derive(Debug, Deserialize)]
@@ -401,46 +397,43 @@ pub async fn subscribe_convo_events(
 
     // Create live event stream
     let convo_id_str = convo_id.to_string();
-    let live_stream = stream::unfold(
-        (rx, convo_id_str),
-        move |(mut rx, convo_id)| async move {
-            loop {
-                tokio::select! {
-                    // Wait for broadcast event
-                    result = rx.recv() => {
-                        match result {
-                            Ok(event) => {
-                                match &event {
-                                    StreamEvent::CleanTypingEvent { .. } => continue,
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!(
-                                    convo = %crate::crypto::redact_for_log(&convo_id),
-                                    skipped = skipped,
-                                    "Slow consumer, events skipped"
-                                );
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                info!(
-                                    convo = %crate::crypto::redact_for_log(&convo_id),
-                                    "Broadcast channel closed"
-                                );
-                                return None;
+    let live_stream = stream::unfold((rx, convo_id_str), move |(mut rx, convo_id)| async move {
+        loop {
+            tokio::select! {
+                // Wait for broadcast event
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            match &event {
+                                StreamEvent::CleanTypingEvent { .. } => continue,
                             }
                         }
-                    }
-
-                    // Heartbeat every 15s
-                    _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        // Send comment line as keepalive
-                        let sse_event = Event::default().comment("keepalive");
-                        return Some((Ok(sse_event), (rx, convo_id)));
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(
+                                convo = %crate::crypto::redact_for_log(&convo_id),
+                                skipped = skipped,
+                                "Slow consumer, events skipped"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!(
+                                convo = %crate::crypto::redact_for_log(&convo_id),
+                                "Broadcast channel closed"
+                            );
+                            return None;
+                        }
                     }
                 }
+
+                // Heartbeat every 15s
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    // Send comment line as keepalive
+                    let sse_event = Event::default().comment("keepalive");
+                    return Some((Ok(sse_event), (rx, convo_id)));
+                }
             }
-        },
-    );
+        }
+    });
 
     let stream = replay_stream.chain(live_stream);
 
@@ -548,7 +541,10 @@ mod tests {
         }
 
         let expected: Vec<String> = (0..10).map(|i| format!("typing-{}", i)).collect();
-        assert_eq!(observed, expected, "per-convo queue must preserve enqueue order");
+        assert_eq!(
+            observed, expected,
+            "per-convo queue must preserve enqueue order"
+        );
     }
 
     #[tokio::test]
@@ -561,8 +557,14 @@ mod tests {
         let mut rx_b = tx_b.subscribe();
 
         for i in 0..5 {
-            state.enqueue("convo-a", make_test_typing_event("convo-a", &format!("a-{}", i)));
-            state.enqueue("convo-b", make_test_typing_event("convo-b", &format!("b-{}", i)));
+            state.enqueue(
+                "convo-a",
+                make_test_typing_event("convo-a", &format!("a-{}", i)),
+            );
+            state.enqueue(
+                "convo-b",
+                make_test_typing_event("convo-b", &format!("b-{}", i)),
+            );
         }
 
         for i in 0..5 {

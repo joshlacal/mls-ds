@@ -4264,9 +4264,7 @@ impl HydrationAuthority {
             PrincipalId::new(did.as_str().as_bytes().to_vec())?,
             *scope.actor_device_id().as_bytes(),
         )?;
-        let dpop_jkt = scope
-            .actor_dpop_jkt()
-            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let dpop_jkt = scope.actor_dpop_jkt();
         let actor_key_id = scope
             .actor_key_id()
             .ok_or(StateMachineError::InvalidHydrationAuthority)?;
@@ -4386,9 +4384,7 @@ impl HydrationAuthority {
             PrincipalId::new(did.as_str().as_bytes().to_vec())?,
             *scope.actor_device_id().as_bytes(),
         )?;
-        let dpop_jkt = scope
-            .actor_dpop_jkt()
-            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        let dpop_jkt = scope.actor_dpop_jkt();
         let actor_key_id = scope
             .actor_key_id()
             .ok_or(StateMachineError::InvalidHydrationAuthority)?;
@@ -4466,8 +4462,9 @@ impl HydrationAuthority {
         digest.update((actor.principal().as_bytes().len() as u64).to_be_bytes());
         digest.update(actor.principal().as_bytes());
         digest.update(actor.device_id());
-        digest.update((dpop_jkt.len() as u64).to_be_bytes());
-        digest.update(dpop_jkt.as_bytes());
+        let jkt_str = dpop_jkt.unwrap_or_default();
+        digest.update((jkt_str.len() as u64).to_be_bytes());
+        digest.update(jkt_str.as_bytes());
         digest.update(key_id);
         digest.update(registered_mls_signature_key);
         digest.update(auth_generation.to_be_bytes());

@@ -5,33 +5,119 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedParticipantAcceptance"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["coordinates", "entry", "recovery"], "properties": {
-        "coordinates": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCoordinates"},
-        "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#participantAcceptanceEntry"},
-        "recovery": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryView"}
-      }}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedParticipantAcceptance"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "coordinates",
+            "entry",
+            "recovery"
+          ],
+          "properties": {
+            "coordinates": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCoordinates"
+            },
+            "entry": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#participantAcceptanceEntry"
+            },
+            "recovery": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#leafRecoveryView"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "BlockedRelationship"},
-        {"name": "ConversationNotFound"},
-        {"name": "CoordinateOverflow"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "GroupInvitesDisabled"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "InvitationNotFound"},
-        {"name": "InvitationNotPending"},
-        {"name": "InvitationProvenanceMismatch"},
-        {"name": "KeyPackageUnavailable"},
-        {"name": "MessagesDisabled"},
-        {"name": "NotFollowedByRecipient"},
-        {"name": "NotParticipant"},
-        {"name": "RelationshipPolicyUnavailable"},
-        {"name": "StaleCoordinates"}
+        {
+          "name": "BlockedRelationship"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CoordinateOverflow"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "GroupInvitesDisabled"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "InvitationNotFound"
+        },
+        {
+          "name": "InvitationNotPending"
+        },
+        {
+          "name": "InvitationProvenanceMismatch"
+        },
+        {
+          "name": "KeyPackageUnavailable"
+        },
+        {
+          "name": "MessagesDisabled"
+        },
+        {
+          "name": "NotFollowedByRecipient"
+        },
+        {
+          "name": "NotParticipant"
+        },
+        {
+          "name": "RelationshipPolicyUnavailable"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

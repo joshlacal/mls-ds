@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{RawQuery, State},
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -44,8 +44,9 @@ pub(super) async fn handle(
     State(pool): State<DbPool>,
     State(runtime): State<Arc<ChatRuntime>>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    match get_own_devices(&pool, &runtime, &headers).await {
+    match get_own_devices(&pool, &runtime, &headers, query.as_deref()).await {
         Ok(response) => response,
         Err(failure) => failure.into_response(),
     }
@@ -55,9 +56,13 @@ async fn get_own_devices(
     pool: &DbPool,
     runtime: &ChatRuntime,
     headers: &HeaderMap,
+    query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
+    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let admission = context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers).await?;
+    let admission =
+        context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
+            .await?;
 
     match create_own_device_snapshot_for_admission(pool, admission).await {
         Ok(snapshot) => Ok(context::json_ok(snapshot.into_response_bytes())),

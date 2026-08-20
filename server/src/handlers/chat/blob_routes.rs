@@ -51,12 +51,14 @@ pub(super) async fn get_blob(
     RawQuery(query): RawQuery,
 ) -> Response {
     let result = async {
+        let actor_device_id = context::actor_device_id_from_query(query.as_deref(), GET_BLOB)?;
         let admission = context::admit_unsigned_read(
             &pool,
             &runtime,
             GET_BLOB,
             CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(GET_BLOB))?,
             &headers,
+            &actor_device_id,
         )
         .await?;
         let blob_id = parse_uuid_query(query.as_deref(), "blobId")
@@ -88,14 +90,17 @@ pub(super) async fn get_blob_usage(
     State(blob_store): State<BlobStore>,
     State(runtime): State<Arc<ChatRuntime>>,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let result = async {
+        let actor_device_id = context::actor_device_id_from_query(query.as_deref(), GET_USAGE)?;
         let admission = context::admit_unsigned_read(
             &pool,
             &runtime,
             GET_USAGE,
             CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(GET_USAGE))?,
             &headers,
+            &actor_device_id,
         )
         .await?;
         let actor =
@@ -308,12 +313,14 @@ async fn upload_blob_inner(
     let ticket = query_param(query, "uploadTicket")
         .filter(|value| (32..=512).contains(&value.len()))
         .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+    let actor_device_id = context::actor_device_id_from_query(query, UPLOAD)?;
     let admission = context::admit_unsigned_read(
         pool,
         runtime,
         UPLOAD,
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(UPLOAD))?,
         headers,
+        &actor_device_id,
     )
     .await?;
     let actor = blobs::read_actor_for_admission(pool, admission, OrdinaryReadEndpoint::UploadBlob)

@@ -50,8 +50,11 @@ async fn get_devices(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<Response, ChatFailure> {
+    let actor_device_id = context::actor_device_id_from_query(query, ENDPOINT)?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(ENDPOINT))?;
-    let admission = context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers).await?;
+    let admission =
+        context::admit_unsigned_read(pool, runtime, ENDPOINT, method, headers, &actor_device_id)
+            .await?;
 
     let dids = parse_user_dids(query);
     let response = read_addressable_devices_for_admission(pool, admission, &dids)

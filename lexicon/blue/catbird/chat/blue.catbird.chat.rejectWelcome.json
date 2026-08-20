@@ -5,22 +5,84 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedWelcomeRejection"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["status", "rejectedAt"], "properties": {
-        "status": {"type": "string", "const": "rejected"},
-        "rejectedAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
-      }}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedWelcomeRejection"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "status",
+            "rejectedAt"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "rejected"
+            },
+            "rejectedAt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "RejectionConflict"},
-        {"name": "WelcomeExpired"},
-        {"name": "WelcomeNotFound"},
-        {"name": "WelcomeSuperseded"}
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "RejectionConflict"
+        },
+        {
+          "name": "WelcomeExpired"
+        },
+        {
+          "name": "WelcomeNotFound"
+        },
+        {
+          "name": "WelcomeSuperseded"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

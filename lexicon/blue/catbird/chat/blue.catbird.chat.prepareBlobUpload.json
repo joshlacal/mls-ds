@@ -2,5 +2,89 @@
   "lexicon": 1,
   "id": "blue.catbird.chat.prepareBlobUpload",
   "description": "Reserve opaque blob quota for the signing DID/device and return one bounded one-time upload ticket. The signed projection binds blob UUID, exact active coordinate, ciphertext SHA-256/size/purpose, owner, and idempotency. After upload the blob is completed and unbound; it may be bound only by that same owner device under exact descriptor/hash/size/purpose equality. Unbound uploads expire and release quota.",
-  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedBlobUploadPreparation"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["upload"], "properties": {"upload": {"type": "ref", "ref": "blue.catbird.chat.defs#blobUploadView"}}}}, "errors": [{"name": "BlobAlreadyExists"}, {"name": "BlobQuotaExceeded"}, {"name": "ConversationNotFound"}, {"name": "CutoverRequired"}, {"name": "DeviceNotLeaf"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "IdempotencyConflict"}, {"name": "InvalidDPoP"}, {"name": "InvalidRequest"}, {"name": "InvalidSignature"}, {"name": "NotAuthorized"}, {"name": "StaleCoordinates"}]}}
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedBlobUploadPreparation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "upload"
+          ],
+          "properties": {
+            "upload": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#blobUploadView"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "BlobAlreadyExists"
+        },
+        {
+          "name": "BlobQuotaExceeded"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotLeaf"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

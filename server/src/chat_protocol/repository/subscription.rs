@@ -324,7 +324,7 @@ fn event_binding(
         ticket.inventory_session_id,
         ticket.user_did.as_bytes(),
         ticket.device_id,
-        ticket.jkt.as_bytes(),
+        ticket.jkt.as_deref().unwrap_or("").as_bytes(),
         u64::try_from(ticket.auth_generation).map_err(|_| TicketRepositoryError::InvalidReceipt)?,
         ticket.protocol_instance_id,
         ticket.cursor_key_id.as_bytes(),

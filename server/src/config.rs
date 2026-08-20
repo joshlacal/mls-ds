@@ -196,8 +196,7 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
 
     Some(match nsid {
         // Enrollment
-        "blue.catbird.chat.enrollDevice"
-        | "blue.catbird.chat.rebindDeviceAuthentication" => Enrollment,
+        "blue.catbird.chat.enrollDevice" => Enrollment,
 
         // Bootstrap
         "blue.catbird.chat.replenishKeyPackages" => Bootstrap,

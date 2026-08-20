@@ -1,6 +1,85 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.getDevices",
-  "description": "Return the complete active addressable-device set for one to five strictly ordered, duplicate-free bare DIDs. At most 20 active devices exist per DID, so the bounded response is never truncated. Output devices are strictly ordered by (userDid exact UTF-8 bytes, deviceId raw UUID bytes). Device scope is never caller-selected for authentication; all calls still require a verified active clean device and fresh DPoP proof.",
-  "defs": {"main": {"type": "query", "parameters": {"type": "params", "required": ["userDids"], "properties": {"userDids": {"type": "array", "items": {"type": "string", "format": "did", "minLength": 12, "maxLength": 261}, "minLength": 1, "maxLength": 5}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["devices"], "properties": {"devices": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#addressableDevice"}, "minLength": 0, "maxLength": 100}}}}, "errors": [{"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "InvalidDPoP"}, {"name": "InvalidRequest"}]}}
+  "description": "Return the complete active addressable-device set for one to five strictly ordered, duplicate-free bare DIDs. At most 20 active devices exist per DID, so the bounded response is never truncated. Output devices are strictly ordered by (userDid exact UTF-8 bytes, deviceId raw UUID bytes). actorDeviceId identifies the authenticated caller's active device and is validated against the service-authenticated DID.",
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId",
+          "userDids"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+          },
+          "userDids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "did",
+              "minLength": 12,
+              "maxLength": 261
+            },
+            "minLength": 1,
+            "maxLength": 5
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "devices"
+          ],
+          "properties": {
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#addressableDevice"
+              },
+              "minLength": 0,
+              "maxLength": 100
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

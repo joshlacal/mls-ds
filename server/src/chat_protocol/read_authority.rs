@@ -250,7 +250,7 @@ pub(crate) struct LockedReadDeviceAuthority {
     txid: i64,
     user_did: String,
     device_id: Uuid,
-    jkt: String,
+    jkt: Option<String>,
     auth_generation: u64,
     active_key_id: String,
     device_row_sha256: [u8; 32],
@@ -269,8 +269,8 @@ impl LockedReadDeviceAuthority {
         self.device_id
     }
 
-    pub(in crate::chat_protocol) fn jkt(&self) -> &str {
-        &self.jkt
+    pub(in crate::chat_protocol) fn jkt(&self) -> Option<&str> {
+        self.jkt.as_deref()
     }
 
     pub(in crate::chat_protocol) fn auth_generation(&self) -> u64 {
@@ -325,7 +325,7 @@ struct LockedReadRequesterDeviceRow {
     user_did: String,
     device_id: Uuid,
     status: String,
-    dpop_jkt: String,
+    dpop_jkt: Option<String>,
     auth_generation: i64,
 }
 
@@ -345,7 +345,7 @@ fn locked_device_row_binding_digest(
     did: &str,
     device_id: Uuid,
     status: &str,
-    textual_jkt: &str,
+    textual_jkt: Option<&str>,
     auth_generation: i64,
     key_id: &str,
     signing_public_key_sha256: &[u8; 32],
@@ -357,8 +357,9 @@ fn locked_device_row_binding_digest(
     digest.update(device_id.as_bytes());
     digest.update((status.len() as u64).to_be_bytes());
     digest.update(status.as_bytes());
-    digest.update((textual_jkt.len() as u64).to_be_bytes());
-    digest.update(textual_jkt.as_bytes());
+    let jkt_str = textual_jkt.unwrap_or_default();
+    digest.update((jkt_str.len() as u64).to_be_bytes());
+    digest.update(jkt_str.as_bytes());
     digest.update(auth_generation.to_be_bytes());
     digest.update((key_id.len() as u64).to_be_bytes());
     digest.update(key_id.as_bytes());
@@ -446,7 +447,7 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         device.user_did.clone().into_boxed_str(),
         device.device_id,
         device.status.clone().into_boxed_str(),
-        device.dpop_jkt.clone().into_boxed_str(),
+        device.dpop_jkt.clone().map(String::into_boxed_str),
         device.auth_generation,
         key.key_id.clone().into_boxed_str(),
         signing_public_key_sha256,
@@ -467,7 +468,7 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         &device.user_did,
         device.device_id,
         &device.status,
-        &device.dpop_jkt,
+        device.dpop_jkt.as_deref(),
         device.auth_generation,
         &key.key_id,
         &signing_public_key_sha256,

@@ -8,7 +8,10 @@ fn runtime_owns_the_fixed_relationship_authority_without_an_injection_path() {
     std::env::remove_var("CHAT_CUTOVER_ENABLED");
     std::env::remove_var("CHAT_NEST_ISSUER");
 
-    let runtime = ChatRuntime::from_env(std::sync::Arc::new(catbird_server::realtime::SseState::new(8))).expect("fixed relationship authority constructs");
+    let runtime = ChatRuntime::from_env(std::sync::Arc::new(
+        catbird_server::realtime::SseState::new(8),
+    ))
+    .expect("fixed relationship authority constructs");
     assert!(
         format!("{runtime:?}").contains("fixed-production-authority"),
         "the mandatory fixed authority must be present in runtime state"

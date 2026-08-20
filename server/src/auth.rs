@@ -20,6 +20,10 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use thiserror::Error;
 use tracing::debug;
 
+pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
+const SERVICE_AUTH_MAX_LIFETIME_SECONDS: i64 = 60;
+const SERVICE_AUTH_FUTURE_IAT_LEEWAY_SECONDS: i64 = 60;
+
 use crate::identity::{canonical_did, did_web_document_url};
 use crate::util::outbound_body::{decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES};
 
@@ -251,6 +255,57 @@ pub struct AuthUser {
     pub claims: AtProtoClaims,
 }
 
+/// Opaque account principal admitted for a standard ATProto AppView request.
+///
+/// The raw bearer is retained only so the chat admission layer can bind its
+/// audit digest. It is never exposed through Debug or to endpoint handlers.
+#[derive(Clone)]
+pub struct VerifiedServicePrincipal {
+    did: String,
+    endpoint_nsid: String,
+    jti: String,
+    iat: i64,
+    exp: i64,
+    token: String,
+}
+
+impl std::fmt::Debug for VerifiedServicePrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedServicePrincipal")
+            .field("did", &crate::crypto::redact_for_log(&self.did))
+            .field("endpoint_nsid", &self.endpoint_nsid)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl VerifiedServicePrincipal {
+    pub fn did(&self) -> &str {
+        &self.did
+    }
+
+    pub fn endpoint_nsid(&self) -> &str {
+        &self.endpoint_nsid
+    }
+
+    pub fn jti(&self) -> &str {
+        &self.jti
+    }
+
+    pub fn iat(&self) -> i64 {
+        self.iat
+    }
+
+    pub fn exp(&self) -> i64 {
+        self.exp
+    }
+
+    pub fn token_bytes(&self) -> &[u8] {
+        self.token.as_bytes()
+    }
+}
+
 /// Opaque exact bearer artifact produced only after `AuthMiddleware` accepts
 /// the token signature and standard claims. Debug output never exposes it.
 #[derive(Clone)]
@@ -385,6 +440,15 @@ impl AuthMiddleware {
 
     /// Verify JWT token and extract claims.
     pub async fn verify_jwt(&self, token: &str) -> Result<AtProtoClaims, AuthError> {
+        self.verify_jwt_for_audience(token, None).await
+    }
+
+    /// Verify JWT token with an explicit expected audience (or fall back to configured SERVICE_DID).
+    pub async fn verify_jwt_for_audience(
+        &self,
+        token: &str,
+        expected_aud: Option<&str>,
+    ) -> Result<AtProtoClaims, AuthError> {
         let parts: Vec<&str> = token.split('.').collect();
         if parts.len() != 3 {
             return Err(AuthError::InvalidToken("Invalid JWT format".into()));
@@ -419,8 +483,15 @@ impl AuthMiddleware {
             return Err(AuthError::TokenExpired);
         }
 
-        // Audience enforcement when configured
-        if let Some(service_did) = self.configured_service_did() {
+        // Audience enforcement
+        if let Some(expected) = expected_aud {
+            if claims.aud != expected {
+                tracing::warn!("JWT audience mismatch with expected audience {expected}");
+                return Err(AuthError::InvalidToken(
+                    format!("aud does not match {expected}").into(),
+                ));
+            }
+        } else if let Some(service_did) = self.configured_service_did() {
             tracing::debug!("Validating JWT audience against configured SERVICE_DID");
             if claims.aud != service_did {
                 tracing::warn!("JWT audience mismatch with SERVICE_DID");
@@ -891,6 +962,12 @@ fn select_verification_method<'a>(
     }
 
     if let Some(kid_value) = kid {
+        let absolute_atproto = format!("{}#atproto", did_doc.id);
+        if kid_value != "#atproto" && kid_value != absolute_atproto {
+            return Err(AuthError::InvalidToken(
+                "service auth must use the DID #atproto verification method".into(),
+            ));
+        }
         return did_doc
             .verification_method
             .iter()
@@ -911,10 +988,7 @@ fn select_verification_method<'a>(
         return Ok(vm);
     }
 
-    did_doc
-        .verification_method
-        .first()
-        .ok_or(AuthError::MissingVerificationMethod)
+    Err(AuthError::MissingVerificationMethod)
 }
 
 fn is_disallowed_host(host: &str) -> bool {
@@ -1143,6 +1217,103 @@ pub async fn cleanup_expired_jti_nonces(pool: &crate::storage::DbPool) -> Result
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+/// Verify the standard account-to-AppView service-auth contract used by every
+/// `blue.catbird.chat.*` HTTP route.
+pub(crate) async fn verify_mls_service_principal(
+    headers: &axum::http::HeaderMap,
+    pool: &crate::storage::DbPool,
+    endpoint_nsid: &str,
+) -> Result<VerifiedServicePrincipal, AuthError> {
+    let authorization = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AuthError::MissingAuthHeader)?;
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .ok_or(AuthError::InvalidAuthFormat)?;
+    let claims = AUTH_MIDDLEWARE
+        .verify_jwt_for_audience(token, Some(MLS_APPVIEW_SERVICE_REF))
+        .await?;
+    let now = Utc::now().timestamp();
+    let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
+
+    enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
+    AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
+    if let Err(retry_after) =
+        crate::middleware::rate_limit::DID_RATE_LIMITER.check_did_limit(issuer, endpoint_nsid)
+    {
+        return Err(AuthError::RateLimitExceeded {
+            retry_after_secs: retry_after,
+        });
+    }
+
+    Ok(VerifiedServicePrincipal {
+        did: issuer.to_owned(),
+        endpoint_nsid: endpoint_nsid.to_owned(),
+        jti: claims.jti.ok_or(AuthError::MissingJti)?,
+        iat,
+        exp: claims.exp,
+        token: token.to_owned(),
+    })
+}
+
+fn validate_mls_service_claims<'a>(
+    claims: &'a AtProtoClaims,
+    endpoint_nsid: &str,
+    now: i64,
+) -> Result<(&'a str, i64), AuthError> {
+    if claims.aud != MLS_APPVIEW_SERVICE_REF {
+        return Err(AuthError::InvalidToken(
+            "aud does not match the MLS AppView service reference".into(),
+        ));
+    }
+    let issuer = canonical_valid_did(&claims.iss)
+        .ok_or_else(|| AuthError::InvalidToken("iss is not a valid account DID".into()))?;
+    if issuer != claims.iss
+        || claims
+            .iss
+            .chars()
+            .any(|character| matches!(character, '#' | '?'))
+    {
+        return Err(AuthError::InvalidToken(
+            "iss must be the exact bare account DID".into(),
+        ));
+    }
+    if claims
+        .sub
+        .as_deref()
+        .is_some_and(|subject| subject != issuer)
+    {
+        return Err(AuthError::InvalidToken(
+            "delegated service-auth tokens are not accepted by MLS v2".into(),
+        ));
+    }
+
+    let iat = claims
+        .iat
+        .ok_or_else(|| AuthError::InvalidToken("missing iat claim".into()))?;
+    if claims.exp < now {
+        return Err(AuthError::TokenExpired);
+    }
+    if claims.exp <= iat
+        || claims.exp - iat > SERVICE_AUTH_MAX_LIFETIME_SECONDS
+        || iat > now + SERVICE_AUTH_FUTURE_IAT_LEEWAY_SECONDS
+    {
+        return Err(AuthError::InvalidToken(
+            "service-auth token is outside the short-lived time profile".into(),
+        ));
+    }
+    match claims.lxm.as_deref() {
+        Some(lxm) if lxm == endpoint_nsid => {}
+        Some(_) => return Err(AuthError::LxmMismatch),
+        None => return Err(AuthError::MissingLxm),
+    }
+    if claims.jti.as_deref().is_none_or(str::is_empty) {
+        return Err(AuthError::MissingJti);
+    }
+    Ok((issuer, iat))
 }
 
 fn endpoint_nsid_from_path(path: &str) -> Option<&str> {
@@ -2012,7 +2183,7 @@ mod tests {
     #[test]
     fn delegated_subjects_have_independent_endpoint_rate_limits() {
         let limiter = crate::middleware::rate_limit::DidRateLimiter::new();
-        let endpoint = "/xrpc/blue.catbird.chat.rebindDeviceAuthentication";
+        let endpoint = "/xrpc/blue.catbird.chat.replenishKeyPackages";
         let trusted_gateway = Some("did:web:api.catbird.blue");
         let alice = claims("did:web:api.catbird.blue", Some("did:plc:alice"));
         let bob = claims("did:web:api.catbird.blue", Some("did:plc:bob"));
@@ -2066,6 +2237,122 @@ mod tests {
                 Err(AuthError::InvalidToken(_))
             ));
         }
+    }
+
+    fn atproto_method_doc() -> DidDocument {
+        DidDocument {
+            id: "did:plc:alice".into(),
+            verification_method: vec![VerificationMethod {
+                id: "did:plc:alice#atproto".into(),
+                key_type: "Multikey".into(),
+                controller: "did:plc:alice".into(),
+                public_key_multibase: Some("zInvalidButSelectionDoesNotDecode".into()),
+                public_key_jwk: None,
+            }],
+            service: None,
+        }
+    }
+
+    #[test]
+    fn service_auth_kid_is_exactly_the_issuer_atproto_method() {
+        let doc = atproto_method_doc();
+        assert!(select_verification_method(&doc, Some("#atproto")).is_ok());
+        assert!(select_verification_method(&doc, Some("did:plc:alice#atproto")).is_ok());
+
+        for wrong in [
+            "did:plc:mallory#atproto",
+            "attacker#atproto",
+            "did:plc:alice#other",
+        ] {
+            assert!(matches!(
+                select_verification_method(&doc, Some(wrong)),
+                Err(AuthError::InvalidToken(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn service_auth_without_kid_never_falls_back_to_another_method() {
+        let mut doc = atproto_method_doc();
+        doc.verification_method[0].id = "did:plc:alice#recovery".into();
+        assert!(matches!(
+            select_verification_method(&doc, None),
+            Err(AuthError::MissingVerificationMethod)
+        ));
+    }
+
+    fn standard_claims(now: i64) -> AtProtoClaims {
+        AtProtoClaims {
+            iss: "did:plc:alice".into(),
+            aud: MLS_APPVIEW_SERVICE_REF.into(),
+            exp: now + 60,
+            iat: Some(now),
+            sub: None,
+            lxm: Some("blue.catbird.chat.getOwnDevices".into()),
+            jti: Some("one-use-jti".into()),
+        }
+    }
+
+    #[test]
+    fn standard_service_claim_profile_is_exact() {
+        let now = 2_000_000_000;
+        let endpoint = "blue.catbird.chat.getOwnDevices";
+        let valid = standard_claims(now);
+        assert_eq!(
+            validate_mls_service_claims(&valid, endpoint, now).unwrap(),
+            ("did:plc:alice", now)
+        );
+
+        let mut wrong_aud = valid.clone();
+        wrong_aud.aud = "did:web:chat.catbird.blue".into();
+        assert!(matches!(
+            validate_mls_service_claims(&wrong_aud, endpoint, now),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        let mut wrong_lxm = valid.clone();
+        wrong_lxm.lxm = Some("blue.catbird.chat.getDevices".into());
+        assert!(matches!(
+            validate_mls_service_claims(&wrong_lxm, endpoint, now),
+            Err(AuthError::LxmMismatch)
+        ));
+
+        let mut delegated = valid.clone();
+        delegated.sub = Some("did:plc:bob".into());
+        assert!(matches!(
+            validate_mls_service_claims(&delegated, endpoint, now),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        let mut bare_violation = valid.clone();
+        bare_violation.iss = "did:plc:alice#device".into();
+        assert!(matches!(
+            validate_mls_service_claims(&bare_violation, endpoint, now),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        let mut expired = valid.clone();
+        expired.iat = Some(now - 61);
+        expired.exp = now - 1;
+        assert!(matches!(
+            validate_mls_service_claims(&expired, endpoint, now),
+            Err(AuthError::TokenExpired)
+        ));
+
+        let mut future = valid.clone();
+        future.iat = Some(now + 61);
+        future.exp = now + 120;
+        assert!(matches!(
+            validate_mls_service_claims(&future, endpoint, now),
+            Err(AuthError::InvalidToken(_))
+        ));
+
+        let mut too_long = valid;
+        too_long.exp = now + SERVICE_AUTH_MAX_LIFETIME_SECONDS + 1;
+        assert!(matches!(
+            validate_mls_service_claims(&too_long, endpoint, now),
+            Err(AuthError::InvalidToken(_))
+        ));
     }
 }
 

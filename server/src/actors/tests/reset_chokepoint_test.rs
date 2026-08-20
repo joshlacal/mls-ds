@@ -513,7 +513,7 @@ mod self_heal_db_tests {
                  group_info_updated_at, created_by_did, \
                  created_at, activated_at) \
              VALUES ($1, $2, 25, $3, 'active', $4, 0, NULL, NULL, NULL, \
-                     'did:web:mlschat.catbird.blue', $5, $5)",
+                     'did:web:chat.catbird.blue', $5, $5)",
         )
         .bind(&cs_id)
         .bind(convo_id)

@@ -45,7 +45,6 @@ mod inventory;
 mod leave;
 #[cfg(not(test))]
 mod publish_typing;
-mod rebind_device_authentication;
 #[cfg(not(test))]
 mod recovery;
 #[cfg(not(test))]
@@ -111,7 +110,6 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
         endpoint,
         ChatEndpoint::EnrollDevice
             | ChatEndpoint::ReplenishKeyPackages
-            | ChatEndpoint::RebindDeviceAuthentication
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
             | ChatEndpoint::RequestLeave
@@ -174,10 +172,6 @@ where
         .route(
             &xrpc_path(ChatEndpoint::ReplenishKeyPackages),
             post(replenish_key_packages::handle),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::RebindDeviceAuthentication),
-            post(rebind_device_authentication::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDevices),

@@ -502,9 +502,8 @@ impl ConversationActorState {
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
-            let commit_shape =
-                crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
-                    .context("Invalid commit framing")?;
+            let commit_shape = crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
+                .context("Invalid commit framing")?;
             if commit_shape.epoch != self.current_epoch as u64 {
                 anyhow::bail!(
                     "Stale commit for convo {}: wire_epoch {} != current_epoch {}",
@@ -730,9 +729,8 @@ impl ConversationActorState {
 
         // Process commit if provided (capture msg_id for later fanout)
         let commit_msg_id = if let Some(commit_bytes) = commit {
-            let commit_shape =
-                crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
-                    .context("Invalid commit framing")?;
+            let commit_shape = crate::crypto::commit_inspect::inspect_commit_shape(&commit_bytes)
+                .context("Invalid commit framing")?;
             if commit_shape.epoch != self.current_epoch as u64 {
                 anyhow::bail!(
                     "Stale commit for convo {}: wire_epoch {} != current_epoch {}",

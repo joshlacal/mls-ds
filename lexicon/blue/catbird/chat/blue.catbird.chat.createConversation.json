@@ -5,29 +5,106 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedCreation"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationCreationResult"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedCreation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCreationResult"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "BlockedRelationship"},
-        {"name": "ConversationAlreadyExists"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "GroupInvitesDisabled"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidGenesisGroupInfo"},
-        {"name": "InvalidMetadataSnapshot"},
-        {"name": "InvalidMlsArtifact"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "InvitationLimitReached"},
-        {"name": "MessagesDisabled"},
-        {"name": "MetadataNonceReuse"},
-        {"name": "NotAuthorized"},
-        {"name": "NotFollowedByRecipient"},
-        {"name": "RelationshipPolicyUnavailable"},
-        {"name": "UnsupportedMlsProfile"}
+        {
+          "name": "BlockedRelationship"
+        },
+        {
+          "name": "ConversationAlreadyExists"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "GroupInvitesDisabled"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidGenesisGroupInfo"
+        },
+        {
+          "name": "InvalidMetadataSnapshot"
+        },
+        {
+          "name": "InvalidMlsArtifact"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "InvitationLimitReached"
+        },
+        {
+          "name": "MessagesDisabled"
+        },
+        {
+          "name": "MetadataNonceReuse"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "NotFollowedByRecipient"
+        },
+        {
+          "name": "RelationshipPolicyUnavailable"
+        },
+        {
+          "name": "UnsupportedMlsProfile"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

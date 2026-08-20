@@ -1,9 +1,9 @@
-//! Known-answer vectors for the eleven signing domains that no control-entry
+//! Known-answer vectors for the ten active signing domains that no control-entry
 //! case covers.
 //!
 //! `mls_chat_contract_vectors.json` pins fourteen of the twenty-five signing
 //! domains: the thirteen control entries, plus `CATBIRD-CHAT-BLOB-DELETE` from
-//! its one `signedMutator` case. The other eleven — `CATBIRD-CHAT-MESSAGE`, the
+//! its one `signedMutator` case. The other ten — `CATBIRD-CHAT-MESSAGE`, the
 //! application-send domain, above all — had no server vector anywhere, so every
 //! client's copy of those domain strings rested on a hand transcription. A
 //! single wrong byte there produces signatures that verify locally and nowhere
@@ -61,8 +61,8 @@ use sha2::{Digest, Sha256};
 
 use transcript::{
     decode_and_verify_enrollment_body, decode_and_verify_signed_mutation,
-    decode_canonical_signed_mutation, decode_rebind_bootstrap, ControlEntryKind,
-    SignedMutationKind, VerifiedMutationProjection,
+    decode_canonical_signed_mutation, ControlEntryKind, SignedMutationKind,
+    VerifiedMutationProjection,
 };
 use validation::ed25519_key_id;
 
@@ -76,7 +76,7 @@ const CANONICAL_SOURCE_LEXICON_PATH: &str =
 const CANONICAL_SOURCE_LEXICON_REVISION: &str = "8ec8acaa1137b68b57b78ebfaea9404d5923305b";
 const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
-    "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a";
+    "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -133,7 +133,9 @@ fn unpinned_body_names() -> Vec<&'static str> {
     SignedMutationKind::ALL
         .into_iter()
         .filter(|kind| {
-            *kind != SignedMutationKind::BlobDeletion && !control.contains(kind.body_name())
+            *kind != SignedMutationKind::BlobDeletion
+                && *kind != SignedMutationKind::DeviceAuthenticationRebind
+                && !control.contains(kind.body_name())
         })
         .map(SignedMutationKind::body_name)
         .collect()
@@ -323,7 +325,7 @@ fn generate() -> Value {
 
     json!({
         "schemaVersion": 1,
-        "purpose": "Known-answer vectors for the eleven signing domains carried by no \
+        "purpose": "Known-answer vectors for the ten active signing domains carried by no \
                     control entry. Produced by the server's own transcript code; see \
                     tests/chat_protocol_signing_domain_vectors.rs.",
         "regenerateCommand": format!(
@@ -350,7 +352,7 @@ fn rendered(document: &Value) -> String {
 }
 
 #[test]
-fn the_eleven_signing_domain_vectors_are_server_products_and_match_the_fixture() {
+fn the_ten_active_signing_domain_vectors_are_server_products_and_match_the_fixture() {
     let document = generate();
     let text = rendered(&document);
 
@@ -369,13 +371,12 @@ fn the_eleven_signing_domain_vectors_are_server_products_and_match_the_fixture()
 #[test]
 fn every_signing_domain_now_has_a_server_vector() {
     // The accounting the vendoring clients rely on: fourteen domains were
-    // already pinned by `mls_chat_contract_vectors.json`, these eleven are the
+    // already pinned by `mls_chat_contract_vectors.json`, these ten are the
     // remainder, and together they are the whole enum. Keep the expected set
     // explicit so adding an enum arm or silently dropping a fixture fails here.
     let expected = BTreeSet::from([
         "deviceEnrollmentBody",
         "keyPackageReplenishmentBody",
-        "deviceAuthenticationRebindBody",
         "deviceRevocationBody",
         "blobUploadPreparationBody",
         "blobDeletionBody",
@@ -401,6 +402,7 @@ fn every_signing_domain_now_has_a_server_vector() {
     ]);
     let enum_kinds: BTreeSet<&'static str> = SignedMutationKind::ALL
         .into_iter()
+        .filter(|kind| *kind != SignedMutationKind::DeviceAuthenticationRebind)
         .map(SignedMutationKind::body_name)
         .collect();
     assert_eq!(enum_kinds, expected, "the enum operation set drifted");
@@ -411,17 +413,16 @@ fn every_signing_domain_now_has_a_server_vector() {
         .collect();
     let unpinned = unpinned_body_names();
     assert_eq!(control.len(), 13);
-    assert_eq!(unpinned.len(), 11);
+    assert_eq!(unpinned.len(), 10);
     assert_eq!(
         control.len() + 1 + unpinned.len(),
-        SignedMutationKind::ALL.len()
+        SignedMutationKind::ALL.len() - 1
     );
     assert_eq!(
         unpinned,
         vec![
             "deviceEnrollmentBody",
             "keyPackageReplenishmentBody",
-            "deviceAuthenticationRebindBody",
             "deviceRevocationBody",
             "blobUploadPreparationBody",
             "applicationSendBody",
@@ -440,7 +441,7 @@ fn every_signing_domain_now_has_a_server_vector() {
         "the existing corpus must cover 14 kinds"
     );
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the vector fixture parses");
-    for case in fixture["cases"].as_array().expect("eleven cases") {
+    for case in fixture["cases"].as_array().expect("ten cases") {
         fixture_kinds.insert(
             case["bodyName"]
                 .as_str()
@@ -461,7 +462,7 @@ fn each_frozen_case_verifies_and_its_declared_mutation_breaks_the_signature() {
 
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
     let cases = fixture["cases"].as_array().expect("cases");
-    assert_eq!(cases.len(), 11);
+    assert_eq!(cases.len(), 10);
 
     let public_key: [u8; 32] = hex::decode(fixture["publicKeyHex"].as_str().unwrap())
         .unwrap()
@@ -515,7 +516,7 @@ fn the_domains_are_distinct_and_none_collides_with_a_control_domain() {
             "the fixture's domain must be the server's, NUL included"
         );
     }
-    assert_eq!(seen.len(), 11);
+    assert_eq!(seen.len(), 10);
 }
 
 #[test]
@@ -639,10 +640,6 @@ fn enrollment_vector_round_trips_through_strict_authority_and_derives_key_hash()
         body["deviceId"].as_str().unwrap()
     );
     assert_eq!(
-        enrollment.dpop_jkt().as_str(),
-        body["dpopJkt"].as_str().unwrap()
-    );
-    assert_eq!(
         enrollment.key_id().as_str(),
         body["keyId"].as_str().unwrap()
     );
@@ -656,43 +653,6 @@ fn enrollment_vector_round_trips_through_strict_authority_and_derives_key_hash()
         enrollment.accepted_wrapper_bytes(),
         wrapper_bytes.as_slice()
     );
-}
-
-#[test]
-fn rebind_vector_round_trips_through_stored_key_and_retains_both_jkts() {
-    let (case, wrapper_bytes, public_key) = frozen_wrapper("deviceAuthenticationRebindBody");
-    let body = &case["body"];
-    let bootstrap = decode_rebind_bootstrap(&wrapper_bytes)
-        .expect("the frozen rebind wrapper must pass strict bootstrap decoding");
-
-    assert_eq!(
-        bootstrap.subject().as_str(),
-        body["actorDid"].as_str().unwrap()
-    );
-    assert_eq!(
-        bootstrap.device_id().as_str(),
-        body["actorDeviceId"].as_str().unwrap()
-    );
-    assert_eq!(
-        bootstrap.current_dpop_jkt().as_str(),
-        body["currentDpopJkt"].as_str().unwrap()
-    );
-    assert_eq!(
-        bootstrap.new_dpop_jkt().as_str(),
-        body["newDpopJkt"].as_str().unwrap()
-    );
-    bootstrap
-        .verify_signature_with_stored_key(&public_key)
-        .expect("the bootstrap signature must verify against the stored key");
-    let mutation = bootstrap
-        .verify_mutation_with_stored_key(&public_key)
-        .expect("stored-key verification must yield the exact mutation");
-    assert_eq!(mutation.key_id(), bootstrap.key_id());
-    assert_eq!(
-        hex::encode(mutation.request_digest()),
-        case["canonicalRequestDigestHex"]
-    );
-    assert_eq!(bootstrap.accepted_wrapper_bytes(), wrapper_bytes.as_slice());
 }
 
 #[test]

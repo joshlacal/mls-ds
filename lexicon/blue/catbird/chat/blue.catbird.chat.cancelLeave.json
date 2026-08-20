@@ -5,19 +5,81 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeaveCancellation"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["leaveRequest", "entry"], "properties": {"leaveRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveRequestView"}, "entry": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveCancellationEntry"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedLeaveCancellation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "leaveRequest",
+            "entry"
+          ],
+          "properties": {
+            "leaveRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#leaveRequestView"
+            },
+            "entry": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#leaveCancellationEntry"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "CancellationConflict"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "LeaveRequestNotFound"},
-        {"name": "NotAuthorized"}
+        {
+          "name": "CancellationConflict"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "LeaveRequestNotFound"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

@@ -1,4 +1,4 @@
-//! Wire-JSON bodies for the eleven signed-mutation kinds that carry no control
+//! Wire-JSON bodies for the ten active signed-mutation kinds that carry no control
 //! entry and so never appeared in the control-fingerprint corpus.
 //!
 //! These are inputs, not answers. Every derived value — canonical projection,
@@ -8,10 +8,7 @@
 //! quietly encoded, which is the point: the shapes are pinned by the same
 //! closed-lexicon projection production uses.
 
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -19,11 +16,6 @@ pub const ACTOR_DID: &str = "did:plc:alicefixtureaaaaaaaaaaaa";
 pub const ACTOR_DEVICE_ID: &str = "70707070-7070-4070-b070-707070707070";
 pub const CONVERSATION_ID: &str = "11111111-1111-4111-9111-111111111111";
 pub const SIGNED_AT: &str = "2026-07-22T14:05:09.123Z";
-
-/// A 43-character base64url thumbprint, shaped like a real DPoP JKT.
-fn dpop_jkt(label: &[u8]) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(label))
-}
 
 fn artifact(bytes: &[u8]) -> (String, String) {
     (
@@ -105,7 +97,6 @@ fn device_enrollment(key_id: &str, public_key: &[u8; 32]) -> Value {
         "deviceName": "Alice's fixture device",
         "keyId": key_id,
         "signaturePublicKey": STANDARD.encode(public_key),
-        "dpopJkt": dpop_jkt(b"catbird-chat-vector-dpop-enroll"),
         "expectedAuthGeneration": 0,
         "capability": capability(),
         "keyPackages": key_packages(),
@@ -114,7 +105,7 @@ fn device_enrollment(key_id: &str, public_key: &[u8; 32]) -> Value {
     })
 }
 
-/// The eleven bodies, each paired with its body name and the top-level field
+/// The ten active bodies, each paired with its body name and the top-level field
 /// the harness mutates to prove the signature covers it.
 pub fn bodies(key_id: &str, public_key: &[u8; 32]) -> Vec<(&'static str, &'static str, Value)> {
     vec![
@@ -127,16 +118,6 @@ pub fn bodies(key_id: &str, public_key: &[u8; 32]) -> Vec<(&'static str, &'stati
             "keyPackageReplenishmentBody",
             "idempotencyKey",
             key_package_replenishment(key_id, public_key),
-        ),
-        (
-            // Not `newDpopJkt`: a 43-character base64url thumbprint encodes 256
-            // bits, so its final character carries only four significant bits
-            // and most substitutions are not decodable at all. The server
-            // rejects them before a transcript exists, which would prove
-            // nothing about signature coverage.
-            "deviceAuthenticationRebindBody",
-            "idempotencyKey",
-            device_authentication_rebind(key_id),
         ),
         (
             "deviceRevocationBody",
@@ -181,25 +162,9 @@ fn key_package_replenishment(key_id: &str, public_key: &[u8; 32]) -> Value {
         "actorDeviceId": ACTOR_DEVICE_ID,
         "keyId": key_id,
         "authGeneration": 1,
-        "dpopJkt": dpop_jkt(b"catbird-chat-vector-dpop-replenish"),
         "signaturePublicKey": STANDARD.encode(public_key),
         "keyPackages": key_packages(),
         "idempotencyKey": "00000000-0000-4000-8000-000000000012",
-        "signedAt": SIGNED_AT
-    })
-}
-
-fn device_authentication_rebind(key_id: &str) -> Value {
-    json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0}",
-        "actorDid": ACTOR_DID,
-        "actorDeviceId": ACTOR_DEVICE_ID,
-        "keyId": key_id,
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": dpop_jkt(b"catbird-chat-vector-dpop-current"),
-        "newDpopJkt": dpop_jkt(b"catbird-chat-vector-dpop-new"),
-        "idempotencyKey": "00000000-0000-4000-8000-000000000013",
         "signedAt": SIGNED_AT
     })
 }

@@ -2,5 +2,64 @@
   "lexicon": 1,
   "id": "blue.catbird.chat.getBlobUsage",
   "description": "Return auth-derived aggregate opaque-blob usage and reserved quota for the verified bare DID; no caller-selected principal is accepted.",
-  "defs": {"main": {"type": "query", "parameters": {"type": "params", "properties": {}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["usage"], "properties": {"usage": {"type": "ref", "ref": "blue.catbird.chat.defs#blobUsageView"}}}}, "errors": [{"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "InvalidDPoP"}]}}
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "usage"
+          ],
+          "properties": {
+            "usage": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#blobUsageView"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

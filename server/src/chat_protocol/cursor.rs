@@ -1771,7 +1771,7 @@ impl SealerBinding {
         validate_binding_bytes(domain, 1, 64)?;
         validate_binding_bytes(endpoint_nsid, 1, 256)?;
         validate_binding_bytes(user_did, 1, 512)?;
-        validate_binding_bytes(jkt, 1, 256)?;
+        validate_binding_bytes(jkt, 0, 256)?;
         validate_binding_bytes(cursor_key_id, 1, 256)?;
         if cursor_format_version == 0 {
             return Err(SealerError::InvalidBinding);
@@ -1838,7 +1838,7 @@ impl SealerBinding {
         expires_at: u64,
     ) -> Result<Self, SealerError> {
         validate_binding_bytes(user_did, 1, 512)?;
-        validate_binding_bytes(jkt, 1, 256)?;
+        validate_binding_bytes(jkt, 0, 256)?;
         validate_binding_bytes(cursor_key_id, 1, 256)?;
         require_binding_uuid_v4(inventory_session_id)?;
         require_binding_uuid_v4(device_id)?;

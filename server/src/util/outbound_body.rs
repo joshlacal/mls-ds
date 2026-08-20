@@ -18,29 +18,29 @@ const DECLARED_INITIAL_CAPACITY_MAX_BYTES: usize = 64 * 1024;
 /// Callers compute `deadline` before `.send()` and reuse it here. This module
 /// enforces only the time remaining while reading and decoding the response body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResponseBodyBudget {
+pub struct ResponseBodyBudget {
     max_bytes: usize,
     deadline: Instant,
 }
 
 impl ResponseBodyBudget {
-    pub(crate) fn new(max_bytes: usize, deadline: Instant) -> Self {
+    pub fn new(max_bytes: usize, deadline: Instant) -> Self {
         Self {
             max_bytes,
             deadline,
         }
     }
 
-    pub(crate) fn max_bytes(self) -> usize {
+    pub fn max_bytes(self) -> usize {
         self.max_bytes
     }
 
-    pub(crate) fn deadline(self) -> Instant {
+    pub fn deadline(self) -> Instant {
         self.deadline
     }
 }
 
-pub(crate) enum OutboundBodyError {
+pub enum OutboundBodyError {
     DeclaredTooLarge {
         declared_bytes: u64,
         max_bytes: usize,
@@ -139,7 +139,7 @@ impl fmt::Display for SanitizedErrorSummary {
 }
 
 /// Collects a response within an explicit limit and the caller's pre-send deadline.
-pub(crate) async fn collect_bounded(
+pub async fn collect_bounded(
     mut response: reqwest::Response,
     budget: ResponseBodyBudget,
 ) -> Result<Bytes, OutboundBodyError> {

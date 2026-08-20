@@ -5,23 +5,91 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeaveOperation"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["result"], "properties": {"result": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveOperationResult"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedLeaveOperation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "result"
+          ],
+          "properties": {
+            "result": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#leaveOperationResult"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "ConversationNotFound"},
-        {"name": "CoordinateOverflow"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "DirectParticipantMutationForbidden"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "LastAdminRequired"},
-        {"name": "LeaveAlreadyPending"},
-        {"name": "NotMember"},
-        {"name": "StaleCoordinates"}
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CoordinateOverflow"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "DirectParticipantMutationForbidden"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "LastAdminRequired"
+        },
+        {
+          "name": "LeaveAlreadyPending"
+        },
+        {
+          "name": "NotMember"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

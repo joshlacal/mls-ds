@@ -544,7 +544,7 @@ pub fn verify_group_info(
 /// The TLS decoder rejects non-minimal variable-length encodings and this
 /// function rejects any trailing bytes, so `canonical_bytes` is the exact,
 /// canonical wire envelope that was authenticated. The expected credential is
-/// derived internally from the verified request's bare user DID; callers cannot
+/// derived internally as `actorDid#deviceId`; callers cannot
 /// substitute an arbitrary credential DTO.
 pub fn verify_group_info_for_transition(
     bytes: &[u8],
@@ -555,13 +555,13 @@ pub fn verify_group_info_for_transition(
 ) -> Result<VerifiedGroupInfo, GroupInfoVerificationError> {
     if registry_authority.user_did != device.user_did()
         || registry_authority.device_id != device.device_id()
-        || registry_authority.dpop_jkt != device.dpop_jkt()
         || registry_authority.auth_generation != device.auth_generation()
     {
         return Err(GroupInfoVerificationError::RegistryAuthorityMismatch);
     }
-    let expected_credential =
-        Credential::from(BasicCredential::new(device.user_did().as_bytes().to_vec()));
+    let expected_credential = Credential::from(BasicCredential::new(
+        format!("{}#{}", device.user_did(), device.device_id()).into_bytes(),
+    ));
     let authenticated = verify_group_info(
         bytes,
         &ExpectedGroupInfoSigner::by_signature_key(&registry_authority.signature_key)

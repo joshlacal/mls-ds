@@ -13,8 +13,6 @@ pub use chat_request::{
     ListRequestsInput, ListRequestsOutput, SendRequestInput, SendRequestOutput,
 };
 
-
-
 // =============================================================================
 // Database-specific models (not in lexicon)
 // =============================================================================
@@ -457,5 +455,3 @@ pub struct PendingWelcome {
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub delivered: bool,
 }
-
-

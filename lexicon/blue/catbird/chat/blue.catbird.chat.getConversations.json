@@ -5,25 +5,109 @@
   "defs": {
     "main": {
       "type": "query",
-      "parameters": {"type": "params", "required": ["limit"], "properties": {
-        "pageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
-      }},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["items", "inventorySessionId", "snapshotEventCursor", "hasMore", "snapshotExpiresAt"], "properties": {
-        "items": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationInventoryItem"}, "minLength": 0, "maxLength": 100},
-        "inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512},
-        "snapshotEventCursor": {"type": "string", "minLength": 1, "maxLength": 512},
-        "nextPageCursor": {"type": "string", "minLength": 1, "maxLength": 512},
-        "hasMore": {"type": "boolean"},
-        "snapshotExpiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
-      }}},
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId",
+          "limit"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+          },
+          "pageCursor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 50
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "items",
+            "inventorySessionId",
+            "snapshotEventCursor",
+            "hasMore",
+            "snapshotExpiresAt"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#conversationInventoryItem"
+              },
+              "minLength": 0,
+              "maxLength": 100
+            },
+            "inventorySessionId": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 512
+            },
+            "snapshotEventCursor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "nextPageCursor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "hasMore": {
+              "type": "boolean"
+            },
+            "snapshotExpiresAt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "CursorExpired"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"}
+        {
+          "name": "CursorExpired"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

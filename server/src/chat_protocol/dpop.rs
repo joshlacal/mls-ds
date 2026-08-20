@@ -30,6 +30,7 @@ use super::{
         NumericDate, ProofJti, TrustedExternalBase, TrustedRequestInstant, ValidatedChatNsid,
     },
 };
+use crate::auth::{VerifiedServicePrincipal, MLS_APPVIEW_SERVICE_REF};
 
 pub(crate) const MAX_TRUSTED_NEST_ISSUER_BYTES: usize = 2048;
 pub(crate) const MAX_TRUSTED_NEST_AUDIENCE_BYTES: usize = 2048;
@@ -150,126 +151,283 @@ impl EnrollmentGrantEvidence {
         self.auth_time
     }
 }
+/// Split authentication evidence: standard ATProto service auth vs legacy custom DPoP.
+#[derive(Debug)]
+pub enum PreReplayAuthenticationEvidence {
+    StandardService(StandardServiceEvidence),
+    LegacyDpop(LegacyDpopEvidence),
+}
+
+/// Standard ATProto service-auth evidence for MLS v2 AppView routes.
+/// Carries no Nest, DPoP, or JKT authority.
+#[derive(Debug)]
+pub struct StandardServiceEvidence {
+    pub(crate) principal: VerifiedServicePrincipal,
+    pub(crate) subject: BareDid,
+    pub(crate) device_id: CanonicalUuidV4,
+    pub(crate) endpoint: ValidatedChatNsid,
+    pub(crate) method: CanonicalHttpMethod,
+    pub(crate) trusted_instant: TrustedRequestInstant,
+    pub(crate) enrollment_body: Option<VerifiedEnrollmentBody>,
+    pub(crate) token_iat: NumericDate,
+    pub(crate) token_exp: NumericDate,
+    pub(crate) token_sha256: [u8; 32],
+    pub(crate) jti_sha256: [u8; 32],
+}
+
+/// Legacy custom-DPoP authentication evidence.
+#[derive(Debug)]
+pub struct LegacyDpopEvidence {
+    pub(crate) subject: BareDid,
+    pub(crate) audience: String,
+    pub(crate) device_id: CanonicalUuidV4,
+    pub(crate) dpop_jkt: KeyThumbprint,
+    pub(crate) token_replay: TokenReplayIdentity,
+    pub(crate) proof_replay: ProofReplayIdentity,
+    pub(crate) auth_transaction_replay: Option<AuthTransactionReplayIdentity>,
+    pub(crate) enrollment: Option<EnrollmentGrantEvidence>,
+    pub(crate) enrollment_body: Option<VerifiedEnrollmentBody>,
+    pub(crate) rebind: Option<CanonicalRebindBootstrap>,
+    pub(crate) endpoint: ValidatedChatNsid,
+    pub(crate) method: CanonicalHttpMethod,
+    pub(crate) htu: String,
+    pub(crate) trusted_instant: TrustedRequestInstant,
+    pub(crate) chat_instance: CanonicalUuidV4,
+    pub(crate) token_iat: NumericDate,
+    pub(crate) token_exp: NumericDate,
+    pub(crate) proof_iat: NumericDate,
+    pub(crate) token_sha256: [u8; 32],
+    pub(crate) proof_sha256: [u8; 32],
+}
 
 /// Cryptographic evidence that still requires one atomic repository operation
 /// to consume token/proof/auth-transaction identities and validate the exact
 /// stored device row. It is neither final authority nor replay-consumed state.
 #[derive(Debug)]
 pub struct PreReplayCryptographicVerification {
-    subject: BareDid,
-    audience: String,
-    device_id: CanonicalUuidV4,
-    dpop_jkt: KeyThumbprint,
-    token_replay: TokenReplayIdentity,
-    proof_replay: ProofReplayIdentity,
-    auth_transaction_replay: Option<AuthTransactionReplayIdentity>,
-    enrollment: Option<EnrollmentGrantEvidence>,
-    enrollment_body: Option<VerifiedEnrollmentBody>,
-    rebind: Option<CanonicalRebindBootstrap>,
-    endpoint: ValidatedChatNsid,
-    method: CanonicalHttpMethod,
-    htu: String,
-    trusted_instant: TrustedRequestInstant,
-    chat_instance: CanonicalUuidV4,
-    token_iat: NumericDate,
-    token_exp: NumericDate,
-    proof_iat: NumericDate,
-    token_sha256: [u8; 32],
-    proof_sha256: [u8; 32],
+    evidence: PreReplayAuthenticationEvidence,
 }
 
 impl PreReplayCryptographicVerification {
+    pub const fn is_standard_service_auth(&self) -> bool {
+        matches!(self.evidence, PreReplayAuthenticationEvidence::StandardService(_))
+    }
+    pub fn standard_service_evidence(&self) -> Option<&StandardServiceEvidence> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(evidence) => Some(evidence),
+            _ => None,
+        }
+    }
+    pub fn legacy_dpop_evidence(&self) -> Option<&LegacyDpopEvidence> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::LegacyDpop(evidence) => Some(evidence),
+            _ => None,
+        }
+    }
     pub fn subject(&self) -> &BareDid {
-        &self.subject
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.subject,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.subject,
+        }
     }
     pub fn audience(&self) -> &str {
-        &self.audience
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => MLS_APPVIEW_SERVICE_REF,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.audience,
+        }
     }
     pub fn device_id(&self) -> &CanonicalUuidV4 {
-        &self.device_id
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.device_id,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.device_id,
+        }
     }
-    pub fn dpop_jkt(&self) -> &KeyThumbprint {
-        &self.dpop_jkt
+    pub fn dpop_jkt(&self) -> Option<&KeyThumbprint> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => Some(&e.dpop_jkt),
+        }
     }
-    pub fn token_replay(&self) -> &TokenReplayIdentity {
-        &self.token_replay
+    pub fn token_replay(&self) -> Option<&TokenReplayIdentity> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => Some(&e.token_replay),
+        }
     }
-    pub fn proof_replay(&self) -> &ProofReplayIdentity {
-        &self.proof_replay
+    pub fn proof_replay(&self) -> Option<&ProofReplayIdentity> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => Some(&e.proof_replay),
+        }
     }
     pub fn auth_transaction_replay(&self) -> Option<&AuthTransactionReplayIdentity> {
-        self.auth_transaction_replay.as_ref()
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.auth_transaction_replay.as_ref(),
+        }
     }
     pub fn auth_time(&self) -> Option<NumericDate> {
-        self.enrollment
-            .as_ref()
-            .map(EnrollmentGrantEvidence::auth_time)
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => Some(e.token_iat),
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => {
+                e.enrollment.as_ref().map(EnrollmentGrantEvidence::auth_time)
+            }
+        }
     }
     pub fn enrollment(&self) -> Option<&EnrollmentGrantEvidence> {
-        self.enrollment.as_ref()
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.enrollment.as_ref(),
+        }
     }
     pub fn enrollment_body(&self) -> Option<&VerifiedEnrollmentBody> {
-        self.enrollment_body.as_ref()
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => e.enrollment_body.as_ref(),
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.enrollment_body.as_ref(),
+        }
     }
     pub fn validate_enrollment_first_execution_signed_at(&self) -> Result<(), AuthPrimitiveError> {
         let body = self
-            .enrollment_body
-            .as_ref()
+            .enrollment_body()
             .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not enrollment"))?;
-        validate_first_execution_signed_at(body.signed_at(), &self.trusted_instant)
+        validate_first_execution_signed_at(body.signed_at(), self.trusted_instant())
     }
     pub fn rebind_bootstrap(&self) -> Option<&CanonicalRebindBootstrap> {
-        self.rebind.as_ref()
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.rebind.as_ref(),
+        }
     }
     pub fn validate_rebind_first_execution_signed_at(&self) -> Result<(), AuthPrimitiveError> {
         let bootstrap = self
-            .rebind
-            .as_ref()
+            .rebind_bootstrap()
             .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?;
-        validate_first_execution_signed_at(bootstrap.signed_at(), &self.trusted_instant)
+        validate_first_execution_signed_at(bootstrap.signed_at(), self.trusted_instant())
     }
     pub fn verify_rebind_stored_signing_key(
         &self,
         stored_public_key: &[u8],
     ) -> Result<(), AuthPrimitiveError> {
-        self.rebind
-            .as_ref()
+        self.rebind_bootstrap()
             .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?
             .verify_signature_with_stored_key(stored_public_key)
     }
     pub fn endpoint(&self) -> &ValidatedChatNsid {
-        &self.endpoint
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.endpoint,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.endpoint,
+        }
     }
     pub fn method(&self) -> &CanonicalHttpMethod {
-        &self.method
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.method,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.method,
+        }
     }
     pub fn htu(&self) -> &str {
-        &self.htu
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => "",
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.htu,
+        }
     }
     pub fn trusted_instant(&self) -> &TrustedRequestInstant {
-        &self.trusted_instant
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.trusted_instant,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.trusted_instant,
+        }
     }
-    pub fn chat_instance(&self) -> &CanonicalUuidV4 {
-        &self.chat_instance
+    pub fn chat_instance(&self) -> Option<&CanonicalUuidV4> {
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(_) => None,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => Some(&e.chat_instance),
+        }
     }
     pub fn token_iat(&self) -> NumericDate {
-        self.token_iat
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => e.token_iat,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.token_iat,
+        }
     }
     pub fn token_exp(&self) -> NumericDate {
-        self.token_exp
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => e.token_exp,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.token_exp,
+        }
     }
     pub fn proof_iat(&self) -> NumericDate {
-        self.proof_iat
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => e.token_iat,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.proof_iat,
+        }
     }
     pub fn token_sha256(&self) -> &[u8; 32] {
-        &self.token_sha256
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.token_sha256,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.token_sha256,
+        }
     }
     pub fn proof_sha256(&self) -> &[u8; 32] {
-        &self.proof_sha256
+        match &self.evidence {
+            PreReplayAuthenticationEvidence::StandardService(e) => &e.jti_sha256,
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => &e.proof_sha256,
+        }
     }
     pub const fn requires_atomic_replay_consumption(&self) -> bool {
         true
     }
+}
+
+#[allow(dead_code)]
+fn canonical_uuid_from_digest(bytes: &[u8]) -> Result<CanonicalUuidV4, AuthPrimitiveError> {
+    let digest = Sha256::digest(bytes);
+    let mut uuid_bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| AuthPrimitiveError::invalid("service-auth replay digest"))?;
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+    CanonicalUuidV4::parse(&Uuid::from_bytes(uuid_bytes).hyphenated().to_string())
+}
+
+/// Create verified standard ATProto service-auth evidence.
+/// Contains only VerifiedServicePrincipal and request parameters — no compatibility JKT.
+pub(crate) fn standard_service_auth_evidence(
+    principal: VerifiedServicePrincipal,
+    device_id: &str,
+    method: CanonicalHttpMethod,
+    trusted_instant: TrustedRequestInstant,
+    enrollment_body: Option<VerifiedEnrollmentBody>,
+) -> Result<PreReplayCryptographicVerification, AuthPrimitiveError> {
+    let subject = BareDid::parse(principal.did())?;
+    let device_id = CanonicalUuidV4::parse(device_id)?;
+    let endpoint = ValidatedChatNsid::parse(principal.endpoint_nsid())?;
+    if let Some(body) = &enrollment_body {
+        if body.subject().as_str() != subject.as_str()
+            || body.device_id().as_str() != device_id.as_str()
+        {
+            return Err(AuthPrimitiveError::invalid(
+                "enrollment body actor/device does not match service principal",
+            ));
+        }
+    }
+    let token_sha256 = Sha256::digest(principal.token_bytes()).into();
+    let jti_sha256 = Sha256::digest(principal.jti().as_bytes()).into();
+    let token_iat = NumericDate::new(principal.iat())?;
+    let token_exp = NumericDate::new(principal.exp())?;
+    Ok(PreReplayCryptographicVerification {
+        evidence: PreReplayAuthenticationEvidence::StandardService(StandardServiceEvidence {
+            principal,
+            subject,
+            device_id,
+            endpoint,
+            method,
+            trusted_instant,
+            enrollment_body,
+            token_iat,
+            token_exp,
+            token_sha256,
+            jti_sha256,
+        }),
+    })
 }
 
 /// Final, non-Clone request authority. The only constructors require the
@@ -282,6 +440,10 @@ pub struct VerifiedChatDeviceRequest {
 }
 
 impl VerifiedChatDeviceRequest {
+    pub fn is_standard_service_auth(&self) -> bool {
+        self.pre_replay.is_standard_service_auth()
+    }
+
     pub fn subject(&self) -> &BareDid {
         self.pre_replay.subject()
     }
@@ -290,7 +452,7 @@ impl VerifiedChatDeviceRequest {
         self.pre_replay.device_id()
     }
 
-    pub fn dpop_jkt(&self) -> &KeyThumbprint {
+    pub fn dpop_jkt(&self) -> Option<&KeyThumbprint> {
         self.pre_replay.dpop_jkt()
     }
 
@@ -371,12 +533,11 @@ pub(super) fn mint_rebind_repository_authority(
 ) -> Result<VerifiedChatDeviceRequest, AuthPrimitiveError> {
     pre_replay.validate_rebind_first_execution_signed_at()?;
     let mutation = pre_replay
-        .rebind
-        .as_ref()
+        .rebind_bootstrap()
         .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?
         .verify_mutation_with_stored_key(stored_public_key)?;
     debug_assert!(
-        pre_replay.rebind.is_some(),
+        pre_replay.rebind_bootstrap().is_some(),
         "rebind bootstrap must survive minting: the repository stage reads it back"
     );
     Ok(VerifiedChatDeviceRequest {
@@ -458,7 +619,7 @@ struct ReadAdmissionBinding {
     method: CanonicalHttpMethod,
     locked_did: String,
     locked_device_id: Uuid,
-    locked_jkt_digest: [u8; 32],
+    locked_jkt_digest: Option<[u8; 32]>,
     locked_auth_generation: i64,
     locked_key_id: String,
     locked_signing_key_sha256: [u8; 32],
@@ -519,7 +680,7 @@ pub(in crate::chat_protocol) struct LockedReadDatabaseRow {
     did: Box<str>,
     device_id: Uuid,
     device_status: Box<str>,
-    textual_jkt: Box<str>,
+    textual_jkt: Option<Box<str>>,
     auth_generation: i64,
     key_id: Box<str>,
     signing_public_key_sha256: [u8; 32],
@@ -568,10 +729,9 @@ pub(crate) fn seal_read_admission(
         return Err(ReadAdmissionBindingError::OperationShape);
     }
     let pre_replay = request.pre_replay();
-    if pre_replay.enrollment.is_some()
-        || pre_replay.enrollment_body.is_some()
-        || pre_replay.rebind.is_some()
-        || pre_replay.auth_transaction_replay.is_some()
+    if pre_replay.enrollment_body().is_some()
+        || pre_replay.rebind_bootstrap().is_some()
+        || pre_replay.auth_transaction_replay().is_some()
     {
         return Err(ReadAdmissionBindingError::OperationShape);
     }
@@ -607,10 +767,14 @@ pub(crate) fn seal_read_admission(
     {
         return Err(ReadAdmissionBindingError::RequesterCoordinates);
     }
-    if coordinates.textual_jkt != pre_replay.dpop_jkt().as_str() {
-        return Err(ReadAdmissionBindingError::Thumbprint);
-    }
-    let locked_jkt_digest = decode_canonical_thumbprint_digest(coordinates.textual_jkt)?;
+    let locked_jkt_digest = if let Some(jkt) = pre_replay.dpop_jkt() {
+        if coordinates.textual_jkt != Some(jkt.as_str()) {
+            return Err(ReadAdmissionBindingError::Thumbprint);
+        }
+        Some(decode_canonical_thumbprint_digest(jkt.as_str())?)
+    } else {
+        None
+    };
     if coordinates.auth_generation <= 0 {
         return Err(ReadAdmissionBindingError::Generation);
     }
@@ -729,7 +893,7 @@ impl LockedReadDatabaseRow {
         did: Box<str>,
         device_id: Uuid,
         device_status: Box<str>,
-        textual_jkt: Box<str>,
+        textual_jkt: Option<Box<str>>,
         auth_generation: i64,
         key_id: Box<str>,
         signing_public_key_sha256: [u8; 32],
@@ -744,8 +908,10 @@ impl LockedReadDatabaseRow {
         {
             return Err(ReadAdmissionBindingError::LockedRowShape);
         }
-        decode_canonical_thumbprint_digest(&textual_jkt)
-            .map_err(|_| ReadAdmissionBindingError::LockedRowShape)?;
+        if let Some(jkt) = &textual_jkt {
+            decode_canonical_thumbprint_digest(jkt)
+                .map_err(|_| ReadAdmissionBindingError::LockedRowShape)?;
+        }
         Ok(Self {
             transaction_id,
             did,
@@ -795,8 +961,11 @@ impl ReadAdmissionAttempt {
         if &*row.did != binding.locked_did.as_str() || row.device_id != binding.locked_device_id {
             return Err(ReadAdmissionBindingError::RequesterCoordinates);
         }
-        if decode_canonical_thumbprint_digest(&row.textual_jkt)? != binding.locked_jkt_digest {
-            return Err(ReadAdmissionBindingError::Thumbprint);
+        if let Some(expected_digest) = binding.locked_jkt_digest {
+            let textual = row.textual_jkt.as_deref().ok_or(ReadAdmissionBindingError::Thumbprint)?;
+            if decode_canonical_thumbprint_digest(textual)? != expected_digest {
+                return Err(ReadAdmissionBindingError::Thumbprint);
+            }
         }
         if row.auth_generation <= 0 || row.auth_generation != binding.locked_auth_generation {
             return Err(ReadAdmissionBindingError::Generation);
@@ -1060,7 +1229,9 @@ pub(crate) fn verify_enrollment_request_auth(
         trusted_instant,
         AuthClass::Enrollment(&body),
     )?;
-    verified.enrollment_body = Some(body);
+    if let PreReplayAuthenticationEvidence::LegacyDpop(legacy) = &mut verified.evidence {
+        legacy.enrollment_body = Some(body);
+    }
     Ok(verified)
 }
 
@@ -1082,7 +1253,9 @@ pub(crate) fn verify_rebind_request_auth(
         trusted_instant,
         AuthClass::Rebind(&body),
     )?;
-    verified.rebind = Some(body);
+    if let PreReplayAuthenticationEvidence::LegacyDpop(legacy) = &mut verified.evidence {
+        legacy.rebind = Some(body);
+    }
     Ok(verified)
 }
 
@@ -1173,26 +1346,28 @@ fn verify_for_class(
                 auth_txn,
             });
     Ok(PreReplayCryptographicVerification {
-        subject: token_claims.common.subject,
-        audience: trust.audience.clone(),
-        device_id: token_claims.common.device_id,
-        dpop_jkt: token_claims.common.dpop_jkt,
-        token_replay,
-        proof_replay,
-        auth_transaction_replay,
-        enrollment: token_claims.enrollment,
-        enrollment_body: None,
-        rebind: None,
-        endpoint: endpoint.clone(),
-        method: method.clone(),
-        htu: trust.external_base.htu(endpoint),
-        trusted_instant: trusted_instant.clone(),
-        chat_instance: trust.chat_instance.clone(),
-        token_iat: token_claims.common.iat,
-        token_exp: token_claims.common.exp,
-        proof_iat,
-        token_sha256: token_hash,
-        proof_sha256: proof_hash,
+        evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+            subject: token_claims.common.subject,
+            audience: trust.audience.clone(),
+            device_id: token_claims.common.device_id,
+            dpop_jkt: token_claims.common.dpop_jkt,
+            token_replay,
+            proof_replay,
+            auth_transaction_replay,
+            enrollment: token_claims.enrollment,
+            enrollment_body: None,
+            rebind: None,
+            endpoint: endpoint.clone(),
+            method: method.clone(),
+            htu: trust.external_base.htu(endpoint),
+            trusted_instant: trusted_instant.clone(),
+            chat_instance: trust.chat_instance.clone(),
+            token_iat: token_claims.common.iat,
+            token_exp: token_claims.common.exp,
+            proof_iat,
+            token_sha256: token_hash,
+            proof_sha256: proof_hash,
+        }),
     })
 }
 
@@ -1266,7 +1441,6 @@ fn validate_enrollment_claims(
     let enrollment_transcript_sha256 = decode_fixed_sha256(&claims.enrollment_transcript_sha256)?;
     if common.subject != *body.subject()
         || common.device_id != *body.device_id()
-        || common.dpop_jkt != *body.dpop_jkt()
         || key_id != *body.key_id()
         || signing_key_sha256 != *body.signing_key_sha256()
         || enrollment_transcript_sha256 != *body.enrollment_transcript_sha256()
@@ -1490,33 +1664,35 @@ pub(crate) mod repository_test_evidence {
         let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.getDevices")
             .expect("fixed endpoint is canonical");
         PreReplayCryptographicVerification {
-            subject,
-            audience: "did:web:chat.catbird.blue".to_owned(),
-            device_id,
-            dpop_jkt: dpop_jkt.clone(),
-            token_replay: TokenReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                jti: token_jti,
-            },
-            proof_replay: ProofReplayIdentity {
-                jkt: dpop_jkt,
-                jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                    .expect("fixed proof JTI is canonical"),
-            },
-            auth_transaction_replay: None,
-            enrollment: None,
-            enrollment_body: None,
-            rebind: None,
-            endpoint,
-            method: CanonicalHttpMethod::parse("GET").expect("fixed method is canonical"),
-            htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.getDevices".to_owned(),
-            trusted_instant,
-            chat_instance,
-            token_iat: NumericDate::new(now - 10).expect("fixed token iat is valid"),
-            token_exp: NumericDate::new(now + 110).expect("fixed token exp is valid"),
-            proof_iat: NumericDate::new(now).expect("fixed proof iat is valid"),
-            token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-            proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+                subject,
+                audience: "did:web:chat.catbird.blue".to_owned(),
+                device_id,
+                dpop_jkt: dpop_jkt.clone(),
+                token_replay: TokenReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    jti: token_jti,
+                },
+                proof_replay: ProofReplayIdentity {
+                    jkt: dpop_jkt,
+                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
+                        .expect("fixed proof JTI is canonical"),
+                },
+                auth_transaction_replay: None,
+                enrollment: None,
+                enrollment_body: None,
+                rebind: None,
+                endpoint,
+                method: CanonicalHttpMethod::parse("GET").expect("fixed method is canonical"),
+                htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.getDevices".to_owned(),
+                trusted_instant,
+                chat_instance,
+                token_iat: NumericDate::new(now - 10).expect("fixed token iat is valid"),
+                token_exp: NumericDate::new(now + 110).expect("fixed token exp is valid"),
+                proof_iat: NumericDate::new(now).expect("fixed proof iat is valid"),
+                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
+                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            }),
         }
     }
 
@@ -1546,33 +1722,35 @@ pub(crate) mod repository_test_evidence {
             .dpop_method()
             .expect("test endpoint uses request DPoP");
         PreReplayCryptographicVerification {
-            subject,
-            audience: "did:web:chat.catbird.blue".to_owned(),
-            device_id,
-            dpop_jkt: dpop_jkt.clone(),
-            token_replay: TokenReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                jti: token_jti,
-            },
-            proof_replay: ProofReplayIdentity {
-                jkt: dpop_jkt,
-                jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                    .expect("fixed proof JTI is canonical"),
-            },
-            auth_transaction_replay: None,
-            enrollment: None,
-            enrollment_body: None,
-            rebind: None,
-            htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
-            endpoint,
-            method,
-            trusted_instant,
-            chat_instance,
-            token_iat: NumericDate::new(now - 10).expect("fixed token iat is valid"),
-            token_exp: NumericDate::new(now + 110).expect("fixed token exp is valid"),
-            proof_iat: NumericDate::new(now).expect("fixed proof iat is valid"),
-            token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-            proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+                subject,
+                audience: "did:web:chat.catbird.blue".to_owned(),
+                device_id,
+                dpop_jkt: dpop_jkt.clone(),
+                token_replay: TokenReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    jti: token_jti,
+                },
+                proof_replay: ProofReplayIdentity {
+                    jkt: dpop_jkt,
+                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
+                        .expect("fixed proof JTI is canonical"),
+                },
+                auth_transaction_replay: None,
+                enrollment: None,
+                enrollment_body: None,
+                rebind: None,
+                htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
+                endpoint,
+                method,
+                trusted_instant,
+                chat_instance,
+                token_iat: NumericDate::new(now - 10).expect("fixed token iat is valid"),
+                token_exp: NumericDate::new(now + 110).expect("fixed token exp is valid"),
+                proof_iat: NumericDate::new(now).expect("fixed proof iat is valid"),
+                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
+                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            }),
         }
     }
 
@@ -1603,33 +1781,35 @@ pub(crate) mod repository_test_evidence {
             .dpop_method()
             .expect("test endpoint uses request DPoP");
         PreReplayCryptographicVerification {
-            subject,
-            audience: "did:web:chat.catbird.blue".to_owned(),
-            device_id,
-            dpop_jkt: dpop_jkt.clone(),
-            token_replay: TokenReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                jti: token_jti,
-            },
-            proof_replay: ProofReplayIdentity {
-                jkt: dpop_jkt,
-                jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                    .expect("test proof JTI is canonical"),
-            },
-            auth_transaction_replay: None,
-            enrollment: None,
-            enrollment_body: None,
-            rebind: None,
-            htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
-            endpoint,
-            method,
-            trusted_instant,
-            chat_instance,
-            token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
-            token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
-            proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
-            token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-            proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+                subject,
+                audience: "did:web:chat.catbird.blue".to_owned(),
+                device_id,
+                dpop_jkt: dpop_jkt.clone(),
+                token_replay: TokenReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    jti: token_jti,
+                },
+                proof_replay: ProofReplayIdentity {
+                    jkt: dpop_jkt,
+                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
+                        .expect("test proof JTI is canonical"),
+                },
+                auth_transaction_replay: None,
+                enrollment: None,
+                enrollment_body: None,
+                rebind: None,
+                htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
+                endpoint,
+                method,
+                trusted_instant,
+                chat_instance,
+                token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
+                token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
+                proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
+                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
+                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            }),
         }
     }
 
@@ -1643,8 +1823,12 @@ pub(crate) mod repository_test_evidence {
         let subject = BareDid::parse(body.subject().as_str()).expect("test DID is canonical");
         let device_id =
             CanonicalUuidV4::parse(body.device_id().as_str()).expect("test device is canonical");
-        let dpop_jkt =
-            KeyThumbprint::parse(body.dpop_jkt().as_str()).expect("test DPoP JKT is canonical");
+        // Expand-only compatibility storage still has a non-null proof JKT
+        // column. Standard AppView enrollment has no device DPoP binding, so
+        // legacy-only test evidence uses the same inert sentinel as the
+        // production standard-service-auth adapter.
+        let dpop_jkt = KeyThumbprint::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .expect("standard service-auth sentinel is canonical");
         let key_id =
             KeyThumbprint::parse(body.key_id().as_str()).expect("test key ID is canonical");
         let signing_key_sha256 = *body.signing_key_sha256();
@@ -1662,41 +1846,43 @@ pub(crate) mod repository_test_evidence {
         let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.enrollDevice")
             .expect("enrollment endpoint is canonical");
         PreReplayCryptographicVerification {
-            subject,
-            audience: "did:web:chat.catbird.blue".to_owned(),
-            device_id,
-            dpop_jkt: dpop_jkt.clone(),
-            token_replay: TokenReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                jti: token_jti,
-            },
-            proof_replay: ProofReplayIdentity {
-                jkt: dpop_jkt,
-                jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                    .expect("test proof JTI is canonical"),
-            },
-            auth_transaction_replay: Some(AuthTransactionReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                auth_txn,
+            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+                subject,
+                audience: "did:web:chat.catbird.blue".to_owned(),
+                device_id,
+                dpop_jkt: dpop_jkt.clone(),
+                token_replay: TokenReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    jti: token_jti,
+                },
+                proof_replay: ProofReplayIdentity {
+                    jkt: dpop_jkt,
+                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
+                        .expect("test proof JTI is canonical"),
+                },
+                auth_transaction_replay: Some(AuthTransactionReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    auth_txn,
+                }),
+                enrollment: Some(EnrollmentGrantEvidence {
+                    key_id,
+                    signing_key_sha256,
+                    enrollment_transcript_sha256,
+                    auth_time: NumericDate::new(now - 20).expect("test auth time is valid"),
+                }),
+                enrollment_body: Some(body),
+                rebind: None,
+                htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.enrollDevice".to_owned(),
+                endpoint,
+                method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
+                trusted_instant,
+                chat_instance,
+                token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
+                token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
+                proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
+                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
+                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
             }),
-            enrollment: Some(EnrollmentGrantEvidence {
-                key_id,
-                signing_key_sha256,
-                enrollment_transcript_sha256,
-                auth_time: NumericDate::new(now - 20).expect("test auth time is valid"),
-            }),
-            enrollment_body: Some(body),
-            rebind: None,
-            htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.enrollDevice".to_owned(),
-            endpoint,
-            method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
-            trusted_instant,
-            chat_instance,
-            token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
-            token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
-            proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
-            token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-            proof_sha256: Sha256::digest(proof_jti_bytes).into(),
         }
     }
 
@@ -1722,34 +1908,36 @@ pub(crate) mod repository_test_evidence {
         let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication")
             .expect("rebind endpoint is canonical");
         PreReplayCryptographicVerification {
-            subject,
-            audience: "did:web:chat.catbird.blue".to_owned(),
-            device_id,
-            dpop_jkt: dpop_jkt.clone(),
-            token_replay: TokenReplayIdentity {
-                issuer: "did:web:api.catbird.blue".to_owned(),
-                jti: token_jti,
-            },
-            proof_replay: ProofReplayIdentity {
-                jkt: dpop_jkt,
-                jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                    .expect("test proof JTI is canonical"),
-            },
-            auth_transaction_replay: None,
-            enrollment: None,
-            enrollment_body: None,
-            rebind: Some(bootstrap),
-            htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.rebindDeviceAuthentication"
-                .to_owned(),
-            endpoint,
-            method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
-            trusted_instant,
-            chat_instance,
-            token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
-            token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
-            proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
-            token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-            proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
+                subject,
+                audience: "did:web:chat.catbird.blue".to_owned(),
+                device_id,
+                dpop_jkt: dpop_jkt.clone(),
+                token_replay: TokenReplayIdentity {
+                    issuer: "did:web:api.catbird.blue".to_owned(),
+                    jti: token_jti,
+                },
+                proof_replay: ProofReplayIdentity {
+                    jkt: dpop_jkt,
+                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
+                        .expect("test proof JTI is canonical"),
+                },
+                auth_transaction_replay: None,
+                enrollment: None,
+                enrollment_body: None,
+                rebind: Some(bootstrap),
+                htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.rebindDeviceAuthentication"
+                    .to_owned(),
+                endpoint,
+                method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
+                trusted_instant,
+                chat_instance,
+                token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
+                token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
+                proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
+                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
+                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
+            }),
         }
     }
 }

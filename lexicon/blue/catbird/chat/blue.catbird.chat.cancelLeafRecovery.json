@@ -5,19 +5,76 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedLeafRecoveryCancellation"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["recovery"], "properties": {"recovery": {"type": "ref", "ref": "blue.catbird.chat.defs#leafRecoveryView"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedLeafRecoveryCancellation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "recovery"
+          ],
+          "properties": {
+            "recovery": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#leafRecoveryView"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "CancellationConflict"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "LeafRecoveryNotFound"},
-        {"name": "NotAuthorized"}
+        {
+          "name": "CancellationConflict"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "LeafRecoveryNotFound"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

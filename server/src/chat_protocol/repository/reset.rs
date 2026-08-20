@@ -819,7 +819,7 @@ pub(crate) struct LockedResetRequestAuthority {
     actor_key_id: Box<str>,
     actor_auth_generation: i64,
     actor_signing_public_key: Box<[u8]>,
-    actor_dpop_jkt: Box<str>,
+    actor_dpop_jkt: Option<Box<str>>,
     scope_digest: [u8; 32],
     head_digest: [u8; 32],
     admission_digest: [u8; 32],
@@ -851,7 +851,7 @@ impl LockedResetRequestAuthority {
             &self.actor_key_id,
             self.actor_auth_generation,
             &self.actor_signing_public_key,
-            &self.actor_dpop_jkt,
+            self.actor_dpop_jkt.as_deref(),
             &self.transaction_id,
             self.trusted_instant,
             &self.scope_digest,
@@ -880,7 +880,7 @@ pub(crate) struct LockedResetActivationAuthority {
     actor_key_id: Box<str>,
     actor_auth_generation: i64,
     actor_signing_public_key: Box<[u8]>,
-    actor_dpop_jkt: Box<str>,
+    actor_dpop_jkt: Option<Box<str>>,
     scope_digest: [u8; 32],
     head_digest: [u8; 32],
     admission_digest: [u8; 32],
@@ -917,7 +917,7 @@ impl LockedResetActivationAuthority {
             &self.actor_key_id,
             self.actor_auth_generation,
             &self.actor_signing_public_key,
-            &self.actor_dpop_jkt,
+            self.actor_dpop_jkt.as_deref(),
             &self.transaction_id,
             self.trusted_instant,
             &self.scope_digest,
@@ -951,7 +951,7 @@ pub(crate) struct ExpiredResetReplacementProof {
     actor_key_id: Box<str>,
     actor_auth_generation: i64,
     actor_signing_public_key: Box<[u8]>,
-    actor_dpop_jkt: Box<str>,
+    actor_dpop_jkt: Option<Box<str>>,
     scope_digest: [u8; 32],
     head_digest: [u8; 32],
     admission_digest: [u8; 32],
@@ -991,7 +991,7 @@ impl ExpiredResetReplacementProof {
             &self.actor_key_id,
             self.actor_auth_generation,
             &self.actor_signing_public_key,
-            &self.actor_dpop_jkt,
+            self.actor_dpop_jkt.as_deref(),
             &self.transaction_id,
             self.trusted_instant,
             &self.scope_digest,
@@ -1018,7 +1018,7 @@ impl ExpiredResetReplacementProof {
             &self.actor_key_id,
             self.actor_auth_generation,
             &self.actor_signing_public_key,
-            &self.actor_dpop_jkt,
+            self.actor_dpop_jkt.as_deref(),
             &self.transaction_id,
             self.trusted_instant,
             &self.scope_digest,
@@ -1066,7 +1066,7 @@ struct PreparedResetReadSet {
     actor_key_id: String,
     actor_auth_generation: i64,
     actor_signing_public_key: Vec<u8>,
-    actor_dpop_jkt: String,
+    actor_dpop_jkt: Option<String>,
     scope_digest: [u8; 32],
     head_digest: [u8; 32],
     pending: Option<LockedPendingResetRequestGuard>,
@@ -1084,7 +1084,7 @@ struct PreparedResetAttempt {
     actor_key_id: String,
     actor_auth_generation: i64,
     actor_signing_public_key: Vec<u8>,
-    actor_dpop_jkt: String,
+    actor_dpop_jkt: Option<String>,
     scope_digest: [u8; 32],
     head_digest: [u8; 32],
     pending: Option<LockedPendingResetRequestGuard>,
@@ -1144,7 +1144,7 @@ fn finish_reset_request_authority(
         actor_key_id: prepared.actor_key_id.into_boxed_str(),
         actor_auth_generation: prepared.actor_auth_generation,
         actor_signing_public_key: prepared.actor_signing_public_key.into_boxed_slice(),
-        actor_dpop_jkt: prepared.actor_dpop_jkt.into_boxed_str(),
+        actor_dpop_jkt: prepared.actor_dpop_jkt.map(String::into_boxed_str),
         scope_digest: prepared.scope_digest,
         head_digest: prepared.head_digest,
         admission_digest,
@@ -1238,7 +1238,7 @@ pub(crate) async fn prepare_reset_activation_authority(
         actor_key_id: prepared.actor_key_id.into_boxed_str(),
         actor_auth_generation: prepared.actor_auth_generation,
         actor_signing_public_key: prepared.actor_signing_public_key.into_boxed_slice(),
-        actor_dpop_jkt: prepared.actor_dpop_jkt.into_boxed_str(),
+        actor_dpop_jkt: prepared.actor_dpop_jkt.map(String::into_boxed_str),
         scope_digest: prepared.scope_digest,
         head_digest: prepared.head_digest,
         admission_digest,
@@ -2340,10 +2340,7 @@ async fn prepare_reset_attempt(
             .actor_signing_public_key()
             .ok_or(ResetRepositoryError::AuthorityBindingMismatch)?
             .to_vec(),
-        actor_dpop_jkt: scope
-            .actor_dpop_jkt()
-            .ok_or(ResetRepositoryError::AuthorityBindingMismatch)?
-            .to_owned(),
+        actor_dpop_jkt: scope.actor_dpop_jkt().map(|s| s.to_owned()),
         scope_digest: *scope.scope_digest(),
         head_digest,
         pending,
@@ -2371,7 +2368,6 @@ async fn validate_scope_and_mutation(
         || scope.actor_auth_generation() != Some(auth_generation)
         || scope.actor_key_id() != Some(authority.key_id().as_str())
         || scope.actor_signing_public_key().is_none()
-        || scope.actor_dpop_jkt().is_none()
         || authority.accepted_wrapper_bytes().is_none()
         || !whole_millis(scope.trusted_instant())
     {
@@ -2408,7 +2404,7 @@ fn validate_sealed_admission(
     actor_key_id: &str,
     actor_auth_generation: i64,
     actor_signing_public_key: &[u8],
-    actor_dpop_jkt: &str,
+    actor_dpop_jkt: Option<&str>,
     transaction_id: &str,
     trusted_instant: DateTime<Utc>,
     scope_digest: &[u8; 32],
@@ -2437,7 +2433,7 @@ fn validate_sealed_admission(
         || scope.actor_key_id() != Some(actor_key_id)
         || scope.actor_auth_generation() != Some(actor_auth_generation)
         || scope.actor_signing_public_key() != Some(actor_signing_public_key)
-        || scope.actor_dpop_jkt() != Some(actor_dpop_jkt)
+        || scope.actor_dpop_jkt() != actor_dpop_jkt
         || scope.scope_digest() != scope_digest
         || admission_digest
             != &reset_admission_digest(

@@ -2,5 +2,61 @@
   "lexicon": 1,
   "id": "blue.catbird.chat.getBlob",
   "description": "Download immutable opaque ciphertext under purpose-specific authorization. An attachment is readable only when its binding seq lies inside the caller's exact application interval; pre-join history and re-add gaps are denied even if the caller is currently a participant. A metadata avatar is readable by any current logical participant from the current metadata snapshot, including a title-only snapshot that reuses an older avatar binding. A completed unbound upload is visible only to its verified owner.",
-  "defs": {"main": {"type": "query", "parameters": {"type": "params", "required": ["blobId"], "properties": {"blobId": {"type": "string", "minLength": 36, "maxLength": 36}}}, "output": {"encoding": "application/octet-stream"}, "errors": [{"name": "BlobNotFound"}, {"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "InvalidDPoP"}, {"name": "NotAuthorized"}]}}
+  "defs": {
+    "main": {
+      "type": "query",
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId",
+          "blobId"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+          },
+          "blobId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/octet-stream"
+      },
+      "errors": [
+        {
+          "name": "BlobNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

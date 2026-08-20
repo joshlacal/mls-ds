@@ -5,28 +5,106 @@
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedApplicationSend"}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["entry"], "properties": {"entry": {"type": "ref", "ref": "blue.catbird.chat.defs#applicationEntry"}}}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedApplicationSend"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "entry"
+          ],
+          "properties": {
+            "entry": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#applicationEntry"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "BlobBindingConflict"},
-        {"name": "BlobNotFound"},
-        {"name": "BlockedRelationship"},
-        {"name": "ConversationNotAccepted"},
-        {"name": "ConversationNotFound"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotLeaf"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "IdempotencyConflict"},
-        {"name": "InvalidApplicationMessage"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InvalidSignature"},
-        {"name": "NotMember"},
-        {"name": "RecipientNotReady"},
-        {"name": "RelationshipPolicyUnavailable"},
-        {"name": "StaleCoordinates"},
-        {"name": "UnsupportedMlsProfile"}
+        {
+          "name": "BlobBindingConflict"
+        },
+        {
+          "name": "BlobNotFound"
+        },
+        {
+          "name": "BlockedRelationship"
+        },
+        {
+          "name": "ConversationNotAccepted"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotLeaf"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidApplicationMessage"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotMember"
+        },
+        {
+          "name": "RecipientNotReady"
+        },
+        {
+          "name": "RelationshipPolicyUnavailable"
+        },
+        {
+          "name": "StaleCoordinates"
+        },
+        {
+          "name": "UnsupportedMlsProfile"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

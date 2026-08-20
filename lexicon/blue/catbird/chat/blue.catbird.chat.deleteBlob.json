@@ -2,5 +2,85 @@
   "lexicon": 1,
   "id": "blue.catbird.chat.deleteBlob",
   "description": "Delete only the signer-owned completed upload that is still unbound, without requiring current conversation coordinates so removed uploaders can release quota. Bound blobs are immutable history. Upload tickets expire after five minutes; completed-unbound uploads expire after one hour; blob IDs and tombstones are never reused.",
-  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedBlobDeletion"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["blobId", "deletedAt"], "properties": {"blobId": {"type": "ref", "ref": "blue.catbird.chat.defs#operationId"}, "deletedAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}}}}, "errors": [{"name": "BlobBound"}, {"name": "BlobNotFound"}, {"name": "CutoverRequired"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "IdempotencyConflict"}, {"name": "InvalidDPoP"}, {"name": "InvalidRequest"}, {"name": "InvalidSignature"}, {"name": "NotAuthorized"}]}}
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedBlobDeletion"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "blobId",
+            "deletedAt"
+          ],
+          "properties": {
+            "blobId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#operationId"
+            },
+            "deletedAt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "BlobBound"
+        },
+        {
+          "name": "BlobNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

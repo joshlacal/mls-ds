@@ -2013,9 +2013,6 @@ impl VerifiedEnrollmentBody {
     pub fn device_id(&self) -> &CanonicalUuidV4 {
         self.verified.actor_device_id()
     }
-    pub fn dpop_jkt(&self) -> &KeyThumbprint {
-        body_thumbprint(&self.verified.canonical.body, "dpopJkt")
-    }
     pub fn key_id(&self) -> &KeyThumbprint {
         self.verified.key_id()
     }

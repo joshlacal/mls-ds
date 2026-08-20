@@ -5,21 +5,99 @@
   "defs": {
     "main": {
       "type": "query",
-      "parameters": {"type": "params", "required": ["conversationId"], "properties": {"conversationId": {"type": "string", "minLength": 36, "maxLength": 36, "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 conversation ID; strict runtime validation rejects every other spelling/version/variant."}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["state", "pendingResetRequests", "pendingLeaveRequests"], "properties": {
-        "state": {"type": "ref", "ref": "blue.catbird.chat.defs#conversationState"},
-        "pendingResetRequests": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#resetRequestView"}, "minLength": 0, "maxLength": 100},
-        "pendingLeaveRequests": {"type": "array", "items": {"type": "ref", "ref": "blue.catbird.chat.defs#leaveRequestView"}, "minLength": 0, "maxLength": 100}
-      }}},
+      "parameters": {
+        "type": "params",
+        "required": [
+          "actorDeviceId",
+          "conversationId"
+        ],
+        "properties": {
+          "actorDeviceId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+          },
+          "conversationId": {
+            "type": "string",
+            "minLength": 36,
+            "maxLength": 36,
+            "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 conversation ID; strict runtime validation rejects every other spelling/version/variant."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "state",
+            "pendingResetRequests",
+            "pendingLeaveRequests"
+          ],
+          "properties": {
+            "state": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationState"
+            },
+            "pendingResetRequests": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#resetRequestView"
+              },
+              "minLength": 0,
+              "maxLength": 100
+            },
+            "pendingLeaveRequests": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#leaveRequestView"
+              },
+              "minLength": 0,
+              "maxLength": 100
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "AccessOutsideMembershipInterval"},
-        {"name": "ConversationNotFound"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "NotEntitled"}
+        {
+          "name": "AccessOutsideMembershipInterval"
+        },
+        {
+          "name": "ConversationNotFound"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "NotEntitled"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

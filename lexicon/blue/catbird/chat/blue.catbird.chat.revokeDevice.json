@@ -1,6 +1,81 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.revokeDevice",
-  "description": "Signed lost-device or self revocation using authoritative own-device inventory CAS fields. Revocation releases packages/reservations/recovery requests but does not forge MLS leaf removal or logical participant removal. For exact completed self-revoke response-loss replay only, the bearer DID and a fresh proof under the historical JKT recorded by that operation plus the same canonical request digest/signature return the stored response before active-device checks; it never reexecutes.",
-  "defs": {"main": {"type": "procedure", "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["signedRequest"], "properties": {"signedRequest": {"type": "ref", "ref": "blue.catbird.chat.defs#signedDeviceRevocation"}}}}, "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["device"], "properties": {"device": {"type": "ref", "ref": "blue.catbird.chat.defs#deviceView"}}}}, "errors": [{"name": "AuthenticationGenerationConflict"}, {"name": "CutoverRequired"}, {"name": "DeviceNotFound"}, {"name": "DeviceNotRegistered"}, {"name": "DeviceRevoked"}, {"name": "IdempotencyConflict"}, {"name": "InvalidDPoP"}, {"name": "InvalidRequest"}, {"name": "InvalidSignature"}, {"name": "NotAuthorized"}]}}
+  "description": "Signed lost-device or self revocation using authoritative own-device inventory CAS fields. Revocation releases packages, reservations, and recovery requests but does not forge MLS leaf removal or logical participant removal. Exact completed response-loss replay requires the same authenticated DID, canonical request digest, and signature; it returns the stored response without reexecuting the revocation.",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "signedRequest"
+          ],
+          "properties": {
+            "signedRequest": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#signedDeviceRevocation"
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "device"
+          ],
+          "properties": {
+            "device": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceView"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AuthenticationGenerationConflict"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotFound"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "IdempotencyConflict"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InvalidSignature"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
 }

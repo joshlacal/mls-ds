@@ -29,10 +29,7 @@ const DEFAULT_TTL_SECONDS: i64 = 86400;
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const IDEMPOTENCY_REPLAYED_HEADER: &str = "Idempotency-Replayed";
 const CHAT_XRPC_PREFIX: &str = "/xrpc/blue.catbird.chat.";
-const ENROLL_DEVICE_ENDPOINT: &str =
-    "/xrpc/blue.catbird.chat.enrollDevice";
-const REBIND_DEVICE_AUTH_ENDPOINT: &str =
-    "/xrpc/blue.catbird.chat.rebindDeviceAuthentication";
+const ENROLL_DEVICE_ENDPOINT: &str = "/xrpc/blue.catbird.chat.enrollDevice";
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 256 * 1024;
 
@@ -68,14 +65,11 @@ struct CachedResponse {
 }
 
 fn should_apply(endpoint: &str, method: &Method) -> bool {
-    endpoint.starts_with(CHAT_XRPC_PREFIX)
-        && matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE")
-        // Enrollment has stronger, request-bound replay semantics: every
-        // attempt needs a fresh DPoP proof and complete consumes a one-time
-        // challenge. Returning a cached response here would bypass both the
-        // DPoP verifier and the handler's database rechecks.
-        && endpoint != ENROLL_DEVICE_ENDPOINT
-        && endpoint != REBIND_DEVICE_AUTH_ENDPOINT
+    let _ = (endpoint, method);
+    // Revised clean-chat routes under blue.catbird.chat.* have request-bound
+    // database arbitration and exact signed-body idempotency; they bypass this
+    // generic HTTP header cache. Non-chat routes are also excluded from this layer.
+    false
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -463,41 +457,21 @@ mod tests {
     }
 
     #[test]
-    fn apply_only_to_chat_write_endpoints() {
-        assert!(should_apply(
+    fn excludes_revised_clean_chat_endpoints_from_generic_cache() {
+        for endpoint in [
             "/xrpc/blue.catbird.chat.sendMessage",
-            &Method::POST
-        ));
-        assert!(!should_apply(
-            "/xrpc/blue.catbird.mlsDS.deliverMessage",
-            &Method::POST
-        ));
+            "/xrpc/blue.catbird.chat.enrollDevice",
+            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
+            "/xrpc/blue.catbird.chat.createConversation",
+        ] {
+            assert!(!should_apply(endpoint, &Method::POST));
+            assert!(!should_apply(endpoint, &Method::PUT));
+        }
         assert!(!should_apply(
             "/xrpc/blue.catbird.chat.getConversations",
             &Method::GET
         ));
     }
-
-    #[test]
-    fn excludes_device_auth_enrollment_from_pre_verification_cache() {
-        for endpoint in [
-            "/xrpc/blue.catbird.chat.enrollDevice",
-            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
-        ] {
-            assert!(!should_apply(endpoint, &Method::POST));
-            assert!(!should_apply(endpoint, &Method::PUT));
-        }
-
-        assert!(should_apply(
-            "/xrpc/blue.catbird.chat.enrollDeviceExtra",
-            &Method::POST
-        ));
-        assert!(should_apply(
-            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication/extra",
-            &Method::POST
-        ));
-    }
-
     #[test]
     fn reject_invalid_idempotency_key() {
         let mut headers = HeaderMap::new();

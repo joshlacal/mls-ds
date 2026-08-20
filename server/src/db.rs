@@ -528,7 +528,6 @@ where
 /// `bootstrap_reset_group.rs:569`). `kp_hashes` empty ⇒ no-op `Ok(())`.
 ///
 
-
 /// Snapshot of the post-bump health counters returned by
 /// [`record_commit_409`]. Used by the inline trigger path
 /// (Phase 2 B5 — `jobs::auto_detect_failed_groups::maybe_trigger_inline_reset`)
@@ -4417,8 +4416,6 @@ mod tests {
 
         assert_eq!(members.len(), 2);
     }
-
-
 
     // ── W4: roster-ghost removal ──────────────────────────────────────────
 

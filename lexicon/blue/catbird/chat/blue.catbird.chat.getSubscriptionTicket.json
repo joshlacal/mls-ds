@@ -1,26 +1,107 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.getSubscriptionTicket",
-  "description": "After conversations, pending Welcomes, and recovery inbox have all reached hasMore=false for one inventorySession, a fresh DPoP-authenticated call atomically marks that barrier complete and mints a one-use short-lived ticket. The ticket binds effective DID, device, JKT, authGeneration, inventorySessionId, exact event cursor, and subscription path. The first durable envelope's previousCursor equals that cursor.",
+  "description": "After conversations, pending Welcomes, and recovery inbox have all reached hasMore=false for one inventorySession, a service-authenticated call atomically marks that barrier complete and mints a one-use short-lived ticket. The ticket binds the authenticated DID, actorDeviceId, authGeneration, inventorySessionId, exact event cursor, and subscription path. The first durable envelope's previousCursor equals that cursor.",
   "defs": {
     "main": {
       "type": "procedure",
-      "input": {"encoding": "application/json", "schema": {"type": "object", "required": ["inventorySessionId", "eventCursor"], "properties": {"inventorySessionId": {"type": "string", "minLength": 32, "maxLength": 512}, "eventCursor": {"type": "string", "minLength": 1, "maxLength": 512}}}},
-      "output": {"encoding": "application/json", "schema": {"type": "object", "required": ["ticket", "endpoint", "expiresAt"], "properties": {
-        "ticket": {"type": "string", "minLength": 32, "maxLength": 4096},
-        "endpoint": {"type": "string", "format": "uri", "minLength": 1, "maxLength": 2048},
-        "expiresAt": {"type": "ref", "ref": "blue.catbird.chat.defs#canonicalDatetime"}
-      }}},
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "actorDeviceId",
+            "inventorySessionId",
+            "eventCursor"
+          ],
+          "properties": {
+            "actorDeviceId": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36,
+              "description": "Canonical lowercase hyphenated RFC 4122-variant UUIDv4 device ID; strict runtime validation rejects every other spelling, version, or variant."
+            },
+            "inventorySessionId": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 512
+            },
+            "eventCursor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "ticket",
+            "endpoint",
+            "expiresAt"
+          ],
+          "properties": {
+            "ticket": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 4096
+            },
+            "endpoint": {
+              "type": "string",
+              "format": "uri",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            "expiresAt": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            }
+          }
+        }
+      },
       "errors": [
-        {"name": "CursorExpired"},
-        {"name": "CutoverRequired"},
-        {"name": "DeviceNotRegistered"},
-        {"name": "DeviceRevoked"},
-        {"name": "InvalidDPoP"},
-        {"name": "InvalidRequest"},
-        {"name": "InventoryIncomplete"},
-        {"name": "InventorySessionExpired"},
-        {"name": "InventorySessionMismatch"}
+        {
+          "name": "CursorExpired"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "InventoryIncomplete"
+        },
+        {
+          "name": "InventorySessionExpired"
+        },
+        {
+          "name": "InventorySessionMismatch"
+        },
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "DeviceBindingMismatch"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
       ]
     }
   }

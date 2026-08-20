@@ -1,10 +1,11 @@
-//! Shared authentication and admission spine for every clean-chat handler.
+//! Shared standard AppView authentication and admission spine for every
+//! clean-chat handler.
 //!
-//! Handlers never re-implement DPoP/replay crypto. They call one `admit_*`
+//! Handlers never re-implement service-auth/replay crypto. They call one `admit_*`
 //! function per auth class, which:
 //!   1. evaluates the global cutover gate (OQ-2),
 //!   2. captures one trusted instant `T`,
-//!   3. dispatches to the correct `dpop::verify_*_request_auth` by NSID,
+//!   3. verifies exact standard service auth for the requested NSID,
 //!   4. extracts the exact `signedRequest` bytes where the endpoint uses one
 //!      (preserved
 //!      verbatim via `RawValue` so the idempotency wrapper-byte contract holds)
@@ -14,8 +15,8 @@
 //!      escape (OQ-3).
 //!
 //! Every failure is mapped to a [`ChatFailure`] at the exact call site that
-//! produced it, so DPoP failures surface as `InvalidDPoP`, malformed request
-//! bodies as `InvalidRequest`, and signature failures as `InvalidSignature`,
+//! produced it, so account/session failures remain distinct from malformed
+//! request bodies and device-signature failures,
 //! while internal storage/invariant failures carry no protocol code.
 
 use axum::{
@@ -25,16 +26,17 @@ use axum::{
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::auth::{self as service_auth, AuthError};
 use crate::chat_protocol::{
-    dpop::{self, TrustedNestVerifier, VerifiedReadAdmission},
+    dpop::{self, VerifiedReadAdmission},
     error::{ChatEndpoint, ChatProtocolErrorCode},
     repository::auth::{
         self, AuthRepositoryError, CompletedIdempotentResponse, EnrollmentOperationAdmission,
-        RebindOperationAdmission, SignedOperationAdmission,
+        SignedOperationAdmission,
     },
     repository::prelude::PreludeError,
     transcript,
-    validation::{CanonicalHttpMethod, TrustedRequestInstant, ValidatedChatNsid},
+    validation::{CanonicalHttpMethod, TrustedRequestInstant},
 };
 use crate::storage::DbPool;
 
@@ -57,50 +59,35 @@ pub(crate) fn require_cutover(
     }
 }
 
-/// The configured Nest verifier. Absence while cutover is enabled is a
-/// misconfiguration (startup rejects it), so at request time it is an internal
-/// invariant violation rather than a client-facing error.
-fn verifier(
-    runtime: &ChatRuntime,
-    endpoint: ChatEndpoint,
-) -> Result<&TrustedNestVerifier, ChatFailure> {
-    runtime
-        .nest_verifier()
-        .ok_or_else(|| ChatFailure::invariant(endpoint))
-}
-
-struct DpopHeaders {
-    authorization: String,
-    proof: String,
-}
-
-fn read_dpop_headers(
-    headers: &HeaderMap,
-    endpoint: ChatEndpoint,
-) -> Result<DpopHeaders, ChatFailure> {
-    let authorization = header_value(headers, "authorization")
-        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    let proof = header_value(headers, "dpop")
-        .ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    Ok(DpopHeaders {
-        authorization,
-        proof,
-    })
-}
-
-fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
-}
-
-fn validated_nsid(endpoint: ChatEndpoint) -> Result<ValidatedChatNsid, ChatFailure> {
-    ValidatedChatNsid::parse(endpoint.nsid()).map_err(|_| ChatFailure::invariant(endpoint))
-}
-
 fn capture_instant(endpoint: ChatEndpoint) -> Result<TrustedRequestInstant, ChatFailure> {
     TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(endpoint))
+}
+
+async fn verify_service_principal(
+    pool: &DbPool,
+    endpoint: ChatEndpoint,
+    headers: &HeaderMap,
+) -> Result<crate::auth::VerifiedServicePrincipal, ChatFailure> {
+    service_auth::verify_mls_service_principal(headers, pool, endpoint.nsid())
+        .await
+        .map_err(|error| service_auth_failure(endpoint, error))
+}
+
+fn service_auth_failure(endpoint: ChatEndpoint, error: AuthError) -> ChatFailure {
+    match error {
+        AuthError::TokenExpired => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::AccountSessionExpired)
+        }
+        AuthError::RateLimitExceeded { retry_after_secs } => {
+            ChatFailure::protocol_with_retry(
+                endpoint,
+                ChatProtocolErrorCode::RateLimited,
+                Some(retry_after_secs),
+            )
+        }
+        AuthError::Internal(_) => ChatFailure::storage(endpoint),
+        _ => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized),
+    }
 }
 
 /// Extract the exact wire bytes of the `signedRequest` field, preserving them
@@ -120,6 +107,22 @@ pub(crate) fn signed_request_bytes(
     Ok(envelope.signed_request.get().as_bytes().to_vec())
 }
 
+pub(crate) fn actor_device_id_from_query(
+    query: Option<&str>,
+    endpoint: ChatEndpoint,
+) -> Result<String, ChatFailure> {
+    let values: Vec<String> = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter_map(|(key, value)| (key == "actorDeviceId").then(|| value.into_owned()))
+        .collect();
+    match values.as_slice() {
+        [value] => Ok(value.clone()),
+        _ => Err(ChatFailure::protocol(
+            endpoint,
+            ChatProtocolErrorCode::InvalidRequest,
+        )),
+    }
+}
+
 /// Admit an ordinary unsigned (DPoP) read query and immediately seal the
 /// committed authority into an opaque [`VerifiedReadAdmission`].
 ///
@@ -134,21 +137,14 @@ pub(crate) async fn admit_unsigned_read(
     endpoint: ChatEndpoint,
     method: CanonicalHttpMethod,
     headers: &HeaderMap,
+    actor_device_id: &str,
 ) -> Result<VerifiedReadAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let nsid = validated_nsid(endpoint)?;
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let instant = capture_instant(endpoint)?;
-    let pre_replay = dpop::verify_ordinary_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        &nsid,
-        &method,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, actor_device_id, method, instant, None)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     let authority = auth::authorize_unsigned_request(pool, pre_replay)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))?;
@@ -167,22 +163,17 @@ pub(crate) async fn admit_signed_operation_only(
     body: &[u8],
 ) -> Result<SignedOperationAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let nsid = validated_nsid(endpoint)?;
-    let instant = capture_instant(endpoint)?;
-    let pre_replay = dpop::verify_ordinary_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        &nsid,
-        &CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let signed_bytes = signed_request_bytes(body, endpoint)?;
     let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes)
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let actor_device_id = canonical.actor_device_id().as_str().to_owned();
+    let method =
+        CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?;
+    let instant = capture_instant(endpoint)?;
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, &actor_device_id, method, instant, None)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     auth::authorize_signed_operation_only(pool, pre_replay, canonical)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
@@ -199,50 +190,23 @@ pub(crate) async fn admit_enrollment_operation_only(
     body: &[u8],
 ) -> Result<EnrollmentOperationAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let instant = capture_instant(endpoint)?;
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let signed_bytes = signed_request_bytes(body, endpoint)?;
     let enrollment_body = transcript::decode_and_verify_enrollment_body(&signed_bytes)
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let pre_replay = dpop::verify_enrollment_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        enrollment_body,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    auth::authorize_enrollment_operation_only(pool, pre_replay)
-        .await
-        .map_err(|error| auth_repository_failure(endpoint, error))
-}
-
-/// Operation-only rebind admission. No completed response can cross this
-/// boundary; post-state replay validation is deferred to the operation prelude.
-pub(crate) async fn admit_rebind_operation_only(
-    pool: &DbPool,
-    runtime: &ChatRuntime,
-    endpoint: ChatEndpoint,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<RebindOperationAdmission, ChatFailure> {
-    require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
+    let device_id = enrollment_body.device_id().as_str().to_owned();
+    let method =
+        CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?;
     let instant = capture_instant(endpoint)?;
-    let signed_bytes = signed_request_bytes(body, endpoint)?;
-    let bootstrap = transcript::decode_rebind_bootstrap(&signed_bytes)
-        .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
-    let pre_replay = dpop::verify_rebind_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        bootstrap,
-        &instant,
+    let pre_replay = dpop::standard_service_auth_evidence(
+        principal,
+        &device_id,
+        method,
+        instant,
+        Some(enrollment_body),
     )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
-    auth::authorize_rebind_operation_only(pool, pre_replay)
+    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    auth::authorize_enrollment_operation_only(pool, pre_replay)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
 }
@@ -258,22 +222,17 @@ pub(crate) async fn admit_replenishment_operation_only(
     body: &[u8],
 ) -> Result<SignedOperationAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let trust = verifier(runtime, endpoint)?;
-    let dpop_headers = read_dpop_headers(headers, endpoint)?;
-    let nsid = validated_nsid(endpoint)?;
-    let instant = capture_instant(endpoint)?;
-    let pre_replay = dpop::verify_ordinary_request_auth(
-        trust,
-        &dpop_headers.authorization,
-        &dpop_headers.proof,
-        &nsid,
-        &CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?,
-        &instant,
-    )
-    .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidDPoP))?;
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let signed_bytes = signed_request_bytes(body, endpoint)?;
     let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes)
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+    let actor_device_id = canonical.actor_device_id().as_str().to_owned();
+    let method =
+        CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?;
+    let instant = capture_instant(endpoint)?;
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, &actor_device_id, method, instant, None)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     auth::authorize_replenishment_operation_only(pool, pre_replay, canonical)
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
@@ -350,7 +309,8 @@ pub(crate) fn auth_repository_failure(
         E::CorruptIdempotencyRecord | E::InvalidCompletion => {
             return ChatFailure::invariant(endpoint)
         }
-        E::ReplayDetected | E::DpopBindingMismatch => C::InvalidDPoP,
+        E::ReplayDetected => C::NotAuthorized,
+        E::DpopBindingMismatch => C::DeviceBindingMismatch,
         E::DeviceNotRegistered | E::DeviceKeyMissing => C::DeviceNotRegistered,
         E::DeviceAlreadyRegistered => C::DeviceAlreadyExists,
         E::DeviceRevoked | E::DeviceKeyRevoked => C::DeviceRevoked,

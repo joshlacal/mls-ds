@@ -530,15 +530,17 @@ async fn handle_socket(
                         "Received typing indicator via WebSocket"
                     );
                     // Broadcast typing event to other subscribers
-                    if let Ok(typing_event) = serde_json::from_value::<StreamEvent>(serde_json::json!({
-                        "$type": "blue.catbird.chat.defs#typingEvent",
-                        "actorDeviceId": "legacy-ws",
-                        "actorDid": user_did_clone,
-                        "conversationId": convo_id,
-                        "expiresAt": "2026-08-16T12:00:08.000Z",
-                        "isTyping": is_typing,
-                        "typingId": ulid::Ulid::new().to_string(),
-                    })) {
+                    if let Ok(typing_event) =
+                        serde_json::from_value::<StreamEvent>(serde_json::json!({
+                            "$type": "blue.catbird.chat.defs#typingEvent",
+                            "actorDeviceId": "legacy-ws",
+                            "actorDid": user_did_clone,
+                            "conversationId": convo_id,
+                            "expiresAt": "2026-08-16T12:00:08.000Z",
+                            "isTyping": is_typing,
+                            "typingId": ulid::Ulid::new().to_string(),
+                        }))
+                    {
                         let tx = sse_state_clone.get_channel(&convo_id).await;
                         let _ = tx.send(typing_event);
                     }

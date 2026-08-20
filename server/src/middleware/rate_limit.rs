@@ -278,10 +278,7 @@ fn get_endpoint_quota(endpoint: &str) -> (u32, Duration) {
         .trim_start_matches("blue.catbird.chat.")
         .trim_start_matches("blue.catbird.mlsDS.");
 
-    let limit = if matches!(
-        endpoint_name,
-        "enrollDevice" | "rebindDeviceAuthentication"
-    ) {
+    let limit = if endpoint_name == "enrollDevice" {
         std::env::var("RATE_LIMIT_DEVICE_AUTH_BINDING")
             .ok()
             .and_then(|v| v.parse().ok())

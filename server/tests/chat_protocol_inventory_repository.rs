@@ -174,7 +174,7 @@ fn fixture_with_capability(
         token_hash: capability_hash,
         user_did: did.clone(),
         device_id,
-        jkt: jkt.clone(),
+        jkt: Some(jkt.clone()),
         auth_generation,
         snapshot_event_position: 42,
         snapshot_event_cursor_bytes: capability.as_bytes().to_vec(),
@@ -185,7 +185,7 @@ fn fixture_with_capability(
         welcomes: InventoryCompletionEvidence::incomplete(),
         recovery: InventoryCompletionEvidence::incomplete(),
         device_status: "active".to_owned(),
-        current_dpop_jkt: jkt.clone(),
+        current_dpop_jkt: Some(jkt.clone()),
         current_auth_generation: auth_generation,
         device_revoked_at: None,
         key_id: ed25519_key_id(&signing_public_key)
@@ -1156,7 +1156,7 @@ fn drifted_authority_or_fence_fails_closed_without_bytes_or_consumption() {
         (
             "DPoP rebind",
             drift_fixture(&fixture, |f| {
-                f.current_dpop_jkt = URL_SAFE_NO_PAD.encode([0x62; 32])
+                f.current_dpop_jkt = Some(URL_SAFE_NO_PAD.encode([0x62; 32]))
             }),
             InventoryRepositoryError::DeviceAuthorityMismatch,
         ),

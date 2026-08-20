@@ -3,20 +3,20 @@
     "https://www.w3.org/ns/did/v1",
     "https://w3id.org/security/multikey/v1"
   ],
-  "id": "did:web:mlschat.catbird.blue",
+  "id": "did:web:chat.catbird.blue",
   "verificationMethod": [
     {
-      "id": "did:web:mlschat.catbird.blue#atproto",
+      "id": "did:web:chat.catbird.blue#atproto",
       "type": "Multikey",
-      "controller": "did:web:mlschat.catbird.blue",
+      "controller": "did:web:chat.catbird.blue",
       "publicKeyMultibase": "z6MkvTNXk57pes2tei8N2uXogzXsf3RT3WmdLtiojcEgMUb6"
     }
   ],
   "service": [
     {
       "id": "#atproto_mls",
-      "type": "AtprotoMlsService",
-      "serviceEndpoint": "https://mlschat.catbird.blue"
+      "type": "AtprotoMLSDeliveryService",
+      "serviceEndpoint": "https://chat.catbird.blue"
     }
   ]
 }
