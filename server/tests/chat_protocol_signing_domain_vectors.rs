@@ -675,3 +675,62 @@ fn application_send_vector_operation_id_is_message_id_not_generic_idempotency() 
         _ => panic!("unexpected application-send projection"),
     }
 }
+#[test]
+fn participant_acceptance_server_fields_accepts_bytes_envelope() {
+    use transcript::CanonicalControlServerFields;
+    let bound_coord = serde_json::json!({
+        "conversationId": "009ffa92-4bf9-4307-bf26-e7428d53d800",
+        "generation": 0,
+        "stateVersion": 1,
+        "groupId": {
+            "$bytes": "GTu3NbweIIBe3sJv720BZEA6YzwPxYTXjYBVB+7EB2M="
+        },
+        "epoch": 0,
+        "groupContextHash": {
+            "$bytes": "dNZwPlqizJADC1l9N2VV1Yna6sSzNnXdvkCiguL6B6k="
+        },
+        "confirmationTag": {
+            "$bytes": "ixtwb78YjjWEJ/Y98+/2pCKNi4qpXyo6FVExKruDDRo="
+        },
+        "lifecycle": "active"
+    });
+    let recovery_json = serde_json::json!({
+        "recovery": {
+            "recoveryRequestId": "6e24c3fd-82b0-4bd4-ad50-8bfe56475481",
+            "conversationId": "009ffa92-4bf9-4307-bf26-e7428d53d800",
+            "requesterDid": "did:plc:z3rwldqwosuekdwpn45d6uly",
+            "requesterDeviceId": "1ad34b5a-3c93-4201-a5c9-b0951b7bc92a",
+            "recoveryKind": "add",
+            "boundCoordinate": bound_coord,
+            "reservation": {
+                "recoveryRequestId": "6e24c3fd-82b0-4bd4-ad50-8bfe56475481",
+                "conversationId": "009ffa92-4bf9-4307-bf26-e7428d53d800",
+                "boundCoordinate": bound_coord,
+                "requesterDid": "did:plc:z3rwldqwosuekdwpn45d6uly",
+                "requesterDeviceId": "1ad34b5a-3c93-4201-a5c9-b0951b7bc92a",
+                "requesterKeyId": "IMTxmsDtJ8LfOrIm1Ptfp_KCnOUyTwzVYRpnQwODXeE",
+                "requesterAuthGeneration": 1,
+                "keyPackageRef": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "purpose": "leafRecovery",
+                "status": "active",
+                "expiresAt": "2026-08-21T08:30:00.000Z",
+                "keyPackage": {
+                    "framing": "mlsMessage",
+                    "contentType": "keyPackage",
+                    "bytes": "AQEBAQEBAQE=",
+                    "sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    "keyPackageRef": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                }
+            },
+            "status": "open",
+            "requestedAt": "2026-08-21T08:21:23.455Z",
+            "expiresAt": "2026-08-21T08:30:00.000Z"
+        }
+    });
+    let sf = CanonicalControlServerFields::decode(
+        ControlEntryKind::ParticipantAcceptance,
+        &serde_json::to_vec(&recovery_json).unwrap(),
+    ).expect("must decode serverFields with bytes envelopes");
+    assert!(!sf.canonical_dag_cbor().is_empty());
+}

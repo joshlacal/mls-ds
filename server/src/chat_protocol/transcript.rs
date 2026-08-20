@@ -648,14 +648,10 @@ fn project_object(
     let required = schema["required"]
         .as_array()
         .ok_or_else(|| AuthPrimitiveError::invalid("invalid embedded required fields"))?;
-    if required
-        .iter()
-        .filter_map(SchemaValue::as_str)
-        .any(|name| !output.contains_key(name))
-    {
-        return Err(AuthPrimitiveError::invalid(
-            "missing required closed object field",
-        ));
+    for name in required.iter().filter_map(SchemaValue::as_str) {
+        if !output.contains_key(name) {
+            return Err(AuthPrimitiveError::invalid("missing required closed object field"));
+        }
     }
     if let Some(name) = definition_name {
         enforce_contract_order(name, &output)?;
@@ -724,8 +720,13 @@ fn decode_standard_base64(value: &str) -> Result<Vec<u8>, AuthPrimitiveError> {
 }
 
 fn project_bytes(schema: &SchemaValue, input: &RawJson) -> Result<DagValue, AuthPrimitiveError> {
-    let RawJson::String(value) = input else {
-        return Err(AuthPrimitiveError::invalid("bytes field type"));
+    let value = match input {
+        RawJson::String(value) => value.as_str(),
+        RawJson::Object(values) if values.len() == 1 => match values.get("$bytes") {
+            Some(RawJson::String(value)) => value.as_str(),
+            _ => return Err(AuthPrimitiveError::invalid("bytes field type")),
+        },
+        _ => return Err(AuthPrimitiveError::invalid("bytes field type")),
     };
     let decoded = decode_standard_base64(value)?;
     let length = decoded.len() as u64;

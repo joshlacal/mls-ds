@@ -120,6 +120,7 @@ lazy_static = "1.4"
 [dev-dependencies]
 tempfile = "3"
 tower-util = { package = "tower", version = "0.5", features = ["util"] }
+ 
 
 [[bin]]
 name = "catbird-server"
@@ -135,6 +136,10 @@ required-features = ["server-bin"]
 name = "chat_protocol_production_cfg"
 path = "tests/chat_protocol_production_cfg.rs"
 required-features = ["chat-protocol-production-proof"]
+
+[[test]]
+name = "chat_protocol_create_conversation_regression"
+path = "tests/chat_protocol_create_conversation_regression.rs"
 
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
