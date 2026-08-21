@@ -105,7 +105,10 @@ async fn serve(
 ) -> Result<Response, ChatFailure> {
     context::require_cutover(runtime, endpoint)?;
     let parsed = match QueryParams::parse(query, domain) {
-        Ok(p) => p,
+        Ok(p) => {
+            eprintln!("inventory query parsed actor_device_id: {:?}", p.actor_device_id);
+            p
+        }
         Err(e) => {
             eprintln!("QueryParams::parse failed: {:?}", e);
             return Err(ChatFailure::protocol(endpoint, e));
