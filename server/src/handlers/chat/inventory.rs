@@ -88,7 +88,10 @@ async fn handle(
 ) -> Response {
     match serve(pool, runtime, headers, query, endpoint, domain).await {
         Ok(response) => response,
-        Err(failure) => failure.into_response(),
+        Err(failure) => {
+            eprintln!("inventory serve failed for {:?}: {:?}", endpoint, failure);
+            failure.into_response()
+        }
     }
 }
 
