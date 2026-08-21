@@ -66,7 +66,8 @@ fn map_snapshot_error(error: PublicGroupSnapshotError) -> PublicStateError {
     }
 }
 
-fn map_wire_error(_error: WireValidationError) -> PublicStateError {
+fn map_wire_error(error: WireValidationError) -> PublicStateError {
+    tracing::error!("map_wire_error: {:?}", error);
     PublicStateError::InvalidWireArtifact
 }
 

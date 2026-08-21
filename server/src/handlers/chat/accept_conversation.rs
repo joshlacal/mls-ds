@@ -74,10 +74,10 @@ async fn handle_inner(
 }
 
 fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> ChatFailure {
+    tracing::error!("acceptance_failure: {:?}", error);
     use AcceptanceFacadeError as E;
     use ChatProtocolErrorCode as C;
     use StateMachineError as S;
-
     match error {
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Prelude(PreludeError::Authorization(error)) => {

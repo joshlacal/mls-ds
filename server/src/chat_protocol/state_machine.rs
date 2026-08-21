@@ -205,13 +205,12 @@ impl ServerTimestamp {
             .ok_or(StateMachineError::InvalidServerTime)
     }
 }
-
 impl From<PublicStateError> for StateMachineError {
-    fn from(_value: PublicStateError) -> Self {
+    fn from(value: PublicStateError) -> Self {
+        tracing::error!("PublicStateError -> InvalidPublicState: {:?}", value);
         Self::InvalidPublicState
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PrincipalId(Vec<u8>);
 
@@ -16842,6 +16841,7 @@ fn ensure_active(state: &ConversationState) -> Result<(), StateMachineError> {
         return Err(StateMachineError::ConversationClosed);
     }
     if state.public_state().coordinate() != &state.coordinate {
+        tracing::error!("coordinate mismatch: public_state={:?} != state_coord={:?}", state.public_state().coordinate(), state.coordinate);
         return Err(StateMachineError::InvalidPublicState);
     }
     Ok(())
@@ -17774,13 +17774,26 @@ fn require_commit_body(
                 ..
             }),
         ) => {
-            signed_prior == prior
-                && signed_next == next
-                && request_id == Some(recovery_request_id)
-                && (evidence.authority.is_none()
-                    || (commit.verified_commit_sha256() == Some(commit_sha256)
-                        && commit.verified_aad_sha256() == Some(aad_digest)
-                        && commit_metadata_matches(prior_state, metadata, next)))
+            let c_prior = signed_prior == prior;
+            let c_next = signed_next == next;
+            let c_req = request_id == Some(recovery_request_id);
+            let c_commit_sha = commit.verified_commit_sha256() == Some(commit_sha256);
+            let c_aad_sha = commit.verified_aad_sha256() == Some(aad_digest);
+            let c_meta = commit_metadata_matches(prior_state, metadata, next);
+            tracing::error!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
+            if !c_prior {
+                tracing::error!("prior mismatch: signed_prior={:?} != prior={:?}", signed_prior, prior);
+            }
+            if !c_next {
+                tracing::error!("next mismatch: signed_next={:?} != next={:?}", signed_next, next);
+            }
+            if !c_commit_sha {
+                tracing::error!("commit_sha mismatch: verified={:?} != signed={:?}", commit.verified_commit_sha256(), commit_sha256);
+            }
+            if !c_aad_sha {
+                tracing::error!("aad_sha mismatch: verified={:?} != signed={:?}", commit.verified_aad_sha256(), aad_digest);
+            }
+            c_prior && c_next && c_req && (evidence.authority.is_none() || (c_commit_sha && c_aad_sha && c_meta))
         }
         (
             SignedMutationKind::LeaveCommitFulfillment,
@@ -17818,25 +17831,25 @@ fn commit_metadata_matches(
     next_coordinate: &PublicGroupSnapshotCoordinate,
 ) -> bool {
     let Some(prior_metadata) = prior.metadata.as_ref() else {
+        tracing::error!("commit_metadata_matches: prior.metadata is None");
         return false;
     };
-    metadata_coordinate_matches(next_metadata, next_coordinate)
-        && next_metadata.metadata_version == prior_metadata.metadata_version
-        && next_metadata.origin_transition_id == prior_metadata.origin_transition_id
-        // `assert_metadata_snapshot_mapping`'s commit arm carries ciphertext_size
-        // forward IS NOT DISTINCT FROM the prior snapshot. Without this the
-        // length drift survives planning and only fails in the deferred trigger
-        // at COMMIT, turning a client-supplied re-encryption of the wrong length
-        // into a 23514 storage 500 instead of a typed InvalidTransition.
-        && next_metadata.ciphertext.len() == prior_metadata.ciphertext.len()
-        // `assert_metadata_snapshot_mapping`'s commit arm carries ciphertext_size
-        // forward IS NOT DISTINCT FROM the prior snapshot. Without this the
-        // length drift survives planning and only fails in the deferred trigger
-        // at COMMIT, turning a client-supplied re-encryption of the wrong length
-        // into a 23514 storage 500 instead of a typed InvalidTransition.
-        && next_metadata.author_proof == prior_metadata.author_proof
-        && next_metadata.avatar_binding == prior_metadata.avatar_binding
-        && next_metadata.nonce != prior_metadata.nonce
+    let c_coord = metadata_coordinate_matches(next_metadata, next_coordinate);
+    let c_ver = next_metadata.metadata_version == prior_metadata.metadata_version;
+    let c_ot = next_metadata.origin_transition_id == prior_metadata.origin_transition_id;
+    let c_len = next_metadata.ciphertext.len() == prior_metadata.ciphertext.len();
+    let c_auth = next_metadata.author_proof == prior_metadata.author_proof;
+    let c_avatar = next_metadata.avatar_binding == prior_metadata.avatar_binding;
+    let c_nonce = next_metadata.nonce != prior_metadata.nonce;
+    tracing::error!("commit_metadata_matches: next_len={}, prior_len={}", next_metadata.ciphertext.len(), prior_metadata.ciphertext.len());
+    tracing::error!("commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}", c_coord, c_ver, c_ot, c_len, c_auth, c_avatar, c_nonce);
+    if !c_coord {
+        tracing::error!("metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}", next_metadata.coordinate, next_coordinate);
+    }
+    if !c_auth {
+        tracing::error!("author_proof mismatch: next={:?} != prior={:?}", next_metadata.author_proof, prior_metadata.author_proof);
+    }
+    c_coord && c_ver && c_ot && c_len && c_auth && c_avatar && c_nonce
 }
 
 enum CommitManifestForm<'a> {
@@ -17926,19 +17939,20 @@ fn require_commit_manifest(
                 .welcome
                 .as_ref()
                 .ok_or(StateMachineError::InvalidWelcomeMapping)?;
-            if !manifest.participant_changes.is_empty()
-                || adds.len() != 1
-                || adds[0].0 != target
-                || adds[0].1 != recovery_request_id
-                || adds[0].2 != key_package_ref
-                || manifest.leaf_recovery_request_id.as_ref() != Some(recovery_request_id)
-                || &signed_welcome.welcome_id != welcome_id
-                || &signed_welcome.recipient != target
-                || &signed_welcome.recovery_request_id != recovery_request_id
-                || &signed_welcome.key_package_ref != key_package_ref
-                || signed_welcome.opaque_welcome != welcome.wire_bytes()
-                || signed_welcome.sha256 != <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()))
-            {
+            let c_pc = manifest.participant_changes.is_empty();
+            let c_adds_len = adds.len() == 1;
+            let c_adds_tgt = adds.get(0).map(|a| a.0 == target).unwrap_or(false);
+            let c_adds_req = adds.get(0).map(|a| a.1 == recovery_request_id).unwrap_or(false);
+            let c_adds_kp = adds.get(0).map(|a| a.2 == key_package_ref).unwrap_or(false);
+            let c_m_req = manifest.leaf_recovery_request_id.as_ref() == Some(recovery_request_id);
+            let c_w_id = &signed_welcome.welcome_id == welcome_id;
+            let c_w_rcp = &signed_welcome.recipient == target;
+            let c_w_req = &signed_welcome.recovery_request_id == recovery_request_id;
+            let c_w_kp = &signed_welcome.key_package_ref == key_package_ref;
+            let c_w_wire = signed_welcome.opaque_welcome == welcome.wire_bytes();
+            let c_w_sha = signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
+            tracing::error!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
+            if !c_pc || !c_adds_len || !c_adds_tgt || !c_adds_req || !c_adds_kp || !c_m_req || !c_w_id || !c_w_rcp || !c_w_req || !c_w_kp || !c_w_wire || !c_w_sha {
                 return Err(StateMachineError::InvalidWelcomeMapping);
             }
         }
@@ -19056,10 +19070,15 @@ fn validate_recovery_work(state: &ConversationState) -> Result<(), StateMachineE
         || state
             .recovery_reservations
             .iter()
+            .filter(|reservation| reservation.status == ReservationStatus::Active)
             .map(|reservation| reservation.key_package_ref)
             .collect::<BTreeSet<_>>()
             .len()
-            != state.recovery_reservations.len()
+            != state
+                .recovery_reservations
+                .iter()
+                .filter(|reservation| reservation.status == ReservationStatus::Active)
+                .count()
     {
         return Err(StateMachineError::InvariantViolation);
     }

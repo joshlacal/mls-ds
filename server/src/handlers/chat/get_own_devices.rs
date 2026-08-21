@@ -69,7 +69,10 @@ async fn get_own_devices(
         Ok(snapshot) => Ok(context::json_ok(snapshot.into_response_bytes())),
         // The facade owns the retry loop; the handler only renders its ceiling.
         Err(ExistingDeviceReadFacadeError::RetryCeiling) => Ok(retry_ceiling_response()),
-        Err(error) => Err(facade_failure(error)),
+        Err(error) => {
+            tracing::error!("create_own_device_snapshot error: {:?}", error);
+            Err(facade_failure(error))
+        }
     }
 }
 

@@ -62,7 +62,10 @@ async fn send(
             let (response_bytes, event_position) =
                 message_delivery::send(&mut tx, &authority, &scope)
                     .await
-                    .map_err(map_failure)?;
+                    .map_err(|e| {
+                        tracing::error!("message_delivery::send error: {:?}", e);
+                        map_failure(e)
+                    })?;
             prelude::complete_operation(
                 &mut tx,
                 &authority,
@@ -73,10 +76,16 @@ async fn send(
                 event_position,
             )
             .await
-            .map_err(|e| context::operation_prelude_failure(ENDPOINT, e))?;
+            .map_err(|e| {
+                tracing::error!("complete_operation error: {:?}", e);
+                context::operation_prelude_failure(ENDPOINT, e)
+            })?;
             tx.commit()
                 .await
-                .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+                .map_err(|e| {
+                    tracing::error!("tx.commit error: {:?}", e);
+                    ChatFailure::storage(ENDPOINT)
+                })?;
             context::canonical_json_response(ENDPOINT, 200, response_bytes)
         }
     }
@@ -84,8 +93,11 @@ async fn send(
 
 fn map_failure(error: MessageDeliveryError) -> ChatFailure {
     use ChatProtocolErrorCode as C;
-    match error {
-        MessageDeliveryError::Database(_) => ChatFailure::storage(ENDPOINT),
+    match &error {
+        MessageDeliveryError::Database(e) => {
+            tracing::error!("MessageDeliveryError::Database: {:?}", e);
+            ChatFailure::storage(ENDPOINT)
+        }
         MessageDeliveryError::InvalidApplicationMessage => {
             ChatFailure::protocol(ENDPOINT, C::InvalidApplicationMessage)
         }

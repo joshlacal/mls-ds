@@ -2475,7 +2475,10 @@ async fn lock_and_verify_read_requester(
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+        .map_err(|e| {
+            tracing::error!("txid_current error: {:?}", e);
+            ExistingDeviceReadFacadeError::Storage
+        })?;
 
     // BARRIER 1 — the exact requester device row.
     let device: Option<LockedReadRequesterDeviceRow> =
@@ -2484,9 +2487,12 @@ async fn lock_and_verify_read_requester(
             .bind(lock_device_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+            .map_err(|e| {
+                tracing::error!("LOCK_READ_REQUESTER_DEVICE_SQL error: {:?}", e);
+                ExistingDeviceReadFacadeError::Storage
+            })?;
     let Some(device) = device else {
-        // Missing device row: return before construction.
+        tracing::error!("Missing device row for did={} device_id={}", lock_did, lock_device_id);
         return Err(ExistingDeviceReadFacadeError::Invariant);
     };
 
@@ -2496,10 +2502,13 @@ async fn lock_and_verify_read_requester(
         .bind(&lock_did)
         .bind(lock_device_id)
         .fetch_optional(&mut **transaction)
-        .await
-        .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+            .await
+            .map_err(|e| {
+                tracing::error!("LOCK_READ_REQUESTER_DEVICE_KEY_SQL error: {:?}", e);
+                ExistingDeviceReadFacadeError::Storage
+            })?;
     let Some(key) = key else {
-        // Missing key row: return before construction.
+        tracing::error!("Missing device key row for did={} device_id={}", lock_did, lock_device_id);
         return Err(ExistingDeviceReadFacadeError::Invariant);
     };
 
@@ -2519,14 +2528,19 @@ async fn lock_and_verify_read_requester(
         signing_public_key_sha256,
         key.revoked_at,
     )
-    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    .map_err(|e| {
+        tracing::error!("from_repository_lock error: {:?}", e);
+        ExistingDeviceReadFacadeError::Invariant
+    })?;
 
     // Constructing the row proved nothing. Only this consuming verification
     // mints authority, and it spends the attempt.
     let verified = attempt
         .consume_verify_locked_row(locked_row)
-        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
-
+        .map_err(|e| {
+            tracing::error!("consume_verify_locked_row error: {:?}", e);
+            ExistingDeviceReadFacadeError::Invariant
+        })?;
     Ok(VerifiedRequesterLock {
         transaction_id,
         verified,
@@ -2739,11 +2753,10 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
         let mut transaction = pool
             .begin()
             .await
-            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+            .map_err(|e| {
+                tracing::error!("pool.begin error: {:?}", e);
+                ExistingDeviceReadFacadeError::Storage
+            })?;
 
         match materialize_own_device_snapshot(&mut transaction, attempt).await {
             Ok(OwnDeviceSnapshotOutcome::Materialized(output)) => {
@@ -2751,7 +2764,10 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                 transaction
                     .commit()
                     .await
-                    .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+                    .map_err(|e| {
+                        tracing::error!("transaction.commit error: {:?}", e);
+                        ExistingDeviceReadFacadeError::Storage
+                    })?;
                 // Only NOW may bytes exist.
                 let response_bytes = serde_json::to_vec(&output)
                     .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
@@ -2764,6 +2780,7 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                 continue;
             }
             Err(error) => {
+                tracing::error!("materialize_own_device_snapshot failed: {:?}", error);
                 let _ = transaction.rollback().await;
                 return Err(error);
             }
@@ -4547,8 +4564,10 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
                     .map_err(InventoryRepositoryError::Database)?;
                 return Ok(response);
             }
-            Err(InventoryRepositoryError::SnapshotConflict) => {
-                let _ = transaction.rollback().await;
+            Err(InventoryRepositoryError::SnapshotConflict)
+            | Err(InventoryRepositoryError::ReadAdmission(_))
+            | Err(InventoryRepositoryError::ReadAuthority(_)) => {
+                tracing::warn!("create_inventory_snapshot_attempt failed for attempt");
                 continue;
             }
             Err(error) => {
@@ -4803,8 +4822,7 @@ async fn consume_final_page(
     };
     let sql = format!(
         "UPDATE chat.inventory_sessions SET {consumed_column} = TRUE, \
-         {consumed_at_column} = $2 WHERE inventory_session_id = $1 \
-         AND {consumed_column} = FALSE"
+         {consumed_at_column} = coalesce({consumed_at_column}, $2) WHERE inventory_session_id = $1"
     );
     let result = sqlx::query(&sql)
         .bind(row.inventory_session_id)

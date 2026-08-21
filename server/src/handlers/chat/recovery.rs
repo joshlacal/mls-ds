@@ -110,10 +110,10 @@ pub(super) async fn execute_prepared(
 }
 
 fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> ChatFailure {
+    tracing::error!("recovery_failure: {:?}", error);
     use ChatProtocolErrorCode as C;
     use RecoveryRepositoryError as E;
     use StateMachineError as S;
-
     match error {
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),

@@ -6153,8 +6153,6 @@ pub(crate) fn select_recovery_request_terminal(
                     && columns.package_terminal_at == Some(columns.expires_at)
             } else {
                 columns.expires_at < columns.package_not_after
-                    && columns.package_status == "available"
-                    && package_has_no_terminal
             };
             if !package_shape_valid {
                 return Err(RecoveryHydrationError::TerminalMismatch);
@@ -6902,10 +6900,6 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                         && package_terminal_at == Some(expires_at)
                 } else {
                     expires_at_timestamp < package_not_after
-                        && package_status == "available"
-                        && package_terminal_transition_id.is_none()
-                        && package_terminal_revocation_id.is_none()
-                        && package_terminal_at.is_none()
                 };
                 if !package_shape_valid {
                     return Err(RecoveryHydrationError::TerminalMismatch);

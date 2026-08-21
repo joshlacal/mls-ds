@@ -43,9 +43,11 @@ pub(crate) async fn get_entries_for_admission(
         admission,
         read_authority::OrdinaryReadEndpoint::GetEntries,
     )
-    .map_err(|_| EntryReadFacadeError::Invariant)?
+    .map_err(|e| {
+        tracing::error!("into_single_read_admission failed: {:?}", e);
+        EntryReadFacadeError::Invariant
+    })?
     .into_attempt();
-
     let mut transaction = pool
         .begin()
         .await
@@ -76,10 +78,16 @@ async fn read_entries_in_transaction(
 ) -> Result<CanonicalEntriesResponse, EntryReadFacadeError> {
     let device = read_authority::lock_read_device_authority_once(transaction, attempt)
         .await
-        .map_err(map_authority_error)?;
+        .map_err(|e| {
+            tracing::error!("lock_read_device_authority_once failed: {:?}", e);
+            map_authority_error(e)
+        })?;
     let authority = read_authority::authorize_entries(transaction, device, conversation_id)
         .await
-        .map_err(map_authority_error)?;
+        .map_err(|e| {
+            tracing::error!("authorize_entries failed: {:?}", e);
+            map_authority_error(e)
+        })?;
     let page = delivery::get_entries(
         transaction,
         conversation_id,
@@ -139,8 +147,8 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     }
     Ok(Value::Object(object))
 }
-
 fn map_authority_error(error: ReadAuthorityError) -> EntryReadFacadeError {
+    tracing::error!("get_entries map_authority_error: {:?}", error);
     match error {
         ReadAuthorityError::AccessOutsideMembershipInterval => {
             EntryReadFacadeError::AccessOutsideMembershipInterval
@@ -154,8 +162,8 @@ fn map_authority_error(error: ReadAuthorityError) -> EntryReadFacadeError {
 }
 
 fn map_delivery_error(error: DeliveryRepositoryError) -> EntryReadFacadeError {
+    tracing::error!("get_entries map_delivery_error: {:?}", error);
     match error {
-        DeliveryRepositoryError::Database(_) => EntryReadFacadeError::Storage,
         DeliveryRepositoryError::SequenceOverflow | DeliveryRepositoryError::EntryKindMismatch => {
             EntryReadFacadeError::Invariant
         }

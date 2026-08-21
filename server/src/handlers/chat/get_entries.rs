@@ -151,6 +151,7 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 fn facade_failure(error: EntryReadFacadeError) -> ChatFailure {
+    tracing::error!("get_entries facade_failure: {:?}", error);
     match error {
         EntryReadFacadeError::AccessOutsideMembershipInterval => ChatFailure::protocol(
             ENDPOINT,

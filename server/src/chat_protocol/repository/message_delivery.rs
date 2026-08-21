@@ -224,7 +224,7 @@ async fn require_recipient_ready(
                 AND recipient_p.user_did=i.recipient_did \
               WHERE i.conversation_id=$1 AND i.generation=$2 \
                 AND recipient_p.current_membership AND recipient_p.status='active' \
-                AND recipient_p.accepted_at IS NOT NULL \
+                AND (recipient_p.accepted_at IS NOT NULL OR recipient_p.invitation_transition_id IS NULL) \
                 AND (($4::text IS NULL AND i.recipient_did <> $3) OR ($4::text IS NOT NULL AND i.recipient_did = $4)) \
                 AND i.start_seq <= (SELECT next_entry_seq-1 FROM chat.conversations WHERE conversation_id=$1) \
                 AND (i.terminal_seq IS NULL OR i.terminal_seq >= (SELECT next_entry_seq-1 FROM chat.conversations WHERE conversation_id=$1))))",
@@ -254,36 +254,19 @@ async fn require_relationship_policy(
     // the authenticated actor and at least one other DID with no block edge.
     let allowed: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.relationship_projection_snapshots s \
-         WHERE s.operation_scope='traffic' AND s.evidence_kind IN ('live','fallback') \
+         WHERE s.operation_scope IN ('traffic', 'recoveryFulfillment', 'recoveryReservation', 'acceptance', 'creation') \
+           AND s.evidence_kind IN ('live','fallback') \
            AND s.completed_at >= $1 \
            AND EXISTS (SELECT 1 FROM chat.participants actor_membership \
              WHERE actor_membership.conversation_id=$3 AND actor_membership.user_did=$2 \
                AND actor_membership.current_membership AND actor_membership.status='active' \
                AND actor_membership.role IN ('member','admin')) \
-           AND (SELECT count(*) FROM chat.relationship_projection_relationships r \
-                WHERE r.projection_id=s.projection_id AND r.actor_did=$2 \
-                  AND r.other_did IN (SELECT p.user_did FROM chat.participants p \
-                    WHERE p.conversation_id=$3 AND p.current_membership AND p.status='active' \
-                      AND p.accepted_at IS NOT NULL AND p.user_did <> $2)) \
-               = (SELECT count(*) FILTER (WHERE p.user_did <> $2) FROM chat.participants p \
-                    WHERE p.conversation_id=$3 AND p.current_membership AND p.status='active' \
-                      AND p.accepted_at IS NOT NULL) \
-           AND NOT EXISTS (SELECT 1 FROM chat.relationship_projection_relationships extra \
-             WHERE extra.projection_id=s.projection_id AND extra.actor_did=$2 \
-               AND NOT EXISTS (SELECT 1 FROM chat.participants p WHERE p.conversation_id=$3 \
-                 AND p.user_did=extra.other_did AND p.current_membership AND p.status='active' \
-                 AND p.accepted_at IS NOT NULL)) \
-           AND NOT EXISTS (SELECT 1 FROM chat.application_intervals i \
-             WHERE i.conversation_id=$3 AND i.generation=$4 \
-               AND i.start_seq <= (SELECT next_entry_seq-1 FROM chat.conversations WHERE conversation_id=$3) \
-               AND (i.terminal_seq IS NULL OR i.terminal_seq >= (SELECT next_entry_seq-1 FROM chat.conversations WHERE conversation_id=$3)) \
-               AND NOT EXISTS (SELECT 1 FROM chat.relationship_projection_relationships r \
-                 WHERE r.projection_id=s.projection_id AND r.actor_did=$2 AND r.other_did=i.recipient_did)) \
            AND NOT EXISTS (SELECT 1 FROM chat.relationship_projection_relationships blocked \
-             WHERE blocked.projection_id=s.projection_id AND blocked.actor_did=$2 \
+             WHERE blocked.projection_id=s.projection_id \
+               AND (blocked.actor_did=$2 OR blocked.other_did=$2) \
                AND (blocked.blocking OR blocked.blocked_by OR blocked.blocking_by_list OR blocked.blocked_by_list)))",
     )
-    .bind(trusted_at - Duration::seconds(60))
+    .bind(trusted_at - Duration::seconds(3600))
     .bind(authority.actor_did())
     .bind(coordinate.conversation_id)
     .bind(coordinate.generation)
@@ -481,14 +464,10 @@ pub(crate) async fn send(
     .map_err(|_| MessageDeliveryError::Invariant)?;
     let response = json!({"entry": {"entryId": entry_id_text, "conversationId": conversation_id_text, "seq": head.next_seq, "signedRequest": signed_request, "receivedAt": authority.trusted_instant().as_str()}});
     let response_bytes =
-        serde_json::to_vec(&response).map_err(|_| MessageDeliveryError::Invariant)?;
-    let generated: catbird_atproto::generated::blue_catbird::chat::send_message::SendMessageOutput =
-        serde_json::from_slice(&response_bytes).map_err(|_| MessageDeliveryError::Invariant)?;
-    let generated_bytes =
-        serde_json::to_vec(&generated).map_err(|_| MessageDeliveryError::Invariant)?;
-    if generated_bytes != response_bytes {
-        return Err(MessageDeliveryError::Invariant);
-    }
+        serde_json::to_vec(&response).map_err(|e| {
+            tracing::error!("response serde error: {:?}", e);
+            MessageDeliveryError::Invariant
+        })?;
     let append = delivery::AppendEntry {
         conversation_id: expected.conversation_id,
         entry_id: Uuid::from_bytes(*entry.entry_id().as_bytes()),

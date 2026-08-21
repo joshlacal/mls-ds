@@ -420,10 +420,9 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
     let Some(device) = device else {
-        // Missing device row: return before construction.
+        tracing::error!("lock_read_device_authority_once: missing device row for did={} device_id={}", lock_did, lock_device_id);
         return Err(ReadAuthorityError::Invariant);
     };
-
     // BARRIER 2 — a SEPARATE statement for the exact requester key row, issued
     // only now that barrier 1 has completed.
     let key: Option<LockedReadRequesterKeyRow> = sqlx::query_as(LOCK_READ_DEVICE_KEY_SQL)
@@ -433,10 +432,9 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
     let Some(key) = key else {
-        // Missing key row: return before construction.
+        tracing::error!("lock_read_device_authority_once: missing key row for did={} device_id={}", lock_did, lock_device_id);
         return Err(ReadAuthorityError::Invariant);
     };
-
     let signing_public_key_sha256: [u8; 32] = Sha256::digest(&key.signing_public_key).into();
 
     // The B-read `from_repository_lock` callsite. Reachable only after BOTH
@@ -640,6 +638,7 @@ fn interval_id(interval: &AccessInterval) -> Uuid {
 /// The relationship witness arms. `pub(crate)` with `pub(crate)` variants so
 /// C1's projection and the entitlement tests can name them; all field
 /// accessors are `pub(in crate::chat_protocol)` (BREAD-08).
+#[derive(Debug)]
 pub(crate) enum CurrentConversationRelationshipWitness {
     CurrentOpenLeaf {
         participant_period_id: Uuid,
@@ -792,35 +791,40 @@ pub(crate) async fn authorize_conversation_state(
             .fetch_one(&mut **tx)
             .await
             .map_err(|_| ReadAuthorityError::Storage)?;
-    let locked = hydrate_locked_conversation_state(tx, conversation_id, locked_at)
-        .await
-        .map_err(map_hydration_error)?;
+    let locked = match hydrate_locked_conversation_state(tx, conversation_id, locked_at).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("authorize_conversation_state hydrate_locked_conversation_state failed: {:?}", e);
+            return Err(map_hydration_error(e));
+        }
+    };
 
     let graph_digest = *locked.locked_graph_digest();
-    // The snapshot digest is required only on a GRANTABLE arm, so it is taken
-    // after classification (below). Requiring it here made every terminal
-    // conversation fail `Invariant` before it could be denied properly: a
-    // terminal aggregate structurally carries no active snapshot, so hydration
-    // returns `(None, None)` (repository/core.rs:10317) and the guard
-    // constructor *requires* that pairing (core.rs:2881-2888) — absence is the
-    // correct shape, not drift. The sibling authority already treats it that
-    // way (`inventory_authorities`, :1815: "close tombstones carry no snapshot
-    // digest").
-    //
-    // The effect was a denial turning into a 500: `Invariant` maps to an
-    // internal error with no protocol code (:181-185), so a client reading a
-    // closed conversation could not tell "closed" from "server broken" instead
-    // of receiving the typed `AccessOutsideMembershipInterval` / `NotEntitled`.
-    let arm = classify_current_relationship(device.user_did(), device.device_id(), locked.state())?;
-    let participant_period_id =
-        load_participant_period_id(tx, conversation_id, device.user_did()).await?;
+    let arm = match classify_current_relationship(device.user_did(), device.device_id(), locked.state()) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("authorize_conversation_state classify_current_relationship failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    let participant_period_id = match load_participant_period_id(tx, conversation_id, device.user_did()).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("authorize_conversation_state load_participant_period_id failed: {:?}", e);
+            return Err(e);
+        }
+    };
     let relationship = match arm {
         ClassifiedRelationshipArm::OpenLeaf {
             open_membership_interval_id,
         } => {
-            let leaf_period_id =
-                load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id())
-                    .await?;
+            let leaf_period_id = match load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("authorize_conversation_state load_leaf_period_id failed: {:?}", e);
+                    return Err(e);
+                }
+            };
             CurrentConversationRelationshipWitness::CurrentOpenLeaf {
                 participant_period_id,
                 leaf_period_id,
@@ -839,18 +843,13 @@ pub(crate) async fn authorize_conversation_state(
         }
     };
 
-    // Every arm that reaches here is grantable, so the digest must be present.
-    // `ActiveParticipant` and `GroupPendingParticipant` are reachable only past
-    // the `facts.terminal` guard (:605), and `facts.terminal` is
-    // `state.active_public_state().is_none()` (:545) — the same predicate the
-    // guard constructor pairs the digest with. `OpenLeaf` cannot reach a
-    // terminal conversation either: `load_leaf_period_id` (:757-774) already
-    // rejected it, because hydration proved `active_leaf_count == 0` under the
-    // same lock (core.rs:10341-10350).
-    let snapshot_digest = *locked
-        .locked_snapshot_digest()
-        .ok_or(ReadAuthorityError::Invariant)?;
-
+    let snapshot_digest = match locked.locked_snapshot_digest() {
+        Some(d) => *d,
+        None => {
+            tracing::error!("authorize_conversation_state locked_snapshot_digest is None");
+            return Err(ReadAuthorityError::Invariant);
+        }
+    };
     Ok(ConversationStateReadAuthority {
         device,
         conversation: locked,
@@ -1305,31 +1304,62 @@ pub(crate) async fn authorize_entries(
     device: LockedReadDeviceAuthority,
     conversation_id: Uuid,
 ) -> Result<EntryReadAuthority, ReadAuthorityError> {
-    let state = authorize_conversation_state(tx, device, conversation_id).await?;
+    let state = match authorize_conversation_state(tx, device, conversation_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("authorize_entries step 1 authorize_conversation_state failed: {:?}", e);
+            return Err(e);
+        }
+    };
     if !matches!(
         state.relationship(),
         CurrentConversationRelationshipWitness::CurrentOpenLeaf { .. }
     ) {
+        tracing::error!("authorize_entries step 2 relationship is not CurrentOpenLeaf: {:?}", state.relationship());
         return Err(ReadAuthorityError::NotEntitled);
     }
 
-    let rows =
-        load_exact_device_interval_rows(tx, conversation_id, state.user_did(), state.device_id())
-            .await?;
-    let observed_head_seq: i64 = sqlx::query_scalar(
+    let rows = match load_exact_device_interval_rows(tx, conversation_id, state.user_did(), state.device_id()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("authorize_entries step 3 load_exact_device_interval_rows failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    let observed_head_seq: i64 = match sqlx::query_scalar(
         "SELECT coalesce(max(seq),0)::bigint FROM chat.entries WHERE conversation_id=$1",
     )
     .bind(conversation_id)
     .fetch_one(&mut **tx)
-    .await
-    .map_err(|_| ReadAuthorityError::Storage)?;
-    let ordered_intervals = build_ordered_interval_witnesses(
-        rows,
-        u64::try_from(observed_head_seq).map_err(|_| ReadAuthorityError::Invariant)?,
-    )?;
+    .await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("authorize_entries step 4 query max seq failed: {:?}", e);
+            return Err(ReadAuthorityError::Storage);
+        }
+    };
+    let head_seq_u64 = match u64::try_from(observed_head_seq) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("authorize_entries step 5 u64 try_from observed_head_seq failed: {:?}", e);
+            return Err(ReadAuthorityError::Invariant);
+        }
+    };
+    let ordered_intervals = match build_ordered_interval_witnesses(rows, head_seq_u64) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!("authorize_entries step 6 build_ordered_interval_witnesses failed: {:?}", e);
+            return Err(e);
+        }
+    };
     let ordered_intervals_sha256 = ordered_intervals_digest(&ordered_intervals);
-    let control_recipient_fence = load_control_recipient_fence(tx, conversation_id).await?;
-
+    let control_recipient_fence = match load_control_recipient_fence(tx, conversation_id).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("authorize_entries step 7 load_control_recipient_fence failed: {:?}", e);
+            return Err(e);
+        }
+    };
     Ok(EntryReadAuthority {
         conversation: state,
         ordered_intervals,

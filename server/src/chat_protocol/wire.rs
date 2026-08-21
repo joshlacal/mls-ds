@@ -1242,6 +1242,7 @@ pub fn process_public_commit(
         return Err(WireValidationError::CommitCoordinateMismatch);
     }
     if commit.aad() != policy.expected_aad {
+        tracing::error!("CommitAadMismatch: commit.aad (len={})={:02x?}, expected.aad (len={})={:02x?}", commit.aad().len(), commit.aad(), policy.expected_aad.len(), policy.expected_aad);
         return Err(WireValidationError::CommitAadMismatch);
     }
     let sender_index = match commit.sender() {
