@@ -695,6 +695,16 @@ async fn standard_audience(
     let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
     let actor_did = device_did(actor)?;
     let actor_device_id = device_uuid(actor);
+    // Entry recipients are MLS leaves, not every active device owned by a
+    // participant DID. A user can have several enrolled devices while only one
+    // has joined this conversation; including DID-wide devices makes the
+    // control-entry audience larger than the authenticated tree.
+    let expected_devices = plan
+        .state()
+        .leaves
+        .iter()
+        .map(|leaf| leaf.device.clone())
+        .collect::<BTreeSet<_>>();
     let successor_dids = plan
         .state()
         .participants
@@ -734,10 +744,17 @@ async fn standard_audience(
     .bind(actor_device_id)
     .fetch_all(&mut **transaction)
     .await?;
-    rows.into_iter()
-        .filter(|(_, _, entitled)| *entitled)
-        .map(|(did, device, _)| device_identity(did, device))
-        .collect()
+    let mut audience = Vec::with_capacity(expected_devices.len());
+    for (did, device_id, entitled) in rows {
+        if !entitled {
+            continue;
+        }
+        let device = device_identity(did, device_id)?;
+        if expected_devices.contains(&device) {
+            audience.push(device);
+        }
+    }
+    Ok(audience)
 }
 
 async fn historical_schedule_audience(
