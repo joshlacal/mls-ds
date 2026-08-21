@@ -5139,7 +5139,9 @@ pub(crate) async fn load_conversation_state_source(
                author_auth_generation, author_origin_seq, author_role,
                author_device_status
           FROM chat.metadata_snapshots
-         WHERE conversation_id = $1 AND generation = $2 AND state_version = $3
+         WHERE conversation_id = $1 AND generation = $2 AND state_version <= $3
+         ORDER BY state_version DESC
+         LIMIT 1
         "#,
     )
     .bind(conversation_id)
