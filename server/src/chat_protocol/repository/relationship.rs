@@ -1463,17 +1463,18 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
     }
     let scope_digest = traffic_scope_digest(&scope);
     let fingerprint = fixed_configuration_fingerprint()?;
-    let (snapshot, relationships) = match lock_fallback_snapshot(
+    let cached_snapshot = lock_fallback_snapshot(
         transaction,
         ProjectionOperationScope::Traffic.as_persisted_str(),
         &scope_digest,
         &fingerprint,
     )
-    .await?
-    {
+    .await?;
+    let cache_observed_at = observe_post_lock_time(transaction).await?;
+    let (snapshot, relationships) = match cached_snapshot {
         Some(snapshot)
-            if observe_post_lock_time(transaction).await? - snapshot.completed_at
-                <= TimeDelta::seconds(60) =>
+            if snapshot.completed_at <= cache_observed_at
+                && cache_observed_at - snapshot.completed_at <= TimeDelta::seconds(60) =>
         {
             let (declarations, relationships) =
                 lock_projection_children(transaction, snapshot.projection_id).await?;

@@ -15,6 +15,11 @@
 
 mod common;
 
+#[path = "../src/identity.rs"]
+mod identity;
+#[path = "../src/util/mod.rs"]
+mod util;
+
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[path = "../src/chat_protocol/relationship_policy.rs"]
@@ -403,6 +408,13 @@ mod repository {
     }
 
     pub(crate) mod relationship {
+        pub(crate) fn observe_relationship_persistence(
+        ) -> crate::relationship_policy::TrustedRelationshipPersistenceInstant {
+            crate::relationship_policy::TrustedRelationshipPersistenceInstant::for_test(
+                chrono::Utc::now(),
+            )
+        }
+
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/repository/relationship.rs"
@@ -414,11 +426,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use relationship_policy::{
     AdmissionOperation, AdmissionRequest, AllocatedProjectionRevisionGuard, HttpRelationshipSource,
-    ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet, PublicResponse,
-    PublicTransport, RelationshipPolicyConfig, RelationshipPolicyConfigInput, TrafficGraphScope,
-    TransportError, TrustedRelationshipPersistenceInstant, HARD_MAX_REQUEST_BURST,
-    HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS, MAX_ADMISSION_SOURCE_CALLS,
-    MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
+    PolicyDenial, ProjectionClock, ProjectionOperationScope, ProjectionScope, PublicGet,
+    PublicResponse, PublicTransport, RelationshipPolicyConfig, RelationshipPolicyConfigInput,
+    TrafficGraphScope, TransportError, TrustedRelationshipPersistenceInstant,
+    HARD_MAX_REQUEST_BURST, HARD_MAX_REQUEST_RATE, MAX_ADMISSION_GRAPH_CALLS,
+    MAX_ADMISSION_SOURCE_CALLS, MAX_DECLARATION_HTTP_CALLS, MAX_TRAFFIC_GRAPH_CALLS,
 };
 use repository::relationship::{
     allocate_projection_revision, load_fallback_relationship_projection,
@@ -999,6 +1011,37 @@ fn authority() -> HttpRelationshipSource<DeterministicPublicTransport> {
     HttpRelationshipSource::new(fixed_test_config(), DeterministicPublicTransport)
 }
 
+#[derive(Clone, Copy)]
+struct BlockedTrafficTransport;
+
+#[async_trait]
+impl PublicTransport for BlockedTrafficTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        if request.url.path() == "/xrpc/app.bsky.graph.getRelationships" {
+            let actor = query_values(&request.url, "actor").remove(0);
+            let relationships = query_values(&request.url, "others")
+                .into_iter()
+                .map(|target| {
+                    json!({
+                        "$type": "app.bsky.graph.defs#relationship",
+                        "did": target,
+                        "blocking": format!("at://{actor}/app.bsky.graph.block/repositorytest")
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(PublicResponse::json(
+                200,
+                json!({"actor": actor, "relationships": relationships}),
+            ));
+        }
+        DeterministicPublicTransport.get(request).await
+    }
+}
+
+fn blocked_authority() -> HttpRelationshipSource<BlockedTrafficTransport> {
+    HttpRelationshipSource::new(fixed_test_config(), BlockedTrafficTransport)
+}
+
 async fn allocated_revision(pool: &sqlx::PgPool) -> AllocatedProjectionRevisionGuard {
     let mut transaction = pool.begin().await.unwrap();
     let guard = allocate_projection_revision(&mut transaction)
@@ -1359,6 +1402,32 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     backdated_transaction.commit().await.unwrap();
     persist_principal_read_set(&pool, &backdated_scope.members).await;
 
+    let mut future_members = (400..432).map(did).collect::<Vec<_>>();
+    future_members.sort();
+    let future_live = relationship_policy::collect_traffic_projection(
+        &authority,
+        &StepClock::anchored(Utc::now() + TimeDelta::seconds(120)),
+        allocated_revision(&pool).await,
+        future_members[0].clone(),
+        future_members,
+    )
+    .await
+    .unwrap();
+    let future_scope = future_live.scope().clone();
+    let future_persisted = future_live
+        .export_persisted_fallback(
+            allocated_revision(&pool).await,
+            &authority,
+            &persistence_at(future_live.completed_at()),
+        )
+        .unwrap();
+    let mut future_transaction = pool.begin().await.unwrap();
+    persist_traffic_projection(&mut future_transaction, future_persisted)
+        .await
+        .unwrap();
+    future_transaction.commit().await.unwrap();
+    persist_principal_read_set(&pool, &future_scope.members).await;
+
     pool.close().await;
 
     let restarted = common::chat_protocol::setup_chat_protocol_db(2).await;
@@ -1377,13 +1446,21 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
 
     let (wrong_witness, wrong_scope) =
         lock_traffic_scope(&mut load_transaction, &wrong_members).await;
-    assert!(
-        load_fallback_traffic_projection(&mut load_transaction, wrong_witness, &authority,)
+    let (wrong_recollected, wrong_decision) =
+        load_fallback_traffic_projection(&mut load_transaction, wrong_witness, &authority)
             .await
             .unwrap()
-            .is_none()
-    );
+            .expect("missing traffic snapshot is recollected");
     assert_ne!(wrong_scope, scope);
+    assert_eq!(wrong_recollected.scope(), &wrong_scope);
+    assert_eq!(
+        relationship_policy::consume_traffic_projection(
+            &wrong_recollected,
+            &authority,
+            &wrong_decision,
+        ),
+        Ok(())
+    );
 
     // Freshness is enforced from the loader's own post-lock observation clock
     // (`observed_at - completed_at > 60s`); the loader no longer accepts an
@@ -1394,12 +1471,30 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
     let (backdated_witness, backdated_lock_scope) =
         lock_traffic_scope(&mut load_transaction, &backdated_scope.members).await;
     assert_eq!(backdated_lock_scope, backdated_scope);
-    assert!(
+    let (refreshed, refreshed_decision) =
         load_fallback_traffic_projection(&mut load_transaction, backdated_witness, &authority)
             .await
             .unwrap()
-            .is_none(),
-        "loader must reject a snapshot whose completed_at is older than the 60s freshness bound"
+            .expect("stale traffic snapshot is recollected");
+    assert_eq!(refreshed.scope(), &backdated_scope);
+    assert_ne!(refreshed.projection_id(), backdated_live.projection_id());
+    assert_eq!(
+        relationship_policy::consume_traffic_projection(
+            &refreshed,
+            &authority,
+            &refreshed_decision,
+        ),
+        Ok(())
+    );
+
+    let (future_witness, future_lock_scope) =
+        lock_traffic_scope(&mut load_transaction, &future_scope.members).await;
+    assert_eq!(future_lock_scope, future_scope);
+    assert!(
+        load_fallback_traffic_projection(&mut load_transaction, future_witness, &authority)
+            .await
+            .is_err(),
+        "future-dated traffic evidence must never be classified as fresh"
     );
 
     let (exact_witness, exact_scope) =
@@ -1418,6 +1513,32 @@ async fn traffic_fallback_hydrates_exact_scope_and_freshness_after_restart() {
         Ok(())
     );
     load_transaction.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "root fresh-database authorization required"]
+async fn missing_traffic_fallback_recollection_preserves_block_denial() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(2).await;
+    let members = roster(2);
+    persist_principal_read_set(&pool, &members).await;
+    let authority = blocked_authority();
+    let mut transaction = pool.begin().await.unwrap();
+    let (witness, expected_scope) = lock_traffic_scope(&mut transaction, &members).await;
+    let (projection, decision) =
+        load_fallback_traffic_projection(&mut transaction, witness, &authority)
+            .await
+            .unwrap()
+            .expect("missing blocked traffic scope is recollected");
+    assert_eq!(projection.scope(), &expected_scope);
+    assert_eq!(
+        relationship_policy::consume_traffic_projection(
+            &projection,
+            &authority,
+            &decision,
+        ),
+        Err(PolicyDenial::BlockedRelationship)
+    );
+    transaction.rollback().await.unwrap();
 }
 
 #[tokio::test]
