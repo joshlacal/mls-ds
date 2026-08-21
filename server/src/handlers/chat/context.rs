@@ -140,35 +140,17 @@ pub(crate) async fn admit_unsigned_read(
     actor_device_id: &str,
 ) -> Result<VerifiedReadAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let principal = match verify_service_principal(pool, endpoint, headers).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("verify_service_principal failed: {:?}", e);
-            return Err(e);
-        }
-    };
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let instant = capture_instant(endpoint)?;
-    let pre_replay = match dpop::standard_service_auth_evidence(principal, actor_device_id, method, instant, None) {
-        Ok(pr) => pr,
-        Err(e) => {
-            eprintln!("standard_service_auth_evidence failed: {:?}", e);
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest));
-        }
-    };
-    let authority = match auth::authorize_unsigned_request(pool, pre_replay).await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("authorize_unsigned_request failed: {:?}", e);
-            return Err(auth_repository_failure(endpoint, e));
-        }
-    };
-    match dpop::seal_read_admission(authority) {
-        Ok(a) => Ok(a),
-        Err(e) => {
-            eprintln!("seal_read_admission failed: {:?}", e);
-            Err(ChatFailure::invariant(endpoint))
-        }
-    }
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, actor_device_id, method, instant, None)
+            .map_err(|_| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
+    let authority = auth::authorize_unsigned_request(pool, pre_replay)
+        .await
+        .map_err(|error| auth_repository_failure(endpoint, error))?;
+    dpop::seal_read_admission(authority).map_err(|_| ChatFailure::invariant(endpoint))
 }
 /// Byte-opaque operation-only admission for an ordinary signed procedure.
 /// Global operation arbitration in the caller-owned transaction decides
@@ -182,38 +164,23 @@ pub(crate) async fn admit_signed_operation_only(
     body: &[u8],
 ) -> Result<SignedOperationAdmission, ChatFailure> {
     require_cutover(runtime, endpoint)?;
-    let principal = match verify_service_principal(pool, endpoint, headers).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("verify_service_principal failed: {:?}", e);
-            return Err(e);
-        }
-    };
+    let principal = verify_service_principal(pool, endpoint, headers).await?;
     let signed_bytes = signed_request_bytes(body, endpoint)?;
-    let canonical = match transcript::decode_canonical_signed_mutation(&signed_bytes) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("decode_canonical_signed_mutation failed: {:?}", e);
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest));
-        }
-    };
+    let canonical = transcript::decode_canonical_signed_mutation(&signed_bytes).map_err(|_| {
+        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+    })?;
     let actor_device_id = canonical.actor_device_id().as_str().to_owned();
     let method =
         CanonicalHttpMethod::parse("POST").map_err(|_| ChatFailure::invariant(endpoint))?;
     let instant = capture_instant(endpoint)?;
-    let pre_replay = match dpop::standard_service_auth_evidence(principal, &actor_device_id, method, instant, None) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("standard_service_auth_evidence failed: {:?}", e);
-            return Err(ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest));
-        }
-    };
+    let pre_replay =
+        dpop::standard_service_auth_evidence(principal, &actor_device_id, method, instant, None)
+            .map_err(|_| {
+                ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest)
+            })?;
     auth::authorize_signed_operation_only(pool, pre_replay, canonical)
         .await
-        .map_err(|error| {
-            eprintln!("authorize_signed_operation_only failed: {:?}", error);
-            auth_repository_failure(endpoint, error)
-        })
+        .map_err(|error| auth_repository_failure(endpoint, error))
 }
 /// Operation-only enrollment admission. This consumes replay evidence but
 /// cannot surface completed response bytes; the caller-owned operation prelude

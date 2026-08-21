@@ -74,6 +74,13 @@ pub async fn run_compaction_worker(pool: PgPool) {
             }
         }
 
+        // Reclaim expired inventory sessions
+        let _ = sqlx::query("SELECT chat.gc_expired_inventory_sessions(1000)")
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("SELECT chat.gc_expired_device_inventory_sessions(1000)")
+            .execute(&pool)
+            .await;
         info!("Compaction worker complete");
     }
 }

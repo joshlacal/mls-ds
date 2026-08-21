@@ -29,7 +29,6 @@ pub(super) async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    eprintln!(">>> create_conversation::handle invoked <<<");
     let endpoint = ChatEndpoint::CreateConversation;
     handle_inner(&pool, &runtime, endpoint, &headers, &body)
         .await
@@ -42,59 +41,30 @@ async fn handle_inner(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let admission = match context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("admit error: {:?}", e);
-            return Err(e);
-        }
-    };
+    let admission = context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
     let mut transaction = pool
         .begin()
         .await
-        .map_err(|e| {
-            eprintln!("tx begin error: {:?}", e);
-            ChatFailure::storage(endpoint)
-        })?;
-    let prepared = match crate::chat_protocol::repository::prelude::prepare_signed_operation(
+        .map_err(|_| ChatFailure::storage(endpoint))?;
+    let prepared = crate::chat_protocol::repository::prelude::prepare_signed_operation(
         &mut transaction,
         admission,
     )
-    .await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("prepare error: {:?}", e);
-            return Err(context::operation_prelude_failure(endpoint, e));
-        }
-    };
-    let outcome = match creation::execute_prepared_creation(
+    .await
+    .map_err(|e| context::operation_prelude_failure(endpoint, e))?;
+    let outcome = creation::execute_prepared_creation(
         &mut transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
     )
-    .await {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("creation execute error: {:?}", e);
-            return Err(creation_failure(endpoint, e));
-        }
-    };
-    let response = match context::canonical_json_response(
+    .await
+    .map_err(|e| creation_failure(endpoint, e))?;
+    let response = context::canonical_json_response(
         endpoint,
         outcome.status(),
         outcome.response_bytes().to_vec(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("canonical_json_response error: {:?}", e);
-            return Err(e);
-        }
-    };
-    if let Err(e) = transaction.commit().await {
-        eprintln!("commit error: {:?}", e);
-        return Err(ChatFailure::storage(endpoint));
-    }
-    eprintln!("create_conversation SUCCESS!");
+    )?;
+    transaction.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
     Ok(response)
 }
 

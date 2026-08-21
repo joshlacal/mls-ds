@@ -1763,20 +1763,11 @@ pub(crate) async fn create_inventory_session(
     let locked_row = lock_inventory_session_row(transaction, request.inventory_session_id)
         .await?
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    let fence = match verify_locked_inventory_fence(transaction, device, &locked_row).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[DEBUG] verify_locked_inventory_fence failed: {:?}", e);
-            return Err(e);
-        }
-    };
-    let authorities = match super::super::read_authority::inventory_authorities(transaction, fence).await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[DEBUG] inventory_authorities failed: {:?}", e);
-            return Err(InventoryRepositoryError::ReadAuthority(e));
-        }
-    };
+    let fence = verify_locked_inventory_fence(transaction, device, &locked_row).await?;
+    let authorities =
+        super::super::read_authority::inventory_authorities(transaction, fence)
+            .await
+            .map_err(InventoryRepositoryError::ReadAuthority)?;
     // 5. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
     //    extended to run ONCE after the authorities derivation and immediately
     //    before the materialization inserts. If the head moved, a
@@ -4388,7 +4379,18 @@ async fn create_inventory_snapshot_attempt(
     // the session identity) and every later call take the replay path over the
     // retained bytes. The device is consumed by the create path's fence
     // verification; the replay path consumes it in the serve verification.
-    let existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
+    let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
+    if let Some(existing_row) = &existing {
+        let now = chrono::Utc::now();
+        if existing_row.expires_at <= now
+            || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
+        {
+            let _ = sqlx::query("SELECT chat.gc_expired_inventory_sessions(100)")
+                .execute(&mut **transaction)
+                .await;
+            existing = None;
+        }
+    }
     if let Some(expected_cap) = expected_inventory_session_capability {
         let expected_hash = capability_hash(expected_cap)?;
         let Some(existing_row) = &existing else {

@@ -33,7 +33,6 @@ pub(super) async fn conversations(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    eprintln!(">>> conversations handler invoked with query={:?} <<<", query);
     handle(
         &pool,
         &runtime,
@@ -87,13 +86,9 @@ async fn handle(
     endpoint: ChatEndpoint,
     domain: InventoryDomain,
 ) -> Response {
-    match serve(pool, runtime, headers, query, endpoint, domain).await {
-        Ok(response) => response,
-        Err(failure) => {
-            eprintln!("inventory serve failed for {:?}: {:?}", endpoint, failure);
-            failure.into_response()
-        }
-    }
+    serve(pool, runtime, headers, query, endpoint, domain)
+        .await
+        .unwrap_or_else(ChatFailure::into_response)
 }
 
 async fn serve(
@@ -105,47 +100,20 @@ async fn serve(
     domain: InventoryDomain,
 ) -> Result<Response, ChatFailure> {
     context::require_cutover(runtime, endpoint)?;
-    let parsed = match QueryParams::parse(query, domain) {
-        Ok(p) => {
-            eprintln!("inventory query parsed actor_device_id: {:?}", p.actor_device_id);
-            p
-        }
-        Err(e) => {
-            eprintln!("QueryParams::parse failed: {:?}", e);
-            return Err(ChatFailure::protocol(endpoint, e));
-        }
-    };
-    let method = CanonicalHttpMethod::parse("GET").map_err(|_| {
-        eprintln!("CanonicalHttpMethod::parse failed");
-        ChatFailure::invariant(endpoint)
-    })?;
-    let admission = match context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &parsed.actor_device_id).await {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("admit_unsigned_read failed: {:?}", e);
-            return Err(e);
-        }
-    };
-    let sealer = match runtime.cursor_sealer() {
-        Some(s) => s,
-        None => {
-            eprintln!("runtime.cursor_sealer is None");
-            return Err(ChatFailure::invariant(endpoint));
-        }
-    };
-    let request = match InventoryPublicRequestBinding::new(
+    let parsed = QueryParams::parse(query, domain)
+        .map_err(|error| ChatFailure::protocol(endpoint, error))?;
+    let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
+    let admission =
+        context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &parsed.actor_device_id).await?;
+    let sealer = runtime.cursor_sealer().ok_or_else(|| ChatFailure::invariant(endpoint))?;
+    let request = InventoryPublicRequestBinding::new(
         endpoint.nsid(),
         1,
         domain,
         parsed.limit,
         Sha256::digest([]).into(),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("InventoryPublicRequestBinding::new failed: {:?}", e);
-            return Err(ChatFailure::invariant(endpoint));
-        }
-    };
+    )
+    .map_err(|_| ChatFailure::invariant(endpoint))?;
 
     let response = if let Some(cursor) = parsed.page_cursor.as_deref() {
         continue_inventory_page_for_admission(
@@ -169,10 +137,7 @@ async fn serve(
         )
         .await
     }
-    .map_err(|error| {
-        eprintln!("create_inventory_snapshot_and_first_page error: {:?}", error);
-        map_repository_error(endpoint, error)
-    })?;
+    .map_err(|error| map_repository_error(endpoint, error))?;
     Ok(context::json_ok(response.into_bytes()))
 }
 

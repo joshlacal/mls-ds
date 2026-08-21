@@ -1369,28 +1369,19 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
                     authority
                         .collect_admission_projection(live_allocation, operation_scope, req.clone())
                         .await
-                        .map_err(|e| {
-                            eprintln!("collect_admission_projection failed: {:?}", e);
-                            RelationshipRepositoryError::InvalidProjection
-                        })?
+                        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
                 }
                 ProjectionScope::BlockOnly(s) => {
                     authority
                         .collect_block_projection(live_allocation, operation_scope, s.members.clone())
                         .await
-                        .map_err(|e| {
-                            eprintln!("collect_block_projection failed: {:?}", e);
-                            RelationshipRepositoryError::InvalidProjection
-                        })?
+                        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
                 }
             };
             let observation = observe_relationship_persistence();
             let sealed = live
                 .export_persisted_fallback(fallback_allocation, authority, &observation)
-                .map_err(|e| {
-                    eprintln!("export_persisted_fallback failed: {:?}", e);
-                    RelationshipRepositoryError::InvalidProjection
-                })?;
+                .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
             persist_relationship_projection(transaction, sealed).await?;
             let newly_locked = lock_fallback_snapshot(
                 transaction,
@@ -1399,10 +1390,7 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
                 &fingerprint,
             )
             .await?
-            .ok_or_else(|| {
-                eprintln!("lock_fallback_snapshot returned None after persist");
-                RelationshipRepositoryError::InvalidProjection
-            })?;
+            .ok_or(RelationshipRepositoryError::InvalidProjection)?;
             let (decl, rel) = lock_projection_children(transaction, newly_locked.projection_id).await?;
             (newly_locked, decl, rel)
         }

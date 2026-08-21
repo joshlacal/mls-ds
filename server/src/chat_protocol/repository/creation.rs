@@ -336,33 +336,15 @@ async fn execute_first_creation<T: PublicTransport>(
             return Ok(CreationTransactionOutcome::first(response, None));
         }
     }
-    let head = match hydrate_locked_creation_head(
+    let head = hydrate_locked_creation_head(
         transaction,
         conversation_id,
         scope_authority.trusted_instant(),
     )
-    .await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("hydrate_locked_creation_head failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
-    let hydration = match HydrationAuthority::from_locked_creation_head(&head) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("HydrationAuthority::from_locked_creation_head failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
-    let registration = match hydration.locked_registration_from_scope_authority(scope_authority) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("locked_registration_from_scope_authority failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
-    let quota = match hydrate_locked_invitation_quota(
+    .await?;
+    let hydration = HydrationAuthority::from_locked_creation_head(&head)?;
+    let registration = hydration.locked_registration_from_scope_authority(scope_authority)?;
+    let quota = hydrate_locked_invitation_quota(
         transaction,
         authority.subject().as_str(),
         &principals
@@ -372,21 +354,9 @@ async fn execute_first_creation<T: PublicTransport>(
             .collect::<Vec<_>>(),
         scope_authority.trusted_instant(),
     )
-    .await {
-        Ok(q) => q,
-        Err(e) => {
-            eprintln!("hydrate_locked_invitation_quota failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
-    let verified = match reverify_scope_mutation(scope_authority, mutation) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("reverify_scope_mutation failed: {:?}", e);
-            return Err(e);
-        }
-    };
-    let entry = match build_verified_control_entry(
+    .await?;
+    let verified = reverify_scope_mutation(scope_authority, mutation)?;
+    let entry = build_verified_control_entry(
         verified,
         authority.endpoint(),
         canonical_uuid(transition_id)?,
@@ -394,20 +364,8 @@ async fn execute_first_creation<T: PublicTransport>(
         1,
         authority.trusted_instant(),
         CanonicalControlServerFields::empty(ControlEntryKind::Creation)?,
-    ) {
-        Ok(en) => en,
-        Err(e) => {
-            eprintln!("build_verified_control_entry failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
-    let products = match CanonicalControlEntryProducts::mint(&entry) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("CanonicalControlEntryProducts::mint failed: {:?}", e);
-            return Err(e.into());
-        }
-    };
+    )?;
+    let products = CanonicalControlEntryProducts::mint(&entry)?;
     let trusted_now = crate::chat_protocol::validation::TrustedRequestInstant::from_datetime(
         scope_authority.trusted_instant(),
     )?;
@@ -418,7 +376,6 @@ async fn execute_first_creation<T: PublicTransport>(
         .collect::<Vec<_>>();
     let planned = if pending.is_empty() {
         if kind != "group" {
-            eprintln!("pending is empty for direct conversation");
             return Err(CreationFacadeError::InvalidCanonicalMaterial);
         }
         let no_admission = seal_group_creation_no_pending_admission(&head, &quota, &registration)?;
@@ -432,43 +389,22 @@ async fn execute_first_creation<T: PublicTransport>(
         )?
     } else {
         let fallback = if kind == "direct" {
-            match seal_direct_creation_fallback_scope(
+            seal_direct_creation_fallback_scope(
                 &head,
                 &quota,
                 direct_lookup
                     .as_ref()
                     .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?,
                 &registration,
-            ) {
-                Ok(fb) => fb,
-                Err(e) => {
-                    eprintln!("seal_direct_creation_fallback_scope failed: {:?}", e);
-                    return Err(e.into());
-                }
-            }
+            )?
         } else {
-            match seal_group_creation_fallback_scope(&head, &quota, &registration) {
-                Ok(fb) => fb,
-                Err(e) => {
-                    eprintln!("seal_group_creation_fallback_scope failed: {:?}", e);
-                    return Err(e.into());
-                }
-            }
+            seal_group_creation_fallback_scope(&head, &quota, &registration)?
         };
         let (relationship, decision) =
-            match load_fallback_relationship_projection(transaction, fallback, relationship_authority)
-                .await {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
-                    eprintln!("load_fallback_relationship_projection returned None");
-                    return Err(CreationFacadeError::InvalidCanonicalMaterial);
-                }
-                Err(e) => {
-                    eprintln!("load_fallback_relationship_projection error: {:?}", e);
-                    return Err(e.into());
-                }
-            };
-        match hydration.plan_creation(
+            load_fallback_relationship_projection(transaction, fallback, relationship_authority)
+                .await?
+                .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
+        hydration.plan_creation(
             entry,
             &registration,
             Some(&head),
@@ -478,36 +414,17 @@ async fn execute_first_creation<T: PublicTransport>(
             quota,
             &decision,
             &trusted_now,
-        ) {
-            Ok(pl) => pl,
-            Err(e) => {
-                eprintln!("hydration.plan_creation failed: {:?}", e);
-                return Err(e.into());
-            }
-        }
+        )?
     };
     let plan = match planned {
         crate::chat_protocol::state_machine::CreationDecision::Create(plan) => {
-            match plan.into_persistence_plan() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("into_persistence_plan failed: {:?}", e);
-                    return Err(e.into());
-                }
-            }
+            plan.into_persistence_plan()?
         }
         crate::chat_protocol::state_machine::CreationDecision::ExistingDirect { .. } => {
-            eprintln!("CreationDecision::ExistingDirect encountered");
             return Err(CreationFacadeError::InvalidCanonicalMaterial)
         }
     };
-    let response = match creation_response(&plan, products.canonical_response_json()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("creation_response failed with: {:?}", e);
-            return Err(e);
-        }
-    };
+    let response = creation_response(&plan, products.canonical_response_json())?;
     let accepted = products.durable_json().to_vec();
     let genesis = match mutation.projection() {
         VerifiedMutationProjection::Creation(value) => {
@@ -516,10 +433,7 @@ async fn execute_first_creation<T: PublicTransport>(
                 _ => return Err(CreationFacadeError::InvalidCanonicalMaterial),
             }
         }
-        _ => {
-            eprintln!("genesis_group_info projection failed");
-            return Err(CreationFacadeError::InvalidCanonicalMaterial);
-        }
+        _ => return Err(CreationFacadeError::InvalidCanonicalMaterial),
     };
     let expected = plan.successor_coordinate().copied();
     let (scope, completion) = prelude.into_execution_parts();
@@ -529,7 +443,6 @@ async fn execute_first_creation<T: PublicTransport>(
         || applied.allocated_seq != 1
         || applied.successor_coordinate.as_ref() != expected.as_ref()
     {
-        eprintln!("applied mismatch: entry_id={:?} expected={:?}, seq={} expected=1, succ={:?} expected={:?}", applied.entry_id, transition_id, applied.allocated_seq, applied.successor_coordinate, expected);
         return Err(CreationFacadeError::InvalidCanonicalMaterial);
     }
     let event_position = applied.event_positions.first().copied();
@@ -586,13 +499,8 @@ fn creation_response(
     let value_bytes =
         serde_json::to_vec(&value).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
     let output: chat_dto::create_conversation::CreateConversationOutput<DefaultStr> =
-        match serde_json::from_slice(&value_bytes) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("output deserialization error: {:?}, json: {}", e, String::from_utf8_lossy(&value_bytes));
-                return Err(CreationFacadeError::InvalidCanonicalMaterial);
-            }
-        };
+        serde_json::from_slice(&value_bytes)
+            .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
     CreationCanonicalResponse::new(
         serde_json::to_vec(&output).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?,
     )
