@@ -159,8 +159,8 @@ fn submit_failure(
         E::StateMachine(s) => map_state_machine_error(mutation_kind, s),
         E::MissingMutation
         | E::UnsupportedMutation
-        | E::InvalidCanonicalMaterial
-        | E::Conversation(_)
+        | E::InvalidCanonicalMaterial => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
+        E::Conversation(_)
         | E::ExecutionContext(_)
         | E::Executor(_) => ChatFailure::invariant(ENDPOINT),
     }

@@ -2803,6 +2803,56 @@ async fn get_own_devices_uses_separate_device_fence() {
     );
 }
 
+#[tokio::test]
+async fn get_own_devices_polling_beyond_cap_succeeds_and_stays_bounded() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
+    let now = whole_second(clock_now(&pool).await);
+    let requester = seed_device_with_key(&pool, now - Duration::seconds(120)).await;
+
+    // Call create_device_inventory_session 25 times in a row for the same device (cap is 8).
+    for i in 1..=25 {
+        let session_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.expect("begin create");
+        let created = create_device_inventory_session(
+            &mut tx,
+            CreateDeviceInventorySessionRequest {
+                device_inventory_session_id: session_id,
+                user_did: &requester.did,
+                device_id: requester.device_id,
+                jkt: Some(&requester.jkt),
+                auth_generation: 1,
+                fence_revision: 0,
+                created_at: now + Duration::seconds(i),
+                expires_at: now + Duration::seconds(i) + Duration::minutes(10),
+                subjects: vec![
+                    DeviceInventorySubject {
+                        subject_device_id: requester.device_id,
+                        payload_bytes: format!("own-device-{}", i).into_bytes(),
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create_device_inventory_session attempt {i} failed: {e:?}"));
+        tx.commit().await.unwrap_or_else(|e| panic!("commit attempt {i} failed: {e:?}"));
+        assert_eq!(created.item_count, 1);
+    }
+
+    // Exactly 1 row retained in device_inventory_sessions for this device (superseded rows reaped).
+    let session_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_inventory_sessions WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&requester.did)
+    .bind(requester.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count device inventory sessions");
+    assert_eq!(
+        session_count, 1,
+        "steady-state device inventory creation must reap superseded sessions and keep exactly 1 row"
+    );
+}
+
 #[test]
 fn terminal_seq_hints_carry_no_fingerprint() {
     // The DTOs expose a `terminal_seq` (wake/navigation) and nothing else that

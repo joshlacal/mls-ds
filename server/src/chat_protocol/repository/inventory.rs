@@ -1717,6 +1717,9 @@ pub(crate) async fn create_inventory_session(
         .seal_successor(capability.as_bytes(), &event_cursor_binding, random)
         .map_err(InventoryRepositoryError::Sealer)?;
 
+    // 2b. Reap expired and excess inventory sessions for this device so active sessions stay bounded
+    reap_expired_and_excess_inventory_sessions(transaction, &user_did, device_id).await?;
+
     // 3. Insert the session with all domains INCOMPLETE and all *_consumed
     //    FALSE first, so every item FK (including the recipient composite FK on
     //    the owner identity) resolves before completion evidence is recorded.
@@ -2072,6 +2075,156 @@ pub(crate) struct CreatedDeviceInventorySession {
     pub(crate) item_count: u64,
 }
 
+async fn reap_prior_device_inventory_sessions(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<(), InventoryRepositoryError> {
+    sqlx::query(
+        r#"
+        DELETE FROM chat.device_inventory_items
+         WHERE device_inventory_session_id IN (
+             SELECT device_inventory_session_id
+               FROM chat.device_inventory_sessions
+              WHERE user_did = $1 AND device_id = $2
+         );
+        DELETE FROM chat.device_inventory_sessions
+         WHERE user_did = $1 AND device_id = $2;
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn reap_expired_and_excess_inventory_sessions(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<(), InventoryRepositoryError> {
+    // 1. Delete all expired sessions for this device
+    sqlx::query(
+        r#"
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.subscription_tickets WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        WITH expired AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+        )
+        DELETE FROM chat.inventory_sessions WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    // 2. If active sessions for this device >= 4, delete oldest excess
+    sqlx::query(
+        r#"
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.subscription_tickets WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        WITH excess AS (
+            SELECT inventory_session_id
+              FROM chat.inventory_sessions
+             WHERE user_did = $1 AND device_id = $2
+             ORDER BY created_at DESC
+            OFFSET 3
+        )
+        DELETE FROM chat.inventory_sessions WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(())
+}
+
 /// Create one retained own-device inventory session at `fence_revision` and
 /// materialize + complete its subject-device items in the same transaction. The
 /// requester device authority is validated up-front and re-checked by the
@@ -2131,6 +2284,10 @@ pub(crate) async fn create_device_inventory_session(
         return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
     }
 
+    // Reap prior device inventory sessions and expired sessions for this device in the same transaction
+    // so steady-state device directory polling never accumulates rows or trips the active cap.
+    reap_prior_device_inventory_sessions(transaction, request.user_did, request.device_id).await?;
+    reap_expired_and_excess_inventory_sessions(transaction, request.user_did, request.device_id).await?;
     sqlx::query(
         r#"
         INSERT INTO chat.device_inventory_sessions(
@@ -2347,6 +2504,8 @@ pub(crate) enum ExistingDeviceReadFacadeError {
     /// The fixed three-attempt ceiling was reached (`getOwnDevices` only).
     /// The handler renders HTTP 503 + `Retry-After: 1`.
     RetryCeiling,
+    /// Active device inventory session cap was reached.
+    RateLimited,
 }
 
 /// Consuming canonical `getDevices` response bytes. Private field, no item
@@ -2766,6 +2925,11 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                     .await
                     .map_err(|e| {
                         tracing::error!("transaction.commit error: {:?}", e);
+                        if let sqlx::Error::Database(dbe) = &e {
+                            if dbe.code().as_deref() == Some("23514") && dbe.message().contains("cap exceeded") {
+                                return ExistingDeviceReadFacadeError::RateLimited;
+                            }
+                        }
                         ExistingDeviceReadFacadeError::Storage
                     })?;
                 // Only NOW may bytes exist.

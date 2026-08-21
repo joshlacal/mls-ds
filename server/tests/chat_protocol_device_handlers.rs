@@ -1328,6 +1328,40 @@ async fn get_own_devices_materializes_single_page_snapshot() {
     assert_eq!(own["device"]["status"], "active");
 }
 
+#[tokio::test]
+#[ignore]
+async fn get_own_devices_steady_state_polling_beyond_cap_succeeds_and_stays_bounded() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let scenario = enroll_fresh_device(&pool, 2).await;
+
+    // Poll getOwnDevices 25 times in a row — well beyond the 8-per-device cap.
+    for attempt in 1..=25 {
+        let request = query_request(&scenario, "blue.catbird.chat.getOwnDevices", "");
+        let (status, body) = send(router_with(pool.clone(), true), request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "getOwnDevices attempt {attempt} failed: {body}"
+        );
+        assert_eq!(body["hasMore"], false);
+    }
+
+    // The session table must not grow unbounded: exactly 1 active session retained for this device.
+    let session_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_inventory_sessions WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&scenario.did)
+    .bind(scenario.device_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count device inventory sessions");
+
+    assert_eq!(
+        session_count, 1,
+        "steady-state polling must reap superseded sessions and retain exactly 1 row"
+    );
+}
+
 /// Render a directory row's `created_at` the same way the handler does, so the
 /// conformance assertion compares like for like.
 fn jacquard_created_at(view: &repository::device_directory::DeviceDirectoryView) -> String {

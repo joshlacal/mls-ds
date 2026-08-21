@@ -75,6 +75,9 @@ fn facade_failure(error: ExistingDeviceReadFacadeError) -> ChatFailure {
         ExistingDeviceReadFacadeError::RequestTooBroad => {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
         }
+        ExistingDeviceReadFacadeError::RateLimited => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::RateLimited)
+        }
         ExistingDeviceReadFacadeError::Storage => ChatFailure::storage(ENDPOINT),
         ExistingDeviceReadFacadeError::Invariant | ExistingDeviceReadFacadeError::RetryCeiling => {
             ChatFailure::invariant(ENDPOINT)
