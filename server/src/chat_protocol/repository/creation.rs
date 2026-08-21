@@ -511,7 +511,10 @@ async fn execute_first_creation<T: PublicTransport>(
     let accepted = products.durable_json().to_vec();
     let genesis = match mutation.projection() {
         VerifiedMutationProjection::Creation(value) => {
-            value.genesis_group_info().canonical_dag_cbor()
+            match value.genesis_group_info().get("bytes") {
+                Some(CanonicalValueRef::Bytes(bytes)) => bytes.to_vec(),
+                _ => return Err(CreationFacadeError::InvalidCanonicalMaterial),
+            }
         }
         _ => {
             eprintln!("genesis_group_info projection failed");
