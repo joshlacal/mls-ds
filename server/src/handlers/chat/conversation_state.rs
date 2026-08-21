@@ -91,18 +91,19 @@ fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure>
         let value = percent_decode(raw_value)
             .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
         match key.as_str() {
-            "actorDeviceId" if actor_device_id.is_none() => {
+            "actorDeviceId" => {
                 let canonical = CanonicalUuidV4::parse(&value)
                     .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
-            "conversationId" if conversation_id.is_none() => {
+            "conversationId" | "convoId" => {
                 let canonical = CanonicalUuidV4::parse(&value)
                     .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
                 let uuid = uuid::Uuid::parse_str(canonical.as_str())
                     .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
                 conversation_id = Some(uuid);
             }
+            "include" => {}
             _ => {
                 return Err(ChatFailure::protocol(
                     ENDPOINT,
