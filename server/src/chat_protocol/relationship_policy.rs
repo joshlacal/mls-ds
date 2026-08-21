@@ -3162,7 +3162,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         &self.config
     }
 
-    #[cfg(not(test))]
+
     pub(crate) async fn collect_admission_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -3180,7 +3180,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         .await
     }
 
-    #[cfg(not(test))]
+
     pub(crate) async fn collect_block_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -3198,7 +3198,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         .await
     }
 
-    #[cfg(not(test))]
+
     pub(crate) async fn collect_traffic_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,

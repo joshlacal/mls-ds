@@ -1350,24 +1350,66 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
     }
     let scope_digest = relationship_scope_digest(&scope);
     let fingerprint = fixed_configuration_fingerprint()?;
-    let Some(snapshot) = lock_fallback_snapshot(
+    let (snapshot, declarations, relationships) = match lock_fallback_snapshot(
         transaction,
         operation_scope.as_persisted_str(),
         &scope_digest,
         &fingerprint,
     )
-    .await?
-    else {
-        return Ok(None);
+    .await? {
+        Some(s) if observe_post_lock_time(transaction).await? - s.completed_at <= TimeDelta::seconds(60) => {
+            let (decl, rel) = lock_projection_children(transaction, s.projection_id).await?;
+            (s, decl, rel)
+        }
+        _ => {
+            let live_allocation = allocate_projection_revision(transaction).await?;
+            let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let live = match &scope {
+                ProjectionScope::Admission(req) => {
+                    authority
+                        .collect_admission_projection(live_allocation, operation_scope, req.clone())
+                        .await
+                        .map_err(|e| {
+                            eprintln!("collect_admission_projection failed: {:?}", e);
+                            RelationshipRepositoryError::InvalidProjection
+                        })?
+                }
+                ProjectionScope::BlockOnly(s) => {
+                    authority
+                        .collect_block_projection(live_allocation, operation_scope, s.members.clone())
+                        .await
+                        .map_err(|e| {
+                            eprintln!("collect_block_projection failed: {:?}", e);
+                            RelationshipRepositoryError::InvalidProjection
+                        })?
+                }
+            };
+            let observation = observe_relationship_persistence();
+            let sealed = live
+                .export_persisted_fallback(fallback_allocation, authority, &observation)
+                .map_err(|e| {
+                    eprintln!("export_persisted_fallback failed: {:?}", e);
+                    RelationshipRepositoryError::InvalidProjection
+                })?;
+            persist_relationship_projection(transaction, sealed).await?;
+            let newly_locked = lock_fallback_snapshot(
+                transaction,
+                operation_scope.as_persisted_str(),
+                &scope_digest,
+                &fingerprint,
+            )
+            .await?
+            .ok_or_else(|| {
+                eprintln!("lock_fallback_snapshot returned None after persist");
+                RelationshipRepositoryError::InvalidProjection
+            })?;
+            let (decl, rel) = lock_projection_children(transaction, newly_locked.projection_id).await?;
+            (newly_locked, decl, rel)
+        }
     };
-    let (declarations, relationships) =
-        lock_projection_children(transaction, snapshot.projection_id).await?;
     let observed_at = observe_post_lock_time(transaction).await?;
     if observed_at < snapshot.completed_at {
         return Err(RelationshipRepositoryError::InvalidProjection);
-    }
-    if observed_at - snapshot.completed_at > TimeDelta::seconds(60) {
-        return Ok(None);
     }
     let decision = TrustedRelationshipDecisionInstant::from_locked_relationship_scope(
         transaction_id.clone(),
