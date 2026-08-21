@@ -845,9 +845,17 @@ fn canonical_response_from_plan(
         "entry": entry,
         "welcomes": welcomes,
     });
+    // Jacquard's generated DTO borrows strings from the deserializer input.
+    // `serde_json::from_value` cannot provide that backing storage and fails on
+    // canonical byte objects with "expected a borrowed string". Serialize the
+    // canonical value first, then deserialize from the retained byte buffer.
+    let value_bytes = serde_json::to_vec(&value).map_err(|e| {
+        tracing::error!(error = %e, value = %value, "canonical_response_from_plan: value to_vec failed");
+        SubmitTransitionFacadeError::InvalidCanonicalMaterial
+    })?;
     let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_value(value.clone()).map_err(|e| {
-            tracing::error!(error = %e, value = %value, "canonical_response_from_plan: serde_json::from_value failed");
+        serde_json::from_slice(&value_bytes).map_err(|e| {
+            tracing::error!(error = %e, value = %value, "canonical_response_from_plan: value from_slice failed");
             SubmitTransitionFacadeError::InvalidCanonicalMaterial
         })?;
     let bytes = serde_json::to_vec(&output).map_err(|e| {
@@ -1484,8 +1492,10 @@ fn canonical_response_from_replay_rows(
             .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
         "welcomes": welcomes,
     });
+    let value_bytes = serde_json::to_vec(&value)
+        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
     let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_value(value)
+        serde_json::from_slice(&value_bytes)
             .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
     let bytes = serde_json::to_vec(&output)
         .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
