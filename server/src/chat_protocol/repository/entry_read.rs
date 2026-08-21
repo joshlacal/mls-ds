@@ -50,7 +50,7 @@ pub(crate) async fn get_entries_for_admission(
         .begin()
         .await
         .map_err(|_| EntryReadFacadeError::Storage)?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *transaction)
         .await
         .map_err(|_| EntryReadFacadeError::Storage)?;
