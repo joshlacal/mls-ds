@@ -4385,6 +4385,14 @@ async fn create_inventory_snapshot_attempt(
         if existing_row.expires_at <= now
             || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
         {
+            sqlx::query("DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id = $1")
+                .bind(inventory_session_id)
+                .execute(&mut **transaction)
+                .await?;
+            sqlx::query("DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id = $1")
+                .bind(inventory_session_id)
+                .execute(&mut **transaction)
+                .await?;
             sqlx::query("DELETE FROM chat.subscription_tickets WHERE inventory_session_id = $1")
                 .bind(inventory_session_id)
                 .execute(&mut **transaction)
