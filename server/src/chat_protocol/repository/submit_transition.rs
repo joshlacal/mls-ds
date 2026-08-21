@@ -968,16 +968,10 @@ fn coordinate_json(
             .to_string(),
         "generation": generation,
         "stateVersion": state_version,
-        "groupId": {
-            "$bytes": STANDARD.encode(coordinate.group_id())
-        },
+        "groupId": STANDARD.encode(coordinate.group_id()),
         "epoch": epoch,
-        "groupContextHash": {
-            "$bytes": STANDARD.encode(coordinate.group_context_hash())
-        },
-        "confirmationTag": {
-            "$bytes": STANDARD.encode(coordinate.confirmation_tag())
-        },
+        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
+        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
         "lifecycle": lifecycle,
     }))
 }
