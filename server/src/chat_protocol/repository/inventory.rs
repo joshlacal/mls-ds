@@ -2087,15 +2087,25 @@ async fn reap_prior_device_inventory_sessions(
              SELECT device_inventory_session_id
                FROM chat.device_inventory_sessions
               WHERE user_did = $1 AND device_id = $2
-         );
-        DELETE FROM chat.device_inventory_sessions
-         WHERE user_did = $1 AND device_id = $2;
+         )
         "#,
     )
     .bind(user_did)
     .bind(device_id)
     .execute(&mut **transaction)
     .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.device_inventory_sessions
+         WHERE user_did = $1 AND device_id = $2
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
     Ok(())
 }
 
@@ -2104,51 +2114,15 @@ async fn reap_expired_and_excess_inventory_sessions(
     user_did: &str,
     device_id: Uuid,
 ) -> Result<(), InventoryRepositoryError> {
-    // 1. Delete all expired sessions for this device
+    // 1. Delete all expired sessions and receipts for this device
     sqlx::query(
         r#"
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.subscription_tickets WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
-        WITH expired AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        )
-        DELETE FROM chat.inventory_sessions WHERE inventory_session_id IN (SELECT inventory_session_id FROM expired);
+        DELETE FROM chat.inventory_page_receipts
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
         "#,
     )
     .bind(user_did)
@@ -2156,65 +2130,85 @@ async fn reap_expired_and_excess_inventory_sessions(
     .execute(&mut **transaction)
     .await?;
 
-    // 2. If active sessions for this device >= 4, delete oldest excess
     sqlx::query(
         r#"
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.subscription_tickets WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
-        WITH excess AS (
-            SELECT inventory_session_id
-              FROM chat.inventory_sessions
-             WHERE user_did = $1 AND device_id = $2
-             ORDER BY created_at DESC
-            OFFSET 3
-        )
-        DELETE FROM chat.inventory_sessions WHERE inventory_session_id IN (SELECT inventory_session_id FROM excess);
+        DELETE FROM chat.event_cursor_receipts
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.subscription_tickets
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.inventory_conversation_items
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.inventory_welcome_items
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.inventory_recovery_items
+         WHERE inventory_session_id IN (
+             SELECT inventory_session_id
+               FROM chat.inventory_sessions
+              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
+         )
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM chat.inventory_sessions
+         WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
         "#,
     )
     .bind(user_did)
