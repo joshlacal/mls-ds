@@ -137,7 +137,10 @@ async fn serve(
         )
         .await
     }
-    .map_err(|error| map_repository_error(endpoint, error))?;
+    .map_err(|error| {
+        tracing::error!("create_inventory_snapshot_and_first_page error: {:?}", error);
+        map_repository_error(endpoint, error)
+    })?;
     Ok(context::json_ok(response.into_bytes()))
 }
 
