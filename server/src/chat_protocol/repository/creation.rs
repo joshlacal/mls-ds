@@ -336,15 +336,33 @@ async fn execute_first_creation<T: PublicTransport>(
             return Ok(CreationTransactionOutcome::first(response, None));
         }
     }
-    let head = hydrate_locked_creation_head(
+    let head = match hydrate_locked_creation_head(
         transaction,
         conversation_id,
         scope_authority.trusted_instant(),
     )
-    .await?;
-    let hydration = HydrationAuthority::from_locked_creation_head(&head)?;
-    let registration = hydration.locked_registration_from_scope_authority(scope_authority)?;
-    let quota = hydrate_locked_invitation_quota(
+    .await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("hydrate_locked_creation_head failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
+    let hydration = match HydrationAuthority::from_locked_creation_head(&head) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("HydrationAuthority::from_locked_creation_head failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
+    let registration = match hydration.locked_registration_from_scope_authority(scope_authority) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("locked_registration_from_scope_authority failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
+    let quota = match hydrate_locked_invitation_quota(
         transaction,
         authority.subject().as_str(),
         &principals
@@ -354,9 +372,21 @@ async fn execute_first_creation<T: PublicTransport>(
             .collect::<Vec<_>>(),
         scope_authority.trusted_instant(),
     )
-    .await?;
-    let verified = reverify_scope_mutation(scope_authority, mutation)?;
-    let entry = build_verified_control_entry(
+    .await {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("hydrate_locked_invitation_quota failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
+    let verified = match reverify_scope_mutation(scope_authority, mutation) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("reverify_scope_mutation failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    let entry = match build_verified_control_entry(
         verified,
         authority.endpoint(),
         canonical_uuid(transition_id)?,
@@ -364,8 +394,20 @@ async fn execute_first_creation<T: PublicTransport>(
         1,
         authority.trusted_instant(),
         CanonicalControlServerFields::empty(ControlEntryKind::Creation)?,
-    )?;
-    let products = CanonicalControlEntryProducts::mint(&entry)?;
+    ) {
+        Ok(en) => en,
+        Err(e) => {
+            eprintln!("build_verified_control_entry failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
+    let products = match CanonicalControlEntryProducts::mint(&entry) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("CanonicalControlEntryProducts::mint failed: {:?}", e);
+            return Err(e.into());
+        }
+    };
     let trusted_now = crate::chat_protocol::validation::TrustedRequestInstant::from_datetime(
         scope_authority.trusted_instant(),
     )?;
@@ -376,6 +418,7 @@ async fn execute_first_creation<T: PublicTransport>(
         .collect::<Vec<_>>();
     let planned = if pending.is_empty() {
         if kind != "group" {
+            eprintln!("pending is empty for direct conversation");
             return Err(CreationFacadeError::InvalidCanonicalMaterial);
         }
         let no_admission = seal_group_creation_no_pending_admission(&head, &quota, &registration)?;
@@ -389,22 +432,43 @@ async fn execute_first_creation<T: PublicTransport>(
         )?
     } else {
         let fallback = if kind == "direct" {
-            seal_direct_creation_fallback_scope(
+            match seal_direct_creation_fallback_scope(
                 &head,
                 &quota,
                 direct_lookup
                     .as_ref()
                     .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?,
                 &registration,
-            )?
+            ) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    eprintln!("seal_direct_creation_fallback_scope failed: {:?}", e);
+                    return Err(e.into());
+                }
+            }
         } else {
-            seal_group_creation_fallback_scope(&head, &quota, &registration)?
+            match seal_group_creation_fallback_scope(&head, &quota, &registration) {
+                Ok(fb) => fb,
+                Err(e) => {
+                    eprintln!("seal_group_creation_fallback_scope failed: {:?}", e);
+                    return Err(e.into());
+                }
+            }
         };
         let (relationship, decision) =
-            load_fallback_relationship_projection(transaction, fallback, relationship_authority)
-                .await?
-                .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
-        hydration.plan_creation(
+            match load_fallback_relationship_projection(transaction, fallback, relationship_authority)
+                .await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    eprintln!("load_fallback_relationship_projection returned None");
+                    return Err(CreationFacadeError::InvalidCanonicalMaterial);
+                }
+                Err(e) => {
+                    eprintln!("load_fallback_relationship_projection error: {:?}", e);
+                    return Err(e.into());
+                }
+            };
+        match hydration.plan_creation(
             entry,
             &registration,
             Some(&head),
@@ -414,11 +478,23 @@ async fn execute_first_creation<T: PublicTransport>(
             quota,
             &decision,
             &trusted_now,
-        )?
+        ) {
+            Ok(pl) => pl,
+            Err(e) => {
+                eprintln!("hydration.plan_creation failed: {:?}", e);
+                return Err(e.into());
+            }
+        }
     };
     let plan = match planned {
         crate::chat_protocol::state_machine::CreationDecision::Create(plan) => {
-            plan.into_persistence_plan()?
+            match plan.into_persistence_plan() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("into_persistence_plan failed: {:?}", e);
+                    return Err(e.into());
+                }
+            }
         }
         crate::chat_protocol::state_machine::CreationDecision::ExistingDirect { .. } => {
             eprintln!("CreationDecision::ExistingDirect encountered");
