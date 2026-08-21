@@ -802,6 +802,45 @@ fn key_package_rejects_capabilities_last_resort_reused_keys_and_bad_signatures()
 }
 
 #[test]
+fn clean_client_enrollment_key_package_contract_lock() {
+    let credential = b"did:plc:alicefixtureaaaaaaaaaaaa#70707070-7070-4070-b070-707070707070";
+    let now = 150;
+
+    // 1. Clean client enrollment key package (empty capability extensions + empty proposals)
+    // MUST be accepted by the server validator.
+    let clean_package =
+        key_package_fixture_with_profile(credential, Lifetime::init(100, 1_000), true, false);
+    let validated = validate_key_package(
+        &clean_package.wrapped,
+        key_package_policy(&clean_package, credential, now),
+    )
+    .expect("clean client enrollment key package must be accepted");
+    assert_eq!(validated.inner_bytes(), clean_package.inner);
+
+    // 2. Negative case: non-empty capability extensions MUST be rejected with UnsupportedCapabilities.
+    let with_ext_caps =
+        key_package_fixture_with_profile(credential, Lifetime::init(100, 1_000), false, false);
+    assert_eq!(
+        validate_key_package(
+            &with_ext_caps.wrapped,
+            key_package_policy(&with_ext_caps, credential, now),
+        ),
+        Err(WireValidationError::UnsupportedCapabilities)
+    );
+
+    // 3. Negative case: non-empty key package extensions MUST be rejected with UnsupportedExtensions.
+    let with_kp_ext =
+        key_package_fixture_with_profile(credential, Lifetime::init(100, 1_000), true, true);
+    assert_eq!(
+        validate_key_package(
+            &with_kp_ext.wrapped,
+            key_package_policy(&with_kp_ext, credential, now),
+        ),
+        Err(WireValidationError::UnsupportedExtensions)
+    );
+}
+
+#[test]
 fn key_package_rejects_malformed_xwing_public_keys() {
     let credential = b"did:plc:alice#malformed-xwing";
     let fixture = key_package_fixture(credential, Lifetime::init(100, 1_000));

@@ -29,12 +29,12 @@ pub(super) async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    eprintln!(">>> create_conversation::handle invoked <<<");
     let endpoint = ChatEndpoint::CreateConversation;
     handle_inner(&pool, &runtime, endpoint, &headers, &body)
         .await
         .unwrap_or_else(IntoResponse::into_response)
 }
-
 async fn handle_inner(
     pool: &DbPool,
     runtime: &ChatRuntime,
@@ -42,34 +42,59 @@ async fn handle_inner(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let admission =
-        context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    let admission = match context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("admit error: {:?}", e);
+            return Err(e);
+        }
+    };
     let mut transaction = pool
         .begin()
         .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
-    let prepared = crate::chat_protocol::repository::prelude::prepare_signed_operation(
+        .map_err(|e| {
+            eprintln!("tx begin error: {:?}", e);
+            ChatFailure::storage(endpoint)
+        })?;
+    let prepared = match crate::chat_protocol::repository::prelude::prepare_signed_operation(
         &mut transaction,
         admission,
     )
-    .await
-    .map_err(|error| context::operation_prelude_failure(endpoint, error))?;
-    let outcome = creation::execute_prepared_creation(
+    .await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("prepare error: {:?}", e);
+            return Err(context::operation_prelude_failure(endpoint, e));
+        }
+    };
+    let outcome = match creation::execute_prepared_creation(
         &mut transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
     )
-    .await
-    .map_err(|error| creation_failure(endpoint, error))?;
-    let response = context::canonical_json_response(
+    .await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("creation execute error: {:?}", e);
+            return Err(creation_failure(endpoint, e));
+        }
+    };
+    let response = match context::canonical_json_response(
         endpoint,
         outcome.status(),
         outcome.response_bytes().to_vec(),
-    )?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("canonical_json_response error: {:?}", e);
+            return Err(e);
+        }
+    };
+    if let Err(e) = transaction.commit().await {
+        eprintln!("commit error: {:?}", e);
+        return Err(ChatFailure::storage(endpoint));
+    }
+    eprintln!("create_conversation SUCCESS!");
     Ok(response)
 }
 
@@ -121,9 +146,9 @@ fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatF
         E::StateMachine(S::InvalidPublicState) => {
             ChatFailure::protocol(endpoint, C::InvalidGenesisGroupInfo)
         }
-        E::StateMachine(S::DirectParticipantMutationForbidden) => {
-            ChatFailure::protocol(endpoint, C::InvalidRequest)
-        }
+        E::StateMachine(
+            S::DirectParticipantMutationForbidden | S::InvalidCreation | S::InvalidTransition,
+        ) => ChatFailure::protocol(endpoint, C::InvalidRequest),
         E::DirectLookup(error) => match error {
             crate::chat_protocol::repository::core::DirectConversationLookupError::Database(_) => {
                 ChatFailure::storage(endpoint)

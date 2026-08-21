@@ -150,6 +150,10 @@ where
             get(get_own_devices::handle),
         )
         .route(
+            &xrpc_path(ChatEndpoint::CreateConversation),
+            post(create_conversation::handle),
+        )
+        .route(
             &xrpc_path(ChatEndpoint::GetConversationState),
             get(conversation_state::handle),
         )
@@ -208,10 +212,6 @@ where
         .route(
             &xrpc_path(ChatEndpoint::PublishTyping),
             post(publish_typing::handle),
-        )
-        .route(
-            &xrpc_path(ChatEndpoint::CreateConversation),
-            post(create_conversation::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::AcceptConversation),

@@ -571,6 +571,9 @@ fn parse_submit_transition(
                             Some(CanonicalValueRef::Did(value)) => {
                                 additions.push(value.as_str().to_owned())
                             }
+                            Some(CanonicalValueRef::Text(value)) => {
+                                additions.push((*value).to_owned())
+                            }
                             _ => return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial),
                         }
                     }

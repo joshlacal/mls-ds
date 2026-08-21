@@ -421,16 +421,26 @@ async fn execute_first_creation<T: PublicTransport>(
             plan.into_persistence_plan()?
         }
         crate::chat_protocol::state_machine::CreationDecision::ExistingDirect { .. } => {
+            eprintln!("CreationDecision::ExistingDirect encountered");
             return Err(CreationFacadeError::InvalidCanonicalMaterial)
         }
     };
-    let response = creation_response(&plan, products.canonical_response_json())?;
+    let response = match creation_response(&plan, products.canonical_response_json()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("creation_response failed with: {:?}", e);
+            return Err(e);
+        }
+    };
     let accepted = products.durable_json().to_vec();
     let genesis = match mutation.projection() {
         VerifiedMutationProjection::Creation(value) => {
             value.genesis_group_info().canonical_dag_cbor()
         }
-        _ => return Err(CreationFacadeError::InvalidCanonicalMaterial),
+        _ => {
+            eprintln!("genesis_group_info projection failed");
+            return Err(CreationFacadeError::InvalidCanonicalMaterial);
+        }
     };
     let expected = plan.successor_coordinate().copied();
     let (scope, completion) = prelude.into_execution_parts();
@@ -440,6 +450,7 @@ async fn execute_first_creation<T: PublicTransport>(
         || applied.allocated_seq != 1
         || applied.successor_coordinate.as_ref() != expected.as_ref()
     {
+        eprintln!("applied mismatch: entry_id={:?} expected={:?}, seq={} expected=1, succ={:?} expected={:?}", applied.entry_id, transition_id, applied.allocated_seq, applied.successor_coordinate, expected);
         return Err(CreationFacadeError::InvalidCanonicalMaterial);
     }
     let event_position = applied.event_positions.first().copied();
@@ -467,6 +478,7 @@ fn parse_creation(
         Some(CanonicalValueRef::Array(values)) => (0..values.len())
             .map(|i| match values.get(i) {
                 Some(CanonicalValueRef::Object(object)) => match object.get("userDid") {
+                    Some(CanonicalValueRef::Did(did)) => Some(did.as_str().to_owned()),
                     Some(CanonicalValueRef::Text(did)) => Some(did.to_owned()),
                     _ => None,
                 },
@@ -475,8 +487,7 @@ fn parse_creation(
             .collect::<Vec<_>>(),
         _ => return Err(CreationFacadeError::InvalidCanonicalMaterial),
     };
-    let principals = validate_creation_participant_dids(&participant_slots)
-        .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
+    let principals = validate_creation_participant_dids(&participant_slots)?;
     Ok((
         Uuid::from_bytes(*value.transition_id().as_bytes()),
         Uuid::from_bytes(*value.conversation_id().as_bytes()),
@@ -496,8 +507,13 @@ fn creation_response(
     let value_bytes =
         serde_json::to_vec(&value).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
     let output: chat_dto::create_conversation::CreateConversationOutput<DefaultStr> =
-        serde_json::from_slice(&value_bytes)
-            .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
+        match serde_json::from_slice(&value_bytes) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("output deserialization error: {:?}, json: {}", e, String::from_utf8_lossy(&value_bytes));
+                return Err(CreationFacadeError::InvalidCanonicalMaterial);
+            }
+        };
     CreationCanonicalResponse::new(
         serde_json::to_vec(&output).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?,
     )
