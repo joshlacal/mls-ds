@@ -1,4 +1,4 @@
--- Fix GC of expired inventory sessions without requiring superuser session_replication_role
+-- Fix GC and reclamation of inventory sessions without requiring superuser session_replication_role
 
 CREATE OR REPLACE FUNCTION chat.enforce_immutable_identity()
 RETURNS trigger
@@ -11,26 +11,19 @@ DECLARE
     END;
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        -- Allow GC of expired inventory sessions and their child rows
-        IF TG_TABLE_NAME IN ('inventory_sessions', 'device_inventory_sessions') AND OLD.expires_at IS NOT NULL AND OLD.expires_at < now() THEN
+        -- Allow cleanup/reclaim of ephemeral inventory sessions and their child rows
+        IF TG_TABLE_NAME IN (
+            'inventory_sessions',
+            'device_inventory_sessions',
+            'inventory_conversation_items',
+            'inventory_welcome_items',
+            'inventory_recovery_items',
+            'subscription_tickets',
+            'inventory_page_receipts',
+            'event_cursor_receipts',
+            'device_inventory_items'
+        ) THEN
             RETURN OLD;
-        END IF;
-        IF TG_TABLE_NAME IN ('inventory_conversation_items', 'inventory_welcome_items', 'inventory_recovery_items', 'subscription_tickets', 'inventory_page_receipts', 'event_cursor_receipts') THEN
-            IF EXISTS (SELECT 1 FROM chat.inventory_sessions WHERE inventory_session_id = OLD.inventory_session_id AND expires_at IS NOT NULL AND expires_at < now()) THEN
-                RETURN OLD;
-            END IF;
-            -- Also allow cleanup of orphaned receipts where the session row has already been deleted
-            IF NOT EXISTS (SELECT 1 FROM chat.inventory_sessions WHERE inventory_session_id = OLD.inventory_session_id) THEN
-                RETURN OLD;
-            END IF;
-        END IF;
-        IF TG_TABLE_NAME = 'device_inventory_items' THEN
-            IF EXISTS (SELECT 1 FROM chat.device_inventory_sessions WHERE device_inventory_session_id = OLD.device_inventory_session_id AND expires_at IS NOT NULL AND expires_at < now()) THEN
-                RETURN OLD;
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM chat.device_inventory_sessions WHERE device_inventory_session_id = OLD.device_inventory_session_id) THEN
-                RETURN OLD;
-            END IF;
         END IF;
         RAISE EXCEPTION 'immutable chat row cannot be deleted: %.%', TG_TABLE_SCHEMA, TG_TABLE_NAME
             USING ERRCODE = '23514';
