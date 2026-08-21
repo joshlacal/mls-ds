@@ -961,10 +961,16 @@ fn coordinate_json(
             .to_string(),
         "generation": generation,
         "stateVersion": state_version,
-        "groupId": STANDARD.encode(coordinate.group_id()),
+        "groupId": {
+            "$bytes": STANDARD.encode(coordinate.group_id())
+        },
         "epoch": epoch,
-        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
-        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+        "groupContextHash": {
+            "$bytes": STANDARD.encode(coordinate.group_context_hash())
+        },
+        "confirmationTag": {
+            "$bytes": STANDARD.encode(coordinate.confirmation_tag())
+        },
         "lifecycle": lifecycle,
     }))
 }

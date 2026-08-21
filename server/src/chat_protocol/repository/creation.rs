@@ -611,9 +611,22 @@ fn coordinate_json(
     if coordinate.lifecycle() != PublicGroupSnapshotLifecycle::Active {
         return Err(CreationFacadeError::InvalidCanonicalMaterial);
     }
-    Ok(
-        json!({"conversationId":Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),"generation":coordinate.generation() as i64,"stateVersion":coordinate.state_version() as i64,"groupId":base64::engine::general_purpose::STANDARD.encode(coordinate.group_id()),"epoch":coordinate.epoch() as i64,"groupContextHash":base64::engine::general_purpose::STANDARD.encode(coordinate.group_context_hash()),"confirmationTag":base64::engine::general_purpose::STANDARD.encode(coordinate.confirmation_tag()),"lifecycle":"active"}),
-    )
+    Ok(json!({
+        "conversationId": Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),
+        "generation": coordinate.generation() as i64,
+        "stateVersion": coordinate.state_version() as i64,
+        "groupId": {
+            "$bytes": base64::engine::general_purpose::STANDARD.encode(coordinate.group_id())
+        },
+        "epoch": coordinate.epoch() as i64,
+        "groupContextHash": {
+            "$bytes": base64::engine::general_purpose::STANDARD.encode(coordinate.group_context_hash())
+        },
+        "confirmationTag": {
+            "$bytes": base64::engine::general_purpose::STANDARD.encode(coordinate.confirmation_tag())
+        },
+        "lifecycle": "active"
+    }))
 }
 
 async fn lock_creation_replay_post_state(
