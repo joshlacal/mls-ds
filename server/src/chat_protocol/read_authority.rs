@@ -403,14 +403,21 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         let coordinates = attempt.lock_coordinates();
         (coordinates.did.to_owned(), coordinates.device_id)
     };
+    eprintln!("[DEBUG lock_read_device] attempting lock for did={}, device_id={}", lock_did, lock_device_id);
 
     let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
         .await
-        .map_err(|_| ReadAuthorityError::Storage)?;
+        .map_err(|e| {
+            eprintln!("[DEBUG lock_read_device] txid query failed: {:?}", e);
+            ReadAuthorityError::Storage
+        })?;
     let txid: i64 = transaction_id
         .parse()
-        .map_err(|_| ReadAuthorityError::Invariant)?;
+        .map_err(|e| {
+            eprintln!("[DEBUG lock_read_device] txid parse failed: {:?}", e);
+            ReadAuthorityError::Invariant
+        })?;
 
     // BARRIER 1 — the exact requester device row.
     let device: Option<LockedReadRequesterDeviceRow> = sqlx::query_as(LOCK_READ_DEVICE_SQL)
@@ -418,12 +425,15 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .bind(lock_device_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|_| ReadAuthorityError::Storage)?;
+        .map_err(|e| {
+            eprintln!("[DEBUG lock_read_device] device query failed: {:?}", e);
+            ReadAuthorityError::Storage
+        })?;
     let Some(device) = device else {
+        eprintln!("[DEBUG lock_read_device] Missing device row for did={}, device_id={}", lock_did, lock_device_id);
         // Missing device row: return before construction.
         return Err(ReadAuthorityError::Invariant);
     };
-
     // BARRIER 2 — a SEPARATE statement for the exact requester key row, issued
     // only now that barrier 1 has completed.
     let key: Option<LockedReadRequesterKeyRow> = sqlx::query_as(LOCK_READ_DEVICE_KEY_SQL)
@@ -433,6 +443,7 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
     let Some(key) = key else {
+        eprintln!("[DEBUG lock_read_device] Missing key row for did={}, device_id={}", lock_did, lock_device_id);
         // Missing key row: return before construction.
         return Err(ReadAuthorityError::Invariant);
     };
@@ -442,7 +453,7 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
     // The B-read `from_repository_lock` callsite. Reachable only after BOTH
     // ordered locks succeeded, and it carries the row's OWN
     // `user_did`/`device_id` rather than the coordinates that addressed it.
-    let locked_row = LockedReadDatabaseRow::from_repository_lock(
+    let locked_row = match LockedReadDatabaseRow::from_repository_lock(
         transaction_id.clone().into_boxed_str(),
         device.user_did.clone().into_boxed_str(),
         device.device_id,
@@ -452,17 +463,27 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         key.key_id.clone().into_boxed_str(),
         signing_public_key_sha256,
         key.revoked_at,
-    )
-    .map_err(|_| ReadAuthorityError::Invariant)?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[DEBUG lock_read_device] from_repository_lock failed: {:?}", e);
+            return Err(ReadAuthorityError::Invariant);
+        }
+    };
 
     // Constructing the row proved nothing. Only this consuming verification
     // mints authority, and it spends the attempt.
-    let verified: VerifiedExistingDeviceReadRow = attempt
-        .consume_verify_locked_row(locked_row)
-        .map_err(map_binding_error)?;
-    verified
-        .verify_same_transaction(&transaction_id)
-        .map_err(|_| ReadAuthorityError::Invariant)?;
+    let verified: VerifiedExistingDeviceReadRow = match attempt.consume_verify_locked_row(locked_row) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[DEBUG lock_read_device] consume_verify_locked_row failed: {:?}", e);
+            return Err(map_binding_error(e));
+        }
+    };
+    if let Err(e) = verified.verify_same_transaction(&transaction_id) {
+        eprintln!("[DEBUG lock_read_device] verify_same_transaction failed: {:?}", e);
+        return Err(ReadAuthorityError::Invariant);
+    }
 
     let device_row_sha256 = locked_device_row_binding_digest(
         &device.user_did,
@@ -473,7 +494,6 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         &key.key_id,
         &signing_public_key_sha256,
     );
-
     Ok(LockedReadDeviceAuthority {
         txid,
         user_did: device.user_did,
@@ -1511,9 +1531,11 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     .await
     .map_err(|_| ReadAuthorityError::Storage)?;
     let Some((_, live_cursor_key)) = live else {
+        eprintln!("[DEBUG verify_inventory_fence] live protocol instance not found: {}", row.protocol_instance_id);
         return Err(ReadAuthorityError::Invariant);
     };
     if live_cursor_key != row.cursor_key_id {
+        eprintln!("[DEBUG verify_inventory_fence] live_cursor_key mismatch: live={}, row={}", live_cursor_key, row.cursor_key_id);
         return Err(ReadAuthorityError::Invariant);
     }
 
@@ -1527,6 +1549,7 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     .map_err(|_| ReadAuthorityError::Storage)?;
     if let Some(floor) = live_floor {
         if u64::try_from(floor).map_err(|_| ReadAuthorityError::Invariant)? > row.event_position {
+            eprintln!("[DEBUG verify_inventory_fence] floor > event_position: floor={}, pos={}", floor, row.event_position);
             return Err(ReadAuthorityError::Invariant);
         }
     }
@@ -1537,9 +1560,9 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     if row.captured_at > now + chrono::Duration::seconds(5)
         || now.signed_duration_since(row.captured_at) > chrono::Duration::minutes(15)
     {
+        eprintln!("[DEBUG verify_inventory_fence] captured_at out of bounds: captured_at={}, now={}", row.captured_at, now);
         return Err(ReadAuthorityError::Invariant);
     }
-
     Ok(VerifiedInventoryFence {
         txid: device.txid(),
         user_did: device.user_did().to_owned(),
@@ -1797,9 +1820,11 @@ async fn revalidate_fence_after_heads(
     .await
     .map_err(|_| ReadAuthorityError::Storage)?;
     let Some((_, live_cursor_key)) = live else {
+        eprintln!("[DEBUG revalidate_fence_after_heads] live protocol instance not found");
         return Err(ReadAuthorityError::Invariant);
     };
     if live_cursor_key != fence.cursor_key_id {
+        eprintln!("[DEBUG revalidate_fence_after_heads] cursor_key mismatch");
         return Err(ReadAuthorityError::Invariant);
     }
 
@@ -1815,6 +1840,7 @@ async fn revalidate_fence_after_heads(
     .map_err(|_| ReadAuthorityError::Storage)?;
     if let Some(floor) = live_floor {
         if u64::try_from(floor).map_err(|_| ReadAuthorityError::Invariant)? > fence.event_position {
+            eprintln!("[DEBUG revalidate_fence_after_heads] floor > event_position");
             return Err(ReadAuthorityError::Invariant);
         }
     }
@@ -1830,6 +1856,7 @@ async fn revalidate_fence_after_heads(
     if fence.event_position
         > u64::try_from(maximum_event_position).map_err(|_| ReadAuthorityError::Invariant)?
     {
+        eprintln!("[DEBUG revalidate_fence_after_heads] event_position > max");
         return Err(ReadAuthorityError::Invariant);
     }
 
@@ -1838,7 +1865,11 @@ async fn revalidate_fence_after_heads(
         .fetch_one(&mut **tx)
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
-    fence.verify_same_transaction(current)
+    if let Err(e) = fence.verify_same_transaction(current) {
+        eprintln!("[DEBUG revalidate_fence_after_heads] verify_same_transaction failed: {:?}", e);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The inventory authorities for one verified fence. Candidate conversations
