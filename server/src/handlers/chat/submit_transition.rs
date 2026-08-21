@@ -18,7 +18,10 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
-            core::{InvitationQuotaHydrationError, RecoveryPackageHydrationError},
+            core::{
+                ConversationHeadHydrationError, ConversationStateHydrationError,
+                InvitationQuotaHydrationError, RecoveryPackageHydrationError,
+            },
             execution_context::ExecutionContextHydrationError,
             prelude,
             relationship::RelationshipRepositoryError,
@@ -99,12 +102,18 @@ fn submit_failure(
     mutation_kind: SignedMutationKind,
     error: SubmitTransitionFacadeError,
 ) -> ChatFailure {
+    tracing::error!(
+        "submit_failure: mutation_kind={:?}, error={:?}",
+        mutation_kind,
+        error
+    );
     use ChatProtocolErrorCode as C;
+    use ConversationHeadHydrationError as H;
+    use ConversationStateHydrationError as CS;
     use ExecutionContextHydrationError as X;
     use InvitationQuotaHydrationError as Q;
     use RecoveryPackageHydrationError as P;
     use RelationshipRepositoryError as R;
-    use StateMachineError as S;
     use SubmitTransitionFacadeError as E;
 
     match error {
@@ -112,62 +121,105 @@ fn submit_failure(
         | E::RecoveryPackage(P::Database(_))
         | E::InvitationQuota(Q::Database(_))
         | E::Relationship(R::Database(_))
-        | E::ExecutionContext(X::Database(_)) => ChatFailure::storage(ENDPOINT),
+        | E::ExecutionContext(X::Database(_))
+        | E::Conversation(CS::Head(H::Database(_))) => ChatFailure::storage(ENDPOINT),
         E::Prelude(error) => context::operation_prelude_failure(ENDPOINT, error),
         E::Primitive(_) => ChatFailure::protocol(ENDPOINT, C::InvalidSignature),
-        E::StateMachine(S::StaleCoordinates) => {
+        E::CandidateScopeDrift => ChatFailure::protocol(ENDPOINT, C::StaleCoordinates),
+        E::Conversation(CS::Head(H::ConversationMissing)) => {
+            ChatFailure::protocol(ENDPOINT, C::ConversationNotFound)
+        }
+        E::Conversation(CS::ReadSetMismatch) => {
             ChatFailure::protocol(ENDPOINT, C::StaleCoordinates)
         }
-        E::StateMachine(S::CoordinateOverflow) => {
-            ChatFailure::protocol(ENDPOINT, C::CoordinateOverflow)
+        E::Conversation(CS::TerminalLifecycleUnsupported | CS::ConversationDomain) => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
         }
-        E::StateMachine(S::DirectParticipantMutationForbidden) => {
-            ChatFailure::protocol(ENDPOINT, C::DirectParticipantMutationForbidden)
-        }
-        E::StateMachine(S::NotMember | S::NotParticipant) => {
-            ChatFailure::protocol(ENDPOINT, C::NotMember)
-        }
-        E::StateMachine(S::AdminRequired) => ChatFailure::protocol(ENDPOINT, C::AdminRequired),
-        E::StateMachine(S::LastAdminRequired) => {
-            ChatFailure::protocol(ENDPOINT, C::LastAdminRequired)
-        }
-        E::StateMachine(S::InvalidWelcomeMapping) => {
-            ChatFailure::protocol(ENDPOINT, C::InvalidWelcomeMapping)
-        }
-        E::StateMachine(S::MetadataVersionOverflow) => {
-            ChatFailure::protocol(ENDPOINT, C::MetadataVersionOverflow)
-        }
-        E::StateMachine(S::InvalidMetadataAuthority)
-            if mutation_kind == SignedMutationKind::MetadataTransition =>
-        {
+        E::Conversation(CS::Metadata(_)) => {
             ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
         }
-        E::StateMachine(S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState)
-            if mutation_kind == SignedMutationKind::MetadataTransition =>
-        {
-            ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
-        }
-        E::StateMachine(S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState) => {
+        E::Conversation(CS::Snapshot(_)) => {
             ChatFailure::protocol(ENDPOINT, C::InvalidCommit)
         }
-        E::StateMachine(S::LeaveRequestNotFound) => {
-            ChatFailure::protocol(ENDPOINT, C::LeaveRequestNotFound)
+        E::Conversation(CS::State(s) | CS::Authority(s)) => {
+            map_state_machine_error(mutation_kind, s)
         }
-        E::StateMachine(S::WorkExpired)
-            if mutation_kind == SignedMutationKind::LeaveCommitFulfillment =>
-        {
-            ChatFailure::protocol(ENDPOINT, C::LeaveRequestExpired)
+        E::Relationship(R::InvalidAuthorityConfiguration(_)) => {
+            ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
         }
+        E::Relationship(R::InvalidProjection) => {
+            ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
+        }
+        E::InvitationQuota(_) => {
+            ChatFailure::protocol(ENDPOINT, C::InvitationLimitReached)
+        }
+        E::RecoveryPackage(_) => {
+            ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound)
+        }
+        E::StateMachine(s) => map_state_machine_error(mutation_kind, s),
         E::MissingMutation
         | E::UnsupportedMutation
         | E::InvalidCanonicalMaterial
-        | E::CandidateScopeDrift
-        | E::StateMachine(_)
         | E::Conversation(_)
-        | E::RecoveryPackage(_)
-        | E::InvitationQuota(_)
-        | E::Relationship(_)
         | E::ExecutionContext(_)
         | E::Executor(_) => ChatFailure::invariant(ENDPOINT),
+    }
+}
+
+fn map_state_machine_error(
+    mutation_kind: SignedMutationKind,
+    error: StateMachineError,
+) -> ChatFailure {
+    use ChatProtocolErrorCode as C;
+    use StateMachineError as S;
+
+    match error {
+        S::StaleCoordinates => ChatFailure::protocol(ENDPOINT, C::StaleCoordinates),
+        S::CoordinateOverflow => ChatFailure::protocol(ENDPOINT, C::CoordinateOverflow),
+        S::DirectParticipantMutationForbidden => {
+            ChatFailure::protocol(ENDPOINT, C::DirectParticipantMutationForbidden)
+        }
+        S::NotMember | S::NotParticipant => ChatFailure::protocol(ENDPOINT, C::NotMember),
+        S::AdminRequired => ChatFailure::protocol(ENDPOINT, C::AdminRequired),
+        S::LastAdminRequired => ChatFailure::protocol(ENDPOINT, C::LastAdminRequired),
+        S::InvalidWelcomeMapping => ChatFailure::protocol(ENDPOINT, C::InvalidWelcomeMapping),
+        S::MetadataVersionOverflow => ChatFailure::protocol(ENDPOINT, C::MetadataVersionOverflow),
+        S::InvalidPolicyAuthority => ChatFailure::protocol(ENDPOINT, C::BlockedRelationship),
+        S::LeaveRequestNotFound => ChatFailure::protocol(ENDPOINT, C::LeaveRequestNotFound),
+        S::LeafRecoveryNotFound => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound),
+        S::LeafRecoveryAlreadyOpen => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryAlreadyOpen),
+        S::LeafRecoverySuperseded => ChatFailure::protocol(ENDPOINT, C::LeafRecoverySuperseded),
+        S::WorkExpired if mutation_kind == SignedMutationKind::LeaveCommitFulfillment => {
+            ChatFailure::protocol(ENDPOINT, C::LeaveRequestExpired)
+        }
+        S::WorkExpired => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryExpired),
+        S::InvalidMetadataAuthority => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
+        }
+        S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState
+            if mutation_kind == SignedMutationKind::MetadataTransition =>
+        {
+            ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
+        }
+        S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidCommit)
+        }
+        S::InvalidIntervalBoundary => ChatFailure::protocol(ENDPOINT, C::InvalidCommit),
+        S::ConversationCloseNotAllowed => ChatFailure::protocol(ENDPOINT, C::AdminRequired),
+        S::InvalidPrincipal
+        | S::InvalidDeviceId
+        | S::InvalidCreation
+        | S::ExistingConversationConflict
+        | S::InvitationNotPending
+        | S::RecoveryKindMismatch
+        | S::RecoveryDeviceMismatch
+        | S::ResetAlreadyPending
+        | S::ResetRequestNotFound
+        | S::ResetRequestStale
+        | S::ResetSuccessorMismatch
+        | S::ConversationClosed
+        | S::LeaveAlreadyPending
+        | S::InvalidServerTime => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
+        S::InvariantViolation | S::InvalidHydrationAuthority => ChatFailure::invariant(ENDPOINT),
     }
 }

@@ -652,6 +652,26 @@ fn build_authenticated_request(
     dpop_jkt: &str,
     body_json: Value,
 ) -> Request<Body> {
+    build_authenticated_post_for_endpoint(
+        user_did,
+        device_id,
+        dpop_signing_key,
+        dpop_jwk,
+        dpop_jkt,
+        ENDPOINT,
+        body_json,
+    )
+}
+
+fn build_authenticated_post_for_endpoint(
+    user_did: &str,
+    device_id: Uuid,
+    dpop_signing_key: &P256SigningKey,
+    dpop_jwk: &Value,
+    dpop_jkt: &str,
+    endpoint: &str,
+    body_json: Value,
+) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let access_token = sign_jwt(
         json!({"alg":"ES256","typ":"JWT","kid":format!("{user_did}#atproto")}),
@@ -659,7 +679,7 @@ fn build_authenticated_request(
             "iss": user_did,
             "sub": user_did,
             "aud": AUDIENCE,
-            "lxm": ENDPOINT,
+            "lxm": endpoint,
             "iat": now,
             "exp": now + 60,
             "jti": Uuid::new_v4().to_string(),
@@ -670,7 +690,7 @@ fn build_authenticated_request(
         dpop_signing_key,
     );
 
-    let htu = format!("{EXTERNAL_BASE}/xrpc/{ENDPOINT}");
+    let htu = format!("{EXTERNAL_BASE}/xrpc/{endpoint}");
     let proof = dpop_proof(
         dpop_signing_key,
         dpop_jwk,
@@ -684,7 +704,7 @@ fn build_authenticated_request(
     let body_bytes = serde_json::to_vec(&body_json).expect("serialize body");
     Request::builder()
         .method("POST")
-        .uri(xrpc(ENDPOINT))
+        .uri(xrpc(endpoint))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {access_token}"))
         .header("dpop", proof)
@@ -1089,5 +1109,114 @@ async fn create_conversation_negative_idempotency_conflict_returns_declared_erro
         conflict_status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "mutated idempotency reuse must NOT return 500"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat gate database"]
+async fn submit_transition_negative_invalid_request_returns_declared_4xx() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let actor_did = random_did();
+    let actor_device_id = Uuid::new_v4();
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+    let mut seed = [0_u8; 32];
+    seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let ed_signing = Ed25519SigningKey::from_bytes(&seed);
+    let actor_ed25519_public_key = ed_signing.verifying_key().to_bytes().to_vec();
+    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key).unwrap().as_str().to_string();
+    seed_device_for_creation(
+        &pool,
+        &actor_did,
+        actor_device_id,
+        &actor_key_id,
+        &actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+
+    let router = router_with(pool, true).await;
+    let request = build_authenticated_post_for_endpoint(
+        &actor_did,
+        actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        "blue.catbird.chat.submitTransition",
+        json!({ "signedRequest": { "invalid": true } }),
+    );
+
+    let (status, body) = send(router, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"], "InvalidRequest",
+        "malformed submitTransition payload must return declared InvalidRequest, not 500"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the dedicated clean-chat gate database"]
+async fn submit_transition_negative_corrupted_signature_returns_invalid_signature() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let actor_did = random_did();
+    let actor_device_id = Uuid::new_v4();
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+    let mut seed = [0_u8; 32];
+    seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let ed_signing = Ed25519SigningKey::from_bytes(&seed);
+    let actor_ed25519_public_key = ed_signing.verifying_key().to_bytes().to_vec();
+    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key).unwrap().as_str().to_string();
+
+    seed_device_for_creation(
+        &pool,
+        &actor_did,
+        actor_device_id,
+        &actor_key_id,
+        &actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+
+    let router = router_with(pool, true).await;
+    let corrupted_signed_request = json!({
+        "body": {
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "actorDeviceId": actor_device_id.hyphenated().to_string(),
+            "operationId": Uuid::new_v4().hyphenated().to_string(),
+            "convoId": Uuid::new_v4().hyphenated().to_string(),
+            "epoch": 0,
+            "commit": STANDARD.encode([0x01_u8; 32]),
+            "signedAt": "2026-08-21T00:00:00.000Z"
+        },
+        "deviceKeyId": actor_key_id,
+        "signature": STANDARD.encode([0xff_u8; 64])
+    });
+
+    let request = build_authenticated_post_for_endpoint(
+        &actor_did,
+        actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        "blue.catbird.chat.submitTransition",
+        json!({ "signedRequest": corrupted_signed_request }),
+    );
+
+    let (status, body) = send(router, request).await;
+    assert!(
+        status == StatusCode::BAD_REQUEST || status == StatusCode::UNAUTHORIZED,
+        "corrupted signedRequest must return 4xx, got {status}: {body}"
+    );
+    assert_ne!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "corrupted signedRequest must NOT return 500: {body}"
     );
 }

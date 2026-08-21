@@ -18,8 +18,13 @@ use crate::{
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::{
+            core::{
+                ConversationHeadHydrationError, ConversationStateHydrationError,
+                RecoveryPackageHydrationError,
+            },
             prelude::{self, PreparedSignedOperation},
             recovery::{self, RecoveryRepositoryError},
+            relationship::RelationshipRepositoryError,
         },
         state_machine::StateMachineError,
     },
@@ -110,52 +115,113 @@ pub(super) async fn execute_prepared(
 }
 
 fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> ChatFailure {
-    tracing::error!("recovery_failure: {:?}", error);
+    tracing::error!("recovery_failure: endpoint={:?}, error={:?}", endpoint, error);
     use ChatProtocolErrorCode as C;
+    use ConversationHeadHydrationError as H;
+    use ConversationStateHydrationError as CS;
+    use RecoveryPackageHydrationError as P;
     use RecoveryRepositoryError as E;
-    use StateMachineError as S;
+    use RelationshipRepositoryError as R;
+
     match error {
-        E::Database(_) => ChatFailure::storage(endpoint),
+        E::Database(_)
+        | E::AggregateHydration(CS::Head(H::Database(_)))
+        | E::PackageHydration(P::Database(_))
+        | E::Relationship(R::Database(_)) => ChatFailure::storage(endpoint),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
-        E::ConversationMissing => ChatFailure::protocol(endpoint, C::ConversationNotFound),
-        E::RecoveryMissing => ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound),
-        E::PackageUnavailable => ChatFailure::protocol(endpoint, C::KeyPackageUnavailable),
-        E::RelationshipUnavailable => {
-            ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
+        E::ConversationMissing
+        | E::AggregateHydration(CS::Head(H::ConversationMissing)) => {
+            ChatFailure::protocol(endpoint, C::ConversationNotFound)
         }
-        E::StateMachine(S::StaleCoordinates) => {
+        E::ConversationDrift | E::ReadSetMismatch | E::CompareAndSetConflict => {
             ChatFailure::protocol(endpoint, C::StaleCoordinates)
         }
-        E::StateMachine(S::NotParticipant) => ChatFailure::protocol(endpoint, C::NotParticipant),
-        E::StateMachine(S::LeafRecoveryAlreadyOpen) => {
-            ChatFailure::protocol(endpoint, C::LeafRecoveryAlreadyOpen)
+        E::RecoveryMissing => ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound),
+        E::PackageUnavailable => ChatFailure::protocol(endpoint, C::KeyPackageUnavailable),
+        E::RelationshipUnavailable | E::Relationship(R::InvalidAuthorityConfiguration(_)) => {
+            ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
         }
-        E::StateMachine(S::LeafRecoveryNotFound) => {
-            ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound)
+        E::Relationship(R::InvalidProjection) => {
+            ChatFailure::protocol(endpoint, C::BlockedRelationship)
         }
-        E::StateMachine(S::LeafRecoverySuperseded) => {
-            ChatFailure::protocol(endpoint, C::LeafRecoverySuperseded)
+        E::AggregateHydration(CS::ReadSetMismatch) => {
+            ChatFailure::protocol(endpoint, C::StaleCoordinates)
         }
-        E::StateMachine(S::WorkExpired) => ChatFailure::protocol(endpoint, C::LeafRecoveryExpired),
-        E::StateMachine(S::InvalidWelcomeMapping) => {
-            ChatFailure::protocol(endpoint, C::InvalidWelcomeMapping)
+        E::AggregateHydration(CS::TerminalLifecycleUnsupported | CS::ConversationDomain) => {
+            ChatFailure::protocol(endpoint, C::InvalidRequest)
         }
+        E::AggregateHydration(CS::Metadata(_)) => {
+            ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot)
+        }
+        E::AggregateHydration(CS::Snapshot(_)) => {
+            ChatFailure::protocol(endpoint, C::InvalidCommit)
+        }
+        E::AggregateHydration(CS::State(s) | CS::Authority(s)) => {
+            map_recovery_state_machine_error(endpoint, s)
+        }
+        E::StateMachine(s) => map_recovery_state_machine_error(endpoint, s),
         E::ForeignTransaction
         | E::UnsupportedAuthority
         | E::AuthorityBindingMismatch
         | E::NonCanonicalOperation
         | E::TrustedInstantMismatch
-        | E::ConversationDrift
-        | E::ReadSetMismatch
         | E::InvalidDurableRow
         | E::ActionNotLive
         | E::ExpiryNotDue
-        | E::CompareAndSetConflict
         | E::AggregateHydration(_)
         | E::PackageHydration(_)
-        | E::Relationship(_)
-        | E::StateMachine(_)
         | E::ExecutionHydration(_)
         | E::Execution(_) => ChatFailure::invariant(endpoint),
+    }
+}
+
+fn map_recovery_state_machine_error(
+    endpoint: ChatEndpoint,
+    error: StateMachineError,
+) -> ChatFailure {
+    use ChatProtocolErrorCode as C;
+    use StateMachineError as S;
+
+    match error {
+        S::StaleCoordinates => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+        S::CoordinateOverflow => ChatFailure::protocol(endpoint, C::CoordinateOverflow),
+        S::DirectParticipantMutationForbidden => {
+            ChatFailure::protocol(endpoint, C::DirectParticipantMutationForbidden)
+        }
+        S::NotParticipant => ChatFailure::protocol(endpoint, C::NotParticipant),
+        S::NotMember => ChatFailure::protocol(endpoint, C::NotMember),
+        S::AdminRequired => ChatFailure::protocol(endpoint, C::AdminRequired),
+        S::LastAdminRequired => ChatFailure::protocol(endpoint, C::LastAdminRequired),
+        S::LeafRecoveryAlreadyOpen => ChatFailure::protocol(endpoint, C::LeafRecoveryAlreadyOpen),
+        S::LeafRecoveryNotFound => ChatFailure::protocol(endpoint, C::LeafRecoveryNotFound),
+        S::LeafRecoverySuperseded => ChatFailure::protocol(endpoint, C::LeafRecoverySuperseded),
+        S::WorkExpired => ChatFailure::protocol(endpoint, C::LeafRecoveryExpired),
+        S::InvalidWelcomeMapping => ChatFailure::protocol(endpoint, C::InvalidWelcomeMapping),
+        S::InvalidPolicyAuthority => ChatFailure::protocol(endpoint, C::BlockedRelationship),
+        S::InvalidMetadataAuthority => {
+            ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot)
+        }
+        S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState => {
+            ChatFailure::protocol(endpoint, C::InvalidCommit)
+        }
+        S::InvalidIntervalBoundary => ChatFailure::protocol(endpoint, C::InvalidCommit),
+        S::MetadataVersionOverflow => ChatFailure::protocol(endpoint, C::MetadataVersionOverflow),
+        S::LeaveRequestNotFound => ChatFailure::protocol(endpoint, C::LeaveRequestNotFound),
+        S::ConversationCloseNotAllowed => ChatFailure::protocol(endpoint, C::AdminRequired),
+        S::InvalidPrincipal
+        | S::InvalidDeviceId
+        | S::InvalidCreation
+        | S::ExistingConversationConflict
+        | S::InvitationNotPending
+        | S::RecoveryKindMismatch
+        | S::RecoveryDeviceMismatch
+        | S::ResetAlreadyPending
+        | S::ResetRequestNotFound
+        | S::ResetRequestStale
+        | S::ResetSuccessorMismatch
+        | S::ConversationClosed
+        | S::LeaveAlreadyPending
+        | S::InvalidServerTime => ChatFailure::protocol(endpoint, C::InvalidRequest),
+        S::InvariantViolation | S::InvalidHydrationAuthority => ChatFailure::invariant(endpoint),
     }
 }
