@@ -17,8 +17,12 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::{blobs, delivery, prelude::ScopeBoundBusinessAuthority};
-use crate::chat_protocol::transcript::{self, CanonicalValueRef, VerifiedSignedMutation};
-use crate::chat_protocol::validation::CanonicalUuidV4;
+use crate::chat_protocol::{
+    relationship_policy::{PublicTransport, RelationshipAuthority},
+    state_machine::HydrationAuthority,
+    transcript::{self, CanonicalValueRef, VerifiedSignedMutation},
+    validation::CanonicalUuidV4,
+};
 
 #[derive(Debug)]
 pub(crate) enum MessageDeliveryError {
@@ -242,42 +246,63 @@ async fn require_recipient_ready(
     }
 }
 
-async fn require_relationship_policy(
+async fn require_relationship_policy<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     authority: &ScopeBoundBusinessAuthority,
     coordinate: Coordinate,
-    trusted_at: DateTime<Utc>,
+    relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<(), MessageDeliveryError> {
-    // Traffic authorization is fail-closed.  The relationship worker supplies
-    // a complete, recent traffic projection; no network call is permitted in
-    // this write transaction.  A projection is accepted only when it contains
-    // the authenticated actor and at least one other DID with no block edge.
-    let allowed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.relationship_projection_snapshots s \
-         WHERE s.operation_scope IN ('traffic', 'recoveryFulfillment', 'recoveryReservation', 'acceptance', 'creation') \
-           AND s.evidence_kind IN ('live','fallback') \
-           AND s.completed_at >= $1 \
-           AND EXISTS (SELECT 1 FROM chat.participants actor_membership \
-             WHERE actor_membership.conversation_id=$3 AND actor_membership.user_did=$2 \
-               AND actor_membership.current_membership AND actor_membership.status='active' \
-               AND actor_membership.role IN ('member','admin')) \
-           AND NOT EXISTS (SELECT 1 FROM chat.relationship_projection_relationships blocked \
-             WHERE blocked.projection_id=s.projection_id \
-               AND (blocked.actor_did=$2 OR blocked.other_did=$2) \
-               AND (blocked.blocking OR blocked.blocked_by OR blocked.blocking_by_list OR blocked.blocked_by_list)))",
+    let aggregate = super::core::hydrate_locked_conversation_state(
+        tx,
+        coordinate.conversation_id,
+        authority.trusted_instant(),
     )
-    .bind(trusted_at - Duration::seconds(3600))
-    .bind(authority.actor_did())
-    .bind(coordinate.conversation_id)
-    .bind(coordinate.generation)
-    .fetch_one(&mut **tx)
-    .await?;
-    if allowed {
-        Ok(())
-    } else {
-        let _ = coordinate;
-        Err(MessageDeliveryError::RelationshipPolicyUnavailable)
-    }
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, "traffic conversation hydration failed");
+        MessageDeliveryError::RelationshipPolicyUnavailable
+    })?;
+    let hydration = HydrationAuthority::from_locked_conversation(&aggregate).map_err(|error| {
+        tracing::error!(?error, "traffic hydration authority failed");
+        MessageDeliveryError::RelationshipPolicyUnavailable
+    })?;
+    let registration = hydration
+        .locked_registration_from_scope_authority(authority)
+        .map_err(|error| {
+            tracing::error!(?error, "traffic registration authority failed");
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        })?;
+    let fallback = super::relationship::seal_traffic_fallback_scope(&aggregate, &registration)
+        .map_err(|error| {
+            tracing::error!(?error, "traffic fallback scope sealing failed");
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        })?;
+    let (projection, decision) = super::relationship::load_fallback_traffic_projection(
+        tx,
+        fallback,
+        relationship_authority,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, "traffic fallback loading failed");
+        MessageDeliveryError::RelationshipPolicyUnavailable
+    })?
+    .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
+    super::relationship::consume_locked_traffic_projection(
+        &projection,
+        &decision,
+        &aggregate,
+        &registration,
+        relationship_authority,
+    )
+    .map_err(|error| match error {
+        super::relationship::RelationshipConsumptionError::PolicyDenied => {
+            MessageDeliveryError::BlockedRelationship
+        }
+        super::relationship::RelationshipConsumptionError::InvalidWitness => {
+            MessageDeliveryError::RelationshipPolicyUnavailable
+        }
+    })
 }
 
 fn validate_application_message(
@@ -423,10 +448,11 @@ fn verified_mutation(
         .map_err(|_| MessageDeliveryError::InvalidApplicationMessage)
 }
 
-pub(crate) async fn send(
+pub(crate) async fn send<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
     scope: &ScopeBoundBusinessAuthority,
+    relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<(Vec<u8>, Option<i64>), MessageDeliveryError> {
     let mutation = verified_mutation(&authority, &scope)?;
     let projection = match mutation.projection() {
@@ -437,7 +463,7 @@ pub(crate) async fn send(
     let head = lock_head(tx, expected).await?;
     require_current_leaf(tx, head.coordinate, &scope).await?;
     require_recipient_ready(tx, head.coordinate, &scope, &head).await?;
-    require_relationship_policy(tx, &scope, head.coordinate, scope.trusted_instant()).await?;
+    require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
     validate_application_message(&projection)?;
     let attachment = validate_artifacts(tx, &projection, expected, message_id, &scope).await?;
@@ -577,10 +603,11 @@ pub(crate) async fn send(
 static TYPING_LAST: OnceLock<Mutex<HashMap<(Uuid, Uuid), (bool, DateTime<Utc>)>>> = OnceLock::new();
 static TYPING_RATE: OnceLock<Mutex<HashMap<(Uuid, String, Uuid), DateTime<Utc>>>> = OnceLock::new();
 
-pub(crate) async fn typing(
+pub(crate) async fn typing<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
     authority: &crate::chat_protocol::dpop::VerifiedChatDeviceRequest,
     scope: &ScopeBoundBusinessAuthority,
+    relationship_authority: &RelationshipAuthority<T>,
 ) -> Result<Vec<u8>, MessageDeliveryError> {
     let mutation = verified_mutation(authority, scope)?;
     let projection = match mutation.projection() {
@@ -591,7 +618,7 @@ pub(crate) async fn typing(
     let head = lock_head(tx, expected).await?;
     require_current_leaf(tx, head.coordinate, scope).await?;
     require_recipient_ready(tx, head.coordinate, scope, &head).await?;
-    require_relationship_policy(tx, scope, head.coordinate, scope.trusted_instant()).await?;
+    require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let now = scope.trusted_instant();
     let key = (
         expected.conversation_id,

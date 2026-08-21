@@ -49,9 +49,14 @@ async fn publish(
         .await
         .map_err(|e| context::operation_prelude_failure(ENDPOINT, e))?;
     let (authority, scope) = prepared.into_execution_parts();
-    let response_bytes = message_delivery::typing(&mut tx, &authority, &scope)
-        .await
-        .map_err(map_failure)?;
+    let response_bytes = message_delivery::typing(
+        &mut tx,
+        &authority,
+        &scope,
+        runtime.relationship_authority().as_ref(),
+    )
+    .await
+    .map_err(map_failure)?;
     let response_value: serde_json::Value =
         serde_json::from_slice(&response_bytes).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let event = response_value
