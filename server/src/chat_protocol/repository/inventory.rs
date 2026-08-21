@@ -4382,8 +4382,18 @@ async fn create_inventory_snapshot_attempt(
     let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
     if let Some(existing_row) = &existing {
         let now = chrono::Utc::now();
+        let current_max_event: Option<i64> = sqlx::query_scalar(
+            "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events WHERE protocol_instance_id = $1",
+        )
+        .bind(existing_row.protocol_instance_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .ok();
+        let is_stale = current_max_event.map_or(false, |max_pos| max_pos > existing_row.snapshot_event_position);
+
         if existing_row.expires_at <= now
             || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
+            || is_stale
         {
             sqlx::query("DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id = $1")
                 .bind(inventory_session_id)
