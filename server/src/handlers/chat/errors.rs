@@ -88,6 +88,10 @@ impl ChatFailure {
         }
     }
 
+    pub(crate) fn code(&self) -> Option<ChatProtocolErrorCode> {
+        self.exposure.public_code()
+    }
+
     #[cfg(test)]
     pub(crate) fn exposure(self) -> ErrorExposure {
         self.exposure

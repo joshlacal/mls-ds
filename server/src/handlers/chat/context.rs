@@ -74,6 +74,11 @@ async fn verify_service_principal(
 }
 
 fn service_auth_failure(endpoint: ChatEndpoint, error: AuthError) -> ChatFailure {
+    tracing::warn!(
+        endpoint = endpoint.nsid(),
+        error = ?error,
+        "clean-chat service auth failed"
+    );
     match error {
         AuthError::TokenExpired => {
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::AccountSessionExpired)
@@ -352,5 +357,86 @@ pub(crate) fn operation_prelude_failure(
         | E::MissingPrincipal
         | E::AuthorityBindingMismatch
         | E::ClaimIntegrity => ChatFailure::invariant(endpoint),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthError;
+    use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode, ErrorExposure};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn service_auth_failure_pins_wire_mapping_for_every_auth_error_variant() {
+        let endpoint = ChatEndpoint::AcceptConversation;
+
+        // 1. TokenExpired -> AccountSessionExpired (401)
+        let failure = service_auth_failure(endpoint, AuthError::TokenExpired);
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::AccountSessionExpired)
+        );
+        let resp = failure.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. RateLimitExceeded -> RateLimited (429) + Retry-After header
+        let failure = service_auth_failure(
+            endpoint,
+            AuthError::RateLimitExceeded {
+                retry_after_secs: 30,
+            },
+        );
+        assert_eq!(failure.code(), Some(ChatProtocolErrorCode::RateLimited));
+        let resp = failure.into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("30")
+        );
+
+        // 3. Internal -> StorageFailure (500, no public error code)
+        let failure =
+            service_auth_failure(endpoint, AuthError::Internal("db pool error".to_string()));
+        assert_eq!(failure.code(), None);
+        assert_eq!(failure.exposure(), ErrorExposure::StorageFailure);
+        let resp = failure.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // 4. All other variants -> NotAuthorized (401)
+        let not_authorized_variants = vec![
+            AuthError::MissingAuthHeader,
+            AuthError::InvalidAuthFormat,
+            AuthError::InvalidToken("bad token format".to_string()),
+            AuthError::InvalidDid("did:plc:invalid".to_string()),
+            AuthError::DidResolutionFailed("timeout".to_string()),
+            AuthError::InvalidSignature,
+            AuthError::MissingVerificationMethod,
+            AuthError::UnsupportedKeyType("Ed25519".to_string()),
+            AuthError::MissingJti,
+            AuthError::ReplayDetected,
+            AuthError::MissingLxm,
+            AuthError::LxmMismatch,
+            AuthError::DeviceAuthorizationDenied,
+        ];
+
+        for error in not_authorized_variants {
+            let desc = format!("{:?}", error);
+            let failure = service_auth_failure(endpoint, error);
+            assert_eq!(
+                failure.code(),
+                Some(ChatProtocolErrorCode::NotAuthorized),
+                "variant {} did not map to NotAuthorized",
+                desc
+            );
+            assert_eq!(
+                failure.into_response().status(),
+                StatusCode::UNAUTHORIZED,
+                "variant {} did not produce 401 Unauthorized",
+                desc
+            );
+        }
     }
 }
