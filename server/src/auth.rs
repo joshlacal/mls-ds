@@ -1245,12 +1245,23 @@ pub(crate) async fn verify_mls_service_principal(
     let token = authorization
         .strip_prefix("Bearer ")
         .ok_or(AuthError::InvalidAuthFormat)?;
-    let claims = AUTH_MIDDLEWARE
+    let claims = match AUTH_MIDDLEWARE
         .verify_jwt_for_audience(token, Some(MLS_APPVIEW_SERVICE_REF))
-        .await?;
+        .await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("verify_jwt_for_audience error: {:?}", e);
+            return Err(e);
+        }
+    };
     let now = Utc::now().timestamp();
-    let (issuer, iat) = validate_mls_service_claims(&claims, endpoint_nsid, now)?;
-
+    let (issuer, iat) = match validate_mls_service_claims(&claims, endpoint_nsid, now) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("validate_mls_service_claims error: {:?}", e);
+            return Err(e);
+        }
+    };
     enforce_standard_with_replay_store(&claims, endpoint_nsid, pool).await?;
     AUTH_MIDDLEWARE.check_rate_limit(issuer)?;
     if let Err(retry_after) =

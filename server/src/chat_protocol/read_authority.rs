@@ -1534,7 +1534,7 @@ pub(in crate::chat_protocol) async fn verify_inventory_fence(
     // Temporal bounds: the fence was captured now or in the recent past, and
     // never in the future or beyond the schema's session expiry horizon.
     let now = Utc::now();
-    if row.captured_at > now
+    if row.captured_at > now + chrono::Duration::seconds(5)
         || now.signed_duration_since(row.captured_at) > chrono::Duration::minutes(15)
     {
         return Err(ReadAuthorityError::Invariant);
@@ -1872,15 +1872,25 @@ pub(crate) async fn inventory_authorities(
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(|_| ReadAuthorityError::Storage)?;
-        let locked = hydrate_locked_conversation_state(tx, conversation_id, locked_at)
-            .await
-            .map_err(map_hydration_error)?;
+        let locked = match hydrate_locked_conversation_state(tx, conversation_id, locked_at).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[DEBUG] hydrate_locked_conversation_state failed for {conversation_id}: {:?}", e);
+                return Err(map_hydration_error(e));
+            }
+        };
         let graph_digest = *locked.locked_graph_digest();
         // Close tombstones carry no snapshot digest: terminal aggregates seal
         // no active snapshot, so the zero digest is the structural sentinel.
         let snapshot_digest = *locked.locked_snapshot_digest().unwrap_or(&[0_u8; 32]);
 
-        let decision = classify_inventory_arm(&fence.user_did, fence.device_id, locked.state())?;
+        let decision = match classify_inventory_arm(&fence.user_did, fence.device_id, locked.state()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[DEBUG] classify_inventory_arm failed for {conversation_id}: {:?}", e);
+                return Err(e);
+            }
+        };
         let arm = match decision {
             InventoryArmDecision::None => continue,
             InventoryArmDecision::Close {
@@ -1909,7 +1919,13 @@ pub(crate) async fn inventory_authorities(
             }
             InventoryArmDecision::State => {
                 let participant_period_id =
-                    load_participant_period_id(tx, conversation_id, &fence.user_did).await?;
+                    match load_participant_period_id(tx, conversation_id, &fence.user_did).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[DEBUG] load_participant_period_id failed for {conversation_id}, {}: {:?}", fence.user_did, e);
+                            return Err(e);
+                        }
+                    };
                 ConversationInventoryArm::State {
                     participant_period_id,
                 }

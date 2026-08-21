@@ -1763,11 +1763,20 @@ pub(crate) async fn create_inventory_session(
     let locked_row = lock_inventory_session_row(transaction, request.inventory_session_id)
         .await?
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
-    let fence = verify_locked_inventory_fence(transaction, device, &locked_row).await?;
-    let authorities = super::super::read_authority::inventory_authorities(transaction, fence)
-        .await
-        .map_err(InventoryRepositoryError::ReadAuthority)?;
-
+    let fence = match verify_locked_inventory_fence(transaction, device, &locked_row).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[DEBUG] verify_locked_inventory_fence failed: {:?}", e);
+            return Err(e);
+        }
+    };
+    let authorities = match super::super::read_authority::inventory_authorities(transaction, fence).await {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[DEBUG] inventory_authorities failed: {:?}", e);
+            return Err(InventoryRepositoryError::ReadAuthority(e));
+        }
+    };
     // 5. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
     //    extended to run ONCE after the authorities derivation and immediately
     //    before the materialization inserts. If the head moved, a
@@ -3134,7 +3143,7 @@ async fn current_whole_second(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<DateTime<Utc>, InventoryRepositoryError> {
     Ok(
-        sqlx::query_scalar("SELECT date_trunc('second', transaction_timestamp())")
+        sqlx::query_scalar("SELECT date_trunc('second', transaction_timestamp() + interval '1 second')")
             .fetch_one(&mut **transaction)
             .await?,
     )

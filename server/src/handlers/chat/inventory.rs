@@ -33,6 +33,7 @@ pub(super) async fn conversations(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
+    eprintln!(">>> conversations handler invoked with query={:?} <<<", query);
     handle(
         &pool,
         &runtime,
