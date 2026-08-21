@@ -846,14 +846,21 @@ fn canonical_response_from_plan(
         "welcomes": welcomes,
     });
     let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_value(value)
-            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let bytes = serde_json::to_vec(&output)
-        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        serde_json::from_value(value.clone()).map_err(|e| {
+            tracing::error!(error = %e, value = %value, "canonical_response_from_plan: serde_json::from_value failed");
+            SubmitTransitionFacadeError::InvalidCanonicalMaterial
+        })?;
+    let bytes = serde_json::to_vec(&output).map_err(|e| {
+        tracing::error!(error = %e, "canonical_response_from_plan: to_vec failed");
+        SubmitTransitionFacadeError::InvalidCanonicalMaterial
+    })?;
     let round_trip: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_slice(&bytes)
-            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            tracing::error!(error = %e, "canonical_response_from_plan: from_slice failed");
+            SubmitTransitionFacadeError::InvalidCanonicalMaterial
+        })?;
     if round_trip != output {
+        tracing::error!("canonical_response_from_plan: round_trip != output");
         return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
     }
     SubmitTransitionCanonicalResponse::new(bytes)

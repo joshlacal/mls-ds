@@ -734,3 +734,13 @@ fn participant_acceptance_server_fields_accepts_bytes_envelope() {
     ).expect("must decode serverFields with bytes envelopes");
     assert!(!sf.canonical_dag_cbor().is_empty());
 }
+
+#[test]
+fn live_submit_transition_fulfillment_decodes_and_verifies() {
+    let raw_file: serde_json::Value = serde_json::from_slice(&std::fs::read("/tmp/last_blue.catbird.chat.submitTransition_body.json").expect("read last body")).unwrap();
+    let signed_req_bytes = serde_json::to_vec(&raw_file["signedRequest"]).unwrap();
+    let public_key = hex::decode("e39325e78052440a7b49e33c39c9a228309678e2cf0f69f67d734d245c7d416d").unwrap();
+    let res = decode_and_verify_signed_mutation(&signed_req_bytes, &public_key);
+    println!("decode_and_verify_signed_mutation fulfillment result: {:?}", res);
+    assert!(res.is_ok());
+}
