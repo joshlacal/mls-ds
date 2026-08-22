@@ -845,8 +845,12 @@ fn canonical_response_from_plan(
         "entry": entry,
         "welcomes": welcomes,
     });
+    // `SubmitTransitionOutput<DefaultStr>` borrows string fields. `from_value`
+    // cannot provide storage for those borrows; parse canonical JSON bytes.
+    let value_bytes = serde_json::to_vec(&value)
+        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
     let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_value(value)
+        serde_json::from_slice(&value_bytes)
             .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
     let bytes = serde_json::to_vec(&output)
         .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
@@ -945,34 +949,8 @@ fn canonical_new_pending_welcomes(
 fn coordinate_json(
     coordinate: &PublicGroupSnapshotCoordinate,
 ) -> Result<JsonValue, SubmitTransitionFacadeError> {
-    let generation = i64::try_from(coordinate.generation())
-        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let state_version = i64::try_from(coordinate.state_version())
-        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let epoch = i64::try_from(coordinate.epoch())
-        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let lifecycle = match coordinate.lifecycle() {
-        PublicGroupSnapshotLifecycle::Active => "active",
-        PublicGroupSnapshotLifecycle::Superseded => "superseded",
-    };
-    Ok(json!({
-        "conversationId": Uuid::from_bytes(*coordinate.conversation_id())
-            .hyphenated()
-            .to_string(),
-        "generation": generation,
-        "stateVersion": state_version,
-        "groupId": {
-            "$bytes": STANDARD.encode(coordinate.group_id())
-        },
-        "epoch": epoch,
-        "groupContextHash": {
-            "$bytes": STANDARD.encode(coordinate.group_context_hash())
-        },
-        "confirmationTag": {
-            "$bytes": STANDARD.encode(coordinate.confirmation_tag())
-        },
-        "lifecycle": lifecycle,
-    }))
+    super::coordinate::canonical_coordinate_json(coordinate)
+        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)
 }
 
 fn canonical_datetime(value: DateTime<Utc>) -> String {

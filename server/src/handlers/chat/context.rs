@@ -366,6 +366,7 @@ mod tests {
     use crate::auth::AuthError;
     use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode, ErrorExposure};
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
 
     #[test]
     fn service_auth_failure_pins_wire_mapping_for_every_auth_error_variant() {
