@@ -11,7 +11,6 @@ use sqlx::{Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[cfg(not(test))]
 use super::prelude::release_signed_operation_replay;
 use super::{
     auth::CompletedIdempotentResponse,
@@ -539,7 +538,7 @@ impl From<ExecutorError> for WelcomeTerminalFacadeError {
     }
 }
 
-#[cfg(not(test))]
+
 pub(crate) async fn prepare_welcome_terminal(
     transaction: &mut Transaction<'_, Postgres>,
     operation: PreparedSignedOperation,
@@ -680,7 +679,7 @@ async fn prepare_first_welcome_terminal(
     }
 }
 
-#[cfg(not(test))]
+
 async fn prepare_completed_welcome_replay(
     transaction: &mut Transaction<'_, Postgres>,
     replay: LockedSignedOperationReplayAuthority,

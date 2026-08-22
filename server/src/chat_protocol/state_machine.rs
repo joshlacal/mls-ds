@@ -24,15 +24,12 @@ use super::repository::core::{
     LockedRecoveryPackageStatus, LockedRecoveryPackageUse, LockedWelcomeGuard,
     LockedWelcomeTerminal,
 };
-#[cfg(not(test))]
 use super::repository::core::{
     LockedRevocationFanoutGuard, LockedRevocationPackageGuard, LockedRevocationTargetGuard,
     LockedRevocationTargetStatus,
 };
-#[cfg(not(test))]
 use super::repository::prelude::RecoveryPreludePrewriteWitness;
 use super::repository::prelude::{OperationCompletionGuard, ScopeBoundBusinessAuthority};
-#[cfg(not(test))]
 use super::repository::recovery::{
     RecoveryCancellationPlanInput, RecoveryClientExpiryPlanInput, RecoveryClientTerminalError,
     RecoveryFulfillmentPlanInput, RecoveryPersistenceWitness, RecoveryRequestPlanInput,
@@ -1249,13 +1246,9 @@ impl RequestEvidence {
 /// maps, caller-selected domains, or caller-selected type identifiers.
 pub(crate) struct HydrationAuthority {
     expected_conversation_id: [u8; 16],
-    #[cfg(not(test))]
-    locked: LockedHydrationBinding,
-    #[cfg(test)]
     locked: Option<LockedHydrationBinding>,
 }
 
-#[cfg(not(test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::chat_protocol) enum RecoveryPlannedKind {
     Request {
@@ -1273,7 +1266,6 @@ pub(in crate::chat_protocol) enum RecoveryPlannedKind {
 /// Sealed output of a planner that consumed exactly one opaque Recovery input.
 /// The executor facade receives only the persistence plan and the canonical
 /// control row minted here; the route never supplies event payload bytes.
-#[cfg(not(test))]
 pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
     transition: PlannedTransition,
     scope_authority: ScopeBoundBusinessAuthority,
@@ -1285,7 +1277,6 @@ pub(in crate::chat_protocol) struct PlannedRecoveryMutation {
     kind: RecoveryPlannedKind,
 }
 
-#[cfg(not(test))]
 impl PlannedRecoveryMutation {
     pub(in crate::chat_protocol) fn into_parts(
         self,
@@ -1312,7 +1303,6 @@ impl PlannedRecoveryMutation {
     }
 }
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol) struct PlannedClientRecoveryExpiry {
     transition: PlannedTransition,
     scope_authority: ScopeBoundBusinessAuthority,
@@ -1324,7 +1314,6 @@ pub(in crate::chat_protocol) struct PlannedClientRecoveryExpiry {
     post_apply_error: RecoveryClientTerminalError,
 }
 
-#[cfg(not(test))]
 impl PlannedClientRecoveryExpiry {
     pub(in crate::chat_protocol) fn into_parts(
         self,
@@ -1351,7 +1340,6 @@ impl PlannedClientRecoveryExpiry {
     }
 }
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol) struct PlannedSchedulerRecoveryExpiry {
     transition: PlannedTransition,
     recovery_request_id: Uuid,
@@ -1359,7 +1347,6 @@ pub(in crate::chat_protocol) struct PlannedSchedulerRecoveryExpiry {
     persistence_witness: RecoveryPersistenceWitness,
 }
 
-#[cfg(not(test))]
 impl PlannedSchedulerRecoveryExpiry {
     pub(in crate::chat_protocol) fn into_parts(
         self,
@@ -1411,17 +1398,6 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
-            #[cfg(not(test))]
-            locked: LockedHydrationBinding {
-                transaction_id: head.transaction_id().to_owned(),
-                expected_prior: head.prior_coordinate().copied(),
-                expected_next_entry_seq: head.next_entry_seq(),
-                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
-                locked_head_digest: *head.durable_row_digest(),
-                locked_graph_digest: Some(*locked.locked_graph_digest()),
-                locked_snapshot_digest: locked.locked_snapshot_digest().copied(),
-            },
-            #[cfg(test)]
             locked: Some(LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: head.prior_coordinate().copied(),
@@ -1445,17 +1421,6 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
-            #[cfg(not(test))]
-            locked: LockedHydrationBinding {
-                transaction_id: head.transaction_id().to_owned(),
-                expected_prior: None,
-                expected_next_entry_seq: head.next_entry_seq(),
-                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
-                locked_head_digest: *head.durable_row_digest(),
-                locked_graph_digest: None,
-                locked_snapshot_digest: None,
-            },
-            #[cfg(test)]
             locked: Some(LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: None,
@@ -1469,26 +1434,9 @@ impl HydrationAuthority {
     }
 
     fn locked_binding(&self) -> Option<&LockedHydrationBinding> {
-        #[cfg(not(test))]
-        {
-            Some(&self.locked)
-        }
-        #[cfg(test)]
-        {
-            self.locked.as_ref()
-        }
+        self.locked.as_ref()
     }
 
-    /// Bootstraps the hydration authority from an EXISTING conversation's
-    /// locked head (`prior_coordinate` = `Some`, `next_entry_seq >= 2`). This is
-    /// the read-time counterpart of `from_locked_creation_head`: the aggregate
-    /// hydrator needs an authority carrying the locked head binding BEFORE the
-    /// `LockedConversationStateGuard` exists, so `from_locked_conversation`
-    /// (which reads the finished guard's `locked_graph_digest`) cannot serve —
-    /// it is circular. The graph/snapshot digests are therefore `None` here;
-    /// they are only known once the aggregate has been assembled and sealed.
-    /// The historical graph rows are re-verified by the DISTINCT read-time
-    /// `HistoricalRehydrationAuthority`, never by this append-time authority.
     #[allow(dead_code)]
     pub(crate) fn from_locked_existing_head(
         head: &LockedConversationHeadGuard,
@@ -1501,17 +1449,6 @@ impl HydrationAuthority {
         }
         Ok(Self {
             expected_conversation_id: *head.conversation_id().as_bytes(),
-            #[cfg(not(test))]
-            locked: LockedHydrationBinding {
-                transaction_id: head.transaction_id().to_owned(),
-                expected_prior: head.prior_coordinate().copied(),
-                expected_next_entry_seq: head.next_entry_seq(),
-                locked_at: ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?,
-                locked_head_digest: *head.durable_row_digest(),
-                locked_graph_digest: None,
-                locked_snapshot_digest: None,
-            },
-            #[cfg(test)]
             locked: Some(LockedHydrationBinding {
                 transaction_id: head.transaction_id().to_owned(),
                 expected_prior: head.prior_coordinate().copied(),
@@ -2029,8 +1966,7 @@ impl HydrationAuthority {
     /// Consume the exact signed Policy body and the complete relationship
     /// projection under the conversation lock. No caller-selected roster or
     /// participant-change command crosses this seam.
-    #[cfg(not(test))]
-    pub(crate) fn plan_policy<T: PublicTransport>(
+        pub(crate) fn plan_policy<T: PublicTransport>(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2320,8 +2256,7 @@ impl HydrationAuthority {
     /// fulfillments have distinct sealed entry points below so their extra
     /// package, target-registration, consent, and work-row authorities cannot
     /// be bypassed by variant dispatch.
-    #[cfg(not(test))]
-    pub(crate) fn plan_commit_entry(
+        pub(crate) fn plan_commit_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2502,8 +2437,7 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_leave_fulfillment_entry(
+        pub(crate) fn plan_leave_fulfillment_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2623,8 +2557,7 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_metadata_entry(
+        pub(crate) fn plan_metadata_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2657,8 +2590,7 @@ impl HydrationAuthority {
             .bind_terminal_package_guards(prior, terminal_packages, &transaction_id)
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_zero_leaf_leave_entry(
+        pub(crate) fn plan_zero_leaf_leave_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2698,8 +2630,7 @@ impl HydrationAuthority {
         )
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_close_entry(
+        pub(crate) fn plan_close_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2834,8 +2765,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_leave_request_entry(
+        pub(crate) fn plan_leave_request_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2864,8 +2794,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_leave_cancellation_entry(
+        pub(crate) fn plan_leave_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2904,9 +2833,10 @@ impl HydrationAuthority {
         if envelope.conversation_id != self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        #[cfg(not(test))]
-        if envelope.received_at != self.locked.locked_at {
-            return Err(StateMachineError::InvalidHydrationAuthority);
+        if let Some(locked) = self.locked_binding() {
+            if envelope.received_at != locked.locked_at {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
         }
         let (kind, request_id, body, body_binding) = match mutation.projection() {
             VerifiedMutationProjection::LeafRecoveryRequest(value) => (
@@ -2965,18 +2895,19 @@ impl HydrationAuthority {
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        #[cfg(not(test))]
-        if match &body_binding {
-            RequestBodyBinding::LeafRecoveryRequest { prior, .. } => {
-                Some(prior) != self.locked.expected_prior.as_ref()
+        if let Some(locked) = self.locked_binding() {
+            if match &body_binding {
+                RequestBodyBinding::LeafRecoveryRequest { prior, .. } => {
+                    Some(prior) != locked.expected_prior.as_ref()
+                }
+                RequestBodyBinding::WelcomeResponse { coordinates, .. } => {
+                    Some(coordinates) != locked.expected_prior.as_ref()
+                }
+                RequestBodyBinding::LeafRecoveryCancellation => false,
+                _ => true,
+            } {
+                return Err(StateMachineError::InvalidHydrationAuthority);
             }
-            RequestBodyBinding::WelcomeResponse { coordinates, .. } => {
-                Some(coordinates) != self.locked.expected_prior.as_ref()
-            }
-            RequestBodyBinding::LeafRecoveryCancellation => false,
-            _ => true,
-        } {
-            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let durable_row_digest =
             durable_signed_request_row_digest(kind, &envelope, &request_id, &mutation)?;
@@ -3079,8 +3010,7 @@ impl HydrationAuthority {
             .bind_recovery_package_cas(package_cas)
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_leaf_recovery_cancellation_entry(
+        pub(crate) fn plan_leaf_recovery_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         envelope: DurableSignedRequestEnvelope,
@@ -3129,6 +3059,7 @@ impl HydrationAuthority {
                 recovery_request_id: evidence.request_id,
                 received_at: evidence.received_at,
                 evidence,
+                #[cfg(not(test))]
                 registration,
             },
         )?;
@@ -3139,8 +3070,7 @@ impl HydrationAuthority {
     /// Consume the exact request repository input and produce one fully bound
     /// transition. No handler identity, prelude, durable row, or payload enters
     /// this planner as a separate argument.
-    #[cfg(not(test))]
-    pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
+        pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
         input: RecoveryRequestPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3191,8 +3121,7 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_recovery_cancellation_input(
+        pub(crate) fn plan_recovery_cancellation_input(
         input: RecoveryCancellationPlanInput,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
         let parts = input.into_planner_parts();
@@ -3236,8 +3165,7 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
+        pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
         input: RecoveryFulfillmentPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3318,8 +3246,7 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_client_recovery_expiry_input(
+        pub(crate) fn plan_client_recovery_expiry_input(
         input: RecoveryClientExpiryPlanInput,
     ) -> Result<PlannedClientRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3359,8 +3286,7 @@ impl HydrationAuthority {
         })
     }
 
-    #[cfg(not(test))]
-    pub(crate) fn plan_scheduler_recovery_expiry_input(
+        pub(crate) fn plan_scheduler_recovery_expiry_input(
         input: RecoverySchedulerExpiryPlanInput,
     ) -> Result<PlannedSchedulerRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3762,8 +3688,7 @@ impl HydrationAuthority {
     /// fanout manifest proves completeness, including the legal empty case;
     /// callers cannot omit a conversation, request, Welcome, or reserved
     /// package and still obtain a persistence plan.
-    #[cfg(not(test))]
-    pub(crate) fn plan_device_revocation_batch(
+        pub(crate) fn plan_device_revocation_batch(
         mutation: VerifiedSignedMutation,
         actor_registration: LockedRegistrationProjection,
         target_guard: LockedRevocationTargetGuard,
@@ -4486,8 +4411,7 @@ impl HydrationAuthority {
     /// Project an exact non-actor device registration solely from the locked
     /// business scope. Recovery fulfillment uses this for the original request
     /// target; no handler-selected key material crosses the planner boundary.
-    #[cfg(not(test))]
-    fn locked_registration_for_scoped_device(
+        fn locked_registration_for_scoped_device(
         &self,
         scope: &ScopeBoundBusinessAuthority,
         did: &str,
@@ -12746,8 +12670,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
-    fn bind_device_revocation_authority(
+        fn bind_device_revocation_authority(
         mut self,
         evidence: DeviceRevocationEvidence,
         head: &LockedConversationHeadGuard,
@@ -12812,8 +12735,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
-    fn bind_recovery_expiry_authority(
+        fn bind_recovery_expiry_authority(
         mut self,
         evidence: RecoveryExpiryPlanAuthority,
         head: &LockedConversationHeadGuard,
@@ -12982,8 +12904,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    #[cfg(not(test))]
-    fn into_revocation_batch_member_plan(
+        fn into_revocation_batch_member_plan(
         self,
     ) -> Result<ConversationPersistencePlan, StateMachineError> {
         if !matches!(
@@ -13003,8 +12924,7 @@ impl PlannedTransition {
         })
     }
 
-    #[cfg(not(test))]
-    fn bind_revocation_package_cas(
+        fn bind_revocation_package_cas(
         mut self,
         binding: RevocationPackageCasBinding,
     ) -> Result<Self, StateMachineError> {
@@ -13662,9 +13582,9 @@ pub(crate) struct LeafRecoveryRequestCommand {
     pub(crate) package_not_after: ServerTimestamp,
     pub(crate) evidence: RequestEvidence,
     #[cfg(not(test))]
-    registration: LockedRegistrationProjection,
+    pub(crate) registration: LockedRegistrationProjection,
     #[cfg(not(test))]
-    reservation: LockedRecoveryReservationProjection,
+    pub(crate) reservation: LockedRecoveryReservationProjection,
 }
 
 fn plan_leaf_recovery_request_inner(
@@ -13802,7 +13722,7 @@ pub(crate) struct LeafRecoveryCancellation {
     pub(crate) received_at: ServerTimestamp,
     pub(crate) evidence: RequestEvidence,
     #[cfg(not(test))]
-    registration: LockedRegistrationProjection,
+    pub(crate) registration: LockedRegistrationProjection,
 }
 
 fn plan_leaf_recovery_cancellation_inner(
@@ -13949,7 +13869,6 @@ fn plan_leaf_recovery_expiry_inner(
     })
 }
 
-#[cfg(not(test))]
 fn recovery_expiry_plan_authority(
     package: &LockedRecoveryPackageGuard,
     request_id: Uuid,

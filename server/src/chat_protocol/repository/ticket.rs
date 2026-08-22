@@ -14,7 +14,6 @@ use sqlx::{Postgres, Row, Transaction};
 use std::fmt;
 use uuid::Uuid;
 
-#[cfg(any(not(test), feature = "subscription-production-proof"))]
 use super::super::{
     dpop::VerifiedReadAdmission, read_authority, repository::inventory, OsSecureRandom,
     SecureRandom,
@@ -633,7 +632,7 @@ pub(crate) fn ticket_hash(opaque_ticket: &[u8]) -> [u8; HASH_BYTES] {
 /// session UUID is only a row handle; the repository recovers and verifies the
 /// sealed snapshot capability before minting the one-use ticket. Both the
 /// recovered capability and the caller's event cursor must match exactly.
-#[cfg(any(not(test), feature = "subscription-production-proof"))]
+
 pub(crate) async fn mint_subscription_ticket_for_admission(
     pool: &sqlx::PgPool,
     admission: VerifiedReadAdmission,

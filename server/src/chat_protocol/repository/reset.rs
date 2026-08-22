@@ -8,20 +8,15 @@
 #[cfg(test)]
 use std::sync::Arc;
 
-#[cfg(not(test))]
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-#[cfg(not(test))]
 use chrono::SecondsFormat;
 use chrono::{DateTime, Duration, Utc};
-#[cfg(not(test))]
 use jacquard_common::DefaultStr;
-#[cfg(not(test))]
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
-#[cfg(not(test))]
 use super::{
     auth::CompletedIdempotentResponse,
     execution_context::{
@@ -58,7 +53,6 @@ use crate::chat_protocol::{
     },
     validation::{BareDid, KeyThumbprint},
 };
-#[cfg(not(test))]
 use crate::chat_protocol::{
     model::AuthPrimitiveError,
     state_machine::{
@@ -213,7 +207,6 @@ pub(crate) fn canonical_reset_activation_event_payload(conversation_id: Uuid) ->
 /// High-level Reset composition failure. Every arm is pre-commit: the caller
 /// retains sole ownership of the outer transaction and must roll it back on an
 /// error.
-#[cfg(not(test))]
 #[derive(Debug)]
 pub(crate) enum ResetFacadeError {
     MissingMutation,
@@ -228,14 +221,12 @@ pub(crate) enum ResetFacadeError {
     Database(sqlx::Error),
 }
 
-#[cfg(not(test))]
 impl From<ResetRepositoryError> for ResetFacadeError {
     fn from(value: ResetRepositoryError) -> Self {
         Self::Repository(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<ResetCompositionError> for ResetFacadeError {
     fn from(value: ResetCompositionError) -> Self {
         match value {
@@ -245,42 +236,36 @@ impl From<ResetCompositionError> for ResetFacadeError {
     }
 }
 
-#[cfg(not(test))]
 impl From<PreludeError> for ResetFacadeError {
     fn from(value: PreludeError) -> Self {
         Self::Prelude(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<AuthPrimitiveError> for ResetFacadeError {
     fn from(value: AuthPrimitiveError) -> Self {
         Self::Primitive(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<StateMachineError> for ResetFacadeError {
     fn from(value: StateMachineError) -> Self {
         Self::StateMachine(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<ExecutionContextHydrationError> for ResetFacadeError {
     fn from(value: ExecutionContextHydrationError) -> Self {
         Self::ExecutionContext(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<ExecutorError> for ResetFacadeError {
     fn from(value: ExecutorError) -> Self {
         Self::Executor(value)
     }
 }
 
-#[cfg(not(test))]
 impl From<sqlx::Error> for ResetFacadeError {
     fn from(value: sqlx::Error) -> Self {
         Self::Database(value)
@@ -291,7 +276,6 @@ impl From<sqlx::Error> for ResetFacadeError {
 ///
 /// The handler may pass these exact bytes to operation completion but cannot
 /// assemble or alter Reset response fields.
-#[cfg(not(test))]
 #[derive(Debug)]
 pub(crate) struct ResetCanonicalResponse {
     endpoint: ResetOperationEndpoint,
@@ -299,7 +283,6 @@ pub(crate) struct ResetCanonicalResponse {
     binding_digest: [u8; 32],
 }
 
-#[cfg(not(test))]
 impl ResetCanonicalResponse {
     pub(crate) fn endpoint(&self) -> ResetOperationEndpoint {
         self.endpoint
@@ -403,14 +386,12 @@ impl ResetCanonicalResponse {
 
 /// Linear first-execution completion authority returned only after the Reset
 /// executor has applied inside the caller-owned transaction.
-#[cfg(not(test))]
 pub(crate) struct ResetCompletion {
     authority: VerifiedChatDeviceRequest,
     scope_authority: ScopeBoundBusinessAuthority,
     completion: OperationCompletionGuard,
 }
 
-#[cfg(not(test))]
 impl ResetCompletion {
     pub(crate) fn into_parts(
         self,
@@ -423,14 +404,12 @@ impl ResetCompletion {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) struct AppliedResetOperation {
     applied: AppliedTransition,
     completion: ResetCompletion,
     response: ResetCanonicalResponse,
 }
 
-#[cfg(not(test))]
 impl AppliedResetOperation {
     pub(crate) fn response(&self) -> &ResetCanonicalResponse {
         &self.response
@@ -445,20 +424,17 @@ impl AppliedResetOperation {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) enum ResetTransactionOutcome {
     First(AppliedResetOperation),
     Replay(CompletedIdempotentResponse),
 }
 
-#[cfg(not(test))]
 struct PreparedResetExecutionGraph {
     plan: ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
     response: ResetCanonicalResponse,
 }
 
-#[cfg(not(test))]
 impl PreparedResetExecutionGraph {
     fn new(
         plan: ConversationPersistencePlan,
@@ -508,17 +484,14 @@ impl PreparedResetExecutionGraph {
     }
 }
 
-#[cfg(not(test))]
 fn parse_json(bytes: &[u8]) -> Result<JsonValue, ResetFacadeError> {
     serde_json::from_slice(bytes).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)
 }
 
-#[cfg(not(test))]
 fn canonical_datetime(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-#[cfg(not(test))]
 fn coordinate_json(
     coordinate: &PublicGroupSnapshotCoordinate,
 ) -> Result<JsonValue, ResetFacadeError> {
@@ -572,7 +545,6 @@ struct PendingResetRow {
     terminal_at: Option<DateTime<Utc>>,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ResetReplayHeadRow {
     kind: String,
@@ -582,7 +554,6 @@ struct ResetReplayHeadRow {
     next_entry_seq: i64,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ResetReplayEntryRow {
     seq: i64,
@@ -604,7 +575,6 @@ struct ResetReplayEntryRow {
     received_at: DateTime<Utc>,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ResetReplayTransitionRow {
     transition_id: Uuid,
@@ -634,7 +604,6 @@ struct ResetReplayTransitionRow {
     accepted_at: DateTime<Utc>,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ResetReplayGenerationRow {
     group_id: Vec<u8>,
@@ -644,7 +613,6 @@ struct ResetReplayGenerationRow {
     activated_at: DateTime<Utc>,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ResetReplaySuccessorRow {
     group_id: Vec<u8>,
@@ -660,7 +628,6 @@ struct ResetReplaySuccessorRow {
 /// Reset-owned, private-constructor replay proof. Prelude can inspect the
 /// complete binding but cannot mint one or substitute loose endpoint facts.
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
     transaction_id: Box<str>,
     operation_id: Uuid,
@@ -677,7 +644,6 @@ pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
 }
 
 
-#[cfg(not(test))]
 impl ResetReplayPostStateProof {
     pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -1354,7 +1320,6 @@ pub(crate) async fn terminalize_locked_reset_request(
     cas_terminalize(transaction, &guard, guard.authorized_terminal).await
 }
 
-#[cfg(not(test))]
 async fn lock_reset_replay_post_state(
     transaction: &mut Transaction<'_, Postgres>,
     locked: &LockedSignedOperationReplayAuthority,
@@ -1452,7 +1417,6 @@ async fn lock_reset_replay_post_state(
     Ok(proof)
 }
 
-#[cfg(not(test))]
 async fn lock_reset_request_replay_rows(
     transaction: &mut Transaction<'_, Postgres>,
     mutation: &VerifiedSignedMutation,
@@ -1558,7 +1522,6 @@ async fn lock_reset_request_replay_rows(
     Ok((digest.finalize().into(), response))
 }
 
-#[cfg(not(test))]
 async fn lock_reset_activation_replay_rows(
     transaction: &mut Transaction<'_, Postgres>,
     mutation: &VerifiedSignedMutation,
@@ -1728,7 +1691,6 @@ async fn lock_reset_activation_replay_rows(
     Ok((digest.finalize().into(), response))
 }
 
-#[cfg(not(test))]
 async fn lock_reset_replay_entry(
     transaction: &mut Transaction<'_, Postgres>,
     mutation: &VerifiedSignedMutation,
@@ -1788,7 +1750,6 @@ async fn lock_reset_replay_entry(
     Ok(rows.into_iter().next().expect("single exact Reset entry"))
 }
 
-#[cfg(not(test))]
 async fn lock_reset_generation_state(
     transaction: &mut Transaction<'_, Postgres>,
     coordinate: &PublicGroupSnapshotCoordinate,
@@ -1823,7 +1784,6 @@ async fn lock_reset_generation_state(
     Ok(row)
 }
 
-#[cfg(not(test))]
 fn coordinate_pair(
     coordinate: &PublicGroupSnapshotCoordinate,
 ) -> Result<(i64, i64), ResetFacadeError> {
@@ -1839,7 +1799,6 @@ fn coordinate_pair(
 /// owns discovery, full scope locking, entry minting, planning, canonical
 /// artifacts/response, and apply. Replay remains byte-opaque until the exact
 /// Reset durable post-state has been locked and validated.
-#[cfg(not(test))]
 pub(crate) async fn execute_prepared_reset(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
@@ -1878,7 +1837,6 @@ pub(crate) async fn execute_prepared_reset(
     }
 }
 
-#[cfg(not(test))]
 async fn execute_first_reset(
     transaction: &mut Transaction<'_, Postgres>,
     authority: VerifiedChatDeviceRequest,
@@ -1919,7 +1877,6 @@ async fn execute_first_reset(
     })
 }
 
-#[cfg(not(test))]
 async fn prepare_reset_request_graph(
     transaction: &mut Transaction<'_, Postgres>,
     request: &VerifiedChatDeviceRequest,
@@ -1992,7 +1949,6 @@ async fn prepare_reset_request_graph(
     ))
 }
 
-#[cfg(not(test))]
 async fn prepare_reset_activation_graph(
     transaction: &mut Transaction<'_, Postgres>,
     request: &VerifiedChatDeviceRequest,
@@ -2039,12 +1995,10 @@ async fn prepare_reset_activation_graph(
     ))
 }
 
-#[cfg(not(test))]
 fn canonical_uuid_v4(value: Uuid) -> Result<CanonicalUuidV4, ResetFacadeError> {
     CanonicalUuidV4::parse(&value.hyphenated().to_string()).map_err(ResetFacadeError::from)
 }
 
-#[cfg(not(test))]
 fn reset_group_info_bytes(mutation: &VerifiedSignedMutation) -> Result<Vec<u8>, ResetFacadeError> {
     let object = match mutation.projection() {
         VerifiedMutationProjection::ResetActivation(value) => value.genesis_group_info(),
@@ -2066,7 +2020,6 @@ fn reset_group_info_bytes(mutation: &VerifiedSignedMutation) -> Result<Vec<u8>, 
     Ok(bytes.to_vec())
 }
 
-#[cfg(not(test))]
 fn reverify_scope_mutation(
     scope: &ScopeBoundBusinessAuthority,
     mutation: &VerifiedSignedMutation,
@@ -2097,20 +2050,24 @@ fn reverify_scope_mutation(
     Ok(verified)
 }
 
+#[cfg(test)]
 async fn prepare_reset_read_set(
     transaction: &mut Transaction<'_, Postgres>,
     prelude: PreparedBusinessPrelude,
     authority: &VerifiedSignedMutation,
     parsed: &ParsedResetAuthority,
 ) -> Result<PreparedResetReadSet, ResetRepositoryError> {
-    #[cfg(test)]
-    {
-        return prepare_reset_read_set_inner(transaction, prelude, authority, parsed, None).await;
-    }
-    #[cfg(not(test))]
-    {
-        prepare_reset_read_set_inner(transaction, prelude, authority, parsed).await
-    }
+    prepare_reset_read_set_inner(transaction, prelude, authority, parsed, None).await
+}
+
+#[cfg(not(test))]
+async fn prepare_reset_read_set(
+    transaction: &mut Transaction<'_, Postgres>,
+    prelude: PreparedBusinessPrelude,
+    authority: &VerifiedSignedMutation,
+    parsed: &ParsedResetAuthority,
+) -> Result<PreparedResetReadSet, ResetRepositoryError> {
+    prepare_reset_read_set_inner(transaction, prelude, authority, parsed).await
 }
 
 #[cfg(test)]
@@ -3401,7 +3358,6 @@ fn digest_coordinate(digest: &mut Sha256, coordinate: &PublicGroupSnapshotCoordi
     }]);
 }
 
-#[cfg(not(test))]
 fn reset_replay_post_state_digest(
     family: &str,
     head: &ResetReplayHeadRow,
@@ -3435,7 +3391,6 @@ fn reset_replay_post_state_digest(
     digest
 }
 
-#[cfg(not(test))]
 fn digest_transition(digest: &mut Sha256, row: &ResetReplayTransitionRow) {
     digest_uuid(digest, row.transition_id);
     digest_uuid(digest, row.conversation_id);
@@ -3464,7 +3419,6 @@ fn digest_transition(digest: &mut Sha256, row: &ResetReplayTransitionRow) {
     digest.update(row.accepted_at.timestamp_millis().to_be_bytes());
 }
 
-#[cfg(not(test))]
 fn digest_generation_state(digest: &mut Sha256, row: &ResetReplaySuccessorRow) {
     digest_len(digest, &row.group_id);
     digest.update(row.epoch.to_be_bytes());
@@ -3508,12 +3462,10 @@ fn reset_replay_seal(
 }
 
 
-#[cfg(not(test))]
 fn digest_uuid(digest: &mut Sha256, value: Uuid) {
     digest.update(value.as_bytes());
 }
 
-#[cfg(not(test))]
 fn digest_optional_uuid(digest: &mut Sha256, value: Option<Uuid>) {
     match value {
         Some(value) => {
@@ -3524,7 +3476,6 @@ fn digest_optional_uuid(digest: &mut Sha256, value: Option<Uuid>) {
     }
 }
 
-#[cfg(not(test))]
 fn digest_optional_i64(digest: &mut Sha256, value: Option<i64>) {
     match value {
         Some(value) => {

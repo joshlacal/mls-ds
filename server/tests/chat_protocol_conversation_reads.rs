@@ -12,9 +12,14 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use catbird_server::{
+    blob_store::BlobStore,
     handlers::chat::{chat_router, ChatRuntime},
+    realtime::SseState,
     storage::DbPool,
 };
 use p256::ecdsa::SigningKey;
@@ -25,6 +30,7 @@ use tower_util::ServiceExt;
 struct TestState {
     pool: DbPool,
     runtime: Arc<ChatRuntime>,
+    blob_store: BlobStore,
 }
 
 impl FromRef<TestState> for DbPool {
@@ -36,6 +42,12 @@ impl FromRef<TestState> for DbPool {
 impl FromRef<TestState> for Arc<ChatRuntime> {
     fn from_ref(state: &TestState) -> Self {
         state.runtime.clone()
+    }
+}
+
+impl FromRef<TestState> for BlobStore {
+    fn from_ref(state: &TestState) -> Self {
+        state.blob_store.clone()
     }
 }
 
@@ -53,6 +65,15 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
         );
         std::env::set_var("CHAT_INSTANCE_ID", "018f3f6a-7b2c-4d91-8a5e-0f123456789a");
         std::env::set_var("CHAT_EXTERNAL_BASE", "https://chat.example.net");
+        std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
+        std::env::set_var(
+            "CHAT_CURSOR_SEALING_SECRET",
+            URL_SAFE_NO_PAD.encode([0x22_u8; 32]),
+        );
+        std::env::set_var(
+            "CHAT_SUBSCRIPTION_ENDPOINT",
+            "wss://chat.example.net/xrpc/blue.catbird.chat.subscribeEvents",
+        );
     });
     let _guard = LOCK.lock().expect("runtime env lock");
     if cutover_enabled {
@@ -60,7 +81,7 @@ fn runtime(cutover_enabled: bool) -> Arc<ChatRuntime> {
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    Arc::new(ChatRuntime::from_env().expect("clean-chat runtime"))
+    Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).expect("clean-chat runtime"))
 }
 
 fn router(cutover_enabled: bool) -> Router {
@@ -71,6 +92,7 @@ fn router(cutover_enabled: bool) -> Router {
     chat_router::<TestState>().with_state(TestState {
         pool,
         runtime: runtime(cutover_enabled),
+        blob_store: BlobStore::for_route_tests(),
     })
 }
 

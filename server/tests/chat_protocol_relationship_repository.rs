@@ -13,8 +13,9 @@
 
 #![allow(dead_code)]
 
-mod common;
+use catbird_server::{identity, util};
 
+mod common;
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[path = "../src/chat_protocol/relationship_policy.rs"]
@@ -209,23 +210,7 @@ mod state_machine {
 // surface; the production library still compiles against repository/core.rs.
 mod repository {
     pub(crate) mod core {
-        pub(crate) use crate::relationship_policy::AllocatedProjectionRevisionGuard;
-
-        impl AllocatedProjectionRevisionGuard {
-            pub(super) fn from_database_allocation(
-                allocation_id: uuid::Uuid,
-                value: i64,
-            ) -> Option<Self> {
-                u64::try_from(value)
-                    .ok()
-                    .filter(|value| (1..=9_007_199_254_740_991).contains(value))
-                    .filter(|_| {
-                        allocation_id.get_variant() == uuid::Variant::RFC4122
-                            && allocation_id.get_version_num() == 4
-                    })
-                    .map(|value| Self::for_test_allocation(allocation_id, value))
-            }
-        }
+        pub use catbird_server::chat_protocol::repository::core::*;
 
         #[derive(Debug)]
         pub(crate) struct LockedConversationHeadGuard {

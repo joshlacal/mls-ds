@@ -36,7 +36,6 @@ use crate::chat_protocol::{
     validation::CanonicalUuidV4,
 };
 
-#[cfg(not(test))]
 use crate::chat_protocol::repository::prelude::{
     lock_signed_operation_replay_authority, release_signed_operation_replay,
     LockedSignedOperationReplayAuthority, SignedOperationReplayPostStateProof,
@@ -473,7 +472,6 @@ fn leave_view_json(
 }
 
 
-#[cfg(not(test))]
 async fn lock_leave_replay_post_state(
     transaction: &mut Transaction<'_, Postgres>,
     locked: &LockedSignedOperationReplayAuthority,
@@ -567,7 +565,6 @@ fn response_contains_entry(value: &Value, entry_id: Uuid) -> bool {
 }
 
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol::repository) struct LeaveReplayPostStateProof {
     transaction_id: Box<str>,
     operation_id: Uuid,
@@ -584,7 +581,6 @@ pub(in crate::chat_protocol::repository) struct LeaveReplayPostStateProof {
 }
 
 
-#[cfg(not(test))]
 impl LeaveReplayPostStateProof {
     fn new(
         locked: &LockedSignedOperationReplayAuthority,

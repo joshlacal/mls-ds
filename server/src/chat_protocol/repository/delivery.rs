@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 /// Failures the append-log allocator can surface to its caller.
 #[derive(Debug)]
-pub(crate) enum DeliveryRepositoryError {
+pub enum DeliveryRepositoryError {
     /// A database error escaped the transaction (including primary-key and
     /// deferred-invariant violations raised while inserting the entry).
     Database(sqlx::Error),
@@ -88,26 +88,26 @@ impl From<sqlx::Error> for DeliveryRepositoryError {
 /// the same seq. Every other `chat.entries` column is carried verbatim, and the
 /// database's `CHECK`/`FK`/deferred constraints remain the shape authority.
 #[derive(Clone, Debug)]
-pub(crate) struct AppendEntry {
-    pub(crate) conversation_id: Uuid,
-    pub(crate) entry_id: Uuid,
-    pub(crate) entry_kind: String,
-    pub(crate) accepted_payload_bytes: Vec<u8>,
-    pub(crate) accepted_payload_sha256: Vec<u8>,
-    pub(crate) signed_request_bytes: Vec<u8>,
-    pub(crate) request_digest: Vec<u8>,
-    pub(crate) signature: Vec<u8>,
-    pub(crate) server_fields_bytes: Vec<u8>,
-    pub(crate) outer_entry_fingerprint: Vec<u8>,
-    pub(crate) actor_did: String,
-    pub(crate) actor_device_id: Uuid,
-    pub(crate) actor_key_id: String,
-    pub(crate) actor_auth_generation: i64,
-    pub(crate) generation: Option<i64>,
-    pub(crate) state_version: Option<i64>,
-    pub(crate) transition_id: Option<Uuid>,
-    pub(crate) message_id: Option<Uuid>,
-    pub(crate) received_at: DateTime<Utc>,
+pub struct AppendEntry {
+    pub conversation_id: Uuid,
+    pub entry_id: Uuid,
+    pub entry_kind: String,
+    pub accepted_payload_bytes: Vec<u8>,
+    pub accepted_payload_sha256: Vec<u8>,
+    pub signed_request_bytes: Vec<u8>,
+    pub request_digest: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub server_fields_bytes: Vec<u8>,
+    pub outer_entry_fingerprint: Vec<u8>,
+    pub actor_did: String,
+    pub actor_device_id: Uuid,
+    pub actor_key_id: String,
+    pub actor_auth_generation: i64,
+    pub generation: Option<i64>,
+    pub state_version: Option<i64>,
+    pub transition_id: Option<Uuid>,
+    pub message_id: Option<Uuid>,
+    pub received_at: DateTime<Utc>,
 }
 
 /// Allocate the next append-log seq for `entry.conversation_id` and insert the
@@ -119,7 +119,7 @@ pub(crate) struct AppendEntry {
 /// contiguous, and never reset by generation. The caller is responsible for
 /// completing any coherent side rows (e.g. `chat.message_sends`) the entry's
 /// kind requires before committing, so the deferred delivery invariants hold.
-pub(crate) async fn append_entry(
+pub async fn append_entry(
     transaction: &mut Transaction<'_, Postgres>,
     entry: &AppendEntry,
 ) -> Result<u64, DeliveryRepositoryError> {
@@ -277,30 +277,23 @@ pub(crate) async fn append_entry_at(
 /// `signing_transcript_bytes` the digest covers and the server-authored
 /// `outcome_bytes` returned to the sender.
 #[derive(Clone, Debug)]
-pub(crate) struct ApplicationSend {
-    pub(crate) entry: AppendEntry,
-    pub(crate) signing_transcript_bytes: Vec<u8>,
-    pub(crate) outcome_bytes: Vec<u8>,
+pub struct ApplicationSend {
+    pub entry: AppendEntry,
+    pub signing_transcript_bytes: Vec<u8>,
+    pub outcome_bytes: Vec<u8>,
 }
 
-/// The caller's per-attempt determination from the sender's LIVE leaf/interval:
-/// `Accept` when the sender may still write, `Stale` when its lease/interval has
-/// been superseded (the send is durably tombstoned but never becomes an entry).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApplicationSendDisposition {
+pub enum ApplicationSendDisposition {
     Accept,
     Stale,
 }
 
-/// The DURABLE outcome of a send, stable across replays regardless of the
-/// caller's later disposition: an `Accepted` send keeps its allocated `seq`
-/// forever; a `Stale` send can never later succeed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ApplicationSendOutcome {
+pub enum ApplicationSendOutcome {
     Accepted { seq: u64 },
     Stale,
 }
-
 /// Resolve an application send idempotently on `(conversation_id, message_id)`.
 ///
 /// * FIRST resolution: apply `disposition` — `Accept` appends the
@@ -316,7 +309,7 @@ pub(crate) enum ApplicationSendOutcome {
 /// The two `chat.message_sends` ↔ `chat.entries` foreign keys are DEFERRED, so the
 /// entry + accepted row (written here in the caller's transaction) are reconciled
 /// by `assert_message_send_mapping` at COMMIT.
-pub(crate) async fn resolve_application_send(
+pub async fn resolve_application_send(
     transaction: &mut Transaction<'_, Postgres>,
     send: &ApplicationSend,
     disposition: ApplicationSendDisposition,

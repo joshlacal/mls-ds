@@ -23,7 +23,6 @@ use super::{
     auth::{self, CompletedIdempotentResponse, RepositoryAuthorityClass},
     key_packages::{self, KeyPackageOwner, NewKeyPackage},
 };
-#[cfg(not(test))]
 use super::{
     acceptance, creation, leave, recovery, reset, revocation, submit_transition, welcome_terminal,
 };
@@ -585,7 +584,6 @@ impl LockedSignedOperationReplayAuthority {
 /// sibling modules cannot implement an open proof contract or synthesize one
 /// from loose request facts.
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProof {
     ResetRequest(reset::ResetReplayPostStateProof),
     ResetActivation(reset::ResetReplayPostStateProof),
@@ -600,7 +598,6 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
 }
 
 
-#[cfg(not(test))]
 impl SignedOperationReplayPostStateProof {
     fn transaction_id(&self) -> &str {
         match self {
@@ -2780,7 +2777,6 @@ pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_a
 }
 
 
-#[cfg(not(test))]
 pub(in crate::chat_protocol::repository) async fn release_signed_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
     locked: LockedSignedOperationReplayAuthority,

@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
-#[cfg(not(test))]
 use super::super::state_machine::{
     PlannedRecoveryMutation, PlannedSchedulerRecoveryExpiry, RecoveryPlannedKind,
 };
@@ -67,7 +66,6 @@ use super::{
     },
 };
 
-#[cfg(not(test))]
 use super::prelude::SignedOperationReplayPostStateProof;
 
 const RECOVERY_AUTHORITY_DOMAIN: &[u8] = b"CATBIRD-CHAT-RECOVERY-REPOSITORY-AUTHORITY\0";
@@ -1836,13 +1834,11 @@ pub(in crate::chat_protocol) struct RecoveryFulfillmentPlannerParts {
     pub(in crate::chat_protocol) persistence_witness: RecoveryPersistenceWitness,
 }
 
-#[cfg(not(test))]
 pub(crate) struct RecoveryCompletion {
     scope_authority: ScopeBoundBusinessAuthority,
     completion: OperationCompletionGuard,
 }
 
-#[cfg(not(test))]
 impl RecoveryCompletion {
     pub(crate) fn into_parts(self) -> (ScopeBoundBusinessAuthority, OperationCompletionGuard) {
         (self.scope_authority, self.completion)
@@ -2394,7 +2390,6 @@ fn canonical_client_response(
     RecoveryCanonicalResponse::new(endpoint, bytes, *fingerprint.digest()).map(Some)
 }
 
-#[cfg(not(test))]
 pub(crate) struct PreparedRecoveryMutation {
     graph: PreparedRecoveryExecutionGraph,
     completion: RecoveryCompletion,
@@ -2586,7 +2581,6 @@ impl PreparedRecoveryExecutionGraph {
     }
 }
 
-#[cfg(not(test))]
 impl PreparedRecoveryMutation {
     pub(crate) fn material(&self) -> RecoveryCanonicalMaterial {
         self.graph.material()
@@ -2611,7 +2605,6 @@ impl PreparedRecoveryMutation {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) struct AppliedRecoveryMutation {
     pub(crate) applied: AppliedTransition,
     pub(crate) completion: RecoveryCompletion,
@@ -2619,7 +2612,6 @@ pub(crate) struct AppliedRecoveryMutation {
     pub(crate) response: Option<RecoveryCanonicalResponse>,
 }
 
-#[cfg(not(test))]
 fn seal_planned_recovery(
     planned: PlannedRecoveryMutation,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
@@ -2668,7 +2660,6 @@ fn seal_planned_recovery(
     })
 }
 
-#[cfg(not(test))]
 fn client_expiry_material(
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
@@ -2683,7 +2674,6 @@ fn client_expiry_material(
     })
 }
 
-#[cfg(not(test))]
 fn scheduler_expiry_material(
     recovery_request_id: Uuid,
     terminal_at: ServerTimestamp,
@@ -2696,7 +2686,6 @@ fn scheduler_expiry_material(
     })
 }
 
-#[cfg(not(test))]
 pub(crate) fn plan_recovery_request<T: PublicTransport>(
     input: RecoveryRequestPlanInput,
     relationship_authority: &RelationshipAuthority<T>,
@@ -2707,14 +2696,12 @@ pub(crate) fn plan_recovery_request<T: PublicTransport>(
     )?)
 }
 
-#[cfg(not(test))]
 pub(crate) fn plan_recovery_cancellation(
     input: RecoveryCancellationPlanInput,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
     seal_planned_recovery(HydrationAuthority::plan_recovery_cancellation_input(input)?)
 }
 
-#[cfg(not(test))]
 pub(crate) fn plan_recovery_fulfillment<T: PublicTransport>(
     input: RecoveryFulfillmentPlanInput,
     relationship_authority: &RelationshipAuthority<T>,
@@ -2725,7 +2712,6 @@ pub(crate) fn plan_recovery_fulfillment<T: PublicTransport>(
     )?)
 }
 
-#[cfg(not(test))]
 pub(crate) fn plan_client_recovery_expiry(
     input: RecoveryClientExpiryPlanInput,
 ) -> Result<PreparedRecoveryMutation, RecoveryRepositoryError> {
@@ -2760,7 +2746,6 @@ pub(crate) fn plan_client_recovery_expiry(
 /// Handler-safe Recovery transaction result. The repository has already
 /// validated or completed the exact operation; the caller owns only transport
 /// serialization and the outer transaction commit.
-#[cfg(not(test))]
 pub(crate) struct RecoveryTransactionOutcome {
     status: i32,
     response_bytes: Box<[u8]>,
@@ -2768,7 +2753,6 @@ pub(crate) struct RecoveryTransactionOutcome {
     replayed: bool,
 }
 
-#[cfg(not(test))]
 impl RecoveryTransactionOutcome {
     pub(crate) fn status(&self) -> i32 {
         self.status
@@ -2802,7 +2786,6 @@ impl RecoveryTransactionOutcome {
 /// canonical success/error material, operation completion, and replay
 /// post-state validation. It deliberately does not commit the caller's outer
 /// transaction.
-#[cfg(not(test))]
 pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
@@ -2925,7 +2908,6 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
     }
 }
 
-#[cfg(not(test))]
 async fn complete_applied_recovery(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
@@ -2970,7 +2952,6 @@ async fn complete_applied_recovery(
     })
 }
 
-#[cfg(not(test))]
 async fn complete_classified_recovery(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &VerifiedChatDeviceRequest,
@@ -2998,12 +2979,10 @@ async fn complete_classified_recovery(
     })
 }
 
-#[cfg(not(test))]
 pub(crate) struct PreparedSchedulerRecoveryExpiry {
     graph: PreparedRecoveryExecutionGraph,
 }
 
-#[cfg(not(test))]
 impl PreparedSchedulerRecoveryExpiry {
     pub(crate) fn material(&self) -> RecoveryCanonicalMaterial {
         self.graph.material()
@@ -3020,13 +2999,11 @@ impl PreparedSchedulerRecoveryExpiry {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) struct AppliedSchedulerRecoveryExpiry {
     pub(crate) applied: AppliedTransition,
     pub(crate) material: RecoveryCanonicalMaterial,
 }
 
-#[cfg(not(test))]
 pub(crate) fn plan_scheduler_recovery_expiry(
     input: RecoverySchedulerExpiryPlanInput,
 ) -> Result<PreparedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
@@ -4111,8 +4088,7 @@ pub mod production_composition_proof {
 }
 
 impl RecoveryRequestAuthority {
-    #[cfg(not(test))]
-    pub(crate) async fn into_plan_input<T: PublicTransport>(
+        pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,
@@ -4249,8 +4225,7 @@ impl RecoveryCancellationAuthority {
 }
 
 impl RecoveryFulfillmentAuthority {
-    #[cfg(not(test))]
-    pub(crate) async fn into_plan_input<T: PublicTransport>(
+        pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,
@@ -4600,7 +4575,6 @@ impl RecoveryReplayProjection {
 
 /// Locks and validates Recovery's complete durable replay graph before asking
 /// the operation prelude to release any completed response material.
-#[cfg(not(test))]
 pub(crate) async fn validate_recovery_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
     authority: SignedOperationReplayAuthority,
@@ -4621,7 +4595,6 @@ pub(crate) async fn validate_recovery_operation_replay(
     .await?)
 }
 
-#[cfg(not(test))]
 async fn prepare_recovery_replay_post_state(
     transaction: &mut Transaction<'_, Postgres>,
     locked: &LockedSignedOperationReplayAuthority,

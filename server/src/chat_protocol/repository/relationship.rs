@@ -49,15 +49,7 @@ use super::core::{
     LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
 };
 
-// Path-included repository tests compile this file under `cfg(test)` beside
-// the policy module's test-only witnesses. Reuse those exact consuming types
-// so the hydrator cannot observe a parallel, forgeable guard type. Production
-// builds define the repository-owned witnesses below.
-#[cfg(test)]
-use super::super::relationship_policy::{
-    RelationshipProjectionLoadGuard, TrafficProjectionLoadGuard,
-    TrustedRelationshipDecisionInstant, TrustedRelationshipPersistenceInstant,
-};
+
 
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 const INSERT_CHUNK_ROWS: usize = 256;
@@ -90,26 +82,21 @@ impl From<sqlx::Error> for RelationshipRepositoryError {
 
 /// Non-Clone witness that startup loaded the one fixed relationship authority
 /// configuration and constructed the audited transport internally. Its fields
-/// are private so no handler/state caller can substitute an origin, digest, or
-/// generic HTTP client.
-pub(crate) struct RelationshipAuthorityStartupGuard {
+pub struct RelationshipAuthorityStartupGuard {
     config: RelationshipPolicyConfig,
     transport: ReqwestPinnedTransport<SystemDnsResolver>,
 }
 
 /// Exact durable operation/scope witness for a relationship snapshot load.
-/// The future SQL loader must mint this only while holding the operation's
-/// locked state and must query by both operation scope and scope digest. There
-/// is deliberately no public constructor or caller-supplied DTO shortcut.
-#[cfg(not(test))]
-pub(crate) struct RelationshipProjectionLoadGuard {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationshipProjectionLoadGuard {
     operation_scope: ProjectionOperationScope,
     scope: ProjectionScope,
 }
 
 /// Exact durable traffic scope witness for a traffic snapshot load.
-#[cfg(not(test))]
-pub(crate) struct TrafficProjectionLoadGuard {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrafficProjectionLoadGuard {
     scope: TrafficGraphScope,
 }
 
@@ -276,8 +263,8 @@ impl LockedNoPendingAdmissionGuard {
     }
 }
 
-#[cfg(not(test))]
-enum TrustedRelationshipDecisionScope {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrustedRelationshipDecisionScope {
     Relationship {
         operation_scope: ProjectionOperationScope,
         scope: ProjectionScope,
@@ -286,10 +273,9 @@ enum TrustedRelationshipDecisionScope {
 }
 
 /// Opaque post-lock clock authority for one exact transaction-bound business
-/// read-set. It is deliberately non-Clone: callers cannot mint it from request
-/// entry time or pair it with a caller-selected relationship/traffic scope.
-#[cfg(not(test))]
-pub(crate) struct TrustedRelationshipDecisionInstant {
+/// read-set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedRelationshipDecisionInstant {
     transaction_id: String,
     scope: TrustedRelationshipDecisionScope,
     authenticated_actor_digest: [u8; 32],
@@ -297,21 +283,59 @@ pub(crate) struct TrustedRelationshipDecisionInstant {
     observed_at: DateTime<Utc>,
 }
 
-/// Opaque wall-clock observation captured only after network collection. This
-/// clock is used solely to fence persistence and cannot substitute for request
-/// entry time or the post-lock decision instant above.
-#[cfg(not(test))]
-pub(crate) struct TrustedRelationshipPersistenceInstant(DateTime<Utc>);
+/// Opaque wall-clock observation captured only after network collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedRelationshipPersistenceInstant(pub(crate) DateTime<Utc>);
 
-#[cfg(not(test))]
 impl TrustedRelationshipPersistenceInstant {
-    pub(crate) fn datetime(&self) -> DateTime<Utc> {
+    #[cfg(test)]
+    pub fn for_test(observed_at: DateTime<Utc>) -> Self {
+        Self(observed_at)
+    }
+
+    pub fn datetime(&self) -> DateTime<Utc> {
         self.0
     }
 }
 
-#[cfg(not(test))]
+const TEST_AUTHENTICATED_ACTOR_DIGEST: [u8; 32] = [0x11; 32];
 impl TrustedRelationshipDecisionInstant {
+    #[cfg(test)]
+    pub(crate) fn for_test_relationship(
+        transaction_id: String,
+        operation_scope: ProjectionOperationScope,
+        scope: ProjectionScope,
+        durable_read_set_digest: [u8; 32],
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            scope: TrustedRelationshipDecisionScope::Relationship {
+                operation_scope,
+                scope,
+            },
+            authenticated_actor_digest: TEST_AUTHENTICATED_ACTOR_DIGEST,
+            durable_read_set_digest,
+            observed_at,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_traffic(
+        transaction_id: String,
+        scope: TrafficGraphScope,
+        durable_read_set_digest: [u8; 32],
+        observed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            scope: TrustedRelationshipDecisionScope::Traffic(scope),
+            authenticated_actor_digest: TEST_AUTHENTICATED_ACTOR_DIGEST,
+            durable_read_set_digest,
+            observed_at,
+        }
+    }
+
     fn from_locked_relationship_scope(
         transaction_id: String,
         operation_scope: ProjectionOperationScope,
@@ -377,6 +401,9 @@ impl TrustedRelationshipDecisionInstant {
             )
     }
 
+pub fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
+    TrustedRelationshipPersistenceInstant(Utc::now())
+}
     pub(crate) fn traffic_scope(&self) -> Option<&TrafficGraphScope> {
         if !self.binding_is_valid() {
             return None;
@@ -405,7 +432,6 @@ impl TrustedRelationshipDecisionInstant {
 /// Capture persistence time after collection. Export rejects observations
 /// before `completed_at`, so capturing this before collection cannot authorize
 /// a projection that finishes later.
-#[cfg(not(test))]
 pub(crate) fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
     TrustedRelationshipPersistenceInstant(Utc::now())
 }
@@ -445,15 +471,29 @@ impl RelationshipAuthorityStartupGuard {
     }
 }
 
-#[cfg(not(test))]
 impl RelationshipProjectionLoadGuard {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        operation_scope: ProjectionOperationScope,
+        scope: ProjectionScope,
+    ) -> Self {
+        Self {
+            operation_scope,
+            scope,
+        }
+    }
+
     pub(crate) fn into_parts(self) -> (ProjectionOperationScope, ProjectionScope) {
         (self.operation_scope, self.scope)
     }
 }
 
-#[cfg(not(test))]
 impl TrafficProjectionLoadGuard {
+    #[cfg(test)]
+    pub(crate) fn for_test(scope: TrafficGraphScope) -> Self {
+        Self { scope }
+    }
+
     pub(crate) fn into_scope(self) -> TrafficGraphScope {
         self.scope
     }
@@ -2254,28 +2294,14 @@ fn relationship_load_guard(
     operation_scope: ProjectionOperationScope,
     scope: ProjectionScope,
 ) -> RelationshipProjectionLoadGuard {
-    #[cfg(test)]
-    {
-        RelationshipProjectionLoadGuard::for_test(operation_scope, scope)
-    }
-    #[cfg(not(test))]
-    {
-        RelationshipProjectionLoadGuard {
-            operation_scope,
-            scope,
-        }
+    RelationshipProjectionLoadGuard {
+        operation_scope,
+        scope,
     }
 }
 
 fn traffic_load_guard(scope: TrafficGraphScope) -> TrafficProjectionLoadGuard {
-    #[cfg(test)]
-    {
-        TrafficProjectionLoadGuard::for_test(scope)
-    }
-    #[cfg(not(test))]
-    {
-        TrafficProjectionLoadGuard { scope }
-    }
+    TrafficProjectionLoadGuard { scope }
 }
 
 fn bytes_32(value: Vec<u8>) -> Result<[u8; 32], RelationshipRepositoryError> {

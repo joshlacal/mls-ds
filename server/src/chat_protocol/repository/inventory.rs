@@ -82,14 +82,11 @@ pub(crate) enum InventoryRepositoryError {
     Sealer(#[from] SealerError),
     #[error("inventory snapshot creation exhausted its three-attempt retry ceiling")]
     RetryCeiling,
-    #[cfg(not(test))]
-    #[error(transparent)]
+        #[error(transparent)]
     Projection(#[from] crate::chat_protocol::read_projection::ProjectionError),
-    #[cfg(not(test))]
-    #[error("clean-chat inventory read authority failed")]
+        #[error("clean-chat inventory read authority failed")]
     ReadAuthority(super::super::read_authority::ReadAuthorityError),
-    #[cfg(not(test))]
-    #[error("clean-chat inventory read admission failed")]
+        #[error("clean-chat inventory read admission failed")]
     ReadAdmission(super::super::dpop::ReadAdmissionBindingError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -1526,7 +1523,6 @@ pub(crate) async fn get_devices(
 /// on every page and to the ticket mint; `snapshot_event_cursor_bytes` is the
 /// same capability's raw 32 bytes. Neither is persisted (only the SHA-256
 /// lookup hash and the sealed nonce/ciphertext pair live at rest).
-#[cfg(not(test))]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct CreatedInventorySession {
     pub(crate) inventory_session_id: Uuid,
@@ -1542,7 +1538,6 @@ pub(crate) struct CreatedInventorySession {
 
 /// Redacted `Debug`: the capability plaintext (`inventory_session_token` and
 /// `snapshot_event_cursor_bytes`) never appears in `Debug` output.
-#[cfg(not(test))]
 impl std::fmt::Debug for CreatedInventorySession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1564,7 +1559,6 @@ impl std::fmt::Debug for CreatedInventorySession {
 /// derives it from the verified device coordinates) plus the repository-owned
 /// whole-second lifetime window. No caller identity, generation, or payload
 /// bytes cross this boundary.
-#[cfg(not(test))]
 #[derive(Clone, Debug)]
 pub(crate) struct CreateInventorySessionRequest {
     pub(crate) inventory_session_id: Uuid,
@@ -1610,7 +1604,6 @@ pub(crate) struct CreateInventorySessionRequest {
 /// future caller that composes further deferred work after
 /// `create_inventory_session` in the same transaction must account for the
 /// constraints already being immediate (or re-defer them explicitly).
-#[cfg(not(test))]
 pub(crate) async fn create_inventory_session(
     transaction: &mut Transaction<'_, Postgres>,
     device: super::super::read_authority::LockedReadDeviceAuthority,
@@ -2478,7 +2471,6 @@ pub(crate) struct IntervalSummaryTerminalHint {
 /// The bound is repository-owned by construction: the admission seam hands the
 /// facade only a base instant and accepts no caller TTL, expiry, or duration,
 /// so no caller can manufacture a snapshot lifetime.
-#[cfg(not(test))]
 const OWN_DEVICE_SNAPSHOT_TTL_MINUTES: i64 = 10;
 
 /// Sanitized facade failure. Every variant is a unit variant, so no `Debug`
@@ -2506,12 +2498,10 @@ pub(crate) enum ExistingDeviceReadFacadeError {
 /// getter, no cursor, no authority/admission/attempt/row/transaction handle, no
 /// requester marker, and no mutable bytes reference: a handler can only move the
 /// bytes into `context::json_ok`.
-#[cfg(not(test))]
 pub(crate) struct CanonicalGetDevicesResponse {
     response_bytes: Vec<u8>,
 }
 
-#[cfg(not(test))]
 impl CanonicalGetDevicesResponse {
     pub(crate) fn into_response_bytes(self) -> Vec<u8> {
         self.response_bytes
@@ -2521,12 +2511,10 @@ impl CanonicalGetDevicesResponse {
 /// Consuming canonical `getOwnDevices` response bytes. Constructible only after
 /// the durable session commit succeeds, so its mere existence is proof that no
 /// bytes escaped before commit.
-#[cfg(not(test))]
 pub(crate) struct CommittedOwnDeviceSnapshot {
     response_bytes: Vec<u8>,
 }
 
-#[cfg(not(test))]
 impl CommittedOwnDeviceSnapshot {
     pub(crate) fn into_response_bytes(self) -> Vec<u8> {
         self.response_bytes
@@ -2537,7 +2525,6 @@ impl CommittedOwnDeviceSnapshot {
 /// statement: the device barrier must complete before the key statement is even
 /// issued, and a joined `FOR UPDATE OF device, device_key` is not proof of that
 /// order.
-#[cfg(not(test))]
 const LOCK_READ_REQUESTER_DEVICE_SQL: &str = r#"
     SELECT device.user_did,
            device.device_id,
@@ -2552,7 +2539,6 @@ const LOCK_READ_REQUESTER_DEVICE_SQL: &str = r#"
 
 /// Lock the EXACT requester `chat.device_keys` row, in a SEPARATE statement
 /// issued only after the device lock above has already returned.
-#[cfg(not(test))]
 const LOCK_READ_REQUESTER_DEVICE_KEY_SQL: &str = r#"
     SELECT device_key.key_id,
            device_key.signing_public_key,
@@ -2563,7 +2549,6 @@ const LOCK_READ_REQUESTER_DEVICE_KEY_SQL: &str = r#"
      FOR UPDATE
 "#;
 
-#[cfg(not(test))]
 #[derive(FromRow)]
 struct LockedReadRequesterDeviceRow {
     user_did: String,
@@ -2573,7 +2558,6 @@ struct LockedReadRequesterDeviceRow {
     auth_generation: i64,
 }
 
-#[cfg(not(test))]
 #[derive(FromRow)]
 struct LockedReadRequesterKeyRow {
     key_id: String,
@@ -2588,7 +2572,6 @@ struct LockedReadRequesterKeyRow {
 /// the two locked rows and kept as facade locals. They are permitted to be bound
 /// into an internal durable write after hidden verification succeeds, and they
 /// are never returned to a handler or placed in a response.
-#[cfg(not(test))]
 struct VerifiedRequesterLock {
     transaction_id: String,
     verified: super::super::dpop::VerifiedExistingDeviceReadRow,
@@ -2611,7 +2594,6 @@ struct VerifiedRequesterLock {
 /// drifted JKT/generation/key — surfaces from `consume_verify_locked_row` and is
 /// mapped to `Invariant`, never to a retryable outcome. A failed or foreign
 /// transaction retains no authority: the attempt was consumed by value.
-#[cfg(not(test))]
 async fn lock_and_verify_read_requester(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
@@ -2707,7 +2689,6 @@ async fn lock_and_verify_read_requester(
 /// Check the private same-transaction token before a protected query. Every
 /// protected audience/directory/item/session query in this section calls this
 /// immediately before issuing SQL.
-#[cfg(not(test))]
 fn guard_protected_query(
     lock: &VerifiedRequesterLock,
 ) -> Result<(), ExistingDeviceReadFacadeError> {
@@ -2719,7 +2700,6 @@ fn guard_protected_query(
 /// Map an inventory repository failure into the sanitized facade vocabulary.
 /// Only the device-fence `SnapshotConflict` is retryable, and it is handled by
 /// the caller's own outcome type rather than by an error variant.
-#[cfg(not(test))]
 fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDeviceReadFacadeError {
     match error {
         InventoryRepositoryError::RequestTooBroad => ExistingDeviceReadFacadeError::RequestTooBroad,
@@ -2734,7 +2714,6 @@ fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDevic
 /// field. It is duplicated rather than called because that helper is
 /// `pub(in crate::handlers::chat)` and the authority places the complete
 /// generated-DTO projection inside this repository module.
-#[cfg(not(test))]
 fn read_facade_device_view(
     view: &super::device_directory::DeviceDirectoryView,
 ) -> catbird_atproto::generated::blue_catbird::chat::DeviceView<jacquard_common::DefaultStr> {
@@ -2761,7 +2740,6 @@ fn read_facade_device_view(
 /// generated empty `extra_data`. It deliberately carries no authentication
 /// generation, JKT, signing key, status, timestamp, reserved count, requester
 /// coordinate, or row object.
-#[cfg(not(test))]
 fn read_facade_addressable_device(
     view: &super::device_directory::DeviceDirectoryView,
     user_did: &str,
@@ -2798,7 +2776,6 @@ fn read_facade_addressable_device(
 /// against the two ordered requester locks, holds those locks through the
 /// bounded audience/directory read, and ends the read-only transaction before
 /// returning consuming canonical JSON bytes.
-#[cfg(not(test))]
 pub(crate) async fn read_addressable_devices_for_admission(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
@@ -2828,7 +2805,6 @@ pub(crate) async fn read_addressable_devices_for_admission(
     outcome
 }
 
-#[cfg(not(test))]
 async fn read_addressable_devices_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
@@ -2870,7 +2846,6 @@ async fn read_addressable_devices_in_transaction(
 }
 
 /// One attempt's terminal disposition inside the fixed three-attempt loop.
-#[cfg(not(test))]
 enum OwnDeviceSnapshotOutcome {
     /// The device fence lost its race. Roll back, drop this attempt's proof, and
     /// use the next fixed array element.
@@ -2890,7 +2865,6 @@ enum OwnDeviceSnapshotOutcome {
 /// the loop is over the fixed `[ReadAdmissionAttempt; 3]` array, a fourth
 /// iteration is unrepresentable, and every retry rolls back the prior
 /// transaction and drops the prior row proof before taking the next element.
-#[cfg(not(test))]
 pub(crate) async fn create_own_device_snapshot_for_admission(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
@@ -2950,7 +2924,6 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
     Err(ExistingDeviceReadFacadeError::RetryCeiling)
 }
 
-#[cfg(not(test))]
 async fn materialize_own_device_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
@@ -3326,9 +3299,7 @@ fn canonical_datetime(value: DateTime<Utc>) -> String {
 const INVENTORY_CIPHER_SUITE_V1: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
 /// The generated key-package artifact framing/content-type constants (single
 /// value; no durable columns carry them).
-#[cfg(not(test))]
 const INVENTORY_KEY_PACKAGE_FRAMING: &str = "mlsMessage";
-#[cfg(not(test))]
 const INVENTORY_KEY_PACKAGE_CONTENT_TYPE: &str = "keyPackage";
 
 /// The locked durable session row consumed by the loader seam. Everything the
@@ -3384,7 +3355,6 @@ async fn lock_inventory_session_row(
 /// durable fence material fields from the locked row and verify the fence
 /// against the live protocol instance, active cursor key, retention floor, and
 /// temporal bounds. The row must belong to the presenting device.
-#[cfg(not(test))]
 async fn verify_locked_inventory_fence(
     transaction: &mut Transaction<'_, Postgres>,
     device: super::super::read_authority::LockedReadDeviceAuthority,
@@ -3436,28 +3406,8 @@ async fn verify_locked_inventory_fence(
 /// replicas), while nothing referencing `read_authority` may leak into the
 /// partial include trees. The REAL B-read fence chain is driven separately by
 /// the DB suite through its admission bridge.
-#[cfg(not(test))]
 pub(crate) type PagingDeviceAuthority = super::super::read_authority::LockedReadDeviceAuthority;
 
-/// Harness-only device identity for the paging entrypoints (see
-/// `PagingDeviceAuthority`). Carries exactly the identity tuple the fence
-/// binds; it grants nothing on its own.
-#[cfg(test)]
-pub(crate) struct PagingDeviceAuthority {
-    pub(crate) user_did: String,
-    pub(crate) device_id: Uuid,
-    pub(crate) jkt: Option<String>,
-    pub(crate) auth_generation: i64,
-}
-
-/// The paging entrypoints' device fence. In production this is the full
-/// consuming B-read fence (`verify_locked_inventory_fence`); under
-/// `cfg(test)` it is the identity/format half of the same check, so a
-/// harness caller can never serve another device's session (the
-/// temporal/protocol half is `revalidate_session_fence`, which runs
-/// unconditionally on every serve, plus the DB suite's real fence-chain
-/// tests through the admission bridge).
-#[cfg(not(test))]
 async fn verify_paging_device_fence(
     transaction: &mut Transaction<'_, Postgres>,
     device: PagingDeviceAuthority,
@@ -3466,25 +3416,6 @@ async fn verify_paging_device_fence(
     verify_locked_inventory_fence(transaction, device, row)
         .await
         .map(|_| ())
-}
-
-#[cfg(test)]
-async fn verify_paging_device_fence(
-    transaction: &mut Transaction<'_, Postgres>,
-    device: PagingDeviceAuthority,
-    row: &InventorySessionFenceLockRow,
-) -> Result<(), InventoryRepositoryError> {
-    let _ = transaction;
-    if row.user_did != device.user_did
-        || row.device_id != device.device_id
-        || row.jkt.as_deref() != device.jkt.as_deref()
-        || row.auth_generation != device.auth_generation
-        || row.legacy_cursor_invalidated_at.is_some()
-        || row.cursor_format_version != 1
-    {
-        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
-    }
-    Ok(())
 }
 
 /// The G6-compatible final fence/source revalidation, run immediately before
@@ -3583,7 +3514,6 @@ fn verify_successor_capability(
 /// locks the exact session, verifies the exact device identity and live fence,
 /// then decrypts the sealed capability under the session's binding. The raw
 /// capability is returned only to the caller's transaction frame.
-#[cfg(any(not(test), feature = "subscription-production-proof"))]
 pub(crate) async fn snapshot_capability_for_ticket(
     transaction: &mut Transaction<'_, Postgres>,
     device: &super::super::read_authority::LockedReadDeviceAuthority,
@@ -4523,7 +4453,6 @@ pub(crate) async fn serve_initial_inventory_page(
 }
 
 /// One per-attempt create-or-lock + first-page flow.
-#[cfg(not(test))]
 async fn create_inventory_snapshot_attempt(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
@@ -4683,7 +4612,6 @@ async fn create_inventory_snapshot_attempt(
 /// Purpose-staged: the G/H handler lanes wire this facade to the three
 /// endpoints; until then it has no production caller and the dead-code lint
 /// is documented rather than papered over.
-#[cfg(not(test))]
 #[allow(dead_code)]
 pub(crate) async fn create_inventory_snapshot_and_first_page(
     pool: &sqlx::PgPool,
@@ -4743,7 +4671,6 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
 /// selected device identity.  Final-page consumption is owned by
 /// `complete_inventory_page`, which performs the one-way compare-and-set in
 /// the same transaction as the page receipt.
-#[cfg(not(test))]
 pub(crate) async fn continue_inventory_page_for_admission(
     pool: &sqlx::PgPool,
     admission: super::super::dpop::VerifiedReadAdmission,
@@ -5015,7 +4942,6 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// The per-arm provenance columns a conversation item row carries (the exact
 /// columns the arm-shape check, the source-precedence trigger, and the
 /// materialization digest transcript require).
-#[cfg(not(test))]
 struct ConversationArmColumns {
     item_kind: &'static str,
     participant_period_id: Option<Uuid>,
@@ -5030,7 +4956,6 @@ struct ConversationArmColumns {
 }
 
 /// One typed loader per `ConversationInventoryAuthority` arm.
-#[cfg(not(test))]
 async fn conversation_projection_source(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &super::super::read_authority::ConversationInventoryAuthority,
@@ -5102,7 +5027,6 @@ async fn conversation_projection_source(
 }
 
 /// The item-row provenance columns for one authority.
-#[cfg(not(test))]
 async fn conversation_arm_columns(
     transaction: &mut Transaction<'_, Postgres>,
     authority: &super::super::read_authority::ConversationInventoryAuthority,
@@ -5188,7 +5112,6 @@ async fn conversation_arm_columns(
 /// leaves, and the current metadata snapshot. Any missing/extra field or a
 /// state without its metadata snapshot fails before materialization.
 
-#[cfg(not(test))]
 pub(crate) async fn load_conversation_state_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
@@ -5447,7 +5370,6 @@ struct ConversationMetadataRow {
 
 /// The close-arm source: the conversation's close coordinate, the closing
 /// transition actor, and the retired state's crypto coordinate.
-#[cfg(not(test))]
 async fn load_conversation_close_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
@@ -5482,7 +5404,6 @@ async fn load_conversation_close_source(
     .ok_or(InventoryRepositoryError::DurableRowInvalid)
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ConversationCloseSourceRow {
     kind: String,
@@ -5502,7 +5423,6 @@ struct ConversationCloseSourceRow {
 }
 
 /// The exact schedule-terminal proof row for one recipient/conversation.
-#[cfg(not(test))]
 async fn load_schedule_terminal_proof(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
@@ -5523,7 +5443,6 @@ async fn load_schedule_terminal_proof(
     .await?)
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct ScheduleTerminalProofRow {
     terminal_seq: i64,
@@ -5534,7 +5453,6 @@ struct ScheduleTerminalProofRow {
 /// The complete retained Welcome source for the exact device's pending
 /// deliveries: every checked field of `RetainedWelcomeProjectionSource`,
 /// derived from the delivery, bundle, and conversation rows.
-#[cfg(not(test))]
 async fn retained_welcome_sources(
     transaction: &mut Transaction<'_, Postgres>,
     user_did: &str,
@@ -5608,7 +5526,6 @@ async fn retained_welcome_sources(
     Ok(sources)
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct WelcomeSourceRow {
     welcome_id: Uuid,
@@ -5633,7 +5550,6 @@ struct WelcomeSourceRow {
 
 /// One retained recovery inbox entry: the closed `LeafRecoveryInboxInput`
 /// plus the durable item identity the materialization row needs.
-#[cfg(not(test))]
 struct RetainedRecoveryInboxEntry {
     item_kind: &'static str,
     leaf_recovery_request_id: Option<Uuid>,
@@ -5645,7 +5561,6 @@ struct RetainedRecoveryInboxEntry {
 /// Every retained leaf-recovery request (all five statuses) and every retained
 /// recovery-work item (all three statuses) for the exact device, in the
 /// canonical 0x00-requests-then-0x01-work ordinal order.
-#[cfg(not(test))]
 async fn retained_recovery_inbox_entries(
     transaction: &mut Transaction<'_, Postgres>,
     user_did: &str,
@@ -5898,7 +5813,6 @@ async fn retained_recovery_inbox_entries(
     Ok(entries)
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct LeafRecoverySourceRow {
     recovery_request_id: Uuid,
@@ -5936,7 +5850,6 @@ struct LeafRecoverySourceRow {
     package_wrapper_sha256: Vec<u8>,
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct RecoveryWorkSourceRow {
     recovery_work_id: Uuid,
@@ -5963,7 +5876,6 @@ struct RecoveryWorkSourceRow {
 /// payload-byte sum, and the digest EXACTLY as
 /// `chat.assert_inventory_materialization` recomputes it (item kind + tagged
 /// arm provenance + payload length included for the conversation domain).
-#[cfg(not(test))]
 async fn read_g7_materialization_digest(
     transaction: &mut Transaction<'_, Postgres>,
     domain: InventoryPageDomain,
@@ -6077,7 +5989,6 @@ async fn read_g7_materialization_digest(
     Ok((item_count, items_sha256, payload_bytes))
 }
 
-#[cfg(not(test))]
 #[derive(Debug, FromRow)]
 struct G7MaterializationDigestRow {
     item_count: i64,

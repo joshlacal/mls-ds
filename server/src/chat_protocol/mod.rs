@@ -84,18 +84,18 @@ pub(crate) use cursor::{
 /// non-Clone, cannot be constructed outside this module, and do not represent
 /// device authority until the repository atomically consumes all replay keys
 /// and validates stored device state in the same transaction.
-pub(crate) mod dpop;
+pub mod dpop;
 pub mod error;
-pub(crate) mod model;
-pub(crate) mod public_state;
-pub(crate) mod read_authority;
-pub(crate) mod read_projection;
-pub(crate) mod relationship_policy;
-pub(crate) mod repository;
+pub mod model;
+pub mod public_state;
+pub mod read_authority;
+pub mod read_projection;
+pub mod relationship_policy;
+pub mod repository;
 pub mod snapshot;
-pub(crate) mod state_machine;
-pub(crate) mod transcript;
-pub(crate) mod validation;
+pub mod state_machine;
+pub mod transcript;
+pub mod validation;
 pub mod wire;
 
 /// Non-shipping executable proof runners. Only zero-authority scenario

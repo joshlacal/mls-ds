@@ -59,7 +59,7 @@ pub(crate) const AUTHORIZED_FETCH_TTL: chrono::Duration = chrono::Duration::seco
 
 /// Failures the blob writers surface to the composing caller.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BlobRepositoryError {
+pub enum BlobRepositoryError {
     /// A database error escaped the transaction (including CHECK / FK / UNIQUE
     /// violations the caller did not specifically expect). The row-shape
     /// authority is the schema; an unexpected violation propagates verbatim.
@@ -448,13 +448,13 @@ fn is_check_violation(error: &sqlx::Error, constraint: &str) -> bool {
 /// Blob purpose. Mirrors `blobs_purpose_check` and the two distinct signed
 /// binding fragments: an application attachment vs. a metadata avatar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlobPurpose {
+pub enum BlobPurpose {
     Attachment,
     Metadata,
 }
 
 impl BlobPurpose {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Attachment => "attachment",
             Self::Metadata => "metadata",
@@ -464,14 +464,13 @@ impl BlobPurpose {
 
 /// Blob status. Mirrors `blobs_status_check` exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlobStatus {
+pub enum BlobStatus {
     Prepared,
     CompletedUnbound,
     Bound,
     Deleted,
     Expired,
 }
-
 impl BlobStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -488,7 +487,7 @@ impl BlobStatus {
 /// encrypted-image MIMEs plus four audio MIMEs for an attachment, but only the
 /// four still-image MIMEs (no GIF, no audio) for a metadata avatar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BlobMediaType {
+pub enum BlobMediaType {
     ImageHeic,
     ImageJpeg,
     ImagePng,
@@ -499,7 +498,6 @@ pub(crate) enum BlobMediaType {
     AudioOgg,
     AudioOpus,
 }
-
 impl BlobMediaType {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -600,7 +598,7 @@ pub(crate) async fn insert_prepared_blob(
 ) -> Result<(), BlobRepositoryError> {
     sqlx::query(
         r#"
-        INSERT INTO chat.blobs(
+        INSERT INTO chat.blobs (
             blob_id, owner_did, owner_device_id, owner_key_id, owner_auth_generation,
             purpose, media_type, plaintext_size, ciphertext_size, ciphertext_sha256,
             object_store_key, status, prepared_at, upload_expires_at
@@ -1538,21 +1536,20 @@ pub(crate) async fn consume_authorized_blob_fetch(
 
 /// The exact validated prepare request. `plaintext_size`/`ciphertext_size` are
 /// the sealed sizes; the AEAD-tag relation and the per-media ceilings are checked
-/// before any write.
 #[derive(Clone, Debug)]
-pub(crate) struct PrepareBlobRequest {
-    pub(crate) blob_id: Uuid,
-    pub(crate) owner_did: String,
-    pub(crate) owner_device_id: Uuid,
-    pub(crate) owner_key_id: String,
-    pub(crate) owner_auth_generation: i64,
-    pub(crate) purpose: BlobPurpose,
-    pub(crate) media_type: BlobMediaType,
-    pub(crate) plaintext_size: i64,
-    pub(crate) ciphertext_size: i64,
-    pub(crate) ciphertext_sha256: Vec<u8>,
-    pub(crate) ticket_hash: Vec<u8>,
-    pub(crate) prepared_at: DateTime<Utc>,
+pub struct PrepareBlobRequest {
+    pub blob_id: Uuid,
+    pub owner_did: String,
+    pub owner_device_id: Uuid,
+    pub owner_key_id: String,
+    pub owner_auth_generation: i64,
+    pub purpose: BlobPurpose,
+    pub media_type: BlobMediaType,
+    pub plaintext_size: i64,
+    pub ciphertext_size: i64,
+    pub ciphertext_sha256: Vec<u8>,
+    pub ticket_hash: Vec<u8>,
+    pub prepared_at: DateTime<Utc>,
 }
 
 /// Validate the visible outer blob predicates the delivery service owns WITHOUT
@@ -1588,7 +1585,7 @@ pub(crate) fn validate_blob_dimensions(
 /// its 1:1 upload ticket, and RESERVE quota. Usage delta:
 ///   used += 0, reserved += ciphertext_size, live_unbound += 1, blob_count += 1.
 /// A over-cap owner surfaces `QuotaExceeded` from the reserve.
-pub(crate) async fn prepare_blob(
+pub async fn prepare_blob(
     transaction: &mut Transaction<'_, Postgres>,
     request: &PrepareBlobRequest,
 ) -> Result<(), BlobRepositoryError> {

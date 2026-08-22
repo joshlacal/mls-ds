@@ -61,14 +61,14 @@ const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 /// opaque UUID identifies the durable allocation claim while the sequence
 /// value supplies global ordering. This pair is deliberately non-cloneable and
 /// must survive collection until it is consumed by the persistence seal.
-#[derive(Debug)]
-pub(crate) struct AllocatedProjectionRevisionGuard {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AllocatedProjectionRevisionGuard {
     allocation_id: Uuid,
     projection_revision: u64,
 }
 
 impl AllocatedProjectionRevisionGuard {
-    pub(super) fn from_database_allocation(
+    pub fn from_database_allocation(
         allocation_id: Uuid,
         projection_revision: i64,
     ) -> Option<Self> {
@@ -84,18 +84,27 @@ impl AllocatedProjectionRevisionGuard {
         })
     }
 
-    pub(crate) fn projection_revision(&self) -> u64 {
+    pub fn projection_revision(&self) -> u64 {
         self.projection_revision
     }
 
-    pub(crate) fn into_allocation(self) -> (Uuid, u64) {
+    pub fn into_allocation(self) -> (Uuid, u64) {
         (self.allocation_id, self.projection_revision)
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test(value: u64) -> Self {
+    pub fn for_test(value: u64) -> Self {
         Self::from_database_allocation(
             Uuid::new_v4(),
+            i64::try_from(value).expect("test revision fits i64"),
+        )
+        .expect("valid test projection allocation")
+    }
+
+    #[cfg(test)]
+    pub fn for_test_allocation(allocation_id: Uuid, value: u64) -> Self {
+        Self::from_database_allocation(
+            allocation_id,
             i64::try_from(value).expect("test revision fits i64"),
         )
         .expect("valid test projection allocation")

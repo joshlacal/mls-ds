@@ -50,28 +50,15 @@
 
 mod common;
 
-mod repository {
-    pub(crate) mod blobs {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/blobs.rs"
-        ));
-    }
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
-}
+use catbird_server::chat_protocol::repository::{blobs, delivery};
 
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use repository::blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
-use repository::delivery::{
+use blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
+use delivery::{
     resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
     ApplicationSendOutcome,
 };
