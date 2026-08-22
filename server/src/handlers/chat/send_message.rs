@@ -59,13 +59,17 @@ async fn send(
         }
         PreparedChatAdmission::First(first) => {
             let (authority, scope, completion) = first.into_execution_parts();
-            let (response_bytes, event_position) =
-                message_delivery::send(&mut tx, &authority, &scope)
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("message_delivery::send error: {:?}", e);
-                        map_failure(e)
-                    })?;
+            let (response_bytes, event_position) = message_delivery::send(
+                &mut tx,
+                &authority,
+                &scope,
+                runtime.relationship_authority().as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("message_delivery::send error: {:?}", e);
+                map_failure(e)
+            })?;
             prelude::complete_operation(
                 &mut tx,
                 &authority,

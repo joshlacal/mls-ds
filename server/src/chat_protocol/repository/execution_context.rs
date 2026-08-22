@@ -695,14 +695,33 @@ async fn standard_audience(
     let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
     let actor_did = device_did(actor)?;
     let actor_device_id = device_uuid(actor);
-    let successor_dids = plan
+    // A control transition is delivered to the exact MLS leaf audience. That
+    // is the successor tree plus any current leaves closed by this transition:
+    // survivors receive `control`; removed leaves receive `intervalClose`.
+    // Never expand from participant DIDs to every enrolled account device.
+    let mut expected_devices = plan
         .state()
-        .participants
+        .leaves
         .iter()
-        .map(|participant| {
-            String::from_utf8(participant.principal.as_bytes().to_vec())
-                .map_err(|_| ExecutionContextHydrationError::OutOfDomain)
-        })
+        .map(|leaf| leaf.device.clone())
+        .collect::<BTreeSet<_>>();
+    let current_leaves: Vec<(String, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT user_did, device_id
+          FROM chat.member_devices
+         WHERE conversation_id=$1 AND active
+         ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id)
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for (did, device_id) in current_leaves {
+        expected_devices.insert(device_identity(did, device_id)?);
+    }
+    let audience_dids = expected_devices
+        .iter()
+        .map(device_did)
         .collect::<Result<Vec<_>, _>>()?;
     let rows: Vec<(String, Uuid, bool)> = sqlx::query_as(
         r#"
@@ -729,15 +748,22 @@ async fn standard_audience(
         "#,
     )
     .bind(conversation_id)
-    .bind(&successor_dids)
+    .bind(&audience_dids)
     .bind(&actor_did)
     .bind(actor_device_id)
     .fetch_all(&mut **transaction)
     .await?;
-    rows.into_iter()
-        .filter(|(_, _, entitled)| *entitled)
-        .map(|(did, device, _)| device_identity(did, device))
-        .collect()
+    let mut audience = Vec::with_capacity(expected_devices.len());
+    for (did, device_id, entitled) in rows {
+        if !entitled {
+            continue;
+        }
+        let device = device_identity(did, device_id)?;
+        if expected_devices.contains(&device) {
+            audience.push(device);
+        }
+    }
+    Ok(audience)
 }
 
 async fn historical_schedule_audience(

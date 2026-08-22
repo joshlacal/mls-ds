@@ -86,15 +86,19 @@ async fn submit(
                 ENDPOINT,
                 outcome.status(),
                 outcome.response_bytes().to_vec(),
-            )?
+            )
+            .map_err(|error| {
+                tracing::error!(?error, "submitTransition canonical response construction failed");
+                error
+            })?
         }
         _ => return Err(ChatFailure::invariant(ENDPOINT)),
     };
 
-    transaction
-        .commit()
-        .await
-        .map_err(|_| ChatFailure::storage(ENDPOINT))?;
+    transaction.commit().await.map_err(|error| {
+        tracing::error!(?error, "submitTransition outer transaction commit failed");
+        ChatFailure::storage(ENDPOINT)
+    })?;
     Ok(response)
 }
 

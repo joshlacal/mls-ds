@@ -1500,21 +1500,61 @@ pub(crate) async fn load_fallback_traffic_projection<T: PublicTransport>(
     }
     let scope_digest = traffic_scope_digest(&scope);
     let fingerprint = fixed_configuration_fingerprint()?;
-    let Some(snapshot) = lock_fallback_snapshot(
+    let cached_snapshot = lock_fallback_snapshot(
         transaction,
         ProjectionOperationScope::Traffic.as_persisted_str(),
         &scope_digest,
         &fingerprint,
     )
-    .await?
-    else {
-        return Ok(None);
+    .await?;
+    let cache_observed_at = observe_post_lock_time(transaction).await?;
+    let (snapshot, relationships) = match cached_snapshot {
+        Some(snapshot)
+            if snapshot.completed_at <= cache_observed_at
+                && cache_observed_at - snapshot.completed_at <= TimeDelta::seconds(60) =>
+        {
+            let (declarations, relationships) =
+                lock_projection_children(transaction, snapshot.projection_id).await?;
+            if !declarations.is_empty() {
+                return Err(RelationshipRepositoryError::InvalidProjection);
+            }
+            (snapshot, relationships)
+        }
+        _ => {
+            let live_allocation = allocate_projection_revision(transaction).await?;
+            let fallback_allocation = allocate_projection_revision(transaction).await?;
+            let live = authority
+                .collect_traffic_projection(
+                    live_allocation,
+                    scope.actor.clone(),
+                    scope.members.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    tracing::error!(?error, "collect_traffic_projection failed");
+                    RelationshipRepositoryError::InvalidProjection
+                })?;
+            let observation = observe_relationship_persistence();
+            let sealed = live
+                .export_persisted_fallback(fallback_allocation, authority, &observation)
+                .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+            persist_traffic_projection(transaction, sealed).await?;
+            let snapshot = lock_fallback_snapshot(
+                transaction,
+                ProjectionOperationScope::Traffic.as_persisted_str(),
+                &scope_digest,
+                &fingerprint,
+            )
+            .await?
+            .ok_or(RelationshipRepositoryError::InvalidProjection)?;
+            let (declarations, relationships) =
+                lock_projection_children(transaction, snapshot.projection_id).await?;
+            if !declarations.is_empty() {
+                return Err(RelationshipRepositoryError::InvalidProjection);
+            }
+            (snapshot, relationships)
+        }
     };
-    let (declarations, relationships) =
-        lock_projection_children(transaction, snapshot.projection_id).await?;
-    if !declarations.is_empty() {
-        return Err(RelationshipRepositoryError::InvalidProjection);
-    }
     let observed_at = observe_post_lock_time(transaction).await?;
     if observed_at < snapshot.completed_at {
         return Err(RelationshipRepositoryError::InvalidProjection);
