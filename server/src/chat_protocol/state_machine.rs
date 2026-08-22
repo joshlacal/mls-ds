@@ -1511,12 +1511,13 @@ impl HydrationAuthority {
         if entry.conversation_id().as_bytes() != &self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        if let Some(locked) = self.locked_binding() {
-            if entry.seq() != locked.expected_next_entry_seq
-                || canonical_server_timestamp(entry.received_at())? != locked.locked_at
-            {
-                return Err(StateMachineError::InvalidHydrationAuthority);
-            }
+        let locked = self
+            .locked_binding()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if entry.seq() != locked.expected_next_entry_seq
+            || canonical_server_timestamp(entry.received_at())? != locked.locked_at
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let (transition_id, body_binding) = match entry.mutation().projection() {
             VerifiedMutationProjection::Creation(value) => {
@@ -1630,10 +1631,8 @@ impl HydrationAuthority {
         if !transition_binding_is_route_bound(&body_binding, &self.expected_conversation_id) {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        if let Some(locked) = self.locked_binding() {
-            if transition_body_prior(&body_binding) != locked.expected_prior.as_ref() {
-                return Err(StateMachineError::InvalidHydrationAuthority);
-            }
+        if transition_body_prior(&body_binding) != locked.expected_prior.as_ref() {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         validate_special_server_fields(entry, &body_binding)?;
         let mut evidence = TransitionEvidence {
@@ -2677,12 +2676,13 @@ impl HydrationAuthority {
         if entry.conversation_id().as_bytes() != &self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        if let Some(locked) = self.locked_binding() {
-            if entry.seq() != locked.expected_next_entry_seq
-                || canonical_server_timestamp(entry.received_at())? != locked.locked_at
-            {
-                return Err(StateMachineError::InvalidHydrationAuthority);
-            }
+        let locked = self
+            .locked_binding()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if entry.seq() != locked.expected_next_entry_seq
+            || canonical_server_timestamp(entry.received_at())? != locked.locked_at
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let (kind, request_id, body_binding) = match entry.mutation().projection() {
             VerifiedMutationProjection::ResetRequest(value) => (
@@ -2708,15 +2708,13 @@ impl HydrationAuthority {
             ),
             _ => return Err(StateMachineError::InvalidHydrationAuthority),
         };
-        if let Some(locked) = self.locked_binding() {
-            if matches!(
-                &body_binding,
-                RequestBodyBinding::ResetRequest { prior }
-                    | RequestBodyBinding::LeaveRequest { prior }
-                    if Some(prior) != locked.expected_prior.as_ref()
-            ) {
-                return Err(StateMachineError::InvalidHydrationAuthority);
-            }
+        if matches!(
+            &body_binding,
+            RequestBodyBinding::ResetRequest { prior }
+                | RequestBodyBinding::LeaveRequest { prior }
+                if Some(prior) != locked.expected_prior.as_ref()
+        ) {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         request_evidence_from_verified(
             kind,
@@ -2833,10 +2831,11 @@ impl HydrationAuthority {
         if envelope.conversation_id != self.expected_conversation_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        if let Some(locked) = self.locked_binding() {
-            if envelope.received_at != locked.locked_at {
-                return Err(StateMachineError::InvalidHydrationAuthority);
-            }
+        let locked = self
+            .locked_binding()
+            .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+        if envelope.received_at != locked.locked_at {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let (kind, request_id, body, body_binding) = match mutation.projection() {
             VerifiedMutationProjection::LeafRecoveryRequest(value) => (
@@ -2895,19 +2894,17 @@ impl HydrationAuthority {
         {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
-        if let Some(locked) = self.locked_binding() {
-            if match &body_binding {
-                RequestBodyBinding::LeafRecoveryRequest { prior, .. } => {
-                    Some(prior) != locked.expected_prior.as_ref()
-                }
-                RequestBodyBinding::WelcomeResponse { coordinates, .. } => {
-                    Some(coordinates) != locked.expected_prior.as_ref()
-                }
-                RequestBodyBinding::LeafRecoveryCancellation => false,
-                _ => true,
-            } {
-                return Err(StateMachineError::InvalidHydrationAuthority);
+        if match &body_binding {
+            RequestBodyBinding::LeafRecoveryRequest { prior, .. } => {
+                Some(prior) != locked.expected_prior.as_ref()
             }
+            RequestBodyBinding::WelcomeResponse { coordinates, .. } => {
+                Some(coordinates) != locked.expected_prior.as_ref()
+            }
+            RequestBodyBinding::LeafRecoveryCancellation => false,
+            _ => true,
+        } {
+            return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let durable_row_digest =
             durable_signed_request_row_digest(kind, &envelope, &request_id, &mutation)?;

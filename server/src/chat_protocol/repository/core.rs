@@ -61,14 +61,14 @@ const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 /// opaque UUID identifies the durable allocation claim while the sequence
 /// value supplies global ordering. This pair is deliberately non-cloneable and
 /// must survive collection until it is consumed by the persistence seal.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct AllocatedProjectionRevisionGuard {
+#[derive(Debug)]
+pub(crate) struct AllocatedProjectionRevisionGuard {
     allocation_id: Uuid,
     projection_revision: u64,
 }
 
 impl AllocatedProjectionRevisionGuard {
-    pub fn from_database_allocation(
+    pub(super) fn from_database_allocation(
         allocation_id: Uuid,
         projection_revision: i64,
     ) -> Option<Self> {

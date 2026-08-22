@@ -1,40 +1,40 @@
 //! PostgreSQL boundaries for clean-chat protocol authority.
 
-pub mod acceptance;
-pub mod auth;
+pub(crate) mod acceptance;
+pub(crate) mod auth;
 #[allow(dead_code)]
-pub mod blobs;
-pub mod conversation;
-pub mod core;
-pub mod coordinate;
-pub mod creation;
-pub mod delivery;
+pub(crate) mod blobs;
+pub(crate) mod conversation;
+pub(crate) mod core;
+pub(crate) mod coordinate;
+pub(crate) mod creation;
+pub(crate) mod delivery;
 #[allow(dead_code)]
-pub mod device_directory;
-pub mod entry_read;
+pub(crate) mod device_directory;
+pub(crate) mod entry_read;
 #[allow(dead_code)]
-pub mod execution_context;
+pub(crate) mod execution_context;
 #[allow(dead_code)]
-pub mod expiry_sweep;
-pub mod inventory;
+pub(crate) mod expiry_sweep;
+pub(crate) mod inventory;
 #[allow(dead_code)]
-pub mod key_packages;
-pub mod leave;
-pub mod message_delivery;
-pub mod prelude;
+pub(crate) mod key_packages;
+pub(crate) mod leave;
+pub(crate) mod message_delivery;
+pub(crate) mod prelude;
 #[allow(dead_code)]
-pub mod recovery;
-pub mod relationship;
+pub(crate) mod recovery;
+pub(crate) mod relationship;
 #[allow(dead_code)]
-pub mod reset;
+pub(crate) mod reset;
 #[allow(dead_code)]
-pub mod revocation;
-pub mod submit_transition;
-pub mod subscription;
+pub(crate) mod revocation;
+pub(crate) mod submit_transition;
+pub(crate) mod subscription;
 #[allow(dead_code)]
-pub mod ticket;
-pub mod transition;
+pub(crate) mod ticket;
+pub(crate) mod transition;
 #[allow(dead_code)]
-pub mod welcome;
+pub(crate) mod welcome;
 #[allow(dead_code)]
-pub mod welcome_terminal;
+pub(crate) mod welcome_terminal;

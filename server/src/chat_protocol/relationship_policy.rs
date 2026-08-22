@@ -1539,7 +1539,7 @@ pub enum ProjectionScope {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone, Eq, PartialEq))]
+#[cfg_attr(test, derive(Clone))]
 pub struct RelationshipProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1560,7 +1560,7 @@ pub struct RelationshipProjection {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone, Eq, PartialEq))]
+#[cfg_attr(test, derive(Clone))]
 pub struct TrafficProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1609,26 +1609,14 @@ impl ProjectionPersistenceAuthority {
 #[cfg(test)]
 impl Clone for ProjectionPersistenceAuthority {
     fn clone(&self) -> Self {
-        Self(Mutex::new(
-            self.0.lock().expect("test authority lock").clone(),
-        ))
-    }
-}
-
-#[cfg(test)]
-impl PartialEq for ProjectionPersistenceAuthority {
-    fn eq(&self, other: &Self) -> bool {
-        if std::ptr::eq(self, other) {
-            return true;
+        let guard = self.0.lock().expect("test authority lock");
+        if guard.is_some() {
+            panic!("AllocatedProjectionRevisionGuard is linear and cannot be cloned");
         }
-        let left = self.0.lock().expect("test authority lock").clone();
-        let right = other.0.lock().expect("test authority lock").clone();
-        left == right
+        Self(Mutex::new(None))
     }
 }
 
-#[cfg(test)]
-impl Eq for ProjectionPersistenceAuthority {}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionPersistenceError {

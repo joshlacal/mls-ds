@@ -88,14 +88,14 @@ pub struct RelationshipAuthorityStartupGuard {
 }
 
 /// Exact durable operation/scope witness for a relationship snapshot load.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct RelationshipProjectionLoadGuard {
     operation_scope: ProjectionOperationScope,
     scope: ProjectionScope,
 }
 
 /// Exact durable traffic scope witness for a traffic snapshot load.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct TrafficProjectionLoadGuard {
     scope: TrafficGraphScope,
 }
@@ -274,7 +274,7 @@ pub enum TrustedRelationshipDecisionScope {
 
 /// Opaque post-lock clock authority for one exact transaction-bound business
 /// read-set.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct TrustedRelationshipDecisionInstant {
     transaction_id: String,
     scope: TrustedRelationshipDecisionScope,
@@ -284,7 +284,7 @@ pub struct TrustedRelationshipDecisionInstant {
 }
 
 /// Opaque wall-clock observation captured only after network collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct TrustedRelationshipPersistenceInstant(pub(crate) DateTime<Utc>);
 
 impl TrustedRelationshipPersistenceInstant {
@@ -401,9 +401,6 @@ impl TrustedRelationshipDecisionInstant {
             )
     }
 
-pub fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
-    TrustedRelationshipPersistenceInstant(Utc::now())
-}
     pub(crate) fn traffic_scope(&self) -> Option<&TrafficGraphScope> {
         if !self.binding_is_valid() {
             return None;
