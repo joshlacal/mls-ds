@@ -138,6 +138,7 @@ impl CreationCanonicalResponse {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CreationTransactionOutcome {
     status: i32,
     response_bytes: Box<[u8]>,
@@ -343,7 +344,6 @@ async fn execute_first_creation<T: PublicTransport>(
                     CreationHeadHydrationError::ConversationExists,
                 ));
             }
-
             let response = creation_existing_response(*existing_id, coordinate)?;
             let (scope, completion) = prelude.into_execution_parts();
             complete_operation(
@@ -629,44 +629,486 @@ fn bind(digest: &mut Sha256, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_protocol::dpop;
+    use crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority;
+    use crate::chat_protocol::repository::auth::creation_existing_device_receipt_for_test;
+    use crate::chat_protocol::repository::prelude::{
+        arbitrate_operation, OperationArbitration, PreparedSignedOperation,
+        PreparedSignedOperationState,
+    };
+    use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
+    use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+    use crate::chat_protocol::transcript::decode_canonical_signed_mutation;
+    use crate::chat_protocol::validation::ed25519_key_id;
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
 
-    #[test]
-    fn direct_dedup_member_branch_preserves_wire_contract_and_non_member_rejects() {
-        let source = include_str!("creation.rs");
-        assert!(
-            source.contains("SELECT EXISTS"),
-            "direct-dedup must verify caller membership via SELECT EXISTS under lock"
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string());
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    fn random_test_did(prefix: &str) -> String {
+        let bytes = Uuid::new_v4();
+        let raw = bytes.as_bytes();
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+        let prefix_bytes = prefix.as_bytes();
+        let mut suffix = String::with_capacity(24);
+        for i in 0..24 {
+            let b = if i < prefix_bytes.len() {
+                prefix_bytes[i]
+            } else {
+                raw[i % 16]
+            };
+            let ch = alphabet[((b as usize) + i) % 32] as char;
+            suffix.push(ch);
+        }
+        format!("did:plc:{suffix}")
+    }
+
+    struct TestActor {
+        did: String,
+        device_id: Uuid,
+        dpop_jkt: String,
+        signing_key: SigningKey,
+        public_key_bytes: Vec<u8>,
+        key_id: String,
+    }
+
+    fn new_test_actor(did_prefix: &str) -> TestActor {
+        let mut seed = [0u8; 32];
+        let id_bytes = Uuid::new_v4();
+        seed[..16].copy_from_slice(id_bytes.as_bytes());
+        seed[16..].copy_from_slice(id_bytes.as_bytes());
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
+        let key_id = ed25519_key_id(&public_key_bytes).unwrap().as_str().to_owned();
+        let did = random_test_did(did_prefix);
+        let device_id = Uuid::new_v4();
+        let dpop_jkt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        TestActor {
+            did,
+            device_id,
+            dpop_jkt,
+            signing_key,
+            public_key_bytes,
+            key_id,
+        }
+    }
+
+    fn build_signed_direct_creation_request(
+        actor: &TestActor,
+        first_did: &str,
+        second_did: &str,
+        trusted_at: DateTime<Utc>,
+    ) -> VerifiedChatDeviceRequest {
+        let (low_did, high_did) = if first_did < second_did {
+            (first_did, second_did)
+        } else {
+            (second_did, first_did)
+        };
+        let cid = Uuid::new_v4();
+        let transition_id = Uuid::new_v4();
+        let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let group_id = [0x42u8; 32];
+        let group_context_hash = [0x43u8; 32];
+        let confirmation_tag_32 = [0x44u8; 32];
+        let metadata_ciphertext = [0x99u8; 32];
+
+        let body = json!({
+            "$type": "blue.catbird.chat.defs#creationBody",
+            "signatureDomain": "CATBIRD-CHAT-CREATE\u{0000}",
+            "conversationId": cid.hyphenated().to_string(),
+            "transitionId": transition_id.hyphenated().to_string(),
+            "conversationKind": "direct",
+            "absence": true,
+            "actorDid": &actor.did,
+            "actorDeviceId": actor.device_id.hyphenated().to_string(),
+            "authGeneration": 1,
+            "idempotencyKey": transition_id.hyphenated().to_string(),
+            "keyId": &actor.key_id,
+            "signedAt": &signed_at,
+            "manifest": {
+                "actorLeaf": {
+                    "userDid": &actor.did,
+                    "deviceId": actor.device_id.hyphenated().to_string(),
+                    "leafOrigin": "genesis"
+                },
+                "participants": [
+                    {
+                        "userDid": low_did,
+                        "status": "active",
+                        "role": "admin"
+                    },
+                    {
+                        "userDid": high_did,
+                        "status": "active",
+                        "role": "admin"
+                    }
+                ]
+            },
+            "genesisGroupInfo": {
+                "framing": "mlsMessage",
+                "contentType": "groupInfo",
+                "bytes": base64::engine::general_purpose::STANDARD.encode(&[0x42u8; 32]),
+                "sha256": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&[0x42u8; 32]))
+            },
+            "next": {
+                "conversationId": cid.hyphenated().to_string(),
+                "generation": 0,
+                "stateVersion": 0,
+                "groupId": base64::engine::general_purpose::STANDARD.encode(group_id),
+                "epoch": 0,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(group_context_hash),
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(confirmation_tag_32),
+                "lifecycle": "active"
+            },
+            "metadataSnapshot": {
+                "coordinate": {
+                    "conversationId": base64::engine::general_purpose::STANDARD.encode(cid.as_bytes()),
+                    "generation": 0,
+                    "groupId": base64::engine::general_purpose::STANDARD.encode(group_id),
+                    "epoch": 0,
+                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode(group_context_hash),
+                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode(confirmation_tag_32),
+                },
+                "originTransitionId": transition_id.hyphenated().to_string(),
+                "metadataVersion": 1,
+                "nonce": base64::engine::general_purpose::STANDARD.encode([0x73_u8; 12]),
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode(metadata_ciphertext),
+                "ciphertextSha256": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(metadata_ciphertext)),
+                "ciphertextSize": metadata_ciphertext.len(),
+                "authorProof": {
+                    "authorDid": &actor.did,
+                    "authorDeviceId": actor.device_id.hyphenated().to_string(),
+                    "authorKeyId": &actor.key_id,
+                    "signaturePublicKey": base64::engine::general_purpose::STANDARD.encode(&actor.public_key_bytes),
+                    "authGenerationAtOrigin": 1,
+                    "originTransitionId": transition_id.hyphenated().to_string(),
+                    "originSeq": 1,
+                    "roleAtOrigin": "admin",
+                    "deviceStatusAtOrigin": "active",
+                },
+            }
+        });
+
+        let mut wrapper = json!({
+            "body": body,
+            "signature": base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
+        });
+        let unsigned = serde_json::to_vec(&wrapper).unwrap();
+        let canonical = decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
+        let signature = actor.signing_key.sign(canonical.transcript_bytes());
+        wrapper["signature"] = json!(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
+
+        let signed_raw = serde_json::to_vec(&wrapper).unwrap();
+        let canonical = decode_canonical_signed_mutation(&signed_raw).expect("canonicalize signed creation body");
+        let pre_replay = dpop::repository_test_evidence::ordinary_device_with_binding(
+            Uuid::new_v4(),
+            *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
+            "blue.catbird.chat.createConversation",
+            &trusted_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &actor.did,
+            actor.device_id,
+            &actor.dpop_jkt,
         );
-        assert!(
-            source.contains("WHERE conversation_id = $1"),
-            "membership query must be scoped to existing conversation_id"
+        let receipt = creation_existing_device_receipt_for_test(
+            &crate::chat_protocol::transcript::decode_and_verify_signed_mutation(&signed_raw, &actor.public_key_bytes).unwrap(),
+            &actor.dpop_jkt,
+            &actor.public_key_bytes,
+        ).unwrap();
+        dpop::mint_signed_repository_authority(pre_replay, canonical, &actor.public_key_bytes, receipt).unwrap()
+    }
+
+    async fn seed_test_direct_environment(
+        tx: &mut Transaction<'_, Postgres>,
+        alice: &TestActor,
+        bob_did: &str,
+        charlie: &TestActor,
+        existing_convo_id: Uuid,
+        now: DateTime<Utc>,
+    ) {
+        let (low_did, high_did) = if alice.did.as_str() < bob_did {
+            (alice.did.as_str(), bob_did)
+        } else {
+            (bob_did, alice.did.as_str())
+        };
+
+        // Seed principals
+        for did in [&alice.did, &bob_did.to_string(), &charlie.did] {
+            sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+                .bind(did)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .unwrap();
+        }
+
+        // Seed devices and device_keys for Alice and Charlie
+        for actor in [alice, charlie] {
+            sqlx::query(
+                "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at) \
+                 VALUES ($1, $2, 'Test Device', 'active', $3, 1, chat.protocol_capabilities(), $4, $4) ON CONFLICT DO NOTHING"
+            )
+            .bind(&actor.did)
+            .bind(actor.device_id)
+            .bind(&actor.dpop_jkt)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+
+            sqlx::query(
+                "INSERT INTO chat.device_keys (user_did, device_id, key_id, signing_public_key, enrollment_auth_generation, created_at) \
+                 VALUES ($1, $2, $3, $4, 1, $5) ON CONFLICT DO NOTHING"
+            )
+            .bind(&actor.did)
+            .bind(actor.device_id)
+            .bind(&actor.key_id)
+            .bind(&actor.public_key_bytes)
+            .bind(now)
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        }
+        // Seed active direct conversation between Alice and Bob
+        sqlx::query(
+            "INSERT INTO chat.conversations (conversation_id, kind, lifecycle, direct_did_low, direct_did_high, current_generation, current_state_version, next_entry_seq, created_at) \
+             VALUES ($1, 'direct', 'active', $2, $3, 1, 1, 2, $4)"
+        )
+        .bind(existing_convo_id)
+        .bind(low_did)
+        .bind(high_did)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+
+        let genesis_bytes = vec![0x11u8; 32];
+        let genesis_sha = Sha256::digest(&genesis_bytes).to_vec();
+        sqlx::query(
+            "INSERT INTO chat.generations (conversation_id, generation, group_id, lifecycle, genesis_group_info_bytes, genesis_group_info_sha256, current_state_version, activated_seq, activated_at) \
+             VALUES ($1, 1, $2, 'active', $3, $4, 1, 1, $5)"
+        )
+        .bind(existing_convo_id)
+        .bind(&[0x42u8; 32])
+        .bind(&genesis_bytes)
+        .bind(&genesis_sha)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+
+        let snapshot_bytes = vec![0x55u8; 32];
+        let snapshot_sha = Sha256::digest(&snapshot_bytes).to_vec();
+        let tree_bytes = vec![0x66u8; 32];
+        let tree_sha = Sha256::digest(&tree_bytes).to_vec();
+        sqlx::query(
+            "INSERT INTO chat.generation_states (conversation_id, generation, state_version, group_id, epoch, group_context_hash, confirmation_tag, lifecycle, state_kind, producing_transition_id, public_snapshot_bytes, snapshot_sha256, tree_summary_bytes, tree_summary_sha256, leaf_count, created_at) \
+             VALUES ($1, 1, 1, $2, 1, $3, $4, 'active', 'creation', $5, $6, $7, $8, $9, 2, $10)"
+        )
+        .bind(existing_convo_id)
+        .bind(&[0x42u8; 32])
+        .bind(&[0x43u8; 32])
+        .bind(&[0x44u8; 32])
+        .bind(Uuid::new_v4())
+        .bind(&snapshot_bytes)
+        .bind(&snapshot_sha)
+        .bind(&tree_bytes)
+        .bind(&tree_sha)
+        .bind(now)
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+        for did in [&alice.did, &bob_did.to_string()] {
+            sqlx::query(
+                "INSERT INTO chat.participants (participant_period_id, conversation_id, user_did, status, role, role_transition_id, role_changed_at, created_by_did, created_by_device_id, current_membership, created_at) \
+                 VALUES ($1, $2, $3, 'active', 'admin', $4, $5, $6, $7, true, $5)"
+            )
+            .bind(Uuid::new_v4())
+            .bind(existing_convo_id)
+            .bind(did)
+            .bind(Uuid::new_v4())
+            .bind(now)
+            .bind(&alice.did)
+            .bind(alice.device_id)
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        }
+    }
+
+
+    #[tokio::test]
+    async fn direct_dedup_member_caller_returns_existing_conversation_and_preserves_wire_contract() {
+        let pool = match test_pool().await {
+            Some(pool) => pool,
+            None => {
+                eprintln!("Skipping database-backed test: PostgreSQL is not reachable");
+                return;
+            }
+        };
+        let mut tx = pool.begin().await.expect("begin transaction");
+        let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        let alice = new_test_actor("alice");
+        let bob_did = random_test_did("bob");
+        let charlie = new_test_actor("charlie");
+        let existing_convo_id = Uuid::new_v4();
+
+        seed_test_direct_environment(&mut tx, &alice, &bob_did, &charlie, existing_convo_id, trusted_at).await;
+
+        let request = build_signed_direct_creation_request(&alice, &alice.did, &bob_did, trusted_at);
+        let reservation = match arbitrate_operation(&mut tx, &request).await.expect("arbitrate operation") {
+            OperationArbitration::First(res) => res,
+            OperationArbitration::Replay(_) => panic!("unexpected replay"),
+        };
+
+        let guard = load_fixed_relationship_authority_startup_guard().unwrap();
+        let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
+
+        let prepared = PreparedSignedOperation {
+            state: PreparedSignedOperationState::First {
+                authority: request,
+                reservation,
+            },
+        };
+        let outcome = execute_prepared_creation(&mut tx, prepared, &rel_auth)
+            .await
+            .expect("member creation on existing direct conversation must succeed");
+        let parsed: serde_json::Value = serde_json::from_slice(outcome.response_bytes()).expect("parse canonical json response");
+        assert_eq!(
+            parsed["result"]["$type"],
+            "blue.catbird.chat.defs#existingDirectConversationResult"
         );
-        assert!(
-            source.contains("AND user_did = $2"),
-            "membership query must check the requesting principal's user_did"
+        assert_eq!(
+            parsed["result"]["conversationId"],
+            existing_convo_id.to_string()
         );
+        assert_eq!(parsed["result"]["conversationKind"], "direct");
+        assert_eq!(parsed["result"]["coordinates"]["epoch"], 1);
+
+        // Ensure conversation and participant state is unmodified
+        let convo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(convo_count, 1);
+
+        let participant_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1 AND current_membership AND status = 'active'")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(participant_count, 2);
+
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_dedup_non_member_caller_rejects_with_conversation_already_exists_and_no_mutation() {
+        let pool = match test_pool().await {
+            Some(pool) => pool,
+            None => {
+                eprintln!("Skipping database-backed test: PostgreSQL is not reachable");
+                return;
+            }
+        };
+        let mut tx = pool.begin().await.expect("begin transaction");
+        let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let alice = new_test_actor("alice");
+        let bob_did = random_test_did("bob");
+        let charlie = new_test_actor("charlie");
+        let existing_convo_id = Uuid::new_v4();
+
+        seed_test_direct_environment(&mut tx, &alice, &bob_did, &charlie, existing_convo_id, trusted_at).await;
+
+        // State before rejection
+        let convos_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let participants_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let idempotency_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.idempotency_records")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+        // Charlie (non-member) tries to create direct conversation for pair (alice, bob)
+        let request = build_signed_direct_creation_request(&charlie, &alice.did, &bob_did, trusted_at);
+        let reservation = match arbitrate_operation(&mut tx, &request).await.expect("arbitrate operation") {
+            OperationArbitration::First(res) => res,
+            OperationArbitration::Replay(_) => panic!("unexpected replay"),
+        };
+
+        let guard = load_fixed_relationship_authority_startup_guard().unwrap();
+        let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
+
+        let prepared = PreparedSignedOperation {
+            state: PreparedSignedOperationState::First {
+                authority: request,
+                reservation,
+            },
+        };
+        let err = execute_prepared_creation(&mut tx, prepared, &rel_auth)
+            .await
+            .expect_err("non-member creation on existing direct conversation must be rejected");
+
         assert!(
-            source.contains("AND current_membership"),
-            "membership query must check current_membership"
+            matches!(
+                err,
+                CreationFacadeError::CreationHead(CreationHeadHydrationError::ConversationExists)
+            ),
+            "non-member must be rejected with CreationHeadHydrationError::ConversationExists, got: {err:?}"
         );
-        assert!(
-            source.contains("AND status = 'active'"),
-            "membership query must require status = 'active'"
-        );
-        assert!(
-            source.contains("CreationHeadHydrationError::ConversationExists"),
-            "non-member caller must receive ConversationAlreadyExists error"
-        );
-        assert!(
-            source.contains("creation_existing_response(*existing_id, coordinate)"),
-            "member caller must receive existing direct conversation response"
-        );
+
+        // Assert state after rejection is completely unchanged
+        let convos_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(convos_after, convos_before, "conversation count must not change");
+
+        let participants_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1")
+            .bind(existing_convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(participants_after, participants_before, "participant count must not change");
+
+        let idempotency_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.idempotency_records")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(idempotency_after, idempotency_before, "no idempotency record must be committed on rejection");
+
+        tx.rollback().await.unwrap();
     }
 
     #[test]
     fn creation_existing_response_encodes_direct_result_without_state_mutation() {
-        use crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate;
-
         let convo_id = Uuid::parse_str("f55a5ece-b653-43f3-950a-ab72b4a5c075").unwrap();
         let coord = PublicGroupSnapshotCoordinate::new(
             *convo_id.as_bytes(),
@@ -676,7 +1118,7 @@ mod tests {
             1,
             [0x43; 32],
             [0x44; 32],
-            crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active,
+            PublicGroupSnapshotLifecycle::Active,
         );
         let response = creation_existing_response(convo_id, &coord).expect("encode existing response");
         assert!(response.validates(), "canonical response digest must validate");

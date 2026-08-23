@@ -512,7 +512,7 @@ struct OperationClaimGuard {
 /// The replay arm remains byte-opaque; only repository endpoint facades can
 /// lock it and later release exact completion material.
 pub(crate) struct PreparedSignedOperation {
-    state: PreparedSignedOperationState,
+    pub(in crate::chat_protocol::repository) state: PreparedSignedOperationState,
 }
 
 pub(in crate::chat_protocol::repository) enum PreparedSignedOperationState {
