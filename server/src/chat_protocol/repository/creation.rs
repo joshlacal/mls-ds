@@ -321,6 +321,29 @@ async fn execute_first_creation<T: PublicTransport>(
             ..
         } = lookup.outcome()
         {
+            let is_member: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                      FROM chat.participants
+                     WHERE conversation_id = $1
+                       AND user_did = $2
+                       AND current_membership
+                       AND status = 'active'
+                )
+                "#,
+            )
+            .bind(existing_id)
+            .bind(authority.subject().as_str())
+            .fetch_one(&mut **transaction)
+            .await?;
+
+            if !is_member {
+                return Err(CreationFacadeError::CreationHead(
+                    CreationHeadHydrationError::ConversationExists,
+                ));
+            }
+
             let response = creation_existing_response(*existing_id, coordinate)?;
             let (scope, completion) = prelude.into_execution_parts();
             complete_operation(
@@ -601,4 +624,74 @@ fn reverify_scope_mutation(
 fn bind(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_be_bytes());
     digest.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_dedup_member_branch_preserves_wire_contract_and_non_member_rejects() {
+        let source = include_str!("creation.rs");
+        assert!(
+            source.contains("SELECT EXISTS"),
+            "direct-dedup must verify caller membership via SELECT EXISTS under lock"
+        );
+        assert!(
+            source.contains("WHERE conversation_id = $1"),
+            "membership query must be scoped to existing conversation_id"
+        );
+        assert!(
+            source.contains("AND user_did = $2"),
+            "membership query must check the requesting principal's user_did"
+        );
+        assert!(
+            source.contains("AND current_membership"),
+            "membership query must check current_membership"
+        );
+        assert!(
+            source.contains("AND status = 'active'"),
+            "membership query must require status = 'active'"
+        );
+        assert!(
+            source.contains("CreationHeadHydrationError::ConversationExists"),
+            "non-member caller must receive ConversationAlreadyExists error"
+        );
+        assert!(
+            source.contains("creation_existing_response(*existing_id, coordinate)"),
+            "member caller must receive existing direct conversation response"
+        );
+    }
+
+    #[test]
+    fn creation_existing_response_encodes_direct_result_without_state_mutation() {
+        use crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate;
+
+        let convo_id = Uuid::parse_str("f55a5ece-b653-43f3-950a-ab72b4a5c075").unwrap();
+        let coord = PublicGroupSnapshotCoordinate::new(
+            *convo_id.as_bytes(),
+            1,
+            1,
+            [0x42; 32],
+            1,
+            [0x43; 32],
+            [0x44; 32],
+            crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active,
+        );
+        let response = creation_existing_response(convo_id, &coord).expect("encode existing response");
+        assert!(response.validates(), "canonical response digest must validate");
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(response.as_bytes()).expect("parse canonical json");
+        assert_eq!(
+            parsed["result"]["$type"],
+            "blue.catbird.chat.defs#existingDirectConversationResult"
+        );
+        assert_eq!(
+            parsed["result"]["conversationId"],
+            "f55a5ece-b653-43f3-950a-ab72b4a5c075"
+        );
+        assert_eq!(parsed["result"]["conversationKind"], "direct");
+        assert_eq!(parsed["result"]["coordinates"]["epoch"], 1);
+    }
 }
