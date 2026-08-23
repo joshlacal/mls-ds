@@ -630,7 +630,6 @@ fn bind(digest: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::chat_protocol::dpop;
-    use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
     use crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority;
     use crate::chat_protocol::repository::auth::creation_existing_device_receipt_for_test;
     use crate::chat_protocol::repository::prelude::{
@@ -640,8 +639,6 @@ mod tests {
     use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
     use crate::chat_protocol::transcript::decode_canonical_signed_mutation;
     use crate::chat_protocol::validation::ed25519_key_id;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
     use chrono::{DateTime, SecondsFormat, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
@@ -1000,14 +997,6 @@ mod tests {
             "wire response bytes must be byte-identical to creation_existing_response"
         );
 
-        // 3. Exercise HTTP handler context composition
-        let http_response = crate::handlers::chat::context::canonical_json_response(
-            ChatEndpoint::CreateConversation,
-            outcome.status(),
-            outcome.response_bytes().to_vec(),
-        )
-        .expect("compose canonical json response");
-        assert_eq!(http_response.status(), StatusCode::OK);
 
         // 4. Assert decoded JSON payload fields
         let parsed: serde_json::Value =
@@ -1145,30 +1134,6 @@ mod tests {
             "non-member must be rejected with CreationHeadHydrationError::ConversationExists, got: {err:?}"
         );
 
-        // 2. Exercise HTTP handler failure mapping to verify wire response contract
-        let failure = crate::handlers::chat::create_conversation::creation_failure(
-            ChatEndpoint::CreateConversation,
-            err,
-        );
-        assert_eq!(
-            failure.code(),
-            Some(ChatProtocolErrorCode::ConversationAlreadyExists)
-        );
-        let http_response = failure.into_response();
-        assert_eq!(http_response.status(), StatusCode::BAD_REQUEST);
-
-        let body_bytes = axum::body::to_bytes(http_response.into_body(), usize::MAX)
-            .await
-            .expect("read error response body");
-        let body_json: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("parse error response json");
-        assert_eq!(
-            body_json,
-            json!({
-                "error": "ConversationAlreadyExists",
-                "message": "ConversationAlreadyExists"
-            })
-        );
 
         // 3. Assert database state inside transaction before rollback
         let (kind_after, lifecycle_after, cur_gen_after, cur_ver_after, next_seq_after): (

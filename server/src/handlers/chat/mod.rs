@@ -23,9 +23,9 @@ use crate::storage::DbPool;
 
 mod accept_conversation;
 mod blob_routes;
-pub(crate) mod context;
+mod context;
 mod conversation_state;
-pub(crate) mod create_conversation;
+mod create_conversation;
 mod device_views;
 mod enroll_device;
 mod errors;

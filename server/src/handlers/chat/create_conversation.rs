@@ -68,7 +68,7 @@ async fn handle_inner(
     Ok(response)
 }
 
-pub(crate) fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatFailure {
+fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatFailure {
     use ChatProtocolErrorCode as C;
     use CreationFacadeError as E;
     use StateMachineError as S;
@@ -132,5 +132,41 @@ pub(crate) fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeErro
         | E::InvalidCanonicalMaterial
         | E::ExecutionContext(_)
         | E::Executor(_) => ChatFailure::invariant(endpoint),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_protocol::error::ChatProtocolErrorCode;
+    use crate::chat_protocol::repository::core::CreationHeadHydrationError;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn creation_failure_maps_conversation_exists_to_conversation_already_exists_wire_response() {
+        let endpoint = ChatEndpoint::CreateConversation;
+        let err = CreationFacadeError::CreationHead(CreationHeadHydrationError::ConversationExists);
+        let failure = creation_failure(endpoint, err);
+
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::ConversationAlreadyExists)
+        );
+        let http_response = failure.into_response();
+        assert_eq!(http_response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(http_response.into_body(), usize::MAX)
+            .await
+            .expect("read error response body");
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("parse error response json");
+        assert_eq!(
+            body_json,
+            json!({
+                "error": "ConversationAlreadyExists",
+                "message": "ConversationAlreadyExists"
+            })
+        );
     }
 }
