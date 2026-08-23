@@ -68,7 +68,7 @@ async fn handle_inner(
     Ok(response)
 }
 
-fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatFailure {
+pub(crate) fn creation_failure(endpoint: ChatEndpoint, error: CreationFacadeError) -> ChatFailure {
     use ChatProtocolErrorCode as C;
     use CreationFacadeError as E;
     use StateMachineError as S;

@@ -512,7 +512,7 @@ struct OperationClaimGuard {
 /// The replay arm remains byte-opaque; only repository endpoint facades can
 /// lock it and later release exact completion material.
 pub(crate) struct PreparedSignedOperation {
-    pub(in crate::chat_protocol::repository) state: PreparedSignedOperationState,
+    state: PreparedSignedOperationState,
 }
 
 pub(in crate::chat_protocol::repository) enum PreparedSignedOperationState {
@@ -556,6 +556,19 @@ impl PreparedSignedOperation {
 
     pub(in crate::chat_protocol::repository) fn into_state(self) -> PreparedSignedOperationState {
         self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_for_test(
+        authority: VerifiedChatDeviceRequest,
+        reservation: OperationReservationGuard,
+    ) -> Self {
+        Self {
+            state: PreparedSignedOperationState::First {
+                authority,
+                reservation,
+            },
+        }
     }
 }
 

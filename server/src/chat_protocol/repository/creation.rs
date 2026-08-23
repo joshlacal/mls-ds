@@ -630,32 +630,32 @@ fn bind(digest: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use super::*;
     use crate::chat_protocol::dpop;
+    use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
     use crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority;
     use crate::chat_protocol::repository::auth::creation_existing_device_receipt_for_test;
     use crate::chat_protocol::repository::prelude::{
         arbitrate_operation, OperationArbitration, PreparedSignedOperation,
-        PreparedSignedOperationState,
     };
     use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
     use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
     use crate::chat_protocol::transcript::decode_canonical_signed_mutation;
     use crate::chat_protocol::validation::ed25519_key_id;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use chrono::{DateTime, SecondsFormat, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
-
-    async fn test_pool() -> Option<PgPool> {
+    async fn test_pool() -> PgPool {
         let url = std::env::var("TEST_DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string());
         PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
             .await
-            .ok()
+            .expect("PostgreSQL test database connection is required for behavioral creation tests")
     }
-
     fn random_test_did(prefix: &str) -> String {
         let bytes = Uuid::new_v4();
         let raw = bytes.as_bytes();
@@ -950,13 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_dedup_member_caller_returns_existing_conversation_and_preserves_wire_contract() {
-        let pool = match test_pool().await {
-            Some(pool) => pool,
-            None => {
-                eprintln!("Skipping database-backed test: PostgreSQL is not reachable");
-                return;
-            }
-        };
+        let pool = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
         let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
             .fetch_one(&mut *tx)
@@ -979,16 +973,45 @@ mod tests {
         let guard = load_fixed_relationship_authority_startup_guard().unwrap();
         let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
 
-        let prepared = PreparedSignedOperation {
-            state: PreparedSignedOperationState::First {
-                authority: request,
-                reservation,
-            },
-        };
+        let prepared = PreparedSignedOperation::first_for_test(request, reservation);
         let outcome = execute_prepared_creation(&mut tx, prepared, &rel_auth)
             .await
             .expect("member creation on existing direct conversation must succeed");
-        let parsed: serde_json::Value = serde_json::from_slice(outcome.response_bytes()).expect("parse canonical json response");
+
+        // 1. Assert status is HTTP 200
+        assert_eq!(outcome.status(), 200);
+
+        // 2. Assert exact wire response bytes match canonical creation_existing_response
+        let expected_coord = PublicGroupSnapshotCoordinate::new(
+            *existing_convo_id.as_bytes(),
+            1,
+            1,
+            [0x42; 32],
+            1,
+            [0x43; 32],
+            [0x44; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let expected_response = creation_existing_response(existing_convo_id, &expected_coord)
+            .expect("encode expected existing response");
+        assert_eq!(
+            outcome.response_bytes(),
+            expected_response.as_bytes(),
+            "wire response bytes must be byte-identical to creation_existing_response"
+        );
+
+        // 3. Exercise HTTP handler context composition
+        let http_response = crate::handlers::chat::context::canonical_json_response(
+            ChatEndpoint::CreateConversation,
+            outcome.status(),
+            outcome.response_bytes().to_vec(),
+        )
+        .expect("compose canonical json response");
+        assert_eq!(http_response.status(), StatusCode::OK);
+
+        // 4. Assert decoded JSON payload fields
+        let parsed: serde_json::Value =
+            serde_json::from_slice(outcome.response_bytes()).expect("parse canonical json response");
         assert_eq!(
             parsed["result"]["$type"],
             "blue.catbird.chat.defs#existingDirectConversationResult"
@@ -1000,33 +1023,65 @@ mod tests {
         assert_eq!(parsed["result"]["conversationKind"], "direct");
         assert_eq!(parsed["result"]["coordinates"]["epoch"], 1);
 
-        // Ensure conversation and participant state is unmodified
-        let convo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
-            .bind(existing_convo_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        assert_eq!(convo_count, 1);
+        // 5. Ensure exact conversation and participant row values are preserved
+        let (kind, lifecycle, did_low, did_high, cur_gen, cur_state_ver, next_seq): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT kind, lifecycle, direct_did_low, direct_did_high, current_generation, current_state_version, next_entry_seq \
+             FROM chat.conversations WHERE conversation_id = $1",
+        )
+        .bind(existing_convo_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(kind, "direct");
+        assert_eq!(lifecycle, "active");
+        assert_eq!(cur_gen, 1);
+        assert_eq!(cur_state_ver, 1);
+        assert_eq!(next_seq, 2);
 
-        let participant_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1 AND current_membership AND status = 'active'")
-            .bind(existing_convo_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        assert_eq!(participant_count, 2);
+        let participants: Vec<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT user_did, status, role, current_membership \
+             FROM chat.participants WHERE conversation_id = $1 ORDER BY user_did",
+        )
+        .bind(existing_convo_id)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(participants.len(), 2);
+        for (_did, status, role, current_membership) in &participants {
+            assert_eq!(status, "active");
+            assert_eq!(role, "admin");
+            assert!(current_membership);
+        }
+
+        let idempotency_records: Vec<(i32, Vec<u8>)> = sqlx::query_as(
+            "SELECT completed_status, response_bytes \
+             FROM chat.idempotency_records WHERE principal_did = $1",
+        )
+        .bind(&alice.did)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(idempotency_records.len(), 1);
+        assert_eq!(idempotency_records[0].0, 200);
+        assert_eq!(
+            idempotency_records[0].1.as_slice(),
+            expected_response.as_bytes()
+        );
 
         tx.rollback().await.unwrap();
     }
 
     #[tokio::test]
     async fn direct_dedup_non_member_caller_rejects_with_conversation_already_exists_and_no_mutation() {
-        let pool = match test_pool().await {
-            Some(pool) => pool,
-            None => {
-                eprintln!("Skipping database-backed test: PostgreSQL is not reachable");
-                return;
-            }
-        };
+        let pool = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
         let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
             .fetch_one(&mut *tx)
@@ -1039,24 +1094,35 @@ mod tests {
 
         seed_test_direct_environment(&mut tx, &alice, &bob_did, &charlie, existing_convo_id, trusted_at).await;
 
-        // State before rejection
-        let convos_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
-            .bind(existing_convo_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        let participants_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1")
-            .bind(existing_convo_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        let idempotency_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.idempotency_records")
+        // Baseline conversation and participant state
+        let (kind_before, lifecycle_before, cur_gen_before, cur_ver_before, next_seq_before): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT kind, lifecycle, current_generation, current_state_version, next_entry_seq \
+             FROM chat.conversations WHERE conversation_id = $1",
+        )
+        .bind(existing_convo_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        let total_convos_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations")
             .fetch_one(&mut *tx)
             .await
             .unwrap();
 
         // Charlie (non-member) tries to create direct conversation for pair (alice, bob)
         let request = build_signed_direct_creation_request(&charlie, &alice.did, &bob_did, trusted_at);
+        let operation_id = match request.mutation().expect("creation mutation").projection() {
+            crate::chat_protocol::transcript::VerifiedMutationProjection::Creation(c) => {
+                Uuid::from_bytes(*c.transition_id().as_bytes())
+            }
+            _ => panic!("expected creation projection"),
+        };
+
         let reservation = match arbitrate_operation(&mut tx, &request).await.expect("arbitrate operation") {
             OperationArbitration::First(res) => res,
             OperationArbitration::Replay(_) => panic!("unexpected replay"),
@@ -1065,16 +1131,12 @@ mod tests {
         let guard = load_fixed_relationship_authority_startup_guard().unwrap();
         let rel_auth = ProductionRelationshipAuthority::from_startup_guard(guard);
 
-        let prepared = PreparedSignedOperation {
-            state: PreparedSignedOperationState::First {
-                authority: request,
-                reservation,
-            },
-        };
+        let prepared = PreparedSignedOperation::first_for_test(request, reservation);
         let err = execute_prepared_creation(&mut tx, prepared, &rel_auth)
             .await
             .expect_err("non-member creation on existing direct conversation must be rejected");
 
+        // 1. Assert repository-level error
         assert!(
             matches!(
                 err,
@@ -1083,28 +1145,108 @@ mod tests {
             "non-member must be rejected with CreationHeadHydrationError::ConversationExists, got: {err:?}"
         );
 
-        // Assert state after rejection is completely unchanged
-        let convos_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations WHERE conversation_id = $1")
-            .bind(existing_convo_id)
+        // 2. Exercise HTTP handler failure mapping to verify wire response contract
+        let failure = crate::handlers::chat::create_conversation::creation_failure(
+            ChatEndpoint::CreateConversation,
+            err,
+        );
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::ConversationAlreadyExists)
+        );
+        let http_response = failure.into_response();
+        assert_eq!(http_response.status(), StatusCode::BAD_REQUEST);
+
+        let body_bytes = axum::body::to_bytes(http_response.into_body(), usize::MAX)
+            .await
+            .expect("read error response body");
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("parse error response json");
+        assert_eq!(
+            body_json,
+            json!({
+                "error": "ConversationAlreadyExists",
+                "message": "ConversationAlreadyExists"
+            })
+        );
+
+        // 3. Assert database state inside transaction before rollback
+        let (kind_after, lifecycle_after, cur_gen_after, cur_ver_after, next_seq_after): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT kind, lifecycle, current_generation, current_state_version, next_entry_seq \
+             FROM chat.conversations WHERE conversation_id = $1",
+        )
+        .bind(existing_convo_id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(kind_after, kind_before);
+        assert_eq!(lifecycle_after, lifecycle_before);
+        assert_eq!(cur_gen_after, cur_gen_before);
+        assert_eq!(cur_ver_after, cur_ver_before);
+        assert_eq!(next_seq_after, next_seq_before);
+
+        let total_convos_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations")
             .fetch_one(&mut *tx)
             .await
             .unwrap();
-        assert_eq!(convos_after, convos_before, "conversation count must not change");
+        assert_eq!(total_convos_after, total_convos_before, "no new conversation row created");
 
-        let participants_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.participants WHERE conversation_id = $1")
-            .bind(existing_convo_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        assert_eq!(participants_after, participants_before, "participant count must not change");
+        let participants: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT user_did, status, current_membership \
+             FROM chat.participants WHERE conversation_id = $1 ORDER BY user_did",
+        )
+        .bind(existing_convo_id)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(participants.len(), 2, "no new participant row created");
+        for (did, status, current_membership) in &participants {
+            assert!(did == &alice.did || did == &bob_did);
+            assert_eq!(status, "active");
+            assert!(current_membership);
+        }
 
-        let idempotency_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.idempotency_records")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        assert_eq!(idempotency_after, idempotency_before, "no idempotency record must be committed on rejection");
+        let idempotency_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat.idempotency_records WHERE principal_did = $1",
+        )
+        .bind(&charlie.did)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(idempotency_count, 0, "no idempotency record in transaction");
 
+        // 4. Roll back transaction and verify no state persists in the database
         tx.rollback().await.unwrap();
+
+        let operation_claims_in_db: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat.operation_claims WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            operation_claims_in_db, 0,
+            "operation claim must be rolled back on rejection"
+        );
+
+        let charlie_idempotency_in_db: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chat.idempotency_records WHERE principal_did = $1",
+        )
+        .bind(&charlie.did)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            charlie_idempotency_in_db, 0,
+            "no idempotency record persisted in database"
+        );
     }
 
     #[test]
