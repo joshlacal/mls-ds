@@ -3033,8 +3033,9 @@ async fn materialize_own_device_snapshot(
 // READ COMMITTED attempts, uses a fresh B-read guard per attempt, and serves
 // the first page of the requested domain from a retained session.
 //
-// Session identity is DETERMINISTIC per verified device: the v4-masked SHA-256
-// over (user_did, device_id, jkt, auth_generation) is the retained row key, so
+// Session identity is DETERMINISTIC per verified device and materialization
+// wire version: the v4-masked SHA-256 over the encoding version plus
+// (user_did, device_id, jkt, auth_generation) is the retained row key, so
 // a repeated call — a lost-response retry, a no-cursor Welcome/recovery read,
 // or a concurrent second initial creator — deterministically selects the SAME
 // session and its initial receipts. The session CAPABILITY is a single random
@@ -3244,21 +3245,53 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024 + 64 * 1024;
 /// while the page accumulation respects the 16 MiB + 64 KiB response ceiling.
 const PAGE_ENVELOPE_HEADROOM: usize = 1024;
 
+/// Version of the retained inventory item wire encoding. This is deliberately
+/// separate from the database `cursor_format_version` (which remains 1 for
+/// existing receipt/session bindings): changing this value rotates the
+/// deterministic session UUID so a new instance cannot reuse pre-version-2
+/// bare-string item payloads.
+///
+/// Retained item payloads are immutable because page receipts and materialization
+/// digests bind their exact bytes. This change is NOT rolling-compatible: the
+/// v2 server has no compatibility lookup that can safely bridge every old
+/// Welcome/recovery and subscription-ticket follow-up. Stop all pre-v2
+/// instances before enabling v2, wait the full 15-minute maximum session TTL,
+/// then resume protocol availability with v2. Never rewrite retained payload
+/// bytes or serve v1 and v2 inventory instances concurrently.
+const INVENTORY_MATERIALIZATION_ENCODING_VERSION: u8 = 2;
+
 /// The only production source of the retained session identity: the v4-masked
-/// SHA-256 over the verified (DID, device, JKT, auth generation) coordinates.
-/// The schema's `chat.is_uuid_v4` check validates only the variant/version
-/// nibbles, so the deterministic identity is masked to the v4 shape. The value
-/// is a row handle, never a bearer: every page call still requires the DPoP
-/// admission for the exact device, and the bearer is the random sealed
-/// capability.
+/// SHA-256 over the materialization encoding version and verified (DID, device,
+/// JKT, auth generation) coordinates. The schema's `chat.is_uuid_v4` check
+/// validates only the variant/version nibbles, so the deterministic identity is
+/// masked to the v4 shape. The value is a row handle, never a bearer: every
+/// page call still requires the DPoP admission for the exact device, and the
+/// bearer is the random sealed capability.
 pub(crate) fn derive_inventory_session_uuid(
     user_did: &str,
     device_id: Uuid,
     jkt: Option<&str>,
     auth_generation: u64,
 ) -> Uuid {
+    derive_inventory_session_uuid_for_version(
+        user_did,
+        device_id,
+        jkt,
+        auth_generation,
+        INVENTORY_MATERIALIZATION_ENCODING_VERSION,
+    )
+}
+
+fn derive_inventory_session_uuid_for_version(
+    user_did: &str,
+    device_id: Uuid,
+    jkt: Option<&str>,
+    auth_generation: u64,
+    encoding_version: u8,
+) -> Uuid {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+    digest.update([encoding_version]);
     digest.update((user_did.len() as u64).to_be_bytes());
     digest.update(user_did.as_bytes());
     digest.update(device_id.as_bytes());
@@ -3272,6 +3305,50 @@ pub(crate) fn derive_inventory_session_uuid(
     uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40;
     uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
     Uuid::from_bytes(uuid_bytes)
+}
+
+#[cfg(test)]
+mod materialization_version_tests {
+    use super::*;
+
+    /// Exact pre-v2 identity transcript: it intentionally omits the encoding
+    /// version byte that v2 adds after the domain separator.
+    fn derive_legacy_inventory_session_uuid(
+        user_did: &str,
+        device_id: Uuid,
+        jkt: Option<&str>,
+        auth_generation: u64,
+    ) -> Uuid {
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+        digest.update((user_did.len() as u64).to_be_bytes());
+        digest.update(user_did.as_bytes());
+        digest.update(device_id.as_bytes());
+        let jkt_str = jkt.unwrap_or_default();
+        digest.update((jkt_str.len() as u64).to_be_bytes());
+        digest.update(jkt_str.as_bytes());
+        digest.update(auth_generation.to_be_bytes());
+        let bytes: [u8; 32] = digest.finalize().into();
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(&bytes[..16]);
+        uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x40;
+        uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80;
+        Uuid::from_bytes(uuid_bytes)
+    }
+
+    #[test]
+    fn materialization_encoding_version_rotates_session_identity() {
+        let user_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let device_id = Uuid::from_u128(0x123e4567e89b12d3a456426614174001);
+        let current = derive_inventory_session_uuid(user_did, device_id, None, 1);
+        let legacy = derive_legacy_inventory_session_uuid(user_did, device_id, None, 1);
+
+        assert_ne!(current, legacy);
+        assert_eq!(
+            current,
+            derive_inventory_session_uuid(user_did, device_id, None, 1)
+        );
+    }
 }
 
 /// The repository-owned whole-second base instant for a session/receipt:
@@ -4468,10 +4545,12 @@ async fn create_inventory_snapshot_attempt(
             .await
             .map_err(InventoryRepositoryError::ReadAuthority)?;
 
-    // Deterministic session identity: one retained session per verified
-    // (DID, device, JKT, auth generation), so repeated calls and the no-cursor
-    // Welcomes/recovery reads deterministically select the same session and
-    // its initial receipts.
+    // Deterministic, encoding-versioned session identity: one retained session
+    // per verified (DID, device, JKT, auth generation, materialization wire
+    // version), so repeated calls and the no-cursor Welcomes/recovery reads
+    // deterministically select the same current-version session and its
+    // initial receipts. A wire-version bump intentionally avoids reusing an
+    // older session whose retained payload bytes are already receipt-bound.
     let inventory_session_id = derive_inventory_session_uuid(
         device.user_did(),
         device.device_id(),

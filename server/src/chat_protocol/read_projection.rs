@@ -29,21 +29,25 @@
 //! * A schema-aware normalization against the exact `definition_id` rejects
 //!   unknown/missing fields, unknown union tags, duplicate keys, invalid
 //!   nulls, and any non-empty `extra_data` before any canonical byte is
-//!   written. Bytes normalize to bare standard padded base64 text (canonical
-//!   spelling required) and datetimes must already be the checked canonical
-//!   UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+//!   written. Bytes normalize to `{"$bytes": <standard padded base64>}`
+//!   objects (canonical spelling required) and datetimes must already be the
+//!   checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`).
 //! * Stored-byte validation re-parses the canonical bytes with a
 //!   duplicate-detecting parser, re-normalizes them against the exact
 //!   definition, re-encodes with this encoder, and requires byte-for-byte
 //!   equality.
 //!
-//! The generated chat DTO surface carries byte fields in two JSON shapes
+//! The generated chat DTO surface accepts byte fields in two input shapes
 //! (`{"$bytes": <padded base64>}` for `serde_bytes_helper` fields and plain
 //! byte arrays for the bare `bytes::Bytes` aliases such as `ArtifactHash` and
-//! `IdentifierBytes`); both normalize to the same bare padded base64 text, as
-//! does a bare base64 string. The encoder is not left to an unspecified
-//! `serde_json::to_vec` ordering: it serializes the DTO once with the
-//! generated serializer and performs its own local canonical write.
+//! `IdentifierBytes`). The normalizer also accepts bare base64 strings when
+//! validating compatibility input trees, but a v2 server must not be mixed with
+//! pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
+//! instances, wait the full 15-minute session TTL, and only then resume v2
+//! protocol availability. All accepted forms normalize to the one lexicon wire shape
+//! `{"$bytes": <padded base64>}`. The encoder is not left to an unspecified
+//! `serde_json::to_vec` ordering: it serializes the DTO once with the generated
+//! serializer and performs its own local canonical write.
 
 use std::{cmp::Ordering, collections::HashSet, fmt, sync::OnceLock};
 
@@ -402,9 +406,9 @@ fn field_path(path: &str, field: &str) -> String {
 
 /// Schema-aware normalization against the exact definition. Rejects unknown
 /// and missing fields, unknown union tags, invalid nulls, and (via the
-/// unknown-field rule) any non-empty `extra_data`; normalizes bytes to bare
-/// standard padded base64 text and verifies datetimes are the checked
-/// canonical UTC text.
+/// unknown-field rule) any non-empty `extra_data`; normalizes bytes to
+/// `{"$bytes": <standard padded base64>}` objects and verifies datetimes are
+/// the checked canonical UTC text.
 fn normalize_def(
     doc: &LexiconDoc<'static>,
     def_name: &str,
@@ -651,7 +655,7 @@ fn normalize_bytes(value: &CanonValue, path: &str) -> Result<CanonValue, Project
         CanonValue::String(text) => text.as_str(),
         CanonValue::Object(entries) if entries.len() == 1 => {
             match (&entries[0].0[..], &entries[0].1) {
-                (key, CanonValue::String(text)) if key == "$bytes" => text.as_str(),
+                ("$bytes", CanonValue::String(text)) => text.as_str(),
                 _ => {
                     return Err(ProjectionError::new(
                         ProjectionErrorKind::InvalidBytesForm,
@@ -680,7 +684,10 @@ fn normalize_bytes(value: &CanonValue, path: &str) -> Result<CanonValue, Project
                 }
                 raw.push(*byte as u8);
             }
-            return Ok(CanonValue::String(STANDARD.encode(raw)));
+            return Ok(CanonValue::Object(vec![(
+                "$bytes".to_owned(),
+                CanonValue::String(STANDARD.encode(raw)),
+            )]));
         }
         _ => {
             return Err(ProjectionError::new(
@@ -704,7 +711,10 @@ fn normalize_bytes(value: &CanonValue, path: &str) -> Result<CanonValue, Project
             "byte field base64 spelling is not canonical",
         ));
     }
-    Ok(CanonValue::String(encoded.to_owned()))
+    Ok(CanonValue::Object(vec![(
+        "$bytes".to_owned(),
+        CanonValue::String(encoded.to_owned()),
+    )]))
 }
 
 fn normalize_array(
@@ -3236,7 +3246,7 @@ mod tests {
     #[test]
     fn normalize_bytes_accepts_all_generated_shapes_and_rejects_bad_base64() {
         let doc = chat_defs_doc();
-        // conversationCoordinates.groupId is a bytes member.
+        // All three conversation-coordinate identifiers are bytes members.
         let name = "conversationCoordinates";
         let build = |group_id: CanonValue| {
             obj(&[
@@ -3259,23 +3269,28 @@ mod tests {
                 ("lifecycle", text("active")),
             ])
         };
-        // Bare base64 text normalizes to itself.
+        // Bare base64 text normalizes to the canonical lexicon bytes object.
         let value = build(text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="));
         let normalized = normalize_def(doc, name, &value, 0, "").unwrap();
         let CanonValue::Object(entries) = normalized else {
             panic!("expected object");
         };
-        let group_id = entries
-            .iter()
-            .find(|(key, _)| key == "groupId")
-            .expect("groupId")
-            .1
-            .clone();
-        assert_eq!(
-            group_id,
-            text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=")
-        );
-        // $bytes object normalizes to bare text.
+        for field in ["groupId", "groupContextHash", "confirmationTag"] {
+            let field_value = entries
+                .iter()
+                .find(|(key, _)| key == field)
+                .unwrap_or_else(|| panic!("{field}"))
+                .1
+                .clone();
+            assert_eq!(
+                field_value,
+                obj(&[(
+                    "$bytes",
+                    text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="),
+                )])
+            );
+        }
+        // A $bytes object remains the canonical lexicon bytes object.
         let value = build(obj(&[(
             "$bytes",
             text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="),
@@ -3284,33 +3299,43 @@ mod tests {
         let CanonValue::Object(entries) = normalized else {
             panic!("expected object");
         };
-        let group_id = entries
-            .iter()
-            .find(|(key, _)| key == "groupId")
-            .expect("groupId")
-            .1
-            .clone();
-        assert_eq!(
-            group_id,
-            text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=")
-        );
-        // Byte array normalizes to bare text.
+        for field in ["groupId", "groupContextHash", "confirmationTag"] {
+            let field_value = entries
+                .iter()
+                .find(|(key, _)| key == field)
+                .unwrap_or_else(|| panic!("{field}"))
+                .1
+                .clone();
+            assert_eq!(
+                field_value,
+                obj(&[(
+                    "$bytes",
+                    text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="),
+                )])
+            );
+        }
+        // A byte array normalizes to the canonical lexicon bytes object.
         let bytes: Vec<CanonValue> = (64..96).map(|value| int(value as i64)).collect();
         let value = build(CanonValue::Array(bytes));
         let normalized = normalize_def(doc, name, &value, 0, "").unwrap();
         let CanonValue::Object(entries) = normalized else {
             panic!("expected object");
         };
-        let group_id = entries
-            .iter()
-            .find(|(key, _)| key == "groupId")
-            .expect("groupId")
-            .1
-            .clone();
-        assert_eq!(
-            group_id,
-            text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=")
-        );
+        for field in ["groupId", "groupContextHash", "confirmationTag"] {
+            let field_value = entries
+                .iter()
+                .find(|(key, _)| key == field)
+                .unwrap_or_else(|| panic!("{field}"))
+                .1
+                .clone();
+            assert_eq!(
+                field_value,
+                obj(&[(
+                    "$bytes",
+                    text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="),
+                )])
+            );
+        }
         // Invalid: unpadded base64.
         let value = build(text("QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"));
         let error = normalize_def(doc, name, &value, 0, "").unwrap_err();
@@ -3320,6 +3345,130 @@ mod tests {
         let value = build(CanonValue::Array(bytes));
         let error = normalize_def(doc, name, &value, 0, "").unwrap_err();
         assert_eq!(error.kind(), ProjectionErrorKind::InvalidBytesForm);
+    }
+
+    fn value_at<'a>(value: &'a CanonValue, path: &[&str]) -> &'a CanonValue {
+        let mut current = value;
+        for component in path {
+            current = match current {
+                CanonValue::Object(entries) => entries
+                    .iter()
+                    .find(|(key, _)| key == component)
+                    .map(|(_, value)| value)
+                    .unwrap_or_else(|| panic!("missing object field {component}")),
+                CanonValue::Array(items) => items
+                    .get(component.parse::<usize>().expect("array path index"))
+                    .unwrap_or_else(|| panic!("missing array item {component}")),
+                _ => panic!("non-container before path component {component}"),
+            };
+        }
+        current
+    }
+
+    #[test]
+    fn conversation_state_normalizes_every_declared_bytes_field_to_dollar_bytes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        ))
+        .expect("canonical fixture parses");
+        let input: CanonValue = serde_json::from_value(fixture["vectors"][0]["value"].clone())
+            .expect("conversation state fixture converts to canonical tree");
+        let normalized = normalize_def(chat_defs_doc(), "conversationState", &input, 0, "")
+            .expect("conversation state fixture normalizes");
+
+        for path in [
+            &["coordinates", "groupId"][..],
+            &["coordinates", "groupContextHash"][..],
+            &["coordinates", "confirmationTag"][..],
+            &["leaves", "1", "joinKeyPackageRef"][..],
+            &["metadataSnapshot", "coordinate", "conversationId"][..],
+            &["metadataSnapshot", "coordinate", "groupId"][..],
+            &["metadataSnapshot", "coordinate", "groupContextHash"][..],
+            &["metadataSnapshot", "coordinate", "confirmationTag"][..],
+            &["metadataSnapshot", "nonce"][..],
+            &["metadataSnapshot", "ciphertext"][..],
+            &["metadataSnapshot", "ciphertextSha256"][..],
+            &["metadataSnapshot", "authorProof", "signaturePublicKey"][..],
+        ] {
+            assert!(
+                matches!(
+                    value_at(&normalized, path),
+                    CanonValue::Object(entries)
+                        if entries.len() == 1 && entries[0].0 == "$bytes"
+                ),
+                "{} must use the canonical $bytes object",
+                path.join(".")
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_state_avatar_binding_hash_normalizes_to_dollar_bytes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        ))
+        .expect("canonical fixture parses");
+        let mut value = fixture["vectors"]
+            .as_array()
+            .expect("fixture vectors are an array")[0]["value"]
+            .clone();
+        let avatar_hash: Vec<serde_json::Value> =
+            (0..32).map(|byte| serde_json::json!(byte)).collect();
+        value["metadataSnapshot"]["avatarBinding"] = serde_json::json!({
+            "blobId": "123e4567-e89b-12d3-a456-426614174005",
+            "ciphertextSha256": avatar_hash,
+            "ciphertextSize": 32,
+            "purpose": "metadata"
+        });
+
+        let input: CanonValue = serde_json::from_value(value)
+            .expect("conversation state with avatar binding converts to canonical tree");
+        let normalized = normalize_def(chat_defs_doc(), "conversationState", &input, 0, "")
+            .expect("conversation state with avatar binding normalizes");
+
+        assert_eq!(
+            value_at(
+                &normalized,
+                &["metadataSnapshot", "avatarBinding", "ciphertextSha256"]
+            ),
+            &obj(&[(
+                "$bytes",
+                text("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="),
+            )])
+        );
+    }
+
+    #[test]
+    fn base64_looking_metadata_strings_remain_strings() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        ))
+        .expect("canonical fixture parses");
+        let mut value = fixture["vectors"]
+            .as_array()
+            .expect("fixture vectors are an array")
+            .iter()
+            .find(|vector| vector["name"] == "metadata_content_projection_escapes")
+            .expect("metadata content projection fixture exists")["value"]
+            .clone();
+        let ordinary = "QUJDREVGR0hJSktMTU5PUA==";
+        value["protocol"] = serde_json::Value::String(ordinary.to_owned());
+        value["title"] = serde_json::Value::String(ordinary.to_owned());
+
+        let input: CanonValue = serde_json::from_value(value)
+            .expect("metadata content projection converts to canonical tree");
+        let normalized = normalize_def(chat_defs_doc(), "metadataContentProjection", &input, 0, "")
+            .expect("metadata content projection normalizes");
+
+        for field in ["protocol", "title"] {
+            assert!(
+                matches!(
+                    value_at(&normalized, &[field]),
+                    CanonValue::String(value) if value == ordinary
+                ),
+                "{field} is an ordinary string field and must remain a string"
+            );
+        }
     }
 
     #[test]

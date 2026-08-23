@@ -781,11 +781,17 @@ async fn event_head(pool: &PgPool) -> i64 {
         .expect("read the current event head")
 }
 
+/// Materialization wire version (replica of the production inventory identity
+/// input). Bumping this value rotates deterministic session IDs without
+/// rewriting receipt-bound retained payload bytes.
+const INVENTORY_MATERIALIZATION_ENCODING_VERSION: u8 = 2;
+
 /// Deterministic session identity (replica of the D-2
-/// `derive_inventory_session_uuid`): v4-masked SHA-256 over the verified
-/// `(DID, device, JKT, auth generation)` coordinates. The retained session row
-/// is keyed by this identity, so repeated initial-page calls and concurrent
-/// second creators deterministically select the SAME session.
+/// `derive_inventory_session_uuid`): v4-masked SHA-256 over the materialization
+/// encoding version and verified `(DID, device, JKT, auth generation)`
+/// coordinates. The retained session row is keyed by this identity, so
+/// repeated initial-page calls and concurrent second creators deterministically
+/// select the SAME current-version session.
 fn derive_inventory_session_uuid(
     user_did: &str,
     device_id: Uuid,
@@ -794,6 +800,7 @@ fn derive_inventory_session_uuid(
 ) -> Uuid {
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+    digest.update([INVENTORY_MATERIALIZATION_ENCODING_VERSION]);
     digest.update((user_did.len() as u64).to_be_bytes());
     digest.update(user_did.as_bytes());
     digest.update(device_id.as_bytes());

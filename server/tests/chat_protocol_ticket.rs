@@ -221,6 +221,8 @@ struct SessionFixture {
     expires_at: DateTime<Utc>,
 }
 
+const INVENTORY_MATERIALIZATION_ENCODING_VERSION: u8 = 2;
+
 fn derive_inventory_session_uuid(
     user_did: &str,
     device_id: Uuid,
@@ -230,6 +232,7 @@ fn derive_inventory_session_uuid(
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
     digest.update(b"CATBIRD-CHAT-INVENTORY-SESSION-IDENTITY\0");
+    digest.update([INVENTORY_MATERIALIZATION_ENCODING_VERSION]);
     digest.update((user_did.len() as u64).to_be_bytes());
     digest.update(user_did.as_bytes());
     digest.update(device_id.as_bytes());
