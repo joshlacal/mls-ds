@@ -56,19 +56,17 @@ async fn submit(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
-    if let Some(completed) =
+    let completed_preflight =
         crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
             .await
             .map_err(|e| context::auth_repository_failure(ENDPOINT, e))?
-    {
-        return context::canonical_json_response(
-            ENDPOINT,
-            completed.status,
-            completed.response_bytes,
-        )
-        .map_err(|_| ChatFailure::invariant(ENDPOINT));
-    }
-    let routing_intent = if let Ok(add_principals) = admission.policy_addition_dids() {
+            .is_some();
+    // The preflight is advisory only. A hit suppresses the expensive routing
+    // lookup, but the canonical operation prelude still owns replay locking,
+    // post-state proof, and response release inside the normal transaction.
+    let routing_intent = if completed_preflight {
+        None
+    } else if let Ok(add_principals) = admission.policy_addition_dids() {
         if !add_principals.is_empty() {
             let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
                 pool,

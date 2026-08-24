@@ -24,7 +24,7 @@ pub(crate) mod message_delivery;
 pub(crate) mod prelude;
 #[allow(dead_code)]
 pub(crate) mod recovery;
-pub(crate) mod relationship;
+pub mod relationship;
 #[allow(dead_code)]
 pub(crate) mod reset;
 #[allow(dead_code)]

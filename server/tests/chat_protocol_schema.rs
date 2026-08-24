@@ -29,19 +29,19 @@ use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::panic::AssertUnwindSafe;
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-static MIGRATION_VERSIONS: LazyLock<[i64; 15]> = LazyLock::new(|| {
+static MIGRATION_VERSIONS: LazyLock<[i64; 21]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
             .version
     })
 });
-static MIGRATION_FILES: LazyLock<[&'static str; 15]> = LazyLock::new(|| {
+static MIGRATION_FILES: LazyLock<[&'static str; 21]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index].filename
     })
 });
-static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 15]> = LazyLock::new(|| {
+static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 21]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
@@ -2649,7 +2649,7 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
     let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
         .await
         .expect("construct reviewed exact-13 migrator");
-    assert_eq!(migrator.iter().count(), 14);
+    assert_eq!(migrator.iter().count(), 21);
     assert!(!migrator.ignore_missing);
     assert!(migrator.locking);
 }

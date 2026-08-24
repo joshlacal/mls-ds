@@ -105,13 +105,13 @@ impl ChatFailure {
 
 impl IntoResponse for ChatFailure {
     fn into_response(self) -> Response {
-        match self.exposure.public_error() {
-            Some(error) => {
-                let code = error.code();
-                let status = protocol_http_status(code);
+        match self.exposure {
+            ErrorExposure::Protocol(error) => {
                 let mut response = (
-                    status,
-                    Json(json!({ "error": code.as_str(), "message": code.as_str() })),
+                    protocol_http_status(error.code()),
+                    Json(json!({
+                        "error": error.code().as_str(),
+                    })),
                 )
                     .into_response();
                 if let Some(retry_after) = self.retry_after_secs {
@@ -123,20 +123,11 @@ impl IntoResponse for ChatFailure {
                 }
                 response
             }
-            // Internal exposure: never a protocol code, never an internal
-            // string. A bare generic transport error name only. The endpoint is
-            // logged (never returned) for operability.
-            None => {
-                tracing::error!(
-                    endpoint = self.endpoint.nsid(),
-                    "clean-chat handler internal failure (no protocol code exposed)"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "InternalServerError" })),
-                )
-                    .into_response()
-            }
+            ErrorExposure::StorageFailure | ErrorExposure::InvariantViolation => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "InternalServerError" })),
+            )
+                .into_response(),
         }
     }
 }

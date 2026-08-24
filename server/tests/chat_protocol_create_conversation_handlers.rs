@@ -79,6 +79,84 @@ struct TestGroupContext {
     extensions: Vec<TestExtension>,
 }
 
+use catbird_server::chat_protocol::relationship_policy::{
+    fixed_production_relationship_policy_config, AdmissionOperation, AdmissionRequest,
+    ProjectionOperationScope, PublicGet, PublicResponse, PublicTransport,
+    RelationshipAuthority, TransportError,
+};
+use catbird_server::chat_protocol::repository::relationship::{
+    allocate_projection_revision, observe_relationship_persistence, persist_relationship_projection,
+};
+
+#[derive(Clone, Copy)]
+struct DeterministicTestTransport;
+
+#[async_trait::async_trait]
+impl PublicTransport for DeterministicTestTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        let path = request.url.path();
+        if path.starts_with("/did:plc:") {
+            let actor = path.trim_start_matches('/');
+            return Ok(PublicResponse::json(
+                200,
+                json!({
+                    "id": actor,
+                    "service": [{
+                        "id": format!("{actor}#atproto_pds"),
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": "https://pds.example.net"
+                    }]
+                }),
+            ));
+        }
+        if path == "/xrpc/com.atproto.repo.getRecord" {
+            let actor = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "repo")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            return Ok(PublicResponse::json(
+                200,
+                json!({
+                    "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
+                    "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                    "value": {
+                        "$type": "chat.bsky.actor.declaration",
+                        "allowIncoming": "all",
+                        "allowGroupInvites": "all"
+                    }
+                }),
+            ));
+        }
+        if path == "/xrpc/app.bsky.graph.getRelationships" {
+            let actor = request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "actor")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            let others = request
+                .url
+                .query_pairs()
+                .filter(|(k, _)| k == "others")
+                .map(|(_, v)| {
+                    json!({
+                        "$type": "app.bsky.graph.defs#relationship",
+                        "did": v,
+                        "following": format!("at://{actor}/app.bsky.graph.follow/test")
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(PublicResponse::json(
+                200,
+                json!({"actor": actor, "relationships": others}),
+            ));
+        }
+        panic!("unexpected public get: {}", request.url);
+    }
+}
+
 #[derive(Clone, Debug, tls_codec::TlsSerialize, tls_codec::TlsDeserialize, tls_codec::TlsSize)]
 struct TestExtension {
     extension_type: u16,
@@ -136,11 +214,28 @@ async fn ensure_verifier_env(pool: &DbPool) {
     .await
     .ok()
     .flatten();
-    if let Some(key_id) = key_id {
-        std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
+    let key_id = if let Some(key_id) = key_id {
+        key_id
+    } else if let Ok(key) = sqlx::query_scalar::<_, String>("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(pool)
+        .await
+    {
+        let inst_id = Uuid::new_v4();
+        let _ = sqlx::query("INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING")
+            .bind(inst_id)
+            .bind(&key)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) VALUES($1,0,clock_timestamp()) ON CONFLICT DO NOTHING")
+            .bind(inst_id)
+            .execute(pool)
+            .await;
+        key
     } else {
-        std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
-    }
+        URL_SAFE_NO_PAD.encode([0x11_u8; 32])
+    };
+    std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
     std::env::set_var(
         "CHAT_CURSOR_SEALING_SECRET",
         URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
@@ -300,9 +395,13 @@ struct CreationTestFixture {
     actor_device_id: Uuid,
     actor_key_id: String,
     actor_ed25519_public_key: Vec<u8>,
+    actor_ed25519_signing_key: Ed25519SigningKey,
     signed_request_json: Value,
     cid: Uuid,
     transition_id: Uuid,
+    group_id: [u8; 32],
+    group_context_hash: [u8; 32],
+    confirmation_tag: [u8; 32],
 }
 
 fn random_did() -> String {
@@ -511,9 +610,13 @@ fn build_test_creation_fixture_with_invitee(
         actor_device_id,
         actor_key_id,
         actor_ed25519_public_key: public_key_bytes.to_vec(),
+        actor_ed25519_signing_key: ed_signing,
         signed_request_json: wrapper,
         cid,
         transition_id,
+        group_id,
+        group_context_hash,
+        confirmation_tag: confirmation_tag_32,
     }
 }
 
@@ -726,7 +829,38 @@ async fn create_conversation_cutover_enabled_missing_auth_returns_not_authorized
 
 #[tokio::test]
 async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_replays() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let (pool, _disposable) =
+        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
+    let ledger_rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read clean-chat migration ledger on fresh database");
+
+    assert_eq!(
+        ledger_rows.len(),
+        21,
+        "fresh database ledger must contain exactly 21 migrations"
+    );
+    for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
+        .iter()
+        .zip(ledger_rows.iter())
+    {
+        assert_eq!(row.0, entry.migration.version, "version matches");
+        assert_eq!(
+            &row.1,
+            entry.migration.description.as_ref(),
+            "description matches"
+        );
+        assert!(row.2, "migration succeeded");
+        assert_eq!(
+            row.3.as_slice(),
+            entry.migration.checksum.as_ref(),
+            "checksum matches"
+        );
+    }
+
     let trusted_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
             .fetch_one(&pool)
@@ -876,6 +1010,272 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         response_sha256.as_slice(),
         Sha256::digest(&response_bytes).as_slice(),
         "completed replay must carry a canonical response digest"
+    );
+    assert_eq!(response_bytes, first_response_bytes);
+}
+
+#[tokio::test]
+async fn submit_transition_policy_add_against_production_router_replays_byte_identically() {
+    let (pool, _disposable) =
+        common::fresh_db::fresh_clean_protocol_db("chat_convhandlers_", 4).await;
+    let ledger_rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read clean-chat migration ledger on fresh database");
+
+    assert_eq!(
+        ledger_rows.len(),
+        21,
+        "fresh database ledger must contain exactly 21 migrations"
+    );
+    for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
+        .iter()
+        .zip(ledger_rows.iter())
+    {
+        assert_eq!(row.0, entry.migration.version, "version matches");
+        assert_eq!(
+            &row.1,
+            entry.migration.description.as_ref(),
+            "description matches"
+        );
+        assert!(row.2, "migration succeeded");
+        assert_eq!(
+            row.3.as_slice(),
+            entry.migration.checksum.as_ref(),
+            "checksum matches"
+        );
+    }
+
+    let trusted_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&pool)
+            .await
+            .expect("sample timestamp");
+
+    let fixture = build_test_creation_fixture(trusted_at);
+    let dpop_key = random_p256();
+    let dpop_jwk = public_jwk(&dpop_key);
+    let dpop_jkt = jwk_thumbprint(&dpop_jwk);
+
+    seed_device_for_creation(
+        &pool,
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &fixture.actor_key_id,
+        &fixture.actor_ed25519_public_key,
+        &dpop_key,
+        &dpop_jkt,
+    )
+    .await;
+
+    let payload = json!({
+        "signedRequest": fixture.signed_request_json,
+    });
+    let router = router_with(pool.clone(), true).await;
+    let create_request = build_authenticated_request(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        payload,
+    );
+    let (create_status, create_response_bytes) = send_raw(router.clone(), create_request).await;
+    let create_text = String::from_utf8_lossy(&create_response_bytes);
+    assert_eq!(
+        create_status,
+        StatusCode::OK,
+        "createConversation must succeed (200 OK), got {create_status}: {create_text}"
+    );
+
+    let create_body: Value =
+        serde_json::from_slice(&create_response_bytes).expect("parse create response json");
+    let result_coords = &create_body["result"]["coordinates"];
+    assert_eq!(
+        result_coords["conversationId"],
+        fixture.cid.hyphenated().to_string()
+    );
+    assert_eq!(result_coords["stateVersion"], 0);
+
+    // Now construct policy transition adding Bob as pending member
+    let policy_transition_id = Uuid::new_v4();
+    let bob_did = random_did();
+    sqlx::query(
+        "INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(&bob_did)
+    .bind(trusted_at)
+    .execute(&pool)
+    .await
+    .expect("seed bob principal");
+
+    let rel_authority = RelationshipAuthority::new(
+        fixed_production_relationship_policy_config().expect("fixed config"),
+        DeterministicTestTransport,
+    );
+    let mut roster = vec![fixture.actor_did.clone(), bob_did.clone()];
+    roster.sort();
+    let admission_req = AdmissionRequest {
+        inviter: fixture.actor_did.clone(),
+        roster,
+        pending_recipients: vec![bob_did.clone()],
+        operation: AdmissionOperation::Group,
+    };
+    let mut fallback_tx = pool.begin().await.expect("begin fallback tx");
+    let live_allocation = allocate_projection_revision(&mut fallback_tx)
+        .await
+        .expect("allocate live projection revision");
+    let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
+        .await
+        .expect("allocate fallback projection revision");
+    let live_rel = rel_authority
+        .collect_admission_projection(live_allocation, ProjectionOperationScope::PendingAdd, admission_req)
+        .await
+        .expect("collect live policy relationship projection");
+    let observation = observe_relationship_persistence();
+    let sealed_fallback = live_rel
+        .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
+        .expect("seal fallback relationship projection");
+    persist_relationship_projection(&mut fallback_tx, sealed_fallback)
+        .await
+        .expect("persist fallback relationship projection");
+    fallback_tx.commit().await.expect("commit fallback tx");
+    let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    let prior_coordinate = json!({
+        "conversationId": fixture.cid.hyphenated().to_string(),
+        "generation": 0,
+        "stateVersion": 0,
+        "groupId": STANDARD.encode(fixture.group_id),
+        "epoch": 0,
+        "groupContextHash": STANDARD.encode(fixture.group_context_hash),
+        "confirmationTag": STANDARD.encode(fixture.confirmation_tag),
+        "lifecycle": "active",
+    });
+
+    let next_coordinate = json!({
+        "conversationId": fixture.cid.hyphenated().to_string(),
+        "generation": 0,
+        "stateVersion": 1,
+        "groupId": STANDARD.encode(fixture.group_id),
+        "epoch": 0,
+        "groupContextHash": STANDARD.encode(fixture.group_context_hash),
+        "confirmationTag": STANDARD.encode(fixture.confirmation_tag),
+        "lifecycle": "active",
+    });
+
+    let participant_changes = vec![json!({
+        "$type": "blue.catbird.chat.defs#addParticipant",
+        "userDid": bob_did,
+        "status": "pending",
+        "role": "member",
+        "invitationProvenance": {
+            "invitedByDid": &fixture.actor_did,
+            "invitedByDeviceId": fixture.actor_device_id.hyphenated().to_string(),
+            "invitationTransitionId": policy_transition_id.hyphenated().to_string(),
+        },
+    })];
+
+    let policy_body = json!({
+        "$type": "blue.catbird.chat.defs#policyTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-POLICY\u{0000}",
+        "transitionId": policy_transition_id.hyphenated().to_string(),
+        "actorDid": &fixture.actor_did,
+        "actorDeviceId": fixture.actor_device_id.hyphenated().to_string(),
+        "keyId": &fixture.actor_key_id,
+        "authGeneration": 1,
+        "prior": prior_coordinate,
+        "next": next_coordinate,
+        "participantChanges": participant_changes,
+        "idempotencyKey": policy_transition_id.hyphenated().to_string(),
+        "signedAt": signed_at,
+    });
+
+    let mut policy_wrapper = json!({
+        "body": policy_body,
+        "signature": STANDARD.encode([0_u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&policy_wrapper).unwrap();
+    let canonical = decode_canonical_signed_mutation(&unsigned).expect("canonicalize policy body");
+    let signature = fixture.actor_ed25519_signing_key.sign(canonical.transcript_bytes());
+    policy_wrapper["signature"] = json!(STANDARD.encode(signature.to_bytes()));
+
+    let policy_payload = json!({
+        "signedRequest": policy_wrapper,
+    });
+
+    let policy_request = build_authenticated_post_for_endpoint(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        "blue.catbird.chat.submitTransition",
+        policy_payload.clone(),
+    );
+    let (status, first_response_bytes) = send_raw(router.clone(), policy_request).await;
+    let text = String::from_utf8_lossy(&first_response_bytes);
+    println!("Policy add HTTP status: {status}, response: {text}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "first submitTransition policy-add must succeed (200 OK), got {status}: {text}"
+    );
+
+    let first_body: Value =
+        serde_json::from_slice(&first_response_bytes).expect("parse policy response json");
+    assert_eq!(
+        first_body["entry"]["$type"],
+        "blue.catbird.chat.defs#policyEntry"
+    );
+    assert_eq!(
+        first_body["coordinates"]["stateVersion"],
+        1
+    );
+
+    // Idempotent replay with the exact same request
+    let replay_policy_request = build_authenticated_post_for_endpoint(
+        &fixture.actor_did,
+        fixture.actor_device_id,
+        &dpop_key,
+        &dpop_jwk,
+        &dpop_jkt,
+        "blue.catbird.chat.submitTransition",
+        policy_payload,
+    );
+
+    let (replay_status, replay_response_bytes) =
+        send_raw(router.clone(), replay_policy_request).await;
+    let replay_text = String::from_utf8_lossy(&replay_response_bytes);
+    assert_eq!(
+        replay_status,
+        StatusCode::OK,
+        "replayed submitTransition policy-add must return 200 OK: {replay_text}"
+    );
+    assert_eq!(
+        first_response_bytes, replay_response_bytes,
+        "idempotent replay of submitTransition policy-add must return byte-identical response"
+    );
+
+    let (completed_status, response_sha256, response_bytes): (i32, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT completed_status, response_sha256, response_bytes \
+             FROM chat.idempotency_records \
+             WHERE principal_did = $1 AND endpoint_nsid = $2 AND operation_id = $3",
+        )
+        .bind(&fixture.actor_did)
+        .bind("blue.catbird.chat.submitTransition")
+        .bind(policy_transition_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read canonical completed replay row for policy transition");
+    assert_eq!(completed_status, 200);
+    assert_eq!(
+        response_sha256.as_slice(),
+        Sha256::digest(&response_bytes).as_slice(),
+        "completed policy replay must carry a canonical response digest"
     );
     assert_eq!(response_bytes, first_response_bytes);
 }

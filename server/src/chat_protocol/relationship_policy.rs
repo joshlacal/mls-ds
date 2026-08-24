@@ -261,7 +261,7 @@ impl RelationshipPolicyConfig {
 /// The production relationship authority has one fixed, audited network
 /// configuration. No production API accepts caller-selected origins, limits,
 /// fingerprints, transport, or time authority.
-pub(crate) fn fixed_production_relationship_policy_config(
+pub fn fixed_production_relationship_policy_config(
 ) -> Result<RelationshipPolicyConfig, RelationshipPolicyConfigError> {
     RelationshipPolicyConfig::validate_and_build(RelationshipPolicyConfigInput {
         appview_origin: concat!("https://", "public", ".api.bsky.app").into(),
@@ -1465,7 +1465,7 @@ impl EvidenceKind {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ProjectionOperationScope {
+pub enum ProjectionOperationScope {
     Creation,
     PendingAdd,
     Acceptance,
@@ -1618,7 +1618,7 @@ impl Clone for ProjectionPersistenceAuthority {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ProjectionPersistenceError {
+pub enum ProjectionPersistenceError {
     Invalid,
 }
 
@@ -1729,7 +1729,7 @@ pub(crate) struct PersistedTrafficProjection {
 /// allocation identity is private and is paired with values derived from the
 /// exact projection that consumed the corresponding SQL allocation guard.
 #[derive(Debug)]
-pub(crate) struct SealedRelationshipProjection {
+pub struct SealedRelationshipProjection {
     allocation_id: Uuid,
     values: PersistedRelationshipProjection,
 }
@@ -1925,7 +1925,7 @@ impl RelationshipProjection {
         })
     }
 
-    pub(crate) fn export_persisted_fallback<T: PublicTransport>(
+    pub fn export_persisted_fallback<T: PublicTransport>(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
         authority: &RelationshipAuthority<T>,
@@ -2870,7 +2870,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         }
     }
 
-    #[cfg(test)]
     pub fn new(config: RelationshipPolicyConfig, transport: T) -> Self {
         Self::from_parts(config, transport, HARDENED_SOURCE_PROFILE_V1)
     }
@@ -2888,7 +2887,7 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         &self.config
     }
 
-    pub(crate) async fn collect_admission_projection(
+    pub async fn collect_admission_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
         operation_scope: ProjectionOperationScope,

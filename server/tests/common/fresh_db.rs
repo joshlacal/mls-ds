@@ -49,6 +49,8 @@ pub const PROTECTED_DATABASE_NAMES: &[&str] = &[
 /// Name prefixes reserved for disposable per-run databases minted by this
 /// module. One prefix per owning target, so a leak names its owner.
 pub const DISPOSABLE_PREFIXES: &[&str] = &[
+    // `tests/chat_protocol_create_conversation_handlers.rs`
+    "chat_convhandlers_",
     // `tests/chat_protocol_device_handlers.rs`
     "chat_devhandlers_",
     // `tests/chat_protocol_auth_repository.rs`

@@ -62,7 +62,7 @@ const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 /// value supplies global ordering. This pair is deliberately non-cloneable and
 /// must survive collection until it is consumed by the persistence seal.
 #[derive(Debug)]
-pub(crate) struct AllocatedProjectionRevisionGuard {
+pub struct AllocatedProjectionRevisionGuard {
     allocation_id: Uuid,
     projection_revision: u64,
 }

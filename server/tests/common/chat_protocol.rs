@@ -27,9 +27,19 @@ pub struct CleanProtocol13ManifestEntry {
     pub migration: Migration,
 }
 
-pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 15]> = LazyLock::new(
+pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 21]> = LazyLock::new(
     || {
         [
+            CleanProtocol13ManifestEntry {
+                filename: "20260214000002_auth_jti_nonce.sql",
+                reviewed_sha384: "a653190a473ce3535c946769e8e269173fcf22c1cc6196063eb9461e4766bc084a57c61d2b3a4ffee4b5a1b4da06856b",
+                migration: Migration::new(
+                    20260214000002,
+                    Cow::Borrowed("auth jti nonce"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260214000002_auth_jti_nonce.sql")),
+                ),
+            },
             CleanProtocol13ManifestEntry {
                 filename: "20260722000001_chat_protocol_core.sql",
                 reviewed_sha384: "dd48feea7beafae59fbc11516e8c1ae91382b356b80366056f71d2493c10923bd39ff0739fe08cb4b0452b0ec82132ff",
@@ -171,6 +181,56 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 1
                 ),
             },
             CleanProtocol13ManifestEntry {
+                filename: "20260816000001_enable_send_message_operation_claims.sql",
+                reviewed_sha384: "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e",
+                migration: Migration::new(
+                    20260816000001,
+                    Cow::Borrowed("enable send message operation claims"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260816000001_enable_send_message_operation_claims.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260820000001_chat_service_auth_admissions.sql",
+                reviewed_sha384: "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac",
+                migration: Migration::new(
+                    20260820000001,
+                    Cow::Borrowed("chat service auth admissions"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260820000001_chat_service_auth_admissions.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260820000002_chat_nullable_legacy_dpop_jkt.sql",
+                reviewed_sha384: "d1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d",
+                migration: Migration::new(
+                    20260820000002,
+                    Cow::Borrowed("chat nullable legacy dpop jkt"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260820000002_chat_nullable_legacy_dpop_jkt.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260821000001_fix_expired_inventory_session_gc.sql",
+                reviewed_sha384: "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a",
+                migration: Migration::new(
+                    20260821000001,
+                    Cow::Borrowed("fix expired inventory session gc"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260821000001_fix_expired_inventory_session_gc.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260824000001_chat_performance_indices.sql",
+                reviewed_sha384: "e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0",
+                migration: Migration::new(
+                    20260824000001,
+                    Cow::Borrowed("chat performance indices"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260824000001_chat_performance_indices.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
                 filename: "20260824000003_chat_federation_routing.sql",
                 reviewed_sha384: "0a70985a3b5811483791911b6ae3b9d0ebd0fbcd9fc53363e65c59ca1c71a1cbd2a74fc02e87ba22dd0321c7f30713e6",
                 migration: Migration::new(
@@ -199,8 +259,8 @@ impl MigrationSource<'static> for CleanProtocol13MigrationSource {
 }
 
 pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
-    if CLEAN_PROTOCOL_13_MANIFEST.len() != 15 {
-        return Err("reviewed clean-protocol manifest must contain exactly 15 migrations".into());
+    if CLEAN_PROTOCOL_13_MANIFEST.len() != 21 {
+        return Err("reviewed clean-protocol manifest must contain exactly 21 migrations".into());
     }
     for (index, entry) in CLEAN_PROTOCOL_13_MANIFEST.iter().enumerate() {
         let filename_version = entry
@@ -231,7 +291,7 @@ pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
         .map_err(|error| format!("resolve reviewed clean-protocol migrator: {error}"))?;
     migrator.set_ignore_missing(false);
     migrator.set_locking(true);
-    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 15 {
+    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 21 {
         return Err("reviewed clean-protocol migrator policy mismatch".into());
     }
     for (entry, migration) in CLEAN_PROTOCOL_13_MANIFEST.iter().zip(migrator.iter()) {
@@ -971,7 +1031,7 @@ async fn validate_exact_reviewed_ledger(
         .collect::<Vec<_>>();
     if actual != expected {
         return Err(
-            "clean-chat fixed target is not the exact reviewed 14-row installation; \
+            "clean-chat fixed target is not the exact reviewed 21-row installation; \
              validation-only setup refuses migration or repair"
                 .into(),
         );
