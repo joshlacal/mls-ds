@@ -1,37 +1,27 @@
-use axum::{extract::State, Json};
-use serde_json::json;
+use std::str::FromStr;
 use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+use catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome;
+use jacquard_common::DefaultStr;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::{
-    auth::AuthUser,
-    crypto::redact_for_log,
-    federation::{AckSigner, FederationError},
-    storage::DbPool,
+use super::deliver_message::{enforce_ds_request_security, record_ds_outcome};
+use crate::auth::AuthUser;
+use crate::chat_protocol::repository::federation::deliver_welcome_mailbox;
+use crate::chat_protocol::validation::CanonicalUuidV4;
+use crate::federation::envelope::{
+    validate_entry_locator, validate_envelope_header, DELIVER_WELCOME_NSID,
 };
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliverWelcome<'a> {
-    #[serde(borrow)]
-    convo_id: jacquard_common::CowStr<'a>,
-    #[serde(borrow)]
-    recipient_did: jacquard_common::CowStr<'a>,
-    #[serde(borrow)]
-    sender_ds_did: jacquard_common::CowStr<'a>,
-    #[serde(borrow)]
-    key_package_hash: jacquard_common::CowStr<'a>,
-    #[serde(with = "jacquard_common::serde_bytes_helper")]
-    welcome_data: bytes::Bytes,
-    initial_epoch: i64,
-}
-
-const NSID: &str = "blue.catbird.mlsDS.deliverWelcome";
+use crate::federation::{AckSigner, FederationError};
+use crate::identity::{dids_equivalent, service_did_base};
+use crate::storage::DbPool;
 
 /// POST /xrpc/blue.catbird.mlsDS.deliverWelcome
 ///
-/// Accept a Welcome message for a new member from a remote DS.
+/// Deliver a federated MLS Welcome message to complete local preprovisioned participant addition (Choice C).
 #[tracing::instrument(skip(pool, ack_signer, auth_user, body))]
 pub async fn deliver_welcome(
     State(pool): State<DbPool>,
@@ -39,100 +29,151 @@ pub async fn deliver_welcome(
     auth_user: AuthUser,
     body: String,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-    let welcome: DeliverWelcome<'_> = serde_json::from_str(&body).map_err(|_| {
+    let Some(signer) = ack_signer.as_deref() else {
+        return Err(FederationError::SignerUnavailable);
+    };
+
+    let msg: DeliverWelcome<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
         FederationError::Json(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Invalid DeliverWelcome body",
+            format!("Invalid DeliverWelcome body: {e}"),
         )))
     })?;
 
-    let recipient_did = welcome.recipient_did.as_ref();
-    let convo_id = welcome.convo_id.as_ref();
-    let sender_ds = welcome.sender_ds_did.as_ref();
-    let key_package_hash = welcome.key_package_hash.as_ref();
-    let initial_epoch = welcome.initial_epoch;
+    if msg.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "unknown fields in DeliverWelcome request".to_string(),
+        });
+    }
 
-    let security = super::deliver_message::enforce_ds_request_security(
+    let header = validate_envelope_header(&msg.header)?;
+    let locator = validate_entry_locator(&msg.entry_locator)?;
+
+    let self_base_did = service_did_base();
+    if !dids_equivalent(&header.receiver_ds_did, &self_base_did) {
+        return Err(FederationError::InvalidEnvelope {
+            reason: format!(
+                "receiverDsDid '{}' does not match local service DID '{}'",
+                header.receiver_ds_did, self_base_did
+            ),
+        });
+    }
+
+    let recipient_device_id_canonical =
+        CanonicalUuidV4::parse(msg.recipient_device_id.as_str()).map_err(|e| {
+            FederationError::InvalidEnvelope {
+                reason: format!("invalid recipientDeviceId: {e}"),
+            }
+        })?;
+    let recipient_device_id =
+        Uuid::from_str(recipient_device_id_canonical.as_str()).map_err(|_| {
+            FederationError::InvalidEnvelope {
+                reason: "invalid recipientDeviceId UUID".to_string(),
+            }
+        })?;
+
+    let welcome_id_canonical =
+        CanonicalUuidV4::parse(msg.welcome_id.as_str()).map_err(|e| {
+            FederationError::InvalidEnvelope {
+                reason: format!("invalid welcomeId: {e}"),
+            }
+        })?;
+    let welcome_id = Uuid::from_str(welcome_id_canonical.as_str()).map_err(|_| {
+        FederationError::InvalidEnvelope {
+            reason: "invalid welcomeId UUID".to_string(),
+        }
+    })?;
+
+    let recovery_request_id_canonical =
+        CanonicalUuidV4::parse(msg.recovery_request_id.as_str()).map_err(|e| {
+            FederationError::InvalidEnvelope {
+                reason: format!("invalid recoveryRequestId: {e}"),
+            }
+        })?;
+    let recovery_request_id =
+        Uuid::from_str(recovery_request_id_canonical.as_str()).map_err(|_| {
+            FederationError::InvalidEnvelope {
+                reason: "invalid recoveryRequestId UUID".to_string(),
+            }
+        })?;
+
+    if msg.key_package_ref.len() != 32 {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "keyPackageRef must be exactly 32 bytes".to_string(),
+        });
+    }
+    let mut key_package_ref = [0u8; 32];
+    key_package_ref.copy_from_slice(&msg.key_package_ref);
+
+    if msg.welcome_sha256.len() != 32 {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "welcomeSha256 must be exactly 32 bytes".to_string(),
+        });
+    }
+    let mut welcome_sha256 = [0u8; 32];
+    welcome_sha256.copy_from_slice(&msg.welcome_sha256);
+
+    if msg.public_snapshot_sha256.len() != 32 {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "publicSnapshotSha256 must be exactly 32 bytes".to_string(),
+        });
+    }
+    let mut public_snapshot_sha256 = [0u8; 32];
+    public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256);
+
+    if msg.tree_summary_sha256.len() != 32 {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "treeSummarySha256 must be exactly 32 bytes".to_string(),
+        });
+    }
+    let mut tree_summary_sha256 = [0u8; 32];
+    tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256);
+
+    let security = enforce_ds_request_security(
         &pool,
         &auth_user,
-        NSID,
-        Some(sender_ds),
+        DELIVER_WELCOME_NSID,
+        Some(&header.sender_ds_did),
     )
     .await?;
     let requester_ds = security.requester_ds.clone();
 
     let result: Result<Json<serde_json::Value>, FederationError> = async {
-        // Verify recipient is a local user
-        let user_exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE did = $1) \
-             OR EXISTS(SELECT 1 FROM devices WHERE user_did = $1 OR credential_did = $1)",
+        let mut tx = pool.begin().await.map_err(FederationError::Database)?;
+
+        let output = deliver_welcome_mailbox(
+            &mut tx,
+            signer,
+            header,
+            msg.recipient_did.as_str().to_string(),
+            recipient_device_id,
+            welcome_id,
+            recovery_request_id,
+            key_package_ref,
+            msg.welcome_bytes.to_vec(),
+            welcome_sha256,
+            msg.entry_bytes.to_vec(),
+            msg.signed_request_bytes.to_vec(),
+            locator,
+            msg.coordinates,
+            public_snapshot_sha256,
+            tree_summary_sha256,
         )
-        .bind(recipient_did)
-        .fetch_one(&pool)
-        .await
-        .map_err(FederationError::Database)?;
+        .await?;
 
-        if !user_exists {
-            return Err(FederationError::RecipientNotFound {
-                did: recipient_did.to_string(),
-            });
-        }
-
-        let mut sequencer_term: u64 = 0;
-        if let Some(sequencer_state) =
-            super::deliver_message::load_convo_sequencer_state_optional(&pool, convo_id).await?
-        {
-            if requester_ds != sequencer_state.expected_sequencer {
-                return Err(FederationError::AuthFailed {
-                    reason: format!(
-                        "DS {} is not the sequencer for {} (expected {})",
-                        requester_ds, convo_id, sequencer_state.expected_sequencer
-                    ),
-                });
-            }
-            sequencer_term = sequencer_state.current_term;
-        }
-
-        // Store the welcome data.
-        let welcome_id = Uuid::new_v4().to_string();
-        let key_package_hash_bytes = if key_package_hash.is_empty() {
-            None
-        } else {
-            Some(key_package_hash.as_bytes())
-        };
-        sqlx::query(
-            "INSERT INTO welcome_messages \
-             (id, convo_id, recipient_did, recipient_device_id, welcome_data, key_package_hash, created_by_did, created_at, consumed) \
-             VALUES ($1, $2, $3, NULL, $4, $5, $6, NOW(), false) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(&welcome_id)
-        .bind(convo_id)
-        .bind(recipient_did)
-        .bind(welcome.welcome_data.as_ref())
-        .bind(key_package_hash_bytes)
-        .bind(&requester_ds)
-        .execute(&pool)
-        .await
-        .map_err(FederationError::Database)?;
+        tx.commit().await.map_err(FederationError::Database)?;
 
         debug!(
-            convo = %redact_for_log(convo_id),
-            recipient = %redact_for_log(recipient_did),
-            sender_ds = %redact_for_log(sender_ds),
+            delivery_id = %output.receipt.delivery_id,
+            convo = %output.receipt.conversation_id,
             "Accepted federated welcome"
         );
 
-        let mut response = json!({ "accepted": true });
-        if let Some(ref signer) = ack_signer {
-            let ack = signer.sign_ack(&welcome_id, convo_id, initial_epoch as i32, sequencer_term);
-            response["ack"] = serde_json::to_value(&ack).unwrap_or_default();
-        }
-
-        Ok(Json(response))
+        let value = serde_json::to_value(output).map_err(FederationError::Json)?;
+        Ok(Json(value))
     }
     .await;
 
-    super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
+    record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result
 }

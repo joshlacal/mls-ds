@@ -1,131 +1,93 @@
-use axum::{extract::State, Json};
-use serde_json::json;
 use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+use catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage;
+use jacquard_common::DefaultStr;
 use tracing::{debug, warn};
-use ulid::Ulid;
 
-use crate::{
-    auth::AuthUser,
-    crypto::redact_for_log,
-    federation::{peer_policy, AckSigner, FederationError},
-    identity::{canonical_did, dids_equivalent},
-    realtime::SseState,
-    storage::DbPool,
+use crate::auth::AuthUser;
+use crate::chat_protocol::repository::federation::deliver_message_replication;
+use crate::federation::envelope::{
+    validate_entry_locator, validate_envelope_header, DELIVER_MESSAGE_NSID,
 };
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeliverMessage<'a> {
-    #[serde(borrow)]
-    convo_id: jacquard_common::CowStr<'a>,
-    #[serde(borrow)]
-    msg_id: jacquard_common::CowStr<'a>,
-    epoch: i64,
-    #[serde(borrow)]
-    sender_ds_did: jacquard_common::CowStr<'a>,
-    #[serde(with = "jacquard_common::serde_bytes_helper")]
-    ciphertext: bytes::Bytes,
-    padded_size: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(borrow)]
-    message_type: Option<jacquard_common::CowStr<'a>>,
-}
-
-const NSID: &str = "blue.catbird.mlsDS.deliverMessage";
+use crate::federation::{peer_policy, AckSigner, FederationError};
+use crate::identity::{canonical_did, dids_equivalent, service_did_base};
+use crate::storage::DbPool;
 
 /// POST /xrpc/blue.catbird.mlsDS.deliverMessage
 ///
-/// Accept an inbound MLS message from a remote DS and store it for local subscribers.
-#[tracing::instrument(skip(pool, sse_state, ack_signer, auth_user, body))]
+/// Deliver a federated MLS application message to a destination DS for a local recipient.
+#[tracing::instrument(skip(pool, ack_signer, auth_user, body))]
 pub async fn deliver_message(
     State(pool): State<DbPool>,
-    State(sse_state): State<Arc<SseState>>,
     State(ack_signer): State<Option<Arc<AckSigner>>>,
     auth_user: AuthUser,
     body: String,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-    let msg: DeliverMessage<'_> = serde_json::from_str(&body).map_err(|_| {
+    let Some(ref signer) = ack_signer else {
+        return Err(FederationError::SignerUnavailable);
+    };
+
+    let msg: DeliverMessage<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
         FederationError::Json(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Invalid DeliverMessage body",
+            format!("Invalid DeliverMessage body: {e}"),
         )))
     })?;
 
-    let convo_id = msg.convo_id.as_ref();
-    let msg_id = msg.msg_id.as_ref();
-    let epoch = msg.epoch;
-    let sender_ds = msg.sender_ds_did.as_ref();
-    let raw_body: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Invalid DeliverMessage body",
-        )))
-    })?;
-    let delivery_id = parse_required_ulid(&raw_body, "deliveryId")?;
-    let sequencer_term = parse_required_u64(&raw_body, "sequencerTerm")?;
+    if msg.extra_data.as_ref().map_or(false, |m| !m.is_empty()) {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "unknown fields in DeliverMessage request".to_string(),
+        });
+    }
 
-    let security = enforce_ds_request_security(&pool, &auth_user, NSID, Some(sender_ds)).await?;
+    let header = validate_envelope_header(&msg.header)?;
+    let locator = validate_entry_locator(&msg.entry_locator)?;
+
+    let self_base_did = service_did_base();
+    if !dids_equivalent(&header.receiver_ds_did, &self_base_did) {
+        return Err(FederationError::InvalidEnvelope {
+            reason: format!(
+                "receiverDsDid '{}' does not match local service DID '{}'",
+                header.receiver_ds_did, self_base_did
+            ),
+        });
+    }
+
+    let security = enforce_ds_request_security(
+        &pool,
+        &auth_user,
+        DELIVER_MESSAGE_NSID,
+        Some(&header.sender_ds_did),
+    )
+    .await?;
     let requester_ds = security.requester_ds.clone();
 
     let result: Result<Json<serde_json::Value>, FederationError> = async {
-        let Some(sequencer_state) = load_convo_sequencer_state_optional(&pool, convo_id).await?
-        else {
-            return Err(FederationError::ConversationNotFound {
-                convo_id: convo_id.to_string(),
-            });
-        };
-        if requester_ds != sequencer_state.expected_sequencer {
-            return Err(FederationError::NotSequencer {
-                convo_id: convo_id.to_string(),
-            });
-        }
-        if sequencer_term != sequencer_state.current_term {
-            return Err(FederationError::TermStale {
-                convo_id: convo_id.to_string(),
-                provided_term: sequencer_term as i64,
-                current_term: sequencer_state.current_term as i64,
-            });
-        }
+        let mut tx = pool.begin().await.map_err(FederationError::Database)?;
 
-        // Store the message (idempotent on msg_id)
-        let seq = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO messages (id, convo_id, sender_did, message_type, ciphertext, epoch, padded_size, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
-             ON CONFLICT (id) DO UPDATE SET id = messages.id \
-             RETURNING seq",
+        let output = deliver_message_replication(
+            &mut tx,
+            signer,
+            header,
+            msg.recipient_did.as_str().to_string(),
+            locator,
+            msg.entry_bytes.to_vec(),
+            msg.signed_request_bytes.to_vec(),
         )
-        .bind(msg_id)
-        .bind(convo_id)
-        .bind(Option::<&str>::None) // sender_did intentionally NULL — PRIV-001 (docs/PRIVACY.md)
-        .bind(msg.message_type.as_deref().unwrap_or("app"))
-        .bind(msg.ciphertext.as_ref())
-        .bind(epoch)
-        .bind(msg.padded_size)
-        .fetch_one(&pool)
-        .await
-        .map_err(FederationError::Database)?;
+        .await?;
 
-        let _ = sse_state; // SSE emission for legacy stream retired in Milestone 2 cutover
+        tx.commit().await.map_err(FederationError::Database)?;
 
         debug!(
-            convo = %redact_for_log(convo_id),
-            msg = %redact_for_log(msg_id),
-            seq,
-            sender_ds = %redact_for_log(sender_ds),
+            delivery_id = %output.receipt.delivery_id,
+            convo = %output.receipt.conversation_id,
             "Accepted federated message"
         );
 
-        let mut response = json!({
-            "accepted": true,
-            "seq": seq,
-            "deliveryId": delivery_id
-        });
-        if let Some(ref signer) = ack_signer {
-            let ack = signer.sign_ack(msg_id, convo_id, epoch as i32, sequencer_term);
-            response["ack"] = serde_json::to_value(&ack).unwrap_or_default();
-        }
-
-        Ok(Json(response))
+        let value = serde_json::to_value(output).map_err(FederationError::Json)?;
+        Ok(Json(value))
     }
     .await;
 
@@ -133,76 +95,12 @@ pub async fn deliver_message(
     result
 }
 
-fn parse_required_u64(
-    body: &serde_json::Value,
-    field: &'static str,
-) -> Result<u64, FederationError> {
-    body.get(field)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            FederationError::Json(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Missing or invalid {field}"),
-            )))
-        })
-}
-
-fn parse_required_ulid(
-    body: &serde_json::Value,
-    field: &'static str,
-) -> Result<String, FederationError> {
-    let value = body
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            FederationError::Json(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Missing or invalid {field}"),
-            )))
-        })?;
-    Ulid::from_string(value).map_err(|_| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid ULID {field}"),
-        )))
-    })?;
-    Ok(value.to_string())
-}
-
 #[derive(Debug, Clone)]
-pub(super) struct ConvoSequencerState {
-    pub expected_sequencer: String,
-    pub current_term: u64,
-}
-
-pub(super) async fn load_convo_sequencer_state_optional(
-    pool: &DbPool,
-    convo_id: &str,
-) -> Result<Option<ConvoSequencerState>, FederationError> {
-    let convo_row = sqlx::query_as::<_, (Option<String>, Option<i64>)>(
-        "SELECT sequencer_ds, sequencer_term FROM conversations WHERE id = $1",
-    )
-    .bind(convo_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(FederationError::Database)?;
-
-    // N31: fail-loudly service identity — no hardcoded fallback DID.
-    let self_did = crate::identity::service_did();
-    Ok(
-        convo_row.map(|(sequencer_ds, current_term_raw)| ConvoSequencerState {
-            expected_sequencer: canonical_did(&sequencer_ds.unwrap_or(self_did)).to_string(),
-            current_term: current_term_raw.unwrap_or(0).max(0) as u64,
-        }),
-    )
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct DsSecurityContext {
+pub struct DsSecurityContext {
     pub requester_ds: String,
 }
 
-pub(super) async fn enforce_ds_request_security(
+pub async fn enforce_ds_request_security(
     pool: &DbPool,
     auth_user: &AuthUser,
     endpoint_nsid: &str,
@@ -260,7 +158,7 @@ pub(super) async fn enforce_ds_request_security(
     Ok(DsSecurityContext { requester_ds })
 }
 
-pub(super) async fn record_ds_outcome(pool: &DbPool, requester_ds: &str, success: bool) {
+pub async fn record_ds_outcome(pool: &DbPool, requester_ds: &str, success: bool) {
     if success {
         peer_policy::record_success(pool, requester_ds).await;
     } else {
@@ -268,10 +166,7 @@ pub(super) async fn record_ds_outcome(pool: &DbPool, requester_ds: &str, success
     }
 }
 
-pub(super) fn validate_lxm(
-    auth_user: &AuthUser,
-    expected_lxm: &str,
-) -> Result<(), FederationError> {
+pub fn validate_lxm(auth_user: &AuthUser, expected_lxm: &str) -> Result<(), FederationError> {
     if let Some(ref lxm) = auth_user.claims.lxm {
         if lxm == expected_lxm {
             return Ok(());
@@ -285,7 +180,7 @@ pub(super) fn validate_lxm(
     })
 }
 
-pub(super) fn validate_ds_issuer(auth_user: &AuthUser) -> Result<(), FederationError> {
+pub fn validate_ds_issuer(auth_user: &AuthUser) -> Result<(), FederationError> {
     let iss = canonical_did(auth_user.claims.iss.as_str());
     if !iss.starts_with("did:") || iss.contains(char::is_whitespace) {
         return Err(FederationError::AuthFailed {

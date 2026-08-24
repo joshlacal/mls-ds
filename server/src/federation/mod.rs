@@ -1,5 +1,6 @@
 pub mod ack;
 pub mod declaration_client;
+pub mod envelope;
 pub mod errors;
 pub mod mailbox;
 pub mod outbound;
@@ -15,9 +16,13 @@ pub mod upstream;
 
 pub use ack::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
+pub use envelope::*;
 pub use errors::{FederationError, ResolutionFailureKind};
 pub use mailbox::FederatedBackend;
-pub use receipt::*;
+pub use receipt::{
+    configured_receipt_signer, hash_commit, validate_receipt_did_document, ReceiptConfigError,
+    ReceiptDidDocumentError, ReceiptSigner, SequencerReceipt, RECEIPT_VERIFICATION_METHOD,
+};
 pub use resolver::{DsEndpoint, DsResolver};
 pub use sequencer::{CommitResult, Sequencer};
 pub use service_auth::ServiceAuthClient;

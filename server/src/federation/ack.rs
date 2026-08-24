@@ -105,6 +105,19 @@ impl AckSigner {
             signature: sig.to_bytes().to_vec(),
         }
     }
+    /// Sign arbitrary canonical bytes producing a 64-byte IEEE P1363 (r || s) signature.
+    pub fn sign_canonical_bytes(&self, canonical: &[u8]) -> [u8; 64] {
+        let sig: Signature = self.signing_key.sign(canonical);
+        let bytes = sig.to_bytes();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&bytes);
+        out
+    }
+
+    /// Return the public verifying key of this signer.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        *self.signing_key.verifying_key()
+    }
 
     /// The DID of this delivery service.
     pub fn ds_did(&self) -> &str {

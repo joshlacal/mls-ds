@@ -1,40 +1,27 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mlsDS.submitCommit",
-  "description": "Submit a commit for CAS sequencing on the sequencer DS.",
+  "description": "Submit an actor-signed MLS commit to the sequencer DS for canonical transition planning and execution.",
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Submit an MLS commit for epoch ordering via compare-and-swap. The sequencer assigns the epoch and returns a receipt.",
+      "description": "Submit a signed commit transition to the sequencer DS for execution through the canonical submitTransition planner and executor.",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "senderDsDid", "epoch", "proposedEpoch", "commitData", "sequencerTerm"],
+          "required": [
+            "header",
+            "signedRequestBytes"
+          ],
           "properties": {
-            "convoId": {
-              "type": "string",
-              "description": "Conversation ID"
+            "header": {
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#envelopeHeaderV1"
             },
-            "senderDsDid": {
-              "type": "string",
-              "description": "DID of the submitting delivery service"
-            },
-            "epoch": {
-              "type": "integer",
-              "description": "Current expected epoch"
-            },
-            "proposedEpoch": {
-              "type": "integer",
-              "description": "Proposed next epoch"
-            },
-            "commitData": {
+            "signedRequestBytes": {
               "type": "bytes",
-              "description": "Serialized MLS commit"
-            },
-            "sequencerTerm": {
-              "type": "integer",
-              "description": "Current sequencer term for CAS validation"
+              "description": "Exact JSON bytes of the signed commit transition request"
             }
           }
         }
@@ -43,23 +30,28 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["accepted", "assignedEpoch", "sequencerTerm"],
+          "required": ["coordinates", "commitEntry", "welcomes", "receipt"],
           "properties": {
-            "accepted": {
-              "type": "boolean",
-              "description": "Whether the commit was accepted"
+            "coordinates": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCoordinates"
             },
-            "assignedEpoch": {
-              "type": "integer",
-              "description": "Epoch assigned by the sequencer"
+            "commitEntry": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#commitEntry"
             },
-            "sequencerTerm": {
-              "type": "integer",
-              "description": "Current sequencer term"
+            "welcomes": {
+              "type": "array",
+              "items": {
+                "type": "ref",
+                "ref": "blue.catbird.chat.defs#welcomeDeliveryView"
+              },
+              "minLength": 0,
+              "maxLength": 100
             },
             "receipt": {
-              "type": "string",
-              "description": "Sequencer receipt for the commit"
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#federationReceiptV1"
             }
           }
         }
@@ -68,7 +60,9 @@
         {"name": "ConversationNotFound"},
         {"name": "NotSequencer"},
         {"name": "TermStale"},
-        {"name": "CommitConflict"}
+        {"name": "CommitConflict"},
+        {"name": "InvalidEnvelope"},
+        {"name": "UnauthorizedParticipantDs"}
       ]
     }
   }

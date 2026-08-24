@@ -7,6 +7,7 @@
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
+use chrono::{DateTime, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -4166,6 +4167,50 @@ impl HydrationAuthority {
             trusted_read_at,
             durable_row_digest: digest.finalize().into(),
             transaction_id: guard.transaction_id().to_owned(),
+            authority_scope_digest: [0; 32],
+        })
+    }
+
+    pub(crate) fn locked_registration_from_raw_parts(
+        &self,
+        did: BareDid,
+        device_id: CanonicalUuidV4,
+        key: KeyThumbprint,
+        registered_mls_signature_key: [u8; 32],
+        auth_generation: u64,
+        trusted_read_at_dt: DateTime<Utc>,
+    ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        let actor = DeviceIdentity::new(
+            PrincipalId::new(did.as_str().as_bytes().to_vec())?,
+            *device_id.as_bytes(),
+        )?;
+        let key_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(key.as_str())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let trusted_read_at =
+            ServerTimestamp::from_unix_millis(trusted_read_at_dt.timestamp_millis())?;
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
+        digest.update(self.expected_conversation_id);
+        digest.update((actor.principal().as_bytes().len() as u64).to_be_bytes());
+        digest.update(actor.principal().as_bytes());
+        digest.update(actor.device_id());
+        digest.update(key_id);
+        digest.update(registered_mls_signature_key);
+        digest.update(auth_generation.to_be_bytes());
+        digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        Ok(LockedRegistrationProjection {
+            conversation_id: self.expected_conversation_id,
+            actor,
+            key_id,
+            registered_mls_signature_key,
+            auth_generation,
+            status: PersistedRegistrationStatus::Active,
+            trusted_read_at,
+            durable_row_digest: digest.finalize().into(),
+            transaction_id: String::new(),
             authority_scope_digest: [0; 32],
         })
     }

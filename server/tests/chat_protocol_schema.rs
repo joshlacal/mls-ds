@@ -29,19 +29,19 @@ use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::panic::AssertUnwindSafe;
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-static MIGRATION_VERSIONS: LazyLock<[i64; 21]> = LazyLock::new(|| {
+static MIGRATION_VERSIONS: LazyLock<[i64; 22]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
             .version
     })
 });
-static MIGRATION_FILES: LazyLock<[&'static str; 21]> = LazyLock::new(|| {
+static MIGRATION_FILES: LazyLock<[&'static str; 22]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index].filename
     })
 });
-static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 21]> = LazyLock::new(|| {
+static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 22]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
@@ -49,7 +49,6 @@ static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 21]> = LazyLock::new(|| {
             .as_ref()
     })
 });
-
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 //
@@ -801,7 +800,6 @@ struct A0ApprovedRuntimeBinding {
     manifest_sha256: String,
     files: Vec<A0ApprovedFileDigest>,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct A0CanonicalEvidence {
     decision: &'static str,
@@ -2341,6 +2339,7 @@ const BLOB_TABLES: [&str; 4] = [
 const OPERATION_CLAIM_TABLES: [&str; 1] = ["operation_claims"];
 const OPERATION_CLAIM_COMPLETENESS_TABLES: [&str; 1] = ["operation_claim_completeness_cutover"];
 const G7_INVENTORY_TABLES: [&str; 2] = ["event_cursor_receipts", "inventory_page_receipts"];
+const FEDERATION_RECEIPT_TABLES: [&str; 1] = ["federation_delivery_receipts"];
 
 fn expected_tables() -> BTreeSet<String> {
     CORE_TABLES
@@ -2350,6 +2349,7 @@ fn expected_tables() -> BTreeSet<String> {
         .chain(OPERATION_CLAIM_TABLES.iter())
         .chain(OPERATION_CLAIM_COMPLETENESS_TABLES.iter())
         .chain(G7_INVENTORY_TABLES.iter())
+        .chain(FEDERATION_RECEIPT_TABLES.iter())
         .map(|name| (*name).to_owned())
         .collect()
 }
@@ -2374,14 +2374,14 @@ fn clean_chat_migration_inventory_orders_g7_entitlement_last() {
         MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
         "migration versions must remain strictly increasing"
     );
-    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000003));
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000004));
     assert_eq!(
         MIGRATION_FILES.last(),
-        Some(&"20260824000003_chat_federation_routing.sql")
+        Some(&"20260824000004_chat_federation_delivery_receipts.sql")
     );
     assert_eq!(
         MIGRATION_DESCRIPTIONS.last(),
-        Some(&"chat federation routing")
+        Some(&"chat federation delivery receipts")
     );
     for file in MIGRATION_FILES.iter().copied() {
         assert!(
@@ -9796,6 +9796,124 @@ async fn operation_claim_completeness_cutover_matches_durable_classification() {
         .close()
         .await
         .expect("close live completeness connection");
+}
+
+#[tokio::test]
+async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
+    let pool = fresh_pool().await;
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("acquire schema non-regression connection");
+
+    let nullable_welcome_cols: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = 'chat' AND table_name = 'welcome_bundles'
+           AND column_name IN ('transition_id', 'entry_seq', 'generation', 'state_version', 'group_id', 'epoch', 'group_context_hash', 'confirmation_tag')
+           AND is_nullable = 'YES'
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("check welcome_bundles nullability");
+    assert!(
+        nullable_welcome_cols.is_empty(),
+        "welcome_bundles columns must not be nullable: {:?}",
+        nullable_welcome_cols
+    );
+
+    let recovery_id_nullable: String = sqlx::query_scalar(
+        r#"
+        SELECT is_nullable
+          FROM information_schema.columns
+         WHERE table_schema = 'chat' AND table_name = 'welcome_deliveries'
+           AND column_name = 'recovery_request_id'
+        "#,
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .expect("check recovery_request_id nullability");
+    assert_eq!(
+        recovery_id_nullable, "NO",
+        "recovery_request_id must remain NOT NULL"
+    );
+
+    let fk_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT conname
+          FROM pg_constraint c
+          JOIN pg_namespace n ON n.oid = c.connamespace
+         WHERE n.nspname = 'chat' AND c.contype = 'f'
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("check FK constraints");
+
+    for required_fk in [
+        "generation_states_generation_fk",
+        "entries_actor_key_fk",
+        "entries_transition_fk",
+        "participants_invitation_provenance_fk",
+        "participants_acceptance_transition_fk",
+        "federation_delivery_receipts_conversation_fk",
+        "federation_delivery_receipts_source_entry_fk",
+    ] {
+        assert!(
+            fk_names.iter().any(|k| k == required_fk),
+            "missing required FK: {required_fk}"
+        );
+    }
+
+    let uq_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT conname
+          FROM pg_constraint c
+          JOIN pg_namespace n ON n.oid = c.connamespace
+         WHERE n.nspname = 'chat' AND c.contype = 'u'
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("check UQ constraints");
+
+    assert!(
+        uq_names
+            .iter()
+            .any(|k| k == "entries_delivery_receipt_source_uq"),
+        "missing entries_delivery_receipt_source_uq"
+    );
+
+    let triggers: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT tgname
+          FROM pg_trigger tg
+          JOIN pg_class c ON c.oid = tg.tgrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'chat' AND NOT tg.tgisinternal
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("check triggers");
+
+    for required_tg in [
+        "entries_immutable",
+        "welcome_bundles_immutable",
+        "welcome_deliveries_identity_immutable",
+        "conversations_identity_immutable",
+        "federation_delivery_receipts_immutable",
+    ] {
+        assert!(
+            triggers.iter().any(|t| t == required_tg),
+            "missing required trigger: {required_tg}"
+        );
+    }
+
+    connection.close().await.expect("close connection");
+    pool.close().await;
 }
 
 #[tokio::test]

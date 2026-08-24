@@ -81,6 +81,27 @@ pub enum FederationError {
         limit: i64,
     },
 
+    #[error("Invalid federation envelope: {reason}")]
+    InvalidEnvelope { reason: String },
+
+    #[error("Remote mailbox is not provisioned: {reason}")]
+    MailboxNotProvisioned { reason: String },
+
+    #[error("Federation delivery conflict: {reason}")]
+    DeliveryConflict { reason: String },
+
+    #[error("Federation sequence conflict: {reason}")]
+    SequenceConflict { reason: String },
+
+    #[error("Unauthorized participant DS: {reason}")]
+    UnauthorizedParticipantDs { reason: String },
+
+    #[error("Unauthorized recipient: {reason}")]
+    UnauthorizedRecipient { reason: String },
+
+    #[error("Federation acknowledgment signer is unavailable")]
+    SignerUnavailable,
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -97,11 +118,19 @@ impl FederationError {
             Self::EndpointNotFound { .. }
             | Self::ConversationNotFound { .. }
             | Self::RecipientNotFound { .. }
+            | Self::MailboxNotProvisioned { .. }
             | Self::NoKeyPackagesAvailable { .. } => StatusCode::NOT_FOUND,
-            Self::CommitConflict { .. } | Self::TermStale { .. } => StatusCode::CONFLICT,
-            Self::NotSequencer { .. } => StatusCode::FORBIDDEN,
+            Self::CommitConflict { .. }
+            | Self::TermStale { .. }
+            | Self::DeliveryConflict { .. }
+            | Self::SequenceConflict { .. } => StatusCode::CONFLICT,
+            Self::NotSequencer { .. }
+            | Self::UnauthorizedParticipantDs { .. }
+            | Self::UnauthorizedRecipient { .. } => StatusCode::FORBIDDEN,
             Self::AuthFailed { .. } => StatusCode::UNAUTHORIZED,
-            Self::InvalidProof | Self::InvalidCommitFraming { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidProof
+            | Self::InvalidCommitFraming { .. }
+            | Self::InvalidEnvelope { .. } => StatusCode::BAD_REQUEST,
             Self::DsUnreachable { .. } | Self::ResolutionFailed { .. } | Self::Http(_) => {
                 StatusCode::BAD_GATEWAY
             }
@@ -110,9 +139,10 @@ impl FederationError {
             Self::RemoteError { status, .. } => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
             }
-            Self::TransferFailed { .. } | Self::ConfigError { .. } | Self::Database(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::TransferFailed { .. }
+            | Self::ConfigError { .. }
+            | Self::SignerUnavailable
+            | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Json(_) => StatusCode::BAD_REQUEST,
         }
     }
@@ -133,6 +163,13 @@ impl FederationError {
             Self::NoKeyPackagesAvailable { .. } => "NoKeyPackagesAvailable",
             Self::InvalidProof => "InvalidProof",
             Self::InvalidCommitFraming { .. } => "InvalidCommitFraming",
+            Self::InvalidEnvelope { .. } => "InvalidEnvelope",
+            Self::MailboxNotProvisioned { .. } => "MailboxNotProvisioned",
+            Self::DeliveryConflict { .. } => "DeliveryConflict",
+            Self::SequenceConflict { .. } => "SequenceConflict",
+            Self::UnauthorizedParticipantDs { .. } => "UnauthorizedParticipantDs",
+            Self::UnauthorizedRecipient { .. } => "UnauthorizedRecipient",
+            Self::SignerUnavailable => "SignerUnavailable",
             Self::ConfigError { .. } => "ConfigError",
             Self::OutboundQueuePeerCapExceeded { .. }
             | Self::OutboundQueueConvoPeerCapExceeded { .. } => "QueueCapacityExceeded",
@@ -151,9 +188,16 @@ impl FederationError {
             Self::RemoteError { status, .. } if *status == 429 => "rate_limited",
             Self::OutboundQueuePeerCapExceeded { .. }
             | Self::OutboundQueueConvoPeerCapExceeded { .. } => "queue_capacity_exceeded",
-            Self::Json(_) | Self::InvalidProof | Self::InvalidCommitFraming { .. } => {
-                "invalid_payload"
-            }
+            Self::MailboxNotProvisioned { .. } => "mailbox_not_provisioned",
+            Self::DeliveryConflict { .. } => "delivery_conflict",
+            Self::SequenceConflict { .. } => "sequence_conflict",
+            Self::UnauthorizedParticipantDs { .. } => "unauthorized_participant_ds",
+            Self::UnauthorizedRecipient { .. } => "unauthorized_recipient",
+            Self::SignerUnavailable => "signer_unavailable",
+            Self::Json(_)
+            | Self::InvalidProof
+            | Self::InvalidCommitFraming { .. }
+            | Self::InvalidEnvelope { .. } => "invalid_payload",
             _ => "conflict",
         }
     }

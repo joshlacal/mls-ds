@@ -1,0 +1,173 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.mlsDS.defs",
+  "description": "Closed MLS v2 Clean Delivery Service federation definitions.",
+  "defs": {
+    "protocolVersion": {
+      "type": "string",
+      "enum": ["1"]
+    },
+    "envelopeHeaderV1": {
+      "type": "object",
+      "required": [
+        "protocolVersion",
+        "deliveryId",
+        "conversationId",
+        "senderDsDid",
+        "receiverDsDid",
+        "sequencerDid",
+        "sequencerTerm",
+        "payloadSha256"
+      ],
+      "properties": {
+        "protocolVersion": {
+          "type": "ref",
+          "ref": "#protocolVersion"
+        },
+        "deliveryId": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#operationId"
+        },
+        "conversationId": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#operationId"
+        },
+        "senderDsDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "receiverDsDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "sequencerDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "sequencerTerm": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "payloadSha256": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        }
+      }
+    },
+    "entryLocatorV1": {
+      "type": "object",
+      "required": [
+        "entryId",
+        "seq",
+        "acceptedPayloadSha256",
+        "outerEntryFingerprint"
+      ],
+      "properties": {
+        "entryId": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#operationId"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "acceptedPayloadSha256": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "outerEntryFingerprint": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        }
+      }
+    },
+    "federationEndpoint": {
+      "type": "string",
+      "enum": [
+        "blue.catbird.mlsDS.deliverWelcome",
+        "blue.catbird.mlsDS.deliverMessage",
+        "blue.catbird.mlsDS.submitCommit"
+      ]
+    },
+    "federationReceiptV1": {
+      "type": "object",
+      "required": [
+        "protocolVersion",
+        "endpoint",
+        "deliveryId",
+        "conversationId",
+        "senderDsDid",
+        "receiverDsDid",
+        "sequencerDid",
+        "sequencerTerm",
+        "envelopeSha256",
+        "resultSha256",
+        "completedAt",
+        "signature"
+      ],
+      "properties": {
+        "protocolVersion": {
+          "type": "ref",
+          "ref": "#protocolVersion"
+        },
+        "endpoint": {
+          "type": "ref",
+          "ref": "#federationEndpoint"
+        },
+        "deliveryId": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#operationId"
+        },
+        "conversationId": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#operationId"
+        },
+        "senderDsDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "receiverDsDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "sequencerDid": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#bareDid"
+        },
+        "sequencerTerm": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "envelopeSha256": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "resultSha256": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "sourceLocator": {
+          "type": "ref",
+          "ref": "#entryLocatorV1"
+        },
+        "completedAt": {
+          "type": "ref",
+          "ref": "blue.catbird.chat.defs#canonicalDatetime"
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    }
+  }
+}

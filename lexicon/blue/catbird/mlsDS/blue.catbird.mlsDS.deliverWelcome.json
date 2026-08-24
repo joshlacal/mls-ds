@@ -1,40 +1,91 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mlsDS.deliverWelcome",
-  "description": "Accept a Welcome message for a new member from a remote DS.",
+  "description": "Accept and verify an inbound MLS Welcome message from a remote sequencer DS for a preprovisioned local recipient mailbox.",
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Deliver a federated MLS Welcome message to add a user to a group on the local DS.",
+      "description": "Deliver a federated MLS Welcome message to complete local preprovisioned participant addition on the destination DS.",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "recipientDid", "senderDsDid", "keyPackageHash", "welcomeData", "initialEpoch"],
+          "required": [
+            "header",
+            "recipientDid",
+            "recipientDeviceId",
+            "welcomeId",
+            "recoveryRequestId",
+            "keyPackageRef",
+            "welcomeBytes",
+            "welcomeSha256",
+            "entryBytes",
+            "signedRequestBytes",
+            "entryLocator",
+            "coordinates",
+            "publicSnapshotSha256",
+            "treeSummarySha256"
+          ],
           "properties": {
-            "convoId": {
-              "type": "string",
-              "description": "Conversation ID"
+            "header": {
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#envelopeHeaderV1"
             },
             "recipientDid": {
-              "type": "string",
-              "description": "DID of the recipient user"
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#bareDid"
             },
-            "senderDsDid": {
-              "type": "string",
-              "description": "DID of the sending delivery service"
+            "recipientDeviceId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceId"
             },
-            "keyPackageHash": {
-              "type": "string",
-              "description": "Hash of the consumed key package"
+            "welcomeId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#operationId"
             },
-            "welcomeData": {
+            "recoveryRequestId": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#operationId"
+            },
+            "keyPackageRef": {
               "type": "bytes",
-              "description": "Serialized MLS Welcome message"
+              "minLength": 32,
+              "maxLength": 32
             },
-            "initialEpoch": {
-              "type": "integer",
-              "description": "Initial epoch of the group for the new member"
+            "welcomeBytes": {
+              "type": "bytes",
+              "description": "Serialized MLS Welcome message bytes"
+            },
+            "welcomeSha256": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "entryBytes": {
+              "type": "bytes",
+              "description": "Canonical DAG-CBOR bytes of the exact control entry"
+            },
+            "signedRequestBytes": {
+              "type": "bytes",
+              "description": "Exact JSON bytes of the signed transition request"
+            },
+            "entryLocator": {
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#entryLocatorV1"
+            },
+            "coordinates": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#conversationCoordinates"
+            },
+            "publicSnapshotSha256": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
+            },
+            "treeSummarySha256": {
+              "type": "bytes",
+              "minLength": 32,
+              "maxLength": 32
             }
           }
         }
@@ -43,22 +94,26 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["accepted"],
+          "required": ["accepted", "receipt"],
           "properties": {
             "accepted": {
               "type": "boolean",
-              "description": "Whether the welcome was accepted"
+              "description": "Whether the welcome was accepted and verified against preprovisioned mailbox state"
             },
-            "ack": {
+            "receipt": {
               "type": "ref",
-              "ref": "blue.catbird.mlsDS.deliverMessage#deliveryAck"
+              "ref": "blue.catbird.mlsDS.defs#federationReceiptV1"
             }
           }
         }
       },
       "errors": [
-        {"name": "RecipientNotFound"},
-        {"name": "NotSequencer"}
+        {"name": "MailboxNotProvisioned"},
+        {"name": "DeliveryConflict"},
+        {"name": "NotSequencer"},
+        {"name": "TermStale"},
+        {"name": "InvalidEnvelope"},
+        {"name": "UnauthorizedRecipient"}
       ]
     }
   }

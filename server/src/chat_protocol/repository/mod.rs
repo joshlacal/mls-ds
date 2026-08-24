@@ -16,8 +16,8 @@ pub(crate) mod entry_read;
 pub(crate) mod execution_context;
 #[allow(dead_code)]
 pub(crate) mod expiry_sweep;
+pub(crate) mod federation;
 pub(crate) mod inventory;
-#[allow(dead_code)]
 pub(crate) mod key_packages;
 pub(crate) mod leave;
 pub(crate) mod message_delivery;

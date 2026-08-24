@@ -1,52 +1,42 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.mlsDS.deliverMessage",
-  "description": "Accept an inbound MLS message from a remote DS and store it for local subscribers.",
+  "description": "Accept an inbound MLS application message from a remote sequencer DS for a local recipient.",
   "defs": {
     "main": {
       "type": "procedure",
-      "description": "Deliver a federated MLS message to a local DS for storage and SSE fanout.",
+      "description": "Deliver a federated MLS application message to a local recipient on the destination DS.",
       "input": {
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["convoId", "msgId", "epoch", "senderDsDid", "ciphertext", "paddedSize", "deliveryId", "sequencerTerm"],
+          "required": [
+            "header",
+            "entryBytes",
+            "signedRequestBytes",
+            "recipientDid",
+            "entryLocator"
+          ],
           "properties": {
-            "convoId": {
-              "type": "string",
-              "description": "Conversation ID"
+            "header": {
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#envelopeHeaderV1"
             },
-            "msgId": {
-              "type": "string",
-              "description": "Unique message ID (ULID)"
-            },
-            "epoch": {
-              "type": "integer",
-              "description": "MLS epoch of the message"
-            },
-            "senderDsDid": {
-              "type": "string",
-              "description": "DID of the sending delivery service"
-            },
-            "ciphertext": {
+            "entryBytes": {
               "type": "bytes",
-              "description": "Encrypted MLS message payload"
+              "description": "Canonical DAG-CBOR bytes of the exact applicationEntry"
             },
-            "paddedSize": {
-              "type": "integer",
-              "description": "Padded size of the plaintext for uniform message lengths"
+            "signedRequestBytes": {
+              "type": "bytes",
+              "description": "Exact JSON bytes of the signed message request"
             },
-            "messageType": {
-              "type": "string",
-              "description": "Message type (default: 'app')"
+            "recipientDid": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#bareDid"
             },
-            "deliveryId": {
-              "type": "string",
-              "description": "Delivery tracking ID (ULID)"
-            },
-            "sequencerTerm": {
-              "type": "integer",
-              "description": "Current sequencer term for CAS validation"
+            "entryLocator": {
+              "type": "ref",
+              "ref": "blue.catbird.mlsDS.defs#entryLocatorV1"
             }
           }
         }
@@ -55,55 +45,28 @@
         "encoding": "application/json",
         "schema": {
           "type": "object",
-          "required": ["accepted", "seq", "deliveryId"],
+          "required": ["accepted", "receipt"],
           "properties": {
             "accepted": {
               "type": "boolean",
-              "description": "Whether the message was accepted"
+              "description": "Whether the message was delivered and persisted"
             },
-            "seq": {
-              "type": "integer",
-              "description": "Assigned sequence number"
-            },
-            "deliveryId": {
-              "type": "string",
-              "description": "Echo of the delivery ID"
-            },
-            "ack": {
+            "receipt": {
               "type": "ref",
-              "ref": "#deliveryAck"
+              "ref": "blue.catbird.mlsDS.defs#federationReceiptV1"
             }
           }
         }
       },
       "errors": [
-        {"name": "ConversationNotFound"},
+        {"name": "MailboxNotProvisioned"},
+        {"name": "SequenceConflict"},
+        {"name": "DeliveryConflict"},
         {"name": "NotSequencer"},
-        {"name": "TermStale"}
+        {"name": "TermStale"},
+        {"name": "InvalidEnvelope"},
+        {"name": "UnauthorizedRecipient"}
       ]
-    },
-    "deliveryAck": {
-      "type": "object",
-      "description": "Signed delivery acknowledgment",
-      "required": ["sig"],
-      "properties": {
-        "sig": {
-          "type": "string",
-          "description": "Signed acknowledgment token"
-        },
-        "msgId": {
-          "type": "string"
-        },
-        "convoId": {
-          "type": "string"
-        },
-        "epoch": {
-          "type": "integer"
-        },
-        "term": {
-          "type": "integer"
-        }
-      }
     }
   }
 }

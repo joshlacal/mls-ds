@@ -508,7 +508,9 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     ))
 }
 
-fn control_kind(kind: SignedMutationKind) -> Result<ControlEntryKind, SubmitTransitionFacadeError> {
+pub(in crate::chat_protocol::repository) fn control_kind(
+    kind: SignedMutationKind,
+) -> Result<ControlEntryKind, SubmitTransitionFacadeError> {
     match kind {
         SignedMutationKind::CommitTransition => Ok(ControlEntryKind::Commit),
         SignedMutationKind::PolicyTransition => Ok(ControlEntryKind::Policy),
@@ -518,7 +520,7 @@ fn control_kind(kind: SignedMutationKind) -> Result<ControlEntryKind, SubmitTran
     }
 }
 
-async fn hydrate_terminal_recovery_packages(
+pub(in crate::chat_protocol::repository) async fn hydrate_terminal_recovery_packages(
     transaction: &mut Transaction<'_, Postgres>,
     aggregate: &LockedConversationStateGuard,
 ) -> Result<Vec<LockedRecoveryPackageGuard>, SubmitTransitionFacadeError> {
@@ -542,7 +544,7 @@ async fn hydrate_terminal_recovery_packages(
     Ok(packages)
 }
 
-fn validate_applied_transition(
+pub(in crate::chat_protocol::repository) fn validate_applied_transition(
     applied: &AppliedTransition,
     expected_entry_id: Uuid,
     expected_seq: u64,
@@ -835,12 +837,14 @@ fn reverify_scope_mutation(
     Ok(verified)
 }
 
-fn canonical_uuid_v4(value: Uuid) -> Result<CanonicalUuidV4, SubmitTransitionFacadeError> {
+pub(in crate::chat_protocol::repository) fn canonical_uuid_v4(
+    value: Uuid,
+) -> Result<CanonicalUuidV4, SubmitTransitionFacadeError> {
     CanonicalUuidV4::parse(&value.hyphenated().to_string())
         .map_err(SubmitTransitionFacadeError::from)
 }
 
-fn canonical_response_from_plan(
+pub(in crate::chat_protocol::repository) fn canonical_response_from_plan(
     plan: &ConversationPersistencePlan,
     canonical_response_entry: &[u8],
 ) -> Result<SubmitTransitionCanonicalResponse, SubmitTransitionFacadeError> {

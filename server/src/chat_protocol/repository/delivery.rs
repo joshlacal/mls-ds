@@ -401,6 +401,176 @@ async fn insert_message_send_row(
     Ok(())
 }
 
+/// Insert one application send at an exact, expected sequence number and advance the conversation head via CAS.
+pub(crate) async fn append_exact_application_entry(
+    transaction: &mut Transaction<'_, Postgres>,
+    send: &ApplicationSend,
+    expected_seq: u64,
+) -> Result<u64, DeliveryRepositoryError> {
+    let message_id = send
+        .entry
+        .message_id
+        .ok_or(DeliveryRepositoryError::MissingMessageId)?;
+    let seq_i64 =
+        i64::try_from(expected_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+
+    let head_row: Option<(Option<i64>, i64)> = sqlx::query_as(
+        r#"
+        SELECT current_entry_seq, next_entry_seq
+          FROM chat.conversations
+         WHERE conversation_id = $1
+         FOR UPDATE
+        "#,
+    )
+    .bind(send.entry.conversation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let (_current_seq, next_entry_seq) =
+        head_row.ok_or(DeliveryRepositoryError::ConversationMissing)?;
+    if next_entry_seq != seq_i64 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+
+    append_entry_at(transaction, &send.entry, expected_seq).await?;
+    insert_message_send_row(transaction, send, message_id, "accepted", Some(expected_seq)).await?;
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE chat.conversations
+           SET current_entry_seq = $1,
+               next_entry_seq = $1 + 1
+         WHERE conversation_id = $2
+           AND next_entry_seq = $1
+        "#,
+    )
+    .bind(seq_i64)
+    .bind(send.entry.conversation_id)
+    .execute(&mut **transaction)
+    .await?;
+
+    if updated.rows_affected() != 1 {
+        return Err(DeliveryRepositoryError::CompareAndSetConflict);
+    }
+
+    Ok(expected_seq)
+}
+
+/// Exact compare of an existing application entry and message send row.
+pub(crate) async fn compare_exact_application_entry(
+    transaction: &mut Transaction<'_, Postgres>,
+    send: &ApplicationSend,
+    expected_seq: u64,
+) -> Result<bool, DeliveryRepositoryError> {
+    let message_id = send
+        .entry
+        .message_id
+        .ok_or(DeliveryRepositoryError::MissingMessageId)?;
+    let seq_i64 =
+        i64::try_from(expected_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
+
+    let entry_row: Option<(
+        Uuid,
+        String,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        Uuid,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<Uuid>,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256,
+               signed_request_bytes, request_digest, signature, outer_entry_fingerprint,
+               actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+               generation, state_version, message_id, received_at
+          FROM chat.entries
+         WHERE conversation_id = $1 AND seq = $2
+        "#,
+    )
+    .bind(send.entry.conversation_id)
+    .bind(seq_i64)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let Some((
+        entry_id,
+        entry_kind,
+        accepted_payload_bytes,
+        accepted_payload_sha256,
+        signed_request_bytes,
+        request_digest,
+        signature,
+        outer_entry_fingerprint,
+        actor_did,
+        actor_device_id,
+        actor_key_id,
+        actor_auth_generation,
+        generation,
+        state_version,
+        stored_message_id,
+        received_at,
+    )) = entry_row
+    else {
+        return Ok(false);
+    };
+
+    if entry_id != send.entry.entry_id
+        || entry_kind != send.entry.entry_kind
+        || accepted_payload_bytes != send.entry.accepted_payload_bytes
+        || accepted_payload_sha256 != send.entry.accepted_payload_sha256
+        || signed_request_bytes != send.entry.signed_request_bytes
+        || request_digest != send.entry.request_digest
+        || signature != send.entry.signature
+        || outer_entry_fingerprint != send.entry.outer_entry_fingerprint
+        || actor_did != send.entry.actor_did
+        || actor_device_id != send.entry.actor_device_id
+        || actor_key_id != send.entry.actor_key_id
+        || actor_auth_generation != send.entry.actor_auth_generation
+        || generation != send.entry.generation
+        || state_version != send.entry.state_version
+        || stored_message_id != Some(message_id)
+        || received_at != send.entry.received_at
+    {
+        return Ok(false);
+    }
+
+    let send_row: Option<(String, Option<i64>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT status, accepted_entry_seq, signing_transcript_bytes, outcome_bytes
+          FROM chat.message_sends
+         WHERE conversation_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(send.entry.conversation_id)
+    .bind(message_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    let Some((status, accepted_entry_seq, signing_transcript_bytes, outcome_bytes)) = send_row
+    else {
+        return Ok(false);
+    };
+
+    if status != "accepted"
+        || accepted_entry_seq != Some(seq_i64)
+        || signing_transcript_bytes != send.signing_transcript_bytes
+        || outcome_bytes != send.outcome_bytes
+    {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
 // ===========================================================================
 // Audience, event, and outbox write primitives.
 //
