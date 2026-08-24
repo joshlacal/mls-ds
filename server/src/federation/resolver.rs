@@ -444,6 +444,7 @@ pub type DestinationResolverFn = Arc<
         + Sync,
 >;
 
+#[cfg(any(test, feature = "test-support"))]
 pub type UserDidResolverFn =
     Arc<dyn Fn(&str) -> Option<Result<DsEndpoint, FederationError>> + Send + Sync>;
 
@@ -458,6 +459,7 @@ pub struct DsResolver {
     default_ds_endpoint: Option<String>,
     cache_ttl_secs: i64,
     destination_resolver: Option<DestinationResolverFn>,
+    #[cfg(any(test, feature = "test-support"))]
     user_did_resolver: Option<UserDidResolverFn>,
 }
 
@@ -496,6 +498,7 @@ impl DsResolver {
             default_ds_endpoint: resolved_default_endpoint,
             cache_ttl_secs: cache_ttl_secs as i64,
             destination_resolver: None,
+            #[cfg(any(test, feature = "test-support"))]
             user_did_resolver: None,
         }
     }
@@ -504,6 +507,7 @@ impl DsResolver {
         self.destination_resolver = Some(hook);
         self
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_user_did_resolver_hook(mut self, hook: UserDidResolverFn) -> Self {
         self.user_did_resolver = Some(hook);
         self
@@ -590,6 +594,7 @@ impl DsResolver {
         &self,
         user_did: &str,
     ) -> (Result<DsEndpoint, FederationError>, &'static str) {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.user_did_resolver {
             if let Some(res) = hook(user_did) {
                 return (res, "test_hook");

@@ -23,7 +23,7 @@ use crate::storage::DbPool;
 
 mod accept_conversation;
 mod blob_routes;
-pub(crate) mod context;
+mod context;
 mod conversation_state;
 mod create_conversation;
 mod device_views;
@@ -55,6 +55,17 @@ pub use expiry_worker::{
 };
 pub use runtime::ChatRuntime;
 pub use subscribe_events::{parse_query as parse_subscribe_events_query, SubscribeEventsQuery};
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn admit_signed_operation_for_test(
+    pool: &DbPool,
+    runtime: &ChatRuntime,
+    endpoint: ChatEndpoint,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<crate::chat_protocol::repository::auth::SignedOperationAdmission, ChatFailure> {
+    context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await
+}
 
 /// Build the isolated `blue.catbird.chat.*` router. Generic over the
 /// application state so it can be assembled in the binary crate where

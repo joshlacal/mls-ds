@@ -16,7 +16,7 @@ pub async fn execute_creation_with_routing_test(
     body: &[u8],
     routing: Option<super::federation_routing::ConversationRoutingIntent>,
 ) -> Result<(), String> {
-    let admission = crate::handlers::chat::context::admit_signed_operation_only(
+    let admission = crate::handlers::chat::admit_signed_operation_for_test(
         pool,
         runtime,
         super::error::ChatEndpoint::CreateConversation,
@@ -149,7 +149,7 @@ impl PublicTransport for DeterministicTestTransport {
 pub async fn seed_deterministic_creation_fallback(
     pool: &PgPool,
     inviter: &str,
-    roster: Vec<String>,
+    mut roster: Vec<String>,
     pending_recipients: Vec<String>,
     operation: AdmissionOperation,
 ) -> Result<(), String> {
@@ -158,6 +158,7 @@ pub async fn seed_deterministic_creation_fallback(
             .map_err(|e| format!("fixed config error: {e:?}"))?,
         DeterministicTestTransport,
     );
+    roster.sort();
     let admission_req = AdmissionRequest {
         inviter: inviter.to_string(),
         roster,
@@ -199,7 +200,7 @@ pub async fn seed_deterministic_creation_fallback(
 pub async fn seed_deterministic_pending_add_fallback(
     pool: &PgPool,
     inviter: &str,
-    roster: Vec<String>,
+    mut roster: Vec<String>,
     pending_recipients: Vec<String>,
 ) -> Result<(), String> {
     let rel_authority = RelationshipAuthority::new(
@@ -207,6 +208,7 @@ pub async fn seed_deterministic_pending_add_fallback(
             .map_err(|e| format!("fixed config error: {e:?}"))?,
         DeterministicTestTransport,
     );
+    roster.sort();
     let admission_req = AdmissionRequest {
         inviter: inviter.to_string(),
         roster,

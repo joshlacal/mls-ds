@@ -1421,7 +1421,8 @@ async fn test_routing_drift_after_real_locks_aborts_cleanly() {
         &dpop_jkt,
     )
     .await;
-    let roster = vec![fixture.actor_did.clone(), invitee_did.clone()];
+    let mut roster = vec![fixture.actor_did.clone(), invitee_did.clone()];
+    roster.sort();
     catbird_server::chat_protocol::test_support::seed_deterministic_creation_fallback(
         &pool,
         &fixture.actor_did,
