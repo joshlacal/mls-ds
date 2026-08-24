@@ -43,37 +43,39 @@ async fn handle_inner(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
-    if let Some(completed) =
+    let completed_preflight =
         crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
             .await
             .map_err(|e| context::auth_repository_failure(endpoint, e))?
-    {
-        return context::canonical_json_response(
-            endpoint,
-            completed.status,
-            completed.response_bytes,
+            .is_some();
+    // The preflight is advisory only. A hit suppresses the expensive routing
+    // lookup, but the canonical operation prelude still owns replay locking,
+    // post-state proof, and response release inside the normal transaction.
+    let routing_intent = if completed_preflight {
+        None
+    } else {
+        let principals = admission
+            .creation_participant_dids()
+            .map_err(|e| context::auth_repository_failure(endpoint, e))?;
+        let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
+            pool,
+            runtime.resolver().map(|resolver| resolver.as_ref()),
+            &principals,
         )
-        .map_err(|_| ChatFailure::invariant(endpoint));
-    }
-    let principals = admission
-        .creation_participant_dids()
-        .map_err(|e| context::auth_repository_failure(endpoint, e))?;
-    let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
-        pool,
-        runtime.resolver().map(|resolver| resolver.as_ref()),
-        &principals,
-    )
-    .await
-    .map_err(|err| {
-        tracing::warn!(
-            ?err,
-            "createConversation participant routing resolution failed"
-        );
-        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
-    })?;
-    let routing_intent = Some(
-        crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(routes),
-    );
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                ?err,
+                "createConversation participant routing resolution failed"
+            );
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
+        })?;
+        Some(
+            crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(
+                routes,
+            ),
+        )
+    };
 
     let mut transaction = pool
         .begin()

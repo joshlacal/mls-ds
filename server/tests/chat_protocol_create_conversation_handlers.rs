@@ -11,9 +11,6 @@ mod common;
 pub use catbird_server::{auth, crypto};
 
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
@@ -23,61 +20,7 @@ mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
-mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
-
-mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod device_directory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/device_directory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-}
-
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -96,9 +39,7 @@ use openmls::prelude::{
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
-use p256::ecdsa::{
-    signature::Signer as _, Signature as P256Signature, SigningKey as P256SigningKey,
-};
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_util::ServiceExt;
@@ -109,7 +50,7 @@ use catbird_server::storage::DbPool;
 use transcript::decode_canonical_signed_mutation;
 use validation::ed25519_key_id;
 
-use tls_codec::{Deserialize as _, Serialize as _, VLBytes};
+use tls_codec::{Deserialize as _, VLBytes};
 
 #[derive(Clone, Debug, tls_codec::TlsSerialize, tls_codec::TlsDeserialize, tls_codec::TlsSize)]
 struct TestGroupInfoEnvelope {
@@ -360,6 +301,7 @@ struct CreationTestFixture {
     actor_ed25519_public_key: Vec<u8>,
     signed_request_json: Value,
     cid: Uuid,
+    transition_id: Uuid,
 }
 
 fn random_did() -> String {
@@ -563,7 +505,6 @@ fn build_test_creation_fixture_with_invitee(
         decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
     let signature = ed_signing.sign(canonical.transcript_bytes());
     wrapper["signature"] = json!(STANDARD.encode(signature.to_bytes()));
-
     CreationTestFixture {
         actor_did,
         actor_device_id,
@@ -571,6 +512,7 @@ fn build_test_creation_fixture_with_invitee(
         actor_ed25519_public_key: public_key_bytes.to_vec(),
         signed_request_json: wrapper,
         cid,
+        transition_id,
     }
 }
 
@@ -782,7 +724,6 @@ async fn create_conversation_cutover_enabled_missing_auth_returns_not_authorized
 }
 
 #[tokio::test]
-#[ignore = "requires the dedicated clean-chat gate database"]
 async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_replays() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let trusted_at: DateTime<Utc> =
@@ -896,6 +837,46 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         first_response_bytes, replay_response_bytes,
         "idempotent replay must return byte-identical response"
     );
+    let (is_remote, sequencer_ds, sequencer_term): (bool, Option<String>, i64) = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds, sequencer_term \
+             FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(fixture.cid)
+    .fetch_one(&pool)
+    .await
+    .expect("read persisted local routing identity");
+    assert!(!is_remote);
+    assert!(sequencer_ds.is_none());
+    assert_eq!(sequencer_term, 0);
+    let participant_ds_dids: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT ds_did FROM chat.participants WHERE conversation_id = $1")
+            .bind(fixture.cid)
+            .fetch_all(&pool)
+            .await
+            .expect("read persisted participant routing identities");
+    assert!(
+        participant_ds_dids.iter().all(Option::is_none),
+        "local participants must persist NULL ds_did"
+    );
+    let (completed_status, response_sha256, response_bytes): (i32, Vec<u8>, Vec<u8>) =
+        sqlx::query_as(
+            "SELECT completed_status, response_sha256, response_bytes \
+             FROM chat.idempotency_records \
+             WHERE principal_did = $1 AND endpoint_nsid = $2 AND operation_id = $3",
+        )
+        .bind(&fixture.actor_did)
+        .bind(ENDPOINT)
+        .bind(fixture.transition_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read canonical completed replay row");
+    assert_eq!(completed_status, 200);
+    assert_eq!(
+        response_sha256.as_slice(),
+        Sha256::digest(&response_bytes).as_slice(),
+        "completed replay must carry a canonical response digest"
+    );
+    assert_eq!(response_bytes, first_response_bytes);
 }
 #[tokio::test]
 #[ignore = "requires the dedicated clean-chat gate database"]
