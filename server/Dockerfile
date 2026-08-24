@@ -26,8 +26,8 @@ COPY codegen codegen
 COPY lexicon lexicon
 RUN cargo build --release -p catbird-server
 
-# ---------- runtime ----------
-FROM debian:bookworm-slim AS runtime
+# ---------- runtime-base ----------
+FROM debian:bookworm-slim AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 libpq5 curl \
@@ -47,10 +47,13 @@ USER catbird
 CMD ["catbird-server"]
 
 # ---------- federation-test (test-only stage with deterministic test fixtures) ----------
-FROM runtime AS federation-test
+FROM runtime-base AS federation-test
 
 USER root
 COPY e2e-tests/fixtures /app/fixtures
 RUN chown -R catbird:catbird /app/fixtures
 
 USER catbird
+
+# ---------- runtime (production default final stage) ----------
+FROM runtime-base AS runtime

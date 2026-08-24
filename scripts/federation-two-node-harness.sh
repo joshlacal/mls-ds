@@ -5,23 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$REPO_ROOT/e2e-tests/docker-compose.federation.yml"
 FIXTURES_DIR="$REPO_ROOT/e2e-tests/fixtures"
-
-STATE_FILE="/tmp/mls-fed-harness-project-${UID:-$(id -u)}"
-
-if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
-  PROJECT_NAME="$COMPOSE_PROJECT_NAME"
-  EXPLICIT_PROJECT=1
-elif [[ -n "${FED_HARNESS_PROJECT_NAME:-}" ]]; then
+if [[ -n "${FED_HARNESS_PROJECT_NAME:-}" ]]; then
   PROJECT_NAME="$FED_HARNESS_PROJECT_NAME"
   EXPLICIT_PROJECT=1
-elif [[ -f "$STATE_FILE" ]] && [[ "${1:-}" != "up" ]]; then
-  PROJECT_NAME="$(cat "$STATE_FILE")"
-  EXPLICIT_PROJECT=0
+elif [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  PROJECT_NAME="$COMPOSE_PROJECT_NAME"
+  EXPLICIT_PROJECT=1
 else
-  PROJECT_NAME="mls-fed-$(date +%s)-$RANDOM"
+  PROJECT_NAME=""
   EXPLICIT_PROJECT=0
 fi
-
 export APP_ENV="${APP_ENV:-test}"
 export FEDERATION_MODE="${FEDERATION_MODE:-allowlist}"
 export FEDERATION_ENABLED="${FEDERATION_ENABLED:-true}"
@@ -49,6 +42,14 @@ compose() {
   (cd "$REPO_ROOT" && docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@")
 }
 
+require_project_name() {
+  if [[ -z "$PROJECT_NAME" ]]; then
+    echo "Error: Explicit project name is required for '$1'." >&2
+    echo "Set FED_HARNESS_PROJECT_NAME or COMPOSE_PROJECT_NAME." >&2
+    echo "Example: FED_HARNESS_PROJECT_NAME=mls-fed-12345 $0 $1" >&2
+    exit 1
+  fi
+}
 require_tools() {
   command -v docker >/dev/null 2>&1 || {
     echo "docker is required for federation harness commands"
@@ -277,7 +278,7 @@ check_signer_and_service_auth() {
 cmd_env() {
   cat <<ENV
 Harness defaults:
-  PROJECT_NAME=$PROJECT_NAME (explicit=$EXPLICIT_PROJECT)
+  PROJECT_NAME=${PROJECT_NAME:-"(unset - required for standalone up/down/status/smoke/logs)"} (explicit=$EXPLICIT_PROJECT)
   APP_ENV=$APP_ENV
   FEDERATION_ENABLED=$FEDERATION_ENABLED
   FEDERATION_MODE=$FEDERATION_MODE
@@ -291,6 +292,7 @@ ENV
 
 cmd_smoke() {
   require_tools
+  require_project_name "smoke"
 
   local ds1_port
   ds1_port="$(get_service_host_port ds1 3001)"
@@ -301,7 +303,6 @@ cmd_smoke() {
     echo "✗ Failed to discover ephemeral ports for ds1/ds2 via docker compose port"
     return 1
   fi
-
   local ds1="http://127.0.0.1:${ds1_port}"
   local ds2="http://127.0.0.1:${ds2_port}"
 
@@ -320,9 +321,7 @@ cmd_smoke() {
 
 cmd_up() {
   require_tools
-  if [[ "$EXPLICIT_PROJECT" -eq 0 ]]; then
-    echo "$PROJECT_NAME" > "$STATE_FILE"
-  fi
+  require_project_name "up"
   echo "Starting deterministic DS1/DS2 federation harness with project '$PROJECT_NAME'..."
   compose up -d --build
   cmd_smoke
@@ -330,21 +329,21 @@ cmd_up() {
 
 cmd_down() {
   require_tools
+  require_project_name "down"
   echo "Stopping and tearing down federation harness project '$PROJECT_NAME'..."
   compose down --volumes --remove-orphans
-  if [[ "$EXPLICIT_PROJECT" -eq 0 ]]; then
-    rm -f "$STATE_FILE"
-  fi
   echo "✓ Teardown complete"
 }
 
 cmd_status() {
   require_tools
+  require_project_name "status"
   compose ps
 }
 
 cmd_logs() {
   require_tools
+  require_project_name "logs"
   if [[ "$#" -eq 0 ]]; then
     compose logs --tail=200 ds1 ds2
   else
@@ -357,13 +356,18 @@ cmd_help() {
 Usage: $0 {up|down|status|smoke|logs|env|help}
 
 Commands:
-  up      Build and start DS1/DS2 containers with ephemeral ports, run signer-authenticated smoke
-  down    Stop and remove containers, networks, volumes, and orphans
-  smoke   Run readiness, health, signer, and service-auth checks against running containers
-  status  Show compose container status
-  logs    Show logs for ds1 and ds2 (or pass service names)
+  up      Build and start DS1/DS2 containers with ephemeral ports, run signer-authenticated smoke (requires explicit project name)
+  down    Stop and remove containers, networks, volumes, and orphans (requires explicit project name)
+  smoke   Run readiness, health, signer, and service-auth checks against running containers (requires explicit project name)
+  status  Show compose container status (requires explicit project name)
+  logs    Show logs for ds1 and ds2 (requires explicit project name)
   env     Print current configuration environment
   help    Show this message
+
+Examples:
+  FED_HARNESS_PROJECT_NAME=mls-fed-12345 $0 up
+  FED_HARNESS_PROJECT_NAME=mls-fed-12345 $0 smoke
+  FED_HARNESS_PROJECT_NAME=mls-fed-12345 $0 down
 HELP
 }
 

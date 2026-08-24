@@ -5,18 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HARNESS_SCRIPT="$REPO_ROOT/scripts/federation-two-node-harness.sh"
 COMPOSE_FILE="$REPO_ROOT/e2e-tests/docker-compose.federation.yml"
-STATE_FILE="/tmp/mls-fed-harness-project-${UID:-$(id -u)}"
-get_project_name() {
-  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
-    echo "$COMPOSE_PROJECT_NAME"
-  elif [[ -n "${FED_HARNESS_PROJECT_NAME:-}" ]]; then
-    echo "$FED_HARNESS_PROJECT_NAME"
-  elif [[ -f "$STATE_FILE" ]]; then
-    cat "$STATE_FILE"
-  else
-    echo "mls-federation-harness"
-  fi
-}
+if [[ -n "${FED_HARNESS_PROJECT_NAME:-}" ]]; then
+  EXPLICIT_PROJECT=1
+  PROJECT_NAME="$FED_HARNESS_PROJECT_NAME"
+elif [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+  EXPLICIT_PROJECT=1
+  PROJECT_NAME="$COMPOSE_PROJECT_NAME"
+else
+  EXPLICIT_PROJECT=0
+  PROJECT_NAME="mls-fed-e2e-$(date +%s)-$RANDOM-$$"
+fi
+
+export FED_HARNESS_PROJECT_NAME="$PROJECT_NAME"
+export COMPOSE_PROJECT_NAME="$PROJECT_NAME"
 
 export DS1_PORT="${DS1_PORT:-0}"
 export DS2_PORT="${DS2_PORT:-0}"
@@ -47,7 +48,7 @@ Usage: $0 [full|verify|dry-run] [--no-cleanup]
 
 Modes:
   full      Boot DS1/DS2 via harness, run federation E2E checks, then clean up (default)
-  verify    Run federation E2E checks against an already-running harness
+  verify    Run federation E2E checks against an already-running harness (requires explicit project name)
   dry-run   Print planned checks without starting containers
 
 Options:
@@ -56,9 +57,7 @@ HELP
 }
 
 compose() {
-  local p
-  p="$(get_project_name)"
-  (cd "$REPO_ROOT" && docker compose -p "$p" -f "$COMPOSE_FILE" "$@")
+  (cd "$REPO_ROOT" && docker compose -p "$FED_HARNESS_PROJECT_NAME" -f "$COMPOSE_FILE" "$@")
 }
 
 get_service_host_port() {
@@ -183,7 +182,7 @@ cleanup() {
   local status="$1"
   set +e
   if [[ "$STARTED_HARNESS" -eq 1 && "$NO_CLEANUP" != "true" ]]; then
-    info "Cleaning up two-node federation harness"
+    info "Cleaning up two-node federation harness for project '$FED_HARNESS_PROJECT_NAME'"
     "$HARNESS_SCRIPT" down >/dev/null 2>&1
   fi
   if [[ "$status" -ne 0 ]]; then
@@ -219,7 +218,7 @@ fi
 
 case "$MODE" in
   dry-run)
-    info "Dry-run complete (no commands executed)"
+    info "Dry-run complete (no commands executed) for project '$FED_HARNESS_PROJECT_NAME'"
     echo "Planned checks:"
     echo "  - DS1/DS2 readiness (/health/ready)"
     echo "  - DS1/DS2 federation health (/xrpc/blue.catbird.mlsDS.healthCheck)"
@@ -227,10 +226,13 @@ case "$MODE" in
     echo "  - DS1->DS2 and DS2->DS1 federated API path health checks (inside harness network)"
     ;;
   verify)
+    if [[ "$EXPLICIT_PROJECT" -eq 0 ]]; then
+      fail "Verify mode requires an explicit project name. Set FED_HARNESS_PROJECT_NAME or COMPOSE_PROJECT_NAME."
+    fi
     run_checks
     ;;
   full)
-    info "Booting DS1/DS2 federation harness"
+    info "Booting DS1/DS2 federation harness for project '$FED_HARNESS_PROJECT_NAME'"
     STARTED_HARNESS=1
     "$HARNESS_SCRIPT" up
     run_checks
