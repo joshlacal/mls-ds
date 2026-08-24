@@ -200,7 +200,7 @@ impl MigrationSource<'static> for CleanProtocol13MigrationSource {
 
 pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
     if CLEAN_PROTOCOL_13_MANIFEST.len() != 15 {
-        return Err("reviewed clean-protocol manifest must contain exactly 14 migrations".into());
+        return Err("reviewed clean-protocol manifest must contain exactly 15 migrations".into());
     }
     for (index, entry) in CLEAN_PROTOCOL_13_MANIFEST.iter().enumerate() {
         let filename_version = entry
