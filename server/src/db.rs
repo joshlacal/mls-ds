@@ -90,21 +90,35 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
         // connection. The value is scoped to that connection and reset
         // immediately afterwards, so it is never set globally or on pooled
         // request connections.
-        let mut migration_connection = pool.acquire().await.context("acquire migration connection")?;
-        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref() == Ok("handlers-and-legacy-apis-sealed") {
-            sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-                .execute(&mut *migration_connection)
-                .await
-                .context("authorize operation-claim activation on the migration connection")?;
+        let mut migration_connection = pool
+            .acquire()
+            .await
+            .context("acquire migration connection")?;
+        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref()
+            == Ok("handlers-and-legacy-apis-sealed")
+        {
+            sqlx::query(
+                "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+            )
+            .execute(&mut *migration_connection)
+            .await
+            .context("authorize operation-claim activation on the migration connection")?;
         }
-        let migration_result = sqlx::migrate!("./migrations").run(&mut *migration_connection).await;
-        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref() == Ok("handlers-and-legacy-apis-sealed") {
+        let migration_result = sqlx::migrate!("./migrations")
+            .run(&mut *migration_connection)
+            .await;
+        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref()
+            == Ok("handlers-and-legacy-apis-sealed")
+        {
             sqlx::query("RESET chat.operation_claim_activation_approved")
                 .execute(&mut *migration_connection)
                 .await
                 .context("reset operation-claim activation approval on the migration connection")?;
         }
-        migration_connection.close().await.context("close the migration connection")?;
+        migration_connection
+            .close()
+            .await
+            .context("close the migration connection")?;
         migration_result.context("Failed to run migrations")?;
     }
 

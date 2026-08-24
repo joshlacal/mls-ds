@@ -23,6 +23,7 @@ pub struct ChatRuntime {
     sse_state: Arc<SseState>,
     cursor_sealer: Option<CursorSealer>,
     subscription_endpoint: Option<String>,
+    resolver: Option<Arc<crate::federation::DsResolver>>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -37,6 +38,7 @@ impl fmt::Debug for ChatRuntime {
                 "subscription_endpoint_configured",
                 &self.subscription_endpoint.is_some(),
             )
+            .field("resolver_configured", &self.resolver.is_some())
             .finish()
     }
 }
@@ -81,7 +83,26 @@ impl ChatRuntime {
             sse_state,
             cursor_sealer,
             subscription_endpoint,
+            resolver: None,
         })
+    }
+
+    pub fn from_env_with_resolver(
+        sse_state: Arc<SseState>,
+        resolver: Arc<crate::federation::DsResolver>,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::from_env(sse_state)?;
+        runtime.resolver = Some(resolver);
+        Ok(runtime)
+    }
+
+    pub fn with_resolver(mut self, resolver: Arc<crate::federation::DsResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    pub fn resolver(&self) -> Option<&Arc<crate::federation::DsResolver>> {
+        self.resolver.as_ref()
     }
 
     /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at

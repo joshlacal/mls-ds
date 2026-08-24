@@ -19,15 +19,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use super::context;
+use super::errors::ChatFailure;
+use super::runtime::ChatRuntime;
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::inventory::{
     read_addressable_devices_for_admission, ExistingDeviceReadFacadeError,
 };
 use crate::chat_protocol::validation::{BareDid, CanonicalHttpMethod, CanonicalUuidV4};
 use crate::storage::DbPool;
-use super::context;
-use super::errors::ChatFailure;
-use super::runtime::ChatRuntime;
 
 const ENDPOINT: ChatEndpoint = ChatEndpoint::GetDevices;
 
@@ -93,22 +93,26 @@ fn parse_query(query: Option<&str>) -> Result<(String, Vec<String>), ChatFailure
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "userDids" => {
-                let did = BareDid::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let did = BareDid::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 let did_str = did.as_str().to_string();
                 if let Some(prev) = user_dids.last() {
                     if prev.as_bytes() >= did_str.as_bytes() {

@@ -2831,17 +2831,17 @@ async fn get_own_devices_polling_beyond_cap_succeeds_and_stays_bounded() {
                 fence_revision: 0,
                 created_at: now + Duration::seconds(i),
                 expires_at: now + Duration::seconds(i) + Duration::minutes(10),
-                subjects: vec![
-                    DeviceInventorySubject {
-                        subject_device_id: requester.device_id,
-                        payload_bytes: format!("own-device-{}", i).into_bytes(),
-                    },
-                ],
+                subjects: vec![DeviceInventorySubject {
+                    subject_device_id: requester.device_id,
+                    payload_bytes: format!("own-device-{}", i).into_bytes(),
+                }],
             },
         )
         .await
         .unwrap_or_else(|e| panic!("create_device_inventory_session attempt {i} failed: {e:?}"));
-        tx.commit().await.unwrap_or_else(|e| panic!("commit attempt {i} failed: {e:?}"));
+        tx.commit()
+            .await
+            .unwrap_or_else(|e| panic!("commit attempt {i} failed: {e:?}"));
         assert_eq!(created.item_count, 1);
     }
 
@@ -4723,7 +4723,11 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     http::ensure_fence(&pool).await;
     let device = http::seed_device(&pool).await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
-    let query = format!("?actorDeviceId={}&userDids={}", device.device_id.hyphenated(), device.did);
+    let query = format!(
+        "?actorDeviceId={}&userDids={}",
+        device.device_id.hyphenated(),
+        device.did
+    );
 
     let (status, body) = http::send(
         router.clone(),
@@ -4755,7 +4759,11 @@ async fn http_get_devices_accepts_exact_device_and_rejects_did_device_and_jkt_dr
     assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "NotAuthorized");
 
-    let drift_query = format!("?actorDeviceId={}&userDids={}", Uuid::new_v4().hyphenated(), device.did);
+    let drift_query = format!(
+        "?actorDeviceId={}&userDids={}",
+        Uuid::new_v4().hyphenated(),
+        device.did
+    );
     let (status, body) = http::send(
         router.clone(),
         http::unsigned_request_as(
@@ -4809,7 +4817,11 @@ async fn http_inventory_rejects_exact_device_when_session_auth_generation_is_sta
     .await;
     let router = http::router_for_authenticated_acceptance(pool.clone()).await;
 
-    let query = format!("?actorDeviceId={}&inventorySessionId={}", device.device_id.hyphenated(), session.capability.encode());
+    let query = format!(
+        "?actorDeviceId={}&inventorySessionId={}",
+        device.device_id.hyphenated(),
+        session.capability.encode()
+    );
     let mut drift = pool.begin().await.expect("begin generation drift fixture");
     sqlx::query("SET LOCAL session_replication_role = 'replica'")
         .execute(&mut *drift)
@@ -4923,9 +4935,20 @@ async fn http_inventory_bootstrap_round_trip_emitter_to_all_consumers_end_to_end
     let emitted_cursor = conv_body["snapshotEventCursor"]
         .as_str()
         .expect("getConversations response must contain snapshotEventCursor string");
-    assert_eq!(emitted_session_id.len(), 43, "emitted capability must be 43-char base64url");
-    assert_eq!(emitted_cursor.len(), 43, "emitted cursor must be 43-char base64url");
-    assert_eq!(emitted_session_id, emitted_cursor, "session id and event cursor share same capability on first page");
+    assert_eq!(
+        emitted_session_id.len(),
+        43,
+        "emitted capability must be 43-char base64url"
+    );
+    assert_eq!(
+        emitted_cursor.len(),
+        43,
+        "emitted cursor must be 43-char base64url"
+    );
+    assert_eq!(
+        emitted_session_id, emitted_cursor,
+        "session id and event cursor share same capability on first page"
+    );
 
     // Step 3: Feed extracted inventorySessionId into authenticated getPendingWelcomes
     let welcomes_query = format!(

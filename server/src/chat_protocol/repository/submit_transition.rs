@@ -286,10 +286,10 @@ impl SubmitTransitionTransactionOutcome {
 }
 
 #[derive(Debug)]
-struct ParsedSubmitTransition {
-    transition_id: Uuid,
-    prior: PublicGroupSnapshotCoordinate,
-    add_principals: Vec<String>,
+pub(crate) struct ParsedSubmitTransition {
+    pub(crate) transition_id: Uuid,
+    pub(crate) prior: PublicGroupSnapshotCoordinate,
+    pub(crate) add_principals: Vec<String>,
 }
 
 /// Consume one globally arbitrated signed `submitTransition` operation.
@@ -301,6 +301,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
     transaction: &mut Transaction<'_, Postgres>,
     prepared: PreparedSignedOperation,
     relationship_authority: &RelationshipAuthority<T>,
+    routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
     match prepared.into_state() {
         PreparedSignedOperationState::First {
@@ -312,6 +313,7 @@ pub(crate) async fn execute_prepared_submit_transition<T: PublicTransport>(
                 authority,
                 reservation,
                 relationship_authority,
+                routing,
             )
             .await
         }
@@ -342,11 +344,18 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     authority: VerifiedChatDeviceRequest,
     reservation: OperationReservationGuard,
     relationship_authority: &RelationshipAuthority<T>,
+    routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
 ) -> Result<SubmitTransitionTransactionOutcome, SubmitTransitionFacadeError> {
     let admitted = authority
         .mutation()
         .ok_or(SubmitTransitionFacadeError::MissingMutation)?;
     let parsed = parse_submit_transition(admitted)?;
+    if let Some(r) = &routing {
+        if !parsed.add_principals.is_empty() {
+            r.recheck_added_dids(&parsed.add_principals)
+                .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        }
+    }
     let scope =
         discover_submit_transition_identity_scope(transaction, &authority, admitted, &parsed)
             .await?;
@@ -465,9 +474,13 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     let response_sha256 = *response.sha256();
 
     let (scope_authority, completion) = prelude.into_execution_parts();
-    let prepared_execution =
-        prepare_submit_transition_execution(transaction, &plan, accepted_control_entry_bytes)
-            .await?;
+    let prepared_execution = prepare_submit_transition_execution(
+        transaction,
+        &plan,
+        accepted_control_entry_bytes,
+        routing,
+    )
+    .await?;
     let applied = apply_prepared_submit_transition_execution(prepared_execution).await?;
     validate_applied_transition(
         &applied,
@@ -545,7 +558,7 @@ fn validate_applied_transition(
     Ok(())
 }
 
-fn parse_submit_transition(
+pub(crate) fn parse_submit_transition(
     mutation: &VerifiedSignedMutation,
 ) -> Result<ParsedSubmitTransition, SubmitTransitionFacadeError> {
     let (transition_id, prior, add_principals) = match mutation.projection() {

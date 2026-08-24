@@ -610,7 +610,6 @@ pub(in crate::chat_protocol::repository) enum SignedOperationReplayPostStateProo
     Leave(leave::LeaveReplayPostStateProof),
 }
 
-
 impl SignedOperationReplayPostStateProof {
     fn transaction_id(&self) -> &str {
         match self {
@@ -2789,7 +2788,6 @@ pub(in crate::chat_protocol::repository) async fn lock_signed_operation_replay_a
     })
 }
 
-
 pub(in crate::chat_protocol::repository) async fn release_signed_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
     locked: LockedSignedOperationReplayAuthority,
@@ -3246,7 +3244,9 @@ async fn validate_bootstrap_completion(
         return Err(PreludeError::ForeignTransaction);
     }
     let (historical_jkt, current_jkt) = match &guard.jkt_shape {
-        BootstrapCompletionJktShape::Enrollment { current } => (None, current.as_deref().unwrap_or("")),
+        BootstrapCompletionJktShape::Enrollment { current } => {
+            (None, current.as_deref().unwrap_or(""))
+        }
         BootstrapCompletionJktShape::Rebind {
             historical,
             current,
@@ -3255,7 +3255,10 @@ async fn validate_bootstrap_completion(
     let subject = authority.subject().as_str();
     let device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
     let trusted_instant = authority.trusted_instant().datetime();
-    let dpop_jkt = authority.dpop_jkt().map(|k| k.as_str()).unwrap_or(current_jkt);
+    let dpop_jkt = authority
+        .dpop_jkt()
+        .map(|k| k.as_str())
+        .unwrap_or(current_jkt);
     let receipt = authority.repository_receipt();
     let fresh_digest = bootstrap_completion_digest(
         &transaction_id,

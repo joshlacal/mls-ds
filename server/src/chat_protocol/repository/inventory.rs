@@ -82,11 +82,11 @@ pub(crate) enum InventoryRepositoryError {
     Sealer(#[from] SealerError),
     #[error("inventory snapshot creation exhausted its three-attempt retry ceiling")]
     RetryCeiling,
-        #[error(transparent)]
+    #[error(transparent)]
     Projection(#[from] crate::chat_protocol::read_projection::ProjectionError),
-        #[error("clean-chat inventory read authority failed")]
+    #[error("clean-chat inventory read authority failed")]
     ReadAuthority(super::super::read_authority::ReadAuthorityError),
-        #[error("clean-chat inventory read admission failed")]
+    #[error("clean-chat inventory read admission failed")]
     ReadAdmission(super::super::dpop::ReadAdmissionBindingError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -365,7 +365,9 @@ impl LockedInventorySessionGuard {
             || expected_token_hash.is_some_and(|expected| expected != token_hash)
             || BareDid::parse(&user_did).is_err()
             || !uuid_is_canonical_v4(device_id)
-            || jkt.as_deref().is_some_and(|value| KeyThumbprint::parse(value).is_err())
+            || jkt
+                .as_deref()
+                .is_some_and(|value| KeyThumbprint::parse(value).is_err())
             || !(1..=MAX_PROTOCOL_INTEGER).contains(&auth_generation)
             || snapshot_event_position > MAX_PROTOCOL_INTEGER
             || snapshot_event_cursor_bytes.is_empty()
@@ -1760,10 +1762,9 @@ pub(crate) async fn create_inventory_session(
         .await?
         .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
     let fence = verify_locked_inventory_fence(transaction, device, &locked_row).await?;
-    let authorities =
-        super::super::read_authority::inventory_authorities(transaction, fence)
-            .await
-            .map_err(InventoryRepositoryError::ReadAuthority)?;
+    let authorities = super::super::read_authority::inventory_authorities(transaction, fence)
+        .await
+        .map_err(InventoryRepositoryError::ReadAuthority)?;
     // 5. Optimistic fence re-validation (ratified 2026-07-24 locking ruling),
     //    extended to run ONCE after the authorities derivation and immediately
     //    before the materialization inserts. If the head moved, a
@@ -1839,27 +1840,38 @@ pub(crate) async fn create_inventory_session(
             )
             "#,
         );
-        query.push_values(chunk, |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256)| {
-            values
-                .push_bind(request.inventory_session_id)
-                .push_bind(*ordinal)
-                .push_bind(*conversation_id)
-                .push_bind(&user_did)
-                .push_bind(device_id)
-                .push_bind(arm_columns.item_kind)
-                .push_bind(arm_columns.participant_period_id)
-                .push_bind(arm_columns.membership_interval_id)
-                .push_bind(arm_columns.interval_terminal_seq)
-                .push_bind(arm_columns.interval_closing_transition_id)
-                .push_bind(arm_columns.interval_closing_outer_entry_fingerprint.as_deref())
-                .push_bind(arm_columns.interval_removed_at)
-                .push_bind(arm_columns.schedule_terminal_seq)
-                .push_bind(arm_columns.schedule_terminal_transition_id)
-                .push_bind(arm_columns.schedule_terminal_outer_entry_fingerprint.as_deref())
-                .push_bind(conversation_id.as_bytes().as_slice())
-                .push_bind(payload_bytes.as_slice())
-                .push_bind(payload_sha256.as_slice());
-        });
+        query.push_values(
+            chunk,
+            |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256)| {
+                values
+                    .push_bind(request.inventory_session_id)
+                    .push_bind(*ordinal)
+                    .push_bind(*conversation_id)
+                    .push_bind(&user_did)
+                    .push_bind(device_id)
+                    .push_bind(arm_columns.item_kind)
+                    .push_bind(arm_columns.participant_period_id)
+                    .push_bind(arm_columns.membership_interval_id)
+                    .push_bind(arm_columns.interval_terminal_seq)
+                    .push_bind(arm_columns.interval_closing_transition_id)
+                    .push_bind(
+                        arm_columns
+                            .interval_closing_outer_entry_fingerprint
+                            .as_deref(),
+                    )
+                    .push_bind(arm_columns.interval_removed_at)
+                    .push_bind(arm_columns.schedule_terminal_seq)
+                    .push_bind(arm_columns.schedule_terminal_transition_id)
+                    .push_bind(
+                        arm_columns
+                            .schedule_terminal_outer_entry_fingerprint
+                            .as_deref(),
+                    )
+                    .push_bind(conversation_id.as_bytes().as_slice())
+                    .push_bind(payload_bytes.as_slice())
+                    .push_bind(payload_sha256.as_slice());
+            },
+        );
         query.build().execute(&mut **transaction).await?;
     }
 
@@ -1895,17 +1907,20 @@ pub(crate) async fn create_inventory_session(
             )
             "#,
         );
-        query.push_values(chunk, |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256)| {
-            values
-                .push_bind(request.inventory_session_id)
-                .push_bind(*ordinal)
-                .push_bind(*welcome_id)
-                .push_bind(&user_did)
-                .push_bind(device_id)
-                .push_bind(welcome_id.as_bytes().as_slice())
-                .push_bind(payload_bytes.as_slice())
-                .push_bind(payload_sha256.as_slice());
-        });
+        query.push_values(
+            chunk,
+            |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256)| {
+                values
+                    .push_bind(request.inventory_session_id)
+                    .push_bind(*ordinal)
+                    .push_bind(*welcome_id)
+                    .push_bind(&user_did)
+                    .push_bind(device_id)
+                    .push_bind(welcome_id.as_bytes().as_slice())
+                    .push_bind(payload_bytes.as_slice())
+                    .push_bind(payload_sha256.as_slice());
+            },
+        );
         query.build().execute(&mut **transaction).await?;
     }
 
@@ -1946,19 +1961,31 @@ pub(crate) async fn create_inventory_session(
             )
             "#,
         );
-        query.push_values(chunk, |mut values, (ordinal, item_kind, leaf_recovery_request_id, recovery_work_id, item_key_bytes, payload_bytes, payload_sha256)| {
-            values
-                .push_bind(request.inventory_session_id)
-                .push_bind(*ordinal)
-                .push_bind(*item_kind)
-                .push_bind(*leaf_recovery_request_id)
-                .push_bind(*recovery_work_id)
-                .push_bind(&user_did)
-                .push_bind(device_id)
-                .push_bind(item_key_bytes.as_slice())
-                .push_bind(payload_bytes.as_slice())
-                .push_bind(payload_sha256.as_slice());
-        });
+        query.push_values(
+            chunk,
+            |mut values,
+             (
+                ordinal,
+                item_kind,
+                leaf_recovery_request_id,
+                recovery_work_id,
+                item_key_bytes,
+                payload_bytes,
+                payload_sha256,
+            )| {
+                values
+                    .push_bind(request.inventory_session_id)
+                    .push_bind(*ordinal)
+                    .push_bind(*item_kind)
+                    .push_bind(*leaf_recovery_request_id)
+                    .push_bind(*recovery_work_id)
+                    .push_bind(&user_did)
+                    .push_bind(device_id)
+                    .push_bind(item_key_bytes.as_slice())
+                    .push_bind(payload_bytes.as_slice())
+                    .push_bind(payload_sha256.as_slice());
+            },
+        );
         query.build().execute(&mut **transaction).await?;
     }
 
@@ -2314,7 +2341,8 @@ pub(crate) async fn create_device_inventory_session(
     // Reap prior device inventory sessions and expired sessions for this device in the same transaction
     // so steady-state device directory polling never accumulates rows or trips the active cap.
     reap_prior_device_inventory_sessions(transaction, request.user_did, request.device_id).await?;
-    reap_expired_and_excess_inventory_sessions(transaction, request.user_did, request.device_id).await?;
+    reap_expired_and_excess_inventory_sessions(transaction, request.user_did, request.device_id)
+        .await?;
     sqlx::query(
         r#"
         INSERT INTO chat.device_inventory_sessions(
@@ -2667,7 +2695,11 @@ async fn lock_and_verify_read_requester(
                 ExistingDeviceReadFacadeError::Storage
             })?;
     let Some(device) = device else {
-        tracing::error!("Missing device row for did={} device_id={}", lock_did, lock_device_id);
+        tracing::error!(
+            "Missing device row for did={} device_id={}",
+            lock_did,
+            lock_device_id
+        );
         return Err(ExistingDeviceReadFacadeError::Invariant);
     };
 
@@ -2677,13 +2709,17 @@ async fn lock_and_verify_read_requester(
         .bind(&lock_did)
         .bind(lock_device_id)
         .fetch_optional(&mut **transaction)
-            .await
-            .map_err(|e| {
-                tracing::error!("LOCK_READ_REQUESTER_DEVICE_KEY_SQL error: {:?}", e);
-                ExistingDeviceReadFacadeError::Storage
-            })?;
+        .await
+        .map_err(|e| {
+            tracing::error!("LOCK_READ_REQUESTER_DEVICE_KEY_SQL error: {:?}", e);
+            ExistingDeviceReadFacadeError::Storage
+        })?;
     let Some(key) = key else {
-        tracing::error!("Missing device key row for did={} device_id={}", lock_did, lock_device_id);
+        tracing::error!(
+            "Missing device key row for did={} device_id={}",
+            lock_did,
+            lock_device_id
+        );
         return Err(ExistingDeviceReadFacadeError::Invariant);
     };
 
@@ -2710,12 +2746,10 @@ async fn lock_and_verify_read_requester(
 
     // Constructing the row proved nothing. Only this consuming verification
     // mints authority, and it spends the attempt.
-    let verified = attempt
-        .consume_verify_locked_row(locked_row)
-        .map_err(|e| {
-            tracing::error!("consume_verify_locked_row error: {:?}", e);
-            ExistingDeviceReadFacadeError::Invariant
-        })?;
+    let verified = attempt.consume_verify_locked_row(locked_row).map_err(|e| {
+        tracing::error!("consume_verify_locked_row error: {:?}", e);
+        ExistingDeviceReadFacadeError::Invariant
+    })?;
     Ok(VerifiedRequesterLock {
         transaction_id,
         verified,
@@ -2917,29 +2951,25 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
 
     for attempt in attempts {
         // Each attempt starts a FRESH transaction.
-        let mut transaction = pool
-            .begin()
-            .await
-            .map_err(|e| {
-                tracing::error!("pool.begin error: {:?}", e);
-                ExistingDeviceReadFacadeError::Storage
-            })?;
+        let mut transaction = pool.begin().await.map_err(|e| {
+            tracing::error!("pool.begin error: {:?}", e);
+            ExistingDeviceReadFacadeError::Storage
+        })?;
 
         match materialize_own_device_snapshot(&mut transaction, attempt).await {
             Ok(OwnDeviceSnapshotOutcome::Materialized(output)) => {
                 // A successful commit is the deferred-constraint proof.
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("transaction.commit error: {:?}", e);
-                        if let sqlx::Error::Database(dbe) = &e {
-                            if dbe.code().as_deref() == Some("23514") && dbe.message().contains("cap exceeded") {
-                                return ExistingDeviceReadFacadeError::RateLimited;
-                            }
+                transaction.commit().await.map_err(|e| {
+                    tracing::error!("transaction.commit error: {:?}", e);
+                    if let sqlx::Error::Database(dbe) = &e {
+                        if dbe.code().as_deref() == Some("23514")
+                            && dbe.message().contains("cap exceeded")
+                        {
+                            return ExistingDeviceReadFacadeError::RateLimited;
                         }
-                        ExistingDeviceReadFacadeError::Storage
-                    })?;
+                    }
+                    ExistingDeviceReadFacadeError::Storage
+                })?;
                 // Only NOW may bytes exist.
                 let response_bytes = serde_json::to_vec(&output)
                     .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
@@ -3398,11 +3428,11 @@ mod materialization_version_tests {
 async fn current_whole_second(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<DateTime<Utc>, InventoryRepositoryError> {
-    Ok(
-        sqlx::query_scalar("SELECT date_trunc('second', transaction_timestamp() + interval '1 second')")
-            .fetch_one(&mut **transaction)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT date_trunc('second', transaction_timestamp() + interval '1 second')",
     )
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 /// The checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`) the C1 checked
@@ -4612,7 +4642,9 @@ async fn create_inventory_snapshot_attempt(
         .fetch_one(&mut **transaction)
         .await
         .ok();
-        let is_stale = current_max_event.map_or(false, |max_pos| max_pos > existing_row.snapshot_event_position);
+        let is_stale = current_max_event.map_or(false, |max_pos| {
+            max_pos > existing_row.snapshot_event_position
+        });
 
         if existing_row.expires_at <= now
             || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
@@ -4630,18 +4662,22 @@ async fn create_inventory_snapshot_attempt(
                 .bind(inventory_session_id)
                 .execute(&mut **transaction)
                 .await?;
-            sqlx::query("DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
+            sqlx::query(
+                "DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id = $1",
+            )
+            .bind(inventory_session_id)
+            .execute(&mut **transaction)
+            .await?;
             sqlx::query("DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id = $1")
                 .bind(inventory_session_id)
                 .execute(&mut **transaction)
                 .await?;
-            sqlx::query("DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
+            sqlx::query(
+                "DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id = $1",
+            )
+            .bind(inventory_session_id)
+            .execute(&mut **transaction)
+            .await?;
             sqlx::query("DELETE FROM chat.inventory_sessions WHERE inventory_session_id = $1")
                 .bind(inventory_session_id)
                 .execute(&mut **transaction)
@@ -5234,7 +5270,10 @@ async fn conversation_arm_columns(
 pub(crate) async fn load_conversation_state_source(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
-) -> Result<crate::chat_protocol::read_projection::ConversationProjectionSource, InventoryRepositoryError> {
+) -> Result<
+    crate::chat_protocol::read_projection::ConversationProjectionSource,
+    InventoryRepositoryError,
+> {
     use crate::chat_protocol::read_projection::{
         CheckedConversationCoordinates, CheckedDeviceLeafView, CheckedInvitationProvenance,
         CheckedMetadataAuthorProof, CheckedMetadataAvatarBinding, CheckedMetadataCryptoContext,
@@ -5244,6 +5283,8 @@ pub(crate) async fn load_conversation_state_source(
         r#"
         SELECT conversation.kind, conversation.lifecycle,
                conversation.current_generation, conversation.current_state_version,
+               conversation.is_remote, conversation.sequencer_ds,
+               conversation.sequencer_term,
                state.group_id AS state_group_id, state.epoch AS state_epoch,
                state.group_context_hash AS state_group_context_hash,
                state.confirmation_tag AS state_confirmation_tag,
@@ -5415,6 +5456,14 @@ pub(crate) async fn load_conversation_state_source(
     )
     .map_err(InventoryRepositoryError::Projection)?;
 
+    let service_did = crate::identity::service_did_base();
+    let sequencer_did = state
+        .sequencer_ds
+        .as_deref()
+        .unwrap_or(service_did.as_str());
+    if state.is_remote && state.sequencer_ds.is_none() {
+        return Err(InventoryRepositoryError::DurableRowInvalid);
+    }
     ConversationProjectionSource::state(
         INVENTORY_CIPHER_SUITE_V1,
         &state.kind,
@@ -5422,11 +5471,12 @@ pub(crate) async fn load_conversation_state_source(
         leaves,
         metadata_snapshot,
         participants,
+        sequencer_did,
+        state.sequencer_term,
         state.snapshot_seq,
     )
     .map_err(InventoryRepositoryError::Projection)
 }
-
 
 #[derive(Debug, FromRow)]
 struct ConversationStateSourceRow {
@@ -5434,6 +5484,9 @@ struct ConversationStateSourceRow {
     lifecycle: String,
     current_generation: i64,
     current_state_version: i64,
+    is_remote: bool,
+    sequencer_ds: Option<String>,
+    sequencer_term: i64,
     state_group_id: Vec<u8>,
     state_epoch: i64,
     state_group_context_hash: Vec<u8>,
@@ -5441,7 +5494,6 @@ struct ConversationStateSourceRow {
     producing_transition_id: Uuid,
     snapshot_seq: i64,
 }
-
 
 #[derive(Debug, FromRow)]
 struct ConversationParticipantRow {
@@ -5454,7 +5506,6 @@ struct ConversationParticipantRow {
     created_by_device_id: Uuid,
 }
 
-
 #[derive(Debug, FromRow)]
 struct ConversationLeafRow {
     user_did: String,
@@ -5464,7 +5515,6 @@ struct ConversationLeafRow {
     device_status: String,
     join_key_package_ref: Option<Vec<u8>>,
 }
-
 
 #[derive(Debug, FromRow)]
 struct ConversationMetadataRow {

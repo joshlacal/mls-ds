@@ -650,7 +650,9 @@ fn project_object(
         .ok_or_else(|| AuthPrimitiveError::invalid("invalid embedded required fields"))?;
     for name in required.iter().filter_map(SchemaValue::as_str) {
         if !output.contains_key(name) {
-            return Err(AuthPrimitiveError::invalid("missing required closed object field"));
+            return Err(AuthPrimitiveError::invalid(
+                "missing required closed object field",
+            ));
         }
     }
     if let Some(name) = definition_name {
@@ -1236,6 +1238,50 @@ impl CanonicalSignedMutation {
             Some(DagValue::Uuid(value)) => Ok(value),
             _ => Err(AuthPrimitiveError::invalid("signed operation identity")),
         }
+    }
+    pub fn creation_participant_dids(&self) -> Result<Vec<String>, AuthPrimitiveError> {
+        let manifest = match self.body.get("manifest") {
+            Some(DagValue::Map(map)) => map,
+            _ => return Err(AuthPrimitiveError::invalid("creation manifest")),
+        };
+        let participants = match manifest.get("participants") {
+            Some(DagValue::Array(array)) => array,
+            _ => return Err(AuthPrimitiveError::invalid("creation participants")),
+        };
+        let mut dids = Vec::with_capacity(participants.len());
+        for item in participants {
+            match item {
+                DagValue::Map(map) => match map.get("userDid") {
+                    Some(DagValue::Did(did)) => dids.push(did.as_str().to_owned()),
+                    Some(DagValue::Text(did)) => dids.push(did.clone()),
+                    _ => return Err(AuthPrimitiveError::invalid("participant userDid")),
+                },
+                _ => return Err(AuthPrimitiveError::invalid("participant row")),
+            }
+        }
+        Ok(dids)
+    }
+
+    pub fn policy_addition_dids(&self) -> Result<Vec<String>, AuthPrimitiveError> {
+        let changes = match self.body.get("participantChanges") {
+            Some(DagValue::Array(array)) => array,
+            _ => return Ok(Vec::new()),
+        };
+        let mut additions = Vec::new();
+        for item in changes {
+            if let DagValue::Map(map) = item {
+                if let Some(DagValue::Text(type_tag)) = map.get("$type") {
+                    if type_tag == "blue.catbird.chat.defs#addParticipant" {
+                        match map.get("userDid") {
+                            Some(DagValue::Did(did)) => additions.push(did.as_str().to_owned()),
+                            Some(DagValue::Text(did)) => additions.push(did.clone()),
+                            _ => return Err(AuthPrimitiveError::invalid("addParticipant userDid")),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(additions)
     }
 }
 

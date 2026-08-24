@@ -884,12 +884,14 @@ async fn main() -> anyhow::Result<()> {
     // config becomes mandatory and its absence fails startup loudly rather than
     // silently 500-ing requests.
     let chat_runtime = Arc::new(
-        catbird_server::handlers::chat::ChatRuntime::from_env(sse_state.clone()).unwrap_or_else(
-            |error| {
-                tracing::error!("clean-chat runtime configuration rejected: {error}");
-                std::process::exit(1);
-            },
-        ),
+        catbird_server::handlers::chat::ChatRuntime::from_env_with_resolver(
+            sse_state.clone(),
+            resolver.clone(),
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!("clean-chat runtime configuration rejected: {error}");
+            std::process::exit(1);
+        }),
     );
 
     // Clean-chat expiry sweeper. Overdue OPEN leaf-recovery requests and overdue

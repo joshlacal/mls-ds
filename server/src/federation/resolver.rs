@@ -1,8 +1,8 @@
-use std::sync::{Arc, LazyLock};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -68,7 +68,9 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
     if host.chars().any(char::is_uppercase) {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host must be lowercase ASCII: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host must be lowercase ASCII: '{raw}'"
+            )),
         });
     }
 
@@ -76,24 +78,37 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
     if host.contains('%') {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host must not contain percent-encoding: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host must not contain percent-encoding: '{raw}'"
+            )),
         });
     }
 
     // Reject path, query, fragment, auth delimiters
-    if host.contains('/') || host.contains('\\') || host.contains('?') || host.contains('#') || host.contains('@') {
+    if host.contains('/')
+        || host.contains('\\')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains('@')
+    {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host contains forbidden path/auth delimiter: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host contains forbidden path/auth delimiter: '{raw}'"
+            )),
         });
     }
 
     // Check for port in production vs test
     let (hostname, port_opt) = if let Some((h, p_str)) = host.split_once(':') {
-        let p = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
-            did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("Invalid port in did:web: '{raw}'")),
-        })?;
+        let p = p_str
+            .parse::<u16>()
+            .map_err(|_| FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Invalid port in did:web: '{raw}'"
+                )),
+            })?;
         if p == 0 {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
@@ -116,7 +131,9 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
         if !(is_app_env_test && allow_insecure_http() && is_localhost) {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("Port in did:web is only allowed for localhost in test environment: '{raw}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Port in did:web is only allowed for localhost in test environment: '{raw}'"
+                )),
             });
         }
     }
@@ -125,21 +142,27 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
     if hostname.starts_with('.') || hostname.ends_with('.') {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host must not have leading or trailing dot: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host must not have leading or trailing dot: '{raw}'"
+            )),
         });
     }
 
     if hostname.contains("..") {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host must not contain empty labels: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host must not contain empty labels: '{raw}'"
+            )),
         });
     }
 
     if hostname.len() > 253 {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web host exceeds 253 characters: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web host exceeds 253 characters: '{raw}'"
+            )),
         });
     }
 
@@ -156,7 +179,9 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
         if label.is_empty() || label.len() > 63 {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("Invalid label length in did:web host: '{raw}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Invalid label length in did:web host: '{raw}'"
+                )),
             });
         }
 
@@ -164,7 +189,9 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
         if label.contains('_') {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("did:web host labels must not contain underscores: '{raw}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "did:web host labels must not contain underscores: '{raw}'"
+                )),
             });
         }
 
@@ -172,24 +199,34 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
         if label.starts_with('-') || label.ends_with('-') {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("did:web host label has leading or trailing hyphen: '{raw}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "did:web host label has leading or trailing hyphen: '{raw}'"
+                )),
             });
         }
 
         // Reject non-alphanumeric/hyphen characters
-        if !label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("did:web host label contains invalid characters: '{raw}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "did:web host label contains invalid characters: '{raw}'"
+                )),
             });
         }
     }
 
     // Lowercase / IDNA roundtrip check via url::Host parser
-    let host_parsed = url::Host::parse(hostname).map_err(|e| FederationError::ResolutionFailed {
-        did: raw.to_string(),
-        kind: ResolutionFailureKind::InvalidDid(format!("IDNA host parsing failed for did:web host '{hostname}': {e}")),
-    })?;
+    let host_parsed =
+        url::Host::parse(hostname).map_err(|e| FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "IDNA host parsing failed for did:web host '{hostname}': {e}"
+            )),
+        })?;
     if let url::Host::Domain(domain) = &host_parsed {
         if domain != hostname {
             return Err(FederationError::ResolutionFailed {
@@ -200,15 +237,20 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
     }
 
     // URL parser check
-    let check_url = url::Url::parse(&format!("https://{host}"))
-        .map_err(|e| FederationError::ResolutionFailed {
+    let check_url = url::Url::parse(&format!("https://{host}")).map_err(|e| {
+        FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("URL parsing failed for did:web host '{host}': {e}")),
-        })?;
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "URL parsing failed for did:web host '{host}': {e}"
+            )),
+        }
+    })?;
     if check_url.host_str().unwrap_or("") != hostname {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("URL parsed host does not match did:web host: '{host}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "URL parsed host does not match did:web host: '{host}'"
+            )),
         });
     }
 
@@ -216,7 +258,9 @@ pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, 
     if canonical != raw {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("did:web not in canonical form: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "did:web not in canonical form: '{raw}'"
+            )),
         });
     }
 
@@ -227,21 +271,27 @@ pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
     if raw.is_empty() || raw.trim() != raw || raw.chars().any(char::is_whitespace) {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("DID cannot contain whitespace or be empty: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "DID cannot contain whitespace or be empty: '{raw}'"
+            )),
         });
     }
 
     if raw.contains('#') {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("DID must be a base DID without fragment: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "DID must be a base DID without fragment: '{raw}'"
+            )),
         });
     }
 
     if raw.ends_with(':') {
         return Err(FederationError::ResolutionFailed {
             did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("DID cannot have trailing colon: '{raw}'")),
+            kind: ResolutionFailureKind::InvalidDid(format!(
+                "DID cannot have trailing colon: '{raw}'"
+            )),
         });
     }
 
@@ -255,7 +305,11 @@ pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
 
     // 2. Exact did:plc validation
     if let Some(plc_suffix) = raw.strip_prefix("did:plc:") {
-        if plc_suffix.len() != 24 || !plc_suffix.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
+        if plc_suffix.len() != 24
+            || !plc_suffix
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+        {
             return Err(FederationError::ResolutionFailed {
                 did: raw.to_string(),
                 kind: ResolutionFailureKind::InvalidDid(format!("Invalid did:plc format: '{raw}'")),
@@ -286,13 +340,14 @@ pub fn validate_declaration_record_value(
     value: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(String, String), FederationError> {
     // 1. Exact $type: bare NSID only
-    let record_type = value
-        .get("$type")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| FederationError::ResolutionFailed {
+    let record_type = value.get("$type").and_then(|t| t.as_str()).ok_or_else(|| {
+        FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing $type".to_string()),
-        })?;
+            kind: ResolutionFailureKind::InvalidDeclaration(
+                "Declaration record missing $type".to_string(),
+            ),
+        }
+    })?;
     if record_type != "blue.catbird.chat.declaration" {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
@@ -308,12 +363,16 @@ pub fn validate_declaration_record_value(
         .and_then(|v| v.as_str())
         .ok_or_else(|| FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing protocolVersion".to_string()),
+            kind: ResolutionFailureKind::InvalidDeclaration(
+                "Declaration record missing protocolVersion".to_string(),
+            ),
         })?;
     if protocol_version != "1" {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration(format!("Unsupported declaration protocolVersion: '{protocol_version}'")),
+            kind: ResolutionFailureKind::InvalidDeclaration(format!(
+                "Unsupported declaration protocolVersion: '{protocol_version}'"
+            )),
         });
     }
 
@@ -323,12 +382,16 @@ pub fn validate_declaration_record_value(
         .and_then(|v| v.as_str())
         .ok_or_else(|| FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing createdAt".to_string()),
+            kind: ResolutionFailureKind::InvalidDeclaration(
+                "Declaration record missing createdAt".to_string(),
+            ),
         })?;
     if chrono::DateTime::parse_from_rfc3339(created_at).is_err() {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration(format!("Declaration record invalid RFC3339 createdAt: '{created_at}'")),
+            kind: ResolutionFailureKind::InvalidDeclaration(format!(
+                "Declaration record invalid RFC3339 createdAt: '{created_at}'"
+            )),
         });
     }
 
@@ -338,7 +401,9 @@ pub fn validate_declaration_record_value(
         .and_then(|v| v.as_str())
         .ok_or_else(|| FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing allowIncoming".to_string()),
+            kind: ResolutionFailureKind::InvalidDeclaration(
+                "Declaration record missing allowIncoming".to_string(),
+            ),
         })?;
 
     // 5. deliveryService base DID
@@ -347,7 +412,9 @@ pub fn validate_declaration_record_value(
         .and_then(|v| v.as_str())
         .ok_or_else(|| FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing deliveryService".to_string()),
+            kind: ResolutionFailureKind::InvalidDeclaration(
+                "Declaration record missing deliveryService".to_string(),
+            ),
         })?;
 
     let canonical_ds_did = validate_declaration_delivery_service(delivery_service_raw)?;
@@ -365,8 +432,15 @@ pub struct DsEndpoint {
 }
 
 pub type DestinationResolverFn = Arc<
-    dyn Fn(&str) -> Option<Pin<Box<dyn Future<Output = Result<ValidatedRemoteDestination, FederationError>> + Send>>>
-        + Send
+    dyn Fn(
+            &str,
+        ) -> Option<
+            Pin<
+                Box<
+                    dyn Future<Output = Result<ValidatedRemoteDestination, FederationError>> + Send,
+                >,
+            >,
+        > + Send
         + Sync,
 >;
 
@@ -585,7 +659,9 @@ impl DsResolver {
         }
 
         // Fallback to default DS (ACTOR default ONLY)
-        if let (Some(default_did), Some(default_ep)) = (&self.default_ds_did, &self.default_ds_endpoint) {
+        if let (Some(default_did), Some(default_ep)) =
+            (&self.default_ds_did, &self.default_ds_endpoint)
+        {
             info!(
                 did = %crate::crypto::redact_for_log(user_did),
                 default_ds_did = %default_did,
@@ -743,7 +819,10 @@ impl DsResolver {
     }
 
     /// Look up cached endpoint directly from ds_endpoints by target DS DID.
-    pub(crate) async fn get_cached_ds_endpoint(&self, ds_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+    pub(crate) async fn get_cached_ds_endpoint(
+        &self,
+        ds_did: &str,
+    ) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(ds_did);
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
@@ -762,7 +841,10 @@ impl DsResolver {
     }
 
     /// Look up degraded cached endpoint directly from ds_endpoints by target DS DID.
-    pub(crate) async fn get_cached_ds_endpoint_any(&self, ds_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+    pub(crate) async fn get_cached_ds_endpoint_any(
+        &self,
+        ds_did: &str,
+    ) -> Result<Option<DsEndpoint>, FederationError> {
         let canonical = canonical_did(ds_did);
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
@@ -866,17 +948,22 @@ impl DsResolver {
         let endpoint = extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                kind: ResolutionFailureKind::ServiceMissing("No #atproto_mls service in DID document".to_string()),
+                kind: ResolutionFailureKind::ServiceMissing(
+                    "No #atproto_mls service in DID document".to_string(),
+                ),
             })?
             .to_string();
 
         self.validate_remote_url(&endpoint).await?;
 
-        let ds_did = derive_ds_did_from_https_endpoint(&endpoint)
-            .ok_or_else(|| FederationError::ResolutionFailed {
+        let ds_did = derive_ds_did_from_https_endpoint(&endpoint).ok_or_else(|| {
+            FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("Could not derive DS DID from endpoint '{endpoint}'")),
-            })?;
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Could not derive DS DID from endpoint '{endpoint}'"
+                )),
+            }
+        })?;
         Ok(DsEndpoint {
             did: ds_did,
             endpoint,
@@ -896,13 +983,9 @@ impl DsResolver {
     ) -> Result<serde_json::Value, FederationError> {
         let url = repo_record_url(pds_endpoint, user_did, collection, rkey);
         let dest = validate_and_resolve_destination(&url, None).await?;
-        let resp = send_hardened_resolution_request(
-            &dest,
-            deadline,
-            user_did,
-            "HTTP request failed",
-        )
-        .await?;
+        let resp =
+            send_hardened_resolution_request(&dest, deadline, user_did, "HTTP request failed")
+                .await?;
 
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
@@ -940,21 +1023,29 @@ impl DsResolver {
         if !canonical_ds.starts_with("did:web:") && !canonical_ds.starts_with("did:plc:") {
             return Err(FederationError::ResolutionFailed {
                 did: ds_did.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("Unsupported DS DID method: '{ds_did}'")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Unsupported DS DID method: '{ds_did}'"
+                )),
             });
         }
 
         // If did:web, validate host/port
         if let Some((host_port, _)) = crate::identity::parse_did_web(&canonical_ds) {
             if let Some((_, p_str)) = host_port.split_once(':') {
-                let port = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
-                    did: ds_did.to_string(),
-                    kind: ResolutionFailureKind::InvalidDid(format!("Invalid port in did:web: '{ds_did}'")),
-                })?;
+                let port = p_str
+                    .parse::<u16>()
+                    .map_err(|_| FederationError::ResolutionFailed {
+                        did: ds_did.to_string(),
+                        kind: ResolutionFailureKind::InvalidDid(format!(
+                            "Invalid port in did:web: '{ds_did}'"
+                        )),
+                    })?;
                 if port == 0 {
                     return Err(FederationError::ResolutionFailed {
                         did: ds_did.to_string(),
-                        kind: ResolutionFailureKind::InvalidDid(format!("Zero port in did:web: '{ds_did}'")),
+                        kind: ResolutionFailureKind::InvalidDid(format!(
+                            "Zero port in did:web: '{ds_did}'"
+                        )),
                     });
                 }
             }
@@ -978,7 +1069,9 @@ impl DsResolver {
 
         Err(FederationError::ResolutionFailed {
             did: ds_did.to_string(),
-            kind: ResolutionFailureKind::ServiceMissing(format!("Could not resolve DS DID {ds_did} to an HTTPS endpoint")),
+            kind: ResolutionFailureKind::ServiceMissing(format!(
+                "Could not resolve DS DID {ds_did} to an HTTPS endpoint"
+            )),
         })
     }
 
@@ -1005,7 +1098,9 @@ impl DsResolver {
             .and_then(|v| v.as_object())
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                kind: ResolutionFailureKind::InvalidPayload("No 'value' object in declaration response".to_string()),
+                kind: ResolutionFailureKind::InvalidPayload(
+                    "No 'value' object in declaration response".to_string(),
+                ),
             })?;
 
         let (canonical_ds_did, _allow_incoming) = validate_declaration_record_value(value)
@@ -1048,7 +1143,9 @@ impl DsResolver {
             .get("value")
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                kind: ResolutionFailureKind::InvalidPayload("No 'value' field in record response".to_string()),
+                kind: ResolutionFailureKind::InvalidPayload(
+                    "No 'value' field in record response".to_string(),
+                ),
             })?;
 
         let delivery_service = value
@@ -1056,7 +1153,9 @@ impl DsResolver {
             .and_then(|v| v.as_str())
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                kind: ResolutionFailureKind::InvalidPayload("No 'deliveryService' in profile record".to_string()),
+                kind: ResolutionFailureKind::InvalidPayload(
+                    "No 'deliveryService' in profile record".to_string(),
+                ),
             })?;
 
         let (ds_did, endpoint_url) = if delivery_service.starts_with("did:") {
@@ -1065,11 +1164,14 @@ impl DsResolver {
             (canonical, ep)
         } else {
             self.validate_remote_url(delivery_service).await?;
-            let derived = derive_ds_did_from_https_endpoint(delivery_service)
-                .ok_or_else(|| FederationError::ResolutionFailed {
+            let derived = derive_ds_did_from_https_endpoint(delivery_service).ok_or_else(|| {
+                FederationError::ResolutionFailed {
                     did: user_did.to_string(),
-                    kind: ResolutionFailureKind::InvalidDid(format!("Could not derive DS DID from endpoint '{delivery_service}'")),
-                })?;
+                    kind: ResolutionFailureKind::InvalidDid(format!(
+                        "Could not derive DS DID from endpoint '{delivery_service}'"
+                    )),
+                }
+            })?;
             (derived, delivery_service.to_string())
         };
 
@@ -1100,7 +1202,9 @@ impl DsResolver {
         let endpoint = extract_service(&doc, "atproto_pds", None).ok_or_else(|| {
             FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: ResolutionFailureKind::ServiceMissing("No #atproto_pds service in DID document".to_string()),
+                kind: ResolutionFailureKind::ServiceMissing(
+                    "No #atproto_pds service in DID document".to_string(),
+                ),
             }
         })?;
 
@@ -1114,7 +1218,9 @@ impl DsResolver {
         let did_doc_url = if did.starts_with("did:web:") {
             did_web_document_url(did).ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: ResolutionFailureKind::InvalidDid(format!("Invalid did:web identifier: {did}")),
+                kind: ResolutionFailureKind::InvalidDid(format!(
+                    "Invalid did:web identifier: {did}"
+                )),
             })?
         } else if did.starts_with("did:plc:") {
             format!("https://plc.directory/{did}")
@@ -1128,13 +1234,9 @@ impl DsResolver {
         let dest = validate_and_resolve_destination(&did_doc_url, None).await?;
         let deadline = checked_outbound_deadline(did, Duration::from_secs(10))?;
 
-        let resp = send_hardened_resolution_request(
-            &dest,
-            deadline,
-            did,
-            "DID resolution HTTP error",
-        )
-        .await?;
+        let resp =
+            send_hardened_resolution_request(&dest, deadline, did, "DID resolution HTTP error")
+                .await?;
 
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
@@ -1207,7 +1309,9 @@ impl DsResolver {
                 .await
                 .map_err(|_| FederationError::ResolutionFailed {
                     did: did.to_string(),
-                    kind: ResolutionFailureKind::InvalidPayload("PDS device-record pagination was incomplete".to_string()),
+                    kind: ResolutionFailureKind::InvalidPayload(
+                        "PDS device-record pagination was incomplete".to_string(),
+                    ),
                 })
             },
             deadline,
@@ -1216,7 +1320,9 @@ impl DsResolver {
 
         resolution.map_err(|_| FederationError::ResolutionFailed {
             did: did.to_string(),
-            kind: ResolutionFailureKind::Timeout("PDS device authority resolution exceeded its deadline".to_string()),
+            kind: ResolutionFailureKind::Timeout(
+                "PDS device authority resolution exceeded its deadline".to_string(),
+            ),
         })?
     }
 
@@ -1249,7 +1355,9 @@ impl DsResolver {
     }
 
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
-        validate_and_resolve_destination(url_str, None).await.map(|_| ())
+        validate_and_resolve_destination(url_str, None)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -1261,7 +1369,9 @@ fn checked_outbound_deadline(
         .checked_add(timeout)
         .ok_or_else(|| FederationError::ResolutionFailed {
             did: did.to_string(),
-            kind: ResolutionFailureKind::Timeout("Outbound resolution deadline overflowed".to_string()),
+            kind: ResolutionFailureKind::Timeout(
+                "Outbound resolution deadline overflowed".to_string(),
+            ),
         })
 }
 
@@ -1312,30 +1422,44 @@ async fn decode_resolution_json<T: serde::de::DeserializeOwned>(
     decode_json_bounded(response, ResponseBodyBudget::new(max_bytes, deadline))
         .await
         .map_err(|error| match error {
-            crate::util::outbound_body::OutboundBodyError::DeadlineExceeded => FederationError::ResolutionFailed {
-                did: did.to_string(),
-                kind: ResolutionFailureKind::Timeout(format!("{context}: response body read deadline exceeded")),
-            },
+            crate::util::outbound_body::OutboundBodyError::DeadlineExceeded => {
+                FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    kind: ResolutionFailureKind::Timeout(format!(
+                        "{context}: response body read deadline exceeded"
+                    )),
+                }
+            }
             crate::util::outbound_body::OutboundBodyError::ReadFailed(source) => {
                 if source.is_timeout() {
                     FederationError::ResolutionFailed {
                         did: did.to_string(),
-                        kind: ResolutionFailureKind::Timeout(format!("{context}: response body read timed out: {source}")),
+                        kind: ResolutionFailureKind::Timeout(format!(
+                            "{context}: response body read timed out: {source}"
+                        )),
                     }
                 } else {
                     FederationError::ResolutionFailed {
                         did: did.to_string(),
-                        kind: ResolutionFailureKind::ConnectionFailed(format!("{context}: response body read failed: {source}")),
+                        kind: ResolutionFailureKind::ConnectionFailed(format!(
+                            "{context}: response body read failed: {source}"
+                        )),
                     }
                 }
             }
-            crate::util::outbound_body::OutboundBodyError::InvalidJson(msg) => FederationError::ResolutionFailed {
-                did: did.to_string(),
-                kind: ResolutionFailureKind::InvalidPayload(format!("{context}: invalid JSON response: {msg}")),
-            },
+            crate::util::outbound_body::OutboundBodyError::InvalidJson(msg) => {
+                FederationError::ResolutionFailed {
+                    did: did.to_string(),
+                    kind: ResolutionFailureKind::InvalidPayload(format!(
+                        "{context}: invalid JSON response: {msg}"
+                    )),
+                }
+            }
             other => FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: ResolutionFailureKind::InvalidPayload(format!("{context}: response body rejected: {other}")),
+                kind: ResolutionFailureKind::InvalidPayload(format!(
+                    "{context}: response body rejected: {other}"
+                )),
             },
         })
 }
@@ -1561,7 +1685,8 @@ pub fn is_non_global_ipv6(v6: &std::net::Ipv6Addr) -> bool {
         return is_non_global_ipv4(&mapped_v4);
     }
     if let [0, 0, 0, 0, 0, 0xffff, high, low] = segments {
-        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        let v4 =
+            std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
         return is_non_global_ipv4(&v4);
     }
     // 2. IPv4-compatible IPv6 (deprecated RFC 4291): [0, 0, 0, 0, 0, 0, high, low]
@@ -1572,12 +1697,14 @@ pub fn is_non_global_ipv6(v6: &std::net::Ipv6Addr) -> bool {
         if high == 0 && low == 0 {
             return true; // :: unspecified
         }
-        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        let v4 =
+            std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
         return is_non_global_ipv4(&v4);
     }
     // 3. NAT64 well-known prefix: 64:ff9b::/96 (RFC 6052)
     if let [0x64, 0xff9b, 0, 0, 0, 0, high, low] = segments {
-        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        let v4 =
+            std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
         return is_non_global_ipv4(&v4);
     }
     // 4. Standard IPv6 checks
@@ -1590,7 +1717,8 @@ pub fn is_non_global_ipv6(v6: &std::net::Ipv6Addr) -> bool {
         || matches!(segments, [0x0100, 0, 0, 0, ..]) // Discard prefix (100::/64)
         || matches!(segments, [0x2001, 0x0db8, ..]) // Documentation (2001:db8::/32)
         || matches!(segments, [0x2001, 0x0002, ..]) // Benchmarking (2001:2::/48)
-        || matches!(segments, [0x2002, ..]) // 6to4 (2002::/16)
+        || matches!(segments, [0x2002, ..])
+    // 6to4 (2002::/16)
     {
         return true;
     }
@@ -1671,16 +1799,24 @@ pub fn classify_dns_io_error(e: &std::io::Error, host: &str) -> ResolutionFailur
         | std::io::ErrorKind::ConnectionReset
         | std::io::ErrorKind::ConnectionAborted
         | std::io::ErrorKind::NotConnected
-        | std::io::ErrorKind::BrokenPipe => {
-            ResolutionFailureKind::ConnectionFailed(format!("Connection error resolving host {host}: {e}"))
-        }
+        | std::io::ErrorKind::BrokenPipe => ResolutionFailureKind::ConnectionFailed(format!(
+            "Connection error resolving host {host}: {e}"
+        )),
         std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {
-            ResolutionFailureKind::DnsTemporary(format!("Temporary DNS failure resolving host {host}: {e}"))
+            ResolutionFailureKind::DnsTemporary(format!(
+                "Temporary DNS failure resolving host {host}: {e}"
+            ))
         }
         _ => {
             let msg = e.to_string().to_ascii_lowercase();
-            if msg.contains("temporary") || msg.contains("eai_again") || msg.contains("try again") || msg.contains("servfail") {
-                ResolutionFailureKind::DnsTemporary(format!("Temporary failure in name resolution for {host}: {e}"))
+            if msg.contains("temporary")
+                || msg.contains("eai_again")
+                || msg.contains("try again")
+                || msg.contains("servfail")
+            {
+                ResolutionFailureKind::DnsTemporary(format!(
+                    "Temporary failure in name resolution for {host}: {e}"
+                ))
             } else if msg.contains("not found")
                 || msg.contains("no such host")
                 || msg.contains("nxdomain")
@@ -1730,7 +1866,9 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
             if !host_is_allowlisted(host, allowed) {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    kind: ResolutionFailureKind::AllowlistBlocked(format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST")),
+                    kind: ResolutionFailureKind::AllowlistBlocked(format!(
+                        "Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"
+                    )),
                 });
             }
         }
@@ -1740,7 +1878,9 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
             if !(is_app_env_test && allow_http) {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    kind: ResolutionFailureKind::SsrfBlocked(format!("Blocked private address: {host}")),
+                    kind: ResolutionFailureKind::SsrfBlocked(format!(
+                        "Blocked private address: {host}"
+                    )),
                 });
             }
         }
@@ -1755,7 +1895,9 @@ pub(crate) fn validate_endpoint_url_with_custom_policy(
             if is_private_ip(&ip) && !(is_app_env_test && allow_http) {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    kind: ResolutionFailureKind::SsrfBlocked(format!("Blocked non-global IP: {ip}")),
+                    kind: ResolutionFailureKind::SsrfBlocked(format!(
+                        "Blocked non-global IP: {ip}"
+                    )),
                 });
             }
         }
@@ -1783,7 +1925,8 @@ pub(crate) async fn validate_and_resolve_destination(
     let is_app_env_test = std::env::var("APP_ENV")
         .map(|v| v.eq_ignore_ascii_case("test"))
         .unwrap_or(false);
-    validate_and_resolve_destination_with_policy(url_str, allow_http, allowlist, is_app_env_test).await
+    validate_and_resolve_destination_with_policy(url_str, allow_http, allowlist, is_app_env_test)
+        .await
 }
 
 pub(crate) async fn validate_and_resolve_destination_with_policy(
@@ -1792,13 +1935,19 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
     allowlist: Option<&[String]>,
     is_app_env_test: bool,
 ) -> Result<ValidatedRemoteDestination, FederationError> {
-    let parsed = validate_endpoint_url_with_custom_policy(url_str, allow_http, allowlist, is_app_env_test)?;
-    let host = parsed.host_str().ok_or_else(|| FederationError::ResolutionFailed {
-        did: String::new(),
-        kind: ResolutionFailureKind::InvalidUrl("URL host is missing".to_string()),
-    })?.to_string();
+    let parsed =
+        validate_endpoint_url_with_custom_policy(url_str, allow_http, allowlist, is_app_env_test)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            kind: ResolutionFailureKind::InvalidUrl("URL host is missing".to_string()),
+        })?
+        .to_string();
 
-    let port = parsed.port_or_known_default().unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
 
     // Hostname allowlist check
     let effective_allowlist = allowlist.or_else(|| FEDERATION_HOST_ALLOWLIST.as_deref());
@@ -1806,7 +1955,9 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         if !host_is_allowlisted(&host, allowed) {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
-                kind: ResolutionFailureKind::AllowlistBlocked(format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST")),
+                kind: ResolutionFailureKind::AllowlistBlocked(format!(
+                    "Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"
+                )),
             });
         }
     }
@@ -1843,7 +1994,9 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         Err(_) => {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
-                kind: ResolutionFailureKind::DnsTimeout(format!("DNS lookup timed out for host {host}")),
+                kind: ResolutionFailureKind::DnsTimeout(format!(
+                    "DNS lookup timed out for host {host}"
+                )),
             });
         }
     };
@@ -1855,7 +2008,9 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
     if addrs.is_empty() {
         return Err(FederationError::ResolutionFailed {
             did: String::new(),
-            kind: ResolutionFailureKind::DnsNxdomain(format!("Host {host} did not resolve to any address")),
+            kind: ResolutionFailureKind::DnsNxdomain(format!(
+                "Host {host} did not resolve to any address"
+            )),
         });
     }
 
@@ -1864,7 +2019,10 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
         if is_private_ip(&addr.ip()) && !(is_app_env_test && allow_http) {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
-                kind: ResolutionFailureKind::SsrfBlocked(format!("Host {host} resolved to blocked IP {}", addr.ip())),
+                kind: ResolutionFailureKind::SsrfBlocked(format!(
+                    "Host {host} resolved to blocked IP {}",
+                    addr.ip()
+                )),
             });
         }
     }
@@ -1879,7 +2037,9 @@ pub(crate) async fn validate_and_resolve_destination_with_policy(
 pub(crate) async fn validate_resolved_host_is_public(
     parsed: &url::Url,
 ) -> Result<(), FederationError> {
-    validate_and_resolve_destination(parsed.as_str(), None).await.map(|_| ())
+    validate_and_resolve_destination(parsed.as_str(), None)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn send_hardened_resolution_request(
@@ -1896,7 +2056,9 @@ pub(crate) async fn send_hardened_resolution_request(
         .build()
         .map_err(|e| FederationError::ResolutionFailed {
             did: did.to_string(),
-            kind: ResolutionFailureKind::InvalidConfiguration(format!("{context}: client build failed: {e}")),
+            kind: ResolutionFailureKind::InvalidConfiguration(format!(
+                "{context}: client build failed: {e}"
+            )),
         })?;
 
     let resp = tokio::time::timeout_at(deadline, client.get(destination.url.clone()).send())
@@ -1932,7 +2094,10 @@ pub(crate) async fn send_hardened_resolution_request(
     if resp.status().is_redirection() {
         return Err(FederationError::ResolutionFailed {
             did: did.to_string(),
-            kind: ResolutionFailureKind::RedirectRejected(format!("{context}: redirect rejected ({})", resp.status())),
+            kind: ResolutionFailureKind::RedirectRejected(format!(
+                "{context}: redirect rejected ({})",
+                resp.status()
+            )),
         });
     }
 
@@ -2455,30 +2620,60 @@ mod tests {
     #[test]
     fn test_ipv4_mapped_ipv6_is_properly_classified_and_rejected() {
         // Mapped loopback
-        assert!(is_private_ip(&"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:127.0.0.2".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:127.0.0.2".parse::<IpAddr>().unwrap()
+        ));
         // Mapped RFC 1918
         assert!(is_private_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:172.16.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:172.16.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
+        ));
         // Mapped link-local
-        assert!(is_private_ip(&"::ffff:169.254.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:169.254.1.1".parse::<IpAddr>().unwrap()
+        ));
         // Mapped CGNAT
-        assert!(is_private_ip(&"::ffff:100.64.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:100.127.255.254".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:100.64.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:100.127.255.254".parse::<IpAddr>().unwrap()
+        ));
         // Mapped non-global / doc / multicast / 0.0.0.0
         assert!(is_private_ip(&"::ffff:0.0.0.0".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:192.0.2.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:198.18.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:198.51.100.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:203.0.113.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:224.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:240.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_ip(&"::ffff:255.255.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:192.0.2.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:198.18.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:198.51.100.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:203.0.113.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:224.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:240.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:255.255.255.255".parse::<IpAddr>().unwrap()
+        ));
 
         // Mapped public global IPs must NOT be private
         assert!(!is_private_ip(&"::ffff:8.8.8.8".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_ip(&"::ffff:93.184.216.34".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(
+            &"::ffff:93.184.216.34".parse::<IpAddr>().unwrap()
+        ));
         assert!(!is_private_ip(&"::ffff:1.1.1.1".parse::<IpAddr>().unwrap()));
     }
 
@@ -2486,7 +2681,13 @@ mod tests {
     async fn test_ssrf_rejects_direct_private_ip_even_if_allowlisted() {
         let allowlist = vec!["127.0.0.1".to_string()];
         // In production environment (is_app_env_test = false, allow_http = false), private IP must fail even if in allowlist
-        let result = validate_and_resolve_destination_with_policy("https://127.0.0.1:8443", false, Some(&allowlist), false).await;
+        let result = validate_and_resolve_destination_with_policy(
+            "https://127.0.0.1:8443",
+            false,
+            Some(&allowlist),
+            false,
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -2494,12 +2695,23 @@ mod tests {
     async fn test_ssrf_injected_allowlist_enforcement() {
         let allowlist = vec!["allowed.example.com".to_string()];
         // Not in allowlist
-        let res1 = validate_endpoint_url_with_allowlist("https://disallowed.example.com", false, Some(&allowlist));
+        let res1 = validate_endpoint_url_with_allowlist(
+            "https://disallowed.example.com",
+            false,
+            Some(&allowlist),
+        );
         assert!(res1.is_err());
-        assert!(res1.unwrap_err().to_string().contains("not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"));
+        assert!(res1
+            .unwrap_err()
+            .to_string()
+            .contains("not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"));
 
         // In allowlist
-        let res2 = validate_endpoint_url_with_allowlist("https://allowed.example.com", false, Some(&allowlist));
+        let res2 = validate_endpoint_url_with_allowlist(
+            "https://allowed.example.com",
+            false,
+            Some(&allowlist),
+        );
         assert!(res2.is_ok());
     }
 
@@ -2810,7 +3022,10 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
             3600,
         );
 
@@ -2843,13 +3058,22 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
             3600,
         );
 
         let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
-        let ds_did = format!("did:web:stale-ds-{}.example.com", Uuid::new_v4().as_simple());
-        let stale_endpoint = format!("https://stale-ds-{}.example.com", Uuid::new_v4().as_simple());
+        let ds_did = format!(
+            "did:web:stale-ds-{}.example.com",
+            Uuid::new_v4().as_simple()
+        );
+        let stale_endpoint = format!(
+            "https://stale-ds-{}.example.com",
+            Uuid::new_v4().as_simple()
+        );
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
              VALUES ($1, $2, NULL, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
@@ -2886,7 +3110,10 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
             3600,
         );
 
@@ -2932,9 +3159,11 @@ mod tests {
             .expect("failed to connect to TEST_DATABASE_URL");
 
         let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-            .execute(&mut *conn)
-            .await;
+        let _ = sqlx::query(
+            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+        )
+        .execute(&mut *conn)
+        .await;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -3083,11 +3312,7 @@ mod tests {
             .invalidate(&actor_did)
             .await
             .expect("invalidation succeeds");
-        assert!(resolver
-            .get_cached(&actor_did)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(resolver.get_cached(&actor_did).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3166,7 +3391,9 @@ mod tests {
         assert!(validate_declaration_delivery_service("did:web:chat..catbird.blue").is_err());
 
         // Underscores rejected
-        assert!(validate_declaration_delivery_service("did:web:chat_service.catbird.blue").is_err());
+        assert!(
+            validate_declaration_delivery_service("did:web:chat_service.catbird.blue").is_err()
+        );
         assert!(validate_declaration_delivery_service("did:web:_chat.catbird.blue").is_err());
 
         // Hyphen violations (leading/trailing in label) rejected
@@ -3192,8 +3419,13 @@ mod tests {
         assert!(validate_declaration_delivery_service("did:web:chat%20catbird.blue").is_err());
 
         // Fragment not allowed
-        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue#atproto_mls").is_err());
-        assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur#fragment").is_err());
+        assert!(
+            validate_declaration_delivery_service("did:web:chat.catbird.blue#atproto_mls").is_err()
+        );
+        assert!(
+            validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur#fragment")
+                .is_err()
+        );
 
         // URL instead of DID
         assert!(validate_declaration_delivery_service("https://chat.catbird.blue").is_err());
@@ -3204,12 +3436,16 @@ mod tests {
         assert!(validate_declaration_delivery_service("did:web:chat .catbird.blue").is_err());
 
         // Unsupported method
-        assert!(validate_declaration_delivery_service("did:key:z6MkhaXgBZDvotDkL5257faiz4zZbcw51635Q6phWoqnVJJN").is_err());
+        assert!(validate_declaration_delivery_service(
+            "did:key:z6MkhaXgBZDvotDkL5257faiz4zZbcw51635Q6phWoqnVJJN"
+        )
+        .is_err());
         assert!(validate_declaration_delivery_service("did:ion:12345").is_err());
 
         // Invalid did:plc length or chars
         assert!(validate_declaration_delivery_service("did:plc:short").is_err());
-        assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvu8").is_err()); // '8' is not base32 [a-z2-7]
+        assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvu8").is_err());
+        // '8' is not base32 [a-z2-7]
     }
     // -- Production Helper Tests: Declaration Record Value Validation --
 
@@ -3223,7 +3459,8 @@ mod tests {
             "deliveryService": "did:web:chat.catbird.blue",
             "createdAt": "2026-08-24T12:00:00Z"
         });
-        let (ds_did, allow) = validate_declaration_record_value(valid.as_object().unwrap()).unwrap();
+        let (ds_did, allow) =
+            validate_declaration_record_value(valid.as_object().unwrap()).unwrap();
         assert_eq!(ds_did, "did:web:chat.catbird.blue");
         assert_eq!(allow, "all");
 
@@ -3326,7 +3563,8 @@ mod tests {
                 "createdAt": "2026-08-24T12:00:00Z"
             });
 
-            let (_, allow_incoming) = validate_declaration_record_value(record.as_object().unwrap()).unwrap();
+            let (_, allow_incoming) =
+                validate_declaration_record_value(record.as_object().unwrap()).unwrap();
             assert_eq!(allow_incoming, consent);
         }
     }
@@ -3371,21 +3609,30 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
             3600,
         );
         let err_direct = resolver_lazy
             .resolve_ds_did_to_endpoint("did:key:unresolvable")
             .await
             .unwrap_err();
-        assert!(matches!(err_direct, FederationError::ResolutionFailed { .. }));
+        assert!(matches!(
+            err_direct,
+            FederationError::ResolutionFailed { .. }
+        ));
         let pool = setup_cache_test_pool().await;
         let resolver = DsResolver::new(
             pool,
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            Some((
+                "did:web:default-ds.example.com".to_string(),
+                "https://default-ds.example.com".to_string(),
+            )),
             3600,
         );
         let err = resolver
@@ -3596,7 +3843,13 @@ mod tests {
 
         // Fetching declaration directly and validating fails
         let decl_body = resolver
-            .fetch_repo_record(&pds_endpoint, "did:plc:alice", DECLARATION_COLLECTION, DECLARATION_RKEY, deadline)
+            .fetch_repo_record(
+                &pds_endpoint,
+                "did:plc:alice",
+                DECLARATION_COLLECTION,
+                DECLARATION_RKEY,
+                deadline,
+            )
             .await
             .expect("fetch declaration record succeeds");
         let decl_val = decl_body.get("value").and_then(|v| v.as_object()).unwrap();
@@ -3604,7 +3857,13 @@ mod tests {
 
         // Profile record fetch succeeds
         let profile_body = resolver
-            .fetch_repo_record(&pds_endpoint, "did:plc:alice", PROFILE_COLLECTION, PROFILE_RKEY, deadline)
+            .fetch_repo_record(
+                &pds_endpoint,
+                "did:plc:alice",
+                PROFILE_COLLECTION,
+                PROFILE_RKEY,
+                deadline,
+            )
             .await
             .expect("fetch profile record succeeds");
         assert!(profile_body.get("value").is_some());
@@ -3620,7 +3879,10 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
-        let mut conn = pool.acquire().await.expect("acquire connection for migration test");
+        let mut conn = pool
+            .acquire()
+            .await
+            .expect("acquire connection for migration test");
         let schema_name = format!("test_mig_{}", Uuid::new_v4().as_simple());
         sqlx::query(&format!("CREATE SCHEMA {schema_name};"))
             .execute(&mut *conn)
@@ -3657,7 +3919,8 @@ mod tests {
         .expect("insert legacy actor-keyed row");
 
         // Apply target migration SQL once into the isolated schema
-        let migration_sql = include_str!("../../migrations/20260824000002_chat_actor_ds_mapping.sql");
+        let migration_sql =
+            include_str!("../../migrations/20260824000002_chat_actor_ds_mapping.sql");
         sqlx::raw_sql(migration_sql)
             .execute(&mut *conn)
             .await
@@ -3669,7 +3932,10 @@ mod tests {
             .fetch_one(&mut *conn)
             .await
             .expect("query count of legacy row");
-        assert_eq!(count, 0, "legacy actor-keyed row must be purged by migration");
+        assert_eq!(
+            count, 0,
+            "legacy actor-keyed row must be purged by migration"
+        );
 
         // Cleanup isolated schema
         let _ = sqlx::query(&format!("DROP SCHEMA {schema_name} CASCADE;"))

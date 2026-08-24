@@ -6,14 +6,14 @@
 //! `broadcast` channel — identical to the local SSE path. The sequencer only
 //! sees "one connection from this home DS," never individual client devices.
 
+use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use futures::{SinkExt, StreamExt};
-use serde::Deserialize;
-use sqlx::PgPool;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -153,7 +153,8 @@ impl UpstreamManager {
                 conn.refcount.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     convo_id,
-                    sequencer_did = canonical_sequencer, "Reusing existing upstream connection"
+                    sequencer_did = canonical_sequencer,
+                    "Reusing existing upstream connection"
                 );
                 return Ok(conn.tx.subscribe());
             }
@@ -304,7 +305,9 @@ async fn upstream_reader_task(ctx: ReaderTaskContext) {
         }
 
         // Recheck peer policy immediately before connect/reconnect; denial stops/cancels reader
-        if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+        if let Err(e) =
+            super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await
+        {
             warn!(
                 convo_id = ctx.convo_id,
                 sequencer_did = ctx.sequencer_did,
@@ -363,7 +366,9 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
         .await?;
 
     // 2. Recheck peer policy after resolve_endpoint_destination await immediately before acquire_ticket_pinned
-    if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+    if let Err(e) =
+        super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await
+    {
         warn!(
             convo_id = ctx.convo_id,
             sequencer_did = ctx.sequencer_did,
@@ -397,7 +402,9 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
     );
 
     // 5. Recheck peer policy post-ticket after URL/cursor prep immediately before TCP loop
-    if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+    if let Err(e) =
+        super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await
+    {
         warn!(
             convo_id = ctx.convo_id,
             sequencer_did = ctx.sequencer_did,
@@ -439,12 +446,8 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
     })?;
 
     // 6. Perform WebSocket handshake (handles TLS via rustls if wss://, retaining SNI and Host header)
-    let connect_fut = tokio_tungstenite::client_async_tls_with_config(
-        &ws_url,
-        tcp_stream,
-        None,
-        None,
-    );
+    let connect_fut =
+        tokio_tungstenite::client_async_tls_with_config(&ws_url, tcp_stream, None, None);
     let (ws_stream, _response) = tokio::select! {
       result = connect_fut => result.map_err(|e| FederationError::DsUnreachable {
         endpoint: ctx.endpoint_url.clone(),
@@ -549,7 +552,11 @@ async fn acquire_ticket_with_timeout_pinned(
             reason: format!("Failed to sign ticket request: {e}"),
         })?;
 
-    let url = format!("{}/xrpc/{}", ctx.endpoint_url.trim_end_matches('/'), TICKET_METHOD);
+    let url = format!(
+        "{}/xrpc/{}",
+        ctx.endpoint_url.trim_end_matches('/'),
+        TICKET_METHOD
+    );
 
     let body = serde_json::json!({
       "convoId": ctx.convo_id,
@@ -1015,9 +1022,11 @@ mod tests {
             .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
 
         let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-            .execute(&mut *conn)
-            .await;
+        let _ = sqlx::query(
+            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+        )
+        .execute(&mut *conn)
+        .await;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -1053,7 +1062,10 @@ mod tests {
         let result = manager
             .subscribe("convo-1", "did:web:unknown-peer.example.com", None)
             .await;
-        assert!(result.is_err(), "subscribe must fail for unallowlisted peer");
+        assert!(
+            result.is_err(),
+            "subscribe must fail for unallowlisted peer"
+        );
         match result.unwrap_err() {
             FederationError::AuthFailed { reason } => {
                 assert!(
@@ -1076,9 +1088,11 @@ mod tests {
             .expect("connect to test db");
 
         let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-            .execute(&mut *conn)
-            .await;
+        let _ = sqlx::query(
+            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+        )
+        .execute(&mut *conn)
+        .await;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -1086,7 +1100,10 @@ mod tests {
         let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
             .execute(&mut *conn)
             .await;
-        let peer_did = format!("did:web:revoked-up-{}.example.com", uuid::Uuid::new_v4().as_simple());
+        let peer_did = format!(
+            "did:web:revoked-up-{}.example.com",
+            uuid::Uuid::new_v4().as_simple()
+        );
 
         // Insert peer as blocked
         sqlx::query(
@@ -1135,11 +1152,15 @@ mod tests {
 
         // Running upstream_reader_task must observe peer policy denial and cancel immediately
         upstream_reader_task(ctx).await;
-        assert!(cancel.is_cancelled(), "reader task must cancel itself when peer policy is revoked");
+        assert!(
+            cancel.is_cancelled(),
+            "reader task must cancel itself when peer policy is revoked"
+        );
     }
 
     #[tokio::test]
-    async fn test_upstream_cancels_when_peer_policy_revoked_during_resolution_proves_no_ticket_request() {
+    async fn test_upstream_cancels_when_peer_policy_revoked_during_resolution_proves_no_ticket_request(
+    ) {
         std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
         std::env::set_var("APP_ENV", "test");
         let database_url = std::env::var("TEST_DATABASE_URL")
@@ -1151,9 +1172,11 @@ mod tests {
             .expect("connect to test db");
 
         let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-            .execute(&mut *conn)
-            .await;
+        let _ = sqlx::query(
+            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+        )
+        .execute(&mut *conn)
+        .await;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -1162,7 +1185,10 @@ mod tests {
             .execute(&mut *conn)
             .await;
 
-        let peer_did = format!("did:web:127.0.0.1%3Arevoked-during-res-{}", uuid::Uuid::new_v4().as_simple());
+        let peer_did = format!(
+            "did:web:127.0.0.1%3Arevoked-during-res-{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
 
         // 1. Peer initially allowed
         sqlx::query(
@@ -1212,12 +1238,17 @@ mod tests {
                 let ep_url = endpoint_for_barrier.clone();
                 Some(Box::pin(async move {
                     // Revoke peer policy in database right during resolution (deterministic resolver barrier)
-                    let _ = sqlx::query("UPDATE federation_peers SET status = 'block' WHERE ds_did = $1")
-                        .bind(&peer)
-                        .execute(&pool)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE federation_peers SET status = 'block' WHERE ds_did = $1",
+                    )
+                    .bind(&peer)
+                    .execute(&pool)
+                    .await;
 
-                    let sock_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), ticket_port);
+                    let sock_addr = std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        ticket_port,
+                    );
                     Ok(crate::federation::resolver::ValidatedRemoteDestination {
                         url: url::Url::parse(&ep_url).unwrap(),
                         host: "127.0.0.1".to_string(),
@@ -1253,8 +1284,14 @@ mod tests {
         };
 
         let res = connect_and_stream(&ctx).await;
-        assert!(res.is_err(), "must fail when peer policy was revoked during resolution");
-        assert!(cancel.is_cancelled(), "cancellation token must be triggered on peer policy denial before ticket");
+        assert!(
+            res.is_err(),
+            "must fail when peer policy was revoked during resolution"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "cancellation token must be triggered on peer policy denial before ticket"
+        );
         assert!(
             !ticket_requested.load(std::sync::atomic::Ordering::SeqCst),
             "ticket request must NEVER have been made when peer policy was revoked during resolution before ticket"
@@ -1280,9 +1317,11 @@ mod tests {
             .expect("connect to test db");
 
         let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-            .execute(&mut *conn)
-            .await;
+        let _ = sqlx::query(
+            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
+        )
+        .execute(&mut *conn)
+        .await;
         sqlx::migrate!("./migrations")
             .run(&mut *conn)
             .await
@@ -1292,7 +1331,10 @@ mod tests {
             .await;
 
         let pool_clone = pool.clone();
-        let peer_did = format!("did:web:127.0.0.1%3Arevoked-after-{}", uuid::Uuid::new_v4().as_simple());
+        let peer_did = format!(
+            "did:web:127.0.0.1%3Arevoked-after-{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
         let peer_did_clone = peer_did.clone();
 
         // Peer initially allowed
@@ -1314,10 +1356,12 @@ mod tests {
                 let peer = peer_did_clone.clone();
                 async move {
                     // Revoke peer policy in database right as ticket is issued
-                    let _ = sqlx::query("UPDATE federation_peers SET status = 'block' WHERE ds_did = $1")
-                        .bind(&peer)
-                        .execute(&pool)
-                        .await;
+                    let _ = sqlx::query(
+                        "UPDATE federation_peers SET status = 'block' WHERE ds_did = $1",
+                    )
+                    .bind(&peer)
+                    .execute(&pool)
+                    .await;
                     Json(json!({ "ticket": "test-ticket-revoked-after" }))
                 }
             }),
@@ -1359,8 +1403,14 @@ mod tests {
         };
 
         let res = connect_and_stream(&ctx).await;
-        assert!(res.is_err(), "must fail after ticket before connect when peer policy is revoked");
-        assert!(cancel.is_cancelled(), "cancellation token must be triggered on peer policy denial after ticket");
+        assert!(
+            res.is_err(),
+            "must fail after ticket before connect when peer policy is revoked"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "cancellation token must be triggered on peer policy denial after ticket"
+        );
         match res.unwrap_err() {
             FederationError::AuthFailed { reason } => {
                 assert!(reason.contains("blocklisted") || reason.contains("Peer DS"));

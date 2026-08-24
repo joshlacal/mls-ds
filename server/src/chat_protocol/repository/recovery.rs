@@ -4088,7 +4088,7 @@ pub mod production_composition_proof {
 }
 
 impl RecoveryRequestAuthority {
-        pub(crate) async fn into_plan_input<T: PublicTransport>(
+    pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,
@@ -4225,7 +4225,7 @@ impl RecoveryCancellationAuthority {
 }
 
 impl RecoveryFulfillmentAuthority {
-        pub(crate) async fn into_plan_input<T: PublicTransport>(
+    pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,

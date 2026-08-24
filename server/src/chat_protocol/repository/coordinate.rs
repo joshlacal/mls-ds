@@ -66,17 +66,9 @@ pub(crate) fn canonical_active_coordinate_json(
 mod tests {
     use super::*;
 
-
     fn fixture(lifecycle: PublicGroupSnapshotLifecycle) -> PublicGroupSnapshotCoordinate {
         PublicGroupSnapshotCoordinate::new(
-            [7u8; 16],
-            3,
-            9,
-            [1u8; 32],
-            4,
-            [2u8; 32],
-            [3u8; 32],
-            lifecycle,
+            [7u8; 16], 3, 9, [1u8; 32], 4, [2u8; 32], [3u8; 32], lifecycle,
         )
     }
 

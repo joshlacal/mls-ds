@@ -56,6 +56,41 @@ async fn submit(
 ) -> Result<Response, ChatFailure> {
     let admission =
         context::admit_signed_operation_only(pool, runtime, ENDPOINT, headers, body).await?;
+    if let Some(completed) =
+        crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
+            .await
+            .map_err(|e| context::auth_repository_failure(ENDPOINT, e))?
+    {
+        return context::canonical_json_response(
+            ENDPOINT,
+            completed.status,
+            completed.response_bytes,
+        )
+        .map_err(|_| ChatFailure::invariant(ENDPOINT));
+    }
+    let routing_intent = if let Ok(add_principals) = admission.policy_addition_dids() {
+        if !add_principals.is_empty() {
+            let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
+                pool,
+                runtime.resolver().map(|resolver| resolver.as_ref()),
+                &add_principals,
+            )
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    ?err,
+                    "submitTransition participant routing resolution failed"
+                );
+                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::NotAuthorized)
+            })?;
+            Some(crate::chat_protocol::federation_routing::ParticipantRoutingIntent::new(routes))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut transaction = pool
         .begin()
         .await
@@ -79,6 +114,7 @@ async fn submit(
                 &mut transaction,
                 prepared,
                 runtime.relationship_authority().as_ref(),
+                routing_intent,
             )
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
@@ -88,7 +124,10 @@ async fn submit(
                 outcome.response_bytes().to_vec(),
             )
             .map_err(|error| {
-                tracing::error!(?error, "submitTransition canonical response construction failed");
+                tracing::error!(
+                    ?error,
+                    "submitTransition canonical response construction failed"
+                );
                 error
             })?
         }
@@ -142,9 +181,7 @@ fn submit_failure(
         E::Conversation(CS::Metadata(_)) => {
             ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
         }
-        E::Conversation(CS::Snapshot(_)) => {
-            ChatFailure::protocol(ENDPOINT, C::InvalidCommit)
-        }
+        E::Conversation(CS::Snapshot(_)) => ChatFailure::protocol(ENDPOINT, C::InvalidCommit),
         E::Conversation(CS::State(s) | CS::Authority(s)) => {
             map_state_machine_error(mutation_kind, s)
         }
@@ -154,19 +191,15 @@ fn submit_failure(
         E::Relationship(R::InvalidProjection) => {
             ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
         }
-        E::InvitationQuota(_) => {
-            ChatFailure::protocol(ENDPOINT, C::InvitationLimitReached)
-        }
-        E::RecoveryPackage(_) => {
-            ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound)
-        }
+        E::InvitationQuota(_) => ChatFailure::protocol(ENDPOINT, C::InvitationLimitReached),
+        E::RecoveryPackage(_) => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound),
         E::StateMachine(s) => map_state_machine_error(mutation_kind, s),
-        E::MissingMutation
-        | E::UnsupportedMutation
-        | E::InvalidCanonicalMaterial => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
-        E::Conversation(_)
-        | E::ExecutionContext(_)
-        | E::Executor(_) => ChatFailure::invariant(ENDPOINT),
+        E::MissingMutation | E::UnsupportedMutation | E::InvalidCanonicalMaterial => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
+        }
+        E::Conversation(_) | E::ExecutionContext(_) | E::Executor(_) => {
+            ChatFailure::invariant(ENDPOINT)
+        }
     }
 }
 
@@ -197,9 +230,7 @@ fn map_state_machine_error(
             ChatFailure::protocol(ENDPOINT, C::LeaveRequestExpired)
         }
         S::WorkExpired => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryExpired),
-        S::InvalidMetadataAuthority => {
-            ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
-        }
+        S::InvalidMetadataAuthority => ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot),
         S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState
             if mutation_kind == SignedMutationKind::MetadataTransition =>
         {

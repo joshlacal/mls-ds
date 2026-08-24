@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use axum::{extract::State, Json};
+use std::sync::Arc;
 use tracing::debug;
 
 use crate::{
@@ -41,7 +41,10 @@ pub async fn resolve(
         )
         .map_err(|e| FederationError::ResolutionFailed {
             did: user_did.clone(),
-            kind: crate::federation::ResolutionFailureKind::InvalidUrl(format!("Invalid endpoint URI: {}", e)),
+            kind: crate::federation::ResolutionFailureKind::InvalidUrl(format!(
+                "Invalid endpoint URI: {}",
+                e
+            )),
         })?;
 
     let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {

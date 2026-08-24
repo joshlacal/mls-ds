@@ -210,7 +210,10 @@ pub struct PreReplayCryptographicVerification {
 
 impl PreReplayCryptographicVerification {
     pub const fn is_standard_service_auth(&self) -> bool {
-        matches!(self.evidence, PreReplayAuthenticationEvidence::StandardService(_))
+        matches!(
+            self.evidence,
+            PreReplayAuthenticationEvidence::StandardService(_)
+        )
     }
     pub fn standard_service_evidence(&self) -> Option<&StandardServiceEvidence> {
         match &self.evidence {
@@ -269,9 +272,10 @@ impl PreReplayCryptographicVerification {
     pub fn auth_time(&self) -> Option<NumericDate> {
         match &self.evidence {
             PreReplayAuthenticationEvidence::StandardService(e) => Some(e.token_iat),
-            PreReplayAuthenticationEvidence::LegacyDpop(e) => {
-                e.enrollment.as_ref().map(EnrollmentGrantEvidence::auth_time)
-            }
+            PreReplayAuthenticationEvidence::LegacyDpop(e) => e
+                .enrollment
+                .as_ref()
+                .map(EnrollmentGrantEvidence::auth_time),
         }
     }
     pub fn enrollment(&self) -> Option<&EnrollmentGrantEvidence> {
@@ -962,7 +966,10 @@ impl ReadAdmissionAttempt {
             return Err(ReadAdmissionBindingError::RequesterCoordinates);
         }
         if let Some(expected_digest) = binding.locked_jkt_digest {
-            let textual = row.textual_jkt.as_deref().ok_or(ReadAdmissionBindingError::Thumbprint)?;
+            let textual = row
+                .textual_jkt
+                .as_deref()
+                .ok_or(ReadAdmissionBindingError::Thumbprint)?;
             if decode_canonical_thumbprint_digest(textual)? != expected_digest {
                 return Err(ReadAdmissionBindingError::Thumbprint);
             }

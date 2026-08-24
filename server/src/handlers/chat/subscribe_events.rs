@@ -61,14 +61,7 @@ pub(super) async fn handle(
     match authorize(&pool, &runtime, &parsed).await {
         Ok((ticket, replay_through)) => ws
             .on_upgrade(move |socket| {
-                stream(
-                    socket,
-                    pool,
-                    runtime,
-                    ticket,
-                    parsed.cursor,
-                    replay_through,
-                )
+                stream(socket, pool, runtime, ticket, parsed.cursor, replay_through)
             })
             .into_response(),
         Err(failure) => failure.into_response(),
@@ -117,10 +110,10 @@ pub fn parse_query(query: Option<&str>) -> Result<SubscribeEventsQuery, ChatFail
             }
         }
     }
-    let cursor =
-        cursor.ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
-    let ticket =
-        ticket.ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+    let cursor = cursor
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
+    let ticket = ticket
+        .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidTicket))?;
     Ok(SubscribeEventsQuery { cursor, ticket })
 }
 

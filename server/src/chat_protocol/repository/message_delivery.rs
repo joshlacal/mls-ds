@@ -277,17 +277,14 @@ async fn require_relationship_policy<T: PublicTransport>(
             tracing::error!(?error, "traffic fallback scope sealing failed");
             MessageDeliveryError::RelationshipPolicyUnavailable
         })?;
-    let (projection, decision) = super::relationship::load_fallback_traffic_projection(
-        tx,
-        fallback,
-        relationship_authority,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(?error, "traffic fallback loading failed");
-        MessageDeliveryError::RelationshipPolicyUnavailable
-    })?
-    .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
+    let (projection, decision) =
+        super::relationship::load_fallback_traffic_projection(tx, fallback, relationship_authority)
+            .await
+            .map_err(|error| {
+                tracing::error!(?error, "traffic fallback loading failed");
+                MessageDeliveryError::RelationshipPolicyUnavailable
+            })?
+            .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
     super::relationship::consume_locked_traffic_projection(
         &projection,
         &decision,
@@ -489,11 +486,10 @@ pub(crate) async fn send<T: PublicTransport>(
     )
     .map_err(|_| MessageDeliveryError::Invariant)?;
     let response = json!({"entry": {"entryId": entry_id_text, "conversationId": conversation_id_text, "seq": head.next_seq, "signedRequest": signed_request, "receivedAt": authority.trusted_instant().as_str()}});
-    let response_bytes =
-        serde_json::to_vec(&response).map_err(|e| {
-            tracing::error!("response serde error: {:?}", e);
-            MessageDeliveryError::Invariant
-        })?;
+    let response_bytes = serde_json::to_vec(&response).map_err(|e| {
+        tracing::error!("response serde error: {:?}", e);
+        MessageDeliveryError::Invariant
+    })?;
     let append = delivery::AppendEntry {
         conversation_id: expected.conversation_id,
         entry_id: Uuid::from_bytes(*entry.entry_id().as_bytes()),

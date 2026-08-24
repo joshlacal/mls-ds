@@ -139,6 +139,7 @@ pub(crate) struct NewParticipantPeriod {
     pub(crate) invitation: Option<ParticipantInvitation>,
     pub(crate) acceptance: Option<ParticipantAcceptance>,
     pub(crate) created_at: DateTime<Utc>,
+    pub(crate) ds_did: Option<String>,
 }
 
 /// Insert one new current participant period.
@@ -177,11 +178,11 @@ pub(crate) async fn insert_participant_period(
             invitation_transition_id, invitation_entry_id, invited_at,
             acceptance_transition_id, acceptance_entry_id, accepted_at,
             removing_transition_id, removing_seq, removed_at,
-            current_membership, created_at
+            current_membership, created_at, ds_did
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9,
             $10, $11, $12, $13, $14, $15,
-            NULL, NULL, NULL, TRUE, $16
+            NULL, NULL, NULL, TRUE, $16, $17
         )
         "#,
     )
@@ -201,6 +202,7 @@ pub(crate) async fn insert_participant_period(
     .bind(acceptance_entry_id)
     .bind(accepted_at)
     .bind(period.created_at)
+    .bind(&period.ds_did)
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -2799,6 +2801,9 @@ pub(crate) struct NewConversationHead {
     pub(crate) current_state_version: i64,
     pub(crate) next_entry_seq: i64,
     pub(crate) created_at: DateTime<Utc>,
+    pub(crate) is_remote: bool,
+    pub(crate) sequencer_ds: Option<String>,
+    pub(crate) sequencer_term: i64,
 }
 
 pub(crate) async fn insert_conversation_head(
@@ -2812,9 +2817,10 @@ pub(crate) async fn insert_conversation_head(
             conversation_id, kind, lifecycle, current_generation,
             current_state_version, next_entry_seq, direct_did_low, direct_did_high,
             created_at, close_transition_id, close_generation, close_state_version,
-            close_seq, closed_at
+            close_seq, closed_at, is_remote, sequencer_ds, sequencer_term
         ) VALUES (
-            $1, $2, 'active', $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, NULL, NULL
+            $1, $2, 'active', $3, $4, $5, $6, $7, $8, NULL, NULL, NULL, NULL, NULL,
+            $9, $10, $11
         )
         "#,
     )
@@ -2826,6 +2832,9 @@ pub(crate) async fn insert_conversation_head(
     .bind(direct_did_low)
     .bind(direct_did_high)
     .bind(head.created_at)
+    .bind(head.is_remote)
+    .bind(&head.sequencer_ds)
+    .bind(head.sequencer_term)
     .execute(&mut **transaction)
     .await?;
     Ok(())

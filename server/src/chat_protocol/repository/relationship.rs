@@ -49,8 +49,6 @@ use super::core::{
     LockedDirectLookupOutcome, LockedInvitationQuotaGuard,
 };
 
-
-
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
 const INSERT_CHUNK_ROWS: usize = 256;
 
@@ -941,19 +939,26 @@ pub(crate) fn seal_acceptance_fallback_scope(
         head.transaction_id(),
         locked.state().coordinate().conversation_id(),
     )?;
-    let accepting_participant = match locked
-        .state()
-        .participant(registration.actor().principal()) {
+    let accepting_participant = match locked.state().participant(registration.actor().principal()) {
         Some(p) => {
-            tracing::info!("seal_acceptance_fallback_scope: found participant status={:?}", p.status());
+            tracing::info!(
+                "seal_acceptance_fallback_scope: found participant status={:?}",
+                p.status()
+            );
             if p.status() != ParticipantStatus::Pending {
-                tracing::error!("seal_acceptance_fallback_scope: participant not pending, is {:?}", p.status());
+                tracing::error!(
+                    "seal_acceptance_fallback_scope: participant not pending, is {:?}",
+                    p.status()
+                );
                 return Err(RelationshipRepositoryError::InvalidProjection);
             }
             p
         }
         None => {
-            tracing::error!("seal_acceptance_fallback_scope: participant not found for {:?}", registration.actor().principal());
+            tracing::error!(
+                "seal_acceptance_fallback_scope: participant not found for {:?}",
+                registration.actor().principal()
+            );
             return Err(RelationshipRepositoryError::InvalidProjection);
         }
     };
@@ -967,7 +972,10 @@ pub(crate) fn seal_acceptance_fallback_scope(
     let inviter = String::from_utf8(inviter.principal().as_bytes().to_vec())
         .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
     if !locked_state_has_active_member(locked, &inviter)? {
-        tracing::error!("seal_acceptance_fallback_scope: inviter {} is not active member", inviter);
+        tracing::error!(
+            "seal_acceptance_fallback_scope: inviter {} is not active member",
+            inviter
+        );
         return Err(RelationshipRepositoryError::InvalidProjection);
     }
     let operation = match locked.state().kind() {
@@ -1409,8 +1417,12 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
         &scope_digest,
         &fingerprint,
     )
-    .await? {
-        Some(s) if observe_post_lock_time(transaction).await? - s.completed_at <= TimeDelta::seconds(60) => {
+    .await?
+    {
+        Some(s)
+            if observe_post_lock_time(transaction).await? - s.completed_at
+                <= TimeDelta::seconds(60) =>
+        {
             let (decl, rel) = lock_projection_children(transaction, s.projection_id).await?;
             (s, decl, rel)
         }
@@ -1418,24 +1430,20 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
             let live_allocation = allocate_projection_revision(transaction).await?;
             let fallback_allocation = allocate_projection_revision(transaction).await?;
             let live = match &scope {
-                ProjectionScope::Admission(req) => {
-                    authority
-                        .collect_admission_projection(live_allocation, operation_scope, req.clone())
-                        .await
-                        .map_err(|e| {
-                            tracing::error!("collect_admission_projection failed: {:?}", e);
-                            RelationshipRepositoryError::InvalidProjection
-                        })?
-                }
-                ProjectionScope::BlockOnly(s) => {
-                    authority
-                        .collect_block_projection(live_allocation, operation_scope, s.members.clone())
-                        .await
-                        .map_err(|e| {
-                            tracing::error!("collect_block_projection failed: {:?}", e);
-                            RelationshipRepositoryError::InvalidProjection
-                        })?
-                }
+                ProjectionScope::Admission(req) => authority
+                    .collect_admission_projection(live_allocation, operation_scope, req.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("collect_admission_projection failed: {:?}", e);
+                        RelationshipRepositoryError::InvalidProjection
+                    })?,
+                ProjectionScope::BlockOnly(s) => authority
+                    .collect_block_projection(live_allocation, operation_scope, s.members.clone())
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("collect_block_projection failed: {:?}", e);
+                        RelationshipRepositoryError::InvalidProjection
+                    })?,
             };
             let observation = observe_relationship_persistence();
             let sealed = live
@@ -1450,7 +1458,8 @@ pub(crate) async fn load_fallback_relationship_projection<T: PublicTransport>(
             )
             .await?
             .ok_or(RelationshipRepositoryError::InvalidProjection)?;
-            let (decl, rel) = lock_projection_children(transaction, newly_locked.projection_id).await?;
+            let (decl, rel) =
+                lock_projection_children(transaction, newly_locked.projection_id).await?;
             (newly_locked, decl, rel)
         }
     };

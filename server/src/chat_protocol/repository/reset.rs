@@ -643,7 +643,6 @@ pub(in crate::chat_protocol::repository) struct ResetReplayPostStateProof {
     seal_digest: [u8; 32],
 }
 
-
 impl ResetReplayPostStateProof {
     pub(in crate::chat_protocol::repository) fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -1927,6 +1926,10 @@ async fn prepare_reset_request_graph(
             conversation_id,
         )),
         welcome_disposition_event_payloads: Vec::new(),
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     let (planned, prelude) = match authority.disposition() {
         LockedResetRequestDisposition::Vacant => {
@@ -1988,6 +1991,10 @@ async fn prepare_reset_activation_graph(
         genesis_group_info_bytes: Some(group_info),
         primary_event_payload: Some(canonical_reset_activation_event_payload(conversation_id)),
         welcome_disposition_event_payloads: Vec::new(),
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     Ok((
         PreparedResetExecutionGraph::new(plan, artifacts, response)?,
@@ -3430,7 +3437,6 @@ fn digest_generation_state(digest: &mut Sha256, row: &ResetReplaySuccessorRow) {
     digest.update(row.created_at.timestamp_millis().to_be_bytes());
 }
 
-
 #[allow(clippy::too_many_arguments)]
 fn reset_replay_seal(
     transaction_id: &str,
@@ -3460,7 +3466,6 @@ fn reset_replay_seal(
     digest.update(expected_response_sha256);
     digest.finalize().into()
 }
-
 
 fn digest_uuid(digest: &mut Sha256, value: Uuid) {
     digest.update(value.as_bytes());

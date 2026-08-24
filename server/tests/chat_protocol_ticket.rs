@@ -351,7 +351,11 @@ async fn seed_session(
     )
     .expect("bind sealed session capability");
     let sealed = sealer
-        .seal_successor(capability_bytes.as_slice(), &binding, &mut FixtureRandom(0x33))
+        .seal_successor(
+            capability_bytes.as_slice(),
+            &binding,
+            &mut FixtureRandom(0x33),
+        )
         .expect("seal session capability");
     sqlx::query(
         r#"
@@ -1000,8 +1004,12 @@ async fn http_subscription_ticket_mints_once_consumes_once_and_denies_foreign_de
     assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
     assert_eq!(foreign_response["error"], "DeviceNotRegistered");
     assert!(foreign_response.get("ticket").is_none());
-    let ticket_str = owner_response["ticket"].as_str().expect("minted ticket string");
-    let opaque_bytes = URL_SAFE_NO_PAD.decode(ticket_str.as_bytes()).expect("decode ticket");
+    let ticket_str = owner_response["ticket"]
+        .as_str()
+        .expect("minted ticket string");
+    let opaque_bytes = URL_SAFE_NO_PAD
+        .decode(ticket_str.as_bytes())
+        .expect("decode ticket");
     let opaque_hash = ticket_hash(&opaque_bytes);
     let subscribe_query = format!("?ticket={ticket_str}&cursor={}", session.capability);
     let first = router

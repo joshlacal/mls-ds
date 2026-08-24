@@ -1965,7 +1965,7 @@ impl HydrationAuthority {
     /// Consume the exact signed Policy body and the complete relationship
     /// projection under the conversation lock. No caller-selected roster or
     /// participant-change command crosses this seam.
-        pub(crate) fn plan_policy<T: PublicTransport>(
+    pub(crate) fn plan_policy<T: PublicTransport>(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2255,7 +2255,7 @@ impl HydrationAuthority {
     /// fulfillments have distinct sealed entry points below so their extra
     /// package, target-registration, consent, and work-row authorities cannot
     /// be bypassed by variant dispatch.
-        pub(crate) fn plan_commit_entry(
+    pub(crate) fn plan_commit_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2436,7 +2436,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_leave_fulfillment_entry(
+    pub(crate) fn plan_leave_fulfillment_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2556,7 +2556,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_metadata_entry(
+    pub(crate) fn plan_metadata_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2589,7 +2589,7 @@ impl HydrationAuthority {
             .bind_terminal_package_guards(prior, terminal_packages, &transaction_id)
     }
 
-        pub(crate) fn plan_zero_leaf_leave_entry(
+    pub(crate) fn plan_zero_leaf_leave_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2629,7 +2629,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_close_entry(
+    pub(crate) fn plan_close_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2763,7 +2763,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-        pub(crate) fn plan_leave_request_entry(
+    pub(crate) fn plan_leave_request_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2792,7 +2792,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-        pub(crate) fn plan_leave_cancellation_entry(
+    pub(crate) fn plan_leave_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -3007,7 +3007,7 @@ impl HydrationAuthority {
             .bind_recovery_package_cas(package_cas)
     }
 
-        pub(crate) fn plan_leaf_recovery_cancellation_entry(
+    pub(crate) fn plan_leaf_recovery_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         envelope: DurableSignedRequestEnvelope,
@@ -3067,7 +3067,7 @@ impl HydrationAuthority {
     /// Consume the exact request repository input and produce one fully bound
     /// transition. No handler identity, prelude, durable row, or payload enters
     /// this planner as a separate argument.
-        pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
+    pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
         input: RecoveryRequestPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3118,7 +3118,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_recovery_cancellation_input(
+    pub(crate) fn plan_recovery_cancellation_input(
         input: RecoveryCancellationPlanInput,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
         let parts = input.into_planner_parts();
@@ -3162,7 +3162,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
+    pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
         input: RecoveryFulfillmentPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3243,7 +3243,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_client_recovery_expiry_input(
+    pub(crate) fn plan_client_recovery_expiry_input(
         input: RecoveryClientExpiryPlanInput,
     ) -> Result<PlannedClientRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3283,7 +3283,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_scheduler_recovery_expiry_input(
+    pub(crate) fn plan_scheduler_recovery_expiry_input(
         input: RecoverySchedulerExpiryPlanInput,
     ) -> Result<PlannedSchedulerRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3685,7 +3685,7 @@ impl HydrationAuthority {
     /// fanout manifest proves completeness, including the legal empty case;
     /// callers cannot omit a conversation, request, Welcome, or reserved
     /// package and still obtain a persistence plan.
-        pub(crate) fn plan_device_revocation_batch(
+    pub(crate) fn plan_device_revocation_batch(
         mutation: VerifiedSignedMutation,
         actor_registration: LockedRegistrationProjection,
         target_guard: LockedRevocationTargetGuard,
@@ -4408,7 +4408,7 @@ impl HydrationAuthority {
     /// Project an exact non-actor device registration solely from the locked
     /// business scope. Recovery fulfillment uses this for the original request
     /// target; no handler-selected key material crosses the planner boundary.
-        fn locked_registration_for_scoped_device(
+    fn locked_registration_for_scoped_device(
         &self,
         scope: &ScopeBoundBusinessAuthority,
         did: &str,
@@ -12667,7 +12667,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn bind_device_revocation_authority(
+    fn bind_device_revocation_authority(
         mut self,
         evidence: DeviceRevocationEvidence,
         head: &LockedConversationHeadGuard,
@@ -12732,7 +12732,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn bind_recovery_expiry_authority(
+    fn bind_recovery_expiry_authority(
         mut self,
         evidence: RecoveryExpiryPlanAuthority,
         head: &LockedConversationHeadGuard,
@@ -12901,7 +12901,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn into_revocation_batch_member_plan(
+    fn into_revocation_batch_member_plan(
         self,
     ) -> Result<ConversationPersistencePlan, StateMachineError> {
         if !matches!(
@@ -12921,7 +12921,7 @@ impl PlannedTransition {
         })
     }
 
-        fn bind_revocation_package_cas(
+    fn bind_revocation_package_cas(
         mut self,
         binding: RevocationPackageCasBinding,
     ) -> Result<Self, StateMachineError> {
@@ -16757,7 +16757,11 @@ fn ensure_active(state: &ConversationState) -> Result<(), StateMachineError> {
         return Err(StateMachineError::ConversationClosed);
     }
     if state.public_state().coordinate() != &state.coordinate {
-        tracing::error!("coordinate mismatch: public_state={:?} != state_coord={:?}", state.public_state().coordinate(), state.coordinate);
+        tracing::error!(
+            "coordinate mismatch: public_state={:?} != state_coord={:?}",
+            state.public_state().coordinate(),
+            state.coordinate
+        );
         return Err(StateMachineError::InvalidPublicState);
     }
     Ok(())
@@ -17698,18 +17702,37 @@ fn require_commit_body(
             let c_meta = commit_metadata_matches(prior_state, metadata, next);
             tracing::error!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
             if !c_prior {
-                tracing::error!("prior mismatch: signed_prior={:?} != prior={:?}", signed_prior, prior);
+                tracing::error!(
+                    "prior mismatch: signed_prior={:?} != prior={:?}",
+                    signed_prior,
+                    prior
+                );
             }
             if !c_next {
-                tracing::error!("next mismatch: signed_next={:?} != next={:?}", signed_next, next);
+                tracing::error!(
+                    "next mismatch: signed_next={:?} != next={:?}",
+                    signed_next,
+                    next
+                );
             }
             if !c_commit_sha {
-                tracing::error!("commit_sha mismatch: verified={:?} != signed={:?}", commit.verified_commit_sha256(), commit_sha256);
+                tracing::error!(
+                    "commit_sha mismatch: verified={:?} != signed={:?}",
+                    commit.verified_commit_sha256(),
+                    commit_sha256
+                );
             }
             if !c_aad_sha {
-                tracing::error!("aad_sha mismatch: verified={:?} != signed={:?}", commit.verified_aad_sha256(), aad_digest);
+                tracing::error!(
+                    "aad_sha mismatch: verified={:?} != signed={:?}",
+                    commit.verified_aad_sha256(),
+                    aad_digest
+                );
             }
-            c_prior && c_next && c_req && (evidence.authority.is_none() || (c_commit_sha && c_aad_sha && c_meta))
+            c_prior
+                && c_next
+                && c_req
+                && (evidence.authority.is_none() || (c_commit_sha && c_aad_sha && c_meta))
         }
         (
             SignedMutationKind::LeaveCommitFulfillment,
@@ -17757,13 +17780,34 @@ fn commit_metadata_matches(
     let c_auth = next_metadata.author_proof == prior_metadata.author_proof;
     let c_avatar = next_metadata.avatar_binding == prior_metadata.avatar_binding;
     let c_nonce = next_metadata.nonce != prior_metadata.nonce;
-    tracing::error!("commit_metadata_matches: next_len={}, prior_len={}", next_metadata.ciphertext.len(), prior_metadata.ciphertext.len());
-    tracing::error!("commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}", c_coord, c_ver, c_ot, c_len, c_auth, c_avatar, c_nonce);
+    tracing::error!(
+        "commit_metadata_matches: next_len={}, prior_len={}",
+        next_metadata.ciphertext.len(),
+        prior_metadata.ciphertext.len()
+    );
+    tracing::error!(
+        "commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}",
+        c_coord,
+        c_ver,
+        c_ot,
+        c_len,
+        c_auth,
+        c_avatar,
+        c_nonce
+    );
     if !c_coord {
-        tracing::error!("metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}", next_metadata.coordinate, next_coordinate);
+        tracing::error!(
+            "metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}",
+            next_metadata.coordinate,
+            next_coordinate
+        );
     }
     if !c_auth {
-        tracing::error!("author_proof mismatch: next={:?} != prior={:?}", next_metadata.author_proof, prior_metadata.author_proof);
+        tracing::error!(
+            "author_proof mismatch: next={:?} != prior={:?}",
+            next_metadata.author_proof,
+            prior_metadata.author_proof
+        );
     }
     c_coord && c_ver && c_ot && c_len && c_auth && c_avatar && c_nonce
 }
@@ -17858,7 +17902,10 @@ fn require_commit_manifest(
             let c_pc = manifest.participant_changes.is_empty();
             let c_adds_len = adds.len() == 1;
             let c_adds_tgt = adds.get(0).map(|a| a.0 == target).unwrap_or(false);
-            let c_adds_req = adds.get(0).map(|a| a.1 == recovery_request_id).unwrap_or(false);
+            let c_adds_req = adds
+                .get(0)
+                .map(|a| a.1 == recovery_request_id)
+                .unwrap_or(false);
             let c_adds_kp = adds.get(0).map(|a| a.2 == key_package_ref).unwrap_or(false);
             let c_m_req = manifest.leaf_recovery_request_id.as_ref() == Some(recovery_request_id);
             let c_w_id = &signed_welcome.welcome_id == welcome_id;
@@ -17866,9 +17913,22 @@ fn require_commit_manifest(
             let c_w_req = &signed_welcome.recovery_request_id == recovery_request_id;
             let c_w_kp = &signed_welcome.key_package_ref == key_package_ref;
             let c_w_wire = signed_welcome.opaque_welcome == welcome.wire_bytes();
-            let c_w_sha = signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
+            let c_w_sha =
+                signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
             tracing::error!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
-            if !c_pc || !c_adds_len || !c_adds_tgt || !c_adds_req || !c_adds_kp || !c_m_req || !c_w_id || !c_w_rcp || !c_w_req || !c_w_kp || !c_w_wire || !c_w_sha {
+            if !c_pc
+                || !c_adds_len
+                || !c_adds_tgt
+                || !c_adds_req
+                || !c_adds_kp
+                || !c_m_req
+                || !c_w_id
+                || !c_w_rcp
+                || !c_w_req
+                || !c_w_kp
+                || !c_w_wire
+                || !c_w_sha
+            {
                 return Err(StateMachineError::InvalidWelcomeMapping);
             }
         }

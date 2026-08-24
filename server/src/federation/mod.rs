@@ -320,14 +320,22 @@ impl FederationConfig {
             receipt_verification_method: std::env::var("RECEIPT_VERIFICATION_METHOD").ok(),
             receipt_did_document_json: std::env::var("RECEIPT_DID_DOCUMENT_JSON").ok(),
             default_ds: {
-                let did_opt = std::env::var("DEFAULT_DS_DID").ok().filter(|v| !v.trim().is_empty());
-                let ep_opt = std::env::var("DEFAULT_DS_ENDPOINT").ok().filter(|v| !v.trim().is_empty());
+                let did_opt = std::env::var("DEFAULT_DS_DID")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty());
+                let ep_opt = std::env::var("DEFAULT_DS_ENDPOINT")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty());
                 match (did_opt, ep_opt) {
                     (Some(did), Some(endpoint)) => {
-                        let valid_did = crate::federation::resolver::validate_canonical_did(&did).unwrap_or_else(|e| {
-                            panic!("Invalid DEFAULT_DS_DID configuration '{did}': {e}");
-                        });
-                        let _valid_endpoint = crate::federation::resolver::validate_endpoint_url(&endpoint).unwrap_or_else(|e| {
+                        let valid_did = crate::federation::resolver::validate_canonical_did(&did)
+                            .unwrap_or_else(|e| {
+                                panic!("Invalid DEFAULT_DS_DID configuration '{did}': {e}");
+                            });
+                        let _valid_endpoint = crate::federation::resolver::validate_endpoint_url(
+                            &endpoint,
+                        )
+                        .unwrap_or_else(|e| {
                             panic!("Invalid DEFAULT_DS_ENDPOINT configuration '{endpoint}': {e}");
                         });
                         Some((valid_did, endpoint))

@@ -103,9 +103,18 @@ async fn serve(
     let parsed = QueryParams::parse(query, domain)
         .map_err(|error| ChatFailure::protocol(endpoint, error))?;
     let method = CanonicalHttpMethod::parse("GET").map_err(|_| ChatFailure::invariant(endpoint))?;
-    let admission =
-        context::admit_unsigned_read(pool, runtime, endpoint, method, headers, &parsed.actor_device_id).await?;
-    let sealer = runtime.cursor_sealer().ok_or_else(|| ChatFailure::invariant(endpoint))?;
+    let admission = context::admit_unsigned_read(
+        pool,
+        runtime,
+        endpoint,
+        method,
+        headers,
+        &parsed.actor_device_id,
+    )
+    .await?;
+    let sealer = runtime
+        .cursor_sealer()
+        .ok_or_else(|| ChatFailure::invariant(endpoint))?;
     let request = InventoryPublicRequestBinding::new(
         endpoint.nsid(),
         1,
@@ -138,7 +147,10 @@ async fn serve(
         .await
     }
     .map_err(|error| {
-        tracing::error!("create_inventory_snapshot_and_first_page error: {:?}", error);
+        tracing::error!(
+            "create_inventory_snapshot_and_first_page error: {:?}",
+            error
+        );
         map_repository_error(endpoint, error)
     })?;
     Ok(context::json_ok(response.into_bytes()))
@@ -318,7 +330,9 @@ mod tests {
         assert_eq!(parsed.actor_device_id, ACTOR);
         assert!(parsed.inventory_session_id.is_none());
         assert!(QueryParams::parse(
-            Some(&format!("actorDeviceId={ACTOR}&limit=50&inventorySessionId={SESSION}")),
+            Some(&format!(
+                "actorDeviceId={ACTOR}&limit=50&inventorySessionId={SESSION}"
+            )),
             InventoryDomain::Conversations
         )
         .is_err());
@@ -329,12 +343,11 @@ mod tests {
         let query = format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1");
         let parsed = QueryParams::parse(Some(&query), InventoryDomain::Welcomes).unwrap();
         assert_eq!(parsed.limit, 1);
-        assert_eq!(
-            parsed.inventory_session_id.as_deref(),
-            Some(SESSION)
-        );
+        assert_eq!(parsed.inventory_session_id.as_deref(), Some(SESSION));
         assert!(QueryParams::parse(
-            Some(&format!("actorDeviceId={ACTOR}&inventorySessionId=not-a-valid-capability&limit=1")),
+            Some(&format!(
+                "actorDeviceId={ACTOR}&inventorySessionId=not-a-valid-capability&limit=1"
+            )),
             InventoryDomain::Recovery,
         )
         .is_err());
@@ -342,7 +355,10 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_unknown_and_oversized_query_values() {
-        let oversized = format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&pageCursor={}", "a".repeat(513));
+        let oversized = format!(
+            "actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&pageCursor={}",
+            "a".repeat(513)
+        );
         for query in [
             format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&limit=2"),
             format!("actorDeviceId={ACTOR}&inventorySessionId={SESSION}&limit=1&unexpected=x"),

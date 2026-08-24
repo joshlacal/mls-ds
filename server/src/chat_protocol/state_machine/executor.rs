@@ -74,6 +74,8 @@ pub(crate) enum ExecutorError {
     /// leaf-auth-generation for an opened leaf).
     MissingContext(&'static str),
     /// A protocol integer or timestamp fell outside the safe `i64` range.
+    /// The repository plan omitted the routing authority for a participant.
+    MissingParticipantRoutingAuthority,
     ValueOutOfRange,
     /// The prepared execution no longer belongs to the live SQL
     /// transaction, or one of its transaction-bound effects disagrees.
@@ -745,8 +747,11 @@ pub(crate) struct ExecutionContext {
     /// For a coordinate-changing commit that SUPERSEDES a prior-coordinate
     /// pending Welcome: the `welcomeDisposition` event the executor appends and
     /// binds the disposition row to (one per superseded welcome). Empty for
-    /// edges that supersede no welcome.
     pub(crate) welcome_dispositions: Vec<WelcomeDispositionInput>,
+    pub(crate) is_remote: bool,
+    pub(crate) sequencer_ds: Option<String>,
+    pub(crate) sequencer_term: i64,
+    pub(crate) participant_ds_dids: std::collections::HashMap<String, Option<String>>,
 }
 
 impl ExecutionContext {
@@ -7680,6 +7685,9 @@ async fn apply_creation(
             current_state_version: state_version,
             next_entry_seq: successor_next_entry_seq,
             created_at: applied_at,
+            is_remote: ctx.is_remote,
+            sequencer_ds: ctx.sequencer_ds.clone(),
+            sequencer_term: ctx.sequencer_term,
         },
     )
     .await?;
@@ -10664,12 +10672,20 @@ async fn write_participants(
             }),
             None => None,
         };
+        let user_did = principal_did(&row.principal)?;
+        // `Some(None)` is an explicit local route. A missing map entry is
+        // missing authority and must never silently become local.
+        let ds_did = ctx
+            .participant_ds_dids
+            .get(&user_did)
+            .cloned()
+            .ok_or(ExecutorError::MissingParticipantRoutingAuthority)?;
         transition::insert_participant_period(
             transaction,
             &NewParticipantPeriod {
                 participant_period_id: period_id,
                 conversation_id: Uuid::from_bytes(*hydration.coordinate.conversation_id()),
-                user_did: principal_did(&row.principal)?,
+                user_did,
                 status: repo_participant_status(row.status),
                 role: repo_participant_role(row.role),
                 role_transition_id: transition_id,
@@ -10679,6 +10695,7 @@ async fn write_participants(
                 invitation,
                 acceptance: None,
                 created_at: applied_at,
+                ds_did,
             },
         )
         .await?;
@@ -12051,6 +12068,10 @@ mod metadata_executor_tests {
                 metadata_avatar,
                 participant_period_ids: Vec::new(),
                 leaf_period_ids: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
                 entry_recipients: Vec::new(),
                 events: vec![EventFanout {
                     event_id: Uuid::from_bytes(uuid(0x3b)),

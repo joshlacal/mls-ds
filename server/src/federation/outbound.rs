@@ -335,7 +335,9 @@ impl OutboundError {
     /// Whether this error is transient and the request should be retried.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::ConnectionFailed { .. } | Self::Timeout { .. } | Self::RequestFailed { .. } => true,
+            Self::ConnectionFailed { .. } | Self::Timeout { .. } | Self::RequestFailed { .. } => {
+                true
+            }
             Self::RemoteError { status, .. } => *status >= 500 || *status == 429,
             Self::InvalidResponse { .. } => false,
             Self::ResolutionFailed { kind, .. } => kind.is_retryable(),
@@ -659,7 +661,9 @@ mod tests {
 
         assert!(!OutboundError::ResolutionFailed {
             did: "did:web:ds.example.com".into(),
-            kind: super::super::errors::ResolutionFailureKind::SsrfBlocked("Blocked private address".into()),
+            kind: super::super::errors::ResolutionFailureKind::SsrfBlocked(
+                "Blocked private address".into()
+            ),
         }
         .is_retryable());
     }

@@ -102,7 +102,9 @@ impl DeviceRecordClient {
             .checked_add(timeout)
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request deadline overflow".to_string()),
+                kind: super::errors::ResolutionFailureKind::Timeout(
+                    "HTTP request deadline overflow".to_string(),
+                ),
             })?;
 
         // com.atproto.repo.listRecords
@@ -142,13 +144,17 @@ impl DeviceRecordClient {
             .and_then(|v| v.as_array())
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::InvalidPayload("No 'records' field in listRecords response".to_string()),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(
+                    "No 'records' field in listRecords response".to_string(),
+                ),
             })?;
 
         if records_json.len() > MAX_DEVICE_RECORDS {
             return Err(FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("PDS returned more than {MAX_DEVICE_RECORDS} device records")),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!(
+                    "PDS returned more than {MAX_DEVICE_RECORDS} device records"
+                )),
             });
         }
 
@@ -187,7 +193,9 @@ impl DeviceRecordClient {
             .checked_add(timeout)
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request deadline overflow".to_string()),
+                kind: super::errors::ResolutionFailureKind::Timeout(
+                    "HTTP request deadline overflow".to_string(),
+                ),
             })?;
 
         let url = format!(
@@ -248,7 +256,9 @@ impl DeviceRecordClient {
             .await
             .map_err(|_| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request failed: outbound request deadline exceeded".to_string()),
+                kind: super::errors::ResolutionFailureKind::Timeout(
+                    "HTTP request failed: outbound request deadline exceeded".to_string(),
+                ),
             })?
             .map_err(|error| {
                 if error.is_timeout() {
@@ -259,7 +269,9 @@ impl DeviceRecordClient {
                 } else if error.is_connect() {
                     FederationError::ResolutionFailed {
                         did: did.to_string(),
-                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(error.to_string()),
+                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(
+                            error.to_string(),
+                        ),
                     }
                 } else if let Some(status) = error.status() {
                     FederationError::ResolutionFailed {
@@ -279,28 +291,38 @@ impl DeviceRecordClient {
         match error {
             OutboundBodyError::DeadlineExceeded => FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::Timeout("Response body read deadline exceeded".to_string()),
+                kind: super::errors::ResolutionFailureKind::Timeout(
+                    "Response body read deadline exceeded".to_string(),
+                ),
             },
             OutboundBodyError::ReadFailed(source) => {
                 if source.is_timeout() {
                     FederationError::ResolutionFailed {
                         did: did.to_string(),
-                        kind: super::errors::ResolutionFailureKind::Timeout(format!("Response body read timed out: {source}")),
+                        kind: super::errors::ResolutionFailureKind::Timeout(format!(
+                            "Response body read timed out: {source}"
+                        )),
                     }
                 } else {
                     FederationError::ResolutionFailed {
                         did: did.to_string(),
-                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(format!("Response body read failed: {source}")),
+                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(format!(
+                            "Response body read failed: {source}"
+                        )),
                     }
                 }
             }
             OutboundBodyError::InvalidJson(_) => FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("Invalid JSON response: {error}")),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!(
+                    "Invalid JSON response: {error}"
+                )),
             },
             other => FederationError::ResolutionFailed {
                 did: did.to_string(),
-                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("Response body rejected: {other}")),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!(
+                    "Response body rejected: {other}"
+                )),
             },
         }
     }

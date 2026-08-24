@@ -166,7 +166,8 @@ pub fn seed_device(pool: &DbPool) -> impl Future<Output = Device> + '_ {
             "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
             "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
         });
-        let jwk_parsed: catbird_server::auth::PublicKeyJwk = serde_json::from_value(jwk_val).unwrap();
+        let jwk_parsed: catbird_server::auth::PublicKeyJwk =
+            serde_json::from_value(jwk_val).unwrap();
         let doc = catbird_server::auth::DidDocument {
             id: did.clone(),
             verification_method: vec![catbird_server::auth::VerificationMethod {

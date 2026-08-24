@@ -118,17 +118,20 @@ fn parse_query(query: Option<&str>) -> Result<String, ChatFailure> {
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "pageCursor" if page_cursor.is_none() => {
@@ -141,9 +144,9 @@ fn parse_query(query: Option<&str>) -> Result<String, ChatFailure> {
                 page_cursor = Some(value);
             }
             "limit" if limit.is_none() => {
-                let parsed = value
-                    .parse::<u16>()
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let parsed = value.parse::<u16>().map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 if !(1..=100).contains(&parsed) {
                     return Err(ChatFailure::protocol(
                         ENDPOINT,

@@ -41,7 +41,40 @@ async fn handle_inner(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let admission = context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    let admission =
+        context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    if let Some(completed) =
+        crate::chat_protocol::repository::auth::preflight_completed_response(pool, &admission)
+            .await
+            .map_err(|e| context::auth_repository_failure(endpoint, e))?
+    {
+        return context::canonical_json_response(
+            endpoint,
+            completed.status,
+            completed.response_bytes,
+        )
+        .map_err(|_| ChatFailure::invariant(endpoint));
+    }
+    let principals = admission
+        .creation_participant_dids()
+        .map_err(|e| context::auth_repository_failure(endpoint, e))?;
+    let routes = crate::chat_protocol::federation_routing::resolve_participant_routing(
+        pool,
+        runtime.resolver().map(|resolver| resolver.as_ref()),
+        &principals,
+    )
+    .await
+    .map_err(|err| {
+        tracing::warn!(
+            ?err,
+            "createConversation participant routing resolution failed"
+        );
+        ChatFailure::protocol(endpoint, ChatProtocolErrorCode::NotAuthorized)
+    })?;
+    let routing_intent = Some(
+        crate::chat_protocol::federation_routing::ConversationRoutingIntent::local_creation(routes),
+    );
+
     let mut transaction = pool
         .begin()
         .await
@@ -56,6 +89,7 @@ async fn handle_inner(
         &mut transaction,
         prepared,
         runtime.relationship_authority().as_ref(),
+        routing_intent,
     )
     .await
     .map_err(|e| creation_failure(endpoint, e))?;
@@ -64,7 +98,10 @@ async fn handle_inner(
         outcome.status(),
         outcome.response_bytes().to_vec(),
     )?;
-    transaction.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
     Ok(response)
 }
 
@@ -144,7 +181,8 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn creation_failure_maps_conversation_exists_to_conversation_already_exists_wire_response() {
+    async fn creation_failure_maps_conversation_exists_to_conversation_already_exists_wire_response(
+    ) {
         let endpoint = ChatEndpoint::CreateConversation;
         let err = CreationFacadeError::CreationHead(CreationHeadHydrationError::ConversationExists);
         let failure = creation_failure(endpoint, err);

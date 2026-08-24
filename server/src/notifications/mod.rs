@@ -60,8 +60,8 @@ fn is_permanent_invalid_token(response: &a2::response::Response) -> bool {
         matches!(
             err.reason,
             ErrorReason::BadDeviceToken
-            | ErrorReason::Unregistered
-            | ErrorReason::DeviceTokenNotForTopic
+                | ErrorReason::Unregistered
+                | ErrorReason::DeviceTokenNotForTopic
         )
     } else {
         false
@@ -155,7 +155,6 @@ impl ApnsClient {
         seq: i64,
         epoch: i64,
     ) -> Result<()> {
-
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
         let masked_device_token = mask_device_token(device_token);
@@ -952,7 +951,10 @@ mod tests {
             apns_id: None,
         };
         let new_is_error = !(200..300).contains(&resp_non_2xx.code);
-        assert!(new_is_error, "APNs non-2xx response must be treated as an error");
+        assert!(
+            new_is_error,
+            "APNs non-2xx response must be treated as an error"
+        );
     }
     #[test]
     fn compare_and_clear_semantics_preserves_rotated_token() {

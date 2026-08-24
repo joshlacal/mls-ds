@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use axum::{extract::State, Json};
 use serde_json::json;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::{
@@ -80,7 +80,6 @@ pub async fn fetch_key_package(
     auth_user: AuthUser,
     axum::extract::Query(query): axum::extract::Query<FetchKeyPackageParams>,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-
     let security =
         super::deliver_message::enforce_ds_request_security(&pool, &auth_user, NSID, None).await?;
     let requester_ds = security.requester_ds.clone();
@@ -432,7 +431,9 @@ mod tests {
             || async {
                 Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    kind: crate::federation::ResolutionFailureKind::InvalidPayload("pagination incomplete".to_string()),
+                    kind: crate::federation::ResolutionFailureKind::InvalidPayload(
+                        "pagination incomplete".to_string(),
+                    ),
                 })
             },
         )

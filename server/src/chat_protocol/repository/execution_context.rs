@@ -67,6 +67,10 @@ pub(crate) struct ExecutionContextArtifacts {
     /// One exact payload for every Pending -> Superseded Welcome delta, keyed by
     /// immutable Welcome ID. The facade derives the recipient and event kind.
     pub(crate) welcome_disposition_event_payloads: Vec<(Uuid, Vec<u8>)>,
+    pub(crate) is_remote: bool,
+    pub(crate) sequencer_ds: Option<String>,
+    pub(crate) sequencer_term: i64,
+    pub(crate) participant_ds_dids: std::collections::HashMap<String, Option<String>>,
 }
 
 /// Caller-supplied serialized artifacts keyed by the exact conversation whose
@@ -2198,6 +2202,10 @@ async fn hydrate_execution_context_inner_with_g6(
         welcome_expiry,
         welcome_response,
         welcome_dispositions,
+        is_remote: artifacts.is_remote,
+        sequencer_ds: artifacts.sequencer_ds,
+        sequencer_term: artifacts.sequencer_term,
+        participant_ds_dids: artifacts.participant_ds_dids,
     })
 }
 
@@ -2342,6 +2350,10 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
             genesis_group_info_bytes: None,
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
         },
     )
     .await
@@ -2367,6 +2379,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_exec
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
+    routing: Option<crate::chat_protocol::federation_routing::ParticipantRoutingIntent>,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2374,6 +2387,10 @@ pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_exec
     if is_recovery_plan(plan) || !submit_transition_authority_matches_plan(plan) {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
+    let participant_ds_dids = match routing {
+        Some(r) => r.participant_routes.into_iter().collect(),
+        None => std::collections::HashMap::new(),
+    };
     let primary_event_payload = canonical_submit_transition_primary_event_payload(plan)?;
     hydrate_execution_context_after_authority_validation(
         transaction,
@@ -2383,6 +2400,10 @@ pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_exec
             genesis_group_info_bytes: None,
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids,
         },
     )
     .await
@@ -2440,6 +2461,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
     plan: &'plan ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
     genesis_group_info_bytes: Vec<u8>,
+    routing: Option<crate::chat_protocol::federation_routing::ConversationRoutingIntent>,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2447,6 +2469,15 @@ pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
     if is_recovery_plan(plan) || !creation_authority_matches_plan(plan) {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
+    let (is_remote, sequencer_ds, sequencer_term, participant_ds_dids) = match routing {
+        Some(r) => (
+            r.is_remote,
+            r.sequencer_ds,
+            r.sequencer_term,
+            r.participant_routes.into_iter().collect(),
+        ),
+        None => (false, None, 0, std::collections::HashMap::new()),
+    };
     let primary_event_payload = canonical_creation_primary_event_payload(plan)?;
     hydrate_execution_context_after_authority_validation(
         transaction,
@@ -2456,6 +2487,10 @@ pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
             genesis_group_info_bytes: Some(genesis_group_info_bytes),
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
+            is_remote,
+            sequencer_ds,
+            sequencer_term,
+            participant_ds_dids,
         },
     )
     .await
@@ -2492,6 +2527,10 @@ pub(in crate::chat_protocol::repository) async fn prepare_acceptance_execution<
             genesis_group_info_bytes: None,
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
         },
     )
     .await
@@ -2542,6 +2581,10 @@ pub(in crate::chat_protocol::repository) async fn prepare_leave_lifecycle_execut
             genesis_group_info_bytes: None,
             primary_event_payload: Some(canonical_leave_event_payload(plan)?),
             welcome_disposition_event_payloads: Vec::new(),
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
         },
     )
     .await

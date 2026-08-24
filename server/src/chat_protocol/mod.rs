@@ -86,6 +86,11 @@ pub(crate) use cursor::{
 /// and validates stored device state in the same transaction.
 pub(crate) mod dpop;
 pub mod error;
+pub mod federation_routing;
+pub use federation_routing::{
+    resolve_participant_routing, ConversationRoutingIntent, FederationRoutingError,
+    ParticipantRoutingIntent,
+};
 pub(crate) mod model;
 pub(crate) mod public_state;
 pub(crate) mod read_authority;

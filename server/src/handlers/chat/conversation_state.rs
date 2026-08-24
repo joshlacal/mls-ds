@@ -83,24 +83,29 @@ fn parse_query(query: Option<&str>) -> Result<(String, uuid::Uuid), ChatFailure>
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "conversationId" | "convoId" => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-                let uuid = uuid::Uuid::parse_str(canonical.as_str())
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
+                let uuid = uuid::Uuid::parse_str(canonical.as_str()).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 conversation_id = Some(uuid);
             }
             "include" => {}

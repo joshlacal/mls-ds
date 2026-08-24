@@ -1701,6 +1701,8 @@ pub(crate) struct CheckedConversationState {
     leaves: Vec<CheckedDeviceLeafView>,
     metadata_snapshot: CheckedMetadataSnapshot,
     participants: Vec<CheckedParticipantView>,
+    sequencer_did: Did<SmolStr>,
+    sequencer_term: i64,
     snapshot_seq: i64,
 }
 
@@ -1722,7 +1724,6 @@ pub(crate) struct CheckedConversationClose {
     retired: CheckedConversationCoordinates,
     terminal_seq: i64,
 }
-
 impl ConversationProjectionSource {
     pub(crate) fn state(
         cipher_suite: &str,
@@ -1731,6 +1732,8 @@ impl ConversationProjectionSource {
         leaves: Vec<CheckedDeviceLeafView>,
         metadata_snapshot: CheckedMetadataSnapshot,
         participants: Vec<CheckedParticipantView>,
+        sequencer_did: &str,
+        sequencer_term: i64,
         snapshot_seq: i64,
     ) -> Result<Self, ProjectionError> {
         checked_enum(cipher_suite, &[CIPHER_SUITE_V1], "cipherSuite")?;
@@ -1739,7 +1742,8 @@ impl ConversationProjectionSource {
             &[CONVERSATION_KIND_DIRECT, CONVERSATION_KIND_GROUP],
             "conversationKind",
         )?;
-        checked_sequence(snapshot_seq, 0, "snapshotSeq")?;
+        checked_sequence(sequencer_term, 0, "sequencerTerm")?;
+        let sequencer_did = checked_did(sequencer_did, "sequencerDid")?;
         for (index, pair) in leaves.windows(2).enumerate() {
             let (left, right) = (&pair[0], &pair[1]);
             let left_key = (left.user_did.as_str(), left.device_id.as_str());
@@ -1767,6 +1771,8 @@ impl ConversationProjectionSource {
             leaves,
             metadata_snapshot,
             participants,
+            sequencer_did,
+            sequencer_term,
             snapshot_seq,
         }))
     }
@@ -2321,6 +2327,8 @@ pub(crate) fn conversation_state_view(
                 extra_data: None,
             })
             .collect(),
+        sequencer_did: Some(state.sequencer_did.clone()),
+        sequencer_term: Some(state.sequencer_term),
         snapshot_seq: state.snapshot_seq,
         extra_data: None,
     })
@@ -2459,6 +2467,8 @@ pub(crate) fn conversation_inventory_item(
                                 extra_data: None,
                             })
                             .collect(),
+                        sequencer_did: Some(state.sequencer_did.clone()),
+                        sequencer_term: Some(state.sequencer_term),
                         snapshot_seq: state.snapshot_seq,
                         extra_data: None,
                     },

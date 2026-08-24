@@ -1617,7 +1617,6 @@ impl Clone for ProjectionPersistenceAuthority {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionPersistenceError {
     Invalid,
@@ -2889,7 +2888,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         &self.config
     }
 
-
     pub(crate) async fn collect_admission_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -2907,7 +2905,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         .await
     }
 
-
     pub(crate) async fn collect_block_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -2924,7 +2921,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         )
         .await
     }
-
 
     pub(crate) async fn collect_traffic_projection(
         &self,

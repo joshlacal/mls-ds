@@ -538,7 +538,6 @@ impl From<ExecutorError> for WelcomeTerminalFacadeError {
     }
 }
 
-
 pub(crate) async fn prepare_welcome_terminal(
     transaction: &mut Transaction<'_, Postgres>,
     operation: PreparedSignedOperation,
@@ -678,7 +677,6 @@ async fn prepare_first_welcome_terminal(
         }
     }
 }
-
 
 async fn prepare_completed_welcome_replay(
     transaction: &mut Transaction<'_, Postgres>,

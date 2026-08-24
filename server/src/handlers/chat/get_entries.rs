@@ -60,44 +60,50 @@ fn parse_query(query: Option<&str>) -> Result<(String, Uuid, u64, i64), ChatFail
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "conversationId" if conversation_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
-                let uuid = Uuid::parse_str(canonical.as_str())
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
+                let uuid = Uuid::parse_str(canonical.as_str()).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 conversation_id = Some(uuid);
             }
             "afterSeq" if after_seq.is_none() => {
-                let parsed = value
-                    .parse::<i64>()
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 if !(0..=MAX_SAFE_INTEGER).contains(&parsed) {
                     return Err(ChatFailure::protocol(
                         ENDPOINT,
                         ChatProtocolErrorCode::InvalidRequest,
                     ));
                 }
-                let seq = u64::try_from(parsed)
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let seq = u64::try_from(parsed).map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 after_seq = Some(seq);
             }
             "limit" if limit.is_none() => {
-                let parsed = value
-                    .parse::<i64>()
-                    .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?;
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 if !(1..=100).contains(&parsed) {
                     return Err(ChatFailure::protocol(
                         ENDPOINT,

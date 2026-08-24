@@ -115,7 +115,11 @@ pub(super) async fn execute_prepared(
 }
 
 fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> ChatFailure {
-    tracing::error!("recovery_failure: endpoint={:?}, error={:?}", endpoint, error);
+    tracing::error!(
+        "recovery_failure: endpoint={:?}, error={:?}",
+        endpoint,
+        error
+    );
     use ChatProtocolErrorCode as C;
     use ConversationHeadHydrationError as H;
     use ConversationStateHydrationError as CS;
@@ -129,8 +133,7 @@ fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> C
         | E::PackageHydration(P::Database(_))
         | E::Relationship(R::Database(_)) => ChatFailure::storage(endpoint),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
-        E::ConversationMissing
-        | E::AggregateHydration(CS::Head(H::ConversationMissing)) => {
+        E::ConversationMissing | E::AggregateHydration(CS::Head(H::ConversationMissing)) => {
             ChatFailure::protocol(endpoint, C::ConversationNotFound)
         }
         E::ConversationDrift | E::ReadSetMismatch | E::CompareAndSetConflict => {
@@ -153,9 +156,7 @@ fn recovery_failure(endpoint: ChatEndpoint, error: RecoveryRepositoryError) -> C
         E::AggregateHydration(CS::Metadata(_)) => {
             ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot)
         }
-        E::AggregateHydration(CS::Snapshot(_)) => {
-            ChatFailure::protocol(endpoint, C::InvalidCommit)
-        }
+        E::AggregateHydration(CS::Snapshot(_)) => ChatFailure::protocol(endpoint, C::InvalidCommit),
         E::AggregateHydration(CS::State(s) | CS::Authority(s)) => {
             map_recovery_state_machine_error(endpoint, s)
         }
@@ -198,9 +199,7 @@ fn map_recovery_state_machine_error(
         S::WorkExpired => ChatFailure::protocol(endpoint, C::LeafRecoveryExpired),
         S::InvalidWelcomeMapping => ChatFailure::protocol(endpoint, C::InvalidWelcomeMapping),
         S::InvalidPolicyAuthority => ChatFailure::protocol(endpoint, C::BlockedRelationship),
-        S::InvalidMetadataAuthority => {
-            ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot)
-        }
+        S::InvalidMetadataAuthority => ChatFailure::protocol(endpoint, C::InvalidMetadataSnapshot),
         S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState => {
             ChatFailure::protocol(endpoint, C::InvalidCommit)
         }
