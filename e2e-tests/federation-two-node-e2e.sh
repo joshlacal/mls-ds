@@ -4,16 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HARNESS_SCRIPT="$REPO_ROOT/scripts/federation-two-node-harness.sh"
-COMPOSE_FILE="$REPO_ROOT/scripts/federation-two-node.compose.yml"
-PROJECT_NAME="${FED_HARNESS_PROJECT_NAME:-mls-federation-harness}"
+COMPOSE_FILE="$REPO_ROOT/e2e-tests/docker-compose.federation.yml"
+STATE_FILE="/tmp/mls-fed-harness-project-${UID:-$(id -u)}"
+get_project_name() {
+  if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then
+    echo "$COMPOSE_PROJECT_NAME"
+  elif [[ -n "${FED_HARNESS_PROJECT_NAME:-}" ]]; then
+    echo "$FED_HARNESS_PROJECT_NAME"
+  elif [[ -f "$STATE_FILE" ]]; then
+    cat "$STATE_FILE"
+  else
+    echo "mls-federation-harness"
+  fi
+}
 
-export DS1_PORT="${DS1_PORT:-3101}"
-export DS2_PORT="${DS2_PORT:-3102}"
+export DS1_PORT="${DS1_PORT:-0}"
+export DS2_PORT="${DS2_PORT:-0}"
 export DS1_SERVICE_DID="${DS1_SERVICE_DID:-did:web:ds1.local}"
 export DS2_SERVICE_DID="${DS2_SERVICE_DID:-did:web:ds2.local}"
-export DS1_SELF_ENDPOINT="${DS1_SELF_ENDPOINT:-http://127.0.0.1:${DS1_PORT}}"
-export DS2_SELF_ENDPOINT="${DS2_SELF_ENDPOINT:-http://127.0.0.1:${DS2_PORT}}"
-
+export DS1_SELF_ENDPOINT="${DS1_SELF_ENDPOINT:-http://ds1:3001}"
+export DS2_SELF_ENDPOINT="${DS2_SELF_ENDPOINT:-http://ds2:3001}"
 MODE="full"
 NO_CLEANUP="false"
 STARTED_HARNESS=0
@@ -46,9 +56,22 @@ HELP
 }
 
 compose() {
-  (cd "$REPO_ROOT" && docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@")
+  local p
+  p="$(get_project_name)"
+  (cd "$REPO_ROOT" && docker compose -p "$p" -f "$COMPOSE_FILE" "$@")
 }
 
+get_service_host_port() {
+  local service="$1"
+  local container_port="${2:-3001}"
+  local port_output
+  port_output="$(compose port "$service" "$container_port" 2>/dev/null || true)"
+  if [[ -z "$port_output" ]]; then
+    echo ""
+    return 1
+  fi
+  echo "$port_output" | sed -E 's/.*:([0-9]+)$/\1/'
+}
 wait_for_url() {
   local label="$1"
   local url="$2"
@@ -83,27 +106,43 @@ assert_json_contains() {
 }
 
 check_readiness() {
-  local ds1="http://127.0.0.1:${DS1_PORT}"
-  local ds2="http://127.0.0.1:${DS2_PORT}"
+  local ds1_port
+  ds1_port="$(get_service_host_port ds1 3001)"
+  local ds2_port
+  ds2_port="$(get_service_host_port ds2 3001)"
+  local ds1="http://127.0.0.1:${ds1_port}"
+  local ds2="http://127.0.0.1:${ds2_port}"
   wait_for_url "DS1 readiness" "$ds1/health/ready"
   wait_for_url "DS2 readiness" "$ds2/health/ready"
 }
 
 check_ds_health() {
-  local ds1="http://127.0.0.1:${DS1_PORT}"
-  local ds2="http://127.0.0.1:${DS2_PORT}"
+  local ds1_port
+  ds1_port="$(get_service_host_port ds1 3001)"
+  local ds2_port
+  ds2_port="$(get_service_host_port ds2 3001)"
+  local ds1="http://127.0.0.1:${ds1_port}"
+  local ds2="http://127.0.0.1:${ds2_port}"
   local payload
 
-  payload="$(curl -fsS "$ds1/xrpc/blue.catbird.mls.ds.healthCheck")"
+  payload="$(curl -fsS "$ds1/xrpc/blue.catbird.mlsDS.healthCheck")"
   assert_json_contains "DS1 federation health DID" "$payload" "\"did\":\"$DS1_SERVICE_DID\""
+  assert_json_contains "DS1 federation capabilities" "$payload" "baseline"
+  assert_json_contains "DS1 federation capabilities v1" "$payload" "reconciliation-v1"
 
-  payload="$(curl -fsS "$ds2/xrpc/blue.catbird.mls.ds.healthCheck")"
+  payload="$(curl -fsS "$ds2/xrpc/blue.catbird.mlsDS.healthCheck")"
   assert_json_contains "DS2 federation health DID" "$payload" "\"did\":\"$DS2_SERVICE_DID\""
+  assert_json_contains "DS2 federation capabilities" "$payload" "baseline"
+  assert_json_contains "DS2 federation capabilities v1" "$payload" "reconciliation-v1"
 }
 
 check_local_getrecord_shim_removed() {
-  local ds1="http://127.0.0.1:${DS1_PORT}"
-  local ds2="http://127.0.0.1:${DS2_PORT}"
+  local ds1_port
+  ds1_port="$(get_service_host_port ds1 3001)"
+  local ds2_port
+  ds2_port="$(get_service_host_port ds2 3001)"
+  local ds1="http://127.0.0.1:${ds1_port}"
+  local ds2="http://127.0.0.1:${ds2_port}"
   local status
 
   status="$(curl -sS -o /dev/null -w '%{http_code}' --get \
@@ -124,10 +163,10 @@ check_local_getrecord_shim_removed() {
 check_cross_ds_federated_path() {
   local payload
 
-  payload="$(compose exec -T ds1 curl -fsS "http://ds2:${DS2_PORT}/xrpc/blue.catbird.mls.ds.healthCheck")"
+  payload="$(compose exec -T ds1 curl -fsS "http://ds2:3001/xrpc/blue.catbird.mlsDS.healthCheck")"
   assert_json_contains "DS1 -> DS2 federated API path" "$payload" "\"did\":\"$DS2_SERVICE_DID\""
 
-  payload="$(compose exec -T ds2 curl -fsS "http://ds1:${DS1_PORT}/xrpc/blue.catbird.mls.ds.healthCheck")"
+  payload="$(compose exec -T ds2 curl -fsS "http://ds1:3001/xrpc/blue.catbird.mlsDS.healthCheck")"
   assert_json_contains "DS2 -> DS1 federated API path" "$payload" "\"did\":\"$DS1_SERVICE_DID\""
 }
 
@@ -183,7 +222,7 @@ case "$MODE" in
     info "Dry-run complete (no commands executed)"
     echo "Planned checks:"
     echo "  - DS1/DS2 readiness (/health/ready)"
-    echo "  - DS1/DS2 federation health (/xrpc/blue.catbird.mls.ds.healthCheck)"
+    echo "  - DS1/DS2 federation health (/xrpc/blue.catbird.mlsDS.healthCheck)"
     echo "  - DS1/DS2 local /xrpc/com.atproto.repo.getRecord returns 404 (discovery requires DID->PDS/AppView)"
     echo "  - DS1->DS2 and DS2->DS1 federated API path health checks (inside harness network)"
     ;;

@@ -50,7 +50,9 @@ did_key.pem
 *.key
 *.p12
 *.pfx
-
+!e2e-tests/fixtures/*.pem
+!e2e-tests/fixtures/*.p8
+!e2e-tests/fixtures/*.key
 # Claude/Copilot local settings
 .claude/
 

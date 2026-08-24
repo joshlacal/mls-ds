@@ -83,10 +83,29 @@ pub async fn init_db(config: DbConfig) -> Result<DbPool> {
         // `scripts/repair-2026-04-migration-versions.sql` for context.
         repair_2026_04_migration_versions(&pool).await?;
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .context("Failed to run migrations")?;
+        // Run migrations on one dedicated connection carrying the exact
+        // operation-claim activation GUC (mirror of tests/common/fresh_db.rs).
+        // Migration 20260728000004 refuses to apply unless
+        // `chat.operation_claim_activation_approved` is set on the migrating
+        // connection. The value is scoped to that connection and reset
+        // immediately afterwards, so it is never set globally or on pooled
+        // request connections.
+        let mut migration_connection = pool.acquire().await.context("acquire migration connection")?;
+        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref() == Ok("handlers-and-legacy-apis-sealed") {
+            sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+                .execute(&mut *migration_connection)
+                .await
+                .context("authorize operation-claim activation on the migration connection")?;
+        }
+        let migration_result = sqlx::migrate!("./migrations").run(&mut *migration_connection).await;
+        if std::env::var("CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED").as_deref() == Ok("handlers-and-legacy-apis-sealed") {
+            sqlx::query("RESET chat.operation_claim_activation_approved")
+                .execute(&mut *migration_connection)
+                .await
+                .context("reset operation-claim activation approval on the migration connection")?;
+        }
+        migration_connection.close().await.context("close the migration connection")?;
+        migration_result.context("Failed to run migrations")?;
     }
 
     Ok(pool)

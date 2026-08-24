@@ -497,6 +497,11 @@ async fn main() -> anyhow::Result<()> {
     middleware::device_auth::install_device_auth_mode(device_auth_mode)?;
     tracing::info!(?device_auth_mode, "Device-auth rollout mode installed");
 
+    // Load offline test DID document fixtures if configured (strictly gated to APP_ENV=test)
+    if let Err(e) = auth::load_test_did_fixtures_from_env().await {
+        panic!("Failed to load test DID document fixtures: {e}");
+    }
+
     // Parse the listener host before initializing external dependencies so a
     // malformed or non-IP SERVER_HOST fails startup rather than falling back
     // to an unexpectedly broad bind. Production APP_ENV safety checks above
@@ -720,16 +725,24 @@ async fn main() -> anyhow::Result<()> {
         fed_config.endpoint_cache_ttl_secs,
     ));
 
-    let service_auth = if let Some(ref key_pem) = fed_config.signing_key_pem {
+    let service_auth = if let Some(key_pem) = &fed_config.signing_key_pem {
         match federation::ServiceAuthClient::from_es256_pem(
             fed_config.self_did.clone(),
             key_pem.as_bytes(),
             None,
         ) {
-            Ok(auth) => Some(Arc::new(auth)),
+            Ok(auth) => {
+                tracing::info!(
+                    self_did = %fed_config.self_did,
+                    "Federation service auth client initialized"
+                );
+                Some(Arc::new(auth))
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to create service auth client, federation outbound disabled");
-                None
+                panic!(
+                    "Failed to create federation service auth client from configured signing key: {}",
+                    e
+                );
             }
         }
     } else {
@@ -1412,7 +1425,10 @@ mod tests {
         let base_router = Router::new()
             .route("/xrpc/blue.catbird.chat.sendMessage", post(consume_body))
             .route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body))
-            .route("/xrpc/blue.catbird.mlsDS.deliverMessage", post(consume_body));
+            .route(
+                "/xrpc/blue.catbird.mlsDS.deliverMessage",
+                post(consume_body),
+            );
         let app = merge_application_routers(
             base_router,
             Router::new(),

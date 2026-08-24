@@ -297,7 +297,23 @@ impl FederationConfig {
             // N31: fail-loudly identity — no hardcoded fallback DID/endpoint.
             self_did: crate::identity::service_did(),
             self_endpoint: crate::identity::self_endpoint(),
-            signing_key_pem: std::env::var("SIGNING_KEY_PEM").ok(),
+            signing_key_pem: match std::env::var("SIGNING_KEY_PEM") {
+                Ok(pem) if !pem.trim().is_empty() => Some(pem),
+                _ => match std::env::var("SIGNING_KEY_PATH")
+                    .or_else(|_| std::env::var("SIGNING_KEY_FILE"))
+                {
+                    Ok(path) if !path.trim().is_empty() => {
+                        let content = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                            panic!(
+                                "Configured signing key file '{}' could not be read: {}",
+                                path, err
+                            );
+                        });
+                        Some(content)
+                    }
+                    _ => None,
+                },
+            },
             receipt_issuance_mode: std::env::var("RECEIPT_ISSUANCE_MODE").ok(),
             receipt_signing_key_pem: std::env::var("RECEIPT_SIGNING_KEY_PEM").ok(),
             receipt_verification_method: std::env::var("RECEIPT_VERIFICATION_METHOD").ok(),

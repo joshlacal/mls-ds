@@ -203,8 +203,9 @@ struct JwtHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DidDocument {
     pub id: String,
-    #[serde(rename = "verificationMethod")]
+    #[serde(rename = "verificationMethod", default)]
     pub verification_method: Vec<VerificationMethod>,
+    #[serde(default)]
     pub service: Option<Vec<Service>>,
 }
 
@@ -506,38 +507,10 @@ impl AuthMiddleware {
         match header.alg.as_str() {
             // ES256: P-256 ECDSA (JOSE signature R||S)
             "ES256" => {
-                use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-                use p256::EncodedPoint;
+                use p256::ecdsa::{signature::Verifier, Signature};
                 let did_doc = self.resolve_did(issuer_did).await?;
                 let vm = select_verification_method(&did_doc, header.kid.as_deref())?;
-                let jwk = vm
-                    .public_key_jwk
-                    .as_ref()
-                    .ok_or(AuthError::MissingVerificationMethod)?;
-                if jwk.kty != "EC" || !jwk.crv.eq_ignore_ascii_case("P-256") {
-                    return Err(AuthError::UnsupportedKeyType(format!(
-                        "Expected EC P-256, got {} {}",
-                        jwk.kty, jwk.crv
-                    )));
-                }
-                let x = URL_SAFE_NO_PAD
-                    .decode(&jwk.x)
-                    .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
-                let y = URL_SAFE_NO_PAD
-                    .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
-                    .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
-                if x.len() != 32 || y.len() != 32 {
-                    return Err(AuthError::InvalidToken(
-                        "invalid P-256 JWK coordinate length".into(),
-                    ));
-                }
-                let ep = EncodedPoint::from_affine_coordinates(
-                    p256::FieldBytes::from_slice(&x),
-                    p256::FieldBytes::from_slice(&y),
-                    false,
-                );
-                let vk = VerifyingKey::from_encoded_point(&ep)
-                    .map_err(|_| AuthError::InvalidToken("invalid P-256 point".into()))?;
+                let vk = extract_p256_key_from_vm(vm)?;
                 let sig_bytes = URL_SAFE_NO_PAD
                     .decode(parts[2])
                     .map_err(|e| AuthError::InvalidToken(format!("Invalid b64 sig: {}", e)))?;
@@ -843,42 +816,63 @@ impl Default for AuthMiddleware {
 // P-256 key extraction helper
 // -----------------------------------------------------------------------------
 
+/// Extract a P-256 [`p256::ecdsa::VerifyingKey`] from a [`VerificationMethod`].
+/// Works with both JWK (`publicKeyJwk`) and Multikey (`publicKeyMultibase`) representations.
+pub fn extract_p256_key_from_vm(
+    vm: &VerificationMethod,
+) -> Result<p256::ecdsa::VerifyingKey, AuthError> {
+    use p256::ecdsa::VerifyingKey;
+    use p256::EncodedPoint;
+
+    // Try JWK first
+    if let Some(ref jwk) = vm.public_key_jwk {
+        if jwk.kty == "EC" && jwk.crv.eq_ignore_ascii_case("P-256") {
+            let x = URL_SAFE_NO_PAD
+                .decode(&jwk.x)
+                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.x: {}", e)))?;
+            let y = URL_SAFE_NO_PAD
+                .decode(jwk.y.as_ref().ok_or(AuthError::MissingVerificationMethod)?)
+                .map_err(|e| AuthError::InvalidToken(format!("bad jwk.y: {}", e)))?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(AuthError::InvalidToken(
+                    "invalid P-256 JWK coordinate length".into(),
+                ));
+            }
+            let ep = EncodedPoint::from_affine_coordinates(
+                p256::FieldBytes::from_slice(&x),
+                p256::FieldBytes::from_slice(&y),
+                false,
+            );
+            return VerifyingKey::from_encoded_point(&ep)
+                .map_err(|_| AuthError::InvalidToken("invalid P-256 point".into()));
+        }
+    }
+
+    // Try multibase (multicodec P-256 key: 0x80 0x24 prefix + 33-byte compressed key)
+    if let Some(ref mb) = vm.public_key_multibase {
+        let (_base, bytes) = multibase::decode(mb)
+            .map_err(|e| AuthError::InvalidToken(format!("bad multibase key: {}", e)))?;
+        if bytes.len() == 35 && bytes[0] == 0x80 && bytes[1] == 0x24 {
+            return VerifyingKey::from_sec1_bytes(&bytes[2..])
+                .map_err(|e| AuthError::InvalidToken(format!("invalid P-256 SEC1 key: {}", e)));
+        } else {
+            return Err(AuthError::UnsupportedKeyType(format!(
+                "Expected p256-pub multicodec (0x80 0x24) with 33-byte key, got {} bytes",
+                bytes.len(),
+            )));
+        }
+    }
+
+    Err(AuthError::MissingVerificationMethod)
+}
+
 /// Extract the first P-256 [`p256::ecdsa::VerifyingKey`] from a DID document's
 /// verification methods.  Works with both JWK (`publicKeyJwk`) and multikey
 /// (`publicKeyMultibase`) representations.
 pub fn extract_p256_key(did_doc: &DidDocument) -> Option<p256::ecdsa::VerifyingKey> {
-    use p256::ecdsa::VerifyingKey;
-    use p256::EncodedPoint;
-
     for vm in &did_doc.verification_method {
-        // Try JWK first
-        if let Some(ref jwk) = vm.public_key_jwk {
-            if jwk.kty == "EC" && jwk.crv.eq_ignore_ascii_case("P-256") {
-                let x = URL_SAFE_NO_PAD.decode(&jwk.x).ok()?;
-                let y = URL_SAFE_NO_PAD.decode(jwk.y.as_ref()?).ok()?;
-                if x.len() != 32 || y.len() != 32 {
-                    continue;
-                }
-                let ep = EncodedPoint::from_affine_coordinates(
-                    p256::FieldBytes::from_slice(&x),
-                    p256::FieldBytes::from_slice(&y),
-                    false,
-                );
-                if let Ok(vk) = VerifyingKey::from_encoded_point(&ep) {
-                    return Some(vk);
-                }
-            }
-        }
-
-        // Try multibase (multicodec P-256 key: 0x80 0x24 prefix + 33-byte compressed key)
-        if let Some(ref mb) = vm.public_key_multibase {
-            if let Ok((_base, bytes)) = multibase::decode(mb) {
-                if bytes.len() == 35 && bytes[0] == 0x80 && bytes[1] == 0x24 {
-                    if let Ok(vk) = VerifyingKey::from_sec1_bytes(&bytes[2..]) {
-                        return Some(vk);
-                    }
-                }
-            }
+        if let Ok(vk) = extract_p256_key_from_vm(vm) {
+            return Some(vk);
         }
     }
     None
@@ -905,6 +899,97 @@ static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
 
 pub async fn cache_test_did_document(doc: DidDocument) {
     AUTH_MIDDLEWARE.cache_did_document(doc).await;
+}
+
+/// Loads test DID document fixtures from environment variables (`TEST_DID_DOCUMENT_PATHS` or `TEST_DID_DOCUMENTS_DIR`).
+///
+/// # Security
+/// This is strictly forbidden outside `APP_ENV=test`. If any fixture configuration is present
+/// while `APP_ENV` is not `"test"`, this function aborts startup immediately.
+pub async fn load_test_did_fixtures_from_env() -> Result<usize, AuthError> {
+    let paths_var = std::env::var("TEST_DID_DOCUMENT_PATHS")
+        .or_else(|_| std::env::var("TEST_DID_DOC_PATHS"))
+        .ok();
+    let dir_var = std::env::var("TEST_DID_DOCUMENTS_DIR")
+        .or_else(|_| std::env::var("TEST_DID_DOC_DIR"))
+        .ok();
+
+    if paths_var.is_none() && dir_var.is_none() {
+        return Ok(0);
+    }
+
+    let is_test = std::env::var("APP_ENV")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+
+    if !is_test {
+        panic!(
+            "Refusing to start: test DID document fixtures are configured via environment, \
+             but APP_ENV is not 'test'. Offline DID fixtures are forbidden outside test mode."
+        );
+    }
+
+    let mut paths = Vec::new();
+
+    if let Some(raw_paths) = paths_var {
+        for path_str in raw_paths
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            paths.push(std::path::PathBuf::from(path_str));
+        }
+    }
+
+    if let Some(dir_str) = dir_var {
+        let dir = std::path::Path::new(&dir_str);
+        if !dir.is_dir() {
+            return Err(AuthError::InvalidDid(format!(
+                "Configured TEST_DID_DOCUMENTS_DIR '{}' is not a directory",
+                dir_str
+            )));
+        }
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            AuthError::InvalidDid(format!(
+                "Failed to read TEST_DID_DOCUMENTS_DIR '{}': {e}",
+                dir_str
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                AuthError::InvalidDid(format!("Error reading directory entry: {e}"))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+    }
+
+    let mut count = 0;
+    for path in &paths {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            AuthError::InvalidDid(format!(
+                "Failed to read test DID doc fixture at '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let doc: DidDocument = serde_json::from_str(&content).map_err(|e| {
+            AuthError::InvalidDid(format!(
+                "Failed to parse test DID doc fixture at '{}': {e}",
+                path.display()
+            ))
+        })?;
+        tracing::info!(
+            did = %doc.id,
+            path = %path.display(),
+            "Cached offline test DID document fixture"
+        );
+        cache_test_did_document(doc).await;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 /// Keep the binary startup gate and library request gate on identical flag semantics.
@@ -975,7 +1060,7 @@ fn select_verification_method<'a>(
 
     if let Some(kid_value) = kid {
         let absolute_atproto = format!("{}#atproto", did_doc.id);
-        if kid_value != "#atproto" && kid_value != absolute_atproto {
+        if kid_value != "#atproto" && kid_value != "atproto" && kid_value != absolute_atproto {
             return Err(AuthError::InvalidToken(
                 "service auth must use the DID #atproto verification method".into(),
             ));
@@ -2364,6 +2449,165 @@ mod tests {
             validate_mls_service_claims(&too_long, endpoint, now),
             Err(AuthError::InvalidToken(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod federation_fixture_tests {
+    use super::*;
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
+    use tokio::sync::Mutex;
+
+    static TEST_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[tokio::test]
+    async fn test_offline_did_fixtures_loaded_and_verified() {
+        let _guard = TEST_ENV_LOCK.lock().await;
+
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("e2e-tests/fixtures");
+        let ds1_did_path = fixture_dir.join("ds1-did.json");
+        let ds2_did_path = fixture_dir.join("ds2-did.json");
+        let ds1_key_path = fixture_dir.join("ds1-key.pem");
+        let ds2_key_path = fixture_dir.join("ds2-key.pem");
+
+        assert!(ds1_did_path.exists(), "ds1-did.json fixture exists");
+        assert!(ds2_did_path.exists(), "ds2-did.json fixture exists");
+        assert!(ds1_key_path.exists(), "ds1-key.pem fixture exists");
+        assert!(ds2_key_path.exists(), "ds2-key.pem fixture exists");
+
+        // Set environment for test fixture loading
+        std::env::set_var("APP_ENV", "test");
+        std::env::set_var(
+            "TEST_DID_DOCUMENT_PATHS",
+            format!("{},{}", ds1_did_path.display(), ds2_did_path.display()),
+        );
+
+        let loaded_count = load_test_did_fixtures_from_env()
+            .await
+            .expect("load test DID fixtures in test env");
+        assert_eq!(loaded_count, 2, "must load exactly 2 DID documents");
+
+        // Verify resolution from cache
+        let doc1 = AUTH_MIDDLEWARE
+            .resolve_did("did:web:ds1.local")
+            .await
+            .expect("resolve ds1 did from cache");
+        assert_eq!(doc1.id, "did:web:ds1.local");
+        let key1 = extract_p256_key(&doc1).expect("extract p256 key for ds1");
+
+        let doc2 = AUTH_MIDDLEWARE
+            .resolve_did("did:web:ds2.local")
+            .await
+            .expect("resolve ds2 did from cache");
+        assert_eq!(doc2.id, "did:web:ds2.local");
+        let key2 = extract_p256_key(&doc2).expect("extract p256 key for ds2");
+
+        // Verify matching private keys
+        let pem1 = std::fs::read_to_string(&ds1_key_path).expect("read ds1-key.pem");
+        let sk1 = SigningKey::from_pkcs8_pem(&pem1).expect("parse ds1 pkcs8 pem");
+        assert_eq!(*sk1.verifying_key(), key1);
+
+        let pem2 = std::fs::read_to_string(&ds2_key_path).expect("read ds2-key.pem");
+        let sk2 = SigningKey::from_pkcs8_pem(&pem2).expect("parse ds2 pkcs8 pem");
+        assert_eq!(*sk2.verifying_key(), key2);
+
+        // Test signing a request with DS1 key and verifying with AUTH_MIDDLEWARE
+        let auth_client = crate::federation::ServiceAuthClient::from_es256_pem(
+            "did:web:ds1.local".to_string(),
+            pem1.as_bytes(),
+            Some("#atproto".to_string()),
+        )
+        .expect("create service auth client for ds1");
+
+        let token = auth_client
+            .sign_request("did:web:ds2.local", "blue.catbird.mlsDS.healthCheck")
+            .expect("sign request");
+
+        // Verify the token using auth middleware
+        let claims = AUTH_MIDDLEWARE
+            .verify_jwt_for_audience(&token, Some("did:web:ds2.local"))
+            .await
+            .expect("verify DS1 service JWT using cached DID doc");
+        assert_eq!(claims.iss, "did:web:ds1.local");
+        assert_eq!(claims.aud, "did:web:ds2.local");
+        assert_eq!(
+            claims.lxm.as_deref(),
+            Some("blue.catbird.mlsDS.healthCheck")
+        );
+        assert!(claims.jti.is_some(), "service auth claims must include JTI");
+        // Clean up env vars
+        std::env::remove_var("TEST_DID_DOCUMENT_PATHS");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Offline DID fixtures are forbidden outside test mode")]
+    async fn test_offline_did_fixtures_aborts_outside_test_mode() {
+        let _guard = TEST_ENV_LOCK.lock().await;
+        std::env::set_var("APP_ENV", "production");
+        std::env::set_var("TEST_DID_DOCUMENT_PATHS", "/nonexistent/path.json");
+
+        let res = load_test_did_fixtures_from_env().await;
+        std::env::remove_var("TEST_DID_DOCUMENT_PATHS");
+        let _ = res;
+    }
+
+    #[tokio::test]
+    async fn test_federation_config_loads_key_from_file_and_health_check_payload() {
+        let _guard = TEST_ENV_LOCK.lock().await;
+
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("e2e-tests/fixtures");
+        let ds1_key_path = fixture_dir.join("ds1-key.pem");
+
+        std::env::set_var("APP_ENV", "test");
+        std::env::set_var("SERVICE_DID", "did:web:ds1.local");
+        std::env::set_var("FEDERATION_ENABLED", "true");
+        std::env::set_var("FEDERATION_MODE", "allowlist");
+        std::env::set_var("SIGNING_KEY_FILE", ds1_key_path.to_str().unwrap());
+        std::env::set_var("FEDERATION_CAPABILITIES", "baseline,reconciliation-v1");
+
+        let fed_config = crate::federation::FederationConfig::from_env();
+        assert!(fed_config.enabled);
+        assert_eq!(fed_config.self_did, "did:web:ds1.local");
+        assert!(fed_config.signing_key_pem.is_some());
+
+        let caps = crate::federation::local_federation_capabilities();
+        assert!(caps.contains(&"baseline".to_string()));
+        assert!(caps.contains(&"reconciliation-v1".to_string()));
+
+        // Verify health check handler
+        let res = crate::handlers::ds::health_check()
+            .await
+            .expect("health check ok");
+        let value = res.0;
+        assert_eq!(value["did"], "did:web:ds1.local");
+        assert_eq!(value["version"], "1.0.0");
+        let res_caps: Vec<String> = serde_json::from_value(value["federationCapabilities"].clone())
+            .expect("parse caps array");
+        assert_eq!(
+            res_caps,
+            vec!["baseline".to_string(), "reconciliation-v1".to_string()]
+        );
+
+        std::env::remove_var("SIGNING_KEY_FILE");
+        std::env::remove_var("FEDERATION_CAPABILITIES");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "could not be read")]
+    async fn test_unreadable_signing_key_file_panics_in_every_environment() {
+        let _guard = TEST_ENV_LOCK.lock().await;
+        std::env::set_var("SERVICE_DID", "did:web:ds1.local");
+        std::env::set_var("SIGNING_KEY_FILE", "/nonexistent/path/to/signing_key.pem");
+        let res = crate::federation::FederationConfig::from_env();
+        std::env::remove_var("SIGNING_KEY_FILE");
+        let _ = res;
     }
 }
 

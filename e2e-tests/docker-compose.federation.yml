@@ -1,15 +1,7 @@
-# Two-node federation stack for the Rust e2e-tests harness.
+# Two-node federation stack for clean-chat testing (Colima / Docker Compose).
 #
-# This file lives adjacent to `mls-ds/e2e-tests/src/federation/` and is the
-# compose topology targeted by `boot_two_node_cluster()` in `harness.rs`.
-# It mirrors `mls-ds/scripts/federation-two-node.compose.yml` (the shell
-# harness) but is kept separate so Cluster E can evolve it without breaking
-# the shell-driven smoke tests.
-#
-# Cluster D (Delta-nonsec) — 2026-04-11. Scaffold only: ports, services,
-# and healthchecks are wired up but no federation tests exercise this yet.
-# Per invariant E2, Cluster E will fill in the Rust tests that call this
-# compose file via the harness.
+# Canonical Compose topology for DS1 and DS2 federated cluster.
+# References: docs/superpowers/plans/2026-08-24-clean-chat-federation-container.md
 
 services:
   ds1-postgres:
@@ -17,11 +9,11 @@ services:
     environment:
       POSTGRES_USER: catbird
       POSTGRES_PASSWORD: catbird
-      POSTGRES_DB: ds1_catbird
+      POSTGRES_DB: catbird
     ports:
-      - "${DS1_DB_PORT:-5641}:5432"
+      - "${DS1_DB_PORT:-0}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U catbird -d ds1_catbird"]
+      test: ["CMD-SHELL", "pg_isready -U catbird -d catbird"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -31,7 +23,7 @@ services:
   ds1-redis:
     image: redis:7-bookworm
     ports:
-      - "${DS1_REDIS_PORT:-6481}:6379"
+      - "${DS1_REDIS_PORT:-0}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -40,46 +32,59 @@ services:
 
   ds1:
     build:
-      context: ../server
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: server/Dockerfile
+      target: federation-test
+      additional_contexts:
+        catbird-atproto: ../../catbird-atproto
     depends_on:
       ds1-postgres:
         condition: service_healthy
       ds1-redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://catbird:catbird@ds1-postgres:5432/ds1_catbird
+      APP_ENV: "${APP_ENV:-test}"
+      SERVER_PORT: "3001"
+      SERVER_HOST: "0.0.0.0"
+      DATABASE_URL: postgres://catbird:catbird@ds1-postgres:5432/catbird
       REDIS_URL: redis://ds1-redis:6379
-      SERVER_PORT: "${DS1_PORT:-3101}"
-      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET}"
       SERVICE_DID: "${DS1_SERVICE_DID:-did:web:ds1.local}"
-      SELF_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://127.0.0.1:3101}"
-      DEFAULT_DS_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://127.0.0.1:3102}"
+      SELF_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
+      DEFAULT_DS_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
       FEDERATION_MODE: "${FEDERATION_MODE:-allowlist}"
       FEDERATION_ENABLED: "${FEDERATION_ENABLED:-true}"
       FEDERATION_ALLOW_INSECURE_HTTP: "${FEDERATION_ALLOW_INSECURE_HTTP:-true}"
-      ENFORCE_LXM: "${ENFORCE_LXM:-false}"
-      ENFORCE_JTI: "${ENFORCE_JTI:-false}"
+      FEDERATION_CAPABILITIES: "${FEDERATION_CAPABILITIES:-baseline,reconciliation-v1}"
+      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.local,did:web:ds2.local}"
+      ENFORCE_LXM: "${ENFORCE_LXM:-true}"
+      ENFORCE_JTI: "${ENFORCE_JTI:-true}"
+      SIGNING_KEY_FILE: "${DS1_SIGNING_KEY_FILE:-/app/fixtures/ds1-key.pem}"
+      TEST_DID_DOCUMENT_PATHS: "/app/fixtures/ds1-did.json,/app/fixtures/ds2-did.json"
+      CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "${CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED:-handlers-and-legacy-apis-sealed}"
+      S3_ENDPOINT: "${S3_ENDPOINT:-http://ds1-blobstore:9000}"
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-catbird-minio-access}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-catbird-minio-secret-key-32-bytes!}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
       RUST_LOG: "${RUST_LOG:-info}"
     ports:
-      - "${DS1_PORT:-3101}:${DS1_PORT:-3101}"
+      - "${DS1_PORT:-0}:3001"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:${DS1_PORT:-3101}/health/ready >/dev/null"]
-      interval: 10s
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/health/ready >/dev/null && curl -sf http://localhost:3001/xrpc/blue.catbird.mlsDS.healthCheck >/dev/null"]
+      interval: 5s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 25
+      start_period: 15s
 
   ds2-postgres:
     image: postgres:16-bookworm
     environment:
       POSTGRES_USER: catbird
       POSTGRES_PASSWORD: catbird
-      POSTGRES_DB: ds2_catbird
+      POSTGRES_DB: catbird
     ports:
-      - "${DS2_DB_PORT:-5642}:5432"
+      - "${DS2_DB_PORT:-0}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U catbird -d ds2_catbird"]
+      test: ["CMD-SHELL", "pg_isready -U catbird -d catbird"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -89,7 +94,7 @@ services:
   ds2-redis:
     image: redis:7-bookworm
     ports:
-      - "${DS2_REDIS_PORT:-6482}:6379"
+      - "${DS2_REDIS_PORT:-0}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -98,35 +103,48 @@ services:
 
   ds2:
     build:
-      context: ../server
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: server/Dockerfile
+      target: federation-test
+      additional_contexts:
+        catbird-atproto: ../../catbird-atproto
     depends_on:
       ds2-postgres:
         condition: service_healthy
       ds2-redis:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://catbird:catbird@ds2-postgres:5432/ds2_catbird
+      APP_ENV: "${APP_ENV:-test}"
+      SERVER_PORT: "3001"
+      SERVER_HOST: "0.0.0.0"
+      DATABASE_URL: postgres://catbird:catbird@ds2-postgres:5432/catbird
       REDIS_URL: redis://ds2-redis:6379
-      SERVER_PORT: "${DS2_PORT:-3102}"
-      JWT_SECRET: "${JWT_SECRET:?Set JWT_SECRET}"
       SERVICE_DID: "${DS2_SERVICE_DID:-did:web:ds2.local}"
-      SELF_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://127.0.0.1:3102}"
-      DEFAULT_DS_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://127.0.0.1:3101}"
+      SELF_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
+      DEFAULT_DS_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
       FEDERATION_MODE: "${FEDERATION_MODE:-allowlist}"
       FEDERATION_ENABLED: "${FEDERATION_ENABLED:-true}"
       FEDERATION_ALLOW_INSECURE_HTTP: "${FEDERATION_ALLOW_INSECURE_HTTP:-true}"
-      ENFORCE_LXM: "${ENFORCE_LXM:-false}"
-      ENFORCE_JTI: "${ENFORCE_JTI:-false}"
+      FEDERATION_CAPABILITIES: "${FEDERATION_CAPABILITIES:-baseline,reconciliation-v1}"
+      FEDERATION_ADMIN_DIDS: "${FEDERATION_ADMIN_DIDS:-did:web:ds1.local,did:web:ds2.local}"
+      ENFORCE_LXM: "${ENFORCE_LXM:-true}"
+      ENFORCE_JTI: "${ENFORCE_JTI:-true}"
+      SIGNING_KEY_FILE: "${DS2_SIGNING_KEY_FILE:-/app/fixtures/ds2-key.pem}"
+      TEST_DID_DOCUMENT_PATHS: "/app/fixtures/ds1-did.json,/app/fixtures/ds2-did.json"
+      CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED: "${CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED:-handlers-and-legacy-apis-sealed}"
+      S3_ENDPOINT: "${S3_ENDPOINT:-http://ds2-blobstore:9000}"
+      S3_ACCESS_KEY: "${S3_ACCESS_KEY:-catbird-minio-access}"
+      S3_SECRET_KEY: "${S3_SECRET_KEY:-catbird-minio-secret-key-32-bytes!}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
       RUST_LOG: "${RUST_LOG:-info}"
     ports:
-      - "${DS2_PORT:-3102}:${DS2_PORT:-3102}"
+      - "${DS2_PORT:-0}:3001"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:${DS2_PORT:-3102}/health/ready >/dev/null"]
-      interval: 10s
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/health/ready >/dev/null && curl -sf http://localhost:3001/xrpc/blue.catbird.mlsDS.healthCheck >/dev/null"]
+      interval: 5s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 25
+      start_period: 15s
 
 volumes:
   ds1_pgdata:

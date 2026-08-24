@@ -13,7 +13,7 @@ const MLS_DID: &str = "did:web:dev-api.catbird.blue:mls";
 const USER_DID: &str = "did:plc:wave1-staging-user";
 const ENDPOINT: &str = "blue.catbird.chat.getConversations";
 const OTHER_ENDPOINT: &str = "blue.catbird.chat.sendMessage";
-const GATEWAY_KID: &str = "catbird-key-1";
+const GATEWAY_KID: &str = "atproto";
 
 fn strict_fixture_policy() -> AuthEnforcementPolicy {
     AuthEnforcementPolicy::strict_for_test()
@@ -275,9 +275,10 @@ async fn wave1_staging_gateway_jwk_verifies_and_delegates_only_with_exact_bindin
     let wrong_kid = sign_token(&gateway_key, Some("other-key"), &claims);
     assert!(matches!(
         middleware.verify_jwt(&wrong_kid).await,
-        Err(AuthError::InvalidToken(message)) if message.contains("No verification method matches")
+        Err(AuthError::InvalidToken(message))
+            if message.contains("must use the DID #atproto verification method")
+                || message.contains("No verification method matches")
     ));
-
     let wrong_key = sign_token(&other_key, Some(GATEWAY_KID), &claims);
     assert!(matches!(
         middleware.verify_jwt(&wrong_key).await,
@@ -453,7 +454,7 @@ async fn wave1_staging_mls_atproto_jwk_verifies_outbound_token_without_kid() {
 }
 
 #[tokio::test]
-async fn es256_multikey_only_document_is_rejected_by_current_verifier() {
+async fn es256_multikey_document_is_accepted_by_verifier() {
     let mls_key = fixture_signing_key(5);
     let middleware =
         middleware_with_document(multikey_document(MLS_DID, "atproto", &mls_key)).await;
@@ -468,8 +469,11 @@ async fn es256_multikey_only_document_is_rejected_by_current_verifier() {
     };
     let token = sign_token(&mls_key, None, &claims);
 
-    assert!(matches!(
-        middleware.verify_jwt(&token).await,
-        Err(AuthError::MissingVerificationMethod)
-    ));
+    let verified = middleware
+        .verify_jwt(&token)
+        .await
+        .expect("multikey verification method must be accepted by verifier");
+    assert_eq!(verified.iss, MLS_DID);
+    assert_eq!(verified.aud, MLS_DID);
+    assert_eq!(verified.lxm.as_deref(), Some(ENDPOINT));
 }

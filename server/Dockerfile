@@ -27,7 +27,7 @@ COPY lexicon lexicon
 RUN cargo build --release -p catbird-server
 
 # ---------- runtime ----------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 libpq5 curl \
@@ -45,3 +45,12 @@ EXPOSE 3001
 ENV SERVER_PORT=3001
 USER catbird
 CMD ["catbird-server"]
+
+# ---------- federation-test (test-only stage with deterministic test fixtures) ----------
+FROM runtime AS federation-test
+
+USER root
+COPY e2e-tests/fixtures /app/fixtures
+RUN chown -R catbird:catbird /app/fixtures
+
+USER catbird
