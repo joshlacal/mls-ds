@@ -242,7 +242,7 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 2
             },
             CleanProtocol13ManifestEntry {
                 filename: "20260824000004_chat_federation_delivery_receipts.sql",
-                reviewed_sha384: "48e81dcab0ec1c2ddda3634d41ef7fa61e885017746bee997d95d204124583aac8bb3c23a5fb086936054a82980992c0",
+                reviewed_sha384: "37ce660ad4630345dfdb0c106631b8926b2d2dfed0780210c072825e3a93f6455ba16a017ffdaaba243afe4c83f5f222",
                 migration: Migration::new(
                     20260824000004,
                     Cow::Borrowed("chat federation delivery receipts"),
@@ -330,15 +330,6 @@ pub fn validate_chat_protocol_database_url(
 ) -> Result<&'static str, &'static str> {
     match value {
         Some(CHAT_PROTOCOL_TEST_DATABASE_URL) => Ok(CHAT_PROTOCOL_TEST_DATABASE_NAME),
-        Some(url)
-            if url == "postgresql://catbird:test_password@localhost:5432/catbird"
-                || url == "postgresql://catbird:test_password@127.0.0.1:5432/catbird"
-                || url == "postgresql://127.0.0.1:5432/catbird"
-                || url == "postgresql://localhost:5432/catbird"
-                || url.ends_with("/catbird_chat_protocol_test_20260722") =>
-        {
-            Ok(CHAT_PROTOCOL_TEST_DATABASE_NAME)
-        }
         _ => {
             Err("TEST_DATABASE_URL must exactly equal the reviewed literal local clean-chat target")
         }

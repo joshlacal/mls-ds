@@ -53,6 +53,8 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_convhandlers_",
     // `tests/chat_protocol_federation_routing.rs`
     "chat_fedrouting_",
+    // `tests/chat_protocol_federation_router.rs`
+    "chat_fedrouter_",
     // `tests/chat_protocol_device_handlers.rs`
     "chat_devhandlers_",
     // `tests/chat_protocol_auth_repository.rs`

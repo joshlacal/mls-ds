@@ -16,9 +16,9 @@ CREATE TABLE chat.federation_delivery_receipts (
     sequencer_term BIGINT NOT NULL,
     envelope_sha256 BYTEA NOT NULL,
     result_sha256 BYTEA NOT NULL,
-    source_entry_id UUID,
-    source_entry_seq BIGINT,
-    source_entry_fingerprint BYTEA,
+    source_entry_id UUID NOT NULL,
+    source_entry_seq BIGINT NOT NULL,
+    source_entry_fingerprint BYTEA NOT NULL,
     response_bytes BYTEA NOT NULL,
     response_sha256 BYTEA NOT NULL,
     receipt_signature BYTEA NOT NULL,
@@ -53,12 +53,9 @@ CREATE TABLE chat.federation_delivery_receipts (
         CHECK (octet_length(receipt_signature) = 64),
     CONSTRAINT federation_delivery_receipts_source_entry_shape_check
         CHECK (
-            (source_entry_id IS NULL AND source_entry_seq IS NULL AND source_entry_fingerprint IS NULL)
-            OR (
-                source_entry_id IS NOT NULL AND chat.is_uuid_v4(source_entry_id)
-                AND source_entry_seq IS NOT NULL AND chat.is_safe_integer(source_entry_seq) AND source_entry_seq >= 1
-                AND source_entry_fingerprint IS NOT NULL AND octet_length(source_entry_fingerprint) = 32
-            )
+            chat.is_uuid_v4(source_entry_id)
+            AND chat.is_safe_integer(source_entry_seq) AND source_entry_seq >= 1
+            AND octet_length(source_entry_fingerprint) = 32
         ),
     CONSTRAINT federation_delivery_receipts_conversation_fk
         FOREIGN KEY (conversation_id)

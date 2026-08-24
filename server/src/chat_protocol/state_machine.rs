@@ -7,8 +7,8 @@
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
-use chrono::{DateTime, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -4171,26 +4171,24 @@ impl HydrationAuthority {
         })
     }
 
-    pub(crate) fn locked_registration_from_raw_parts(
+    pub(crate) fn locked_registration_from_federated_admission(
         &self,
-        did: BareDid,
-        device_id: CanonicalUuidV4,
-        key: KeyThumbprint,
-        registered_mls_signature_key: [u8; 32],
-        auth_generation: u64,
-        trusted_read_at_dt: DateTime<Utc>,
+        admission: &FederatedOperationAdmission,
     ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        if admission.conversation_id != Uuid::from_bytes(self.expected_conversation_id) {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         let actor = DeviceIdentity::new(
-            PrincipalId::new(did.as_str().as_bytes().to_vec())?,
-            *device_id.as_bytes(),
+            PrincipalId::new(admission.actor_did.as_str().as_bytes().to_vec())?,
+            *admission.actor_device_id.as_bytes(),
         )?;
         let key_id: [u8; 32] = URL_SAFE_NO_PAD
-            .decode(key.as_str())
+            .decode(admission.actor_key_id.as_str())
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
             .try_into()
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
         let trusted_read_at =
-            ServerTimestamp::from_unix_millis(trusted_read_at_dt.timestamp_millis())?;
+            ServerTimestamp::from_unix_millis(admission.trusted_read_at.timestamp_millis())?;
         let mut digest = Sha256::new();
         digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
         digest.update(self.expected_conversation_id);
@@ -4198,19 +4196,31 @@ impl HydrationAuthority {
         digest.update(actor.principal().as_bytes());
         digest.update(actor.device_id());
         digest.update(key_id);
-        digest.update(registered_mls_signature_key);
-        digest.update(auth_generation.to_be_bytes());
+        digest.update(admission.registered_mls_signature_key);
+        digest.update(admission.auth_generation.to_be_bytes());
         digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        let computed_row_digest: [u8; 32] = digest.finalize().into();
+        if computed_row_digest != admission.durable_row_digest {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let transaction_id = self
+            .locked
+            .as_ref()
+            .map(|l| l.transaction_id.clone())
+            .unwrap_or_default();
+        if !transaction_id.is_empty() && transaction_id != admission.transaction_id {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         Ok(LockedRegistrationProjection {
             conversation_id: self.expected_conversation_id,
             actor,
             key_id,
-            registered_mls_signature_key,
-            auth_generation,
+            registered_mls_signature_key: admission.registered_mls_signature_key,
+            auth_generation: admission.auth_generation,
             status: PersistedRegistrationStatus::Active,
             trusted_read_at,
-            durable_row_digest: digest.finalize().into(),
-            transaction_id: String::new(),
+            durable_row_digest: computed_row_digest,
+            transaction_id: transaction_id.clone(),
             authority_scope_digest: [0; 32],
         })
     }
@@ -6733,6 +6743,64 @@ impl LockedRegistrationProjection {
         let mut projection = Self::for_test(evidence);
         projection.auth_generation = auth_generation;
         projection
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FederatedOperationAdmission {
+    pub(crate) actor_did: BareDid,
+    pub(crate) actor_device_id: CanonicalUuidV4,
+    pub(crate) actor_key_id: KeyThumbprint,
+    pub(crate) registered_mls_signature_key: [u8; 32],
+    pub(crate) auth_generation: u64,
+    pub(crate) trusted_read_at: DateTime<Utc>,
+    pub(crate) transaction_id: String,
+    pub(crate) requester_ds: String,
+    pub(crate) conversation_id: Uuid,
+    pub(crate) durable_row_digest: [u8; 32],
+}
+
+impl FederatedOperationAdmission {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal(
+        actor_did: BareDid,
+        actor_device_id: CanonicalUuidV4,
+        actor_key_id: KeyThumbprint,
+        registered_mls_signature_key: [u8; 32],
+        auth_generation: u64,
+        trusted_read_at: DateTime<Utc>,
+        transaction_id: String,
+        requester_ds: String,
+        conversation_id: Uuid,
+    ) -> Result<Self, StateMachineError> {
+        let key_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(actor_key_id.as_str())
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+            .try_into()
+            .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+        let trusted_timestamp =
+            ServerTimestamp::from_unix_millis(trusted_read_at.timestamp_millis())?;
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
+        digest.update(*conversation_id.as_bytes());
+        digest.update((actor_did.as_str().as_bytes().len() as u64).to_be_bytes());
+        digest.update(actor_did.as_str().as_bytes());
+        digest.update(*actor_device_id.as_bytes());
+        digest.update(key_id);
+        digest.update(registered_mls_signature_key);
+        digest.update(auth_generation.to_be_bytes());
+        digest.update(trusted_timestamp.unix_millis().to_be_bytes());
+        Ok(Self {
+            actor_did,
+            actor_device_id,
+            actor_key_id,
+            registered_mls_signature_key,
+            auth_generation,
+            trusted_read_at,
+            transaction_id,
+            requester_ds,
+            conversation_id,
+            durable_row_digest: digest.finalize().into(),
+        })
     }
 }
 

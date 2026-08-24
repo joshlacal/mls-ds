@@ -414,9 +414,9 @@ pub(crate) async fn append_exact_application_entry(
     let seq_i64 =
         i64::try_from(expected_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
 
-    let head_row: Option<(Option<i64>, i64)> = sqlx::query_as(
+    let head_row: Option<(i64,)> = sqlx::query_as(
         r#"
-        SELECT current_entry_seq, next_entry_seq
+        SELECT next_entry_seq
           FROM chat.conversations
          WHERE conversation_id = $1
          FOR UPDATE
@@ -426,20 +426,25 @@ pub(crate) async fn append_exact_application_entry(
     .fetch_optional(&mut **transaction)
     .await?;
 
-    let (_current_seq, next_entry_seq) =
-        head_row.ok_or(DeliveryRepositoryError::ConversationMissing)?;
+    let (next_entry_seq,) = head_row.ok_or(DeliveryRepositoryError::ConversationMissing)?;
     if next_entry_seq != seq_i64 {
         return Err(DeliveryRepositoryError::CompareAndSetConflict);
     }
 
     append_entry_at(transaction, &send.entry, expected_seq).await?;
-    insert_message_send_row(transaction, send, message_id, "accepted", Some(expected_seq)).await?;
+    insert_message_send_row(
+        transaction,
+        send,
+        message_id,
+        "accepted",
+        Some(expected_seq),
+    )
+    .await?;
 
     let updated = sqlx::query(
         r#"
         UPDATE chat.conversations
-           SET current_entry_seq = $1,
-               next_entry_seq = $1 + 1
+           SET next_entry_seq = $1 + 1
          WHERE conversation_id = $2
            AND next_entry_seq = $1
         "#,
@@ -461,6 +466,7 @@ pub(crate) async fn compare_exact_application_entry(
     transaction: &mut Transaction<'_, Postgres>,
     send: &ApplicationSend,
     expected_seq: u64,
+    blob_binding: Option<&super::blobs::NewBlobBinding>,
 ) -> Result<bool, DeliveryRepositoryError> {
     let message_id = send
         .entry
@@ -468,7 +474,6 @@ pub(crate) async fn compare_exact_application_entry(
         .ok_or(DeliveryRepositoryError::MissingMessageId)?;
     let seq_i64 =
         i64::try_from(expected_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
-
     let entry_row: Option<(
         Uuid,
         String,
@@ -566,6 +571,52 @@ pub(crate) async fn compare_exact_application_entry(
         || outcome_bytes != send.outcome_bytes
     {
         return Ok(false);
+    }
+
+    if let Some(b) = blob_binding {
+        let binding_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
+            r#"
+            SELECT bb.descriptor_bytes, bb.aad_bytes, bb.ciphertext_sha256, bl.status
+              FROM chat.blob_bindings bb
+              JOIN chat.blobs bl ON bl.blob_id = bb.blob_id
+             WHERE bb.conversation_id = $1 AND bb.entry_seq = $2 AND bb.message_id = $3 AND bb.blob_id = $4
+            "#,
+        )
+        .bind(send.entry.conversation_id)
+        .bind(seq_i64)
+        .bind(message_id)
+        .bind(b.blob_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        let Some((stored_desc, stored_aad, stored_hash, blob_status)) = binding_row else {
+            return Ok(false);
+        };
+
+        if stored_desc != b.descriptor_bytes
+            || stored_aad != b.aad_bytes
+            || stored_hash != b.ciphertext_sha256
+            || blob_status != "bound"
+        {
+            return Ok(false);
+        }
+    } else {
+        let has_binding: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM chat.blob_bindings
+                 WHERE conversation_id = $1 AND entry_seq = $2
+            )
+            "#,
+        )
+        .bind(send.entry.conversation_id)
+        .bind(seq_i64)
+        .fetch_one(&mut **transaction)
+        .await?;
+
+        if has_binding {
+            return Ok(false);
+        }
     }
 
     Ok(true)

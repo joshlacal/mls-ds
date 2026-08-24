@@ -29,7 +29,6 @@ pub async fn submit_commit(
     let Some(signer) = ack_signer.as_deref() else {
         return Err(FederationError::SignerUnavailable);
     };
-
     let msg: SubmitCommit<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
         FederationError::Json(serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
