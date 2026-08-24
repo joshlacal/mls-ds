@@ -235,8 +235,8 @@ pub fn classify_device_auth_endpoint(nsid: &str) -> Option<DeviceAuthEndpointCla
         | "blue.catbird.chat.revokeDevice"
         | "blue.catbird.chat.sendMessage"
         | "blue.catbird.chat.submitTransition"
+        | "blue.catbird.chat.updatePushToken"
         | "blue.catbird.chat.uploadBlob" => Mutation,
-
         _ => return None,
     })
 }

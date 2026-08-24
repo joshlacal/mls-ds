@@ -775,6 +775,16 @@ define_endpoint_contracts!(
         NotAuthorized,
         DeviceBindingMismatch,
     ]),
+    UpdatePushToken => ("blue.catbird.chat.updatePushToken", [
+        AccountSessionExpired,
+        CutoverRequired,
+        DeviceNotRegistered,
+        DeviceRevoked,
+        InvalidRequest,
+        NotAuthorized,
+        ProtocolUpgradeRequired,
+        RateLimited,
+    ]),
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

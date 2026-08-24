@@ -1,0 +1,64 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.updatePushToken",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Register, update, or clear the APNs device token for the caller's active device.",
+      "input": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "token": {
+              "type": "string",
+              "maxLength": 512,
+              "description": "APNs device token (e.g. hex-encoded). Omit to unregister/clear."
+            }
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "object",
+          "required": [
+            "device"
+          ],
+          "properties": {
+            "device": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#deviceView"
+            }
+          }
+        }
+      },
+      "errors": [
+        {
+          "name": "AccountSessionExpired"
+        },
+        {
+          "name": "CutoverRequired"
+        },
+        {
+          "name": "DeviceNotRegistered"
+        },
+        {
+          "name": "DeviceRevoked"
+        },
+        {
+          "name": "InvalidRequest"
+        },
+        {
+          "name": "NotAuthorized"
+        },
+        {
+          "name": "ProtocolUpgradeRequired"
+        },
+        {
+          "name": "RateLimited"
+        }
+      ]
+    }
+  }
+}

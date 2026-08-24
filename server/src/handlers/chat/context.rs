@@ -63,7 +63,7 @@ fn capture_instant(endpoint: ChatEndpoint) -> Result<TrustedRequestInstant, Chat
     TrustedRequestInstant::capture().map_err(|_| ChatFailure::invariant(endpoint))
 }
 
-async fn verify_service_principal(
+pub(crate) async fn verify_service_principal(
     pool: &DbPool,
     endpoint: ChatEndpoint,
     headers: &HeaderMap,

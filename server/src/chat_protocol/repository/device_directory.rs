@@ -35,10 +35,19 @@
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Error)]
+pub(crate) enum UpdatePushTokenRepositoryError {
+    #[error("clean-chat push token update database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("clean-chat push token update target device is missing")]
+    DeviceNotRegistered,
+    #[error("clean-chat push token update target device is revoked")]
+    DeviceRevoked,
+}
 #[derive(Debug, Error)]
 pub(crate) enum DeviceDirectoryError {
     #[error("clean-chat device-directory database error: {0}")]
@@ -209,6 +218,87 @@ pub(crate) async fn read_device_view(
         .bind(device_id)
         .fetch_optional(&mut **transaction)
         .await?;
+    Ok(view)
+}
+
+/// Atomically update or clear the APNs device token for the caller's active device.
+/// Selects the active device row for the authenticated user DID, updates `devices`,
+/// and returns the canonical `DeviceDirectoryView`.
+pub(crate) async fn update_device_push_token(
+    pool: &PgPool,
+    user_did: &str,
+    push_token: Option<&str>,
+) -> Result<DeviceDirectoryView, UpdatePushTokenRepositoryError> {
+    let mut tx = pool.begin().await?;
+
+    let active_device: Option<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT device_id, status
+          FROM chat.devices
+         WHERE user_did = $1
+         ORDER BY (status = 'active') DESC, updated_at DESC, created_at DESC
+         LIMIT 1
+         FOR UPDATE
+        "#,
+    )
+    .bind(user_did)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (device_id, status) = match active_device {
+        Some((device_id, status)) => (device_id, status),
+        None => return Err(UpdatePushTokenRepositoryError::DeviceNotRegistered),
+    };
+
+    if status != "active" {
+        return Err(UpdatePushTokenRepositoryError::DeviceRevoked);
+    }
+
+    let device_id_str = device_id.to_string();
+    if let Some(token) = push_token {
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                id, user_did, device_id, credential_did, active, push_token, push_token_updated_at
+            ) VALUES (
+                gen_random_uuid()::text, $1, $2, $1 || '#' || $2, TRUE, $3, NOW()
+            )
+            ON CONFLICT (user_did, device_id)
+            DO UPDATE SET
+                push_token = EXCLUDED.push_token,
+                push_token_updated_at = NOW(),
+                active = TRUE
+            "#,
+        )
+        .bind(user_did)
+        .bind(&device_id_str)
+        .bind(token)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"
+            UPDATE devices
+               SET push_token = NULL,
+                   push_token_updated_at = NOW()
+             WHERE user_did = $1
+               AND (device_id = $2 OR device_uuid = $2)
+            "#,
+        )
+        .bind(user_did)
+        .bind(&device_id_str)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let view = read_device_view(&mut tx, user_did, device_id)
+        .await
+        .map_err(|e| match e {
+            DeviceDirectoryError::Database(err) => UpdatePushTokenRepositoryError::Database(err),
+        })?
+        .ok_or(UpdatePushTokenRepositoryError::DeviceNotRegistered)?;
+
+    tx.commit().await?;
     Ok(view)
 }
 

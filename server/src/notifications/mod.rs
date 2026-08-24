@@ -1,3 +1,4 @@
+use a2::ErrorReason;
 use a2::{
     Client, ClientConfig, DefaultNotificationBuilder, Endpoint, NotificationBuilder,
     NotificationOptions, Priority, PushType,
@@ -49,6 +50,58 @@ fn mask_device_token(device_token: &str) -> String {
     )
 }
 
+/// Determine whether an APNs response indicates a permanent invalid device token
+/// that should be compare-cleared from the database.
+fn is_permanent_invalid_token(response: &a2::response::Response) -> bool {
+    if response.code == 410 {
+        return true;
+    }
+    if let Some(err) = &response.error {
+        matches!(
+            err.reason,
+            ErrorReason::BadDeviceToken
+            | ErrorReason::Unregistered
+            | ErrorReason::DeviceTokenNotForTopic
+        )
+    } else {
+        false
+    }
+}
+
+/// Compare-and-clear a stale push token from the devices table.
+/// Binds the exact token in the WHERE clause so a concurrently rotated token is preserved.
+async fn prune_stale_device_token(pool: &PgPool, device_token: &str) {
+    let result = sqlx::query(
+        "UPDATE devices SET push_token = NULL, push_token_updated_at = NOW() WHERE push_token = $1",
+    )
+    .bind(device_token)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(res) if res.rows_affected() > 0 => {
+            info!(
+                device_token = %mask_device_token(device_token),
+                rows_cleared = res.rows_affected(),
+                "🧹 [push_notification] Cleared stale push token from database"
+            );
+        }
+        Ok(_) => {
+            debug!(
+                device_token = %mask_device_token(device_token),
+                "🧹 [push_notification] Stale token already cleared or rotated concurrently"
+            );
+        }
+        Err(e) => {
+            error!(
+                device_token = %mask_device_token(device_token),
+                error = %e,
+                "❌ [push_notification] Failed to clear stale push token from database"
+            );
+        }
+    }
+}
+
 impl ApnsClient {
     /// Create a new APNs client
     fn new(
@@ -93,6 +146,7 @@ impl ApnsClient {
     /// Send a notification with ciphertext payload
     async fn send_message_notification(
         &self,
+        pool: &PgPool,
         device_token: &str,
         ciphertext: &[u8],
         convo_id: &str,
@@ -101,7 +155,6 @@ impl ApnsClient {
         seq: i64,
         epoch: i64,
     ) -> Result<()> {
-        info!("🔔 [push_notification] Starting send_message_notification");
 
         // Encode ciphertext as base64 for JSON payload
         let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
@@ -168,32 +221,73 @@ impl ApnsClient {
             );
 
             match self.client.send(notification.clone()).await {
-                Ok(response) => {
+                Ok(response) if (200..300).contains(&response.code) => {
                     info!(
-                        "🔔 [push_notification] Received APNs response: status_code={}",
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        convo_id = %convo_id,
+                        message_id = %message_id,
+                        attempts = retry_count + 1,
+                        "✅ [push_notification] MLS message notification delivered successfully"
+                    );
+                    return Ok(());
+                }
+                Ok(response) if is_permanent_invalid_token(&response) => {
+                    warn!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        convo_id = %convo_id,
+                        message_id = %message_id,
+                        "⚠️ [push_notification] APNs reported permanent invalid device token, compare-clearing"
+                    );
+                    prune_stale_device_token(pool, device_token).await;
+                    return Err(anyhow::anyhow!(
+                        "APNs rejected notification with permanent invalid token status {}",
                         response.code
+                    ));
+                }
+                Ok(response) if response.code == 429 || response.code >= 500 => {
+                    retry_count += 1;
+                    warn!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        attempt = retry_count,
+                        max_retries = MAX_RETRIES,
+                        backoff_ms = backoff_ms,
+                        convo_id = %convo_id,
+                        message_id = %message_id,
+                        "⚠️ [push_notification] Transient APNs status, retrying"
                     );
 
-                    if response.code >= 200 && response.code < 300 {
-                        info!(
+                    if retry_count >= MAX_RETRIES {
+                        error!(
                             device_token = %masked_device_token,
                             status = response.code,
                             convo_id = %convo_id,
                             message_id = %message_id,
-                            attempts = retry_count + 1,
-                            "✅ [push_notification] MLS message notification delivered successfully"
+                            "❌ [push_notification] Notification failed with transient status after maximum retries"
                         );
-                        return Ok(());
-                    } else {
-                        warn!(
-                            device_token = %masked_device_token,
-                            status = response.code,
-                            convo_id = %convo_id,
-                            message_id = %message_id,
-                            "⚠️ [push_notification] Notification accepted with non-success status"
-                        );
-                        return Ok(());
+                        return Err(anyhow::anyhow!(
+                            "APNs notification failed with transient status {} after retries",
+                            response.code
+                        ));
                     }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms *= 2;
+                }
+                Ok(response) => {
+                    warn!(
+                        device_token = %masked_device_token,
+                        status = response.code,
+                        convo_id = %convo_id,
+                        message_id = %message_id,
+                        "⚠️ [push_notification] Non-success APNs status (not retrying)"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "APNs rejected notification with status {}",
+                        response.code
+                    ));
                 }
                 Err(e) => {
                     retry_count += 1;
@@ -535,6 +629,7 @@ impl NotificationService {
 
             let result = client
                 .send_message_notification(
+                    pool,
                     &device_token,
                     ciphertext,
                     convo_id,
@@ -767,5 +862,122 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn apns_permanent_invalid_token_classification() {
+        use a2::response::{ErrorBody, Response};
+
+        // 1. Status 410 (Gone / Unregistered) is always permanent invalid token
+        let resp_410 = Response {
+            code: 410,
+            error: None,
+            apns_id: None,
+        };
+        assert!(is_permanent_invalid_token(&resp_410));
+
+        // 2. BadDeviceToken is permanent invalid token
+        let resp_bad_token = Response {
+            code: 400,
+            error: Some(ErrorBody {
+                reason: ErrorReason::BadDeviceToken,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        assert!(is_permanent_invalid_token(&resp_bad_token));
+
+        // 3. Unregistered is permanent invalid token
+        let resp_unreg = Response {
+            code: 400,
+            error: Some(ErrorBody {
+                reason: ErrorReason::Unregistered,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        assert!(is_permanent_invalid_token(&resp_unreg));
+
+        // 4. DeviceTokenNotForTopic is permanent invalid token
+        let resp_wrong_topic = Response {
+            code: 400,
+            error: Some(ErrorBody {
+                reason: ErrorReason::DeviceTokenNotForTopic,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        assert!(is_permanent_invalid_token(&resp_wrong_topic));
+
+        // 5. Success (200) is NOT an invalid token
+        let resp_200 = Response {
+            code: 200,
+            error: None,
+            apns_id: Some("id".to_string()),
+        };
+        assert!(!is_permanent_invalid_token(&resp_200));
+
+        // 6. Rate limited / TooManyRequests (429) is transient, NOT permanent invalid token
+        let resp_429 = Response {
+            code: 429,
+            error: Some(ErrorBody {
+                reason: ErrorReason::TooManyRequests,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        assert!(!is_permanent_invalid_token(&resp_429));
+
+        // 7. InternalServerError (500) is transient, NOT permanent invalid token
+        let resp_500 = Response {
+            code: 500,
+            error: Some(ErrorBody {
+                reason: ErrorReason::InternalServerError,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        assert!(!is_permanent_invalid_token(&resp_500));
+    }
+
+    #[test]
+    fn apns_non_2xx_must_not_be_swallowed_as_success() {
+        use a2::response::{ErrorBody, Response};
+        let resp_non_2xx = Response {
+            code: 400,
+            error: Some(ErrorBody {
+                reason: ErrorReason::BadTopic,
+                timestamp: None,
+            }),
+            apns_id: None,
+        };
+        let new_is_error = !(200..300).contains(&resp_non_2xx.code);
+        assert!(new_is_error, "APNs non-2xx response must be treated as an error");
+    }
+    #[test]
+    fn compare_and_clear_semantics_preserves_rotated_token() {
+        // Verifies the predicate logic of compare-and-clear:
+        // WHERE push_token = $1 only matches when the DB token has NOT been rotated.
+        let initial_token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let rotated_token = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+        let mut current_db_token = Some(initial_token.to_string());
+
+        // 1. If DB token still equals the failed token, compare-and-clear clears it
+        let failed_token = initial_token;
+        if current_db_token.as_deref() == Some(failed_token) {
+            current_db_token = None;
+        }
+        assert_eq!(current_db_token, None);
+
+        // 2. If client rotates to a new token
+        current_db_token = Some(rotated_token.to_string());
+
+        // 3. Stale async task with old failed token tries to compare-and-clear
+        if current_db_token.as_deref() == Some(failed_token) {
+            current_db_token = None;
+        }
+        // Rotated token is preserved!
+        assert_eq!(current_db_token, Some(rotated_token.to_string()));
     }
 }

@@ -46,6 +46,7 @@ mod send_message;
 mod submit_transition;
 mod subscribe_events;
 mod subscription;
+mod update_push_token;
 mod welcome;
 
 pub use errors::ChatFailure;
@@ -121,6 +122,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::CancelLeafRecovery
             | ChatEndpoint::SubmitTransition
             | ChatEndpoint::GetEntries
+            | ChatEndpoint::UpdatePushToken
     )
 }
 
@@ -252,6 +254,10 @@ where
         .route(
             &xrpc_path(ChatEndpoint::DeleteBlob),
             post(blob_routes::delete_blob),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::UpdatePushToken),
+            post(update_push_token::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetBlob),

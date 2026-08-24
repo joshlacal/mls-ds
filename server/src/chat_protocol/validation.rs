@@ -547,7 +547,7 @@ fn origin_hostname_is_valid(host: &str) -> bool {
     })
 }
 
-const CHAT_ENDPOINTS: [&str; 32] = [
+const CHAT_ENDPOINTS: [&str; 33] = [
     "blue.catbird.chat.enrollDevice",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.rebindDeviceAuthentication",
@@ -580,6 +580,7 @@ const CHAT_ENDPOINTS: [&str; 32] = [
     "blue.catbird.chat.getBlobUsage",
     "blue.catbird.chat.getSubscriptionTicket",
     "blue.catbird.chat.subscribeEvents",
+    "blue.catbird.chat.updatePushToken",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
