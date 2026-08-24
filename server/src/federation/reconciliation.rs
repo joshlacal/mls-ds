@@ -185,7 +185,7 @@ async fn reconcile_conversation(
         .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
 
     let endpoint = resolver
-        .resolve(sequencer_ds)
+        .resolve_ds_did(sequencer_ds)
         .await
         .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
     let discovery_payload = fetch_discovery_payload(&endpoint.endpoint).await;

@@ -8,10 +8,9 @@ use tracing::{debug, error, info, warn};
 use super::errors::FederationError;
 use super::outbound::{OutboundClient, OutboundError};
 use super::peer_policy;
-use super::resolver::{validate_endpoint_url, validate_resolved_host_is_public};
+use super::resolver::DsResolver;
 use crate::auth::AuthMiddleware;
-use crate::identity::{canonical_did, did_web_service_endpoint};
-
+use crate::identity::canonical_did;
 const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV: &str =
     "FEDERATION_OUTBOUND_QUEUE_PER_PEER_PENDING_CAP";
 const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV: &str =
@@ -67,12 +66,17 @@ pub struct QueueStats {
 pub struct OutboundQueue {
     pool: PgPool,
     auth_middleware: AuthMiddleware,
+    resolver: Arc<DsResolver>,
     per_peer_pending_cap: i64,
     per_convo_peer_pending_cap: i64,
 }
 
 impl OutboundQueue {
-    pub fn new(pool: PgPool, auth_middleware: AuthMiddleware) -> Self {
+    pub fn new(
+        pool: PgPool,
+        auth_middleware: AuthMiddleware,
+        resolver: Arc<DsResolver>,
+    ) -> Self {
         let per_peer_pending_cap = pending_cap_from_env(
             OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV,
             OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT,
@@ -88,6 +92,7 @@ impl OutboundQueue {
         Self {
             pool,
             auth_middleware,
+            resolver,
             per_peer_pending_cap,
             per_convo_peer_pending_cap,
         }
@@ -501,55 +506,20 @@ impl OutboundQueue {
             }
         }
     }
-
     async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
         let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
-        let cached_endpoint = sqlx::query_scalar::<_, String>(
-            "SELECT endpoint FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
-        )
-        .bind(&canonical_target_ds_did)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
-
-        if let Some(endpoint) = cached_endpoint {
-            return self
-                .validate_endpoint_candidate(&endpoint, &canonical_target_ds_did)
-                .await;
-        }
-
-        if let Some(derived_endpoint) = did_web_service_endpoint(&canonical_target_ds_did) {
-            return self
-                .validate_endpoint_candidate(&derived_endpoint, &canonical_target_ds_did)
-                .await;
-        }
-
-        Err(OutboundError::RequestFailed {
-            endpoint: canonical_target_ds_did,
-            reason: "target endpoint missing and DS endpoint could not be resolved".to_string(),
-        })
-    }
-
-    async fn validate_endpoint_candidate(
-        &self,
-        endpoint: &str,
-        target_ds_did: &str,
-    ) -> Result<String, OutboundError> {
-        let parsed = validate_endpoint_url(endpoint).map_err(|e| OutboundError::RequestFailed {
-            endpoint: endpoint.to_string(),
-            reason: format!("SSRF validation failed for {target_ds_did}: {e}"),
-        })?;
-        validate_resolved_host_is_public(&parsed)
+        let endpoint = self
+            .resolver
+            .resolve_ds_did(&canonical_target_ds_did)
             .await
             .map_err(|e| OutboundError::RequestFailed {
-                endpoint: endpoint.to_string(),
-                reason: format!("SSRF validation failed for {target_ds_did}: {e}"),
+                endpoint: canonical_target_ds_did.clone(),
+                reason: format!("Could not resolve DS DID: {e}"),
             })?;
-        Ok(endpoint.to_string())
-    }
 
+        Ok(endpoint.endpoint)
+    }
     // -- Status mutations -------------------------------------------------------
 
     async fn mark_delivered(&self, id: &str) -> Result<(), sqlx::Error> {
@@ -709,5 +679,38 @@ mod tests {
         assert_eq!(backoff_delay(5), Duration::from_secs(160));
         assert_eq!(backoff_delay(6), Duration::from_secs(300)); // capped
         assert_eq!(backoff_delay(10), Duration::from_secs(300)); // still capped
+    }
+
+    #[tokio::test]
+    async fn outbound_queue_resolves_target_endpoint_via_injected_resolver() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http,
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        ));
+        let queue = OutboundQueue::new(pool, AuthMiddleware::new(), resolver);
+
+        let item = QueueItem {
+            id: "item-1".to_string(),
+            target_ds_did: "did:web:127.0.0.1%3A3001".to_string(),
+            target_endpoint: String::new(),
+            method: "blue.catbird.mlsDS.deliverMessage".to_string(),
+            payload: vec![],
+            convo_id: "convo-1".to_string(),
+            retry_count: 0,
+            max_retries: 5,
+        };
+
+        let endpoint = queue.resolve_target_endpoint(&item).await.unwrap();
+        assert_eq!(endpoint, "https://127.0.0.1:3001");
     }
 }

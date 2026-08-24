@@ -50,6 +50,7 @@ services:
       REDIS_URL: redis://ds1-redis:6379
       SERVICE_DID: "${DS1_SERVICE_DID:-did:web:ds1.local}"
       SELF_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
+      DEFAULT_DS_DID: "${DS2_SERVICE_DID:-did:web:ds2.local}"
       DEFAULT_DS_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
       FEDERATION_MODE: "${FEDERATION_MODE:-allowlist}"
       FEDERATION_ENABLED: "${FEDERATION_ENABLED:-true}"
@@ -121,6 +122,7 @@ services:
       REDIS_URL: redis://ds2-redis:6379
       SERVICE_DID: "${DS2_SERVICE_DID:-did:web:ds2.local}"
       SELF_ENDPOINT: "${DS2_SELF_ENDPOINT:-http://ds2:3001}"
+      DEFAULT_DS_DID: "${DS1_SERVICE_DID:-did:web:ds1.local}"
       DEFAULT_DS_ENDPOINT: "${DS1_SELF_ENDPOINT:-http://ds1:3001}"
       FEDERATION_MODE: "${FEDERATION_MODE:-allowlist}"
       FEDERATION_ENABLED: "${FEDERATION_ENABLED:-true}"

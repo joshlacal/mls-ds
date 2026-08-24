@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use axum::{extract::State, Json};
-use once_cell::sync::Lazy;
 use serde_json::json;
 use tracing::{debug, warn};
 
@@ -7,47 +7,7 @@ use crate::{
     auth::AuthUser, crypto::redact_for_log, federation::FederationError, identity::canonical_did,
     storage::DbPool,
 };
-
 const NSID: &str = "blue.catbird.mlsDS.fetchKeyPackage";
-
-static FEDERATION_HTTP_CLIENT: Lazy<Result<reqwest::Client, &'static str>> = Lazy::new(|| {
-    let timeout_secs = std::env::var("OUTBOUND_TIMEOUT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(30);
-    let connect_timeout_secs = std::env::var("OUTBOUND_CONNECT_TIMEOUT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(10);
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .user_agent("catbird-mls-ds/1.0")
-        .build()
-        .map_err(|_| "failed to initialize authoritative device HTTP client")
-});
-
-fn shared_federation_http_client() -> Result<&'static reqwest::Client, &'static str> {
-    FEDERATION_HTTP_CLIENT.as_ref().map_err(|error| *error)
-}
-
-fn try_resolver_identity_from_env_values(
-    service_did: Result<String, std::env::VarError>,
-    self_endpoint: Result<String, std::env::VarError>,
-) -> Result<(String, String), &'static str> {
-    let service_did = service_did
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or("SERVICE_DID is not configured")?;
-    let self_endpoint = self_endpoint
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| crate::identity::did_web_service_endpoint(&service_did))
-        .ok_or("SELF_ENDPOINT is not configured for this SERVICE_DID")?;
-    Ok((service_did, self_endpoint))
-}
 
 async fn claim_current_authorized_key_package(
     pool: &DbPool,
@@ -113,35 +73,13 @@ where
 /// GET /xrpc/blue.catbird.mlsDS.fetchKeyPackage
 ///
 /// Return and consume a key package for a local user, requested by a remote DS.
-#[tracing::instrument(skip(pool, auth_user, query))]
+#[tracing::instrument(skip(pool, resolver, auth_user, query))]
 pub async fn fetch_key_package(
     State(pool): State<DbPool>,
+    State(resolver): State<Arc<crate::federation::DsResolver>>,
     auth_user: AuthUser,
     axum::extract::Query(query): axum::extract::Query<FetchKeyPackageParams>,
 ) -> Result<Json<serde_json::Value>, FederationError> {
-    let (self_did, self_endpoint) = try_resolver_identity_from_env_values(
-        std::env::var("SERVICE_DID"),
-        std::env::var("SELF_ENDPOINT"),
-    )
-    .map_err(|reason| FederationError::ConfigError {
-        reason: reason.to_string(),
-    })?;
-    let http = shared_federation_http_client()
-        .map_err(|reason| FederationError::ConfigError {
-            reason: reason.to_string(),
-        })?
-        .clone();
-    let resolver = crate::federation::DsResolver::new(
-        pool.clone(),
-        http,
-        self_did,
-        self_endpoint,
-        std::env::var("DEFAULT_DS_ENDPOINT").ok(),
-        std::env::var("ENDPOINT_CACHE_TTL")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3600),
-    );
 
     let security =
         super::deliver_message::enforce_ds_request_security(&pool, &auth_user, NSID, None).await?;
@@ -286,37 +224,6 @@ mod tests {
     use uuid::Uuid;
 
     const CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
-
-    #[test]
-    fn resolver_identity_reports_missing_service_did_without_panicking() {
-        let result = try_resolver_identity_from_env_values(
-            Err(std::env::VarError::NotPresent),
-            Err(std::env::VarError::NotPresent),
-        );
-        assert_eq!(result.unwrap_err(), "SERVICE_DID is not configured");
-    }
-
-    #[test]
-    fn resolver_identity_derives_endpoint_from_did_web() {
-        let result = try_resolver_identity_from_env_values(
-            Ok(" did:web:ds.example.com ".to_string()),
-            Err(std::env::VarError::NotPresent),
-        );
-        assert_eq!(
-            result,
-            Ok((
-                "did:web:ds.example.com".to_string(),
-                "https://ds.example.com".to_string()
-            ))
-        );
-    }
-
-    #[test]
-    fn configured_http_client_is_shared_across_requests() {
-        let first = shared_federation_http_client().expect("first client");
-        let second = shared_federation_http_client().expect("second client");
-        assert!(std::ptr::eq(first, second));
-    }
 
     async fn setup_test_db() -> DbPool {
         let database_url = std::env::var("TEST_DATABASE_URL")

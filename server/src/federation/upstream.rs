@@ -11,9 +11,9 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use sqlx::PgPool;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::federation::errors::FederationError;
 use crate::federation::resolver::DsResolver;
 use crate::federation::service_auth::ServiceAuthClient;
+use crate::identity::canonical_did;
 use crate::realtime::sse::StreamEvent;
 use crate::util::outbound_body::{
     decode_json_bounded, summarize_error_body, ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
@@ -84,6 +85,7 @@ struct UpstreamConnection {
 // ---------------------------------------------------------------------------
 
 pub struct UpstreamManager {
+    pool: PgPool,
     resolver: Arc<DsResolver>,
     auth: Arc<ServiceAuthClient>,
     http: reqwest::Client,
@@ -97,6 +99,7 @@ pub struct UpstreamManager {
 
 impl UpstreamManager {
     pub fn new(
+        pool: PgPool,
         resolver: Arc<DsResolver>,
         auth: Arc<ServiceAuthClient>,
         self_did: String,
@@ -111,6 +114,7 @@ impl UpstreamManager {
             .unwrap_or_default();
 
         Self {
+            pool,
             resolver,
             auth,
             http,
@@ -133,8 +137,11 @@ impl UpstreamManager {
         sequencer_did: &str,
         cursor: Option<&str>,
     ) -> Result<broadcast::Receiver<StreamEvent>, FederationError> {
+        let canonical_sequencer = canonical_did(sequencer_did);
+        super::peer_policy::enforce_outbound_peer_policy(&self.pool, canonical_sequencer).await?;
+
         let key = UpstreamKey {
-            sequencer_did: sequencer_did.to_string(),
+            sequencer_did: canonical_sequencer.to_string(),
             convo_id: convo_id.to_string(),
         };
 
@@ -145,14 +152,14 @@ impl UpstreamManager {
                 conn.refcount.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     convo_id,
-                    sequencer_did, "Reusing existing upstream connection"
+                    sequencer_did = canonical_sequencer, "Reusing existing upstream connection"
                 );
                 return Ok(conn.tx.subscribe());
             }
         }
 
         // Slow path: create new upstream connection
-        let endpoint = self.resolver.resolve(sequencer_did).await?;
+        let endpoint = self.resolver.resolve_ds_did(canonical_sequencer).await?;
         let (tx, _) = broadcast::channel(self.buffer_size);
         let cancel = self.shutdown.child_token();
         let refcount = Arc::new(AtomicUsize::new(1));
@@ -166,7 +173,6 @@ impl UpstreamManager {
         };
 
         let rx = tx.subscribe();
-
         {
             let mut conns = self.connections.write().await;
             // Double-check: another task may have created it while we awaited
@@ -181,7 +187,7 @@ impl UpstreamManager {
         let task_ctx = ReaderTaskContext {
             key: key.clone(),
             endpoint_url: endpoint.endpoint,
-            sequencer_did: sequencer_did.to_string(),
+            sequencer_did: canonical_sequencer.to_string(),
             convo_id: convo_id.to_string(),
             auth: self.auth.clone(),
             http: self.http.clone(),
@@ -855,5 +861,58 @@ mod tests {
             conns.contains_key(&key),
             "Entry still present before grace period"
         );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_subscribe_denies_untrusted_peer_before_resolution() {
+        let database_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                eprintln!("Skipping upstream peer policy test: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
+        let http_client = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http_client,
+            "did:web:local.test".to_string(),
+            "https://local.test".to_string(),
+            None,
+            300,
+        ));
+        let auth = Arc::new(ServiceAuthClient::from_shared_secret(
+            "did:web:local.test".into(),
+            b"test-secret",
+        ));
+        let manager = UpstreamManager::new(
+            pool,
+            resolver,
+            auth,
+            "did:web:local.test".to_string(),
+            "https://local.test".to_string(),
+            CancellationToken::new(),
+            100,
+        );
+
+        // Subscribing to an unallowlisted peer must fail with AuthFailed before resolution or network
+        let result = manager
+            .subscribe("convo-1", "did:web:unknown-peer.example.com", None)
+            .await;
+        assert!(result.is_err(), "subscribe must fail for unallowlisted peer");
+        match result.unwrap_err() {
+            FederationError::AuthFailed { reason } => {
+                assert!(
+                    reason.contains("not allowlisted") || reason.contains("Peer DS"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
     }
 }

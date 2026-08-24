@@ -721,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
         http_client.clone(),
         fed_config.self_did.clone(),
         fed_config.self_endpoint.clone(),
-        fed_config.default_ds_endpoint.clone(),
+        fed_config.default_ds.clone(),
         fed_config.endpoint_cache_ttl_secs,
     ));
 
@@ -777,6 +777,7 @@ async fn main() -> anyhow::Result<()> {
     let outbound_queue = Arc::new(federation::queue::OutboundQueue::new(
         db_pool.clone(),
         auth::AuthMiddleware::new(),
+        resolver.clone(),
     ));
 
     // Receipt issuance has its own key and fixed DID verification method.
@@ -857,6 +858,7 @@ async fn main() -> anyhow::Result<()> {
     let upstream_manager = if fed_config.enabled && ws_proxy_enabled {
         if let Some(ref auth) = service_auth {
             let manager = federation::UpstreamManager::new(
+                db_pool.clone(),
                 resolver.clone(),
                 auth.clone(),
                 fed_config.self_did.clone(),

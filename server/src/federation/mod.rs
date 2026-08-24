@@ -18,7 +18,7 @@ pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue
 pub use errors::FederationError;
 pub use mailbox::FederatedBackend;
 pub use receipt::*;
-pub use resolver::DsResolver;
+pub use resolver::{DsEndpoint, DsResolver};
 pub use sequencer::{CommitResult, Sequencer};
 pub use service_auth::ServiceAuthClient;
 use std::collections::BTreeSet;
@@ -278,8 +278,9 @@ pub struct FederationConfig {
     /// Issue mode validates this document against both configured signing
     /// keys before startup can complete.
     pub receipt_did_document_json: Option<String>,
-    /// Fallback DS endpoint for users without a `blue.catbird.chat.profile` record.
-    pub default_ds_endpoint: Option<String>,
+    /// Explicit fallback DS pair (DID, URL) for actors without a declaration or profile record.
+    /// Configured only when both DEFAULT_DS_DID and DEFAULT_DS_ENDPOINT are present and valid.
+    pub default_ds: Option<(String, String)>,
     pub endpoint_cache_ttl_secs: u64,
     pub outbound_timeout_secs: u64,
     pub outbound_connect_timeout_secs: u64,
@@ -318,7 +319,28 @@ impl FederationConfig {
             receipt_signing_key_pem: std::env::var("RECEIPT_SIGNING_KEY_PEM").ok(),
             receipt_verification_method: std::env::var("RECEIPT_VERIFICATION_METHOD").ok(),
             receipt_did_document_json: std::env::var("RECEIPT_DID_DOCUMENT_JSON").ok(),
-            default_ds_endpoint: std::env::var("DEFAULT_DS_ENDPOINT").ok(),
+            default_ds: {
+                let did_opt = std::env::var("DEFAULT_DS_DID").ok().filter(|v| !v.trim().is_empty());
+                let ep_opt = std::env::var("DEFAULT_DS_ENDPOINT").ok().filter(|v| !v.trim().is_empty());
+                match (did_opt, ep_opt) {
+                    (Some(did), Some(endpoint)) => {
+                        let valid_did = crate::federation::resolver::validate_canonical_did(&did).unwrap_or_else(|e| {
+                            panic!("Invalid DEFAULT_DS_DID configuration '{did}': {e}");
+                        });
+                        let _valid_endpoint = crate::federation::resolver::validate_endpoint_url(&endpoint).unwrap_or_else(|e| {
+                            panic!("Invalid DEFAULT_DS_ENDPOINT configuration '{endpoint}': {e}");
+                        });
+                        Some((valid_did, endpoint))
+                    }
+                    (None, None) => None,
+                    (Some(did), None) => {
+                        panic!("DEFAULT_DS_DID was set ('{did}') but DEFAULT_DS_ENDPOINT was missing. Both must be set or neither.");
+                    }
+                    (None, Some(endpoint)) => {
+                        panic!("DEFAULT_DS_ENDPOINT was set ('{endpoint}') but DEFAULT_DS_DID was missing. Both must be set or neither.");
+                    }
+                }
+            },
             endpoint_cache_ttl_secs: std::env::var("ENDPOINT_CACHE_TTL")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -332,5 +354,13 @@ impl FederationConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
         }
+    }
+
+    pub fn default_ds_did(&self) -> Option<&str> {
+        self.default_ds.as_ref().map(|(did, _)| did.as_str())
+    }
+
+    pub fn default_ds_endpoint(&self) -> Option<&str> {
+        self.default_ds.as_ref().map(|(_, ep)| ep.as_str())
     }
 }

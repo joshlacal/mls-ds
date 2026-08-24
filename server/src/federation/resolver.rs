@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::future::Future;
@@ -6,11 +6,13 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use super::errors::FederationError;
-use crate::identity::{canonical_did, did_web_document_url};
+use crate::identity::{canonical_did, did_web_document_url, did_web_service_endpoint};
 use crate::util::outbound_body::{
     decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES, PROFILE_OR_DEVICE_MAX_BYTES,
 };
 
+const DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
+const DECLARATION_RKEY: &str = "self";
 const PROFILE_COLLECTION: &str = "blue.catbird.chat.profile";
 const PROFILE_RKEY: &str = "self";
 const AUTHORITY_PAGE_SIZE: usize = 100;
@@ -18,16 +20,244 @@ const AUTHORITY_PAGE_SIZE_PARAM: &str = "100";
 const MAX_AUTHORITY_PAGES: usize = 10;
 const MAX_AUTHORITY_RECORDS: usize = AUTHORITY_PAGE_SIZE * MAX_AUTHORITY_PAGES;
 
-fn profile_record_url(pds_endpoint: &str, user_did: &str) -> String {
+fn repo_record_url(pds_endpoint: &str, user_did: &str, collection: &str, rkey: &str) -> String {
     format!(
-        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={PROFILE_COLLECTION}&rkey={PROFILE_RKEY}",
-        pds_endpoint,
-        urlencoding::encode(user_did)
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+        pds_endpoint.trim_end_matches('/'),
+        urlencoding::encode(user_did),
+        urlencoding::encode(collection),
+        urlencoding::encode(rkey)
     )
 }
 
+fn profile_record_url(pds_endpoint: &str, user_did: &str) -> String {
+    repo_record_url(pds_endpoint, user_did, PROFILE_COLLECTION, PROFILE_RKEY)
+}
+
+fn declaration_record_url(pds_endpoint: &str, user_did: &str) -> String {
+    repo_record_url(
+        pds_endpoint,
+        user_did,
+        DECLARATION_COLLECTION,
+        DECLARATION_RKEY,
+    )
+}
+
+/// Validate a canonical DID identifier according to ATProto and federation rules.
+///
+/// Rules:
+/// 1. Must be non-empty, trimmed, with no whitespace or fragment (`#`).
+/// 2. Must not have trailing colon (`:`).
+/// 3. Must parse via ATProto parser (`jacquard_common::types::string::Did`).
+/// 4. Supported DID methods: exact `did:plc:` and hostname-level `did:web:`.
+/// 5. `did:plc:` must have exactly 24 lowercase base32 characters (`did:plc:[a-z2-7]{24}`).
+/// 6. `did:web:` must be hostname-level only (no path segments).
+///    - No public port in production; development port on localhost allowed only under APP_ENV=test.
+///    - Hostname must be valid with no special or malformed characters.
+/// 7. Canonical round-trip must match: `canonical_did(raw) == raw`.
+pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
+    if raw.is_empty() || raw.trim() != raw || raw.chars().any(char::is_whitespace) {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("DID cannot contain whitespace or be empty: '{raw}'"),
+        });
+    }
+
+    if raw.contains('#') {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("DID must be a base DID without fragment: '{raw}'"),
+        });
+    }
+
+    if raw.ends_with(':') {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("DID cannot have trailing colon: '{raw}'"),
+        });
+    }
+
+    // 1. ATProto DID parser check
+    let _parsed = jacquard_common::types::string::Did::new(raw).map_err(|e| {
+        FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("Invalid ATProto DID syntax: {e}"),
+        }
+    })?;
+
+    // 2. Exact did:plc validation
+    if let Some(plc_suffix) = raw.strip_prefix("did:plc:") {
+        if plc_suffix.len() != 24 || !plc_suffix.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("Invalid did:plc format: '{raw}'"),
+            });
+        }
+        return Ok(raw.to_string());
+    }
+
+    // 3. Hostname-level did:web validation
+    if let Some(_web_suffix) = raw.strip_prefix("did:web:") {
+        if let Some((host_port, path_segments)) = crate::identity::parse_did_web(raw) {
+            if !path_segments.is_empty() {
+                return Err(FederationError::ResolutionFailed {
+                    did: raw.to_string(),
+                    reason: format!("did:web with path segments is not allowed: '{raw}'"),
+                });
+            }
+
+            let (host, port_opt) = if let Some((h, p_str)) = host_port.split_once(':') {
+                let p = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
+                    did: raw.to_string(),
+                    reason: format!("Invalid port in did:web: '{raw}'"),
+                })?;
+                if p == 0 {
+                    return Err(FederationError::ResolutionFailed {
+                        did: raw.to_string(),
+                        reason: format!("Zero port in did:web: '{raw}'"),
+                    });
+                }
+                (h, Some(p))
+            } else {
+                (host_port.as_str(), None)
+            };
+
+            let is_app_env_test = std::env::var("APP_ENV")
+                .map(|v| v.eq_ignore_ascii_case("test"))
+                .unwrap_or(false);
+            let is_localhost = host.eq_ignore_ascii_case("localhost")
+                || host == "127.0.0.1"
+                || host.to_ascii_lowercase().ends_with(".localhost");
+
+            // Port in did:web is rejected in production; allowed only on localhost in test mode
+            if port_opt.is_some() {
+                if !(is_app_env_test && allow_insecure_http() && is_localhost) {
+                    return Err(FederationError::ResolutionFailed {
+                        did: raw.to_string(),
+                        reason: format!("Port in did:web is only allowed for localhost in test environment: '{raw}'"),
+                    });
+                }
+            }
+
+            // Validate host
+            if host.is_empty()
+                || host.contains('/')
+                || host.contains('\\')
+                || host.contains('@')
+                || host.contains('%')
+            {
+                return Err(FederationError::ResolutionFailed {
+                    did: raw.to_string(),
+                    reason: format!("Invalid host in did:web: '{raw}'"),
+                });
+            }
+
+            let canonical = crate::identity::canonical_did(raw);
+            if canonical != raw {
+                return Err(FederationError::ResolutionFailed {
+                    did: raw.to_string(),
+                    reason: format!("did:web not in canonical form: '{raw}'"),
+                });
+            }
+
+            return Ok(canonical.to_string());
+        } else {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("Could not parse did:web: '{raw}'"),
+            });
+        }
+    }
+
+    Err(FederationError::ResolutionFailed {
+        did: raw.to_string(),
+        reason: format!("Unsupported DID method: '{raw}'"),
+    })
+}
+
+/// Validate a declaration record's `deliveryService` field.
+pub fn validate_declaration_delivery_service(raw: &str) -> Result<String, FederationError> {
+    validate_canonical_did(raw)
+}
+
+/// Validate a `blue.catbird.chat.declaration` record value object.
+///
+/// Returns `(canonical_delivery_service_did, allow_incoming)` on success.
+pub fn validate_declaration_record_value(
+    value: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(String, String), FederationError> {
+    // 1. Exact $type: bare NSID only
+    let record_type = value
+        .get("$type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: "Declaration record missing $type".to_string(),
+        })?;
+    if record_type != "blue.catbird.chat.declaration" {
+        return Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: format!(
+                "Declaration record invalid $type: '{record_type}' (expected exact 'blue.catbird.chat.declaration')"
+            ),
+        });
+    }
+
+    // 2. protocolVersion == "1"
+    let protocol_version = value
+        .get("protocolVersion")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: "Declaration record missing protocolVersion".to_string(),
+        })?;
+    if protocol_version != "1" {
+        return Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: format!("Unsupported declaration protocolVersion: '{protocol_version}'"),
+        });
+    }
+
+    // 3. createdAt RFC3339 datetime
+    let created_at = value
+        .get("createdAt")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: "Declaration record missing createdAt".to_string(),
+        })?;
+    if chrono::DateTime::parse_from_rfc3339(created_at).is_err() {
+        return Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: format!("Declaration record invalid RFC3339 createdAt: '{created_at}'"),
+        });
+    }
+
+    // 4. allowIncoming required field (schema verification only, not routing authz)
+    let allow_incoming = value
+        .get("allowIncoming")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: "Declaration record missing allowIncoming".to_string(),
+        })?;
+
+    // 5. deliveryService base DID
+    let delivery_service_raw = value
+        .get("deliveryService")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: "Declaration record missing deliveryService".to_string(),
+        })?;
+
+    let canonical_ds_did = validate_declaration_delivery_service(delivery_service_raw)?;
+
+    Ok((canonical_ds_did, allow_incoming.to_string()))
+}
+
 /// Cached DS endpoint information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsEndpoint {
     pub did: String,
     pub endpoint: String,
@@ -42,7 +272,8 @@ pub struct DsResolver {
     http: reqwest::Client,
     self_did: String,
     self_endpoint: String,
-    default_ds: Option<String>,
+    default_ds_did: Option<String>,
+    default_ds_endpoint: Option<String>,
     cache_ttl_secs: i64,
 }
 
@@ -52,17 +283,60 @@ impl DsResolver {
         http: reqwest::Client,
         self_did: String,
         self_endpoint: String,
-        default_ds: Option<String>,
+        default_ds: Option<(String, String)>,
         cache_ttl_secs: u64,
     ) -> Self {
+        let (resolved_default_did, resolved_default_endpoint) = match default_ds {
+            Some((did, ep)) => (Some(canonical_did(&did).to_string()), Some(ep)),
+            None => (None, None),
+        };
+
         Self {
             pool,
             http,
             self_did,
             self_endpoint,
-            default_ds,
+            default_ds_did: resolved_default_did,
+            default_ds_endpoint: resolved_default_endpoint,
             cache_ttl_secs: cache_ttl_secs as i64,
         }
+    }
+
+    pub fn with_defaults(
+        pool: PgPool,
+        http: reqwest::Client,
+        self_did: String,
+        self_endpoint: String,
+        default_ds_did: Option<String>,
+        default_ds_endpoint: Option<String>,
+        cache_ttl_secs: u64,
+    ) -> Self {
+        let default_ds = match (default_ds_did, default_ds_endpoint) {
+            (Some(did), Some(ep)) => Some((did, ep)),
+            (Some(did), None) => {
+                let ep = did_web_service_endpoint(&did).unwrap_or_else(|| format!("https://{did}"));
+                Some((did, ep))
+            }
+            (None, Some(ep)) => {
+                let derived = derive_ds_did_from_https_endpoint(&ep).unwrap_or_else(|| {
+                    let host = ep
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_end_matches('/');
+                    format!("did:web:{host}")
+                });
+                Some((derived, ep))
+            }
+            (None, None) => None,
+        };
+        Self::new(
+            pool,
+            http,
+            self_did,
+            self_endpoint,
+            default_ds,
+            cache_ttl_secs,
+        )
     }
 
     /// Check if a DID refers to this DS.
@@ -83,7 +357,8 @@ impl DsResolver {
     /// Resolve a user's DS endpoint.
     ///
     /// Ordering (ADR-010 D2): self → fresh cache → `#atproto_mls` DID-document
-    /// service entry → `blue.catbird.chat.profile` repo record →
+    /// service entry → `blue.catbird.chat.declaration` repo record →
+    /// `blue.catbird.chat.profile` legacy repo record →
     /// expired-cache degraded mode → default DS → not found.
     ///
     /// An unexpired cache row counts as "fresh resolution" (the TTL defines
@@ -131,26 +406,39 @@ impl DsResolver {
         // `#atproto_mls` service entry in the user's DID document (ADR-010 D1)
         match self.resolve_from_did_doc(user_did).await {
             Ok(endpoint) => {
-                if let Err(e) = self.cache_endpoint(&endpoint).await {
+                if let Err(e) = self.cache_mapping(user_did, &endpoint).await {
                     return (Err(e), "hard_failure");
                 }
                 return (Ok(endpoint), "did_doc");
             }
             Err(e) => {
-                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "DID-document #atproto_mls resolution failed, trying profile record");
+                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "DID-document #atproto_mls resolution failed, trying declaration record");
+            }
+        }
+
+        // Declaration record (blue.catbird.chat.declaration/self)
+        match self.resolve_from_declaration(user_did).await {
+            Ok(endpoint) => {
+                if let Err(e) = self.cache_mapping(user_did, &endpoint).await {
+                    return (Err(e), "hard_failure");
+                }
+                return (Ok(endpoint), "declaration");
+            }
+            Err(e) => {
+                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Declaration record resolution failed, trying legacy profile record");
             }
         }
 
         // Profile record fallback (blue.catbird.chat.profile)
         match self.resolve_from_repo(user_did).await {
             Ok(endpoint) => {
-                if let Err(e) = self.cache_endpoint(&endpoint).await {
+                if let Err(e) = self.cache_mapping(user_did, &endpoint).await {
                     return (Err(e), "hard_failure");
                 }
                 return (Ok(endpoint), "profile_record");
             }
             Err(e) => {
-                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Repo resolution failed, trying fallback");
+                debug!(did = %crate::crypto::redact_for_log(user_did), error = %e, "Repo profile resolution failed, trying fallback");
             }
         }
 
@@ -172,17 +460,18 @@ impl DsResolver {
             }
         }
 
-        // Fallback to default DS
-        if let Some(ref default) = self.default_ds {
+        // Fallback to default DS (ACTOR default ONLY)
+        if let (Some(default_did), Some(default_ep)) = (&self.default_ds_did, &self.default_ds_endpoint) {
             info!(
                 did = %crate::crypto::redact_for_log(user_did),
-                default_ds = default,
-                "Using default DS fallback"
+                default_ds_did = %default_did,
+                default_ds_endpoint = %default_ep,
+                "Using default DS fallback for actor"
             );
             return (
                 Ok(DsEndpoint {
-                    did: user_did.to_string(),
-                    endpoint: default.clone(),
+                    did: default_did.clone(),
+                    endpoint: default_ep.clone(),
                     supported_cipher_suites: None,
                     federation_capabilities: None,
                 }),
@@ -211,12 +500,100 @@ impl DsResolver {
         results
     }
 
-    async fn get_cached(&self, did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+    /// Resolve a DS DID directly to a DS endpoint without default fallback.
+    ///
+    /// Required by reconciliation, upstream, and outbound retry queue.
+    /// Returns an error if the DS DID cannot be resolved.
+    pub async fn resolve_ds_did(&self, ds_did: &str) -> Result<DsEndpoint, FederationError> {
+        let canonical = canonical_did(ds_did);
+        if canonical.is_empty() {
+            return Err(FederationError::ResolutionFailed {
+                did: ds_did.to_string(),
+                reason: "Empty DS DID".to_string(),
+            });
+        }
+
+        // 1. Self check
+        if self.is_self(canonical) {
+            return Ok(DsEndpoint {
+                did: self.self_did.clone(),
+                endpoint: self.self_endpoint.clone(),
+                supported_cipher_suites: None,
+                federation_capabilities: Some(super::local_federation_capabilities()),
+            });
+        }
+
+        // 2. Fresh cache check directly on ds_endpoints
+        if let Ok(Some(cached)) = self.get_cached_ds_endpoint(canonical).await {
+            if cached.did == canonical {
+                return Ok(cached);
+            }
+        }
+        // 3. Live resolution
+        let endpoint_url = self.resolve_ds_did_to_endpoint(canonical).await?;
+        let endpoint = DsEndpoint {
+            did: canonical.to_string(),
+            endpoint: endpoint_url,
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        };
+
+        // Cache in ds_endpoints
+        let _ = self.cache_endpoint(&endpoint).await;
+
+        Ok(endpoint)
+    }
+
+    /// Look up cached endpoint for an actor DID from did_ds_mappings joined with ds_endpoints.
+    async fn get_cached(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+        let canonical = canonical_did(actor_did);
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT e.did, e.endpoint, e.supported_cipher_suites \
+             FROM did_ds_mappings m \
+             JOIN ds_endpoints e ON m.ds_did = e.did \
+             WHERE m.actor_did = $1 AND m.expires_at > NOW() AND e.expires_at > NOW()",
+        )
+        .bind(&canonical)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(ds_did, endpoint, suites)| DsEndpoint {
+            did: ds_did,
+            endpoint,
+            supported_cipher_suites: suites.and_then(|s| serde_json::from_str(&s).ok()),
+            federation_capabilities: None,
+        }))
+    }
+
+    /// Look up degraded cached endpoint for an actor DID ignoring expires_at.
+    async fn get_cached_any(&self, actor_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+        let canonical = canonical_did(actor_did);
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT e.did, e.endpoint, e.supported_cipher_suites \
+             FROM did_ds_mappings m \
+             JOIN ds_endpoints e ON m.ds_did = e.did \
+             WHERE m.actor_did = $1",
+        )
+        .bind(&canonical)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(ds_did, endpoint, suites)| DsEndpoint {
+            did: ds_did,
+            endpoint,
+            supported_cipher_suites: suites.and_then(|s| serde_json::from_str(&s).ok()),
+            federation_capabilities: None,
+        }))
+    }
+
+    /// Look up cached endpoint directly from ds_endpoints by target DS DID.
+    pub(crate) async fn get_cached_ds_endpoint(&self, ds_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+        let canonical = canonical_did(ds_did);
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
-       FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
+             FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
         )
-        .bind(did)
+        .bind(&canonical)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -228,15 +605,14 @@ impl DsResolver {
         }))
     }
 
-    /// Like [`Self::get_cached`], but ignores `expires_at`. Used only for the
-    /// degraded-mode fallback after all live resolution paths have failed
-    /// (ADR-010 D2).
-    async fn get_cached_any(&self, did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+    /// Look up degraded cached endpoint directly from ds_endpoints by target DS DID.
+    pub(crate) async fn get_cached_ds_endpoint_any(&self, ds_did: &str) -> Result<Option<DsEndpoint>, FederationError> {
+        let canonical = canonical_did(ds_did);
         let row = sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT did, endpoint, supported_cipher_suites \
-       FROM ds_endpoints WHERE did = $1",
+             FROM ds_endpoints WHERE did = $1",
         )
-        .bind(did)
+        .bind(&canonical)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -248,27 +624,75 @@ impl DsResolver {
         }))
     }
 
-    async fn cache_endpoint(&self, endpoint: &DsEndpoint) -> Result<(), FederationError> {
+    pub async fn cache_mapping(
+        &self,
+        actor_did: &str,
+        endpoint: &DsEndpoint,
+    ) -> Result<(), FederationError> {
+        let canonical_actor = canonical_did(actor_did);
+        let canonical_ds = canonical_did(&endpoint.did);
+        let suites_json = endpoint
+            .supported_cipher_suites
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+
+        // 1. Insert/update ds_endpoints
+        sqlx::query(
+            "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
+             VALUES ($1, $2, $3, NOW(), NOW() + make_interval(secs => $4)) \
+             ON CONFLICT (did) DO UPDATE SET \
+               endpoint = $2, \
+               supported_cipher_suites = $3, \
+               resolved_at = NOW(), \
+               expires_at = NOW() + make_interval(secs => $4)",
+        )
+        .bind(&canonical_ds)
+        .bind(&endpoint.endpoint)
+        .bind(&suites_json)
+        .bind(self.cache_ttl_secs as f64)
+        .execute(&self.pool)
+        .await?;
+
+        // 2. Insert/update did_ds_mappings
+        sqlx::query(
+            "INSERT INTO did_ds_mappings (actor_did, ds_did, resolved_at, expires_at) \
+             VALUES ($1, $2, NOW(), NOW() + make_interval(secs => $3)) \
+             ON CONFLICT (actor_did) DO UPDATE SET \
+               ds_did = $2, \
+               resolved_at = NOW(), \
+               expires_at = NOW() + make_interval(secs => $3)",
+        )
+        .bind(&canonical_actor)
+        .bind(&canonical_ds)
+        .bind(self.cache_ttl_secs as f64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn cache_endpoint(&self, endpoint: &DsEndpoint) -> Result<(), FederationError> {
+        let canonical_ds = canonical_did(&endpoint.did);
         let suites_json = endpoint
             .supported_cipher_suites
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
 
         sqlx::query(
-      "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
-       VALUES ($1, $2, $3, NOW(), NOW() + make_interval(secs => $4)) \
-       ON CONFLICT (did) DO UPDATE SET \
-         endpoint = $2, \
-         supported_cipher_suites = $3, \
-         resolved_at = NOW(), \
-         expires_at = NOW() + make_interval(secs => $4)",
-    )
-    .bind(&endpoint.did)
-    .bind(&endpoint.endpoint)
-    .bind(&suites_json)
-    .bind(self.cache_ttl_secs as f64)
-    .execute(&self.pool)
-    .await?;
+            "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
+             VALUES ($1, $2, $3, NOW(), NOW() + make_interval(secs => $4)) \
+             ON CONFLICT (did) DO UPDATE SET \
+               endpoint = $2, \
+               supported_cipher_suites = $3, \
+               resolved_at = NOW(), \
+               expires_at = NOW() + make_interval(secs => $4)",
+        )
+        .bind(&canonical_ds)
+        .bind(&endpoint.endpoint)
+        .bind(&suites_json)
+        .bind(self.cache_ttl_secs as f64)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -292,15 +716,11 @@ impl DsResolver {
 
         self.validate_remote_url(&endpoint).await?;
 
-        // D1 rules 4-6: record the *base* DS DID (no fragment). The user's
-        // DID doc only carries the endpoint, so derive `did:web:<host>` for
-        // did:web-style deployments. Serving the DS DID document from mls-ds
-        // itself is ADR-010 Stage 4; non-did:web DSes are out of scope until
-        // then. When derivation fails (path components, non-HTTPS), fall back
-        // to keying the cache row by the *user* DID, exactly as the legacy
-        // profile-record path does.
-        let ds_did =
-            derive_ds_did_from_https_endpoint(&endpoint).unwrap_or_else(|| user_did.to_string());
+        let ds_did = derive_ds_did_from_https_endpoint(&endpoint)
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: user_did.to_string(),
+                reason: format!("Could not derive DS DID from endpoint '{endpoint}'"),
+            })?;
 
         Ok(DsEndpoint {
             did: ds_did,
@@ -310,15 +730,19 @@ impl DsResolver {
         })
     }
 
-    /// Resolve DS endpoint from the user's repo record (blue.catbird.chat.profile).
-    async fn resolve_from_repo(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
-        let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
-
-        let profile_url = profile_record_url(&pds_endpoint, user_did);
-        let deadline = checked_outbound_deadline(user_did, Duration::from_secs(10))?;
-
-        let resp = send_resolution_request(
-            self.http.get(&profile_url),
+    /// Fetch a bounded repo record from the user's PDS.
+    pub(crate) async fn fetch_repo_record(
+        &self,
+        pds_endpoint: &str,
+        user_did: &str,
+        collection: &str,
+        rkey: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<serde_json::Value, FederationError> {
+        let url = repo_record_url(pds_endpoint, user_did, collection, rkey);
+        let dest = validate_and_resolve_destination(&url, None).await?;
+        let resp = send_hardened_resolution_request(
+            &dest,
             deadline,
             user_did,
             "HTTP request failed",
@@ -328,18 +752,140 @@ impl DsResolver {
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
                 did: user_did.to_string(),
-                reason: format!("PDS returned status {}", resp.status()),
+                reason: format!(
+                    "PDS returned status {} for record {collection}/{rkey}",
+                    resp.status()
+                ),
             });
         }
 
-        let body: serde_json::Value = decode_resolution_json(
+        decode_resolution_json(
             resp,
             PROFILE_OR_DEVICE_MAX_BYTES,
             deadline,
             user_did,
             "Invalid JSON response",
         )
-        .await?;
+        .await
+    }
+
+    /// Convert a declared DS DID into an SSRF-validated endpoint without recursive actor mapping.
+    pub(crate) async fn resolve_ds_did_to_endpoint(
+        &self,
+        ds_did: &str,
+    ) -> Result<String, FederationError> {
+        if self.is_self(ds_did) {
+            return Ok(self.self_endpoint.clone());
+        }
+
+        let canonical_ds = canonical_did(ds_did);
+        if !canonical_ds.starts_with("did:web:") && !canonical_ds.starts_with("did:plc:") {
+            return Err(FederationError::ResolutionFailed {
+                did: ds_did.to_string(),
+                reason: format!("Unsupported DS DID method: '{ds_did}'"),
+            });
+        }
+
+        // If did:web, validate host/port
+        if let Some((host_port, _)) = crate::identity::parse_did_web(&canonical_ds) {
+            if let Some((_, p_str)) = host_port.split_once(':') {
+                let port = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
+                    did: ds_did.to_string(),
+                    reason: format!("Invalid port in did:web: '{ds_did}'"),
+                })?;
+                if port == 0 {
+                    return Err(FederationError::ResolutionFailed {
+                        did: ds_did.to_string(),
+                        reason: format!("Zero port in did:web: '{ds_did}'"),
+                    });
+                }
+            }
+        }
+
+        // Try resolving the DS's DID document for #atproto_mls service (exact type AtprotoMLSDeliveryService only)
+        if let Ok(doc) = self.fetch_did_document(&canonical_ds).await {
+            if let Some(endpoint) =
+                extract_service(&doc, "atproto_mls", Some("AtprotoMLSDeliveryService"))
+            {
+                self.validate_remote_url(endpoint).await?;
+                return Ok(endpoint.to_string());
+            }
+        }
+
+        // Fall back to direct did:web service endpoint derivation
+        if let Some(derived) = did_web_service_endpoint(&canonical_ds) {
+            self.validate_remote_url(&derived).await?;
+            return Ok(derived);
+        }
+
+        Err(FederationError::ResolutionFailed {
+            did: ds_did.to_string(),
+            reason: format!("Could not resolve DS DID {ds_did} to an HTTPS endpoint"),
+        })
+    }
+
+    /// Resolve DS endpoint from the user's declaration record (blue.catbird.chat.declaration).
+    async fn resolve_from_declaration(
+        &self,
+        user_did: &str,
+    ) -> Result<DsEndpoint, FederationError> {
+        let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
+        let deadline = checked_outbound_deadline(user_did, Duration::from_secs(10))?;
+
+        let body = self
+            .fetch_repo_record(
+                &pds_endpoint,
+                user_did,
+                DECLARATION_COLLECTION,
+                DECLARATION_RKEY,
+                deadline,
+            )
+            .await?;
+
+        let value = body
+            .get("value")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| FederationError::ResolutionFailed {
+                did: user_did.to_string(),
+                reason: "No 'value' object in declaration response".to_string(),
+            })?;
+
+        let (canonical_ds_did, _allow_incoming) = validate_declaration_record_value(value)
+            .map_err(|e| match e {
+                FederationError::ResolutionFailed { reason, .. } => {
+                    FederationError::ResolutionFailed {
+                        did: user_did.to_string(),
+                        reason,
+                    }
+                }
+                other => other,
+            })?;
+
+        // Convert declared DS DID to SSRF-validated endpoint without recursive actor mapping
+        let endpoint = self.resolve_ds_did_to_endpoint(&canonical_ds_did).await?;
+
+        Ok(DsEndpoint {
+            did: canonical_ds_did,
+            endpoint,
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        })
+    }
+
+    /// Resolve DS endpoint from the user's legacy profile record (blue.catbird.chat.profile).
+    async fn resolve_from_repo(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
+        let pds_endpoint = self.resolve_did_to_pds(user_did).await?;
+        let deadline = checked_outbound_deadline(user_did, Duration::from_secs(10))?;
+
+        let body = self
+            .fetch_repo_record(
+                &pds_endpoint,
+                user_did,
+                PROFILE_COLLECTION,
+                PROFILE_RKEY,
+                deadline,
+            )
+            .await?;
 
         let value = body
             .get("value")
@@ -356,7 +902,19 @@ impl DsResolver {
                 reason: "No 'deliveryService' in profile record".to_string(),
             })?;
 
-        self.validate_remote_url(delivery_service).await?;
+        let (ds_did, endpoint_url) = if delivery_service.starts_with("did:") {
+            let canonical = canonical_did(delivery_service).to_string();
+            let ep = self.resolve_ds_did_to_endpoint(&canonical).await?;
+            (canonical, ep)
+        } else {
+            self.validate_remote_url(delivery_service).await?;
+            let derived = derive_ds_did_from_https_endpoint(delivery_service)
+                .ok_or_else(|| FederationError::ResolutionFailed {
+                    did: user_did.to_string(),
+                    reason: format!("Could not derive DS DID from endpoint '{delivery_service}'"),
+                })?;
+            (derived, delivery_service.to_string())
+        };
 
         let suites = value
             .get("supportedCipherSuites")
@@ -371,8 +929,8 @@ impl DsResolver {
                 .or_else(|| super::parse_capabilities_from_json_array(value.get("capabilities")));
 
         Ok(DsEndpoint {
-            did: user_did.to_string(),
-            endpoint: delivery_service.to_string(),
+            did: ds_did,
+            endpoint: endpoint_url,
             supported_cipher_suites: suites,
             federation_capabilities,
         })
@@ -410,11 +968,11 @@ impl DsResolver {
             });
         };
 
-        self.validate_remote_url(&did_doc_url).await?;
+        let dest = validate_and_resolve_destination(&did_doc_url, None).await?;
         let deadline = checked_outbound_deadline(did, Duration::from_secs(10))?;
 
-        let resp = send_resolution_request(
-            self.http.get(&did_doc_url),
+        let resp = send_hardened_resolution_request(
+            &dest,
             deadline,
             did,
             "DID resolution HTTP error",
@@ -502,26 +1060,36 @@ impl DsResolver {
         })?
     }
 
-    /// Invalidate cache entry for a DID.
+    /// Invalidate cache entry for a DID (actor DID or DS DID).
     pub async fn invalidate(&self, did: &str) -> Result<(), FederationError> {
+        let canonical = canonical_did(did);
+        sqlx::query("DELETE FROM did_ds_mappings WHERE actor_did = $1 OR ds_did = $1")
+            .bind(&canonical)
+            .execute(&self.pool)
+            .await?;
         sqlx::query("DELETE FROM ds_endpoints WHERE did = $1")
-            .bind(did)
+            .bind(&canonical)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// Clean up expired cache entries.
+    /// Clean up expired cache entries from both mappings and endpoints tables.
     pub async fn cleanup_expired(&self) -> Result<u64, FederationError> {
-        let result = sqlx::query("DELETE FROM ds_endpoints WHERE expires_at < NOW()")
+        let mut deleted = 0;
+        let r1 = sqlx::query("DELETE FROM did_ds_mappings WHERE expires_at < NOW()")
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected())
+        deleted += r1.rows_affected();
+        let r2 = sqlx::query("DELETE FROM ds_endpoints WHERE expires_at < NOW()")
+            .execute(&self.pool)
+            .await?;
+        deleted += r2.rows_affected();
+        Ok(deleted)
     }
 
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
-        let parsed = validate_endpoint_url(url_str)?;
-        validate_resolved_host_is_public(&parsed).await
+        validate_and_resolve_destination(url_str, None).await.map(|_| ())
     }
 }
 
@@ -733,10 +1301,8 @@ fn extract_service<'a>(
 /// `https://ds.example.com` → `did:web:ds.example.com`;
 /// `https://ds.example.com:8443` → `did:web:ds.example.com%3A8443` (did:web
 /// percent-encodes the port colon). Hosts are lowercased. Endpoints with path
-/// components or non-HTTPS schemes return `None` — the caller then falls back
-/// to legacy user-DID cache keying. Authoritative DS-DID discovery from the
-/// mls-ds served well-known DID document is ADR-010 Stage 4; non-did:web DSes
-/// are out of scope until then.
+/// components or non-HTTPS schemes return `None` — the caller then fails
+/// resolution rather than substituting an actor DID.
 fn derive_ds_did_from_https_endpoint(endpoint: &str) -> Option<String> {
     let parsed = url::Url::parse(endpoint).ok()?;
     if parsed.scheme() != "https" {
@@ -778,7 +1344,7 @@ fn allow_insecure_http() -> bool {
         .unwrap_or(false)
 }
 
-static FEDERATION_HOST_ALLOWLIST: Lazy<Option<Vec<String>>> = Lazy::new(|| {
+static FEDERATION_HOST_ALLOWLIST: LazyLock<Option<Vec<String>>> = LazyLock::new(|| {
     std::env::var("FEDERATION_OUTBOUND_HOST_ALLOWLIST")
         .ok()
         .map(|raw| {
@@ -806,14 +1372,30 @@ fn host_is_allowlisted(host: &str, allowlist: &[String]) -> bool {
         .any(|allowed| host_lc == *allowed || host_lc.ends_with(&format!(".{allowed}")))
 }
 
-/// Validate a DS endpoint URL for SSRF protection.
-pub(crate) fn validate_endpoint_url(url_str: &str) -> Result<url::Url, FederationError> {
-    validate_endpoint_url_with_policy(url_str, allow_insecure_http())
+#[derive(Debug, Clone)]
+pub struct ValidatedRemoteDestination {
+    pub url: url::Url,
+    pub host: String,
+    pub addrs: Vec<std::net::SocketAddr>,
 }
 
-fn validate_endpoint_url_with_policy(
+/// Validate a DS endpoint URL for SSRF protection with optional injected allowlist.
+pub(crate) fn validate_endpoint_url_with_allowlist(
     url_str: &str,
     allow_http: bool,
+    allowlist: Option<&[String]>,
+) -> Result<url::Url, FederationError> {
+    let is_app_env_test = std::env::var("APP_ENV")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+    validate_endpoint_url_with_custom_policy(url_str, allow_http, allowlist, is_app_env_test)
+}
+
+pub(crate) fn validate_endpoint_url_with_custom_policy(
+    url_str: &str,
+    allow_http: bool,
+    allowlist: Option<&[String]>,
+    is_app_env_test: bool,
 ) -> Result<url::Url, FederationError> {
     let parsed = url::Url::parse(url_str).map_err(|e| FederationError::ResolutionFailed {
         did: String::new(),
@@ -825,7 +1407,7 @@ fn validate_endpoint_url_with_policy(
             did: String::new(),
             reason: if parsed.scheme() == "http" {
                 "HTTP federation endpoint rejected; set FEDERATION_ALLOW_INSECURE_HTTP=true only in trusted development"
-          .to_string()
+                    .to_string()
             } else {
                 format!("URL scheme must be https, got {}", parsed.scheme())
             },
@@ -834,36 +1416,39 @@ fn validate_endpoint_url_with_policy(
 
     if let Some(host) = parsed.host_str() {
         let host_lc = host.to_ascii_lowercase();
+
+        // 1. Hostname allowlist check if configured
+        let effective_allowlist = allowlist.or_else(|| FEDERATION_HOST_ALLOWLIST.as_deref());
+        if let Some(allowed) = effective_allowlist {
+            if !host_is_allowlisted(host, allowed) {
+                return Err(FederationError::ResolutionFailed {
+                    did: String::new(),
+                    reason: format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"),
+                });
+            }
+        }
+
         let blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"];
         if blocked.contains(&host_lc.as_str()) || host_lc.ends_with(".localhost") {
-            return Err(FederationError::ResolutionFailed {
-                did: String::new(),
-                reason: format!("Blocked private address: {host}"),
-            });
+            if !(is_app_env_test && allow_http) {
+                return Err(FederationError::ResolutionFailed {
+                    did: String::new(),
+                    reason: format!("Blocked private address: {host}"),
+                });
+            }
         }
-        // IPv6 hosts are returned by `host_str()` as bracketed
-        // strings (e.g. `[::1]`), which do NOT parse as
-        // `std::net::IpAddr`. Use `parsed.host()` to access the typed
-        // host enum and inspect the IP variant directly. Without this
-        // path, `https://[::1]` slips through the SSRF check.
+
+        // IPv6 hosts are returned by `host_str()` as bracketed strings (e.g. `[::1]`)
         let typed_ip: Option<std::net::IpAddr> = match parsed.host() {
             Some(url::Host::Ipv4(v4)) => Some(std::net::IpAddr::V4(v4)),
             Some(url::Host::Ipv6(v6)) => Some(std::net::IpAddr::V6(v6)),
             _ => host.parse::<std::net::IpAddr>().ok(),
         };
         if let Some(ip) = typed_ip {
-            if is_private_ip(&ip) {
+            if is_private_ip(&ip) && !(is_app_env_test && allow_http) {
                 return Err(FederationError::ResolutionFailed {
                     did: String::new(),
                     reason: format!("Blocked non-global IP: {ip}"),
-                });
-            }
-        }
-        if let Some(allowlist) = FEDERATION_HOST_ALLOWLIST.as_ref() {
-            if !host_is_allowlisted(host, allowlist) {
-                return Err(FederationError::ResolutionFailed {
-                    did: String::new(),
-                    reason: format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"),
                 });
             }
         }
@@ -872,30 +1457,71 @@ fn validate_endpoint_url_with_policy(
     Ok(parsed)
 }
 
-pub(crate) async fn validate_resolved_host_is_public(
-    parsed: &url::Url,
-) -> Result<(), FederationError> {
-    let Some(host) = parsed.host_str() else {
-        return Err(FederationError::ResolutionFailed {
-            did: String::new(),
-            reason: "URL host is missing".to_string(),
-        });
-    };
+pub(crate) fn validate_endpoint_url_with_policy(
+    url_str: &str,
+    allow_http: bool,
+) -> Result<url::Url, FederationError> {
+    validate_endpoint_url_with_allowlist(url_str, allow_http, None)
+}
+
+pub(crate) fn validate_endpoint_url(url_str: &str) -> Result<url::Url, FederationError> {
+    validate_endpoint_url_with_allowlist(url_str, allow_insecure_http(), None)
+}
+
+pub(crate) async fn validate_and_resolve_destination(
+    url_str: &str,
+    allowlist: Option<&[String]>,
+) -> Result<ValidatedRemoteDestination, FederationError> {
+    let allow_http = allow_insecure_http();
+    let is_app_env_test = std::env::var("APP_ENV")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+    validate_and_resolve_destination_with_policy(url_str, allow_http, allowlist, is_app_env_test).await
+}
+
+pub(crate) async fn validate_and_resolve_destination_with_policy(
+    url_str: &str,
+    allow_http: bool,
+    allowlist: Option<&[String]>,
+    is_app_env_test: bool,
+) -> Result<ValidatedRemoteDestination, FederationError> {
+    let parsed = validate_endpoint_url_with_custom_policy(url_str, allow_http, allowlist, is_app_env_test)?;
+    let host = parsed.host_str().ok_or_else(|| FederationError::ResolutionFailed {
+        did: String::new(),
+        reason: "URL host is missing".to_string(),
+    })?.to_string();
+
+    let port = parsed.port_or_known_default().unwrap_or(if parsed.scheme() == "http" { 80 } else { 443 });
+
+    // Hostname allowlist check
+    let effective_allowlist = allowlist.or_else(|| FEDERATION_HOST_ALLOWLIST.as_deref());
+    if let Some(allowed) = effective_allowlist {
+        if !host_is_allowlisted(&host, allowed) {
+            return Err(FederationError::ResolutionFailed {
+                did: String::new(),
+                reason: format!("Host {host} is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"),
+            });
+        }
+    }
 
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(&ip) {
+        if is_private_ip(&ip) && !(is_app_env_test && allow_http) {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 reason: format!("Blocked non-global IP: {ip}"),
             });
         }
-        return Ok(());
+        let sock_addr = std::net::SocketAddr::new(ip, port);
+        return Ok(ValidatedRemoteDestination {
+            url: parsed,
+            host,
+            addrs: vec![sock_addr],
+        });
     }
 
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let addrs = tokio::time::timeout(
+    let addrs_iter = tokio::time::timeout(
         federation_dns_timeout(),
-        tokio::net::lookup_host((host, port)),
+        tokio::net::lookup_host((host.as_str(), port)),
     )
     .await
     .map_err(|_| FederationError::ResolutionFailed {
@@ -907,10 +1533,20 @@ pub(crate) async fn validate_resolved_host_is_public(
         reason: format!("Failed to resolve host {host}: {e}"),
     })?;
 
-    let mut resolved_any = false;
-    for addr in addrs {
-        resolved_any = true;
-        if is_private_ip(&addr.ip()) {
+    let mut addrs: Vec<std::net::SocketAddr> = addrs_iter.collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+
+    if addrs.is_empty() {
+        return Err(FederationError::ResolutionFailed {
+            did: String::new(),
+            reason: format!("Host {host} did not resolve to any address"),
+        });
+    }
+
+    // Reject mixed/private: ALL addresses must be public
+    for addr in &addrs {
+        if is_private_ip(&addr.ip()) && !(is_app_env_test && allow_http) {
             return Err(FederationError::ResolutionFailed {
                 did: String::new(),
                 reason: format!("Host {host} resolved to blocked IP {}", addr.ip()),
@@ -918,14 +1554,56 @@ pub(crate) async fn validate_resolved_host_is_public(
         }
     }
 
-    if !resolved_any {
+    Ok(ValidatedRemoteDestination {
+        url: parsed,
+        host,
+        addrs,
+    })
+}
+
+
+pub(crate) async fn validate_resolved_host_is_public(
+    parsed: &url::Url,
+) -> Result<(), FederationError> {
+    validate_and_resolve_destination(parsed.as_str(), None).await.map(|_| ())
+}
+
+pub(crate) async fn send_hardened_resolution_request(
+    destination: &ValidatedRemoteDestination,
+    deadline: tokio::time::Instant,
+    did: &str,
+    context: &str,
+) -> Result<reqwest::Response, FederationError> {
+    let client = reqwest::Client::builder()
+        .user_agent("catbird-mls-ds/1.0")
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&destination.host, &destination.addrs)
+        .build()
+        .map_err(|e| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: client build failed: {e}"),
+        })?;
+
+    let resp = tokio::time::timeout_at(deadline, client.get(destination.url.clone()).send())
+        .await
+        .map_err(|_| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: deadline exceeded"),
+        })?
+        .map_err(|error| FederationError::ResolutionFailed {
+            did: did.to_string(),
+            reason: format!("{context}: {error}"),
+        })?;
+
+    if resp.status().is_redirection() {
         return Err(FederationError::ResolutionFailed {
-            did: String::new(),
-            reason: format!("Host {host} did not resolve to any address"),
+            did: did.to_string(),
+            reason: format!("{context}: redirect rejected ({})", resp.status()),
         });
     }
 
-    Ok(())
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -1393,6 +2071,7 @@ mod tests {
             assert!(parse_authoritative_device_keys(&body).is_err());
         }
     }
+
     use sqlx::postgres::PgPoolOptions;
     use std::net::IpAddr;
     use uuid::Uuid;
@@ -1419,15 +2098,25 @@ mod tests {
     fn test_172_16_is_private() {
         assert!(is_private_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
     }
-
-    #[test]
-    fn test_unspecified_is_private() {
-        assert!(is_private_ip(&"0.0.0.0".parse::<IpAddr>().unwrap()));
+    #[tokio::test]
+    async fn test_ssrf_rejects_direct_private_ip_even_if_allowlisted() {
+        let allowlist = vec!["127.0.0.1".to_string()];
+        // In production environment (is_app_env_test = false, allow_http = false), private IP must fail even if in allowlist
+        let result = validate_and_resolve_destination_with_policy("https://127.0.0.1:8443", false, Some(&allowlist), false).await;
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn test_link_local_is_private() {
-        assert!(is_private_ip(&"169.254.1.1".parse::<IpAddr>().unwrap()));
+    #[tokio::test]
+    async fn test_ssrf_injected_allowlist_enforcement() {
+        let allowlist = vec!["allowed.example.com".to_string()];
+        // Not in allowlist
+        let res1 = validate_endpoint_url_with_allowlist("https://disallowed.example.com", false, Some(&allowlist));
+        assert!(res1.is_err());
+        assert!(res1.unwrap_err().to_string().contains("not in FEDERATION_OUTBOUND_HOST_ALLOWLIST"));
+
+        // In allowlist
+        let res2 = validate_endpoint_url_with_allowlist("https://allowed.example.com", false, Some(&allowlist));
+        assert!(res2.is_ok());
     }
 
     #[test]
@@ -1471,37 +2160,37 @@ mod tests {
 
     #[test]
     fn test_rejects_localhost() {
-        let result = validate_endpoint_url("https://localhost");
+        let result = validate_endpoint_url_with_policy("https://localhost", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_127_0_0_1() {
-        let result = validate_endpoint_url("https://127.0.0.1");
+        let result = validate_endpoint_url_with_policy("https://127.0.0.1", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_0_0_0_0() {
-        let result = validate_endpoint_url("https://0.0.0.0");
+        let result = validate_endpoint_url_with_policy("https://0.0.0.0", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_private_ip_10() {
-        let result = validate_endpoint_url("https://10.0.0.1");
+        let result = validate_endpoint_url_with_policy("https://10.0.0.1", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_private_ip_192_168() {
-        let result = validate_endpoint_url("https://192.168.1.1");
+        let result = validate_endpoint_url_with_policy("https://192.168.1.1", false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_rejects_ipv6_loopback() {
-        let result = validate_endpoint_url("https://[::1]");
+        let result = validate_endpoint_url_with_policy("https://[::1]", false);
         assert!(result.is_err());
     }
 
@@ -1641,8 +2330,6 @@ mod tests {
 
     #[test]
     fn test_extract_service_atproto_pds_without_type_check() {
-        // The refactored resolve_did_to_pds path: no type requirement,
-        // suffix-match id semantics preserved.
         let doc = doc_with_services(serde_json::json!([
             {
                 "id": "did:web:user.example.com#atproto_pds",
@@ -1710,8 +2397,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_self_outcome() {
-        // The self path never touches the pool, so a lazy (unconnected) pool
-        // is sufficient.
         let pool = PgPoolOptions::new()
             .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
             .expect("lazy pool");
@@ -1744,25 +2429,23 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some("https://default-ds.example.com".to_string()),
+            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
             3600,
         );
 
-        // did:key is an unsupported DID method: if the fresh-cache
-        // short-circuit failed, the live paths would error without touching
-        // the network, and we'd see a different outcome.
-        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let target_endpoint = DsEndpoint {
+            did: "did:web:cached-ds.example.com".to_string(),
+            endpoint: "https://cached-ds.example.com".to_string(),
+            supported_cipher_suites: None,
+            federation_capabilities: None,
+        };
         resolver
-            .cache_endpoint(&DsEndpoint {
-                did: did.clone(),
-                endpoint: "https://cached-ds.example.com".to_string(),
-                supported_cipher_suites: None,
-                federation_capabilities: None,
-            })
+            .cache_mapping(&actor_did, &target_endpoint)
             .await
             .expect("cache insert succeeds");
 
-        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        let (result, outcome) = resolver.resolve_with_outcome(&actor_did).await;
         assert_eq!(outcome, "cache_fresh");
         assert_eq!(
             result.expect("resolution succeeds").endpoint,
@@ -1782,24 +2465,33 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            // default_ds is set: degraded mode must win over the default.
-            Some("https://default-ds.example.com".to_string()),
+            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
             3600,
         );
 
-        // Unsupported DID method → both live paths fail fast, offline.
-        let did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let ds_did = "did:web:stale-ds.example.com";
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
              VALUES ($1, $2, NULL, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
         )
-        .bind(&did)
+        .bind(ds_did)
         .bind("https://stale-ds.example.com")
         .execute(&pool)
         .await
-        .expect("expired row insert succeeds");
+        .expect("expired endpoint insert succeeds");
 
-        let (result, outcome) = resolver.resolve_with_outcome(&did).await;
+        sqlx::query(
+            "INSERT INTO did_ds_mappings (actor_did, ds_did, resolved_at, expires_at) \
+             VALUES ($1, $2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(&actor_did)
+        .bind(ds_did)
+        .execute(&pool)
+        .await
+        .expect("expired mapping insert succeeds");
+
+        let (result, outcome) = resolver.resolve_with_outcome(&actor_did).await;
         assert_eq!(outcome, "cache_stale_degraded");
         assert_eq!(
             result.expect("degraded resolution succeeds").endpoint,
@@ -1819,7 +2511,7 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            Some("https://default-ds.example.com".to_string()),
+            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
             3600,
         );
 
@@ -1839,11 +2531,12 @@ mod tests {
             return;
         };
 
-        let resolver = DsResolver::new(
+        let resolver = DsResolver::with_defaults(
             pool,
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
+            None,
             None,
             3600,
         );
@@ -1871,19 +2564,9 @@ mod tests {
             }
         };
 
-        if let Err(err) = sqlx::query(
-            "CREATE TABLE IF NOT EXISTS ds_endpoints (
-                did TEXT PRIMARY KEY,
-                endpoint TEXT NOT NULL,
-                supported_cipher_suites TEXT,
-                resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
-            )",
-        )
-        .execute(&pool)
-        .await
-        {
-            eprintln!("Skipping cache test: unable to ensure ds_endpoints table ({err})");
+        // Run migrations
+        if let Err(err) = sqlx::migrate!("./migrations").run(&pool).await {
+            eprintln!("Skipping cache test: migration run error ({err})");
             return None;
         }
 
@@ -1906,36 +2589,38 @@ mod tests {
             3600,
         );
 
-        let did = format!("did:plc:{}", Uuid::new_v4().as_simple());
+        let actor_did = format!("did:plc:{}", Uuid::new_v4().as_simple());
+        let ds_did_one = "did:web:ds-one.example.com";
         let first = DsEndpoint {
-            did: did.clone(),
+            did: ds_did_one.to_string(),
             endpoint: "https://ds-one.example.com".to_string(),
             supported_cipher_suites: Some(vec!["suite-a".to_string()]),
             federation_capabilities: Some(vec!["baseline".to_string()]),
         };
         resolver
-            .cache_endpoint(&first)
+            .cache_mapping(&actor_did, &first)
             .await
-            .expect("cache insert succeeds");
+            .expect("cache mapping succeeds");
         let cached = resolver
-            .get_cached(&did)
+            .get_cached(&actor_did)
             .await
             .expect("cache read succeeds")
             .expect("cache entry exists");
         assert_eq!(cached.endpoint, first.endpoint);
 
+        let ds_did_two = "did:web:ds-two.example.com";
         let refreshed = DsEndpoint {
-            did: did.clone(),
+            did: ds_did_two.to_string(),
             endpoint: "https://ds-two.example.com".to_string(),
             supported_cipher_suites: Some(vec!["suite-b".to_string(), "suite-c".to_string()]),
             federation_capabilities: Some(vec!["reconciliation-v1".to_string()]),
         };
         resolver
-            .cache_endpoint(&refreshed)
+            .cache_mapping(&actor_did, &refreshed)
             .await
             .expect("cache refresh succeeds");
         let cached_refreshed = resolver
-            .get_cached(&did)
+            .get_cached(&actor_did)
             .await
             .expect("cache read succeeds")
             .expect("cache entry exists");
@@ -1944,16 +2629,658 @@ mod tests {
             cached_refreshed.supported_cipher_suites,
             refreshed.supported_cipher_suites
         );
-        assert!(cached_refreshed.federation_capabilities.is_none());
 
         resolver
-            .invalidate(&did)
+            .invalidate(&actor_did)
             .await
             .expect("cache invalidation succeeds");
         let after_invalidate = resolver
-            .get_cached(&did)
+            .get_cached(&actor_did)
             .await
             .expect("cache read succeeds");
         assert!(after_invalidate.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_two_table_cache_actor_mapping_and_ds_queue_lookup() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let resolver = DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        let actor_did = format!("did:plc:actor-{}", Uuid::new_v4().as_simple());
+        let ds_did = format!("did:web:ds-{}.example.com", Uuid::new_v4().as_simple());
+        let endpoint_url = format!("https://ds-{}.example.com", Uuid::new_v4().as_simple());
+
+        let target_endpoint = DsEndpoint {
+            did: ds_did.clone(),
+            endpoint: endpoint_url.clone(),
+            supported_cipher_suites: Some(vec!["suite-1".to_string()]),
+            federation_capabilities: None,
+        };
+
+        // Cache the mapping: actor_did -> ds_did -> endpoint_url
+        resolver
+            .cache_mapping(&actor_did, &target_endpoint)
+            .await
+            .expect("cache_mapping succeeds");
+
+        // 1. Verify actor DID lookup returns the DS DID and endpoint
+        let cached_for_actor = resolver
+            .get_cached(&actor_did)
+            .await
+            .expect("get_cached succeeds")
+            .expect("actor mapping exists");
+        assert_eq!(cached_for_actor.did, ds_did);
+        assert_eq!(cached_for_actor.endpoint, endpoint_url);
+
+        let cached_for_ds = resolver
+            .get_cached_ds_endpoint(&ds_did)
+            .await
+            .expect("get_cached_ds_endpoint succeeds")
+            .expect("ds endpoint exists");
+        assert_eq!(cached_for_ds.did, ds_did);
+        assert_eq!(cached_for_ds.endpoint, endpoint_url);
+
+        // 3. Verify the outbound queue's exact SQL lookup finds the endpoint by target DS DID
+        let queue_lookup = sqlx::query_scalar::<_, String>(
+            "SELECT endpoint FROM ds_endpoints WHERE did = $1 AND expires_at > NOW()",
+        )
+        .bind(&ds_did)
+        .fetch_optional(&pool)
+        .await
+        .expect("queue query succeeds");
+        assert_eq!(queue_lookup.as_deref(), Some(endpoint_url.as_str()));
+
+        // 4. Verify did_ds_mappings contains the expected row
+        let mapping_row = sqlx::query_scalar::<_, String>(
+            "SELECT ds_did FROM did_ds_mappings WHERE actor_did = $1 AND expires_at > NOW()",
+        )
+        .bind(&actor_did)
+        .fetch_optional(&pool)
+        .await
+        .expect("mapping query succeeds");
+        assert_eq!(mapping_row.as_deref(), Some(ds_did.as_str()));
+
+        // 5. Invalidation by actor_did removes both mapping and ds_endpoints
+        resolver
+            .invalidate(&actor_did)
+            .await
+            .expect("invalidation succeeds");
+        assert!(resolver
+            .get_cached(&actor_did)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_default_fallback_has_real_ds_identity() {
+        let Some(pool) = setup_cache_test_pool().await else {
+            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        // 1. Test HTTPS URL fallback derives did:web:<host>
+        let resolver = DsResolver::with_defaults(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            Some("https://default-ds.example.com".to_string()),
+            3600,
+        );
+
+        let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
+        let (result, outcome) = resolver.resolve_with_outcome(&actor_did).await;
+        assert_eq!(outcome, "default_fallback");
+        let endpoint = result.expect("default fallback succeeds");
+        assert_eq!(endpoint.did, "did:web:default-ds.example.com");
+        assert_ne!(endpoint.did, actor_did);
+        assert_eq!(endpoint.endpoint, "https://default-ds.example.com");
+
+        // 2. Test explicit DID fallback uses canonical DID
+        let resolver_did = DsResolver::with_defaults(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some("did:web:custom-default.example.com".to_string()),
+            Some("https://custom-default.example.com".to_string()),
+            3600,
+        );
+        let (result_did, outcome_did) = resolver_did.resolve_with_outcome(&actor_did).await;
+        assert_eq!(outcome_did, "default_fallback");
+        let endpoint_did = result_did.expect("default fallback succeeds");
+        assert_eq!(endpoint_did.did, "did:web:custom-default.example.com");
+    }
+
+    // -- Production Helper Tests: Delivery Service Base DID Validation --
+
+    #[test]
+    fn test_production_helper_delivery_service_validation() {
+        // Valid did:web
+        assert_eq!(
+            validate_declaration_delivery_service("did:web:chat.catbird.blue").unwrap(),
+            "did:web:chat.catbird.blue"
+        );
+        // Valid did:plc
+        assert_eq!(
+            validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur").unwrap(),
+            "did:plc:z72i7hdynmk6r22z27h6tvur"
+        );
+
+        // Rejections:
+        // Public port in did:web rejected in production
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A8443").is_err());
+        // Rejections:
+        // Fragment not allowed
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue#atproto_mls").is_err());
+        assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur#fragment").is_err());
+
+        // URL instead of DID
+        assert!(validate_declaration_delivery_service("https://chat.catbird.blue").is_err());
+
+        // Empty / whitespace
+        assert!(validate_declaration_delivery_service("").is_err());
+        assert!(validate_declaration_delivery_service(" did:web:chat.catbird.blue ").is_err());
+        assert!(validate_declaration_delivery_service("did:web:chat .catbird.blue").is_err());
+
+        // Unsupported method
+        assert!(validate_declaration_delivery_service("did:key:z6MkhaXgBZDvotDkL5257faiz4zZbcw51635Q6phWoqnVJJN").is_err());
+        assert!(validate_declaration_delivery_service("did:ion:12345").is_err());
+
+        // Invalid did:plc length or chars
+        assert!(validate_declaration_delivery_service("did:plc:short").is_err());
+        assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvu8").is_err()); // '8' is not base32 [a-z2-7]
+
+        // Invalid did:web ports
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A99999").is_err()); // port > 65535
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A0").is_err()); // port 0
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3Anotanumber").is_err());
+    }
+
+    // -- Production Helper Tests: Declaration Record Value Validation --
+
+    #[test]
+    fn test_production_helper_declaration_exact_raw_validation() {
+        // 1. Valid declaration
+        let valid = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        let (ds_did, allow) = validate_declaration_record_value(valid.as_object().unwrap()).unwrap();
+        assert_eq!(ds_did, "did:web:chat.catbird.blue");
+        assert_eq!(allow, "all");
+
+        // 2. Reject #main type tag (exact bare NSID required)
+        let with_main_tag = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration#main",
+            "protocolVersion": "1",
+            "allowIncoming": "following",
+            "deliveryService": "did:web:ds2.example.com",
+            "createdAt": "2026-08-24T12:00:00.123456Z"
+        });
+        assert!(validate_declaration_record_value(with_main_tag.as_object().unwrap()).is_err());
+
+        // 3. Missing $type
+        let missing_type = serde_json::json!({
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(missing_type.as_object().unwrap()).is_err());
+
+        // 4. Wrong $type
+        let wrong_type = serde_json::json!({
+            "$type": "blue.catbird.chat.wrong",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(wrong_type.as_object().unwrap()).is_err());
+
+        // 5. Unsupported protocolVersion ("2")
+        let wrong_version = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "2",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(wrong_version.as_object().unwrap()).is_err());
+
+        // 6. Invalid createdAt (not RFC3339)
+        let invalid_date = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "not-a-datetime"
+        });
+        assert!(validate_declaration_record_value(invalid_date.as_object().unwrap()).is_err());
+
+        // 7. Missing allowIncoming
+        let missing_allow = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(missing_allow.as_object().unwrap()).is_err());
+
+        // 8. Missing deliveryService
+        let missing_ds = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(missing_ds.as_object().unwrap()).is_err());
+
+        // 9. deliveryService with URL instead of DID
+        let url_ds = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "https://chat.catbird.blue",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(url_ds.as_object().unwrap()).is_err());
+
+        // 10. deliveryService with fragment
+        let fragment_ds = serde_json::json!({
+            "$type": "blue.catbird.chat.declaration",
+            "protocolVersion": "1",
+            "allowIncoming": "all",
+            "deliveryService": "did:web:chat.catbird.blue#atproto_mls",
+            "createdAt": "2026-08-24T12:00:00Z"
+        });
+        assert!(validate_declaration_record_value(fragment_ds.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_declaration_allow_incoming_values_accepted() {
+        for consent in ["all", "following", "none"] {
+            let record = serde_json::json!({
+                "$type": "blue.catbird.chat.declaration",
+                "protocolVersion": "1",
+                "allowIncoming": consent,
+                "deliveryService": "did:web:ds.example.com",
+                "createdAt": "2026-08-24T12:00:00Z"
+            });
+
+            let (_, allow_incoming) = validate_declaration_record_value(record.as_object().unwrap()).unwrap();
+            assert_eq!(allow_incoming, consent);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ds_did_to_endpoint_non_recursive() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        // Self DID resolves to self_endpoint immediately
+        let self_endpoint = resolver
+            .resolve_ds_did_to_endpoint("did:web:self.example.com")
+            .await
+            .expect("self DS DID resolves to self endpoint");
+        assert_eq!(self_endpoint, "https://self.example.com");
+
+        // Public IP did:web resolves to direct endpoint without DNS
+        let remote_endpoint = resolver
+            .resolve_ds_did_to_endpoint("did:web:8.8.8.8")
+            .await
+            .expect("public ip did:web resolves to https endpoint");
+        assert_eq!(remote_endpoint, "https://8.8.8.8");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ds_did_has_no_default_fallback() {
+        // 1. Test offline resolution method rejects unresolvable DS DID without network/DB
+        let pool_lazy = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver_lazy = DsResolver::new(
+            pool_lazy,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            3600,
+        );
+        let err_direct = resolver_lazy
+            .resolve_ds_did_to_endpoint("did:key:unresolvable")
+            .await
+            .unwrap_err();
+        assert!(matches!(err_direct, FederationError::ResolutionFailed { .. }));
+
+        // 2. If DB available, test resolve_ds_did rejects unresolvable DS DID
+        if let Some(pool) = setup_cache_test_pool().await {
+            let resolver = DsResolver::new(
+                pool,
+                reqwest::Client::new(),
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+                3600,
+            );
+            let err = resolver
+                .resolve_ds_did("did:key:unresolvable")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FederationError::ResolutionFailed { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_peer_resolves_in_naming_layer() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        // Naming layer resolves untrusted peer DS successfully (peer policy is enforced at use)
+        let endpoint = resolver
+            .resolve_ds_did_to_endpoint("did:web:1.1.1.1")
+            .await
+            .expect("naming resolution succeeds for untrusted peer");
+        assert_eq!(endpoint, "https://1.1.1.1");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_repo_record_mock_pds_and_declaration_flow() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Json};
+        use axum::routing::get;
+        use axum::Router;
+        use std::collections::HashMap;
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.getRecord",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let collection = params.get("collection").map(String::as_str).unwrap_or("");
+                let rkey = params.get("rkey").map(String::as_str).unwrap_or("");
+
+                match (collection, rkey) {
+                    ("blue.catbird.chat.declaration", "self") => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "uri": "at://did:plc:alice/blue.catbird.chat.declaration/self",
+                            "cid": "cid-declaration-1",
+                            "value": {
+                                "$type": "blue.catbird.chat.declaration",
+                                "protocolVersion": "1",
+                                "allowIncoming": "all",
+                                "deliveryService": "did:web:8.8.8.8",
+                                "createdAt": "2026-08-24T12:00:00Z"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    ("blue.catbird.chat.profile", "self") => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "uri": "at://did:plc:alice/blue.catbird.chat.profile/self",
+                            "cid": "cid-profile-1",
+                            "value": {
+                                "deliveryService": "https://8.8.8.8",
+                                "supportedCipherSuites": ["MLS_128_HPKE_P256_AES128GCM_SHA256_Ed25519"]
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    _ => (StatusCode::NOT_FOUND, "Record not found").into_response(),
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let pds_endpoint = format!("http://{addr}");
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        // 1. Fetch declaration record from mock PDS
+        let decl_body = resolver
+            .fetch_repo_record(
+                &pds_endpoint,
+                "did:plc:alice",
+                DECLARATION_COLLECTION,
+                DECLARATION_RKEY,
+                deadline,
+            )
+            .await
+            .expect("fetch declaration record succeeds");
+
+        let decl_val = decl_body.get("value").and_then(|v| v.as_object()).unwrap();
+        let (decl_ds, _) = validate_declaration_record_value(decl_val).expect("valid declaration");
+        assert_eq!(decl_ds, "did:web:8.8.8.8");
+
+        // Convert declared DS to endpoint without recursive actor mapping
+        let ds_endpoint = resolver
+            .resolve_ds_did_to_endpoint(&decl_ds)
+            .await
+            .expect("resolve declared DS DID succeeds");
+        assert_eq!(ds_endpoint, "https://8.8.8.8");
+
+        // 2. Fetch nonexistent record returns 404 error
+        let err = resolver
+            .fetch_repo_record(
+                &pds_endpoint,
+                "did:plc:alice",
+                "nonexistent.collection",
+                "self",
+                deadline,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("PDS returned status 404"));
+    }
+
+    #[tokio::test]
+    async fn test_declaration_wrong_type_falls_through_to_profile() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Json};
+        use axum::routing::get;
+        use axum::Router;
+        use std::collections::HashMap;
+        // Mock PDS returns declaration with wrong $type (#main) and a valid profile
+        let router = Router::new().route(
+            "/xrpc/com.atproto.repo.getRecord",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let collection = params.get("collection").map(String::as_str).unwrap_or("");
+                match collection {
+                    "blue.catbird.chat.declaration" => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "uri": "at://did:plc:alice/blue.catbird.chat.declaration/self",
+                            "cid": "cid-declaration-wrong",
+                            "value": {
+                                "$type": "blue.catbird.chat.declaration#main",
+                                "protocolVersion": "1",
+                                "allowIncoming": "all",
+                                "deliveryService": "did:web:declaration-wrong.example.com",
+                                "createdAt": "2026-08-24T12:00:00Z"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    "blue.catbird.chat.profile" => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "uri": "at://did:plc:alice/blue.catbird.chat.profile/self",
+                            "cid": "cid-profile-1",
+                            "value": {
+                                "deliveryService": "https://8.8.8.8",
+                                "supportedCipherSuites": ["MLS_128_HPKE_P256_AES128GCM_SHA256_Ed25519"]
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    _ => (StatusCode::NOT_FOUND, "Record not found").into_response(),
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let pds_endpoint = format!("http://{addr}");
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        // Fetching declaration directly and validating fails
+        let decl_body = resolver
+            .fetch_repo_record(&pds_endpoint, "did:plc:alice", DECLARATION_COLLECTION, DECLARATION_RKEY, deadline)
+            .await
+            .expect("fetch declaration record succeeds");
+        let decl_val = decl_body.get("value").and_then(|v| v.as_object()).unwrap();
+        assert!(validate_declaration_record_value(decl_val).is_err());
+
+        // Profile record fetch succeeds
+        let profile_body = resolver
+            .fetch_repo_record(&pds_endpoint, "did:plc:alice", PROFILE_COLLECTION, PROFILE_RKEY, deadline)
+            .await
+            .expect("fetch profile record succeeds");
+        assert!(profile_body.get("value").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_migration_purges_legacy_actor_keyed_ds_endpoints_row() {
+        let database_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                eprintln!("Skipping migration test: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
+
+        let schema_name = format!("test_mig_{}", Uuid::new_v4().as_simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema_name};"))
+            .execute(&pool)
+            .await
+            .expect("create test schema");
+
+        sqlx::query(&format!("SET search_path TO {schema_name}, public;"))
+            .execute(&pool)
+            .await
+            .expect("set search path");
+
+        // Seed pre-migration table definition in isolated schema
+        sqlx::query(
+            "CREATE TABLE ds_endpoints (
+                did TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                supported_cipher_suites TEXT,
+                resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
+            );",
+        )
+        .execute(&pool)
+        .await
+        .expect("create pre-migration table");
+
+        let actor_did = format!("did:plc:legacy{}", Uuid::new_v4().as_simple())[..32].to_string();
+        sqlx::query(
+            "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at)
+             VALUES ($1, 'https://legacy.example.com', NULL, NOW(), NOW() + INTERVAL '1 hour');",
+        )
+        .bind(&actor_did)
+        .execute(&pool)
+        .await
+        .expect("insert legacy actor-keyed row");
+
+        // Apply target migration SQL once into the isolated schema
+        let migration_sql = include_str!("../../migrations/20260824000002_chat_actor_ds_mapping.sql");
+        sqlx::raw_sql(migration_sql)
+            .execute(&pool)
+            .await
+            .expect("applying migration SQL in isolated schema must succeed");
+
+        // Assert legacy row is gone from ds_endpoints
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ds_endpoints WHERE did = $1")
+            .bind(&actor_did)
+            .fetch_one(&pool)
+            .await
+            .expect("query count of legacy row");
+        assert_eq!(count, 0, "legacy actor-keyed row must be purged by migration");
+
+        // Cleanup isolated schema
+        let _ = sqlx::query(&format!("DROP SCHEMA {schema_name} CASCADE;"))
+            .execute(&pool)
+            .await;
     }
 }
