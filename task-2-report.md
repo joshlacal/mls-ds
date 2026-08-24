@@ -176,3 +176,57 @@ Implemented Task 2 from `docs/superpowers/plans/2026-08-24-clean-chat-federation
 - Container Two-Node Smoke Test (`scripts/federation-two-node-harness.sh up` & `smoke`):
   - Ephemeral ports: DS1=32862, DS2=32861
   - Readiness, federation capabilities, admin upsert, signer verification, service auth, and cross-DS calls: ALL PASSED
+
+---
+
+## Fix Round 4: Transient-DNS Resolution Retries and Strict Point-of-Use Peer Policy Enforcement
+
+### 1. Unified Queue Destination Resolution Retry Scheduling
+- Implemented `FederationError::is_retryable(&self) -> bool` classifying transient errors (e.g. DNS lookup timeouts, temporary lookup failures, socket timeouts, connection failures, HTTP 5xx/429) as retryable, while strictly rejecting permanent errors (e.g. SSRF blocked IPs, host allowlist rejections, malformed DIDs, unparseable URLs, invalid schemas).
+- Updated `OutboundError::is_retryable(&self) -> bool` to distinguish retryable `RequestFailed` errors from non-retryable resolution and validation rejections.
+- Enhanced `OutboundQueue::resolve_target_destination` and helper `outbound_error_from_federation_error` to preserve and surface underlying resolution errors with exact retryability classification.
+- In `OutboundQueue::process_item`, updated destination resolution error handling to use the exact same `is_retryable() && item.retry_count < item.max_retries` scheduling as request failure (`schedule_retry` with exponential backoff delay and incremented `retry_count`). Only non-retryable errors or exhausted retries mark the queue item as `failed`.
+- Added database tests `test_outbound_queue_retries_on_transient_dns_resolution_failure` (verifying retry count increments to 1 and status remains `pending`) and `test_outbound_queue_fails_immediately_on_nonretryable_ssrf_resolution_failure` (verifying immediate `failed` status without retry on permanent errors).
+
+### 2. Strict Point-of-Use Peer Policy Enforcement on Queue Dispatch and Upstream Pinned Connect
+- In `OutboundQueue::process_item`, enforced `peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did)` immediately before `call_procedure_pinned` after destination resolution and token preparation. Denial immediately cancels delivery and marks the row `failed`.
+- In `upstream.rs::connect_and_stream`, enforced `enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did)` immediately before ticket acquisition and again immediately after ticket acquisition before pinned TCP/WS connect. Denial triggers `ctx.cancel.cancel()` and halts the connection attempt.
+- In `upstream.rs::upstream_reader_task`, checked `ctx.cancel.is_cancelled()` on connection failure to immediately exit and terminate reconnect loops upon policy denial.
+- Added focused tests:
+  - `test_upstream_cancels_when_peer_policy_revoked_before_ticket`
+  - `test_upstream_cancels_when_peer_policy_revoked_after_ticket_before_connect`
+
+## Verification
+- `cargo check --lib --bin catbird-server`: PASSED
+- `TEST_DATABASE_URL="postgres://catbird:catbird@127.0.0.1:5432/catbird" cargo test --lib federation::`: 190 passed, 0 failed
+
+---
+
+## Fix Round 5 (Final): Elimination of String-Parsed Retries & Point-of-Use Upstream Peer Policy Invariant
+
+### 1. Eliminated String-Parsed Retry Classification with Typed `ResolutionFailureKind`
+- Introduced typed `ResolutionFailureKind` enum with explicit classification:
+  - Transient/Retryable: `DnsTemporary`, `DnsTimeout`, `Timeout`, `ConnectionFailed`, `Transient`, and `HttpStatus` (where status >= 500 or 429).
+  - Permanent/Non-retryable: `DnsNxdomain`, `SsrfBlocked`, `AllowlistBlocked`, `InvalidUrl`, `InvalidDid`, `InvalidDeclaration`, `InvalidPayload`, `ServiceMissing`, `RedirectRejected`, `InvalidConfiguration`, and `Permanent`.
+- Replaced string-parsed `is_resolution_reason_retryable` in `errors.rs` and `outbound.rs` with typed `is_retryable(&self)` methods directly on `ResolutionFailureKind`, `FederationError`, and `OutboundError`.
+- Added `classify_dns_io_error` classifying `std::io::Error` from DNS resolution into typed `DnsTemporary`, `DnsTimeout`, `DnsNxdomain`, `ConnectionFailed`, or other causes.
+- Preserved typed `reqwest` errors and statuses across `declaration_client.rs`, `resolver.rs`, `outbound.rs`, and `queue.rs`.
+- Added destination resolver hook support (`with_destination_resolver_hook`) to `DsResolver` allowing deterministic cause injection in tests.
+- Added comprehensive queue unit tests asserting `status`, `retry_count`, and `next_retry_at` under injected transient and permanent causes:
+  - `test_outbound_queue_retries_on_injected_dns_temporary_and_timeout` (asserts `status == "pending"`, `retry_count == 1`, `next_retry_at > now()`)
+  - `test_outbound_queue_fails_immediately_on_injected_dns_nxdomain_permanent` (asserts `status == "failed"`, `retry_count == 0`)
+  - `test_outbound_queue_distinguishes_injected_http_status_codes` (503 retries, 404 fails immediately)
+
+### 2. Upstream Strict Point-of-Use Peer Policy Rechecks & Deterministic Resolver Barrier
+- In `upstream.rs::connect_and_stream`:
+  1. Await `ctx.resolver.resolve_endpoint_destination(&ctx.endpoint_url)`
+  2. Enforce peer policy immediately before `acquire_ticket_pinned`
+  3. Acquire subscription ticket via `acquire_ticket_pinned`
+  4. Perform WS URL and cursor preparation
+  5. Enforce peer policy immediately before the TCP connection loop
+  6. Direct TCP connect to pinned addresses and WebSocket handshake
+- Added `test_upstream_cancels_when_peer_policy_revoked_during_resolution_proves_no_ticket_request` using a deterministic resolver barrier that revokes peer policy in Postgres during destination resolution and proves that no ticket request was made to the ticket server.
+
+## Verification
+- `cargo check --lib --bin catbird-server`: PASSED
+- `TEST_DATABASE_URL="postgres://catbird:catbird@127.0.0.1:5432/catbird" cargo test --lib federation::`: 191 passed, 0 failed

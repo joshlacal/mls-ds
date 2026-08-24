@@ -432,7 +432,7 @@ mod tests {
             || async {
                 Err(FederationError::ResolutionFailed {
                     did: String::new(),
-                    reason: "pagination incomplete".to_string(),
+                    kind: crate::federation::ResolutionFailureKind::InvalidPayload("pagination incomplete".to_string()),
                 })
             },
         )

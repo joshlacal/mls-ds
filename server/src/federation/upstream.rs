@@ -326,6 +326,14 @@ async fn upstream_reader_task(ctx: ReaderTaskContext) {
                 );
             }
             Err(e) => {
+                if ctx.cancel.is_cancelled() {
+                    debug!(
+                        convo_id = ctx.convo_id,
+                        sequencer_did = ctx.sequencer_did,
+                        "Upstream reader cancelled after connection failure"
+                    );
+                    return;
+                }
                 warn!(
                   convo_id = ctx.convo_id,
                   sequencer_did = ctx.sequencer_did,
@@ -348,19 +356,28 @@ async fn upstream_reader_task(ctx: ReaderTaskContext) {
 
 /// Acquire ticket, connect WS, and stream events until disconnect.
 async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationError> {
-    // 1. Recheck peer policy immediately before ticket and connect
-    super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await?;
-
-    // 2. Revalidate and resolve pinned destination on each ticket/connect
+    // 1. Revalidate and resolve pinned destination on each ticket/connect
     let destination = ctx
         .resolver
         .resolve_endpoint_destination(&ctx.endpoint_url)
         .await?;
 
+    // 2. Recheck peer policy after resolve_endpoint_destination await immediately before acquire_ticket_pinned
+    if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+        warn!(
+            convo_id = ctx.convo_id,
+            sequencer_did = ctx.sequencer_did,
+            error = %e,
+            "Peer policy denied upstream connection after destination resolution before ticket; cancelling upstream reader"
+        );
+        ctx.cancel.cancel();
+        return Err(e);
+    }
+
     // 3. Acquire subscription ticket from sequencer DS using pinned client
     let ticket = acquire_ticket_pinned(ctx, &destination).await?;
 
-    // 4. Build WS URL
+    // 4. Build WS URL & cursor prep
     let cursor_param = {
         let cursor = ctx.last_cursor.read().await;
         cursor
@@ -378,6 +395,18 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
         urlencoding::encode(&ticket),
         cursor_param,
     );
+
+    // 5. Recheck peer policy post-ticket after URL/cursor prep immediately before TCP loop
+    if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+        warn!(
+            convo_id = ctx.convo_id,
+            sequencer_did = ctx.sequencer_did,
+            error = %e,
+            "Peer policy denied upstream connection post-ticket before TCP/WS connect; cancelling upstream reader"
+        );
+        ctx.cancel.cancel();
+        return Err(e);
+    }
 
     debug!(
         convo_id = ctx.convo_id,
@@ -1107,5 +1136,236 @@ mod tests {
         // Running upstream_reader_task must observe peer policy denial and cancel immediately
         upstream_reader_task(ctx).await;
         assert!(cancel.is_cancelled(), "reader task must cancel itself when peer policy is revoked");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_cancels_when_peer_policy_revoked_during_resolution_proves_no_ticket_request() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for upstream revocation test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
+        let peer_did = format!("did:web:127.0.0.1%3Arevoked-during-res-{}", uuid::Uuid::new_v4().as_simple());
+
+        // 1. Peer initially allowed
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 2. Ticket server tracks whether any ticket request was received
+        let ticket_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ticket_requested_clone = ticket_requested.clone();
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(move || {
+                let requested = ticket_requested_clone.clone();
+                async move {
+                    requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Json(json!({ "ticket": "test-ticket-never-requested" }))
+                }
+            }),
+        );
+        let endpoint = spawn_ticket_server(router).await;
+        let endpoint_url_parsed = url::Url::parse(&endpoint).unwrap();
+        let ticket_port = endpoint_url_parsed.port().unwrap_or(80);
+
+        // 3. Deterministic resolver barrier: revokes peer in DB during destination resolution
+        let pool_for_barrier = pool.clone();
+        let peer_for_barrier = peer_did.clone();
+        let endpoint_for_barrier = endpoint.clone();
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(
+            DsResolver::new(
+                pool.clone(),
+                http.clone(),
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                None,
+                3600,
+            )
+            .with_destination_resolver_hook(Arc::new(move |_ep| {
+                let pool = pool_for_barrier.clone();
+                let peer = peer_for_barrier.clone();
+                let ep_url = endpoint_for_barrier.clone();
+                Some(Box::pin(async move {
+                    // Revoke peer policy in database right during resolution (deterministic resolver barrier)
+                    let _ = sqlx::query("UPDATE federation_peers SET status = 'block' WHERE ds_did = $1")
+                        .bind(&peer)
+                        .execute(&pool)
+                        .await;
+
+                    let sock_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), ticket_port);
+                    Ok(crate::federation::resolver::ValidatedRemoteDestination {
+                        url: url::Url::parse(&ep_url).unwrap(),
+                        host: "127.0.0.1".to_string(),
+                        addrs: vec![sock_addr],
+                    })
+                }))
+            })),
+        );
+
+        let auth = Arc::new(ServiceAuthClient::from_shared_secret(
+            "did:web:self.example.com".into(),
+            b"test-secret",
+        ));
+        let cancel = CancellationToken::new();
+        let (tx, _) = broadcast::channel(100);
+
+        let ctx = ReaderTaskContext {
+            key: UpstreamKey {
+                sequencer_did: peer_did.clone(),
+                convo_id: "convo-test-barrier-revocation".to_string(),
+            },
+            endpoint_url: endpoint,
+            sequencer_did: peer_did.clone(),
+            convo_id: "convo-test-barrier-revocation".to_string(),
+            auth,
+            http,
+            self_did: "did:web:self.example.com".to_string(),
+            pool,
+            resolver,
+            tx,
+            cancel: cancel.clone(),
+            last_cursor: Arc::new(RwLock::new(None)),
+        };
+
+        let res = connect_and_stream(&ctx).await;
+        assert!(res.is_err(), "must fail when peer policy was revoked during resolution");
+        assert!(cancel.is_cancelled(), "cancellation token must be triggered on peer policy denial before ticket");
+        assert!(
+            !ticket_requested.load(std::sync::atomic::Ordering::SeqCst),
+            "ticket request must NEVER have been made when peer policy was revoked during resolution before ticket"
+        );
+        match res.unwrap_err() {
+            FederationError::AuthFailed { reason } => {
+                assert!(reason.contains("blocklisted") || reason.contains("Peer DS"));
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_cancels_when_peer_policy_revoked_after_ticket_before_connect() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for upstream revocation test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
+        let pool_clone = pool.clone();
+        let peer_did = format!("did:web:127.0.0.1%3Arevoked-after-{}", uuid::Uuid::new_v4().as_simple());
+        let peer_did_clone = peer_did.clone();
+
+        // Peer initially allowed
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Server returns ticket, but immediately revokes peer in db during ticket endpoint call!
+        let router = Router::new().route(
+            &format!("/xrpc/{TICKET_METHOD}"),
+            post(move || {
+                let pool = pool_clone.clone();
+                let peer = peer_did_clone.clone();
+                async move {
+                    // Revoke peer policy in database right as ticket is issued
+                    let _ = sqlx::query("UPDATE federation_peers SET status = 'block' WHERE ds_did = $1")
+                        .bind(&peer)
+                        .execute(&pool)
+                        .await;
+                    Json(json!({ "ticket": "test-ticket-revoked-after" }))
+                }
+            }),
+        );
+        let endpoint = spawn_ticket_server(router).await;
+
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http.clone(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        ));
+        let auth = Arc::new(ServiceAuthClient::from_shared_secret(
+            "did:web:self.example.com".into(),
+            b"test-secret",
+        ));
+        let cancel = CancellationToken::new();
+        let (tx, _) = broadcast::channel(100);
+
+        let ctx = ReaderTaskContext {
+            key: UpstreamKey {
+                sequencer_did: peer_did.clone(),
+                convo_id: "convo-test-after-ticket".to_string(),
+            },
+            endpoint_url: endpoint,
+            sequencer_did: peer_did.clone(),
+            convo_id: "convo-test-after-ticket".to_string(),
+            auth,
+            http,
+            self_did: "did:web:self.example.com".to_string(),
+            pool,
+            resolver,
+            tx,
+            cancel: cancel.clone(),
+            last_cursor: Arc::new(RwLock::new(None)),
+        };
+
+        let res = connect_and_stream(&ctx).await;
+        assert!(res.is_err(), "must fail after ticket before connect when peer policy is revoked");
+        assert!(cancel.is_cancelled(), "cancellation token must be triggered on peer policy denial after ticket");
+        match res.unwrap_err() {
+            FederationError::AuthFailed { reason } => {
+                assert!(reason.contains("blocklisted") || reason.contains("Peer DS"));
+            }
+            other => panic!("expected AuthFailed, got {other:?}"),
+        }
     }
 }

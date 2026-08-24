@@ -362,12 +362,28 @@ impl OutboundQueue {
         // 2. Revalidate and resolve pinned destination on every retry
         let destination = match self.resolve_target_destination(item).await {
             Ok(dest) => dest,
+            Err(e) if e.is_retryable() && item.retry_count < item.max_retries => {
+                let delay = backoff_delay(item.retry_count);
+                warn!(
+                    queue_id = %item.id,
+                    target_ds = %item.target_ds_did,
+                    retry = item.retry_count + 1,
+                    next_retry_secs = delay.as_secs(),
+                    error = %e,
+                    "Retryable destination resolution failure, scheduling next attempt"
+                );
+                let _ = self
+                    .schedule_retry(&item.id, item.retry_count + 1, &e.to_string(), delay)
+                    .await;
+                return;
+            }
             Err(e) => {
                 error!(
                     queue_id = %item.id,
                     target_ds = %item.target_ds_did,
+                    retries = item.retry_count,
                     error = %e,
-                    "Unable to resolve pinned target destination for queued delivery"
+                    "Non-retryable destination resolution failure or max retries exceeded"
                 );
                 let _ = self.mark_failed(&item.id, &e.to_string()).await;
                 return;
@@ -397,6 +413,17 @@ impl OutboundQueue {
         };
         let expected_sequencer_term = extract_expected_sequencer_term(&item.method, &body);
 
+        // 3. Recheck peer policy immediately before call_procedure_pinned after resolution and token prep
+        if let Err(e) = peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did).await {
+            warn!(
+                queue_id = %item.id,
+                target_ds = %item.target_ds_did,
+                error = %e,
+                "Peer policy denied outbound delivery immediately before procedure call; cancelling delivery"
+            );
+            let _ = self.mark_failed(&item.id, &format!("Peer policy denied: {e}")).await;
+            return;
+        }
         match outbound
             .call_procedure_pinned(&destination, &item.method, &token, &body)
             .await
@@ -523,6 +550,7 @@ impl OutboundQueue {
     async fn resolve_target_destination(&self, item: &QueueItem) -> Result<ValidatedRemoteDestination, OutboundError> {
         let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
+        let mut last_error = None;
         if !canonical_target_ds_did.is_empty() {
             match self.resolver.resolve_ds_destination(&canonical_target_ds_did).await {
                 Ok(dest) => return Ok(dest),
@@ -533,21 +561,94 @@ impl OutboundQueue {
                         error = %e,
                         "resolve_ds_destination failed, attempting stored endpoint"
                     );
+                    last_error = Some(e);
                 }
             }
         }
 
         if !item.target_endpoint.is_empty() {
-            return self.resolver.resolve_endpoint_destination(&item.target_endpoint).await.map_err(|e| OutboundError::RequestFailed {
-                endpoint: item.target_endpoint.clone(),
-                reason: format!("Could not validate and resolve destination: {e}"),
-            });
+            match self.resolver.resolve_endpoint_destination(&item.target_endpoint).await {
+                Ok(dest) => return Ok(dest),
+                Err(e) => {
+                    debug!(
+                        queue_id = %item.id,
+                        target_endpoint = %item.target_endpoint,
+                        error = %e,
+                        "resolve_endpoint_destination failed"
+                    );
+                    if !e.is_retryable() || last_error.is_none() {
+                        last_error = Some(e);
+                    }
+                }
+            }
         }
 
-        Err(OutboundError::RequestFailed {
-            endpoint: canonical_target_ds_did,
-            reason: "Could not resolve target DS DID to pinned destination".to_string(),
-        })
+        let err = last_error.unwrap_or_else(|| FederationError::ResolutionFailed {
+            did: canonical_target_ds_did.clone(),
+            kind: crate::federation::ResolutionFailureKind::Permanent(
+                "Could not resolve target DS DID to pinned destination".to_string(),
+            ),
+        });
+
+        Err(Self::outbound_error_from_federation_error(&err, &item.target_ds_did))
+    }
+
+    fn outbound_error_from_federation_error(err: &FederationError, target_ds: &str) -> OutboundError {
+        match err {
+            FederationError::DsUnreachable { endpoint, reason } => OutboundError::ConnectionFailed {
+                endpoint: endpoint.clone(),
+                reason: reason.clone(),
+            },
+            FederationError::RemoteError { status, body } => OutboundError::RemoteError {
+                status: *status,
+                body: body.clone(),
+                endpoint: target_ds.to_string(),
+                method: "resolve".to_string(),
+            },
+            FederationError::Http(e) => {
+                if e.is_timeout() {
+                    OutboundError::Timeout {
+                        endpoint: target_ds.to_string(),
+                        method: "resolve".to_string(),
+                    }
+                } else if e.is_connect() {
+                    OutboundError::ConnectionFailed {
+                        endpoint: target_ds.to_string(),
+                        reason: e.to_string(),
+                    }
+                } else if let Some(status) = e.status() {
+                    OutboundError::RemoteError {
+                        status: status.as_u16(),
+                        body: e.to_string(),
+                        endpoint: target_ds.to_string(),
+                        method: "resolve".to_string(),
+                    }
+                } else {
+                    OutboundError::RequestFailed {
+                        endpoint: target_ds.to_string(),
+                        reason: e.to_string(),
+                    }
+                }
+            }
+            FederationError::ResolutionFailed { did, kind } => {
+                OutboundError::ResolutionFailed {
+                    did: did.clone(),
+                    kind: kind.clone(),
+                }
+            }
+            other => {
+                if other.is_retryable() {
+                    OutboundError::RequestFailed {
+                        endpoint: target_ds.to_string(),
+                        reason: other.to_string(),
+                    }
+                } else {
+                    OutboundError::InvalidResponse {
+                        reason: format!("Non-retryable resolution error for {target_ds}: {other}"),
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
@@ -835,5 +936,377 @@ mod tests {
 
         assert_eq!(status, "failed");
         assert!(last_error.unwrap_or_default().contains("Peer policy denied"));
+    }
+
+    #[tokio::test]
+    async fn test_outbound_queue_retries_on_injected_dns_temporary_and_timeout() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for queue transient DNS test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
+        let peer_did = format!("did:web:injected-dns-{}.example.com", uuid::Uuid::new_v4().as_simple());
+
+        // Peer is allowed in federation_peers
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(
+            DsResolver::new(
+                pool.clone(),
+                http,
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                None,
+                3600,
+            )
+            .with_destination_resolver_hook(Arc::new(|_endpoint| {
+                Some(Box::pin(async {
+                    Err(FederationError::ResolutionFailed {
+                        did: "injected-peer".to_string(),
+                        kind: crate::federation::ResolutionFailureKind::DnsTemporary(
+                            "Injected EAI_AGAIN temporary DNS failure".to_string(),
+                        ),
+                    })
+                }))
+            })),
+        );
+        let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+
+        let item_id = format!("queue-item-dns-temp-{}", uuid::Uuid::new_v4().as_simple());
+        let payload = serde_json::to_vec(&serde_json::json!({"test": "dns-temp-retry"})).unwrap();
+
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+        )
+        .bind(&item_id)
+        .bind(&peer_did)
+        .bind("https://injected.example.com")
+        .bind("blue.catbird.mlsDS.deliverMessage")
+        .bind(&payload)
+        .bind("convo-test-dns-temp")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let item = QueueItem {
+            id: item_id.clone(),
+            target_ds_did: peer_did.clone(),
+            target_endpoint: "https://injected.example.com".to_string(),
+            method: "blue.catbird.mlsDS.deliverMessage".to_string(),
+            payload: payload.clone(),
+            convo_id: "convo-test-dns-temp".to_string(),
+            retry_count: 0,
+            max_retries: 5,
+        };
+
+        let outbound = OutboundClient::new(1, 1);
+        let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
+
+        queue.process_item(&item, &outbound, auth_sign.as_ref()).await;
+        // Verify item status is STILL 'pending', retry_count is 1, and next_retry_at is scheduled in future
+        let (status, retry_count, next_retry_at, last_error): (String, i32, chrono::DateTime<chrono::Utc>, Option<String>) = sqlx::query_as(
+            "SELECT status, retry_count, next_retry_at, last_error FROM outbound_queue WHERE id = $1",
+        )
+        .bind(&item_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "pending", "Transient DNS failure must remain pending for retry");
+        assert_eq!(retry_count, 1, "Retry count must increment to 1");
+        assert!(next_retry_at > chrono::Utc::now(), "next_retry_at must be in the future");
+        let err_msg = last_error.unwrap_or_default();
+        assert!(err_msg.contains("Injected EAI_AGAIN") || err_msg.contains("temporary"));
+    }
+
+    #[tokio::test]
+    async fn test_outbound_queue_fails_immediately_on_injected_dns_nxdomain_permanent() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for queue NXDOMAIN test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
+        let peer_did = format!("did:web:nxdomain-{}.example.com", uuid::Uuid::new_v4().as_simple());
+
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(
+            DsResolver::new(
+                pool.clone(),
+                http,
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                None,
+                3600,
+            )
+            .with_destination_resolver_hook(Arc::new(|_endpoint| {
+                Some(Box::pin(async {
+                    Err(FederationError::ResolutionFailed {
+                        did: "nxdomain-peer".to_string(),
+                        kind: crate::federation::ResolutionFailureKind::DnsNxdomain(
+                            "Injected host not found (NXDOMAIN)".to_string(),
+                        ),
+                    })
+                }))
+            })),
+        );
+        let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+
+        let item_id = format!("queue-item-nxdomain-{}", uuid::Uuid::new_v4().as_simple());
+        let payload = serde_json::to_vec(&serde_json::json!({"test": "nxdomain"})).unwrap();
+
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+        )
+        .bind(&item_id)
+        .bind(&peer_did)
+        .bind("https://nxdomain.example.com")
+        .bind("blue.catbird.mlsDS.deliverMessage")
+        .bind(&payload)
+        .bind("convo-test-nxdomain")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let item = QueueItem {
+            id: item_id.clone(),
+            target_ds_did: peer_did.clone(),
+            target_endpoint: "https://nxdomain.example.com".to_string(),
+            method: "blue.catbird.mlsDS.deliverMessage".to_string(),
+            payload: payload.clone(),
+            convo_id: "convo-test-nxdomain".to_string(),
+            retry_count: 0,
+            max_retries: 5,
+        };
+
+        let outbound = OutboundClient::new(1, 1);
+        let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
+
+        queue.process_item(&item, &outbound, auth_sign.as_ref()).await;
+        let (status, retry_count, last_error): (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT status, retry_count, last_error FROM outbound_queue WHERE id = $1",
+        )
+        .bind(&item_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "failed", "NXDOMAIN resolution error must be marked failed immediately");
+        assert_eq!(retry_count, 0, "Retry count must remain 0");
+        let err_msg = last_error.unwrap_or_default();
+        assert!(err_msg.contains("NXDOMAIN") || err_msg.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_outbound_queue_distinguishes_injected_http_status_codes() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for queue HTTP status test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
+        let peer_did = format!("did:web:status-{}.example.com", uuid::Uuid::new_v4().as_simple());
+
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        // 1. Resolver returning HTTP 503 (transient / retryable)
+        let resolver_503 = Arc::new(
+            DsResolver::new(
+                pool.clone(),
+                http.clone(),
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                None,
+                3600,
+            )
+            .with_destination_resolver_hook(Arc::new(|_endpoint| {
+                Some(Box::pin(async {
+                    Err(FederationError::ResolutionFailed {
+                        did: "status-503-peer".to_string(),
+                        kind: crate::federation::ResolutionFailureKind::HttpStatus {
+                            status: 503,
+                            message: "Service Unavailable".to_string(),
+                        },
+                    })
+                }))
+            })),
+        );
+        let queue_503 = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver_503);
+
+        let item_503_id = format!("queue-item-503-{}", uuid::Uuid::new_v4().as_simple());
+        let payload = serde_json::to_vec(&serde_json::json!({"test": "503"})).unwrap();
+
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+        )
+        .bind(&item_503_id)
+        .bind(&peer_did)
+        .bind("https://status503.example.com")
+        .bind("blue.catbird.mlsDS.deliverMessage")
+        .bind(&payload)
+        .bind("convo-test-503")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let item_503 = QueueItem {
+            id: item_503_id.clone(),
+            target_ds_did: peer_did.clone(),
+            target_endpoint: "https://status503.example.com".to_string(),
+            method: "blue.catbird.mlsDS.deliverMessage".to_string(),
+            payload: payload.clone(),
+            convo_id: "convo-test-503".to_string(),
+            retry_count: 0,
+            max_retries: 5,
+        };
+
+        let outbound = OutboundClient::new(1, 1);
+        let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
+
+        queue_503.process_item(&item_503, &outbound, auth_sign.as_ref()).await;
+        let (status_503, retry_count_503, next_retry_503): (String, i32, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT status, retry_count, next_retry_at FROM outbound_queue WHERE id = $1",
+        )
+        .bind(&item_503_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status_503, "pending", "503 must remain pending for retry");
+        assert_eq!(retry_count_503, 1, "Retry count must increment to 1 for 503");
+        assert!(next_retry_503 > chrono::Utc::now(), "next_retry_at must be in the future");
+
+        // 2. Resolver returning HTTP 404 (permanent / non-retryable)
+        let resolver_404 = Arc::new(
+            DsResolver::new(
+                pool.clone(),
+                http,
+                "did:web:self.example.com".to_string(),
+                "https://self.example.com".to_string(),
+                None,
+                3600,
+            )
+            .with_destination_resolver_hook(Arc::new(|_endpoint| {
+                Some(Box::pin(async {
+                    Err(FederationError::ResolutionFailed {
+                        did: "status-404-peer".to_string(),
+                        kind: crate::federation::ResolutionFailureKind::HttpStatus {
+                            status: 404,
+                            message: "Not Found".to_string(),
+                        },
+                    })
+                }))
+            })),
+        );
+        let queue_404 = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver_404);
+
+        let item_404_id = format!("queue-item-404-{}", uuid::Uuid::new_v4().as_simple());
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+        )
+        .bind(&item_404_id)
+        .bind(&peer_did)
+        .bind("https://status404.example.com")
+        .bind("blue.catbird.mlsDS.deliverMessage")
+        .bind(&payload)
+        .bind("convo-test-404")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let item_404 = QueueItem {
+            id: item_404_id.clone(),
+            target_ds_did: peer_did.clone(),
+            target_endpoint: "https://status404.example.com".to_string(),
+            method: "blue.catbird.mlsDS.deliverMessage".to_string(),
+            payload: payload.clone(),
+            convo_id: "convo-test-404".to_string(),
+            retry_count: 0,
+            max_retries: 5,
+        };
+
+        queue_404.process_item(&item_404, &outbound, auth_sign.as_ref()).await;
+        let (status_404, retry_count_404): (String, i32) = sqlx::query_as(
+            "SELECT status, retry_count FROM outbound_queue WHERE id = $1",
+        )
+        .bind(&item_404_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status_404, "failed", "404 must fail immediately");
+        assert_eq!(retry_count_404, 0, "Retry count must remain 0 for 404");
     }
 }

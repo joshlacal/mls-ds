@@ -15,7 +15,7 @@ pub mod upstream;
 
 pub use ack::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
-pub use errors::FederationError;
+pub use errors::{FederationError, ResolutionFailureKind};
 pub use mailbox::FederatedBackend;
 pub use receipt::*;
 pub use resolver::{DsEndpoint, DsResolver};

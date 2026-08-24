@@ -102,7 +102,7 @@ impl DeviceRecordClient {
             .checked_add(timeout)
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: "HTTP request deadline overflow".to_string(),
+                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request deadline overflow".to_string()),
             })?;
 
         // com.atproto.repo.listRecords
@@ -122,7 +122,10 @@ impl DeviceRecordClient {
         if !resp.status().is_success() {
             return Err(FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: format!("PDS returned status {}", resp.status()),
+                kind: super::errors::ResolutionFailureKind::HttpStatus {
+                    status: resp.status().as_u16(),
+                    message: format!("PDS returned status {}", resp.status()),
+                },
             });
         }
 
@@ -139,13 +142,13 @@ impl DeviceRecordClient {
             .and_then(|v| v.as_array())
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: "No 'records' field in listRecords response".to_string(),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload("No 'records' field in listRecords response".to_string()),
             })?;
 
         if records_json.len() > MAX_DEVICE_RECORDS {
             return Err(FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: format!("PDS returned more than {MAX_DEVICE_RECORDS} device records"),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("PDS returned more than {MAX_DEVICE_RECORDS} device records")),
             });
         }
 
@@ -184,7 +187,7 @@ impl DeviceRecordClient {
             .checked_add(timeout)
             .ok_or_else(|| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: "HTTP request deadline overflow".to_string(),
+                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request deadline overflow".to_string()),
             })?;
 
         let url = format!(
@@ -245,22 +248,60 @@ impl DeviceRecordClient {
             .await
             .map_err(|_| FederationError::ResolutionFailed {
                 did: did.to_string(),
-                reason: "HTTP request failed: outbound request deadline exceeded".to_string(),
+                kind: super::errors::ResolutionFailureKind::Timeout("HTTP request failed: outbound request deadline exceeded".to_string()),
             })?
-            .map_err(|error| FederationError::ResolutionFailed {
-                did: did.to_string(),
-                reason: format!("HTTP request failed: {error}"),
+            .map_err(|error| {
+                if error.is_timeout() {
+                    FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: super::errors::ResolutionFailureKind::Timeout(error.to_string()),
+                    }
+                } else if error.is_connect() {
+                    FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(error.to_string()),
+                    }
+                } else if let Some(status) = error.status() {
+                    FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: super::errors::ResolutionFailureKind::HttpStatus {
+                            status: status.as_u16(),
+                            message: error.to_string(),
+                        },
+                    }
+                } else {
+                    FederationError::Http(error)
+                }
             })
     }
 
     fn response_decode_error(did: &str, error: OutboundBodyError) -> FederationError {
-        let category = match error {
-            OutboundBodyError::InvalidJson(_) => "Invalid JSON response",
-            _ => "Response body rejected",
-        };
-        FederationError::ResolutionFailed {
-            did: did.to_string(),
-            reason: format!("{category}: {error}"),
+        match error {
+            OutboundBodyError::DeadlineExceeded => FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: super::errors::ResolutionFailureKind::Timeout("Response body read deadline exceeded".to_string()),
+            },
+            OutboundBodyError::ReadFailed(source) => {
+                if source.is_timeout() {
+                    FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: super::errors::ResolutionFailureKind::Timeout(format!("Response body read timed out: {source}")),
+                    }
+                } else {
+                    FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: super::errors::ResolutionFailureKind::ConnectionFailed(format!("Response body read failed: {source}")),
+                    }
+                }
+            }
+            OutboundBodyError::InvalidJson(_) => FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("Invalid JSON response: {error}")),
+            },
+            other => FederationError::ResolutionFailed {
+                did: did.to_string(),
+                kind: super::errors::ResolutionFailureKind::InvalidPayload(format!("Response body rejected: {other}")),
+            },
         }
     }
 }
@@ -331,9 +372,13 @@ mod tests {
 
     fn resolution_reason(error: FederationError) -> String {
         match error {
-            FederationError::ResolutionFailed { did, reason } => {
+            FederationError::ResolutionFailed { did, kind } => {
                 assert_eq!(did, TEST_DID);
-                reason
+                match kind {
+                    crate::federation::ResolutionFailureKind::InvalidPayload(msg) => msg,
+                    crate::federation::ResolutionFailureKind::HttpStatus { message, .. } => message,
+                    other => other.to_string(),
+                }
             }
             other => panic!("expected ResolutionFailed, got {other:?}"),
         }

@@ -31,7 +31,7 @@ pub async fn resolve(
     let did = crate::sqlx_jacquard::try_string_to_did(user_did).map_err(|e| {
         FederationError::ResolutionFailed {
             did: user_did.clone(),
-            reason: e,
+            kind: crate::federation::ResolutionFailureKind::InvalidDid(e),
         }
     })?;
 
@@ -41,7 +41,7 @@ pub async fn resolve(
         )
         .map_err(|e| FederationError::ResolutionFailed {
             did: user_did.clone(),
-            reason: format!("Invalid endpoint URI: {}", e),
+            kind: crate::federation::ResolutionFailureKind::InvalidUrl(format!("Invalid endpoint URI: {}", e)),
         })?;
 
     let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {

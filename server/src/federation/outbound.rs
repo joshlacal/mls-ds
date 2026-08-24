@@ -323,17 +323,22 @@ pub enum OutboundError {
 
     #[error("Invalid response from remote DS: {reason}")]
     InvalidResponse { reason: String },
+
+    #[error("Resolution failed for {did}: {kind}")]
+    ResolutionFailed {
+        did: String,
+        kind: super::errors::ResolutionFailureKind,
+    },
 }
 
 impl OutboundError {
     /// Whether this error is transient and the request should be retried.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::ConnectionFailed { .. } | Self::Timeout { .. } | Self::RequestFailed { .. } => {
-                true
-            }
+            Self::ConnectionFailed { .. } | Self::Timeout { .. } | Self::RequestFailed { .. } => true,
             Self::RemoteError { status, .. } => *status >= 500 || *status == 429,
             Self::InvalidResponse { .. } => false,
+            Self::ResolutionFailed { kind, .. } => kind.is_retryable(),
         }
     }
 }
@@ -633,8 +638,31 @@ mod tests {
             reason: "DNS resolution failed".into(),
         }
         .is_retryable());
-    }
 
+        assert!(OutboundError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: super::super::errors::ResolutionFailureKind::DnsTemporary("EAI_AGAIN".into()),
+        }
+        .is_retryable());
+
+        assert!(OutboundError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: super::super::errors::ResolutionFailureKind::DnsTimeout("lookup timeout".into()),
+        }
+        .is_retryable());
+
+        assert!(!OutboundError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: super::super::errors::ResolutionFailureKind::DnsNxdomain("NXDOMAIN".into()),
+        }
+        .is_retryable());
+
+        assert!(!OutboundError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: super::super::errors::ResolutionFailureKind::SsrfBlocked("Blocked private address".into()),
+        }
+        .is_retryable());
+    }
     #[test]
     fn test_invalid_response_not_retryable() {
         assert!(!OutboundError::InvalidResponse {

@@ -38,8 +38,11 @@ pub enum FederationError {
     #[error("Remote DS returned error: {status} {body}")]
     RemoteError { status: u16, body: String },
 
-    #[error("Resolution failed for {did}: {reason}")]
-    ResolutionFailed { did: String, reason: String },
+    #[error("Resolution failed for {did}: {kind}")]
+    ResolutionFailed {
+        did: String,
+        kind: ResolutionFailureKind,
+    },
 
     #[error("Conversation not found: {convo_id}")]
     ConversationNotFound { convo_id: String },
@@ -154,6 +157,102 @@ impl FederationError {
             _ => "conflict",
         }
     }
+
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::DsUnreachable { .. } => true,
+            Self::Http(err) => {
+                err.is_timeout()
+                    || err.is_connect()
+                    || err
+                        .status()
+                        .map(|s| s.as_u16() >= 500 || s.as_u16() == 429)
+                        .unwrap_or(false)
+            }
+            Self::RemoteError { status, .. } => *status >= 500 || *status == 429,
+            Self::ResolutionFailed { kind, .. } => kind.is_retryable(),
+            Self::Database(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionFailureKind {
+    #[error("DNS temporary failure: {0}")]
+    DnsTemporary(String),
+
+    #[error("DNS NXDOMAIN/not found: {0}")]
+    DnsNxdomain(String),
+
+    #[error("DNS lookup timed out: {0}")]
+    DnsTimeout(String),
+
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    #[error("HTTP status {status}: {message}")]
+    HttpStatus { status: u16, message: String },
+
+    #[error("Blocked by SSRF policy: {0}")]
+    SsrfBlocked(String),
+
+    #[error("Blocked by allowlist policy: {0}")]
+    AllowlistBlocked(String),
+
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(String),
+
+    #[error("Invalid DID: {0}")]
+    InvalidDid(String),
+
+    #[error("Invalid declaration record: {0}")]
+    InvalidDeclaration(String),
+
+    #[error("Invalid payload: {0}")]
+    InvalidPayload(String),
+
+    #[error("Service missing: {0}")]
+    ServiceMissing(String),
+
+    #[error("Redirect rejected: {0}")]
+    RedirectRejected(String),
+
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
+
+    #[error("Permanent error: {0}")]
+    Permanent(String),
+
+    #[error("Transient error: {0}")]
+    Transient(String),
+}
+
+impl ResolutionFailureKind {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::DnsTemporary(_)
+            | Self::DnsTimeout(_)
+            | Self::Timeout(_)
+            | Self::ConnectionFailed(_)
+            | Self::Transient(_) => true,
+            Self::HttpStatus { status, .. } => *status >= 500 || *status == 429,
+            Self::DnsNxdomain(_)
+            | Self::SsrfBlocked(_)
+            | Self::AllowlistBlocked(_)
+            | Self::InvalidUrl(_)
+            | Self::InvalidDid(_)
+            | Self::InvalidDeclaration(_)
+            | Self::InvalidPayload(_)
+            | Self::ServiceMissing(_)
+            | Self::RedirectRejected(_)
+            | Self::InvalidConfiguration(_)
+            | Self::Permanent(_) => false,
+        }
+    }
 }
 
 impl IntoResponse for FederationError {
@@ -243,7 +342,7 @@ mod tests {
         assert_eq!(
             FederationError::ResolutionFailed {
                 did: "x".into(),
-                reason: "y".into()
+                kind: ResolutionFailureKind::Permanent("y".into()),
             }
             .status_code(),
             StatusCode::BAD_GATEWAY
@@ -397,5 +496,113 @@ mod tests {
             .reason_code(),
             "queue_capacity_exceeded"
         );
+    }
+
+    #[test]
+    fn test_federation_error_retryability() {
+        assert!(FederationError::DsUnreachable {
+            endpoint: "https://ds.example.com".into(),
+            reason: "connection failed".into()
+        }.is_retryable());
+
+        assert!(FederationError::RemoteError {
+            status: 503,
+            body: "service unavailable".into()
+        }.is_retryable());
+
+        assert!(FederationError::RemoteError {
+            status: 429,
+            body: "rate limited".into()
+        }.is_retryable());
+
+        assert!(!FederationError::RemoteError {
+            status: 404,
+            body: "not found".into()
+        }.is_retryable());
+
+        // Transient resolution errors are retryable
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::DnsTimeout("DNS lookup timed out for host ds.example.com".into()),
+        }.is_retryable());
+
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::DnsTemporary("Failed to resolve host ds.example.com: Temporary failure in name resolution".into()),
+        }.is_retryable());
+
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::Timeout("outbound resolution: deadline exceeded".into()),
+        }.is_retryable());
+
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::ConnectionFailed("Connection refused".into()),
+        }.is_retryable());
+
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::HttpStatus { status: 503, message: "DID document server returned status 503".into() },
+        }.is_retryable());
+
+        assert!(FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::HttpStatus { status: 429, message: "Rate limit exceeded".into() },
+        }.is_retryable());
+
+        // Non-retryable resolution errors are NOT retryable
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::DnsNxdomain("Host ds.example.com not found".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::SsrfBlocked("Blocked non-global IP: 127.0.0.1".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::SsrfBlocked("Blocked private address: 10.0.0.1".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::AllowlistBlocked("Host ds.example.com is not in FEDERATION_OUTBOUND_HOST_ALLOWLIST".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::InvalidUrl("Invalid URL: relative URL without a base".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "invalid".into(),
+            kind: ResolutionFailureKind::InvalidDid("Invalid ATProto DID syntax: invalid".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::HttpStatus { status: 404, message: "DID document server returned status 404".into() },
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::ServiceMissing("No #atproto_mls service in DID document".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::InvalidDeclaration("Declaration record missing $type".into()),
+        }.is_retryable());
+
+        assert!(!FederationError::ResolutionFailed {
+            did: "did:web:ds.example.com".into(),
+            kind: ResolutionFailureKind::RedirectRejected("Redirect rejected".into()),
+        }.is_retryable());
+        assert!(!FederationError::AuthFailed {
+            reason: "unauthorized".into()
+        }.is_retryable());
     }
 }
