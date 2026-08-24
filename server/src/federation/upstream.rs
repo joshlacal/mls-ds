@@ -26,7 +26,8 @@ use crate::federation::service_auth::ServiceAuthClient;
 use crate::identity::canonical_did;
 use crate::realtime::sse::StreamEvent;
 use crate::util::outbound_body::{
-    decode_json_bounded, summarize_error_body, ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
+    decode_json_bounded, summarize_error_body, OutboundBodyError, ResponseBodyBudget,
+    ORDINARY_DS_CONTROL_MAX_BYTES,
 };
 
 // ---------------------------------------------------------------------------
@@ -192,11 +193,12 @@ impl UpstreamManager {
             auth: self.auth.clone(),
             http: self.http.clone(),
             self_did: self.self_did.clone(),
+            pool: self.pool.clone(),
+            resolver: self.resolver.clone(),
             tx,
             cancel,
             last_cursor,
         };
-
         tokio::spawn(upstream_reader_task(task_ctx));
 
         info!(
@@ -281,6 +283,8 @@ struct ReaderTaskContext {
     auth: Arc<ServiceAuthClient>,
     http: reqwest::Client,
     self_did: String,
+    pool: PgPool,
+    resolver: Arc<DsResolver>,
     tx: broadcast::Sender<StreamEvent>,
     cancel: CancellationToken,
     last_cursor: Arc<RwLock<Option<String>>>,
@@ -296,6 +300,18 @@ async fn upstream_reader_task(ctx: ReaderTaskContext) {
                 sequencer_did = ctx.sequencer_did,
                 "Upstream reader cancelled"
             );
+            return;
+        }
+
+        // Recheck peer policy immediately before connect/reconnect; denial stops/cancels reader
+        if let Err(e) = super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await {
+            warn!(
+                convo_id = ctx.convo_id,
+                sequencer_did = ctx.sequencer_did,
+                error = %e,
+                "Peer policy denied upstream connection before reconnect; cancelling upstream reader"
+            );
+            ctx.cancel.cancel();
             return;
         }
 
@@ -332,10 +348,19 @@ async fn upstream_reader_task(ctx: ReaderTaskContext) {
 
 /// Acquire ticket, connect WS, and stream events until disconnect.
 async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationError> {
-    // 1. Acquire subscription ticket from sequencer DS
-    let ticket = acquire_ticket(ctx).await?;
+    // 1. Recheck peer policy immediately before ticket and connect
+    super::peer_policy::enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did).await?;
 
-    // 2. Build WS URL
+    // 2. Revalidate and resolve pinned destination on each ticket/connect
+    let destination = ctx
+        .resolver
+        .resolve_endpoint_destination(&ctx.endpoint_url)
+        .await?;
+
+    // 3. Acquire subscription ticket from sequencer DS using pinned client
+    let ticket = acquire_ticket_pinned(ctx, &destination).await?;
+
+    // 4. Build WS URL
     let cursor_param = {
         let cursor = ctx.last_cursor.read().await;
         cursor
@@ -357,11 +382,40 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
     debug!(
         convo_id = ctx.convo_id,
         sequencer_did = ctx.sequencer_did,
+        host = %destination.host,
         "Connecting upstream WS"
     );
 
-    // 3. Connect with timeout
-    let connect_fut = tokio_tungstenite::connect_async(&ws_url);
+    // 5. Connect TCP directly to approved socket address from pinned destination
+    let mut tcp_stream = None;
+    let mut last_err = None;
+    for addr in &destination.addrs {
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                tcp_stream = Some(stream);
+                break;
+            }
+            Ok(Err(e)) => {
+                last_err = Some(format!("TCP connect to {addr} failed: {e}"));
+            }
+            Err(_) => {
+                last_err = Some(format!("TCP connect to {addr} timed out"));
+            }
+        }
+    }
+    let tcp_stream = tcp_stream.ok_or_else(|| FederationError::DsUnreachable {
+        endpoint: ctx.endpoint_url.clone(),
+        reason: last_err.unwrap_or_else(|| "No approved socket address reachable".to_string()),
+    })?;
+
+    // 6. Perform WebSocket handshake (handles TLS via rustls if wss://, retaining SNI and Host header)
+    let connect_fut = tokio_tungstenite::client_async_tls_with_config(
+        &ws_url,
+        tcp_stream,
+        None,
+        None,
+    );
     let (ws_stream, _response) = tokio::select! {
       result = connect_fut => result.map_err(|e| FederationError::DsUnreachable {
         endpoint: ctx.endpoint_url.clone(),
@@ -381,7 +435,6 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
         sequencer_did = ctx.sequencer_did,
         "Upstream WS connected"
     );
-
     let (mut write, mut read) = ws_stream.split();
 
     // 4. Read loop
@@ -429,13 +482,26 @@ async fn connect_and_stream(ctx: &ReaderTaskContext) -> Result<(), FederationErr
     Ok(())
 }
 
-/// Acquire a subscription ticket from the sequencer DS using service auth.
-async fn acquire_ticket(ctx: &ReaderTaskContext) -> Result<String, FederationError> {
-    acquire_ticket_with_timeout(ctx, TICKET_REQUEST_TIMEOUT).await
+/// Acquire a subscription ticket from the sequencer DS using service auth and pinned transport.
+async fn acquire_ticket_pinned(
+    ctx: &ReaderTaskContext,
+    destination: &super::resolver::ValidatedRemoteDestination,
+) -> Result<String, FederationError> {
+    acquire_ticket_with_timeout_pinned(ctx, destination, TICKET_REQUEST_TIMEOUT).await
 }
 
-async fn acquire_ticket_with_timeout(
+#[allow(dead_code)]
+async fn acquire_ticket(ctx: &ReaderTaskContext) -> Result<String, FederationError> {
+    let destination = ctx
+        .resolver
+        .resolve_endpoint_destination(&ctx.endpoint_url)
+        .await?;
+    acquire_ticket_pinned(ctx, &destination).await
+}
+
+async fn acquire_ticket_with_timeout_pinned(
     ctx: &ReaderTaskContext,
+    destination: &super::resolver::ValidatedRemoteDestination,
     timeout: Duration,
 ) -> Result<String, FederationError> {
     let started_at = tokio::time::Instant::now();
@@ -454,14 +520,26 @@ async fn acquire_ticket_with_timeout(
             reason: format!("Failed to sign ticket request: {e}"),
         })?;
 
-    let url = format!("{}/xrpc/{}", ctx.endpoint_url, TICKET_METHOD);
+    let url = format!("{}/xrpc/{}", ctx.endpoint_url.trim_end_matches('/'), TICKET_METHOD);
 
     let body = serde_json::json!({
       "convoId": ctx.convo_id,
     });
 
-    let send = ctx
-        .http
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .user_agent("catbird-mls-ds/1.0")
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&destination.host, &destination.addrs)
+        .build()
+        .map_err(|e| FederationError::DsUnreachable {
+            endpoint: ctx.endpoint_url.clone(),
+            reason: format!("Failed to build pinned ticket HTTP client: {e}"),
+        })?;
+
+    let send = client
         .post(&url)
         .bearer_auth(&token)
         .header("atproto-proxy", &ctx.self_did)
@@ -495,12 +573,32 @@ async fn acquire_ticket_with_timeout(
         ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
     )
     .await
-    .map_err(|error| FederationError::RemoteError {
-        status: 200,
-        body: format!("Failed to parse ticket response: {error}"),
+    .map_err(|error| match error {
+        OutboundBodyError::ReadFailed(source) if source.is_timeout() => {
+            FederationError::RemoteError {
+                status: 200,
+                body: "Ticket response body deadline exceeded".to_string(),
+            }
+        }
+        other => FederationError::RemoteError {
+            status: 200,
+            body: format!("Failed to parse ticket response: {other}"),
+        },
     })?;
 
     Ok(ticket_resp.ticket)
+}
+
+#[allow(dead_code)]
+async fn acquire_ticket_with_timeout(
+    ctx: &ReaderTaskContext,
+    timeout: Duration,
+) -> Result<String, FederationError> {
+    let destination = ctx
+        .resolver
+        .resolve_endpoint_destination(&ctx.endpoint_url)
+        .await?;
+    acquire_ticket_with_timeout_pinned(ctx, &destination, timeout).await
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +669,18 @@ mod tests {
 
     fn ticket_context(endpoint_url: String) -> ReaderTaskContext {
         let (tx, _) = broadcast::channel(1);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http.clone(),
+            "did:web:local.test".to_string(),
+            "https://local.test".to_string(),
+            None,
+            3600,
+        ));
         ReaderTaskContext {
             key: UpstreamKey {
                 sequencer_did: "did:web:sequencer.test".into(),
@@ -583,8 +693,10 @@ mod tests {
                 "did:web:local.test".into(),
                 b"test-only-secret",
             )),
-            http: reqwest::Client::new(),
+            http,
             self_did: "did:web:local.test".into(),
+            pool,
+            resolver,
             tx,
             cancel: CancellationToken::new(),
             last_cursor: Arc::new(RwLock::new(None)),
@@ -865,18 +977,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_upstream_subscribe_denies_untrusted_peer_before_resolution() {
-        let database_url = match std::env::var("TEST_DATABASE_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!("Skipping upstream peer policy test: TEST_DATABASE_URL not set");
-                return;
-            }
-        };
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for upstream peer policy test");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)
             .await
             .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
+
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+
         let http_client = reqwest::Client::new();
         let resolver = Arc::new(DsResolver::new(
             pool.clone(),
@@ -914,5 +1034,78 @@ mod tests {
             }
             other => panic!("expected AuthFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_reconnect_stops_when_peer_policy_revoked() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for upstream revocation test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+        let peer_did = format!("did:web:revoked-up-{}.example.com", uuid::Uuid::new_v4().as_simple());
+
+        // Insert peer as blocked
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'block', 0, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'block'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http.clone(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        ));
+        let auth = Arc::new(ServiceAuthClient::from_shared_secret(
+            "did:web:self.example.com".into(),
+            b"test-secret",
+        ));
+        let cancel = CancellationToken::new();
+        let (tx, _) = broadcast::channel(100);
+
+        let ctx = ReaderTaskContext {
+            key: UpstreamKey {
+                sequencer_did: peer_did.clone(),
+                convo_id: "convo-test".to_string(),
+            },
+            endpoint_url: "https://revoked.example.com".to_string(),
+            sequencer_did: peer_did.clone(),
+            convo_id: "convo-test".to_string(),
+            auth,
+            http,
+            self_did: "did:web:self.example.com".to_string(),
+            pool,
+            resolver,
+            tx,
+            cancel: cancel.clone(),
+            last_cursor: Arc::new(RwLock::new(None)),
+        };
+
+        // Running upstream_reader_task must observe peer policy denial and cancel immediately
+        upstream_reader_task(ctx).await;
+        assert!(cancel.is_cancelled(), "reader task must cancel itself when peer policy is revoked");
     }
 }

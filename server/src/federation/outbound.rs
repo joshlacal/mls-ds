@@ -13,9 +13,12 @@ use crate::util::outbound_body::{
 
 const REMOTE_DS: &str = "remote DS";
 
+use super::resolver::ValidatedRemoteDestination;
+
 /// HTTP client for outbound DS-to-DS calls.
 pub struct OutboundClient {
     http: Client,
+    connect_timeout: Duration,
     request_timeout: Duration,
 }
 
@@ -50,6 +53,7 @@ impl OutboundClient {
 
         Self {
             http,
+            connect_timeout: Duration::from_secs(connect_timeout_secs),
             request_timeout: Duration::from_secs(request_timeout_secs),
         }
     }
@@ -68,6 +72,45 @@ impl OutboundClient {
 
         let send = self
             .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {auth_token}"))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
+            .await
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+
+        parse_response(resp, method, deadline).await
+    }
+
+    /// Make an authenticated XRPC procedure call to a remote DS with pinned SSRF-validated socket addresses.
+    pub async fn call_procedure_pinned(
+        &self,
+        destination: &ValidatedRemoteDestination,
+        method: &str,
+        auth_token: &str,
+        body: &impl Serialize,
+    ) -> Result<DsResponse, OutboundError> {
+        let endpoint = destination.url.as_str().trim_end_matches('/');
+        let url = format!("{}/xrpc/{}", endpoint, method);
+        debug!(method, host = %destination.host, "Outbound pinned DS call");
+        let deadline = self.deadline(method)?;
+
+        let client = Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .user_agent("catbird-mls-ds/1.0")
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&destination.host, &destination.addrs)
+            .build()
+            .map_err(|e| OutboundError::RequestFailed {
+                endpoint: destination.host.clone(),
+                reason: format!("Failed to build pinned HTTP client: {e}"),
+            })?;
+        let send = client
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
             .header("Content-Type", "application/json")

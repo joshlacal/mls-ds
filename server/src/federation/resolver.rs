@@ -55,6 +55,173 @@ fn declaration_record_url(pds_endpoint: &str, user_did: &str) -> String {
 ///    - No public port in production; development port on localhost allowed only under APP_ENV=test.
 ///    - Hostname must be valid with no special or malformed characters.
 /// 7. Canonical round-trip must match: `canonical_did(raw) == raw`.
+pub fn validate_canonical_did_web_host(host: &str, raw: &str) -> Result<String, FederationError> {
+    if host.is_empty() {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("Empty host in did:web: '{raw}'"),
+        });
+    }
+
+    // Reject uppercase characters
+    if host.chars().any(char::is_uppercase) {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host must be lowercase ASCII: '{raw}'"),
+        });
+    }
+
+    // Reject percent-encoding
+    if host.contains('%') {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host must not contain percent-encoding: '{raw}'"),
+        });
+    }
+
+    // Reject path, query, fragment, auth delimiters
+    if host.contains('/') || host.contains('\\') || host.contains('?') || host.contains('#') || host.contains('@') {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host contains forbidden path/auth delimiter: '{raw}'"),
+        });
+    }
+
+    // Check for port in production vs test
+    let (hostname, port_opt) = if let Some((h, p_str)) = host.split_once(':') {
+        let p = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("Invalid port in did:web: '{raw}'"),
+        })?;
+        if p == 0 {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("Zero port in did:web: '{raw}'"),
+            });
+        }
+        (h, Some(p))
+    } else {
+        (host, None)
+    };
+
+    let is_app_env_test = std::env::var("APP_ENV")
+        .map(|v| v.eq_ignore_ascii_case("test"))
+        .unwrap_or(false);
+    let is_localhost = hostname.eq_ignore_ascii_case("localhost")
+        || hostname == "127.0.0.1"
+        || hostname.to_ascii_lowercase().ends_with(".localhost");
+
+    if port_opt.is_some() {
+        if !(is_app_env_test && allow_insecure_http() && is_localhost) {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("Port in did:web is only allowed for localhost in test environment: '{raw}'"),
+            });
+        }
+    }
+
+    // Reject trailing dot, leading dot, consecutive dots
+    if hostname.starts_with('.') || hostname.ends_with('.') {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host must not have leading or trailing dot: '{raw}'"),
+        });
+    }
+
+    if hostname.contains("..") {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host must not contain empty labels: '{raw}'"),
+        });
+    }
+
+    if hostname.len() > 253 {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host exceeds 253 characters: '{raw}'"),
+        });
+    }
+
+    // Validate DNS labels
+    let labels: Vec<&str> = hostname.split('.').collect();
+    if labels.is_empty() {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web host has no labels: '{raw}'"),
+        });
+    }
+
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("Invalid label length in did:web host: '{raw}'"),
+            });
+        }
+
+        // Reject underscores
+        if label.contains('_') {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("did:web host labels must not contain underscores: '{raw}'"),
+            });
+        }
+
+        // Reject leading or trailing hyphens in labels
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("did:web host label has leading or trailing hyphen: '{raw}'"),
+            });
+        }
+
+        // Reject non-alphanumeric/hyphen characters
+        if !label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("did:web host label contains invalid characters: '{raw}'"),
+            });
+        }
+    }
+
+    // Lowercase / IDNA roundtrip check via url::Host parser
+    let host_parsed = url::Host::parse(hostname).map_err(|e| FederationError::ResolutionFailed {
+        did: raw.to_string(),
+        reason: format!("IDNA host parsing failed for did:web host '{hostname}': {e}"),
+    })?;
+    if let url::Host::Domain(domain) = &host_parsed {
+        if domain != hostname {
+            return Err(FederationError::ResolutionFailed {
+                did: raw.to_string(),
+                reason: format!("did:web host does not match canonical IDNA ASCII representation: '{hostname}' vs '{domain}'"),
+            });
+        }
+    }
+
+    // URL parser check
+    let check_url = url::Url::parse(&format!("https://{host}"))
+        .map_err(|e| FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("URL parsing failed for did:web host '{host}': {e}"),
+        })?;
+    if check_url.host_str().unwrap_or("") != hostname {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("URL parsed host does not match did:web host: '{host}'"),
+        });
+    }
+
+    let canonical = crate::identity::canonical_did(raw);
+    if canonical != raw {
+        return Err(FederationError::ResolutionFailed {
+            did: raw.to_string(),
+            reason: format!("did:web not in canonical form: '{raw}'"),
+        });
+    }
+
+    Ok(canonical.to_string())
+}
+
 pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
     if raw.is_empty() || raw.trim() != raw || raw.chars().any(char::is_whitespace) {
         return Err(FederationError::ResolutionFailed {
@@ -97,76 +264,8 @@ pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
     }
 
     // 3. Hostname-level did:web validation
-    if let Some(_web_suffix) = raw.strip_prefix("did:web:") {
-        if let Some((host_port, path_segments)) = crate::identity::parse_did_web(raw) {
-            if !path_segments.is_empty() {
-                return Err(FederationError::ResolutionFailed {
-                    did: raw.to_string(),
-                    reason: format!("did:web with path segments is not allowed: '{raw}'"),
-                });
-            }
-
-            let (host, port_opt) = if let Some((h, p_str)) = host_port.split_once(':') {
-                let p = p_str.parse::<u16>().map_err(|_| FederationError::ResolutionFailed {
-                    did: raw.to_string(),
-                    reason: format!("Invalid port in did:web: '{raw}'"),
-                })?;
-                if p == 0 {
-                    return Err(FederationError::ResolutionFailed {
-                        did: raw.to_string(),
-                        reason: format!("Zero port in did:web: '{raw}'"),
-                    });
-                }
-                (h, Some(p))
-            } else {
-                (host_port.as_str(), None)
-            };
-
-            let is_app_env_test = std::env::var("APP_ENV")
-                .map(|v| v.eq_ignore_ascii_case("test"))
-                .unwrap_or(false);
-            let is_localhost = host.eq_ignore_ascii_case("localhost")
-                || host == "127.0.0.1"
-                || host.to_ascii_lowercase().ends_with(".localhost");
-
-            // Port in did:web is rejected in production; allowed only on localhost in test mode
-            if port_opt.is_some() {
-                if !(is_app_env_test && allow_insecure_http() && is_localhost) {
-                    return Err(FederationError::ResolutionFailed {
-                        did: raw.to_string(),
-                        reason: format!("Port in did:web is only allowed for localhost in test environment: '{raw}'"),
-                    });
-                }
-            }
-
-            // Validate host
-            if host.is_empty()
-                || host.contains('/')
-                || host.contains('\\')
-                || host.contains('@')
-                || host.contains('%')
-            {
-                return Err(FederationError::ResolutionFailed {
-                    did: raw.to_string(),
-                    reason: format!("Invalid host in did:web: '{raw}'"),
-                });
-            }
-
-            let canonical = crate::identity::canonical_did(raw);
-            if canonical != raw {
-                return Err(FederationError::ResolutionFailed {
-                    did: raw.to_string(),
-                    reason: format!("did:web not in canonical form: '{raw}'"),
-                });
-            }
-
-            return Ok(canonical.to_string());
-        } else {
-            return Err(FederationError::ResolutionFailed {
-                did: raw.to_string(),
-                reason: format!("Could not parse did:web: '{raw}'"),
-            });
-        }
+    if let Some(web_suffix) = raw.strip_prefix("did:web:") {
+        return validate_canonical_did_web_host(web_suffix, raw);
     }
 
     Err(FederationError::ResolutionFailed {
@@ -542,6 +641,22 @@ impl DsResolver {
         let _ = self.cache_endpoint(&endpoint).await;
 
         Ok(endpoint)
+    }
+    /// Resolve a target DS DID directly to a validated remote destination with pinned socket addrs.
+    pub async fn resolve_ds_destination(
+        &self,
+        ds_did: &str,
+    ) -> Result<ValidatedRemoteDestination, FederationError> {
+        let endpoint = self.resolve_ds_did(ds_did).await?;
+        validate_and_resolve_destination(&endpoint.endpoint, None).await
+    }
+
+    /// Resolve an endpoint URL directly to a validated remote destination with pinned socket addrs.
+    pub async fn resolve_endpoint_destination(
+        &self,
+        endpoint_url: &str,
+    ) -> Result<ValidatedRemoteDestination, FederationError> {
+        validate_and_resolve_destination(endpoint_url, None).await
     }
 
     /// Look up cached endpoint for an actor DID from did_ds_mappings joined with ds_endpoints.
@@ -1318,23 +1433,89 @@ fn derive_ds_did_from_https_endpoint(endpoint: &str) -> Option<String> {
     }
 }
 
+/// Returns `true` if an IPv4 address is non-global (private, loopback, link-local, unspecified, CGNAT, documentation, benchmarking, multicast, or reserved/broadcast).
+pub fn is_non_global_ipv4(v4: &std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    // 0.0.0.0/8 (unspecified / "this host on this network", RFC 1122)
+    octets[0] == 0
+        // 10.0.0.0/8 (RFC 1918 private)
+        || octets[0] == 10
+        // 127.0.0.0/8 (loopback, RFC 1122)
+        || octets[0] == 127
+        // 100.64.0.0/10 (CGNAT / Shared Address Space, RFC 6598: 100.64.0.0 - 100.127.255.255)
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        // 169.254.0.0/16 (link-local, RFC 3927)
+        || (octets[0] == 169 && octets[1] == 254)
+        // 172.16.0.0/12 (RFC 1918 private: 172.16.0.0 - 172.31.255.255)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        // 192.0.0.0/24 (IETF protocol assignments, RFC 6890)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        // 192.0.2.0/24 (TEST-NET-1 documentation, RFC 5737)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        // 192.88.99.0/24 (6to4 Relay Anycast deprecated, RFC 7526)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        // 192.168.0.0/16 (RFC 1918 private)
+        || (octets[0] == 192 && octets[1] == 168)
+        // 198.18.0.0/15 (benchmarking, RFC 2544: 198.18.0.0 - 198.19.255.255)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        // 198.51.100.0/24 (TEST-NET-2 documentation, RFC 5737)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        // 203.0.113.0/24 (TEST-NET-3 documentation, RFC 5737)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        // 224.0.0.0/4 (multicast, RFC 5771) & 240.0.0.0/4 (reserved / Class E / broadcast, RFC 1112)
+        || octets[0] >= 224
+}
+
+/// Returns `true` if an IPv6 address is non-global (private, loopback, link-local, unspecified, unique local, IPv4-mapped/compatible non-global, NAT64 non-global, documentation, benchmarking, or discard).
+pub fn is_non_global_ipv6(v6: &std::net::Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    // 1. IPv4-mapped IPv6: ::ffff:0:0/96 (RFC 4291)
+    if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+        return is_non_global_ipv4(&mapped_v4);
+    }
+    if let [0, 0, 0, 0, 0, 0xffff, high, low] = segments {
+        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        return is_non_global_ipv4(&v4);
+    }
+    // 2. IPv4-compatible IPv6 (deprecated RFC 4291): [0, 0, 0, 0, 0, 0, high, low]
+    if let [0, 0, 0, 0, 0, 0, high, low] = segments {
+        if high == 0 && low == 1 {
+            return true; // ::1 loopback
+        }
+        if high == 0 && low == 0 {
+            return true; // :: unspecified
+        }
+        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        return is_non_global_ipv4(&v4);
+    }
+    // 3. NAT64 well-known prefix: 64:ff9b::/96 (RFC 6052)
+    if let [0x64, 0xff9b, 0, 0, 0, 0, high, low] = segments {
+        let v4 = std::net::Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8);
+        return is_non_global_ipv4(&v4);
+    }
+    // 4. Standard IPv6 checks
+    if v6.is_unspecified()
+        || v6.is_loopback()
+        || v6.is_multicast()
+        || v6.is_unicast_link_local()
+        || (segments[0] & 0xfe00) == 0xfc00 // Unique Local (fc00::/7)
+        || (segments[0] & 0xffc0) == 0xfec0 // Site-Local (fec0::/10)
+        || matches!(segments, [0x0100, 0, 0, 0, ..]) // Discard prefix (100::/64)
+        || matches!(segments, [0x2001, 0x0db8, ..]) // Documentation (2001:db8::/32)
+        || matches!(segments, [0x2001, 0x0002, ..]) // Benchmarking (2001:2::/48)
+        || matches!(segments, [0x2002, ..]) // 6to4 (2002::/16)
+    {
+        return true;
+    }
+    // Global unicast space must be within 2000::/3
+    (segments[0] & 0xe000) != 0x2000
+}
+
 /// Returns `true` if the IP is private, loopback, link-local, or unspecified.
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_unspecified()
-                || v4.is_link_local()
-                || v4.is_multicast()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_multicast()
-                || v6.is_unicast_link_local()
-        }
+        std::net::IpAddr::V4(v4) => is_non_global_ipv4(v4),
+        std::net::IpAddr::V6(v6) => is_non_global_ipv6(v6),
     }
 }
 
@@ -2081,6 +2262,7 @@ mod tests {
     #[test]
     fn test_loopback_v4_is_private() {
         assert!(is_private_ip(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"127.1.2.3".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -2097,7 +2279,57 @@ mod tests {
     #[test]
     fn test_172_16_is_private() {
         assert!(is_private_ip(&"172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"172.31.255.254".parse::<IpAddr>().unwrap()));
     }
+
+    #[test]
+    fn test_ipv4_cgnat_and_link_local_and_nonglobal() {
+        // CGNAT (100.64.0.0/10)
+        assert!(is_private_ip(&"100.64.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"100.127.255.254".parse::<IpAddr>().unwrap()));
+        // Link-local
+        assert!(is_private_ip(&"169.254.1.1".parse::<IpAddr>().unwrap()));
+        // Documentation / benchmarking / multicast / broadcast / 0.0.0.0
+        assert!(is_private_ip(&"0.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"192.0.2.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"198.18.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"198.51.100.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"203.0.113.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"224.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"240.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"255.255.255.255".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_is_properly_classified_and_rejected() {
+        // Mapped loopback
+        assert!(is_private_ip(&"::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:127.0.0.2".parse::<IpAddr>().unwrap()));
+        // Mapped RFC 1918
+        assert!(is_private_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()));
+        // Mapped link-local
+        assert!(is_private_ip(&"::ffff:169.254.1.1".parse::<IpAddr>().unwrap()));
+        // Mapped CGNAT
+        assert!(is_private_ip(&"::ffff:100.64.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:100.127.255.254".parse::<IpAddr>().unwrap()));
+        // Mapped non-global / doc / multicast / 0.0.0.0
+        assert!(is_private_ip(&"::ffff:0.0.0.0".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:192.0.2.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:198.18.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:198.51.100.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:203.0.113.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:224.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:240.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(&"::ffff:255.255.255.255".parse::<IpAddr>().unwrap()));
+
+        // Mapped public global IPs must NOT be private
+        assert!(!is_private_ip(&"::ffff:8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"::ffff:93.184.216.34".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_ip(&"::ffff:1.1.1.1".parse::<IpAddr>().unwrap()));
+    }
+
     #[tokio::test]
     async fn test_ssrf_rejects_direct_private_ip_even_if_allowlisted() {
         let allowlist = vec!["127.0.0.1".to_string()];
@@ -2419,10 +2651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_fresh_cache_short_circuits() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool,
@@ -2455,10 +2684,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_expired_cache_degraded_after_live_failure() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -2470,23 +2696,23 @@ mod tests {
         );
 
         let actor_did = format!("did:key:{}", Uuid::new_v4().as_simple());
-        let ds_did = "did:web:stale-ds.example.com";
+        let ds_did = format!("did:web:stale-ds-{}.example.com", Uuid::new_v4().as_simple());
+        let stale_endpoint = format!("https://stale-ds-{}.example.com", Uuid::new_v4().as_simple());
         sqlx::query(
             "INSERT INTO ds_endpoints (did, endpoint, supported_cipher_suites, resolved_at, expires_at) \
              VALUES ($1, $2, NULL, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
         )
-        .bind(ds_did)
-        .bind("https://stale-ds.example.com")
+        .bind(&ds_did)
+        .bind(&stale_endpoint)
         .execute(&pool)
         .await
         .expect("expired endpoint insert succeeds");
-
         sqlx::query(
             "INSERT INTO did_ds_mappings (actor_did, ds_did, resolved_at, expires_at) \
              VALUES ($1, $2, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
         )
         .bind(&actor_did)
-        .bind(ds_did)
+        .bind(&ds_did)
         .execute(&pool)
         .await
         .expect("expired mapping insert succeeds");
@@ -2495,16 +2721,13 @@ mod tests {
         assert_eq!(outcome, "cache_stale_degraded");
         assert_eq!(
             result.expect("degraded resolution succeeds").endpoint,
-            "https://stale-ds.example.com"
+            stale_endpoint
         );
     }
 
     #[tokio::test]
     async fn test_resolve_default_fallback_when_no_cache() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool,
@@ -2526,10 +2749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_hard_failure_without_default() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::with_defaults(
             pool,
@@ -2550,35 +2770,33 @@ mod tests {
         ));
     }
 
-    async fn setup_cache_test_pool() -> Option<PgPool> {
-        let database_url = std::env::var("TEST_DATABASE_URL").ok()?;
-        let pool = match PgPoolOptions::new()
-            .max_connections(2)
+    async fn setup_cache_test_pool() -> PgPool {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for database integration tests");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
             .connect(&database_url)
             .await
-        {
-            Ok(pool) => pool,
-            Err(err) => {
-                eprintln!("Skipping cache test: failed to connect to TEST_DATABASE_URL ({err})");
-                return None;
-            }
-        };
+            .expect("failed to connect to TEST_DATABASE_URL");
 
-        // Run migrations
-        if let Err(err) = sqlx::migrate!("./migrations").run(&pool).await {
-            eprintln!("Skipping cache test: migration run error ({err})");
-            return None;
-        }
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migration run failed in setup_cache_test_pool");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
 
-        Some(pool)
+        pool
     }
 
     #[tokio::test]
     async fn test_cache_refresh_and_invalidate() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -2643,10 +2861,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_table_cache_actor_mapping_and_ds_queue_lookup() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -2725,10 +2940,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_fallback_has_real_ds_identity() {
-        let Some(pool) = setup_cache_test_pool().await else {
-            eprintln!("Skipping cache test: TEST_DATABASE_URL not set");
-            return;
-        };
+        let pool = setup_cache_test_pool().await;
 
         // 1. Test HTTPS URL fallback derives did:web:<host>
         let resolver = DsResolver::with_defaults(
@@ -2774,16 +2986,59 @@ mod tests {
             validate_declaration_delivery_service("did:web:chat.catbird.blue").unwrap(),
             "did:web:chat.catbird.blue"
         );
+        assert_eq!(
+            validate_declaration_delivery_service("did:web:ds1.local").unwrap(),
+            "did:web:ds1.local"
+        );
+        assert_eq!(
+            validate_declaration_delivery_service("did:web:example.com").unwrap(),
+            "did:web:example.com"
+        );
         // Valid did:plc
         assert_eq!(
             validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur").unwrap(),
             "did:plc:z72i7hdynmk6r22z27h6tvur"
         );
 
-        // Rejections:
-        // Public port in did:web rejected in production
+        // Rejections for Finding 3:
+        // Uppercase rejected
+        assert!(validate_declaration_delivery_service("did:web:Chat.Catbird.blue").is_err());
+        assert!(validate_declaration_delivery_service("did:web:CHAT.CATBIRD.BLUE").is_err());
+        assert!(validate_declaration_delivery_service("did:web:chat.Catbird.blue").is_err());
+
+        // Trailing dot rejected
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue.").is_err());
+        // Leading dot rejected
+        assert!(validate_declaration_delivery_service("did:web:.chat.catbird.blue").is_err());
+        // Empty labels / double dot rejected
+        assert!(validate_declaration_delivery_service("did:web:chat..catbird.blue").is_err());
+
+        // Underscores rejected
+        assert!(validate_declaration_delivery_service("did:web:chat_service.catbird.blue").is_err());
+        assert!(validate_declaration_delivery_service("did:web:_chat.catbird.blue").is_err());
+
+        // Hyphen violations (leading/trailing in label) rejected
+        assert!(validate_declaration_delivery_service("did:web:-chat.catbird.blue").is_err());
+        assert!(validate_declaration_delivery_service("did:web:chat-.catbird.blue").is_err());
+        assert!(validate_declaration_delivery_service("did:web:-.catbird.blue").is_err());
+        // Internal hyphens are valid
+        assert_eq!(
+            validate_declaration_delivery_service("did:web:chat-service.catbird.blue").unwrap(),
+            "did:web:chat-service.catbird.blue"
+        );
+
+        // Path rejected
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue/path").is_err());
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue/").is_err());
+
+        // Port in did:web rejected in production
+        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue:8443").is_err());
         assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A8443").is_err());
-        // Rejections:
+
+        // Percent encoding rejected
+        assert!(validate_declaration_delivery_service("did:web:chat%2ecatbird.blue").is_err());
+        assert!(validate_declaration_delivery_service("did:web:chat%20catbird.blue").is_err());
+
         // Fragment not allowed
         assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue#atproto_mls").is_err());
         assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvur#fragment").is_err());
@@ -2803,13 +3058,7 @@ mod tests {
         // Invalid did:plc length or chars
         assert!(validate_declaration_delivery_service("did:plc:short").is_err());
         assert!(validate_declaration_delivery_service("did:plc:z72i7hdynmk6r22z27h6tvu8").is_err()); // '8' is not base32 [a-z2-7]
-
-        // Invalid did:web ports
-        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A99999").is_err()); // port > 65535
-        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3A0").is_err()); // port 0
-        assert!(validate_declaration_delivery_service("did:web:chat.catbird.blue%3Anotanumber").is_err());
     }
-
     // -- Production Helper Tests: Declaration Record Value Validation --
 
     #[test]
@@ -2978,23 +3227,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err_direct, FederationError::ResolutionFailed { .. }));
-
-        // 2. If DB available, test resolve_ds_did rejects unresolvable DS DID
-        if let Some(pool) = setup_cache_test_pool().await {
-            let resolver = DsResolver::new(
-                pool,
-                reqwest::Client::new(),
-                "did:web:self.example.com".to_string(),
-                "https://self.example.com".to_string(),
-                Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
-                3600,
-            );
-            let err = resolver
-                .resolve_ds_did("did:key:unresolvable")
-                .await
-                .unwrap_err();
-            assert!(matches!(err, FederationError::ResolutionFailed { .. }));
-        }
+        let pool = setup_cache_test_pool().await;
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            Some(("did:web:default-ds.example.com".to_string(), "https://default-ds.example.com".to_string())),
+            3600,
+        );
+        let err = resolver
+            .resolve_ds_did("did:key:unresolvable")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FederationError::ResolutionFailed { .. }));
     }
 
     #[tokio::test]
@@ -3214,28 +3460,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_purges_legacy_actor_keyed_ds_endpoints_row() {
-        let database_url = match std::env::var("TEST_DATABASE_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!("Skipping migration test: TEST_DATABASE_URL not set");
-                return;
-            }
-        };
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for migration test");
 
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)
             .await
             .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
-
+        let mut conn = pool.acquire().await.expect("acquire connection for migration test");
         let schema_name = format!("test_mig_{}", Uuid::new_v4().as_simple());
         sqlx::query(&format!("CREATE SCHEMA {schema_name};"))
-            .execute(&pool)
+            .execute(&mut *conn)
             .await
             .expect("create test schema");
 
-        sqlx::query(&format!("SET search_path TO {schema_name}, public;"))
-            .execute(&pool)
+        sqlx::query(&format!("SET search_path TO {schema_name};"))
+            .execute(&mut *conn)
             .await
             .expect("set search path");
 
@@ -3249,7 +3490,7 @@ mod tests {
                 expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '1 hour'
             );",
         )
-        .execute(&pool)
+        .execute(&mut *conn)
         .await
         .expect("create pre-migration table");
 
@@ -3259,28 +3500,28 @@ mod tests {
              VALUES ($1, 'https://legacy.example.com', NULL, NOW(), NOW() + INTERVAL '1 hour');",
         )
         .bind(&actor_did)
-        .execute(&pool)
+        .execute(&mut *conn)
         .await
         .expect("insert legacy actor-keyed row");
 
         // Apply target migration SQL once into the isolated schema
         let migration_sql = include_str!("../../migrations/20260824000002_chat_actor_ds_mapping.sql");
         sqlx::raw_sql(migration_sql)
-            .execute(&pool)
+            .execute(&mut *conn)
             .await
             .expect("applying migration SQL in isolated schema must succeed");
 
         // Assert legacy row is gone from ds_endpoints
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ds_endpoints WHERE did = $1")
             .bind(&actor_did)
-            .fetch_one(&pool)
+            .fetch_one(&mut *conn)
             .await
             .expect("query count of legacy row");
         assert_eq!(count, 0, "legacy actor-keyed row must be purged by migration");
 
         // Cleanup isolated schema
         let _ = sqlx::query(&format!("DROP SCHEMA {schema_name} CASCADE;"))
-            .execute(&pool)
+            .execute(&mut *conn)
             .await;
     }
 }

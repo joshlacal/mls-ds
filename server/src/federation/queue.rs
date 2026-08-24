@@ -5,12 +5,13 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::errors::FederationError;
-use super::outbound::{OutboundClient, OutboundError};
-use super::peer_policy;
-use super::resolver::DsResolver;
 use crate::auth::AuthMiddleware;
 use crate::identity::canonical_did;
+use super::errors::FederationError;
+use super::outbound::{DsResponse, OutboundClient, OutboundError};
+use super::peer_policy;
+use super::resolver::{DsResolver, ValidatedRemoteDestination};
+
 const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV: &str =
     "FEDERATION_OUTBOUND_QUEUE_PER_PEER_PENDING_CAP";
 const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV: &str =
@@ -346,14 +347,27 @@ impl OutboundQueue {
         outbound: &OutboundClient,
         auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     ) {
-        let target_endpoint = match self.resolve_target_endpoint(item).await {
-            Ok(endpoint) => endpoint,
+        // 1. Recheck peer policy immediately before send; denial stops/cancels delivery
+        if let Err(e) = peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did).await {
+            warn!(
+                queue_id = %item.id,
+                target_ds = %item.target_ds_did,
+                error = %e,
+                "Peer policy denied outbound delivery for queued item; cancelling delivery"
+            );
+            let _ = self.mark_failed(&item.id, &format!("Peer policy denied: {e}")).await;
+            return;
+        }
+
+        // 2. Revalidate and resolve pinned destination on every retry
+        let destination = match self.resolve_target_destination(item).await {
+            Ok(dest) => dest,
             Err(e) => {
                 error!(
                     queue_id = %item.id,
                     target_ds = %item.target_ds_did,
                     error = %e,
-                    "Unable to resolve target endpoint for queued delivery"
+                    "Unable to resolve pinned target destination for queued delivery"
                 );
                 let _ = self.mark_failed(&item.id, &e.to_string()).await;
                 return;
@@ -384,7 +398,7 @@ impl OutboundQueue {
         let expected_sequencer_term = extract_expected_sequencer_term(&item.method, &body);
 
         match outbound
-            .call_procedure(&target_endpoint, &item.method, &token, &body)
+            .call_procedure_pinned(&destination, &item.method, &token, &body)
             .await
         {
             Ok(resp) if resp.accepted => {
@@ -506,19 +520,39 @@ impl OutboundQueue {
             }
         }
     }
-    async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
+    async fn resolve_target_destination(&self, item: &QueueItem) -> Result<ValidatedRemoteDestination, OutboundError> {
         let canonical_target_ds_did = canonical_did(&item.target_ds_did).to_string();
 
-        let endpoint = self
-            .resolver
-            .resolve_ds_did(&canonical_target_ds_did)
-            .await
-            .map_err(|e| OutboundError::RequestFailed {
-                endpoint: canonical_target_ds_did.clone(),
-                reason: format!("Could not resolve DS DID: {e}"),
-            })?;
+        if !canonical_target_ds_did.is_empty() {
+            match self.resolver.resolve_ds_destination(&canonical_target_ds_did).await {
+                Ok(dest) => return Ok(dest),
+                Err(e) => {
+                    debug!(
+                        queue_id = %item.id,
+                        target_ds = %item.target_ds_did,
+                        error = %e,
+                        "resolve_ds_destination failed, attempting stored endpoint"
+                    );
+                }
+            }
+        }
 
-        Ok(endpoint.endpoint)
+        if !item.target_endpoint.is_empty() {
+            return self.resolver.resolve_endpoint_destination(&item.target_endpoint).await.map_err(|e| OutboundError::RequestFailed {
+                endpoint: item.target_endpoint.clone(),
+                reason: format!("Could not validate and resolve destination: {e}"),
+            });
+        }
+
+        Err(OutboundError::RequestFailed {
+            endpoint: canonical_target_ds_did,
+            reason: "Could not resolve target DS DID to pinned destination".to_string(),
+        })
+    }
+
+    pub(crate) async fn resolve_target_endpoint(&self, item: &QueueItem) -> Result<String, OutboundError> {
+        let dest = self.resolve_target_destination(item).await?;
+        Ok(dest.url.as_str().trim_end_matches('/').to_string())
     }
     // -- Status mutations -------------------------------------------------------
 
@@ -712,5 +746,94 @@ mod tests {
 
         let endpoint = queue.resolve_target_endpoint(&item).await.unwrap();
         assert_eq!(endpoint, "https://127.0.0.1:3001");
+    }
+
+    #[tokio::test]
+    async fn test_outbound_queue_stops_delivery_when_peer_policy_revoked_after_enqueue() {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL is required for queue policy revocation test");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect to test db");
+        let mut conn = pool.acquire().await.expect("acquire migration connection");
+        let _ = sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+            .execute(&mut *conn)
+            .await;
+        sqlx::migrate!("./migrations")
+            .run(&mut *conn)
+            .await
+            .expect("migrations must succeed");
+        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
+            .execute(&mut *conn)
+            .await;
+        let peer_did = format!("did:web:revoked-{}.example.com", uuid::Uuid::new_v4().as_simple());
+
+        // 1. Peer is initially allowed in federation_peers
+        sqlx::query(
+            "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+             VALUES ($1, 'allow', 100, NOW(), NOW()) \
+             ON CONFLICT (ds_did) DO UPDATE SET status = 'allow'",
+        )
+        .bind(&peer_did)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let resolver = Arc::new(DsResolver::new(
+            pool.clone(),
+            http,
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        ));
+        let queue = OutboundQueue::new(pool.clone(), AuthMiddleware::new(), resolver);
+
+        let item_id = format!("queue-item-{}", uuid::Uuid::new_v4().as_simple());
+        let payload = serde_json::to_vec(&serde_json::json!({"test": "value"})).unwrap();
+
+        // 2. Insert item into outbound_queue
+        sqlx::query(
+            "INSERT INTO outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+        )
+        .bind(&item_id)
+        .bind(&peer_did)
+        .bind("https://revoked.example.com")
+        .bind("blue.catbird.mlsDS.deliverMessage")
+        .bind(&payload)
+        .bind("convo-test-revocation")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 3. Revoke peer policy in database after enqueue
+        sqlx::query("UPDATE federation_peers SET status = 'block' WHERE ds_did = $1")
+            .bind(&peer_did)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 4. Process pending batch with OutboundClient
+        let outbound = OutboundClient::new(5, 5);
+        let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
+
+        let processed = queue.process_pending_batch(&outbound, auth_sign.as_ref()).await.unwrap();
+        assert!(processed >= 1);
+
+        // 5. Verify the item status is now 'failed' with peer policy denial
+        let (status, last_error): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, last_error FROM outbound_queue WHERE id = $1",
+        )
+        .bind(&item_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "failed");
+        assert!(last_error.unwrap_or_default().contains("Peer policy denied"));
     }
 }

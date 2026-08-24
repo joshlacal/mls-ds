@@ -132,3 +132,47 @@ Implemented Task 2 from `docs/superpowers/plans/2026-08-24-clean-chat-federation
   - Federation endpoints and capabilities: OK
   - Service-auth and signer verification (unauthenticated, malformed, wrong audience, admin upsert, cross-DS calls): ALL PASSED
   - Clean teardown: OK
+
+---
+
+## Fix Round 3: Comprehensive Findings Resolution
+
+### 1. IPv4-Mapped IPv6 Classification & Non-Global Rejection
+- Implemented `is_non_global_ipv4` and `is_non_global_ipv6` routing IPv4-mapped IPv6 (`::ffff:0:0/96`), IPv4-compatible (`::0:0/96`), and NAT64 (`64:ff9b::/96`) through full IPv4 global checks.
+- Enforced rejection on mapped loopback (`127.0.0.0/8`), RFC 1918 private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), CGNAT / Shared Address Space (`100.64.0.0/10`), documentation (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), benchmarking (`198.18.0.0/15`), multicast (`224.0.0.0/4`), and broadcast/reserved (`240.0.0.0/4`, `0.0.0.0/8`).
+- Added unit tests covering mapped loopback, RFC 1918, link-local, CGNAT, non-global ranges, and asserting public IPv4 mapped addresses remain permitted.
+
+### 2. Full SSRF Pinning for Queue POST, Upstream Ticket POST, and WebSocket
+- Enhanced `DsResolver` to provide `resolve_ds_destination` and `resolve_endpoint_destination` returning `ValidatedRemoteDestination` (URL + host + approved socket addrs).
+- Updated `OutboundClient` with `call_procedure_pinned` configuring `no_proxy()`, `redirect(Policy::none())`, and `resolve_to_addrs(&destination.host, &destination.addrs)` on every retry.
+- In `OutboundQueue::process_item`, revalidate destination on every retry and dispatch through `call_procedure_pinned`.
+- In `upstream.rs`, `acquire_ticket_pinned` uses `reqwest::Client` with `no_proxy()`, `redirect(none)`, and `resolve_to_addrs(&dest.host, &dest.addrs)`.
+- In `upstream.rs`, WebSocket connects TCP/TLS directly to approved socket address in `dest.addrs` retaining hostname/SNI, then performs the handshake via `tokio_tungstenite::client_async_tls_with_config`.
+
+### 3. Canonical did:web Hostname-Level Validator
+- Implemented `validate_canonical_did_web_host`:
+  - Rejects uppercase characters (enforcing lowercase ASCII).
+  - Rejects trailing dot, leading dot, empty labels / double dots (`..`).
+  - Rejects underscores (`_`).
+  - Rejects invalid leading/trailing hyphens in labels.
+  - Rejects paths, queries, fragments, and percent-encoding (`%`).
+  - Rejects ports in production (permits development port on localhost only when `APP_ENV=test` and `FEDERATION_ALLOW_INSECURE_HTTP=true`).
+  - Enforces WHATWG IDNA domain parsing and lowercase roundtrip matching.
+- Added exhaustive tests for all valid and invalid cases.
+
+### 4. Peer Policy Immediate Recheck on Dispatch, Ticket, and Connect/Reconnect
+- In `OutboundQueue::process_item`, recheck `peer_policy::enforce_outbound_peer_policy(&self.pool, &item.target_ds_did)` immediately before dispatch; denial stops/cancels delivery.
+- In `upstream.rs`, `upstream_reader_task` and `connect_and_stream` recheck `enforce_outbound_peer_policy(&ctx.pool, &ctx.sequencer_did)` immediately before ticket acquisition and WS connect/reconnect; denial cancels the reader task and stops reconnects.
+- Added unit tests: `test_outbound_queue_stops_delivery_when_peer_policy_revoked_after_enqueue` and `test_upstream_reconnect_stops_when_peer_policy_revoked`.
+
+### 5. PostgreSQL Tests Never Skip & Migration Isolation
+- Removed all silent test skips: database tests require `TEST_DATABASE_URL` and fail loudly if missing.
+- Test helper `setup_cache_test_pool` acquires a dedicated migration connection, sets `chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'`, runs migrations, and resets the GUC.
+- Migration purge test `test_migration_purges_legacy_actor_keyed_ds_endpoints_row` executes on a single dedicated connection in an isolated schema (`test_mig_<uuid>`), seeds pre-migration table, applies migration, and asserts physical purge.
+
+## Final Verification
+- `cargo check --bin catbird-server && cargo check --lib`: PASSED
+- `TEST_DATABASE_URL="postgres://catbird:catbird@127.0.0.1:<port>/catbird" cargo test --lib federation::`: 185 passed, 0 failed
+- Container Two-Node Smoke Test (`scripts/federation-two-node-harness.sh up` & `smoke`):
+  - Ephemeral ports: DS1=32862, DS2=32861
+  - Readiness, federation capabilities, admin upsert, signer verification, service auth, and cross-DS calls: ALL PASSED
