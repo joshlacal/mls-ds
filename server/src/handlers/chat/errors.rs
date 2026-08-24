@@ -107,10 +107,13 @@ impl IntoResponse for ChatFailure {
     fn into_response(self) -> Response {
         match self.exposure {
             ErrorExposure::Protocol(error) => {
+                let code = error.code();
+                let status = protocol_http_status(code);
                 let mut response = (
-                    protocol_http_status(error.code()),
+                    status,
                     Json(json!({
-                        "error": error.code().as_str(),
+                        "error": code.as_str(),
+                        "message": code.as_str(),
                     })),
                 )
                     .into_response();
@@ -123,11 +126,17 @@ impl IntoResponse for ChatFailure {
                 }
                 response
             }
-            ErrorExposure::StorageFailure | ErrorExposure::InvariantViolation => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "InternalServerError" })),
-            )
-                .into_response(),
+            ErrorExposure::StorageFailure | ErrorExposure::InvariantViolation => {
+                tracing::error!(
+                    endpoint = self.endpoint.nsid(),
+                    "clean-chat handler internal failure (no protocol code exposed)"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "InternalServerError" })),
+                )
+                    .into_response()
+            }
         }
     }
 }

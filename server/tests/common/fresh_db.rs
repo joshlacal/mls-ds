@@ -51,6 +51,8 @@ pub const PROTECTED_DATABASE_NAMES: &[&str] = &[
 pub const DISPOSABLE_PREFIXES: &[&str] = &[
     // `tests/chat_protocol_create_conversation_handlers.rs`
     "chat_convhandlers_",
+    // `tests/chat_protocol_federation_routing.rs`
+    "chat_fedrouting_",
     // `tests/chat_protocol_device_handlers.rs`
     "chat_devhandlers_",
     // `tests/chat_protocol_auth_repository.rs`

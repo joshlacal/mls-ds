@@ -60,7 +60,7 @@ pub(crate) enum RelationshipAuthorityStartupError {
 }
 
 #[derive(Debug)]
-pub enum RelationshipRepositoryError {
+pub(crate) enum RelationshipRepositoryError {
     Database(sqlx::Error),
     InvalidProjection,
     InvalidAuthorityConfiguration(RelationshipPolicyConfigError),
@@ -427,7 +427,7 @@ impl TrustedRelationshipDecisionInstant {
 /// Capture persistence time after collection. Export rejects observations
 /// before `completed_at`, so capturing this before collection cannot authorize
 /// a projection that finishes later.
-pub fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
+pub(crate) fn observe_relationship_persistence() -> TrustedRelationshipPersistenceInstant {
     TrustedRelationshipPersistenceInstant(Utc::now())
 }
 
@@ -1244,7 +1244,7 @@ struct ProjectionAllocationRow {
 
 /// Allocate exactly one non-reusable projection revision from PostgreSQL.
 /// Sequence values intentionally survive transaction rollback.
-pub async fn allocate_projection_revision(
+pub(crate) async fn allocate_projection_revision(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<AllocatedProjectionRevisionGuard, RelationshipRepositoryError> {
     let allocation = sqlx::query_as::<_, ProjectionAllocationRow>(
@@ -1262,7 +1262,7 @@ pub async fn allocate_projection_revision(
 /// Insert a sealed relationship projection and all of its evidence into the
 /// caller-owned transaction. Deferred cross-row constraints are forced before
 /// returning, so callers never receive a false success for an incomplete set.
-pub async fn persist_relationship_projection(
+pub(crate) async fn persist_relationship_projection(
     transaction: &mut Transaction<'_, Postgres>,
     projection: SealedRelationshipProjection,
 ) -> Result<(), RelationshipRepositoryError> {

@@ -141,9 +141,19 @@ required-features = ["chat-protocol-production-proof"]
 name = "chat_protocol_create_conversation_regression"
 path = "tests/chat_protocol_create_conversation_regression.rs"
 
+[[test]]
+name = "chat_protocol_create_conversation_handlers"
+path = "tests/chat_protocol_create_conversation_handlers.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_federation_routing"
+path = "tests/chat_protocol_federation_routing.rs"
+required-features = ["test-support"]
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []
 server-bin = []
 chat-protocol-production-proof = []
 subscription-production-proof = []
+test-support = []

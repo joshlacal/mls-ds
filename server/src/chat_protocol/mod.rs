@@ -95,10 +95,12 @@ pub(crate) mod model;
 pub(crate) mod public_state;
 pub(crate) mod read_authority;
 pub(crate) mod read_projection;
-pub mod relationship_policy;
-pub mod repository;
+pub(crate) mod relationship_policy;
+pub(crate) mod repository;
 pub mod snapshot;
 pub(crate) mod state_machine;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub(crate) mod transcript;
 pub(crate) mod validation;
 pub mod wire;

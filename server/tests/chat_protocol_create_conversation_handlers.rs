@@ -79,84 +79,6 @@ struct TestGroupContext {
     extensions: Vec<TestExtension>,
 }
 
-use catbird_server::chat_protocol::relationship_policy::{
-    fixed_production_relationship_policy_config, AdmissionOperation, AdmissionRequest,
-    ProjectionOperationScope, PublicGet, PublicResponse, PublicTransport,
-    RelationshipAuthority, TransportError,
-};
-use catbird_server::chat_protocol::repository::relationship::{
-    allocate_projection_revision, observe_relationship_persistence, persist_relationship_projection,
-};
-
-#[derive(Clone, Copy)]
-struct DeterministicTestTransport;
-
-#[async_trait::async_trait]
-impl PublicTransport for DeterministicTestTransport {
-    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
-        let path = request.url.path();
-        if path.starts_with("/did:plc:") {
-            let actor = path.trim_start_matches('/');
-            return Ok(PublicResponse::json(
-                200,
-                json!({
-                    "id": actor,
-                    "service": [{
-                        "id": format!("{actor}#atproto_pds"),
-                        "type": "AtprotoPersonalDataServer",
-                        "serviceEndpoint": "https://pds.example.net"
-                    }]
-                }),
-            ));
-        }
-        if path == "/xrpc/com.atproto.repo.getRecord" {
-            let actor = request
-                .url
-                .query_pairs()
-                .find(|(k, _)| k == "repo")
-                .map(|(_, v)| v.into_owned())
-                .unwrap_or_default();
-            return Ok(PublicResponse::json(
-                200,
-                json!({
-                    "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
-                    "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
-                    "value": {
-                        "$type": "chat.bsky.actor.declaration",
-                        "allowIncoming": "all",
-                        "allowGroupInvites": "all"
-                    }
-                }),
-            ));
-        }
-        if path == "/xrpc/app.bsky.graph.getRelationships" {
-            let actor = request
-                .url
-                .query_pairs()
-                .find(|(k, _)| k == "actor")
-                .map(|(_, v)| v.into_owned())
-                .unwrap_or_default();
-            let others = request
-                .url
-                .query_pairs()
-                .filter(|(k, _)| k == "others")
-                .map(|(_, v)| {
-                    json!({
-                        "$type": "app.bsky.graph.defs#relationship",
-                        "did": v,
-                        "following": format!("at://{actor}/app.bsky.graph.follow/test")
-                    })
-                })
-                .collect::<Vec<_>>();
-            return Ok(PublicResponse::json(
-                200,
-                json!({"actor": actor, "relationships": others}),
-            ));
-        }
-        panic!("unexpected public get: {}", request.url);
-    }
-}
-
 #[derive(Clone, Debug, tls_codec::TlsSerialize, tls_codec::TlsDeserialize, tls_codec::TlsSize)]
 struct TestExtension {
     extension_type: u16,
@@ -765,7 +687,7 @@ fn build_authenticated_post_for_endpoint(
 }
 fn build_authenticated_get_request(
     user_did: &str,
-    device_id: Uuid,
+    _device_id: Uuid,
     dpop_signing_key: &P256SigningKey,
     dpop_jwk: &Value,
     dpop_jkt: &str,
@@ -1111,37 +1033,16 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
     .await
     .expect("seed bob principal");
 
-    let rel_authority = RelationshipAuthority::new(
-        fixed_production_relationship_policy_config().expect("fixed config"),
-        DeterministicTestTransport,
-    );
     let mut roster = vec![fixture.actor_did.clone(), bob_did.clone()];
     roster.sort();
-    let admission_req = AdmissionRequest {
-        inviter: fixture.actor_did.clone(),
+    catbird_server::chat_protocol::test_support::seed_deterministic_pending_add_fallback(
+        &pool,
+        &fixture.actor_did,
         roster,
-        pending_recipients: vec![bob_did.clone()],
-        operation: AdmissionOperation::Group,
-    };
-    let mut fallback_tx = pool.begin().await.expect("begin fallback tx");
-    let live_allocation = allocate_projection_revision(&mut fallback_tx)
-        .await
-        .expect("allocate live projection revision");
-    let fallback_allocation = allocate_projection_revision(&mut fallback_tx)
-        .await
-        .expect("allocate fallback projection revision");
-    let live_rel = rel_authority
-        .collect_admission_projection(live_allocation, ProjectionOperationScope::PendingAdd, admission_req)
-        .await
-        .expect("collect live policy relationship projection");
-    let observation = observe_relationship_persistence();
-    let sealed_fallback = live_rel
-        .export_persisted_fallback(fallback_allocation, &rel_authority, &observation)
-        .expect("seal fallback relationship projection");
-    persist_relationship_projection(&mut fallback_tx, sealed_fallback)
-        .await
-        .expect("persist fallback relationship projection");
-    fallback_tx.commit().await.expect("commit fallback tx");
+        vec![bob_did.clone()],
+    )
+    .await
+    .expect("seed deterministic fallback relationship projection");
     let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
         .to_rfc3339_opts(SecondsFormat::Millis, true);
     let prior_coordinate = json!({
@@ -1199,7 +1100,9 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
     });
     let unsigned = serde_json::to_vec(&policy_wrapper).unwrap();
     let canonical = decode_canonical_signed_mutation(&unsigned).expect("canonicalize policy body");
-    let signature = fixture.actor_ed25519_signing_key.sign(canonical.transcript_bytes());
+    let signature = fixture
+        .actor_ed25519_signing_key
+        .sign(canonical.transcript_bytes());
     policy_wrapper["signature"] = json!(STANDARD.encode(signature.to_bytes()));
 
     let policy_payload = json!({
@@ -1230,10 +1133,7 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
         first_body["entry"]["$type"],
         "blue.catbird.chat.defs#policyEntry"
     );
-    assert_eq!(
-        first_body["coordinates"]["stateVersion"],
-        1
-    );
+    assert_eq!(first_body["coordinates"]["stateVersion"], 1);
 
     // Idempotent replay with the exact same request
     let replay_policy_request = build_authenticated_post_for_endpoint(
@@ -1531,7 +1431,7 @@ async fn create_conversation_negative_idempotency_conflict_returns_declared_erro
         mutated_payload,
     );
 
-    let (conflict_status, conflict_body) = send(router, conflicting_request).await;
+    let (conflict_status, _conflict_body) = send(router, conflicting_request).await;
     assert!(
         conflict_status == StatusCode::BAD_REQUEST || conflict_status == StatusCode::UNAUTHORIZED,
         "mutated idempotency reuse must return 4xx, got {conflict_status}"

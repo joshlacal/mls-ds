@@ -23,7 +23,7 @@ use crate::storage::DbPool;
 
 mod accept_conversation;
 mod blob_routes;
-mod context;
+pub(crate) mod context;
 mod conversation_state;
 mod create_conversation;
 mod device_views;

@@ -444,6 +444,9 @@ pub type DestinationResolverFn = Arc<
         + Sync,
 >;
 
+pub type UserDidResolverFn =
+    Arc<dyn Fn(&str) -> Option<Result<DsEndpoint, FederationError>> + Send + Sync>;
+
 /// Resolves a user's DID to their DS endpoint.
 #[derive(Clone)]
 pub struct DsResolver {
@@ -455,6 +458,7 @@ pub struct DsResolver {
     default_ds_endpoint: Option<String>,
     cache_ttl_secs: i64,
     destination_resolver: Option<DestinationResolverFn>,
+    user_did_resolver: Option<UserDidResolverFn>,
 }
 
 impl std::fmt::Debug for DsResolver {
@@ -492,6 +496,7 @@ impl DsResolver {
             default_ds_endpoint: resolved_default_endpoint,
             cache_ttl_secs: cache_ttl_secs as i64,
             destination_resolver: None,
+            user_did_resolver: None,
         }
     }
 
@@ -499,6 +504,11 @@ impl DsResolver {
         self.destination_resolver = Some(hook);
         self
     }
+    pub fn with_user_did_resolver_hook(mut self, hook: UserDidResolverFn) -> Self {
+        self.user_did_resolver = Some(hook);
+        self
+    }
+
 
     pub fn with_defaults(
         pool: PgPool,
@@ -580,6 +590,12 @@ impl DsResolver {
         &self,
         user_did: &str,
     ) -> (Result<DsEndpoint, FederationError>, &'static str) {
+        if let Some(hook) = &self.user_did_resolver {
+            if let Some(res) = hook(user_did) {
+                return (res, "test_hook");
+            }
+        }
+
         // Check if it's us
         if canonical_did(user_did) == canonical_did(&self.self_did) {
             return (
