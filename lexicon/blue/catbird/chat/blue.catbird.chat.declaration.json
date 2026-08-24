@@ -1,0 +1,37 @@
+{
+  "lexicon": 1,
+  "id": "blue.catbird.chat.declaration",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A declaration of a Catbird secure chat account.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["allowIncoming", "deliveryService", "protocolVersion", "createdAt"],
+        "properties": {
+          "allowIncoming": {
+            "type": "string",
+            "knownValues": ["all", "none", "following"],
+            "description": "Incoming message consent policy: 'all', 'following', or 'none'."
+          },
+          "deliveryService": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the delivery service that serves this actor (e.g. did:web:chat.catbird.blue)."
+          },
+          "protocolVersion": {
+            "type": "string",
+            "knownValues": ["1"],
+            "description": "Secure chat protocol version."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp when this declaration record was created."
+          }
+        }
+      }
+    }
+  }
+}
