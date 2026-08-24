@@ -29,19 +29,19 @@ use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::panic::AssertUnwindSafe;
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-static MIGRATION_VERSIONS: LazyLock<[i64; 13]> = LazyLock::new(|| {
+static MIGRATION_VERSIONS: LazyLock<[i64; 15]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
             .version
     })
 });
-static MIGRATION_FILES: LazyLock<[&'static str; 13]> = LazyLock::new(|| {
+static MIGRATION_FILES: LazyLock<[&'static str; 15]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index].filename
     })
 });
-static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 13]> = LazyLock::new(|| {
+static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 15]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
@@ -2374,14 +2374,14 @@ fn clean_chat_migration_inventory_orders_g7_entitlement_last() {
         MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
         "migration versions must remain strictly increasing"
     );
-    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260729000001));
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000003));
     assert_eq!(
         MIGRATION_FILES.last(),
-        Some(&"20260729000001_chat_g7_inventory_entitlement.sql")
+        Some(&"20260824000003_chat_federation_routing.sql")
     );
     assert_eq!(
         MIGRATION_DESCRIPTIONS.last(),
-        Some(&"chat g7 inventory entitlement")
+        Some(&"chat federation routing")
     );
     for file in MIGRATION_FILES.iter().copied() {
         assert!(

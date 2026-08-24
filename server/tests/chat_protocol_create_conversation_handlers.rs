@@ -122,6 +122,7 @@ fn nest_signing_key() -> P256SigningKey {
 
 async fn ensure_verifier_env(pool: &DbPool) {
     let point = nest_signing_key().verifying_key().to_encoded_point(false);
+    std::env::set_var("SERVICE_DID", "did:web:chat.catbird.blue");
     std::env::set_var("CHAT_NEST_ISSUER", ISSUER);
     std::env::set_var("CHAT_NEST_AUDIENCE", AUDIENCE);
     std::env::set_var("CHAT_NEST_KEY_ID", NEST_KEY_ID);
