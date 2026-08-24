@@ -1806,7 +1806,7 @@ async fn discover_inventory_candidates(
 }
 
 /// The final protocol/key/head/floor revalidation after all conversation
-/// heads. The `FOR UPDATE` re-read of the protocol instance is the
+/// heads. The `FOR SHARE` re-read of the protocol instance is the
 /// deterministic barrier that makes concurrent key drift fail closed: a
 /// writer holding an uncommitted change to the row blocks this statement
 /// until it commits, and the committed drift is then observed and refused.
@@ -1814,10 +1814,10 @@ async fn revalidate_fence_after_heads(
     tx: &mut Transaction<'_, Postgres>,
     fence: &VerifiedInventoryFence,
 ) -> Result<(), ReadAuthorityError> {
-    // Protocol instance and active cursor key, re-read FOR UPDATE.
+    // Protocol instance and active cursor key, re-read FOR SHARE.
     let live: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances \
-         WHERE protocol_instance_id=$1 FOR UPDATE",
+         WHERE protocol_instance_id=$1 FOR SHARE",
     )
     .bind(fence.protocol_instance_id)
     .fetch_optional(&mut **tx)
@@ -1830,11 +1830,11 @@ async fn revalidate_fence_after_heads(
         return Err(ReadAuthorityError::Invariant);
     }
 
-    // Retention floor, re-read FOR UPDATE: the live floor must never sit
+    // Retention floor, re-read FOR SHARE: the live floor must never sit
     // above the fence's snapshot event position.
     let live_floor: Option<i64> = sqlx::query_scalar(
         "SELECT retained_floor FROM chat.event_retention \
-         WHERE protocol_instance_id=$1 FOR UPDATE",
+         WHERE protocol_instance_id=$1 FOR SHARE",
     )
     .bind(fence.protocol_instance_id)
     .fetch_optional(&mut **tx)

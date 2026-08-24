@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{FromRow, Postgres, QueryBuilder, Transaction};
 use thiserror::Error;
 use uuid::{Uuid, Variant, Version};
 
@@ -690,7 +690,7 @@ pub(crate) async fn lock_inventory_session(
         SELECT protocol_instance_id, cursor_key_id
           FROM chat.protocol_instances
          WHERE singleton = TRUE
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .fetch_optional(&mut **transaction)
@@ -702,7 +702,7 @@ pub(crate) async fn lock_inventory_session(
         SELECT retained_floor, updated_at AS retention_updated_at
           FROM chat.event_retention
          WHERE protocol_instance_id = $1
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .bind(protocol.protocol_instance_id)
@@ -720,7 +720,7 @@ pub(crate) async fn lock_inventory_session(
          WHERE protocol_instance_id = $1
          ORDER BY event_position DESC
          LIMIT 1
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .bind(protocol.protocol_instance_id)
@@ -1634,7 +1634,7 @@ pub(crate) async fn create_inventory_session(
         SELECT protocol_instance_id, cursor_key_id
           FROM chat.protocol_instances
          WHERE singleton = TRUE
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .fetch_optional(&mut **transaction)
@@ -1646,7 +1646,7 @@ pub(crate) async fn create_inventory_session(
         SELECT retained_floor, updated_at AS retention_updated_at
           FROM chat.event_retention
          WHERE protocol_instance_id = $1
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .bind(protocol.protocol_instance_id)
@@ -1664,7 +1664,7 @@ pub(crate) async fn create_inventory_session(
          WHERE protocol_instance_id = $1
          ORDER BY event_position DESC
          LIMIT 1
-         FOR UPDATE
+         FOR SHARE
         "#,
     )
     .bind(protocol.protocol_instance_id)
@@ -1799,6 +1799,7 @@ pub(crate) async fn create_inventory_session(
     //     source-precedence trigger and the materialization digest transcript
     //     require.
     let mut conversation_ordinal: i64 = 0;
+    let mut conversation_items = Vec::with_capacity(authorities.len());
     for authority in authorities.iter() {
         let source =
             conversation_projection_source(transaction, authority, &user_did, device_id).await?;
@@ -1812,7 +1813,19 @@ pub(crate) async fn create_inventory_session(
         let payload_sha256 = canonical.sha256();
         let arm_columns =
             conversation_arm_columns(transaction, authority, &user_did, device_id).await?;
-        sqlx::query(
+        conversation_items.push((
+            conversation_ordinal,
+            authority.conversation_id(),
+            arm_columns,
+            canonical.bytes().to_vec(),
+            payload_sha256,
+        ));
+        conversation_ordinal += 1;
+    }
+
+    const INVENTORY_INSERT_CHUNK_ROWS: usize = 64;
+    for chunk in conversation_items.chunks(INVENTORY_INSERT_CHUNK_ROWS) {
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO chat.inventory_conversation_items(
                 inventory_session_id, ordinal, conversation_id, recipient_did,
@@ -1823,36 +1836,38 @@ pub(crate) async fn create_inventory_session(
                 schedule_terminal_seq, schedule_terminal_transition_id,
                 schedule_terminal_outer_entry_fingerprint,
                 item_key_bytes, payload_bytes, payload_sha256
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                      uuid_send($3),$16,$17)
+            )
             "#,
-        )
-        .bind(request.inventory_session_id)
-        .bind(conversation_ordinal)
-        .bind(authority.conversation_id())
-        .bind(&user_did)
-        .bind(device_id)
-        .bind(arm_columns.item_kind)
-        .bind(arm_columns.participant_period_id)
-        .bind(arm_columns.membership_interval_id)
-        .bind(arm_columns.interval_terminal_seq)
-        .bind(arm_columns.interval_closing_transition_id)
-        .bind(arm_columns.interval_closing_outer_entry_fingerprint)
-        .bind(arm_columns.interval_removed_at)
-        .bind(arm_columns.schedule_terminal_seq)
-        .bind(arm_columns.schedule_terminal_transition_id)
-        .bind(arm_columns.schedule_terminal_outer_entry_fingerprint)
-        .bind(canonical.bytes())
-        .bind(payload_sha256.as_slice())
-        .execute(&mut **transaction)
-        .await?;
-        conversation_ordinal += 1;
+        );
+        query.push_values(chunk, |mut values, (ordinal, conversation_id, arm_columns, payload_bytes, payload_sha256)| {
+            values
+                .push_bind(request.inventory_session_id)
+                .push_bind(*ordinal)
+                .push_bind(*conversation_id)
+                .push_bind(&user_did)
+                .push_bind(device_id)
+                .push_bind(arm_columns.item_kind)
+                .push_bind(arm_columns.participant_period_id)
+                .push_bind(arm_columns.membership_interval_id)
+                .push_bind(arm_columns.interval_terminal_seq)
+                .push_bind(arm_columns.interval_closing_transition_id)
+                .push_bind(arm_columns.interval_closing_outer_entry_fingerprint.as_deref())
+                .push_bind(arm_columns.interval_removed_at)
+                .push_bind(arm_columns.schedule_terminal_seq)
+                .push_bind(arm_columns.schedule_terminal_transition_id)
+                .push_bind(arm_columns.schedule_terminal_outer_entry_fingerprint.as_deref())
+                .push_bind(conversation_id.as_bytes().as_slice())
+                .push_bind(payload_bytes.as_slice())
+                .push_bind(payload_sha256.as_slice());
+        });
+        query.build().execute(&mut **transaction).await?;
     }
 
     // 6b. Welcome domain — the exact device's `status='pending'` deliveries,
     //     payload server-derived from `welcome_bundles.wrapper_bytes`. Ordinals
     //     ascend by `welcome_id`.
     let welcome_sources = retained_welcome_sources(transaction, &user_did, device_id).await?;
+    let mut welcome_items = Vec::with_capacity(welcome_sources.len());
     for (ordinal, (welcome_id, source)) in welcome_sources.iter().enumerate() {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
@@ -1864,23 +1879,34 @@ pub(crate) async fn create_inventory_session(
         )
         .map_err(InventoryRepositoryError::Projection)?;
         let payload_sha256 = canonical.sha256();
-        sqlx::query(
+        welcome_items.push((
+            ordinal,
+            *welcome_id,
+            canonical.bytes().to_vec(),
+            payload_sha256,
+        ));
+    }
+    for chunk in welcome_items.chunks(INVENTORY_INSERT_CHUNK_ROWS) {
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO chat.inventory_welcome_items(
                 inventory_session_id, ordinal, welcome_id, recipient_did,
                 recipient_device_id, item_key_bytes, payload_bytes, payload_sha256
-            ) VALUES ($1,$2,$3,$4,$5,uuid_send($3),$6,$7)
+            )
             "#,
-        )
-        .bind(request.inventory_session_id)
-        .bind(ordinal)
-        .bind(*welcome_id)
-        .bind(&user_did)
-        .bind(device_id)
-        .bind(canonical.bytes())
-        .bind(payload_sha256.as_slice())
-        .execute(&mut **transaction)
-        .await?;
+        );
+        query.push_values(chunk, |mut values, (ordinal, welcome_id, payload_bytes, payload_sha256)| {
+            values
+                .push_bind(request.inventory_session_id)
+                .push_bind(*ordinal)
+                .push_bind(*welcome_id)
+                .push_bind(&user_did)
+                .push_bind(device_id)
+                .push_bind(welcome_id.as_bytes().as_slice())
+                .push_bind(payload_bytes.as_slice())
+                .push_bind(payload_sha256.as_slice());
+        });
+        query.build().execute(&mut **transaction).await?;
     }
 
     // 6c. Recovery domain — every retained leaf-recovery request (all five
@@ -1888,6 +1914,7 @@ pub(crate) async fn create_inventory_session(
     //     one canonical ordinal sequence with 0x00/0x01-prefixed item keys.
     let recovery_entries =
         retained_recovery_inbox_entries(transaction, &user_did, device_id).await?;
+    let mut recovery_items = Vec::with_capacity(recovery_entries.len());
     let mut recovery_ordinal: i64 = 0;
     for entry in recovery_entries {
         let dto = super::super::read_projection::leaf_recovery_inbox_item(entry.input)
@@ -1898,28 +1925,41 @@ pub(crate) async fn create_inventory_session(
         )
         .map_err(InventoryRepositoryError::Projection)?;
         let payload_sha256 = canonical.sha256();
-        sqlx::query(
+        recovery_items.push((
+            recovery_ordinal,
+            entry.item_kind,
+            entry.leaf_recovery_request_id,
+            entry.recovery_work_id,
+            entry.item_key_bytes,
+            canonical.bytes().to_vec(),
+            payload_sha256,
+        ));
+        recovery_ordinal += 1;
+    }
+    for chunk in recovery_items.chunks(INVENTORY_INSERT_CHUNK_ROWS) {
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             INSERT INTO chat.inventory_recovery_items(
                 inventory_session_id, ordinal, item_kind, leaf_recovery_request_id,
                 recovery_work_id, recipient_did, recipient_device_id,
                 item_key_bytes, payload_bytes, payload_sha256
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            )
             "#,
-        )
-        .bind(request.inventory_session_id)
-        .bind(recovery_ordinal)
-        .bind(entry.item_kind)
-        .bind(entry.leaf_recovery_request_id)
-        .bind(entry.recovery_work_id)
-        .bind(&user_did)
-        .bind(device_id)
-        .bind(&entry.item_key_bytes)
-        .bind(canonical.bytes())
-        .bind(payload_sha256.as_slice())
-        .execute(&mut **transaction)
-        .await?;
-        recovery_ordinal += 1;
+        );
+        query.push_values(chunk, |mut values, (ordinal, item_kind, leaf_recovery_request_id, recovery_work_id, item_key_bytes, payload_bytes, payload_sha256)| {
+            values
+                .push_bind(request.inventory_session_id)
+                .push_bind(*ordinal)
+                .push_bind(*item_kind)
+                .push_bind(*leaf_recovery_request_id)
+                .push_bind(*recovery_work_id)
+                .push_bind(&user_did)
+                .push_bind(device_id)
+                .push_bind(item_key_bytes.as_slice())
+                .push_bind(payload_bytes.as_slice())
+                .push_bind(payload_sha256.as_slice());
+        });
+        query.build().execute(&mut **transaction).await?;
     }
 
     // 7. Record per-domain completion evidence from the exact projection the
@@ -3507,7 +3547,7 @@ async fn revalidate_session_fence(
 ) -> Result<(), InventoryRepositoryError> {
     let live: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances \
-         WHERE protocol_instance_id=$1 FOR UPDATE",
+         WHERE protocol_instance_id=$1 FOR SHARE",
     )
     .bind(row.protocol_instance_id)
     .fetch_optional(&mut **transaction)
@@ -3520,7 +3560,7 @@ async fn revalidate_session_fence(
     }
     let live_floor: Option<i64> = sqlx::query_scalar(
         "SELECT retained_floor FROM chat.event_retention \
-         WHERE protocol_instance_id=$1 FOR UPDATE",
+         WHERE protocol_instance_id=$1 FOR SHARE",
     )
     .bind(row.protocol_instance_id)
     .fetch_optional(&mut **transaction)

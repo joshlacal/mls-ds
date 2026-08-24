@@ -554,9 +554,11 @@ async fn lock_creation_replay_post_state(
     let mutation = authority.mutation();
     let (transition_id, _, _, _) = parse_creation(mutation)?;
     let rows = sqlx::query("SELECT transition_id,conversation_id,entry_seq,accepted_at FROM chat.transitions WHERE transition_id=$1 FOR SHARE").bind(transition_id).fetch_optional(&mut **transaction).await?.ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
+    let conversation_id: Uuid = rows.try_get("conversation_id")?;
     let entry = sqlx::query(
-        "SELECT accepted_payload_bytes FROM chat.entries WHERE transition_id=$1 FOR SHARE",
+        "SELECT accepted_payload_bytes FROM chat.entries WHERE conversation_id=$1 AND transition_id=$2 FOR SHARE",
     )
+    .bind(conversation_id)
     .bind(transition_id)
     .fetch_one(&mut **transaction)
     .await?;
