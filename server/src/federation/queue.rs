@@ -6,9 +6,9 @@ use super::envelope::{
     verify_receipt, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use super::errors::FederationError;
-use super::receipt::result_bytes_for_receipt;
 use super::outbound::{DsResponse, OutboundClient, OutboundError};
 use super::peer_policy;
+use super::receipt::result_bytes_for_receipt;
 use super::resolver::{DsResolver, ValidatedRemoteDestination};
 use crate::auth::AuthMiddleware;
 use crate::identity::{canonical_did, dids_equivalent, service_did_base};
@@ -687,10 +687,14 @@ impl OutboundQueue {
                         self.handle_failure(item, &error_msg, false).await;
                         return;
                     }
-                    let result_bytes = match result_bytes_for_receipt(&item.method, &resp.response_bytes) {
+                    let result_bytes = match result_bytes_for_receipt(
+                        &item.method,
+                        &resp.response_bytes,
+                    ) {
                         Ok(b) => b,
                         Err(e) => {
-                            let error_msg = format!("Failed to reconstruct result bytes for receipt: {e}");
+                            let error_msg =
+                                format!("Failed to reconstruct result bytes for receipt: {e}");
                             warn!(queue_id = %item.id, error = %error_msg, "Response could not be parsed for result verification");
                             self.handle_failure(item, &error_msg, false).await;
                             return;

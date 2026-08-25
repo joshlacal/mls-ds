@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    outbound::OutboundClient, peer_policy,
+    outbound::OutboundClient,
+    peer_policy,
     resolver::{self, DsResolver, ValidatedRemoteDestination},
     CAPABILITY_RECONCILIATION_V1,
 };
@@ -21,7 +22,6 @@ const DIGEST_NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
 const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
 const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
 const EVENTS_PAGE_LIMIT: i64 = 500;
-
 
 /// Decoded `getConvoDigest` response from a peer DS.
 ///
@@ -963,7 +963,10 @@ mod tests {
             get(move |headers: HeaderMap| {
                 let body = body.clone();
                 async move {
-                    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
+                    let host = headers
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("");
                     assert!(
                         host == "peer.example.com" || host.starts_with("peer.example.com:"),
                         "host header must retain original host, got {host}"
@@ -997,9 +1000,18 @@ mod tests {
         let discovery_client_sym = ["DISCOVERY", "_CLIENT"].concat();
         let client_builder_sym = ["Client::", "builder"].concat();
         let unpinned_get_sym = [".get(&", "url).send()"].concat();
-        assert!(!source.contains(&discovery_client_sym), "must not contain discovery client static");
-        assert!(!source.contains(&client_builder_sym), "must not build client");
-        assert!(!source.contains(&unpinned_get_sym), "must not send unpinned get");
+        assert!(
+            !source.contains(&discovery_client_sym),
+            "must not contain discovery client static"
+        );
+        assert!(
+            !source.contains(&client_builder_sym),
+            "must not build client"
+        );
+        assert!(
+            !source.contains(&unpinned_get_sym),
+            "must not send unpinned get"
+        );
     }
 
     #[test]

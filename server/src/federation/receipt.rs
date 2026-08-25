@@ -321,8 +321,12 @@ pub(crate) fn result_bytes_for_receipt(
         DELIVER_WELCOME_NSID | DELIVER_MESSAGE_NSID => Ok(b"{\"accepted\":true}".to_vec()),
         SUBMIT_COMMIT_NSID => {
             let output: SubmitCommitOutput =
-                serde_json::from_slice(response_bytes).map_err(|e| FederationError::InvalidEnvelope {
-                    reason: format!("failed to parse submitCommit response for receipt result: {e}"),
+                serde_json::from_slice(response_bytes).map_err(|e| {
+                    FederationError::InvalidEnvelope {
+                        reason: format!(
+                            "failed to parse submitCommit response for receipt result: {e}"
+                        ),
+                    }
                 })?;
             let st_output = SubmitTransitionOutput {
                 coordinates: output.coordinates,
@@ -833,14 +837,15 @@ mod tests {
         let welcome_bytes = result_bytes_for_receipt(DELIVER_WELCOME_NSID, b"{}").unwrap();
         assert_eq!(welcome_bytes, b"{\"accepted\":true}");
 
-        let msg_bytes = result_bytes_for_receipt(DELIVER_MESSAGE_NSID, b"{\"extra\":\"value\"}").unwrap();
+        let msg_bytes =
+            result_bytes_for_receipt(DELIVER_MESSAGE_NSID, b"{\"extra\":\"value\"}").unwrap();
         assert_eq!(msg_bytes, b"{\"accepted\":true}");
     }
 
     #[test]
     fn result_bytes_for_receipt_submit_commit() {
-        use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
         let b64_32 = STANDARD.encode([1u8; 32]);
         let b64_48 = STANDARD.encode([1u8; 48]);
         let b64_12 = STANDARD.encode([1u8; 12]);
@@ -849,7 +854,8 @@ mod tests {
         let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
         let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
 
-        let json_str = format!(r#"{{
+        let json_str = format!(
+            r#"{{
             "commitEntry": {{
                 "conversationId": "convo-1",
                 "entryId": "entry-1",
@@ -975,7 +981,8 @@ mod tests {
                 "completedAt": "2026-08-25T12:00:00Z"
             }},
             "welcomes": []
-        }}"#);
+        }}"#
+        );
         let resp_bytes = json_str.into_bytes();
         let result = result_bytes_for_receipt(SUBMIT_COMMIT_NSID, &resp_bytes).unwrap();
 

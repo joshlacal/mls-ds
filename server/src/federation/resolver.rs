@@ -1302,8 +1302,7 @@ impl DsResolver {
                             let base_url = base_url.clone();
                             let did = did_owned.clone();
                             async move {
-                                let mut parsed_url =
-                                    url::Url::parse(&base_url).map_err(|_| ())?;
+                                let mut parsed_url = url::Url::parse(&base_url).map_err(|_| ())?;
                                 {
                                     let mut query = parsed_url.query_pairs_mut();
                                     query.append_pair("repo", did.as_str());
@@ -1389,9 +1388,7 @@ impl DsResolver {
     }
 
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
-        self.resolve_endpoint_destination(url_str)
-            .await
-            .map(|_| ())
+        self.resolve_endpoint_destination(url_str).await.map(|_| ())
     }
 }
 
@@ -2655,18 +2652,22 @@ mod tests {
                 Some(Box::pin(async move {
                     Err(FederationError::ResolutionFailed {
                         did: "did:web:alice.example".to_string(),
-                        kind: ResolutionFailureKind::SsrfBlocked(
-                            format!("Forbidden destination address: {forbidden_addr_copy}")
-                        ),
+                        kind: ResolutionFailureKind::SsrfBlocked(format!(
+                            "Forbidden destination address: {forbidden_addr_copy}"
+                        )),
                     })
                 }))
             } else if target.contains("com.atproto.repo.listRecords") {
                 page1_validated_cb.store(true, Ordering::SeqCst);
-                let query_str = target.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+                let query_str = target
+                    .split_once('?')
+                    .map(|(_, q)| format!("?{q}"))
+                    .unwrap_or_default();
                 let target_url = url::Url::parse(&format!(
                     "http://127.0.0.1:{}/xrpc/com.atproto.repo.listRecords{query_str}",
                     pds_addr.port()
-                )).unwrap();
+                ))
+                .unwrap();
                 Some(Box::pin(async move {
                     Ok(ValidatedRemoteDestination {
                         url: target_url,
@@ -2678,7 +2679,8 @@ mod tests {
                 let target_url = url::Url::parse(&format!(
                     "http://127.0.0.1:{}/.well-known/did.json",
                     pds_addr.port()
-                )).unwrap();
+                ))
+                .unwrap();
                 Some(Box::pin(async move {
                     Ok(ValidatedRemoteDestination {
                         url: target_url,
@@ -2698,11 +2700,23 @@ mod tests {
             }
         }));
 
-        let result = resolver.resolve_authorized_device_keys("did:web:alice.example").await;
+        let result = resolver
+            .resolve_authorized_device_keys("did:web:alice.example")
+            .await;
         assert!(result.is_err());
-        assert!(page1_validated.load(Ordering::SeqCst), "page 1 must be validated via destination resolver");
-        assert!(page2_validated.load(Ordering::SeqCst), "page 2 must be re-validated via destination resolver");
-        assert_eq!(pds_page2_hits.load(Ordering::SeqCst), 0, "forbidden page 2 must not receive request");
+        assert!(
+            page1_validated.load(Ordering::SeqCst),
+            "page 1 must be validated via destination resolver"
+        );
+        assert!(
+            page2_validated.load(Ordering::SeqCst),
+            "page 2 must be re-validated via destination resolver"
+        );
+        assert_eq!(
+            pds_page2_hits.load(Ordering::SeqCst),
+            0,
+            "forbidden page 2 must not receive request"
+        );
         assert_eq!(forbidden_hits.load(Ordering::SeqCst), 0);
     }
 

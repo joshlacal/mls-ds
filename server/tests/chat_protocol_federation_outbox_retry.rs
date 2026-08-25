@@ -34,8 +34,8 @@ use catbird_server::chat_protocol::test_support::repository::{
 use catbird_server::federation::ack::AckSigner;
 use catbird_server::federation::envelope::{
     compute_commit_envelope_digest, compute_message_envelope_digest,
-    compute_welcome_envelope_digest, sign_receipt, ValidatedEntryLocator,
-    ValidatedEnvelopeHeader, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
+    compute_welcome_envelope_digest, sign_receipt, ValidatedEntryLocator, ValidatedEnvelopeHeader,
+    DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use catbird_server::federation::outbound::OutboundClient;
 use catbird_server::federation::queue::OutboundQueue;
@@ -45,7 +45,7 @@ use catbird_server::workers::federation_outbox::{
     claim_due_rows, handoff_to_outbound_queue, FederationOutboxRow,
 };
 use chrono::Utc;
-use common::fresh_db::fresh_clean_protocol_db;
+use common::fresh_db::fresh_legacy_pool;
 use p256::ecdsa::SigningKey;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -370,7 +370,7 @@ async fn seed_genesis_conversation_for_test(
 
 #[tokio::test]
 async fn test_chokepoint_message_send_creates_typed_outbox_job() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -488,7 +488,7 @@ async fn test_chokepoint_message_send_creates_typed_outbox_job() {
 
 #[tokio::test]
 async fn test_outbox_worker_atomic_handoff_and_done() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -568,7 +568,7 @@ async fn test_outbox_worker_atomic_handoff_and_done() {
 
 #[tokio::test]
 async fn test_outbox_worker_replay_succeeds_over_cap_and_new_insert_rejected() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     std::env::set_var("FEDERATION_OUTBOUND_QUEUE_PER_PEER_PENDING_CAP", "1");
@@ -692,7 +692,7 @@ async fn test_outbox_worker_replay_succeeds_over_cap_and_new_insert_rejected() {
 
 #[tokio::test]
 async fn test_outbox_and_queue_dead_rows_purged() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4().to_string();
@@ -799,7 +799,7 @@ async fn test_outbox_and_queue_dead_rows_purged() {
 
 #[tokio::test]
 async fn test_outbound_queue_claim_fencing_and_concurrent_workers() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let queue = OutboundQueue::new(
@@ -887,7 +887,7 @@ async fn test_outbound_queue_claim_fencing_and_concurrent_workers() {
 
 #[tokio::test]
 async fn test_outbound_queue_policy_revoked_after_enqueue_fails_closed() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:blocked-{}.example.com", Uuid::new_v4().as_simple());
@@ -963,7 +963,7 @@ async fn test_outbound_queue_policy_revoked_after_enqueue_fails_closed() {
 
 #[tokio::test]
 async fn test_outbound_queue_malicious_receipt_signature_marks_dead_immediately_mock() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:peer-{}.example.com", Uuid::new_v4().as_simple());
@@ -1022,7 +1022,7 @@ async fn test_outbound_queue_malicious_receipt_signature_marks_dead_immediately_
             "sequencerTerm": 1,
             "payloadSha256": base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
         },
-        "recipientDid": "did:plc:bob",
+        "recipientDid": "did:plc:ragtjsm2j2vknwk6zpkrhgah",
         "entryLocator": {
             "entryId": Uuid::new_v4().to_string(),
             "seq": 1,
@@ -1150,7 +1150,7 @@ async fn test_outbound_queue_malicious_receipt_signature_marks_dead_immediately_
 
 #[tokio::test]
 async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_marked_delivered() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:peer-{}.example.com", Uuid::new_v4().as_simple());
@@ -1387,7 +1387,7 @@ async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_ma
 
 #[tokio::test]
 async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_response_bytes() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:peer-{}.example.com", Uuid::new_v4().as_simple());
@@ -1585,7 +1585,7 @@ async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_res
 #[tokio::test]
 async fn test_outbound_queue_cryptographically_valid_field_mismatched_receipt_is_permanent_hostile_dead(
 ) {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:peer-{}.example.com", Uuid::new_v4().as_simple());
@@ -1689,7 +1689,7 @@ async fn test_outbound_queue_cryptographically_valid_field_mismatched_receipt_is
             "sequencerTerm": 1,
             "payloadSha256": base64::engine::general_purpose::STANDARD.encode([42u8; 32]),
         },
-        "recipientDid": "did:plc:bob",
+        "recipientDid": "did:plc:ragtjsm2j2vknwk6zpkrhgah",
         "entryLocator": {
             "entryId": Uuid::new_v4().to_string(),
             "seq": 1,
@@ -1744,7 +1744,7 @@ async fn test_outbound_queue_cryptographically_valid_field_mismatched_receipt_is
 
 #[tokio::test]
 async fn test_state_machine_creation_does_not_enqueue_synthetic_deliver_message() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -1880,32 +1880,27 @@ async fn test_state_machine_creation_does_not_enqueue_synthetic_deliver_message(
 
 #[tokio::test]
 async fn test_notification_outbox_reclaim_does_not_reference_claim_columns() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
-    // Ensure notification_outbox exists in disposable db
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS notification_outbox (
-            id TEXT PRIMARY KEY,
-            conversation_id TEXT NOT NULL,
-            delivery_event_id TEXT,
-            recipient_did TEXT NOT NULL,
-            recipient_device_id TEXT,
-            kind TEXT NOT NULL,
-            payload BYTEA,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            status TEXT NOT NULL CHECK (status IN ('pending','in_flight','done','failed','dead')),
-            last_error TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
 
     let convo_id = Uuid::new_v4().to_string();
     let stuck_id = Uuid::new_v4().to_string();
     let fresh_id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO conversations (id, creator_did, group_id, created_at, updated_at) VALUES ($1, 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'group-1', NOW(), NOW()) ON CONFLICT DO NOTHING",
+    )
+    .bind(&convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO delivery_events (id, conversation_id, seq, event_type, sender_did, idempotency_key, payload_json) VALUES ('evt-1', $1, 1, 'message', 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'idem-1', '{}'), ('evt-2', $1, 2, 'message', 'did:plc:ragtjsm2j2vknwk6zpkrhgah', 'idem-2', '{}') ON CONFLICT DO NOTHING",
+    )
+    .bind(&convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Row 1: in_flight and updated 10 minutes ago (stuck)
     sqlx::query(
@@ -1961,7 +1956,7 @@ async fn test_notification_outbox_reclaim_does_not_reference_claim_columns() {
 
 #[tokio::test]
 async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_rollback() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -2136,7 +2131,7 @@ async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_r
 
 #[tokio::test]
 async fn test_mailbox_commit_targeting_remote_sequencer_creates_typed_outbox_job_and_rollback() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -2200,7 +2195,7 @@ async fn test_mailbox_commit_targeting_remote_sequencer_creates_typed_outbox_job
 }
 #[tokio::test]
 async fn test_recovery_fulfillment_absent_participant_fails_hard_and_rolls_back() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -2329,7 +2324,7 @@ async fn test_recovery_fulfillment_absent_participant_fails_hard_and_rolls_back(
 }
 #[tokio::test]
 async fn test_recovery_fulfillment_local_participant_skips_outbox_job() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -2432,7 +2427,7 @@ async fn test_recovery_fulfillment_local_participant_skips_outbox_job() {
 
 #[tokio::test]
 async fn test_outbound_queue_worker_periodic_cleanup_dead_and_old_wiring() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let target_ds = "did:web:remote.ds.example.com";
@@ -2544,7 +2539,7 @@ async fn test_outbound_queue_worker_periodic_cleanup_dead_and_old_wiring() {
 
 #[tokio::test]
 async fn test_recovery_fulfillment_pending_remote_welcome_creates_typed_outbox_job() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
@@ -2713,7 +2708,7 @@ async fn test_recovery_fulfillment_pending_remote_welcome_creates_typed_outbox_j
 
 #[tokio::test]
 async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!(
@@ -2783,7 +2778,8 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
 
     let entry_id_str = Uuid::new_v4().to_string();
-    let st_expected_json = format!(r#"{{
+    let st_expected_json = format!(
+        r#"{{
         "coordinates": {{
             "confirmationTag": {{"$bytes": "{b64_32}"}},
             "conversationId": "{convo_id}",
@@ -2890,7 +2886,8 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
             }}
         }},
         "welcomes": []
-    }}"#);
+    }}"#
+    );
     let st_dto: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput =
         serde_json::from_str(&st_expected_json).unwrap();
     let canonical_result_bytes = serde_json::to_vec(&st_dto).unwrap();
@@ -2912,7 +2909,8 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     )
     .unwrap();
 
-    let raw_http_response_str = format!(r#"{{
+    let raw_http_response_str = format!(
+        r#"{{
         "commitEntry": {{
             "conversationId": "{convo_id}",
             "entryId": "{entry_id_str}",
@@ -3020,7 +3018,7 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
         "receipt": {},
         "welcomes": []
     }}"#,
-    serde_json::to_string(&valid_receipt).unwrap()
+        serde_json::to_string(&valid_receipt).unwrap()
     );
     let raw_http_bytes = raw_http_response_str.into_bytes();
     let resp_body_bytes = raw_http_bytes.clone();
@@ -3103,7 +3101,7 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
 
 #[tokio::test]
 async fn test_outbox_record_failure_with_stale_claim_token_does_not_mutate_reclaimed_or_done_row() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
 
     let row_id = Uuid::new_v4().to_string();
     let token_a = Uuid::new_v4();
@@ -3192,7 +3190,7 @@ async fn test_outbox_record_failure_with_stale_claim_token_does_not_mutate_recla
 
 #[tokio::test]
 async fn test_recomputed_envelope_digest_mismatch_marks_dead_immediately() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let peer_did = format!("did:web:peer-{}.example.com", Uuid::new_v4().as_simple());
@@ -3365,7 +3363,7 @@ async fn test_recomputed_envelope_digest_mismatch_marks_dead_immediately() {
 
 #[tokio::test]
 async fn test_store_federation_receipt_db_conflict_exact_compares_digest_and_bytes() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
 
     let peer_did = "did:web:peer.example.com";
     let (signer, _vk, _sk) = test_signer(peer_did);
@@ -3436,28 +3434,137 @@ async fn test_store_federation_receipt_db_conflict_exact_compares_digest_and_byt
 
     assert!(err_envelope.to_string().contains("Receipt conflict"));
 }
-#[tokio::test]
-async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_welcome_is_permanent_dead() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+async fn assert_wrong_result_sha256_marks_queue_item_dead(
+    method: &str,
+    item_id: &str,
+    convo_id: &str,
+    peer_did: &str,
+    verifying_key: &p256::ecdsa::VerifyingKey,
+    payload: Vec<u8>,
+    raw_http_bytes: Vec<u8>,
+) {
+    let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
-    let peer_did = format!("did:web:peer-welcome-{}.example.com", Uuid::new_v4().as_simple());
-    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
+    let delivery_id = Uuid::parse_str(item_id).unwrap();
     let auth_mw = AuthMiddleware::new();
-    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
+    cache_peer_did_doc(&auth_mw, peer_did, verifying_key).await;
     sqlx::query(
-        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
-         VALUES ($1, 'allow', 100, NOW(), NOW())",
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at)          VALUES ($1, 'allow', 100, NOW(), NOW())",
     )
-    .bind(&peer_did)
+    .bind(peer_did)
     .execute(&pool)
     .await
     .unwrap();
 
+    let resp_body_bytes = raw_http_bytes.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
+        let b = resp_body_bytes.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
+
+    sqlx::query(
+        "INSERT INTO outbound_queue (
+            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    )
+    .bind(item_id)
+    .bind(peer_did)
+    .bind(method)
+    .bind(&payload)
+    .bind(convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed = queue.claim_due_batch(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let outbound = OutboundClient::new(2, 2);
+    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
+
+    queue
+        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
+        .await;
+
+    let (status, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
+            .bind(item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        status, "dead",
+        "{method} with wrong result_sha256 must mark dead immediately"
+    );
+    let err_str = last_error.unwrap_or_default();
+    assert!(
+        err_str.contains("result_sha256 mismatch"),
+        "expected result_sha256 mismatch, got: {err_str}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "No receipt must be persisted for hostile wrong result hash on {method}"
+    );
+}
+
+#[tokio::test]
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_welcome_is_permanent_dead(
+) {
+    std::env::set_var("SERVICE_DID", LOCAL_SERVICE_DID);
     let item_id = Uuid::new_v4().to_string();
     let convo_id = Uuid::new_v4().to_string();
     let delivery_id = Uuid::parse_str(&item_id).unwrap();
     let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+    let peer_did = format!(
+        "did:web:peer-welcome-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    let (signer, verifying_key, _) = test_signer(&peer_did);
 
     let source_locator = ValidatedEntryLocator {
         entry_id: Uuid::new_v4(),
@@ -3466,27 +3573,32 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome::<jacquard_common::DefaultStr> {
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome::<
+        jacquard_common::DefaultStr,
+    > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
             receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: service_did_base().into(),
+            sequencer_did: peer_did.clone().into(),
             sequencer_term: 1,
             payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned("did:plc:alice".to_string()).unwrap(),
+        recipient_did: jacquard_common::types::string::Did::new_owned(
+            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
+        )
+        .unwrap(),
         recipient_device_id: Uuid::new_v4().to_string().into(),
-        recovery_request_id: None,
+        recovery_request_id: Uuid::new_v4().to_string().into(),
         coordinates: catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates {
             conversation_id: convo_id.clone().into(),
             epoch: 1,
             generation: 0,
             state_version: 1,
-            lifecycle: catbird_atproto::generated::blue_catbird::chat::Lifecycle::Active,
+            lifecycle: "active".into(),
             group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[1u8; 32]),
             group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[2u8; 32]),
             confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[3u8; 32]),
@@ -3494,29 +3606,39 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
         },
         welcome_id: Uuid::new_v4().to_string().into(),
         welcome_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"welcome"),
-        welcome_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&Sha256::digest(b"welcome")),
+        welcome_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&Sha256::digest(
+            b"welcome",
+        )),
         key_package_ref: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[11u8; 32]),
         tree_summary_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[12u8; 32]),
         public_snapshot_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[13u8; 32]),
         entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-signed-request-bytes"),
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            b"sample-signed-request-bytes",
+        ),
         entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(source_locator.entry_id.to_string()),
+            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
+                source_locator.entry_id.to_string(),
+            ),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.accepted_payload_sha256),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.outer_entry_fingerprint),
+            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &source_locator.accepted_payload_sha256,
+            ),
+            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &source_locator.outer_entry_fingerprint,
+            ),
             extra_data: None,
         },
         extra_data: None,
     };
     let payload = serde_json::to_vec(&msg).unwrap();
-    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
-        DELIVER_WELCOME_NSID,
-        &payload,
-    )
-    .unwrap();
+    let envelope_digest =
+        catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+            DELIVER_WELCOME_NSID,
+            &payload,
+        )
+        .unwrap();
 
-    // Validly signed receipt, but with WRONG result_sha256
     let wrong_result_sha256 = [0xeeu8; 32];
     let wrong_receipt = sign_receipt(
         &signer,
@@ -3540,114 +3662,31 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
     });
     let raw_http_bytes = serde_json::to_vec(&raw_http_response).unwrap();
 
-    let resp_body_bytes = raw_http_bytes.clone();
-    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
-        let b = resp_body_bytes.clone();
-        async move {
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(b))
-                .unwrap()
-        }
-    }));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let resolver = Arc::new(
-        DsResolver::new(
-            pool.clone(),
-            reqwest::Client::new(),
-            "did:web:self.example.com".to_string(),
-            "https://self.example.com".to_string(),
-            None,
-            3600,
-        )
-        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
-            let port = local_addr.port();
-            Some(Box::pin(async move {
-                Ok(ValidatedRemoteDestination {
-                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
-                    host: "127.0.0.1".to_string(),
-                    addrs: vec![local_addr],
-                })
-            }))
-        })),
-    );
-
-    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
-
-    sqlx::query(
-        "INSERT INTO outbound_queue (
-            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
-         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    assert_wrong_result_sha256_marks_queue_item_dead(
+        DELIVER_WELCOME_NSID,
+        &item_id,
+        &convo_id,
+        &peer_did,
+        &verifying_key,
+        payload,
+        raw_http_bytes,
     )
-    .bind(&item_id)
-    .bind(&peer_did)
-    .bind(DELIVER_WELCOME_NSID)
-    .bind(&payload)
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let claimed = queue.claim_due_batch(10).await.unwrap();
-    assert_eq!(claimed.len(), 1);
-
-    let outbound = OutboundClient::new(2, 2);
-    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
-
-    queue
-        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
-        .await;
-
-    let (status, last_error): (String, Option<String>) =
-        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
-            .bind(&item_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-    assert_eq!(status, "dead", "wrong result_sha256 must mark deliverWelcome dead immediately");
-    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
-
-    // Assert no receipt was persisted
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
-    )
-    .bind(delivery_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
+    .await;
 }
 
 #[tokio::test]
-async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_message_is_permanent_dead() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
-    ensure_federation_peers_table(&pool).await;
-
-    let peer_did = format!("did:web:peer-msg-{}.example.com", Uuid::new_v4().as_simple());
-    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
-    let auth_mw = AuthMiddleware::new();
-    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
-    sqlx::query(
-        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
-         VALUES ($1, 'allow', 100, NOW(), NOW())",
-    )
-    .bind(&peer_did)
-    .execute(&pool)
-    .await
-    .unwrap();
-
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_message_is_permanent_dead(
+) {
+    std::env::set_var("SERVICE_DID", LOCAL_SERVICE_DID);
     let item_id = Uuid::new_v4().to_string();
     let convo_id = Uuid::new_v4().to_string();
     let delivery_id = Uuid::parse_str(&item_id).unwrap();
     let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+    let peer_did = format!(
+        "did:web:peer-msg-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    let (signer, verifying_key, _) = test_signer(&peer_did);
 
     let source_locator = ValidatedEntryLocator {
         entry_id: Uuid::new_v4(),
@@ -3656,38 +3695,51 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_me
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<jacquard_common::DefaultStr> {
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<
+        jacquard_common::DefaultStr,
+    > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
             receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: service_did_base().into(),
+            sequencer_did: peer_did.clone().into(),
             sequencer_term: 1,
             payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned("did:plc:bob".to_string()).unwrap(),
+        recipient_did: jacquard_common::types::string::Did::new_owned(
+            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
+        )
+        .unwrap(),
         entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(source_locator.entry_id.to_string()),
+            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
+                source_locator.entry_id.to_string(),
+            ),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.accepted_payload_sha256),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.outer_entry_fingerprint),
+            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &source_locator.accepted_payload_sha256,
+            ),
+            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                &source_locator.outer_entry_fingerprint,
+            ),
             extra_data: None,
         },
         entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-signed-request-bytes"),
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            b"sample-signed-request-bytes",
+        ),
         extra_data: None,
     };
     let payload = serde_json::to_vec(&msg).unwrap();
-    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
-        DELIVER_MESSAGE_NSID,
-        &payload,
-    )
-    .unwrap();
+    let envelope_digest =
+        catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+            DELIVER_MESSAGE_NSID,
+            &payload,
+        )
+        .unwrap();
 
-    // Validly signed receipt, but with WRONG result_sha256
     let wrong_result_sha256 = [0xeeu8; 32];
     let wrong_receipt = sign_receipt(
         &signer,
@@ -3711,114 +3763,31 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_me
     });
     let raw_http_bytes = serde_json::to_vec(&raw_http_response).unwrap();
 
-    let resp_body_bytes = raw_http_bytes.clone();
-    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
-        let b = resp_body_bytes.clone();
-        async move {
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(b))
-                .unwrap()
-        }
-    }));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let resolver = Arc::new(
-        DsResolver::new(
-            pool.clone(),
-            reqwest::Client::new(),
-            "did:web:self.example.com".to_string(),
-            "https://self.example.com".to_string(),
-            None,
-            3600,
-        )
-        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
-            let port = local_addr.port();
-            Some(Box::pin(async move {
-                Ok(ValidatedRemoteDestination {
-                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
-                    host: "127.0.0.1".to_string(),
-                    addrs: vec![local_addr],
-                })
-            }))
-        })),
-    );
-
-    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
-
-    sqlx::query(
-        "INSERT INTO outbound_queue (
-            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
-         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    assert_wrong_result_sha256_marks_queue_item_dead(
+        DELIVER_MESSAGE_NSID,
+        &item_id,
+        &convo_id,
+        &peer_did,
+        &verifying_key,
+        payload,
+        raw_http_bytes,
     )
-    .bind(&item_id)
-    .bind(&peer_did)
-    .bind(DELIVER_MESSAGE_NSID)
-    .bind(&payload)
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let claimed = queue.claim_due_batch(10).await.unwrap();
-    assert_eq!(claimed.len(), 1);
-
-    let outbound = OutboundClient::new(2, 2);
-    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
-
-    queue
-        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
-        .await;
-
-    let (status, last_error): (String, Option<String>) =
-        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
-            .bind(&item_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-    assert_eq!(status, "dead", "wrong result_sha256 must mark deliverMessage dead immediately");
-    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
-
-    // Assert no receipt was persisted
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
-    )
-    .bind(delivery_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
+    .await;
 }
 
 #[tokio::test]
-async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_commit_is_permanent_dead() {
-    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
-    ensure_federation_peers_table(&pool).await;
-
-    let peer_did = format!("did:web:peer-commit-{}.example.com", Uuid::new_v4().as_simple());
-    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
-    let auth_mw = AuthMiddleware::new();
-    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
-    sqlx::query(
-        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
-         VALUES ($1, 'allow', 100, NOW(), NOW())",
-    )
-    .bind(&peer_did)
-    .execute(&pool)
-    .await
-    .unwrap();
-
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_commit_is_permanent_dead(
+) {
+    std::env::set_var("SERVICE_DID", LOCAL_SERVICE_DID);
     let item_id = Uuid::new_v4().to_string();
     let convo_id = Uuid::new_v4().to_string();
     let delivery_id = Uuid::parse_str(&item_id).unwrap();
     let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+    let peer_did = format!(
+        "did:web:peer-commit-{}.example.com",
+        Uuid::new_v4().as_simple()
+    );
+    let (signer, verifying_key, _) = test_signer(&peer_did);
 
     let source_locator = ValidatedEntryLocator {
         entry_id: Uuid::new_v4(),
@@ -3827,29 +3796,33 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<jacquard_common::DefaultStr> {
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<
+        jacquard_common::DefaultStr,
+    > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
             receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: service_did_base().into(),
+            sequencer_did: peer_did.clone().into(),
             sequencer_term: 1,
             payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
             extra_data: None,
         },
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"fake-signed-request"),
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            b"fake-signed-request",
+        ),
         extra_data: None,
     };
     let payload = serde_json::to_vec(&msg).unwrap();
-    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
-        SUBMIT_COMMIT_NSID,
-        &payload,
-    )
-    .unwrap();
+    let envelope_digest =
+        catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+            SUBMIT_COMMIT_NSID,
+            &payload,
+        )
+        .unwrap();
 
-    // Validly signed receipt, but with WRONG result_sha256
     let wrong_result_sha256 = [0xeeu8; 32];
     let wrong_receipt = sign_receipt(
         &signer,
@@ -3858,7 +3831,7 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
         convo_uuid,
         &service_did_base(),
         &peer_did,
-        &service_did_base(),
+        &peer_did,
         1,
         envelope_digest,
         wrong_result_sha256,
@@ -3874,200 +3847,20 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
     let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
     let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
 
-    let json_str = format!(r#"{{
-        "commitEntry": {{
-            "conversationId": "{convo_id}",
-            "entryId": "{item_id}",
-            "receivedAt": "2026-08-25T12:00:00Z",
-            "seq": 1,
-            "signedRequest": {{
-                "body": {{
-                    "$type": "blue.catbird.chat.defs#commitTransitionBody",
-                    "signatureDomain": "CATBIRD-CHAT-COMMIT\u0000",
-                    "transitionId": "{item_id}",
-                    "idempotencyKey": "{item_id}",
-                    "actorDid": "did:plc:alice",
-                    "actorDeviceId": "{item_id}",
-                    "keyId": "k-1",
-                    "authGeneration": 1,
-                    "signedAt": "2026-08-25T12:00:00Z",
-                    "conversationId": "{convo_id}",
-                    "prior": {{
-                        "conversationId": "{convo_id}",
-                        "generation": 0,
-                        "stateVersion": 0,
-                        "groupId": {{"$bytes": "{b64_32}"}},
-                        "epoch": 0,
-                        "groupContextHash": {{"$bytes": "{b64_32}"}},
-                        "confirmationTag": {{"$bytes": "{b64_32}"}},
-                        "lifecycle": "active"
-                    }},
-                    "next": {{
-                        "conversationId": "{convo_id}",
-                        "generation": 0,
-                        "stateVersion": 1,
-                        "groupId": {{"$bytes": "{b64_32}"}},
-                        "epoch": 1,
-                        "groupContextHash": {{"$bytes": "{b64_32}"}},
-                        "confirmationTag": {{"$bytes": "{b64_32}"}},
-                        "lifecycle": "active"
-                    }},
-                    "aad": {{
-                        "protocolVersion": "1",
-                        "conversationId": {b16},
-                        "generation": 0,
-                        "transitionId": {b16},
-                        "prior": {{
-                            "conversationId": {b16},
-                            "generation": 0,
-                            "stateVersion": 0,
-                            "groupId": {{"$bytes": "{b64_32}"}},
-                            "epoch": 0,
-                            "groupContextHash": {{"$bytes": "{b64_32}"}},
-                            "confirmationTag": {{"$bytes": "{b64_32}"}},
-                            "lifecycle": "active"
-                        }}
-                    }},
-                    "manifest": {{
-                        "participantChanges": [],
-                        "leafChanges": []
-                    }},
-                    "commit": {{
-                        "framing": "mlsMessage",
-                        "contentType": "publicMessageCommit",
-                        "bytes": {{"$bytes": "{b64_48}"}},
-                        "sha256": {b32_arr}
-                    }},
-                    "metadataSnapshot": {{
-                        "coordinate": {{
-                            "conversationId": {b16},
-                            "generation": 0,
-                            "groupId": {{"$bytes": "{b64_32}"}},
-                            "epoch": 1,
-                            "groupContextHash": {{"$bytes": "{b64_32}"}},
-                            "confirmationTag": {{"$bytes": "{b64_32}"}}
-                        }},
-                        "originTransitionId": "{item_id}",
-                        "metadataVersion": 1,
-                        "nonce": {{"$bytes": "{b64_12}"}},
-                        "ciphertext": {{"$bytes": "{b64_48}"}},
-                        "ciphertextSha256": {b32_arr},
-                        "ciphertextSize": 48,
-                        "authorProof": {{
-                            "authorDid": "did:plc:alice",
-                            "authorDeviceId": "{item_id}",
-                            "authorKeyId": "k-1",
-                            "signaturePublicKey": {{"$bytes": "{b64_32}"}},
-                            "authGenerationAtOrigin": 1,
-                            "originTransitionId": "{item_id}",
-                            "originSeq": 1,
-                            "roleAtOrigin": "admin",
-                            "deviceStatusAtOrigin": "active"
-                        }}
-                    }}
-                }},
-                "signature": {{"$bytes": "{b64_64}"}}
-            }}
-        }},
-        "coordinates": {{
-            "confirmationTag": {{"$bytes": "{b64_32}"}},
-            "conversationId": "{convo_id}",
-            "epoch": 1,
-            "generation": 0,
-            "groupContextHash": {{"$bytes": "{b64_32}"}},
-            "groupId": {{"$bytes": "{b64_32}"}},
-            "lifecycle": "active",
-            "stateVersion": 1
-        }},
-        "receipt": {},
-        "welcomes": []
-    }}"#,
-    serde_json::to_string(&wrong_receipt).unwrap()
+    let json_str = format!(
+        r#"{{"commitEntry":{{"conversationId":"{convo_id}","entryId":"{item_id}","receivedAt":"2026-08-25T12:00:00Z","seq":1,"signedRequest":{{"body":{{"$type":"blue.catbird.chat.defs#commitTransitionBody","signatureDomain":"CATBIRD-CHAT-COMMIT\u0000","transitionId":"{item_id}","idempotencyKey":"{item_id}","actorDid":"did:plc:alice","actorDeviceId":"{item_id}","keyId":"k-1","authGeneration":1,"signedAt":"2026-08-25T12:00:00Z","conversationId":"{convo_id}","prior":{{"conversationId":"{convo_id}","generation":0,"stateVersion":0,"groupId":{{"$bytes":"{b64_32}"}},"epoch":0,"groupContextHash":{{"$bytes":"{b64_32}"}},"confirmationTag":{{"$bytes":"{b64_32}"}},"lifecycle":"active"}},"next":{{"conversationId":"{convo_id}","generation":0,"stateVersion":1,"groupId":{{"$bytes":"{b64_32}"}},"epoch":1,"groupContextHash":{{"$bytes":"{b64_32}"}},"confirmationTag":{{"$bytes":"{b64_32}"}},"lifecycle":"active"}},"aad":{{"protocolVersion":"1","conversationId":{b16},"generation":0,"transitionId":{b16},"prior":{{"conversationId":{b16},"generation":0,"stateVersion":0,"groupId":{{"$bytes":"{b64_32}"}},"epoch":0,"groupContextHash":{{"$bytes":"{b64_32}"}},"confirmationTag":{{"$bytes":"{b64_32}"}},"lifecycle":"active"}}}},"manifest":{{"participantChanges":[],"leafChanges":[]}},"commit":{{"framing":"mlsMessage","contentType":"publicMessageCommit","bytes":{{"$bytes":"{b64_48}"}},"sha256":{b32_arr}}},"metadataSnapshot":{{"coordinate":{{"conversationId":{b16},"generation":0,"groupId":{{"$bytes":"{b64_32}"}},"epoch":1,"groupContextHash":{{"$bytes":"{b64_32}"}},"confirmationTag":{{"$bytes":"{b64_32}"}}}},"originTransitionId":"{item_id}","metadataVersion":1,"nonce":{{"$bytes":"{b64_12}"}},"ciphertext":{{"$bytes":"{b64_48}"}},"ciphertextSha256":{b32_arr},"ciphertextSize":48,"authorProof":{{"authorDid":"did:plc:alice","authorDeviceId":"{item_id}","authorKeyId":"k-1","signaturePublicKey":{{"$bytes":"{b64_32}"}},"authGenerationAtOrigin":1,"originTransitionId":"{item_id}","originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}}}}}},"signature":{{"$bytes":"{b64_64}"}}}}}},"coordinates":{{"confirmationTag":{{"$bytes":"{b64_32}"}},"conversationId":"{convo_id}","epoch":1,"generation":0,"groupContextHash":{{"$bytes":"{b64_32}"}},"groupId":{{"$bytes":"{b64_32}"}},"lifecycle":"active","stateVersion":1}},"receipt":{},"welcomes":[]}}"#,
+        serde_json::to_string(&wrong_receipt).unwrap()
     );
     let raw_http_bytes = json_str.into_bytes();
 
-    let resp_body_bytes = raw_http_bytes.clone();
-    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
-        let b = resp_body_bytes.clone();
-        async move {
-            axum::response::Response::builder()
-                .status(200)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(b))
-                .unwrap()
-        }
-    }));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let resolver = Arc::new(
-        DsResolver::new(
-            pool.clone(),
-            reqwest::Client::new(),
-            "did:web:self.example.com".to_string(),
-            "https://self.example.com".to_string(),
-            None,
-            3600,
-        )
-        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
-            let port = local_addr.port();
-            Some(Box::pin(async move {
-                Ok(ValidatedRemoteDestination {
-                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
-                    host: "127.0.0.1".to_string(),
-                    addrs: vec![local_addr],
-                })
-            }))
-        })),
-    );
-
-    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
-
-    sqlx::query(
-        "INSERT INTO outbound_queue (
-            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
-         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    assert_wrong_result_sha256_marks_queue_item_dead(
+        SUBMIT_COMMIT_NSID,
+        &item_id,
+        &convo_id,
+        &peer_did,
+        &verifying_key,
+        payload,
+        raw_http_bytes,
     )
-    .bind(&item_id)
-    .bind(&peer_did)
-    .bind(SUBMIT_COMMIT_NSID)
-    .bind(&payload)
-    .bind(&convo_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let claimed = queue.claim_due_batch(10).await.unwrap();
-    assert_eq!(claimed.len(), 1);
-
-    let outbound = OutboundClient::new(2, 2);
-    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
-
-    queue
-        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
-        .await;
-
-    let (status, last_error): (String, Option<String>) =
-        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
-            .bind(&item_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-    assert_eq!(status, "dead", "wrong result_sha256 must mark submitCommit dead immediately");
-    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
-
-    // Assert no receipt was persisted
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
-    )
-    .bind(delivery_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
+    .await;
 }
