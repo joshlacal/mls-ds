@@ -2332,6 +2332,16 @@ const OPERATION_CLAIM_COMPLETENESS_TABLES: [&str; 1] = ["operation_claim_complet
 const G7_INVENTORY_TABLES: [&str; 2] = ["event_cursor_receipts", "inventory_page_receipts"];
 const SERVICE_AUTH_TABLES: [&str; 1] = ["service_auth_admissions"];
 const FEDERATION_RECEIPT_TABLES: [&str; 1] = ["federation_delivery_receipts"];
+const PUBLIC_FEDERATION_TRANSPORT_RELATIONS: &[&str] = &[
+    "federation_outbox",
+    "federation_outbox_pkey",
+    "idx_federation_outbox_due_v2",
+    "idx_federation_outbox_lease",
+    "outbound_queue",
+    "outbound_queue_pkey",
+    "idx_outbound_queue_due_v2",
+    "idx_outbound_queue_lease",
+];
 
 fn expected_tables() -> BTreeSet<String> {
     CORE_TABLES
@@ -8375,13 +8385,28 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
             "_sqlx_migrations_pkey|i".to_owned(),
             "auth_jti_nonce|r".to_owned(),
             "auth_jti_nonce_pkey|i".to_owned(),
+            "federation_outbox|r".to_owned(),
+            "federation_outbox_pkey|i".to_owned(),
             "idx_auth_jti_nonce_expires|i".to_owned(),
+            "idx_federation_outbox_due_v2|i".to_owned(),
+            "idx_federation_outbox_lease|i".to_owned(),
+            "idx_outbound_queue_due_v2|i".to_owned(),
+            "idx_outbound_queue_lease|i".to_owned(),
+            "outbound_queue|r".to_owned(),
+            "outbound_queue_pkey|i".to_owned(),
         ],
         "A0 final public relation allowlist drift"
     );
     assert_eq!(
         public_constraints,
-        ["_sqlx_migrations_pkey|p", "auth_jti_nonce_pkey|p"],
+        [
+            "_sqlx_migrations_pkey|p".to_owned(),
+            "auth_jti_nonce_pkey|p".to_owned(),
+            "federation_outbox_pkey|p".to_owned(),
+            "federation_outbox_status_check|c".to_owned(),
+            "outbound_queue_pkey|p".to_owned(),
+            "outbound_queue_status_check|c".to_owned(),
+        ],
         "A0 final public constraint allowlist drift"
     );
     assert!(
@@ -9910,6 +9935,183 @@ async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
             "missing required trigger: {required_tg}"
         );
     }
+
+    // Federation transport public catalog validation and rejection tests
+    #[derive(Debug, PartialEq, Eq)]
+    enum FederationTransportCatalogDrift {
+        MissingRelation(String),
+        UnexpectedRelation(String),
+        WrongIndexPredicate {
+            index: String,
+            expected: String,
+            actual: String,
+        },
+    }
+
+    fn validate_federation_transport_catalog(
+        actual_relations: &[&str],
+        actual_predicates: &[(&str, &str)],
+    ) -> Result<(), FederationTransportCatalogDrift> {
+        let expected_relations: BTreeSet<&str> = PUBLIC_FEDERATION_TRANSPORT_RELATIONS
+            .iter()
+            .copied()
+            .collect();
+        let actual_set: BTreeSet<&str> = actual_relations.iter().copied().collect();
+
+        for expected in &expected_relations {
+            if !actual_set.contains(expected) {
+                return Err(FederationTransportCatalogDrift::MissingRelation(
+                    (*expected).to_owned(),
+                ));
+            }
+        }
+        for actual in &actual_set {
+            if !expected_relations.contains(actual) {
+                return Err(FederationTransportCatalogDrift::UnexpectedRelation(
+                    (*actual).to_owned(),
+                ));
+            }
+        }
+
+        const EXPECTED_INDEX_PREDICATES: &[(&str, &str)] = &[
+            ("idx_federation_outbox_due_v2", "(status = 'pending'::text)"),
+            (
+                "idx_federation_outbox_lease",
+                "(status = 'in_flight'::text)",
+            ),
+            ("idx_outbound_queue_due_v2", "(status = 'pending'::text)"),
+            ("idx_outbound_queue_lease", "(status = 'in_flight'::text)"),
+        ];
+        let actual_pred_map: BTreeMap<&str, &str> = actual_predicates.iter().copied().collect();
+        for (index, expected_pred) in EXPECTED_INDEX_PREDICATES {
+            if let Some(actual_pred) = actual_pred_map.get(index) {
+                if actual_pred != expected_pred {
+                    return Err(FederationTransportCatalogDrift::WrongIndexPredicate {
+                        index: (*index).to_owned(),
+                        expected: (*expected_pred).to_owned(),
+                        actual: (*actual_pred).to_owned(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    let baseline_relations = PUBLIC_FEDERATION_TRANSPORT_RELATIONS;
+    let baseline_predicates = [
+        ("idx_federation_outbox_due_v2", "(status = 'pending'::text)"),
+        (
+            "idx_federation_outbox_lease",
+            "(status = 'in_flight'::text)",
+        ),
+        ("idx_outbound_queue_due_v2", "(status = 'pending'::text)"),
+        ("idx_outbound_queue_lease", "(status = 'in_flight'::text)"),
+    ];
+
+    // Positive control: exact catalog passes
+    assert!(
+        validate_federation_transport_catalog(baseline_relations, &baseline_predicates).is_ok()
+    );
+
+    // Negative 1: Missing relation
+    let mut missing_relations = baseline_relations.to_vec();
+    missing_relations.retain(|&r| r != "idx_federation_outbox_due_v2");
+    assert_eq!(
+        validate_federation_transport_catalog(&missing_relations, &baseline_predicates),
+        Err(FederationTransportCatalogDrift::MissingRelation(
+            "idx_federation_outbox_due_v2".to_owned()
+        ))
+    );
+
+    // Negative 2: Unexpected relation
+    let mut unexpected_relations = baseline_relations.to_vec();
+    unexpected_relations.push("unapproved_federation_table");
+    assert_eq!(
+        validate_federation_transport_catalog(&unexpected_relations, &baseline_predicates),
+        Err(FederationTransportCatalogDrift::UnexpectedRelation(
+            "unapproved_federation_table".to_owned()
+        ))
+    );
+
+    // Negative 3: Index with wrong predicate
+    let wrong_predicates = [
+        ("idx_federation_outbox_due_v2", "(status = 'done'::text)"),
+        (
+            "idx_federation_outbox_lease",
+            "(status = 'in_flight'::text)",
+        ),
+        ("idx_outbound_queue_due_v2", "(status = 'pending'::text)"),
+        ("idx_outbound_queue_lease", "(status = 'in_flight'::text)"),
+    ];
+    assert_eq!(
+        validate_federation_transport_catalog(baseline_relations, &wrong_predicates),
+        Err(FederationTransportCatalogDrift::WrongIndexPredicate {
+            index: "idx_federation_outbox_due_v2".to_owned(),
+            expected: "(status = 'pending'::text)".to_owned(),
+            actual: "(status = 'done'::text)".to_owned(),
+        })
+    );
+
+    // Live DB verification of actual federation transport index predicates
+    let db_predicates: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT i.relname, pg_get_expr(x.indpred, x.indrelid, false)
+          FROM pg_index x
+          JOIN pg_class i ON i.oid = x.indexrelid
+          JOIN pg_class t ON t.oid = x.indrelid
+          JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public'
+           AND i.relname IN (
+               'idx_federation_outbox_due_v2',
+               'idx_federation_outbox_lease',
+               'idx_outbound_queue_due_v2',
+               'idx_outbound_queue_lease'
+           )
+         ORDER BY i.relname
+        "#,
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .expect("fetch public federation transport index predicates");
+
+    let live_predicates: Vec<(&str, &str)> = db_predicates
+        .iter()
+        .map(|(name, pred)| (name.as_str(), pred.as_deref().unwrap_or("")))
+        .collect();
+    assert!(
+        validate_federation_transport_catalog(baseline_relations, &live_predicates).is_ok(),
+        "live database federation transport index predicates drifted: {live_predicates:?}"
+    );
+
+    // Migration source audit
+    let migration_sql = std::fs::read_to_string(
+        migration_dir().join("20260824000005_chat_federation_outbox_retry.sql"),
+    )
+    .expect("read federation outbox retry migration");
+    let compact_sql = compact_sql(&migration_sql);
+
+    assert_source_contract(
+        "federation transport index predicates",
+        &[
+            (
+                "idx_federation_outbox_due_v2 is partial on status = 'pending'",
+                compact_sql.contains("CREATE INDEX IF NOT EXISTS idx_federation_outbox_due_v2 ON federation_outbox(next_attempt_at) WHERE status = 'pending'"),
+            ),
+            (
+                "idx_federation_outbox_lease is partial on status = 'in_flight'",
+                compact_sql.contains("CREATE INDEX IF NOT EXISTS idx_federation_outbox_lease ON federation_outbox(claim_expires_at) WHERE status = 'in_flight'"),
+            ),
+            (
+                "idx_outbound_queue_due_v2 is partial on status = 'pending'",
+                compact_sql.contains("CREATE INDEX IF NOT EXISTS idx_outbound_queue_due_v2 ON outbound_queue(next_retry_at) WHERE status = 'pending'"),
+            ),
+            (
+                "idx_outbound_queue_lease is partial on status = 'in_flight'",
+                compact_sql.contains("CREATE INDEX IF NOT EXISTS idx_outbound_queue_lease ON outbound_queue(claim_expires_at) WHERE status = 'in_flight'"),
+            ),
+        ],
+    );
 
     connection.close().await.expect("close connection");
     pool.close().await;
