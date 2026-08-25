@@ -93,13 +93,9 @@ async fn submit(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let prepared = match prelude::prepare_signed_operation(&mut transaction, admission).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("PRELUDE PREPARE ERROR ON CALL: {e:?}");
-            return Err(context::operation_prelude_failure(ENDPOINT, e));
-        }
-    };
+    let prepared = prelude::prepare_signed_operation(&mut transaction, admission)
+        .await
+        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
     let mutation_kind = prepared
         .mutation_kind()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
@@ -212,9 +208,9 @@ fn submit_failure(
                 crate::federation::FederationError::UnauthorizedParticipantDs { .. }
                 | crate::federation::FederationError::UnauthorizedRecipient { .. }
                 | crate::federation::FederationError::AuthFailed { .. }
-                | crate::federation::FederationError::RemoteError { status: 401, .. } => {
-                    ChatFailure::protocol(ENDPOINT, C::NotAuthorized)
-                }
+                | crate::federation::FederationError::RemoteError {
+                    status: 401 | 403, ..
+                } => ChatFailure::protocol(ENDPOINT, C::NotAuthorized),
                 crate::federation::FederationError::TermStale { .. }
                 | crate::federation::FederationError::InvalidCommitFraming { .. }
                 | crate::federation::FederationError::InvalidEnvelope { .. }

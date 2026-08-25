@@ -95,19 +95,13 @@ impl RemoteCommitSubmitter {
                 });
             }
         };
-
-        let receipt = resp
-            .clean_receipt()
-            .ok_or_else(|| FederationError::InvalidEnvelope {
-                reason: "submitCommit response missing clean FederationReceiptV1".to_string(),
-            })?;
-
         let output: SubmitCommitOutput =
             serde_json::from_slice(&resp.response_bytes).map_err(|e| {
                 FederationError::InvalidEnvelope {
                     reason: format!("failed to parse submitCommit response: {e}"),
                 }
             })?;
+        let receipt = output.receipt.clone();
 
         let did_doc = self
             .auth_middleware
@@ -120,30 +114,53 @@ impl RemoteCommitSubmitter {
                 ),
             })?;
 
-        let verifying_key =
-            crate::auth::extract_p256_key(&did_doc).ok_or_else(|| FederationError::AuthFailed {
+        let matching_vm = did_doc
+            .verification_method
+            .iter()
+            .find(|vm| {
+                vm.id == super::RECEIPT_VERIFICATION_METHOD
+                    || vm.id.ends_with("#mls-receipt-1")
+                    || vm.id == format!("{}#mls-receipt-1", receipt.receiver_ds_did.as_str())
+            })
+            .ok_or_else(|| FederationError::AuthFailed {
                 reason: format!(
-                    "no P-256 key found in DID document for {}",
+                    "no verification method matching {} in DID document for {}",
+                    super::RECEIPT_VERIFICATION_METHOD,
                     receipt.receiver_ds_did.as_str()
                 ),
             })?;
 
+        if !dids_equivalent(&matching_vm.controller, receipt.receiver_ds_did.as_str()) {
+            return Err(FederationError::AuthFailed {
+                reason: format!(
+                    "receipt verification method controller mismatch: expected {}, got {}",
+                    receipt.receiver_ds_did.as_str(),
+                    matching_vm.controller
+                ),
+            });
+        }
+
+        let verifying_key = crate::auth::extract_p256_key_from_vm(matching_vm).map_err(|e| {
+            FederationError::AuthFailed {
+                reason: format!(
+                    "failed to extract P-256 key from receipt verification method: {e}"
+                ),
+            }
+        })?;
+
         match verify_receipt(&receipt, &verifying_key) {
             Ok(true) => {}
             Ok(false) => {
-                eprintln!("RECEIPT SIGNATURE VERIFICATION FAILED!");
                 return Err(FederationError::InvalidEnvelope {
                     reason: "receipt signature verification failed".to_string(),
                 });
             }
             Err(e) => {
-                eprintln!("RECEIPT VERIFICATION ERROR: {e:?}");
                 return Err(FederationError::InvalidEnvelope {
                     reason: format!("receipt verification error: {e}"),
                 });
             }
         }
-
         if receipt.endpoint.as_str() != SUBMIT_COMMIT_NSID {
             return Err(FederationError::InvalidEnvelope {
                 reason: format!(
@@ -198,14 +215,6 @@ impl RemoteCommitSubmitter {
                 ),
             });
         }
-        if receipt.sequencer_term as u64 != sequencer_term {
-            return Err(FederationError::InvalidEnvelope {
-                reason: format!(
-                    "receipt sequencerTerm mismatch: expected {sequencer_term}, got {}",
-                    receipt.sequencer_term
-                ),
-            });
-        }
         if receipt.envelope_sha256.as_ref() != envelope.header.payload_sha256.as_ref() {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt envelope_sha256 mismatch".to_string(),
@@ -231,6 +240,7 @@ impl RemoteCommitSubmitter {
                 reason: "receipt source_locator seq mismatch with commit_entry".to_string(),
             });
         }
+
         Ok(VerifiedSubmitCommit {
             output,
             submit_transition_response_bytes,

@@ -774,9 +774,11 @@ async fn main() -> anyhow::Result<()> {
         fed_config.outbound_timeout_secs,
     ));
 
+    let auth_middleware = auth::AuthMiddleware::new();
+
     let outbound_queue = Arc::new(federation::queue::OutboundQueue::new(
         db_pool.clone(),
-        auth::AuthMiddleware::new(),
+        auth_middleware.clone(),
         resolver.clone(),
     ));
     let commit_submitter = if fed_config.enabled {
@@ -791,7 +793,7 @@ async fn main() -> anyhow::Result<()> {
                 resolver.clone(),
                 outbound.clone(),
                 auth.clone(),
-                auth::AuthMiddleware::new(),
+                auth_middleware.clone(),
             ),
         ))
     } else {

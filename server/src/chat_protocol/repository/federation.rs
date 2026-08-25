@@ -2747,3 +2747,24 @@ pub fn build_federated_commit_envelope(
 
     Ok(msg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_derive_submit_commit_delivery_id_fixed_vector() {
+        let convo_id = Uuid::from_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let trans_id = Uuid::from_str("66666666-7777-4888-8999-aaaaaaaaaaaa").unwrap();
+        let sequencer_did = "did:web:chat.example.com";
+
+        let delivery_id = derive_submit_commit_delivery_id(convo_id, trans_id, sequencer_did);
+        assert_eq!(
+            delivery_id.to_string(),
+            "de0a360e-1972-4780-bee0-ffe46ea0e7da",
+            "delivery_id must match fixed test vector exactly"
+        );
+        assert_eq!(delivery_id.get_version_num(), 4, "must be UUIDv4");
+    }
+}

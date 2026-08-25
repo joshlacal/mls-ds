@@ -410,180 +410,137 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     .await
     .map_err(SubmitTransitionFacadeError::Database)?;
 
+    let entry = build_verified_control_entry(
+        mutation,
+        authority.endpoint(),
+        canonical_uuid_v4(parsed.transition_id)?,
+        canonical_uuid_v4(Uuid::from_bytes(*parsed.prior.conversation_id()))?,
+        expected_seq,
+        authority.trusted_instant(),
+        CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
+    )?;
+    let products = CanonicalControlEntryProducts::mint(&entry)?;
+
+    let planned = match admitted.kind() {
+        SignedMutationKind::CommitTransition => {
+            hydration.plan_commit_entry(&aggregate, entry, &registration, terminal_packages)?
+        }
+        SignedMutationKind::PolicyTransition if parsed.add_principals.is_empty() => {
+            let quota = hydrate_locked_invitation_quota(
+                transaction,
+                std::str::from_utf8(registration.actor().principal().as_bytes())
+                    .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
+                &[],
+                scope_authority.trusted_instant(),
+            )
+            .await?;
+            let no_admission =
+                seal_non_add_policy_no_pending_admission(&aggregate, &quota, &registration)?;
+            hydration.plan_policy_without_pending_admission(
+                &aggregate,
+                entry,
+                &registration,
+                terminal_packages,
+                quota,
+                no_admission,
+                authority.trusted_instant(),
+            )?
+        }
+        SignedMutationKind::PolicyTransition => {
+            let quota = hydrate_locked_invitation_quota(
+                transaction,
+                admitted.actor_did().as_str(),
+                &parsed.add_principals,
+                scope_authority.trusted_instant(),
+            )
+            .await?;
+            let fallback_scope =
+                seal_pending_add_fallback_scope(&aggregate, &quota, &registration)?;
+            let (relationship, relationship_decision) = load_fallback_relationship_projection(
+                transaction,
+                fallback_scope,
+                relationship_authority,
+            )
+            .await?
+            .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+            hydration.plan_policy(
+                &aggregate,
+                entry,
+                &registration,
+                terminal_packages,
+                &relationship,
+                relationship_authority,
+                quota,
+                &relationship_decision,
+                authority.trusted_instant(),
+            )?
+        }
+        SignedMutationKind::MetadataTransition => {
+            hydration.plan_metadata_entry(&aggregate, entry, registration, terminal_packages)?
+        }
+        SignedMutationKind::LeaveCommitFulfillment => hydration.plan_leave_fulfillment_entry(
+            &aggregate,
+            entry,
+            &registration,
+            terminal_packages,
+        )?,
+        _ => return Err(SubmitTransitionFacadeError::UnsupportedMutation),
+    };
+    let plan = planned.into_persistence_plan()?;
+    let local_response = canonical_response_from_plan(&plan, products.canonical_response_json())?;
+    if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
+        let submitter = commit_submitter.ok_or_else(|| {
+            SubmitTransitionFacadeError::Federation(
+                crate::federation::FederationError::ConfigError {
+                    reason: "Remote commit submitter is not configured for federated conversation"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        let accepted_request = admitted
+            .accepted_wrapper_bytes()
+            .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+        let transition_id = parsed.transition_id;
+
+        let envelope =
+            crate::chat_protocol::repository::federation::build_federated_commit_envelope(
+                conversation_id,
+                transition_id,
+                &sequencer_ds,
+                accepted_request,
+                sequencer_term as u64,
+            )?;
+
+        // ponytail: the remote call holds the conversation lock; split admission into a durable
+        // pending state only if measured federation latency makes this a throughput bottleneck.
+        let verified = submitter
+            .submit(&sequencer_ds, sequencer_term as u64, &envelope)
+            .await?;
+
+        if verified.output.commit_entry.entry_id.as_str()
+            != expected_entry_id.hyphenated().to_string()
+            || verified.output.commit_entry.seq as u64 != expected_seq
+        {
+            return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
+        }
+
+        let succ = plan
+            .successor_coordinate()
+            .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        if verified.output.coordinates.epoch as u64 != succ.epoch()
+            || verified.output.coordinates.state_version as u64 != succ.state_version()
+            || verified.output.coordinates.group_id.as_ref() != succ.group_id()
+            || verified.output.coordinates.group_context_hash.as_ref() != succ.group_context_hash()
+            || verified.output.coordinates.confirmation_tag.as_ref() != succ.confirmation_tag()
+        {
+            return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
+        }
+    }
+
     let (plan, response, accepted_control_entry_bytes) =
-        if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
-            let submitter = commit_submitter.ok_or_else(|| {
-                SubmitTransitionFacadeError::Federation(
-                    crate::federation::FederationError::ConfigError {
-                        reason:
-                            "Remote commit submitter is not configured for federated conversation"
-                                .to_string(),
-                    },
-                )
-            })?;
-
-            let accepted_request = admitted
-                .accepted_wrapper_bytes()
-                .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-            let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
-            let transition_id = parsed.transition_id;
-
-            let envelope =
-                crate::chat_protocol::repository::federation::build_federated_commit_envelope(
-                    conversation_id,
-                    transition_id,
-                    &sequencer_ds,
-                    accepted_request,
-                    sequencer_term as u64,
-                )?;
-
-            // ponytail: the remote call holds the conversation lock; split admission into a durable
-            // pending state only if measured federation latency makes this a throughput bottleneck.
-            let verified = submitter
-                .submit(&sequencer_ds, sequencer_term as u64, &envelope)
-                .await?;
-
-            if verified.output.commit_entry.entry_id.as_str()
-                != expected_entry_id.hyphenated().to_string()
-                || verified.output.commit_entry.seq as u64 != expected_seq
-            {
-                return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
-            }
-
-            let entry = build_verified_control_entry(
-                mutation,
-                authority.endpoint(),
-                canonical_uuid_v4(parsed.transition_id)?,
-                canonical_uuid_v4(Uuid::from_bytes(*parsed.prior.conversation_id()))?,
-                expected_seq,
-                authority.trusted_instant(),
-                CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
-            )?;
-            let products = CanonicalControlEntryProducts::mint(&entry)?;
-
-            let planned = match admitted.kind() {
-                SignedMutationKind::CommitTransition => hydration.plan_commit_entry(
-                    &aggregate,
-                    entry,
-                    &registration,
-                    terminal_packages,
-                )?,
-                _ => return Err(SubmitTransitionFacadeError::UnsupportedMutation),
-            };
-            let plan = planned.into_persistence_plan()?;
-
-            let succ = plan
-                .successor_coordinate()
-                .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-            if verified.output.coordinates.epoch as u64 != succ.epoch()
-                || verified.output.coordinates.state_version as u64 != succ.state_version()
-                || verified.output.coordinates.group_id.as_ref() != succ.group_id()
-                || verified.output.coordinates.group_context_hash.as_ref()
-                    != succ.group_context_hash()
-                || verified.output.coordinates.confirmation_tag.as_ref() != succ.confirmation_tag()
-            {
-                return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
-            }
-
-            let local_response =
-                canonical_response_from_plan(&plan, products.canonical_response_json())?;
-            (plan, local_response, products.durable_json().to_vec())
-        } else {
-            let entry = build_verified_control_entry(
-                mutation,
-                authority.endpoint(),
-                canonical_uuid_v4(parsed.transition_id)?,
-                canonical_uuid_v4(Uuid::from_bytes(*parsed.prior.conversation_id()))?,
-                expected_seq,
-                authority.trusted_instant(),
-                CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
-            )?;
-            let products = CanonicalControlEntryProducts::mint(&entry)?;
-
-            let planned = match admitted.kind() {
-                SignedMutationKind::CommitTransition => hydration.plan_commit_entry(
-                    &aggregate,
-                    entry,
-                    &registration,
-                    terminal_packages,
-                )?,
-                SignedMutationKind::PolicyTransition if parsed.add_principals.is_empty() => {
-                    let quota = hydrate_locked_invitation_quota(
-                        transaction,
-                        std::str::from_utf8(registration.actor().principal().as_bytes())
-                            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
-                        &[],
-                        scope_authority.trusted_instant(),
-                    )
-                    .await?;
-                    let no_admission = seal_non_add_policy_no_pending_admission(
-                        &aggregate,
-                        &quota,
-                        &registration,
-                    )?;
-                    hydration.plan_policy_without_pending_admission(
-                        &aggregate,
-                        entry,
-                        &registration,
-                        terminal_packages,
-                        quota,
-                        no_admission,
-                        authority.trusted_instant(),
-                    )?
-                }
-                SignedMutationKind::PolicyTransition => {
-                    let quota = hydrate_locked_invitation_quota(
-                        transaction,
-                        admitted.actor_did().as_str(),
-                        &parsed.add_principals,
-                        scope_authority.trusted_instant(),
-                    )
-                    .await?;
-                    let fallback_scope =
-                        seal_pending_add_fallback_scope(&aggregate, &quota, &registration)?;
-                    let (relationship, relationship_decision) =
-                        load_fallback_relationship_projection(
-                            transaction,
-                            fallback_scope,
-                            relationship_authority,
-                        )
-                        .await?
-                        .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-                    hydration.plan_policy(
-                        &aggregate,
-                        entry,
-                        &registration,
-                        terminal_packages,
-                        &relationship,
-                        relationship_authority,
-                        quota,
-                        &relationship_decision,
-                        authority.trusted_instant(),
-                    )?
-                }
-                SignedMutationKind::MetadataTransition => hydration.plan_metadata_entry(
-                    &aggregate,
-                    entry,
-                    registration,
-                    terminal_packages,
-                )?,
-                SignedMutationKind::LeaveCommitFulfillment => hydration
-                    .plan_leave_fulfillment_entry(
-                        &aggregate,
-                        entry,
-                        &registration,
-                        terminal_packages,
-                    )?,
-                _ => return Err(SubmitTransitionFacadeError::UnsupportedMutation),
-            };
-            let plan = planned.into_persistence_plan()?;
-            let local_response =
-                canonical_response_from_plan(&plan, products.canonical_response_json())?;
-            if !local_response.validates() {
-                return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
-            }
-            (plan, local_response, products.durable_json().to_vec())
-        };
+        (plan, local_response, products.durable_json().to_vec());
     let expected_coordinate = plan.successor_coordinate().copied();
     let response_sha256 = *response.sha256();
     let (scope_authority, completion) = prelude.into_execution_parts();
