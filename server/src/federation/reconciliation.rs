@@ -64,26 +64,23 @@ struct RemoteConvoEvents {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RemoteEvent {
-    seq: i64,
-    epoch: i64,
-    msg_id: String,
-    message_type: String,
+pub(crate) struct RemoteEvent {
+    pub seq: i64,
+    pub epoch: i64,
+    pub msg_id: String,
+    pub message_type: String,
     #[serde(with = "crate::atproto_bytes")]
-    ciphertext: Vec<u8>,
-    padded_size: i64,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct LocalDigestRow {
-    seq: i64,
-    epoch: i64,
-    msg_id: Option<String>,
-    message_type: String,
-    ciphertext: Vec<u8>,
-    padded_size: i64,
-    created_at: DateTime<Utc>,
+    pub ciphertext: Vec<u8>,
+    pub padded_size: i64,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub entry_id: Option<String>,
+    #[serde(default)]
+    pub entry_kind: Option<String>,
+    #[serde(default, with = "crate::atproto_bytes::option")]
+    pub signed_request: Option<Vec<u8>>,
+    #[serde(default, with = "crate::atproto_bytes::option")]
+    pub outer_fingerprint: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -93,7 +90,6 @@ struct LocalDigestState {
     event_count: i64,
     digest_sha256: String,
 }
-
 pub async fn run_reconciliation_worker(
     pool: PgPool,
     resolver: Arc<DsResolver>,
@@ -136,27 +132,65 @@ async fn run_once(
         return Ok(());
     }
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
+    // 1. Reconcile clean chat conversations from chat.conversations
+    let clean_rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT conversation_id, split_part(sequencer_ds, '#', 1) \
+         FROM chat.conversations \
+         WHERE is_remote = TRUE AND sequencer_ds IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("failed to list clean remote conversations: {e}"))?;
+
+    for (convo_uuid, sequencer_ds_raw) in clean_rows {
+        let sequencer_ds = canonical_did(&sequencer_ds_raw).to_string();
+        if canonical_did(&sequencer_ds) == canonical_did(self_did) {
+            continue;
+        }
+        let convo_id_str = convo_uuid.to_string();
+        if let Err(e) = reconcile_conversation_internal(
+            pool,
+            resolver,
+            outbound,
+            auth_sign,
+            &convo_id_str,
+            &sequencer_ds,
+            true,
+        )
+        .await
+        {
+            warn!(
+                convo_id = %convo_uuid,
+                sequencer_ds = %crate::crypto::redact_for_log(&sequencer_ds),
+                error = %e,
+                "Failed to reconcile clean conversation"
+            );
+        }
+    }
+
+    // 2. Reconcile legacy conversations from conversations (public schema)
+    let legacy_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, split_part(sequencer_ds, '#', 1) \
          FROM conversations \
          WHERE is_remote = TRUE AND sequencer_ds IS NOT NULL",
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("failed to list remote conversations: {e}"))?;
+    .map_err(|e| format!("failed to list legacy remote conversations: {e}"))?;
 
-    for (convo_id, sequencer_ds_raw) in rows {
+    for (convo_id, sequencer_ds_raw) in legacy_rows {
         let sequencer_ds = canonical_did(&sequencer_ds_raw).to_string();
         if canonical_did(&sequencer_ds) == canonical_did(self_did) {
             continue;
         }
-        if let Err(e) = reconcile_conversation(
+        if let Err(e) = reconcile_conversation_internal(
             pool,
             resolver,
             outbound,
             auth_sign,
             &convo_id,
             &sequencer_ds,
+            false,
         )
         .await
         {
@@ -164,7 +198,7 @@ async fn run_once(
                 convo_id = %crate::crypto::redact_for_log(&convo_id),
                 sequencer_ds = %crate::crypto::redact_for_log(&sequencer_ds),
                 error = %e,
-                "Failed to reconcile conversation"
+                "Failed to reconcile legacy conversation"
             );
         }
     }
@@ -172,13 +206,35 @@ async fn run_once(
     Ok(())
 }
 
-async fn reconcile_conversation(
+pub async fn reconcile_conversation(
     pool: &PgPool,
     resolver: &DsResolver,
     outbound: &OutboundClient,
     auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     convo_id: &str,
     sequencer_ds: &str,
+) -> Result<(), String> {
+    let is_clean = uuid::Uuid::parse_str(convo_id).is_ok();
+    reconcile_conversation_internal(
+        pool,
+        resolver,
+        outbound,
+        auth_sign,
+        convo_id,
+        sequencer_ds,
+        is_clean,
+    )
+    .await
+}
+
+async fn reconcile_conversation_internal(
+    pool: &PgPool,
+    resolver: &DsResolver,
+    outbound: &OutboundClient,
+    auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
+    convo_id: &str,
+    sequencer_ds: &str,
+    is_clean: bool,
 ) -> Result<(), String> {
     peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
         .await
@@ -221,9 +277,16 @@ async fn reconcile_conversation(
     let remote_digest: RemoteConvoDigest =
         serde_json::from_value(digest_json).map_err(|e| format!("invalid digest response: {e}"))?;
 
-    let mut local_state = local_digest_state(pool, convo_id)
-        .await
-        .map_err(|e| format!("local digest failed: {e}"))?;
+    let mut local_state = if is_clean {
+        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
+        local_clean_digest_state(pool, convo_uuid)
+            .await
+            .map_err(|e| format!("local clean digest failed: {e}"))?
+    } else {
+        local_legacy_digest_state(pool, convo_id)
+            .await
+            .map_err(|e| format!("local legacy digest failed: {e}"))?
+    };
     let drifted = local_state.digest_sha256 != remote_digest.digest_sha256
         || local_state.last_seq != remote_digest.last_seq
         || local_state.event_count != remote_digest.event_count;
@@ -268,33 +331,64 @@ async fn reconcile_conversation(
                     page.to_seq_inclusive
                 ));
             }
-            apply_remote_events(pool, convo_id, &page.events)
-                .await
-                .map_err(|e| format!("apply events failed: {e}"))?;
+            if is_clean {
+                let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
+                apply_remote_clean_events(pool, convo_uuid, &page.events)
+                    .await
+                    .map_err(|e| format!("apply clean events failed: {e}"))?;
+            } else {
+                apply_remote_events(pool, convo_id, &page.events)
+                    .await
+                    .map_err(|e| format!("apply legacy events failed: {e}"))?;
+            }
             after_seq = page.to_seq_inclusive;
             if page.events.len() < EVENTS_PAGE_LIMIT as usize {
                 break;
             }
         }
 
-        sqlx::query(
-            "UPDATE conversations \
-             SET current_epoch = GREATEST(current_epoch, $2), \
-                 sequencer_term = GREATEST(COALESCE(sequencer_term, 0), $3), \
-                 sequencer_ds = $4 \
-             WHERE id = $1",
-        )
-        .bind(convo_id)
-        .bind(remote_digest.epoch)
-        .bind(remote_digest.sequencer_term)
-        .bind(canonical_did(&remote_digest.sequencer_ds_did))
-        .execute(pool)
-        .await
-        .map_err(|e| format!("failed to update conversation state after reconciliation: {e}"))?;
-
-        local_state = local_digest_state(pool, convo_id)
+        if is_clean {
+            let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
+            sqlx::query(
+                "UPDATE chat.conversations \
+                 SET sequencer_term = GREATEST(sequencer_term, $2), \
+                     sequencer_ds = $3 \
+                 WHERE conversation_id = $1",
+            )
+            .bind(convo_uuid)
+            .bind(remote_digest.sequencer_term)
+            .bind(canonical_did(&remote_digest.sequencer_ds_did))
+            .execute(pool)
             .await
-            .map_err(|e| format!("local digest after reconcile failed: {e}"))?;
+            .map_err(|e| {
+                format!("failed to update chat.conversations after reconciliation: {e}")
+            })?;
+
+            local_state = local_clean_digest_state(pool, convo_uuid)
+                .await
+                .map_err(|e| format!("local clean digest after reconcile failed: {e}"))?;
+        } else {
+            sqlx::query(
+                "UPDATE conversations \
+                 SET current_epoch = GREATEST(current_epoch, $2), \
+                     sequencer_term = GREATEST(COALESCE(sequencer_term, 0), $3), \
+                     sequencer_ds = $4 \
+                 WHERE id = $1",
+            )
+            .bind(convo_id)
+            .bind(remote_digest.epoch)
+            .bind(remote_digest.sequencer_term)
+            .bind(canonical_did(&remote_digest.sequencer_ds_did))
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                format!("failed to update conversation state after reconciliation: {e}")
+            })?;
+
+            local_state = local_legacy_digest_state(pool, convo_id)
+                .await
+                .map_err(|e| format!("local legacy digest after reconcile failed: {e}"))?;
+        }
     }
 
     let drift_increment = if drifted { 1_i64 } else { 0_i64 };
@@ -404,8 +498,198 @@ async fn apply_remote_events(
     }
     Ok(())
 }
+async fn apply_remote_clean_events(
+    pool: &PgPool,
+    convo_id: uuid::Uuid,
+    events: &[RemoteEvent],
+) -> Result<(), String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-async fn local_digest_state(
+    for event in events {
+        let seq_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM chat.entries WHERE conversation_id = $1 AND seq = $2)",
+        )
+        .bind(convo_id)
+        .bind(event.seq)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if seq_exists {
+            continue;
+        }
+
+        let entry_id = if let Some(ref eid) = event.entry_id {
+            uuid::Uuid::parse_str(eid).map_err(|e| e.to_string())?
+        } else if let Ok(u) = uuid::Uuid::parse_str(&event.msg_id) {
+            u
+        } else {
+            uuid::Uuid::new_v4()
+        };
+
+        let message_id = if event.message_type == "blue.catbird.chat.defs#applicationEntry"
+            || event.message_type == "app"
+        {
+            uuid::Uuid::parse_str(&event.msg_id).ok()
+        } else {
+            None
+        };
+
+        let entry_kind = if event.message_type == "app" {
+            "blue.catbird.chat.defs#applicationEntry".to_string()
+        } else if event.message_type == "commit" {
+            "blue.catbird.chat.defs#commitEntry".to_string()
+        } else {
+            event.message_type.clone()
+        };
+
+        let payload_sha256: [u8; 32] = Sha256::digest(&event.ciphertext).into();
+        let signed_req = event.signed_request.clone().unwrap_or_default();
+        let outer_fp = event
+            .outer_fingerprint
+            .clone()
+            .unwrap_or_else(|| payload_sha256.to_vec());
+
+        let (actor_did, actor_device_id, actor_key_id, actor_auth_gen) = if !signed_req.is_empty() {
+            if let Ok(mutation) =
+                crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed_req)
+            {
+                let did = mutation.actor_did().as_str().to_string();
+                let dev_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
+                let key_id = mutation.key_id().as_str().to_string();
+                let auth_gen = mutation.auth_generation() as i64;
+                (did, dev_id, key_id, auth_gen)
+            } else {
+                (
+                    "did:web:unknown.actor".to_string(),
+                    uuid::Uuid::nil(),
+                    "unknown".to_string(),
+                    1i64,
+                )
+            }
+        } else {
+            (
+                "did:web:unknown.actor".to_string(),
+                uuid::Uuid::nil(),
+                "unknown".to_string(),
+                1i64,
+            )
+        };
+
+        let empty_server_fields =
+            serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
+                .unwrap_or_default();
+
+        let req_digest = Sha256::digest(&signed_req).to_vec();
+        let signature = vec![0u8; 64];
+
+        sqlx::query(
+            r#"
+            INSERT INTO chat.entries (
+                conversation_id, seq, entry_id, entry_kind,
+                accepted_payload_bytes, accepted_payload_sha256, signed_request_bytes,
+                request_digest, signature, server_fields_bytes, outer_entry_fingerprint,
+                actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+                generation, message_id, received_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, $6, $7,
+                $8, $9, $10, $11,
+                $12, $13, $14, $15,
+                $16, $17, $18
+            )
+            ON CONFLICT (conversation_id, seq) DO NOTHING
+            "#,
+        )
+        .bind(convo_id)
+        .bind(event.seq)
+        .bind(entry_id)
+        .bind(&entry_kind)
+        .bind(&event.ciphertext)
+        .bind(&payload_sha256[..])
+        .bind(&signed_req)
+        .bind(&req_digest)
+        .bind(&signature)
+        .bind(&empty_server_fields)
+        .bind(&outer_fp)
+        .bind(&actor_did)
+        .bind(actor_device_id)
+        .bind(&actor_key_id)
+        .bind(actor_auth_gen)
+        .bind(event.epoch)
+        .bind(message_id)
+        .bind(event.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Advance next_entry_seq in chat.conversations
+        sqlx::query(
+            r#"
+            UPDATE chat.conversations
+               SET next_entry_seq = GREATEST(next_entry_seq, $2 + 1)
+             WHERE conversation_id = $1
+            "#,
+        )
+        .bind(convo_id)
+        .bind(event.seq)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn local_clean_digest_state(
+    pool: &PgPool,
+    convo_id: uuid::Uuid,
+) -> Result<LocalDigestState, sqlx::Error> {
+    let stats = sqlx::query(
+        "SELECT \
+           CAST(COALESCE(MAX(seq), 0) AS BIGINT) AS last_seq, \
+           CAST(COALESCE(MAX(generation), 0) AS BIGINT) AS last_epoch, \
+           CAST(COUNT(*) AS BIGINT) AS event_count \
+         FROM chat.entries WHERE conversation_id = $1",
+    )
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await?;
+    let last_seq: i64 = stats.try_get("last_seq")?;
+    let last_epoch: i64 = stats.try_get("last_epoch")?;
+    let event_count: i64 = stats.try_get("event_count")?;
+
+    let rows: Vec<crate::handlers::ds::get_convo_digest::CleanDigestRow> =
+        sqlx::query_as::<_, crate::handlers::ds::get_convo_digest::CleanDigestRow>(
+            "SELECT \
+           CAST(seq AS BIGINT) AS seq, \
+           CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+           entry_id, \
+           entry_kind, \
+           accepted_payload_bytes, \
+           signed_request_bytes, \
+           outer_entry_fingerprint, \
+           received_at \
+         FROM chat.entries \
+         WHERE conversation_id = $1 \
+         ORDER BY seq ASC",
+        )
+        .bind(convo_id)
+        .fetch_all(pool)
+        .await?;
+
+    let digest_sha256 = crate::handlers::ds::get_convo_digest::compute_clean_convo_digest(&rows);
+
+    Ok(LocalDigestState {
+        last_seq,
+        last_epoch,
+        event_count,
+        digest_sha256,
+    })
+}
+
+async fn local_legacy_digest_state(
     pool: &PgPool,
     convo_id: &str,
 ) -> Result<LocalDigestState, sqlx::Error> {
@@ -423,8 +707,9 @@ async fn local_digest_state(
     let last_epoch: i64 = stats.try_get("last_epoch")?;
     let event_count: i64 = stats.try_get("event_count")?;
 
-    let rows: Vec<LocalDigestRow> = sqlx::query_as::<_, LocalDigestRow>(
-        "SELECT \
+    let rows: Vec<crate::handlers::ds::get_convo_digest::LegacyDigestRow> =
+        sqlx::query_as::<_, crate::handlers::ds::get_convo_digest::LegacyDigestRow>(
+            "SELECT \
            CAST(seq AS BIGINT) AS seq, \
            CAST(epoch AS BIGINT) AS epoch, \
            COALESCE(msg_id, id) AS msg_id, \
@@ -435,32 +720,28 @@ async fn local_digest_state(
          FROM messages \
          WHERE convo_id = $1 \
          ORDER BY seq ASC",
-    )
-    .bind(convo_id)
-    .fetch_all(pool)
-    .await?;
+        )
+        .bind(convo_id)
+        .fetch_all(pool)
+        .await?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"CATBIRD-CONVO-DIGEST-V1:");
-    for row in rows {
-        hasher.update(row.seq.to_be_bytes());
-        hasher.update(row.epoch.to_be_bytes());
-        let msg_id = row.msg_id.as_deref().unwrap_or_default();
-        hash_len_prefixed(&mut hasher, msg_id.as_bytes());
-        hash_len_prefixed(&mut hasher, row.message_type.as_bytes());
-        hash_len_prefixed(&mut hasher, &row.ciphertext);
-        hasher.update(row.padded_size.to_be_bytes());
-        hasher.update(row.created_at.timestamp_millis().to_be_bytes());
-    }
+    let digest_sha256 = crate::handlers::ds::get_convo_digest::compute_legacy_convo_digest(&rows);
 
     Ok(LocalDigestState {
         last_seq,
         last_epoch,
         event_count,
-        digest_sha256: hex::encode(hasher.finalize()),
+        digest_sha256,
     })
 }
 
+#[allow(dead_code)]
+async fn local_digest_state(
+    pool: &PgPool,
+    convo_id: &str,
+) -> Result<LocalDigestState, sqlx::Error> {
+    local_legacy_digest_state(pool, convo_id).await
+}
 fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u32).to_be_bytes());
     hasher.update(bytes);

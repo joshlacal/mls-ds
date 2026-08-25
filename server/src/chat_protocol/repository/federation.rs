@@ -24,9 +24,14 @@ use super::delivery::{
 use super::execution_context::{
     apply_prepared_submit_transition_execution, prepare_submit_transition_execution,
 };
+use super::prelude::PreludeError;
 use super::submit_transition::{
     canonical_response_from_plan, canonical_uuid_v4, hydrate_terminal_recovery_packages,
     parse_submit_transition, validate_applied_transition, SubmitTransitionFacadeError,
+};
+use super::{
+    auth::{self, CompletedIdempotentResponse},
+    prelude,
 };
 use crate::chat_protocol::dpop::VerifiedChatDeviceRequest;
 use crate::chat_protocol::relationship_policy::{PublicTransport, RelationshipAuthority};
@@ -324,10 +329,23 @@ pub async fn deliver_welcome_mailbox(
         dev_status: String,
         dev_revoked_at: Option<DateTime<Utc>>,
         p_status: String,
+        p_ds_did: Option<String>,
+        has_active_leaf: bool,
+        kp_status: String,
+        kp_terminal_at: Option<DateTime<Utc>>,
+        kp_not_after: DateTime<Utc>,
+        kp_terminal_transition_id: Option<Uuid>,
+        kpr_status: String,
+        kpr_terminal_at: Option<DateTime<Utc>>,
+        kpr_expires_at: DateTime<Utc>,
+        kpr_consumed_transition_id: Option<Uuid>,
+        lrr_status: String,
+        lrr_terminal_at: Option<DateTime<Utc>>,
+        lrr_expires_at: DateTime<Utc>,
+        lrr_fulfilling_transition_id: Option<Uuid>,
         is_remote: bool,
         sequencer_ds: Option<String>,
         sequencer_term: i64,
-        convo_gen: i64,
         convo_sv: i64,
         transition_kind: String,
         stored_entry_id: Uuid,
@@ -348,7 +366,11 @@ pub async fn deliver_welcome_mailbox(
                b.wrapper_bytes AS stored_welcome_data, b.wrapper_sha256 AS stored_welcome_sha256, b.generation AS stored_gen, b.state_version AS stored_sv, b.epoch AS stored_epoch, b.group_id AS stored_gid,
                b.group_context_hash AS stored_gch, b.confirmation_tag AS stored_ctag, b.transition_id AS stored_transition_id, b.entry_seq AS stored_entry_seq,
                dev.status AS dev_status, dev.revoked_at AS dev_revoked_at,
-               p.status AS p_status,
+               p.status AS p_status, p.ds_did AS p_ds_did,
+               (md.leaf_period_id IS NOT NULL) AS has_active_leaf,
+               kp.status AS kp_status, kp.terminal_at AS kp_terminal_at, kp.not_after AS kp_not_after, kp.terminal_transition_id AS kp_terminal_transition_id,
+               kpr.status AS kpr_status, kpr.terminal_at AS kpr_terminal_at, kpr.expires_at AS kpr_expires_at, kpr.consumed_transition_id AS kpr_consumed_transition_id,
+               lrr.status AS lrr_status, lrr.terminal_at AS lrr_terminal_at, lrr.expires_at AS lrr_expires_at, lrr.fulfilling_transition_id AS lrr_fulfilling_transition_id,
                c.is_remote AS is_remote, c.sequencer_ds AS sequencer_ds, c.sequencer_term AS sequencer_term, c.current_generation AS convo_gen, c.current_state_version AS convo_sv,
                t.kind AS transition_kind,
                e.entry_id AS stored_entry_id, e.seq AS stored_seq, e.accepted_payload_bytes AS stored_accepted_payload, e.accepted_payload_sha256 AS stored_accepted_payload_sha256, e.signed_request_bytes AS stored_signed_request, e.outer_entry_fingerprint AS stored_outer_fp,
@@ -357,15 +379,17 @@ pub async fn deliver_welcome_mailbox(
           JOIN chat.welcome_bundles b ON b.welcome_id = d.welcome_id
           JOIN chat.key_packages kp ON kp.key_package_ref = d.key_package_ref AND kp.owner_did = d.recipient_did AND kp.owner_device_id = d.recipient_device_id
           JOIN chat.key_package_reservations kpr ON kpr.key_package_ref = d.key_package_ref AND kpr.recipient_did = d.recipient_did AND kpr.recipient_device_id = d.recipient_device_id AND kpr.conversation_id = b.conversation_id AND kpr.recovery_request_id = d.recovery_request_id
+          JOIN chat.leaf_recovery_requests lrr ON lrr.recovery_request_id = d.recovery_request_id AND lrr.conversation_id = b.conversation_id AND lrr.requester_did = d.recipient_did AND lrr.requester_device_id = d.recipient_device_id
           JOIN chat.devices dev ON dev.user_did = d.recipient_did AND dev.device_id = d.recipient_device_id
           JOIN chat.participants p ON p.conversation_id = b.conversation_id AND p.user_did = d.recipient_did AND p.current_membership = TRUE
+          JOIN chat.member_devices md ON md.conversation_id = b.conversation_id AND md.user_did = d.recipient_did AND md.device_id = d.recipient_device_id AND md.active = TRUE AND md.removed_at IS NULL
           JOIN chat.conversations c ON c.conversation_id = b.conversation_id
           JOIN chat.transitions t ON t.conversation_id = b.conversation_id AND t.transition_id = b.transition_id
           JOIN chat.entries e ON e.conversation_id = b.conversation_id AND e.seq = b.entry_seq AND e.entry_id = b.transition_id
           JOIN chat.generation_states s ON s.conversation_id = b.conversation_id AND s.generation = b.generation AND s.state_version = b.state_version AND s.producing_transition_id = b.transition_id
          WHERE d.welcome_id = $1 AND d.recipient_device_id = $2 AND d.recovery_request_id = $3
            AND b.conversation_id = $4
-         FOR UPDATE OF c, p, dev, d, b, t, e, s
+         FOR UPDATE OF c, p, dev, d, b, t, e, s, kp, kpr, md, lrr
         "#,
     )
     .bind(welcome_id)
@@ -385,6 +409,7 @@ pub async fn deliver_welcome_mailbox(
 
     let d_status = r.d_status;
     let d_terminal_at = r.d_terminal_at;
+    let d_expires_at = r.d_expires_at;
     let d_kp_ref = r.d_key_package_ref;
     let stored_welcome_data = r.stored_welcome_data;
     let stored_welcome_sha256 = r.stored_welcome_sha256;
@@ -392,13 +417,26 @@ pub async fn deliver_welcome_mailbox(
     let stored_sv = r.stored_sv;
     let stored_epoch = r.stored_epoch;
     let stored_gid = r.stored_gid;
-    let stored_entry_seq = r.stored_entry_seq;
+    let stored_transition_id = r.stored_transition_id;
     let stored_entry_id = r.stored_entry_id;
+    let stored_entry_seq = r.stored_entry_seq;
     let stored_accepted_payload_sha256 = r.stored_accepted_payload_sha256;
     let stored_outer_fp = r.stored_outer_fp;
     let dev_status = r.dev_status;
     let dev_revoked_at = r.dev_revoked_at;
     let p_status = r.p_status;
+    let p_ds_did = r.p_ds_did;
+    let has_active_leaf = r.has_active_leaf;
+    let kp_status = r.kp_status;
+    let kp_terminal_at = r.kp_terminal_at;
+    let kp_not_after = r.kp_not_after;
+    let kp_terminal_transition_id = r.kp_terminal_transition_id;
+    let kpr_status = r.kpr_status;
+    let kpr_terminal_at = r.kpr_terminal_at;
+    let kpr_consumed_transition_id = r.kpr_consumed_transition_id;
+    let lrr_status = r.lrr_status;
+    let lrr_terminal_at = r.lrr_terminal_at;
+    let lrr_fulfilling_transition_id = r.lrr_fulfilling_transition_id;
     let is_remote = r.is_remote;
     let sequencer_ds = r.sequencer_ds;
     let sequencer_term = r.sequencer_term;
@@ -432,6 +470,12 @@ pub async fn deliver_welcome_mailbox(
             reason: format!("welcome delivery status is {d_status}, expected pending"),
         });
     }
+    let now = Utc::now();
+    if d_expires_at <= now {
+        return Err(FederationError::DeliveryConflict {
+            reason: "welcome delivery has expired".to_string(),
+        });
+    }
 
     // Verify recipient device is active and unrevoked
     if dev_status != "active" || dev_revoked_at.is_some() {
@@ -442,6 +486,25 @@ pub async fn deliver_welcome_mailbox(
         });
     }
 
+    // Verify recipient is a LOCAL participant (ds_did NULL or the local service DID)
+    // with an ACTIVE member leaf in the MLS group.
+    let self_base_did = service_did_base();
+    let recipient_is_local =
+        p_ds_did.is_none() || dids_equivalent(p_ds_did.as_deref().unwrap_or(""), &self_base_did);
+    if !recipient_is_local {
+        return Err(FederationError::UnauthorizedRecipient {
+            reason: format!(
+                "recipient participant ds_did {:?} is not local on this destination DS",
+                p_ds_did
+            ),
+        });
+    }
+    if !has_active_leaf {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: "recipient has no active member leaf in this conversation".to_string(),
+        });
+    }
+
     // Verify recipient participant is active or pending
     if p_status != "pending" && p_status != "active" {
         return Err(FederationError::MailboxNotProvisioned {
@@ -449,9 +512,88 @@ pub async fn deliver_welcome_mailbox(
         });
     }
 
+    // Enforce key package / reservation / leaf recovery status and terminality exact recovery lifecycle
+    if kp_not_after <= now {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: "recipient key package is expired".to_string(),
+        });
+    }
+
+    if lrr_status == "cancelled" || lrr_status == "expired" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!("leaf recovery request is {lrr_status}"),
+        });
+    }
+    if lrr_status == "fulfilled" && lrr_fulfilling_transition_id != Some(stored_transition_id) {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!(
+                "leaf recovery request fulfilled by transition {:?}, expected {stored_transition_id}",
+                lrr_fulfilling_transition_id
+            ),
+        });
+    }
+    if lrr_status != "fulfilled" && lrr_status != "open" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!(
+                "leaf recovery request status is {lrr_status}, expected fulfilled or open"
+            ),
+        });
+    }
+
+    if kpr_status == "cancelled" || kpr_status == "expired" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!("key package reservation is {kpr_status}"),
+        });
+    }
+    if kpr_status == "consumed" && kpr_consumed_transition_id != Some(stored_transition_id) {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!(
+                "key package reservation consumed by transition {:?}, expected {stored_transition_id}",
+                kpr_consumed_transition_id
+            ),
+        });
+    }
+    if kpr_status != "consumed" && kpr_status != "active" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!(
+                "key package reservation status is {kpr_status}, expected consumed or active"
+            ),
+        });
+    }
+
+    if kp_status == "revoked" || kp_status == "available" || kp_status == "expired" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!("key package status is {kp_status}"),
+        });
+    }
+    if kp_status == "consumed" && kp_terminal_transition_id != Some(stored_transition_id) {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!(
+                "key package consumed by transition {:?}, expected {stored_transition_id}",
+                kp_terminal_transition_id
+            ),
+        });
+    }
+    if kp_status != "consumed" && kp_status != "reserved" {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!("key package status is {kp_status}, expected consumed or reserved"),
+        });
+    }
+
     // Verify welcome bytes and entry locator
     let computed_welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let computed_entry_sha256: [u8; 32] = Sha256::digest(&entry_bytes).into();
+
+    // The Welcome must be a REAL MLS Welcome bound to exactly the reserved
+    // key package ref, not merely byte-for-byte equal to the stored bundle.
+    crate::chat_protocol::public_state::verify_recovery_welcome(
+        &welcome_bytes,
+        key_package_ref,
+        crate::chat_protocol::wire::MAX_WELCOME_WIRE_BYTES,
+    )
+    .map_err(|e| FederationError::InvalidEnvelope {
+        reason: format!("welcome is not a valid MLS Welcome for the reserved key package: {e:?}"),
+    })?;
 
     if computed_welcome_sha256 != welcome_sha256
         || computed_entry_sha256 != entry_locator.accepted_payload_sha256
@@ -571,7 +713,7 @@ pub async fn deliver_welcome_mailbox(
         header.sequencer_term,
         envelope_digest,
         result_sha256,
-        Some(entry_locator.clone()),
+        entry_locator.clone(),
         now,
     )?;
 
@@ -586,6 +728,288 @@ pub async fn deliver_welcome_mailbox(
     insert_delivery_receipt(tx, &output.receipt, &entry_locator, &response_bytes).await?;
 
     Ok(output)
+}
+
+/// Arbitration for one inbound federated operation sharing the exact
+/// `chat.operation_claims`/`chat.idempotency_records` lifecycle with the local
+/// signed-operation prelude.
+pub(crate) enum FederatedOperationArbitration {
+    First(FederatedOperationReservationGuard),
+    Replay(CompletedIdempotentResponse),
+}
+
+/// Non-forgeable claim on one operation id in one transaction for the federated
+/// (DS-to-DS) submitCommit path. Mirrors `OperationReservationGuard` but is
+/// derived from the sealed `FederatedOperationAdmission` rather than a local
+/// `VerifiedChatDeviceRequest`.
+pub(crate) struct FederatedOperationReservationGuard {
+    operation_lock: auth::CanonicalOperationReservationGuard,
+    binding: FederatedOperationClaimBinding,
+}
+
+impl std::fmt::Debug for FederatedOperationReservationGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FederatedOperationReservationGuard(<sealed>)")
+    }
+}
+
+impl FederatedOperationReservationGuard {
+    pub(crate) fn binding(&self) -> &FederatedOperationClaimBinding {
+        &self.binding
+    }
+}
+
+/// Exact immutable claim binding for a federated commit. The fields are the
+/// same authoritative values `OperationClaimBinding` records.
+#[derive(Clone, Debug)]
+pub(crate) struct FederatedOperationClaimBinding {
+    operation_id: Uuid,
+    principal_did: String,
+    endpoint_nsid: String,
+    mutation_kind: String,
+    request_digest: [u8; 32],
+    accepted_request_sha256: [u8; 32],
+    signature: [u8; 64],
+    claimed_at: DateTime<Utc>,
+}
+
+impl FederatedOperationClaimBinding {
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+    pub(crate) fn principal_did(&self) -> &str {
+        &self.principal_did
+    }
+    pub(crate) fn endpoint_nsid(&self) -> &str {
+        &self.endpoint_nsid
+    }
+    pub(crate) fn request_digest(&self) -> &[u8; 32] {
+        &self.request_digest
+    }
+    pub(crate) fn accepted_request_sha256(&self) -> &[u8; 32] {
+        &self.accepted_request_sha256
+    }
+    pub(crate) fn signature(&self) -> &[u8; 64] {
+        &self.signature
+    }
+    pub(crate) fn claimed_at(&self) -> DateTime<Utc> {
+        self.claimed_at
+    }
+}
+
+/// Reserve the global operation lock and reconcile an exact existing claim for a
+/// federated commit before any transition planning. A `Replay` arm means a prior
+/// delivery already completed this operation: the caller must reproduce the
+/// stored canonical response and only mint a new delivery receipt.
+pub(crate) async fn prepare_federated_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    admission: &crate::chat_protocol::state_machine::FederatedOperationAdmission,
+    mutation: &VerifiedSignedMutation,
+    signed_request_bytes: &[u8],
+) -> Result<FederatedOperationArbitration, PreludeError> {
+    let binding = federated_operation_binding(admission, mutation, signed_request_bytes)?;
+    let operation_lock = auth::reserve_canonical_operation_id(
+        transaction,
+        binding.operation_id,
+        Some(binding.operation_id),
+    )
+    .await?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if operation_lock.transaction_id() != transaction_id
+        || operation_lock.operation_id() != binding.operation_id
+    {
+        return Err(PreludeError::ForeignTransaction);
+    }
+
+    let existing: Option<(Vec<u8>, Vec<u8>, Vec<u8>, String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT request_digest, accepted_request_sha256, signature,
+               principal_did, endpoint_nsid, mutation_kind
+          FROM chat.operation_claims
+         WHERE operation_id=$1
+        "#,
+    )
+    .bind(binding.operation_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+
+    if let Some((request_digest, accepted_sha, signature, principal, endpoint, mutation_kind)) =
+        existing
+    {
+        if request_digest.as_slice() != binding.request_digest
+            || accepted_sha.as_slice() != binding.accepted_request_sha256
+            || signature.as_slice() != binding.signature
+            || principal != binding.principal_did
+            || endpoint != binding.endpoint_nsid
+            || mutation_kind != binding.mutation_kind
+        {
+            return Err(PreludeError::OperationIdConflict);
+        }
+        let completed: Option<(i32, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            r#"
+            SELECT completed_status, response_bytes, response_sha256
+              FROM chat.idempotency_records
+             WHERE principal_did = $1 AND endpoint_nsid = $2 AND operation_id = $3
+            "#,
+        )
+        .bind(&binding.principal_did)
+        .bind(&binding.endpoint_nsid)
+        .bind(binding.operation_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let Some((completed_status, response_bytes, stored_response_sha256)) = completed else {
+            return Err(PreludeError::ClaimIntegrity);
+        };
+        if completed_status == 0
+            || response_bytes.is_empty()
+            || stored_response_sha256.as_slice() != Sha256::digest(&response_bytes).as_slice()
+        {
+            return Err(PreludeError::ClaimIntegrity);
+        }
+        return Ok(FederatedOperationArbitration::Replay(
+            CompletedIdempotentResponse::for_federated_replay(completed_status, response_bytes),
+        ));
+    }
+
+    Ok(FederatedOperationArbitration::First(
+        FederatedOperationReservationGuard {
+            operation_lock,
+            binding,
+        },
+    ))
+}
+
+fn federated_operation_binding(
+    admission: &crate::chat_protocol::state_machine::FederatedOperationAdmission,
+    mutation: &VerifiedSignedMutation,
+    signed_request_bytes: &[u8],
+) -> Result<FederatedOperationClaimBinding, PreludeError> {
+    let endpoint = admission.endpoint_nsid();
+    if !prelude::endpoint_has_operation_claim(endpoint)
+        || admission.operation_id().get_version_num() != 4
+    {
+        return Err(PreludeError::NonCanonicalOperation);
+    }
+    if mutation.actor_did().as_str() != admission.actor_did()
+        || mutation.request_digest() != admission.mutation_request_digest()
+        || mutation.signature() != admission.mutation_signature()
+        || mutation.kind().type_id() != "blue.catbird.chat.defs#commitTransitionBody"
+    {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    Ok(FederatedOperationClaimBinding {
+        operation_id: admission.operation_id(),
+        principal_did: admission.actor_did().to_owned(),
+        endpoint_nsid: admission.endpoint_nsid().to_owned(),
+        mutation_kind: mutation.type_id().to_owned(),
+        request_digest: *mutation.request_digest(),
+        accepted_request_sha256: Sha256::digest(signed_request_bytes).into(),
+        signature: *mutation.signature(),
+        claimed_at: admission.trusted_read_at(),
+    })
+}
+
+/// Persist the operation claim for a federated first execution. The caller must
+/// hold the reservation guard; this runs under the same transaction as the
+/// transition execution.
+pub(crate) async fn claim_federated_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    reservation: FederatedOperationReservationGuard,
+) -> Result<(), PreludeError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if reservation.operation_lock.transaction_id() != transaction_id {
+        return Err(PreludeError::ForeignTransaction);
+    }
+    let binding = reservation.binding;
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO chat.operation_claims (
+            operation_id,principal_did,endpoint_nsid,mutation_kind,
+            request_digest,accepted_request_sha256,signature,claimed_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        "#,
+    )
+    .bind(binding.operation_id)
+    .bind(&binding.principal_did)
+    .bind(&binding.endpoint_nsid)
+    .bind(&binding.mutation_kind)
+    .bind(binding.request_digest.as_slice())
+    .bind(binding.accepted_request_sha256.as_slice())
+    .bind(binding.signature.as_slice())
+    .bind(binding.claimed_at)
+    .execute(&mut **transaction)
+    .await;
+    match inserted {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref()
+                == Some("23505") =>
+        {
+            Err(PreludeError::OperationIdConflict)
+        }
+        Err(error) => Err(PreludeError::Database(error)),
+    }
+}
+
+/// Complete a federated first operation by writing the immutable idempotency
+/// record, exactly as the local prelude does. The claim must be recorded first.
+pub(crate) async fn complete_federated_operation(
+    transaction: &mut Transaction<'_, Postgres>,
+    binding: &FederatedOperationClaimBinding,
+    accepted_request_bytes: &[u8],
+    signing_transcript_bytes: &[u8],
+    completed_status: i32,
+    response_bytes: &[u8],
+    event_position: Option<i64>,
+) -> Result<(), PreludeError> {
+    if !(200..=599).contains(&completed_status) || response_bytes.is_empty() {
+        return Err(PreludeError::ClaimIntegrity);
+    }
+    let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO chat.idempotency_records(
+            principal_did,endpoint_nsid,operation_id,request_digest,
+            accepted_request_bytes,signing_transcript_bytes,signature,
+            completed_status,response_bytes,response_sha256,event_position,
+            historical_jkt,current_jkt,completed_at
+        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,$12)
+        "#,
+    )
+    .bind(&binding.principal_did)
+    .bind(&binding.endpoint_nsid)
+    .bind(binding.operation_id)
+    .bind(binding.request_digest.as_slice())
+    .bind(accepted_request_bytes)
+    .bind(signing_transcript_bytes)
+    .bind(binding.signature.as_slice())
+    .bind(completed_status)
+    .bind(response_bytes)
+    .bind(response_sha256.as_slice())
+    .bind(event_position)
+    .bind(binding.claimed_at)
+    .execute(&mut **transaction)
+    .await;
+    match inserted {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("23505") =>
+        {
+            Err(PreludeError::OperationIdConflict)
+        }
+        Err(error) => Err(PreludeError::Database(error)),
+    }
 }
 
 /// Replicate an inbound MLS application message to a destination DS.
@@ -695,13 +1119,14 @@ pub async fn deliver_message_replication(
         });
     }
 
-    // 2. Verify recipient participant and application interval.
-    let recipient_row: Option<(String,)> = sqlx::query_as(
+    // 2. Verify recipient is a LOCAL participant (ds_did NULL/local) with an
+    //    active member leaf, and the application interval covers the entry.
+    let recipient_row: Option<(String, Option<String>)> = sqlx::query_as(
         r#"
-        SELECT status
-          FROM chat.participants
-         WHERE conversation_id = $1 AND user_did = $2 AND current_membership = TRUE
-         FOR UPDATE
+        SELECT p.status, p.ds_did
+          FROM chat.participants p
+         WHERE p.conversation_id = $1 AND p.user_did = $2 AND p.current_membership = TRUE
+         FOR UPDATE OF p
         "#,
     )
     .bind(header.conversation_id)
@@ -710,11 +1135,58 @@ pub async fn deliver_message_replication(
     .await
     .map_err(FederationError::Database)?;
 
-    let Some((p_status,)) = recipient_row else {
+    let Some((p_status, p_ds_did)) = recipient_row else {
         return Err(FederationError::UnauthorizedRecipient {
             reason: format!("user {} is not a participant", recipient_did),
         });
     };
+
+    let self_base_did = service_did_base();
+    let recipient_is_local =
+        p_ds_did.is_none() || dids_equivalent(p_ds_did.as_deref().unwrap_or(""), &self_base_did);
+    if !recipient_is_local {
+        return Err(FederationError::UnauthorizedRecipient {
+            reason: format!(
+                "recipient participant ds_did {:?} is not local on this destination DS",
+                p_ds_did
+            ),
+        });
+    }
+
+    if p_status != "active" {
+        return Err(FederationError::UnauthorizedRecipient {
+            reason: format!("recipient status is {p_status}, expected active"),
+        });
+    }
+    // Lock exact recipient member_devices active leaf and device FOR UPDATE
+    let active_leaves: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT md.leaf_period_id
+          FROM chat.member_devices md
+          JOIN chat.devices dev ON dev.user_did = md.user_did AND dev.device_id = md.device_id
+         WHERE md.conversation_id = $1
+           AND md.user_did = $2
+           AND md.active = TRUE
+           AND md.removed_at IS NULL
+           AND dev.status = 'active'
+           AND dev.revoked_at IS NULL
+         FOR UPDATE OF md, dev
+        "#,
+    )
+    .bind(header.conversation_id)
+    .bind(&recipient_did)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(FederationError::Database)?;
+
+    if active_leaves.is_empty() {
+        return Err(FederationError::UnauthorizedRecipient {
+            reason: format!(
+                "recipient {} has no active unrevoked member leaf",
+                recipient_did
+            ),
+        });
+    }
 
     if p_status != "active" {
         return Err(FederationError::UnauthorizedRecipient {
@@ -1176,7 +1648,7 @@ pub async fn deliver_message_replication(
                         header.sequencer_term,
                         envelope_digest,
                         result_sha256,
-                        Some(locator.clone()),
+                        locator.clone(),
                         now,
                     )?;
                     let output = DeliverMessageOutput {
@@ -1226,7 +1698,7 @@ pub async fn deliver_message_replication(
         header.sequencer_term,
         envelope_digest,
         result_sha256,
-        Some(locator.clone()),
+        locator.clone(),
         now,
     )?;
 
@@ -1533,6 +2005,12 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         tx_id,
         header.sender_ds_did.clone(),
         header.conversation_id,
+        header.delivery_id,
+        envelope_digest,
+        parsed.transition_id,
+        "blue.catbird.chat.submitTransition".to_string(),
+        *mutation.request_digest(),
+        *mutation.signature(),
     )
     .map_err(|e| FederationError::UnauthorizedParticipantDs {
         reason: format!("cannot seal federated operation admission: {e:?}"),
@@ -1563,6 +2041,118 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             }
         })?;
     let transcript_bytes = mutation.transcript_bytes().to_vec();
+
+    // Shared operation claim via the federated prelude (replaces handwritten SQL).
+    let operation_binding = match prepare_federated_operation(
+        tx,
+        &admission,
+        &mutation,
+        &signed_request_bytes,
+    )
+    .await
+    .map_err(|e| FederationError::InvalidEnvelope {
+        reason: format!("federated operation arbitration failed: {e:?}"),
+    })? {
+        FederatedOperationArbitration::First(reservation) => {
+            let binding = reservation.binding().clone();
+            claim_federated_operation(tx, reservation)
+                .await
+                .map_err(|e| FederationError::InvalidEnvelope {
+                    reason: format!("federated operation claim failed: {e:?}"),
+                })?;
+            Some(binding)
+        }
+        FederatedOperationArbitration::Replay(response) => {
+            if response.status() != 200 || response.response_bytes().is_empty() {
+                return Err(FederationError::CommitConflict {
+                    convo_id: header.conversation_id.to_string(),
+                    current_epoch: 0,
+                });
+            }
+            // New delivery ID for same operation returns canonical outcome + new receipt.
+            // Read the stored source locator from the transition's entry.
+            let replay_locator: Option<(Uuid, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+                r#"
+                SELECT entry_id, seq, accepted_payload_sha256, outer_entry_fingerprint
+                  FROM chat.entries
+                 WHERE transition_id = $1
+                "#,
+            )
+            .bind(parsed.transition_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(FederationError::Database)?;
+
+            let Some((entry_id, seq, accepted_payload_sha256, outer_entry_fingerprint)) =
+                replay_locator
+            else {
+                return Err(FederationError::CommitConflict {
+                    convo_id: header.conversation_id.to_string(),
+                    current_epoch: 0,
+                });
+            };
+            let replay_source_locator = ValidatedEntryLocator {
+                entry_id,
+                seq: seq as u64,
+                accepted_payload_sha256: accepted_payload_sha256.as_slice().try_into().map_err(
+                    |_| FederationError::InvalidEnvelope {
+                        reason: "stored source locator payload hash not 32 bytes".to_string(),
+                    },
+                )?,
+                outer_entry_fingerprint: outer_entry_fingerprint.as_slice().try_into().map_err(
+                    |_| FederationError::InvalidEnvelope {
+                        reason: "stored source locator fingerprint not 32 bytes".to_string(),
+                    },
+                )?,
+            };
+
+            let now = Utc::now();
+            let result_sha256: [u8; 32] = Sha256::digest(response.response_bytes()).into();
+            let receipt = sign_receipt(
+                ack_signer,
+                SUBMIT_COMMIT_NSID,
+                header.delivery_id,
+                header.conversation_id,
+                &header.sender_ds_did,
+                &header.receiver_ds_did,
+                &header.sequencer_did,
+                header.sequencer_term,
+                envelope_digest,
+                result_sha256,
+                replay_source_locator.clone(),
+                now,
+            )?;
+
+            let st_output: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
+                jacquard_common::DefaultStr,
+            > = serde_json::from_slice(response.response_bytes()).map_err(FederationError::Json)?;
+
+            let commit_entry_dto = match st_output.entry {
+                catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(
+                    entry,
+                ) => *entry,
+                _ => {
+                    return Err(FederationError::InvalidEnvelope {
+                        reason: "expected commitEntry in submitTransition output".to_string(),
+                    })
+                }
+            };
+
+            let output = SubmitCommitOutput {
+                commit_entry: commit_entry_dto,
+                coordinates: st_output.coordinates,
+                receipt,
+                welcomes: vec![],
+                extra_data: None,
+            };
+
+            let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
+            insert_delivery_receipt(tx, &output.receipt, &replay_source_locator, &response_bytes)
+                .await?;
+            return Ok(output);
+        }
+    };
+
     let entry = build_verified_control_entry(
         mutation,
         &endpoint,
@@ -1622,108 +2212,6 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         outer_entry_fingerprint: outer_control_fingerprint,
     };
 
-    // Shared operation claim in chat.operation_claims using blue.catbird.chat.submitTransition
-    let signed_req_sha256: [u8; 32] = Sha256::digest(&signed_request_bytes).into();
-    let claim_res = sqlx::query(
-        r#"
-        INSERT INTO chat.operation_claims (
-            operation_id, principal_did, endpoint_nsid, mutation_kind,
-            request_digest, accepted_request_sha256, signature, claimed_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
-    )
-    .bind(parsed.transition_id)
-    .bind(actor_did)
-    .bind("blue.catbird.chat.submitTransition")
-    .bind("blue.catbird.chat.defs#commitTransitionBody")
-    .bind(request_digest.as_slice())
-    .bind(signed_req_sha256.as_slice())
-    .bind(signature.as_slice())
-    .bind(now)
-    .execute(&mut **tx)
-    .await;
-
-    if let Err(e) = claim_res {
-        if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") {
-            // New delivery ID for same operation returns canonical outcome + new receipt
-            let existing_idem: Option<(Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
-                r#"
-                SELECT request_digest, signature, principal_did
-                  FROM chat.idempotency_records
-                 WHERE endpoint_nsid = 'blue.catbird.chat.submitTransition' AND operation_id = $1
-                "#,
-            )
-            .bind(parsed.transition_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(FederationError::Database)?;
-
-            if let Some((stored_req_digest, stored_sig, stored_principal)) = existing_idem {
-                if stored_req_digest != request_digest.to_vec()
-                    || stored_sig != signature.to_vec()
-                    || stored_principal != actor_did
-                {
-                    return Err(FederationError::CommitConflict {
-                        convo_id: header.conversation_id.to_string(),
-                        current_epoch: 0,
-                    });
-                }
-
-                // Mint new receipt for new delivery ID
-                let now = Utc::now();
-                let result_sha256: [u8; 32] = *response.sha256();
-                let receipt = sign_receipt(
-                    ack_signer,
-                    SUBMIT_COMMIT_NSID,
-                    header.delivery_id,
-                    header.conversation_id,
-                    &header.sender_ds_did,
-                    &header.receiver_ds_did,
-                    &header.sequencer_did,
-                    header.sequencer_term,
-                    envelope_digest,
-                    result_sha256,
-                    Some(source_locator.clone()),
-                    now,
-                )?;
-
-                let st_output: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
-                    jacquard_common::DefaultStr,
-                > = serde_json::from_slice(response.as_bytes()).map_err(FederationError::Json)?;
-
-                let commit_entry_dto = match st_output.entry {
-                    catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(entry) => {
-                        *entry
-                    }
-                    _ => {
-                        return Err(FederationError::InvalidEnvelope {
-                            reason: "expected commitEntry in submitTransition output".to_string(),
-                        })
-                    }
-                };
-
-                let output = SubmitCommitOutput {
-                    commit_entry: commit_entry_dto,
-                    coordinates: st_output.coordinates,
-                    receipt,
-                    welcomes: vec![],
-                    extra_data: None,
-                };
-
-                let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
-                insert_delivery_receipt(tx, &output.receipt, &source_locator, &response_bytes)
-                    .await?;
-                return Ok(output);
-            }
-
-            return Err(FederationError::CommitConflict {
-                convo_id: header.conversation_id.to_string(),
-                current_epoch: 0,
-            });
-        }
-        return Err(FederationError::Database(e));
-    }
-
     let prepared_execution =
         prepare_submit_transition_execution(tx, &plan, accepted_control_entry_bytes, None)
             .await
@@ -1759,7 +2247,7 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         header.sequencer_term,
         envelope_digest,
         result_sha256,
-        Some(source_locator.clone()),
+        source_locator.clone(),
         now,
     )?;
 
@@ -1787,45 +2275,465 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     };
 
     let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
-    let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
 
-    // transcript_bytes was already extracted before moving mutation
-    let idem_res = sqlx::query(
-        r#"
-        INSERT INTO chat.idempotency_records (
-            principal_did, endpoint_nsid, operation_id, request_digest,
-            accepted_request_bytes, signing_transcript_bytes, signature,
-            completed_status, response_bytes, response_sha256, event_position,
-            historical_jkt, current_jkt, completed_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL, $12)
-        "#,
+    // Complete the shared operation claim exactly as the local prelude does.
+    let Some(binding) = operation_binding else {
+        return Err(FederationError::InvalidEnvelope {
+            reason: "missing federated operation claim".to_string(),
+        });
+    };
+    complete_federated_operation(
+        tx,
+        &binding,
+        &signed_request_bytes,
+        &transcript_bytes,
+        200,
+        &response_bytes,
+        applied.event_positions.first().copied(),
     )
-    .bind(actor_did)
-    .bind("blue.catbird.chat.submitTransition")
-    .bind(parsed.transition_id)
-    .bind(request_digest.as_slice())
-    .bind(&signed_request_bytes)
-    .bind(&transcript_bytes)
-    .bind(signature.as_slice())
-    .bind(200i32)
-    .bind(&response_bytes)
-    .bind(&response_sha256[..])
-    .bind(applied.event_positions.first().copied())
-    .bind(now)
-    .execute(&mut **tx)
-    .await;
-
-    if let Err(e) = idem_res {
-        if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") {
-            return Err(FederationError::CommitConflict {
+    .await
+    .map_err(|e| match e {
+        crate::chat_protocol::repository::prelude::PreludeError::OperationIdConflict => {
+            FederationError::CommitConflict {
                 convo_id: header.conversation_id.to_string(),
                 current_epoch: 0,
-            });
+            }
         }
-        return Err(FederationError::Database(e));
-    }
+        other => FederationError::InvalidEnvelope {
+            reason: format!("federated operation completion failed: {other:?}"),
+        },
+    })?;
 
     insert_delivery_receipt(tx, &output.receipt, &source_locator, &response_bytes).await?;
 
     Ok(output)
+}
+
+/// Insert a typed source job into `federation_outbox` in the same transaction as state.
+pub async fn insert_federation_outbox_job(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    conversation_id: Uuid,
+    target_service_did: &str,
+    method: &str,
+    payload: &[u8],
+    payload_sha256: &[u8; 32],
+) -> Result<(), FederationError> {
+    let target = canonical_did(target_service_did).to_string();
+    sqlx::query(
+        "INSERT INTO federation_outbox (
+            id, conversation_id, target_service_did, method, payload, payload_sha256,
+            envelope_version, status, next_attempt_at, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 1, 'pending', NOW(), NOW(), NOW())",
+    )
+    .bind(id.to_string())
+    .bind(conversation_id.to_string())
+    .bind(&target)
+    .bind(method)
+    .bind(payload)
+    .bind(payload_sha256.as_slice())
+    .execute(&mut **tx)
+    .await
+    .map_err(FederationError::Database)?;
+    Ok(())
+}
+
+/// Find all distinct remote participant DSes for a conversation.
+pub async fn find_remote_participant_dses(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    self_ds_did: &str,
+) -> Result<Vec<(String, String)>, FederationError> {
+    let self_base = canonical_did(self_ds_did).to_string();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT user_did, ds_did \
+         FROM chat.participants \
+         WHERE conversation_id = $1 \
+           AND current_membership = TRUE \
+           AND status = 'active' \
+           AND ds_did IS NOT NULL \
+           AND ds_did != $2",
+    )
+    .bind(conversation_id)
+    .bind(&self_base)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(FederationError::Database)?;
+    Ok(rows)
+}
+
+/// Enqueue a `blue.catbird.mlsDS.deliverMessage` job for a remote participant.
+pub async fn enqueue_federated_message_job(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    target_ds_did: &str,
+    recipient_did: &str,
+    entry: &AppendEntry,
+    seq: u64,
+    sequencer_term: u64,
+) -> Result<Uuid, FederationError> {
+    use catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage;
+    use jacquard_common::deps::bytes::Bytes;
+    use jacquard_common::deps::smol_str::SmolStr;
+    use jacquard_common::types::string::Did;
+
+    let delivery_id = Uuid::new_v4();
+    let self_base_did = service_did_base();
+
+    let locator = ValidatedEntryLocator {
+        entry_id: entry.entry_id,
+        seq,
+        accepted_payload_sha256: entry
+            .accepted_payload_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| FederationError::InvalidEnvelope {
+                reason: "invalid accepted_payload_sha256 length".to_string(),
+            })?,
+        outer_entry_fingerprint: entry
+            .outer_entry_fingerprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| FederationError::InvalidEnvelope {
+                reason: "invalid outer_entry_fingerprint length".to_string(),
+            })?,
+    };
+    let envelope_header_for_digest = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id,
+        sender_ds_did: self_base_did.clone(),
+        receiver_ds_did: canonical_did(target_ds_did).to_string(),
+        sequencer_did: self_base_did.clone(),
+        sequencer_term,
+        payload_sha256: [0u8; 32],
+    };
+
+    let envelope_sha256 = compute_message_envelope_digest(
+        &envelope_header_for_digest,
+        recipient_did,
+        &locator,
+        &entry.accepted_payload_bytes,
+        &entry.signed_request_bytes,
+    )?;
+
+    let msg = DeliverMessage::<jacquard_common::DefaultStr> {
+        header: EnvelopeHeaderV1 {
+            protocol_version: SmolStr::from("1"),
+            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
+            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sender DID".to_string(),
+                }
+            })?,
+            receiver_ds_did: Did::new_owned(canonical_did(target_ds_did).to_string()).map_err(
+                |_| FederationError::InvalidEnvelope {
+                    reason: "invalid receiver DID".to_string(),
+                },
+            )?,
+            sequencer_did: Did::new_owned(service_did_base()).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sequencer DID".to_string(),
+                }
+            })?,
+            sequencer_term: sequencer_term as i64,
+            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            extra_data: None,
+        },
+        recipient_did: Did::new_owned(recipient_did.to_string()).map_err(|_| {
+            FederationError::InvalidEnvelope {
+                reason: "invalid recipient DID".to_string(),
+            }
+        })?,
+        entry_locator: EntryLocatorV1 {
+            entry_id: SmolStr::from(locator.entry_id.hyphenated().to_string()),
+            seq: locator.seq as i64,
+            accepted_payload_sha256: Bytes::copy_from_slice(&locator.accepted_payload_sha256),
+            outer_entry_fingerprint: Bytes::copy_from_slice(&locator.outer_entry_fingerprint),
+            extra_data: None,
+        },
+        entry_bytes: Bytes::copy_from_slice(&entry.accepted_payload_bytes),
+        signed_request_bytes: Bytes::copy_from_slice(&entry.signed_request_bytes),
+        extra_data: None,
+    };
+
+    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
+    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+
+    insert_federation_outbox_job(
+        tx,
+        delivery_id,
+        conversation_id,
+        target_ds_did,
+        DELIVER_MESSAGE_NSID,
+        &payload,
+        &payload_sha256,
+    )
+    .await?;
+
+    Ok(delivery_id)
+}
+
+/// Enqueue message delivery jobs for all remote participants on a conversation.
+pub async fn enqueue_clean_federation_message_jobs(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    entry: &AppendEntry,
+    seq: u64,
+    sequencer_term: u64,
+) -> Result<usize, FederationError> {
+    let self_base = service_did_base();
+    let remote_participants = find_remote_participant_dses(tx, conversation_id, &self_base).await?;
+    let count = remote_participants.len();
+    for (user_did, ds_did) in remote_participants {
+        enqueue_federated_message_job(
+            tx,
+            conversation_id,
+            &ds_did,
+            &user_did,
+            entry,
+            seq,
+            sequencer_term,
+        )
+        .await?;
+    }
+    Ok(count)
+}
+
+/// Enqueue a `blue.catbird.mlsDS.deliverWelcome` job for a remote participant.
+#[allow(clippy::too_many_arguments)]
+pub async fn enqueue_federated_welcome_job(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    target_ds_did: &str,
+    recipient_did: &str,
+    recipient_device_id: Uuid,
+    welcome_id: Uuid,
+    recovery_request_id: Uuid,
+    key_package_ref: &[u8; 32],
+    welcome_bytes: &[u8],
+    welcome_sha256: &[u8; 32],
+    entry: &AppendEntry,
+    seq: u64,
+    coordinates: ConversationCoordinates,
+    public_snapshot_sha256: &[u8; 32],
+    tree_summary_sha256: &[u8; 32],
+    sequencer_term: u64,
+) -> Result<Uuid, FederationError> {
+    use catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome;
+    use jacquard_common::deps::bytes::Bytes;
+    use jacquard_common::deps::smol_str::SmolStr;
+    use jacquard_common::types::string::Did;
+
+    let delivery_id = Uuid::new_v4();
+    let self_base_did = service_did_base();
+
+    let participant_exists: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT ds_did FROM chat.participants \
+         WHERE conversation_id = $1 AND user_did = $2 \
+           AND current_membership = TRUE AND status IN ('pending', 'active')",
+    )
+    .bind(conversation_id)
+    .bind(recipient_did)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(FederationError::Database)?;
+
+    if participant_exists.is_none() {
+        return Err(FederationError::MailboxNotProvisioned {
+            reason: format!(
+                "recipient participant {recipient_did} not found in conversation {conversation_id}"
+            ),
+        });
+    }
+
+    let locator = ValidatedEntryLocator {
+        entry_id: entry.entry_id,
+        seq,
+        accepted_payload_sha256: entry
+            .accepted_payload_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| FederationError::InvalidEnvelope {
+                reason: "invalid accepted_payload_sha256 length".to_string(),
+            })?,
+        outer_entry_fingerprint: entry
+            .outer_entry_fingerprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| FederationError::InvalidEnvelope {
+                reason: "invalid outer_entry_fingerprint length".to_string(),
+            })?,
+    };
+
+    let envelope_header_for_digest = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id,
+        sender_ds_did: self_base_did.clone(),
+        receiver_ds_did: canonical_did(target_ds_did).to_string(),
+        sequencer_did: self_base_did.clone(),
+        sequencer_term,
+        payload_sha256: [0u8; 32],
+    };
+
+    let envelope_sha256 = compute_welcome_envelope_digest(
+        &envelope_header_for_digest,
+        recipient_did,
+        recipient_device_id,
+        welcome_id,
+        recovery_request_id,
+        key_package_ref,
+        welcome_bytes,
+        welcome_sha256,
+        &entry.accepted_payload_bytes,
+        &entry.signed_request_bytes,
+        &locator,
+        &coordinates,
+        public_snapshot_sha256,
+        tree_summary_sha256,
+    )?;
+
+    let msg = DeliverWelcome::<jacquard_common::DefaultStr> {
+        header: EnvelopeHeaderV1 {
+            protocol_version: SmolStr::from("1"),
+            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
+            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sender DID".to_string(),
+                }
+            })?,
+            receiver_ds_did: Did::new_owned(canonical_did(target_ds_did).to_string()).map_err(
+                |_| FederationError::InvalidEnvelope {
+                    reason: "invalid receiver DID".to_string(),
+                },
+            )?,
+            sequencer_did: Did::new_owned(service_did_base()).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sequencer DID".to_string(),
+                }
+            })?,
+            sequencer_term: sequencer_term as i64,
+            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            extra_data: None,
+        },
+        recipient_did: Did::new_owned(recipient_did.to_string()).map_err(|_| {
+            FederationError::InvalidEnvelope {
+                reason: "invalid recipient DID".to_string(),
+            }
+        })?,
+        recipient_device_id: SmolStr::from(recipient_device_id.hyphenated().to_string()),
+        welcome_id: SmolStr::from(welcome_id.hyphenated().to_string()),
+        recovery_request_id: SmolStr::from(recovery_request_id.hyphenated().to_string()),
+        key_package_ref: Bytes::copy_from_slice(key_package_ref),
+        welcome_bytes: Bytes::copy_from_slice(welcome_bytes),
+        welcome_sha256: Bytes::copy_from_slice(welcome_sha256),
+        entry_bytes: Bytes::copy_from_slice(&entry.accepted_payload_bytes),
+        signed_request_bytes: Bytes::copy_from_slice(&entry.signed_request_bytes),
+        entry_locator: EntryLocatorV1 {
+            entry_id: SmolStr::from(locator.entry_id.hyphenated().to_string()),
+            seq: locator.seq as i64,
+            accepted_payload_sha256: Bytes::copy_from_slice(&locator.accepted_payload_sha256),
+            outer_entry_fingerprint: Bytes::copy_from_slice(&locator.outer_entry_fingerprint),
+            extra_data: None,
+        },
+        coordinates,
+        public_snapshot_sha256: Bytes::copy_from_slice(public_snapshot_sha256),
+        tree_summary_sha256: Bytes::copy_from_slice(tree_summary_sha256),
+        extra_data: None,
+    };
+
+    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
+    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+
+    insert_federation_outbox_job(
+        tx,
+        delivery_id,
+        conversation_id,
+        target_ds_did,
+        DELIVER_WELCOME_NSID,
+        &payload,
+        &payload_sha256,
+    )
+    .await?;
+
+    Ok(delivery_id)
+}
+
+/// Enqueue a `blue.catbird.mlsDS.submitCommit` job from a mailbox to a sequencer.
+pub async fn enqueue_federated_commit_job(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    sequencer_ds_did: &str,
+    signed_request_bytes: &[u8],
+    sequencer_term: u64,
+) -> Result<Uuid, FederationError> {
+    use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+    use jacquard_common::deps::bytes::Bytes;
+    use jacquard_common::deps::smol_str::SmolStr;
+    use jacquard_common::types::string::Did;
+
+    let delivery_id = Uuid::new_v4();
+    let self_base_did = service_did_base();
+    let target = canonical_did(sequencer_ds_did).to_string();
+
+    let envelope_header_for_digest = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id,
+        sender_ds_did: self_base_did.clone(),
+        receiver_ds_did: target.clone(),
+        sequencer_did: target.clone(),
+        sequencer_term,
+        payload_sha256: [0u8; 32],
+    };
+
+    let envelope_sha256 =
+        compute_commit_envelope_digest(&envelope_header_for_digest, signed_request_bytes)?;
+
+    let msg = SubmitCommit::<jacquard_common::DefaultStr> {
+        header: EnvelopeHeaderV1 {
+            protocol_version: SmolStr::from("1"),
+            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
+            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sender DID".to_string(),
+                }
+            })?,
+            receiver_ds_did: Did::new_owned(target.clone()).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid receiver DID".to_string(),
+                }
+            })?,
+            sequencer_did: Did::new_owned(target).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid sequencer DID".to_string(),
+                }
+            })?,
+            sequencer_term: sequencer_term as i64,
+            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            extra_data: None,
+        },
+        signed_request_bytes: Bytes::copy_from_slice(signed_request_bytes),
+        extra_data: None,
+    };
+
+    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
+    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+
+    insert_federation_outbox_job(
+        tx,
+        delivery_id,
+        conversation_id,
+        sequencer_ds_did,
+        SUBMIT_COMMIT_NSID,
+        &payload,
+        &payload_sha256,
+    )
+    .await?;
+
+    Ok(delivery_id)
 }

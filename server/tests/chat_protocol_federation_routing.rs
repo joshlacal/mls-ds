@@ -1576,12 +1576,11 @@ async fn test_real_reset_preserves_remote_sequencer_identity_and_term() {
     assert_eq!(sequencer_term, 4, "sequencer_term must be preserved");
 
     // Stale generation CAS must fail with HeadConflict
-    let stale_err =
-        catbird_server::chat_protocol::test_support::cas_conversation_head_test(
-            &mut tx, convo_id, 0, 0, 2, 2, 0, 4,
-        )
-        .await
-        .expect_err("stale generation head CAS must fail");
+    let stale_err = catbird_server::chat_protocol::test_support::cas_conversation_head_test(
+        &mut tx, convo_id, 0, 0, 2, 2, 0, 4,
+    )
+    .await
+    .expect_err("stale generation head CAS must fail");
     assert!(
         stale_err.contains("CompareAndSetConflict"),
         "stale generation head CAS must fail with CompareAndSetConflict: {stale_err}"
@@ -1619,8 +1618,8 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
     let resolve_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls_clone = resolve_calls.clone();
     let self_did = "did:web:chat.catbird.blue".to_string();
-    let hook: catbird_server::federation::resolver::UserDidResolverFn =
-        Arc::new(move |user_did: &str| {
+    let hook: catbird_server::federation::resolver::UserDidResolverFn = Arc::new(
+        move |user_did: &str| {
             let count = calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count >= 1 {
                 // Fail on any call after the initial participant resolution call
@@ -1642,7 +1641,8 @@ async fn test_replay_counting_failing_resolver_proves_zero_calls() {
                     federation_capabilities: None,
                 }))
             }
-        });
+        },
+    );
 
     ensure_verifier_env(&pool).await;
     std::env::set_var("CHAT_CUTOVER_ENABLED", "1");

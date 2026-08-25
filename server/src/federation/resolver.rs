@@ -513,7 +513,6 @@ impl DsResolver {
         self
     }
 
-
     pub fn with_defaults(
         pool: PgPool,
         http: reqwest::Client,
@@ -3185,7 +3184,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migration run failed in setup_cache_test_pool");

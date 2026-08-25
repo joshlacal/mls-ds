@@ -507,35 +507,8 @@ async fn enqueue_outbox_for_event(
             .context("bulk INSERT notification_outbox")?;
     }
 
-    // 3. Federation rows — one per DISTINCT non-local peer DS DID. A
-    //    non-federated conversation has all members with
-    //    `ds_did IS NULL`; in that case we insert zero rows.
-    let federation_targets: std::collections::BTreeSet<String> = members
-        .iter()
-        .filter_map(|(_member_did, _user_did, ds_did)| ds_did.clone())
-        .collect();
-
-    if !federation_targets.is_empty() {
-        let mut qb = sqlx::QueryBuilder::<Postgres>::new(
-            "INSERT INTO federation_outbox (\
-                id, conversation_id, delivery_event_id, target_service_did, \
-                payload, status \
-             ) ",
-        );
-        qb.push_values(federation_targets.iter(), |mut b, target_did| {
-            b.push_bind(Uuid::new_v4().to_string())
-                .push_bind(conversation_id)
-                .push_bind(delivery_event_id)
-                .push_bind(target_did)
-                .push_bind(&payload_bytes)
-                .push_bind("pending");
-        });
-        qb.build()
-            .execute(&mut **tx)
-            .await
-            .context("bulk INSERT federation_outbox")?;
-    }
-
+    // 3. Federation rows — generic reset audit payload federation is stopped (Task 5).
+    //    Typed clean federation jobs are emitted directly from clean chokepoints.
     // 4. Phase 3 codex P1 fix — persist the SSE `event_stream` row in
     //    the SAME tx as the delivery_event + outbox INSERTs above. This
     //    closes the SIGKILL-between-commit-and-fanout window by moving
@@ -586,7 +559,7 @@ async fn enqueue_outbox_for_event(
 
     Ok(EnqueueOutboxOutcome {
         notification_count: members.len(),
-        federation_count: federation_targets.len(),
+        federation_count: 0,
         sse_cursor,
         sse_event: sse_event_with_cursor,
     })

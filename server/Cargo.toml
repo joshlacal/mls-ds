@@ -30,7 +30,7 @@ http = "1.0"
 serde_bytes = "0.11"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "uuid", "chrono", "migrate"] }
+sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "chrono", "migrate"] }
 
 # MLS
 openmls = { version = "=0.8.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }

@@ -4189,6 +4189,14 @@ impl HydrationAuthority {
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
         let trusted_read_at =
             ServerTimestamp::from_unix_millis(admission.trusted_read_at.timestamp_millis())?;
+        let transaction_id = self
+            .locked
+            .as_ref()
+            .map(|l| l.transaction_id.clone())
+            .unwrap_or_default();
+        if !transaction_id.is_empty() && transaction_id != admission.transaction_id {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         let mut digest = Sha256::new();
         digest.update(b"CATBIRD-CHAT-REPOSITORY-AUTHORITY-GUARD\0");
         digest.update(self.expected_conversation_id);
@@ -4199,16 +4207,19 @@ impl HydrationAuthority {
         digest.update(admission.registered_mls_signature_key);
         digest.update(admission.auth_generation.to_be_bytes());
         digest.update(trusted_read_at.unix_millis().to_be_bytes());
+        digest.update((admission.transaction_id.len() as u64).to_be_bytes());
+        digest.update(admission.transaction_id.as_bytes());
+        digest.update((admission.requester_ds.len() as u64).to_be_bytes());
+        digest.update(admission.requester_ds.as_bytes());
+        digest.update(admission.delivery_id.as_bytes());
+        digest.update(admission.envelope_digest);
+        digest.update(admission.operation_id.as_bytes());
+        digest.update((admission.endpoint_nsid.len() as u64).to_be_bytes());
+        digest.update(admission.endpoint_nsid.as_bytes());
+        digest.update(admission.mutation_request_digest);
+        digest.update(admission.mutation_signature);
         let computed_row_digest: [u8; 32] = digest.finalize().into();
         if computed_row_digest != admission.durable_row_digest {
-            return Err(StateMachineError::InvalidHydrationAuthority);
-        }
-        let transaction_id = self
-            .locked
-            .as_ref()
-            .map(|l| l.transaction_id.clone())
-            .unwrap_or_default();
-        if !transaction_id.is_empty() && transaction_id != admission.transaction_id {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
         Ok(LockedRegistrationProjection {
@@ -6745,18 +6756,24 @@ impl LockedRegistrationProjection {
         projection
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FederatedOperationAdmission {
-    pub(crate) actor_did: BareDid,
-    pub(crate) actor_device_id: CanonicalUuidV4,
-    pub(crate) actor_key_id: KeyThumbprint,
-    pub(crate) registered_mls_signature_key: [u8; 32],
-    pub(crate) auth_generation: u64,
-    pub(crate) trusted_read_at: DateTime<Utc>,
-    pub(crate) transaction_id: String,
-    pub(crate) requester_ds: String,
-    pub(crate) conversation_id: Uuid,
-    pub(crate) durable_row_digest: [u8; 32],
+    actor_did: BareDid,
+    actor_device_id: CanonicalUuidV4,
+    actor_key_id: KeyThumbprint,
+    registered_mls_signature_key: [u8; 32],
+    auth_generation: u64,
+    trusted_read_at: DateTime<Utc>,
+    transaction_id: String,
+    requester_ds: String,
+    conversation_id: Uuid,
+    delivery_id: Uuid,
+    envelope_digest: [u8; 32],
+    operation_id: Uuid,
+    endpoint_nsid: String,
+    mutation_request_digest: [u8; 32],
+    mutation_signature: [u8; 64],
+    durable_row_digest: [u8; 32],
 }
 
 impl FederatedOperationAdmission {
@@ -6771,7 +6788,16 @@ impl FederatedOperationAdmission {
         transaction_id: String,
         requester_ds: String,
         conversation_id: Uuid,
+        delivery_id: Uuid,
+        envelope_digest: [u8; 32],
+        operation_id: Uuid,
+        endpoint_nsid: String,
+        mutation_request_digest: [u8; 32],
+        mutation_signature: [u8; 64],
     ) -> Result<Self, StateMachineError> {
+        if requester_ds.is_empty() || transaction_id.is_empty() || endpoint_nsid.is_empty() {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         let key_id: [u8; 32] = URL_SAFE_NO_PAD
             .decode(actor_key_id.as_str())
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
@@ -6789,6 +6815,17 @@ impl FederatedOperationAdmission {
         digest.update(registered_mls_signature_key);
         digest.update(auth_generation.to_be_bytes());
         digest.update(trusted_timestamp.unix_millis().to_be_bytes());
+        digest.update((transaction_id.len() as u64).to_be_bytes());
+        digest.update(transaction_id.as_bytes());
+        digest.update((requester_ds.len() as u64).to_be_bytes());
+        digest.update(requester_ds.as_bytes());
+        digest.update(delivery_id.as_bytes());
+        digest.update(envelope_digest);
+        digest.update(operation_id.as_bytes());
+        digest.update((endpoint_nsid.len() as u64).to_be_bytes());
+        digest.update(endpoint_nsid.as_bytes());
+        digest.update(mutation_request_digest);
+        digest.update(mutation_signature);
         Ok(Self {
             actor_did,
             actor_device_id,
@@ -6799,8 +6836,66 @@ impl FederatedOperationAdmission {
             transaction_id,
             requester_ds,
             conversation_id,
+            delivery_id,
+            envelope_digest,
+            operation_id,
+            endpoint_nsid,
+            mutation_request_digest,
+            mutation_signature,
             durable_row_digest: digest.finalize().into(),
         })
+    }
+
+    pub(crate) fn delivery_id(&self) -> Uuid {
+        self.delivery_id
+    }
+
+    pub(crate) fn envelope_digest(&self) -> &[u8; 32] {
+        &self.envelope_digest
+    }
+
+    pub(crate) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+
+    pub(crate) fn endpoint_nsid(&self) -> &str {
+        &self.endpoint_nsid
+    }
+
+    pub(crate) fn mutation_request_digest(&self) -> &[u8; 32] {
+        &self.mutation_request_digest
+    }
+
+    pub(crate) fn mutation_signature(&self) -> &[u8; 64] {
+        &self.mutation_signature
+    }
+
+    pub(crate) fn requester_ds(&self) -> &str {
+        &self.requester_ds
+    }
+
+    pub(crate) fn actor_did(&self) -> &str {
+        self.actor_did.as_str()
+    }
+
+    pub(crate) fn actor_device_id(&self) -> &CanonicalUuidV4 {
+        &self.actor_device_id
+    }
+
+    pub(crate) fn actor_key_id(&self) -> &KeyThumbprint {
+        &self.actor_key_id
+    }
+
+    pub(crate) fn actor_auth_generation(&self) -> u64 {
+        self.auth_generation
+    }
+
+    pub(crate) fn trusted_read_at(&self) -> DateTime<Utc> {
+        self.trusted_read_at
+    }
+
+    pub(crate) fn transaction_id(&self) -> &str {
+        &self.transaction_id
     }
 }
 

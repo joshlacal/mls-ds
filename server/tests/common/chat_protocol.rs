@@ -27,7 +27,7 @@ pub struct CleanProtocol13ManifestEntry {
     pub migration: Migration,
 }
 
-pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 22]> = LazyLock::new(
+pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 23]> = LazyLock::new(
     || {
         [
             CleanProtocol13ManifestEntry {
@@ -250,6 +250,16 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 2
                     Cow::Borrowed(include_str!("../../migrations/20260824000004_chat_federation_delivery_receipts.sql")),
                 ),
             },
+            CleanProtocol13ManifestEntry {
+                filename: "20260824000005_chat_federation_outbox_retry.sql",
+                reviewed_sha384: "cdd1249fe0a4d125aa5626b80aa0829ef2fe9bb29a516a0da9d58eb876e57bc16781dd701ffe55ad8cfafdbf101d6ba1",
+                migration: Migration::new(
+                    20260824000005,
+                    Cow::Borrowed("chat federation outbox retry"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260824000005_chat_federation_outbox_retry.sql")),
+                ),
+            },
         ]
     },
 );
@@ -269,8 +279,8 @@ impl MigrationSource<'static> for CleanProtocol13MigrationSource {
 }
 
 pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
-    if CLEAN_PROTOCOL_13_MANIFEST.len() != 22 {
-        return Err("reviewed clean-protocol manifest must contain exactly 22 migrations".into());
+    if CLEAN_PROTOCOL_13_MANIFEST.len() != 23 {
+        return Err("reviewed clean-protocol manifest must contain exactly 23 migrations".into());
     }
     for (index, entry) in CLEAN_PROTOCOL_13_MANIFEST.iter().enumerate() {
         let filename_version = entry
@@ -301,7 +311,7 @@ pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
         .map_err(|error| format!("resolve reviewed clean-protocol migrator: {error}"))?;
     migrator.set_ignore_missing(false);
     migrator.set_locking(true);
-    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 22 {
+    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 23 {
         return Err("reviewed clean-protocol migrator policy mismatch".into());
     }
     for (entry, migration) in CLEAN_PROTOCOL_13_MANIFEST.iter().zip(migrator.iter()) {

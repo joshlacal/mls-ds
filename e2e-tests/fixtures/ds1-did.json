@@ -3,18 +3,18 @@
     "https://www.w3.org/ns/did/v1",
     "https://w3id.org/security/suites/jws-2020/v1"
   ],
-  "id": "did:web:ds1.local",
+  "id": "did:web:ds1.catbird.blue",
   "verificationMethod": [
     {
-      "id": "did:web:ds1.local#atproto",
+      "id": "did:web:ds1.catbird.blue#atproto",
       "type": "Multikey",
-      "controller": "did:web:ds1.local",
+      "controller": "did:web:ds1.catbird.blue",
       "publicKeyMultibase": "zDnaepsL7AXenJkVYdkh5KuKsSU7Ykh7kyXaLLU7auN9FWSiZ"
     }
   ],
   "service": [
     {
-      "id": "did:web:ds1.local#atproto_mls",
+      "id": "did:web:ds1.catbird.blue#atproto_mls",
       "type": "AtprotoMLSDeliveryService",
       "serviceEndpoint": "http://ds1:3001"
     }

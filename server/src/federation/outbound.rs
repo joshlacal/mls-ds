@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 use super::ack::DeliveryAck;
 use super::receipt::SequencerReceipt;
 use crate::util::outbound_body::{
-    decode_json_bounded, summarize_error_body, OutboundBodyError, ResponseBodyBudget,
-    ORDINARY_DS_CONTROL_MAX_BYTES,
+    collect_bounded, decode_json_bounded, summarize_error_body, OutboundBodyError,
+    ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
 };
 
 const REMOTE_DS: &str = "remote DS";
@@ -22,8 +22,10 @@ pub struct OutboundClient {
     request_timeout: Duration,
 }
 
+use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
+
 /// Response from a remote DS.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct DsResponse {
     #[serde(default)]
     pub accepted: bool,
@@ -37,10 +39,28 @@ pub struct DsResponse {
     pub error: Option<String>,
     pub message: Option<String>,
     pub ack: Option<DeliveryAck>,
-    /// Sequencer receipt proving commit ordering (only present for commit responses).
-    pub receipt: Option<SequencerReceipt>,
+    /// Receipt JSON value proving delivery/sequencer ordering.
+    pub receipt: Option<serde_json::Value>,
+    /// Actual raw HTTP response bytes (captured on parse).
+    #[serde(skip)]
+    pub response_bytes: Vec<u8>,
 }
 
+impl DsResponse {
+    pub fn clean_receipt(&self) -> Option<FederationReceiptV1> {
+        self.receipt.as_ref().and_then(|v| {
+            let bytes = serde_json::to_vec(v).ok()?;
+            serde_json::from_slice(&bytes).ok()
+        })
+    }
+
+    pub fn sequencer_receipt(&self) -> Option<SequencerReceipt> {
+        self.receipt.as_ref().and_then(|v| {
+            let bytes = serde_json::to_vec(v).ok()?;
+            serde_json::from_slice(&bytes).ok()
+        })
+    }
+}
 impl OutboundClient {
     pub fn new(connect_timeout_secs: u64, request_timeout_secs: u64) -> Self {
         let http = Client::builder()
@@ -255,12 +275,15 @@ async fn parse_response(
 ) -> Result<DsResponse, OutboundError> {
     let status = resp.status();
     if status.is_success() {
-        decode_json_bounded(
-            resp,
-            ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
-        )
-        .await
-        .map_err(|error| map_ordinary_body_error(error, method))
+        let budget = ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline);
+        let bytes = collect_bounded(resp, budget)
+            .await
+            .map_err(|error| map_ordinary_body_error(error, method))?;
+        let mut ds_response: DsResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            map_ordinary_body_error(OutboundBodyError::InvalidJson(error), method)
+        })?;
+        ds_response.response_bytes = bytes.to_vec();
+        Ok(ds_response)
     } else {
         let body = summarize_error_body(resp, deadline)
             .await

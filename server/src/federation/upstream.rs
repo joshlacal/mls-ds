@@ -1027,7 +1027,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1093,7 +1095,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1177,7 +1181,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1322,7 +1328,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");

@@ -387,7 +387,7 @@ impl OperationClaimBinding {
     }
 }
 
-fn endpoint_has_operation_claim(endpoint: &str) -> bool {
+pub(crate) fn endpoint_has_operation_claim(endpoint: &str) -> bool {
     matches!(
         endpoint,
         "blue.catbird.chat.acceptConversation"

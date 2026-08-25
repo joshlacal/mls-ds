@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use catbird_mls::{KeychainAccess, MLSContext, MLSError};
+use catbird_mls::{EpochSecretStorage, KeychainAccess, MLSContext, MLSError};
 
 // ── In-memory keychain (no iOS Keychain in tests) ────────────────────────
 
@@ -39,6 +39,55 @@ impl KeychainAccess for InMemoryKeychain {
   async fn delete(&self, key: String) -> std::result::Result<(), MLSError> {
     self.store.lock().unwrap().remove(&key);
     Ok(())
+  }
+}
+
+#[derive(Default)]
+struct InMemoryEpochSecretStorage {
+  secrets: Mutex<HashMap<(String, u64), Vec<u8>>>,
+}
+
+#[async_trait::async_trait]
+impl EpochSecretStorage for InMemoryEpochSecretStorage {
+  async fn store_epoch_secret(
+    &self,
+    conversation_id: String,
+    epoch: u64,
+    secret_data: Vec<u8>,
+  ) -> bool {
+    self
+      .secrets
+      .lock()
+      .unwrap()
+      .insert((conversation_id, epoch), secret_data);
+    true
+  }
+
+  async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
+    self
+      .secrets
+      .lock()
+      .unwrap()
+      .get(&(conversation_id, epoch))
+      .cloned()
+  }
+
+  async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
+    self
+      .secrets
+      .lock()
+      .unwrap()
+      .remove(&(conversation_id, epoch));
+    true
+  }
+
+  async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
+    let mut secrets = self.secrets.lock().unwrap();
+    let before = secrets.len();
+    secrets.retain(|(stored_conversation, epoch), _| {
+      stored_conversation != &conversation_id || *epoch >= cutoff_epoch
+    });
+    u32::try_from(before.saturating_sub(secrets.len())).unwrap_or(u32::MAX)
   }
 }
 
@@ -77,6 +126,10 @@ impl MlsEngine {
       keychain,
     )
     .map_err(|e| anyhow::anyhow!("MLSContext::new failed: {e}"))?;
+
+    ctx
+      .set_epoch_secret_storage(Box::new(InMemoryEpochSecretStorage::default()))
+      .map_err(|e| anyhow::anyhow!("set_epoch_secret_storage failed: {e}"))?;
 
     Ok(Self {
       ctx,
@@ -118,6 +171,14 @@ impl MlsEngine {
       .add_members(group_id.to_vec(), kps)
       .map_err(|e| anyhow::anyhow!("add_members: {e}"))?;
     Ok((result.commit_data, result.welcome_data))
+  }
+  /// Merge pending commit locally to advance epoch after server ACK.
+  pub fn merge_pending_commit(&self, group_id: &[u8]) -> Result<u64> {
+    let result = self
+      .ctx
+      .merge_pending_commit(group_id.to_vec())
+      .map_err(|e| anyhow::anyhow!("merge_pending_commit: {e}"))?;
+    Ok(result.new_epoch)
   }
 
   /// Process a welcome message to join a group. Returns binary group_id.

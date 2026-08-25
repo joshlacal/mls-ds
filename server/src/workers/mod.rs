@@ -40,7 +40,7 @@ pub use notification_outbox::run_notification_outbox_worker;
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{error, info};
-
+use uuid::Uuid;
 /// Worker poll interval. Tuned for "low-latency notifications" — most rows
 /// will be dispatched on the first tick because the chokepoint commits
 /// ~immediately before the worker wakes. Increase if Postgres load is the
@@ -72,6 +72,9 @@ pub const MAX_ATTEMPTS: i32 = 10;
 /// A row that has been pending+retrying for more than this is given up on
 /// regardless of attempt count.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(86_400);
+/// Maximum age for dead outbox rows before being purged during periodic cleanup.
+/// Default: 7 days.
+pub const DEAD_ROWS_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 
 /// Visibility timeout for `in_flight` rows: if a row has been `in_flight`
 /// for longer than this, a follow-up tick reclaims it back to `pending`
@@ -117,13 +120,24 @@ pub fn compute_backoff(attempts: i32) -> Duration {
 ///
 /// Returns the number of rows reclaimed. A non-zero return is logged but
 /// is not an error condition.
-async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, sqlx::Error> {
-    let timeout_secs = IN_FLIGHT_VISIBILITY_TIMEOUT.as_secs() as i64;
-    let sql = format!(
-        "UPDATE {table} SET status = 'pending', updated_at = NOW() \
-         WHERE status = 'in_flight' \
-           AND updated_at < NOW() - make_interval(secs => $1)"
-    );
+pub async fn reclaim_stuck_in_flight(pool: &PgPool, table: &str) -> Result<u64, sqlx::Error> {
+    let timeout_secs = IN_FLIGHT_VISIBILITY_TIMEOUT.as_secs() as f64;
+    let sql = match table {
+        "notification_outbox" => {
+            format!(
+                "UPDATE {table} SET status = 'pending', updated_at = NOW() \
+                 WHERE status = 'in_flight' \
+                   AND updated_at < NOW() - make_interval(secs => $1)"
+            )
+        }
+        _ => {
+            format!(
+                "UPDATE {table} SET status = 'pending', claim_token = NULL, claim_expires_at = NULL, updated_at = NOW() \
+                 WHERE status = 'in_flight' \
+                   AND (claim_expires_at <= NOW() OR (claim_expires_at IS NULL AND updated_at < NOW() - make_interval(secs => $1)))"
+            )
+        }
+    };
     let result = sqlx::query(&sql).bind(timeout_secs).execute(pool).await?;
     Ok(result.rows_affected())
 }
@@ -147,6 +161,7 @@ pub async fn record_failure(
     pool: &PgPool,
     table: &str,
     row_id: &str,
+    claim_token: Option<Uuid>,
     attempts: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     error_msg: &str,
@@ -176,24 +191,78 @@ pub async fn record_failure(
     // (attempts > 0, last_error IS NOT NULL) projection.
     let stored_status = if dead { "dead" } else { "pending" };
 
-    let sql = format!(
-        "UPDATE {table} \
-         SET status = $1, \
-             attempts = $2, \
-             next_attempt_at = NOW() + make_interval(secs => $3), \
-             last_error = $4, \
-             updated_at = NOW() \
-         WHERE id = $5"
-    );
+    let rows_affected = match table {
+        "federation_outbox" => {
+            let sql = format!(
+                "UPDATE {table} \
+                 SET status = $1, \
+                     attempts = $2, \
+                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     last_error = $4, \
+                     claim_token = NULL, \
+                     claim_expires_at = NULL, \
+                     updated_at = NOW() \
+                 WHERE id = $5 AND status = 'in_flight' AND ($6::uuid IS NULL OR claim_token = $6)"
+            );
+            let result = sqlx::query(&sql)
+                .bind(stored_status)
+                .bind(new_attempts)
+                .bind(backoff_secs)
+                .bind(error_msg)
+                .bind(row_id)
+                .bind(claim_token)
+                .execute(pool)
+                .await?;
+            result.rows_affected()
+        }
+        "notification_outbox" => {
+            let sql = format!(
+                "UPDATE {table} \
+                 SET status = $1, \
+                     attempts = $2, \
+                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     last_error = $4, \
+                     updated_at = NOW() \
+                 WHERE id = $5"
+            );
+            let result = sqlx::query(&sql)
+                .bind(stored_status)
+                .bind(new_attempts)
+                .bind(backoff_secs)
+                .bind(error_msg)
+                .bind(row_id)
+                .execute(pool)
+                .await?;
+            result.rows_affected()
+        }
+        _ => {
+            let sql = format!(
+                "UPDATE {table} \
+                 SET status = $1, \
+                     attempts = $2, \
+                     next_attempt_at = NOW() + make_interval(secs => $3), \
+                     last_error = $4, \
+                     claim_token = NULL, \
+                     claim_expires_at = NULL, \
+                     updated_at = NOW() \
+                 WHERE id = $5 AND status = 'in_flight' AND ($6::uuid IS NULL OR claim_token = $6)"
+            );
+            let result = sqlx::query(&sql)
+                .bind(stored_status)
+                .bind(new_attempts)
+                .bind(backoff_secs)
+                .bind(error_msg)
+                .bind(row_id)
+                .bind(claim_token)
+                .execute(pool)
+                .await?;
+            result.rows_affected()
+        }
+    };
 
-    sqlx::query(&sql)
-        .bind(stored_status)
-        .bind(new_attempts)
-        .bind(backoff_secs)
-        .bind(error_msg)
-        .bind(row_id)
-        .execute(pool)
-        .await?;
+    if rows_affected == 0 {
+        return Ok("stale");
+    }
 
     Ok(stored_status)
 }
@@ -204,6 +273,22 @@ async fn mark_done(pool: &PgPool, table: &str, row_id: &str) -> Result<(), sqlx:
     let sql = format!("UPDATE {table} SET status = 'done', updated_at = NOW() WHERE id = $1");
     sqlx::query(&sql).bind(row_id).execute(pool).await?;
     Ok(())
+}
+
+/// Clean up dead rows older than `max_age` from outbox tables.
+pub async fn cleanup_dead_rows(
+    pool: &PgPool,
+    table: &str,
+    max_age: Duration,
+) -> Result<u64, sqlx::Error> {
+    let secs = max_age.as_secs() as f64;
+    let sql = format!(
+        "DELETE FROM {table} \
+         WHERE status = 'dead' \
+           AND (updated_at < NOW() - make_interval(secs => $1) OR (updated_at IS NULL AND created_at < NOW() - make_interval(secs => $1)))"
+    );
+    let result = sqlx::query(&sql).bind(secs).execute(pool).await?;
+    Ok(result.rows_affected())
 }
 
 /// Convenience: log + ignore reclaim errors. The reclaim is a best-effort

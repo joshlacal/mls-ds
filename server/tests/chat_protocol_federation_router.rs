@@ -2914,9 +2914,11 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
     let _recipient_period_id = Uuid::new_v4();
     let welcome_id = Uuid::new_v4();
     let recovery_request_id = Uuid::new_v4();
-    let key_package_ref = [0x77u8; 32];
-    let welcome_bytes = vec![0x33u8; 64];
+    let welcome_bytes = corpus_file("welcome.mls");
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
+    let manifest_bytes = corpus_file("manifest.json");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
+    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
     let public_snapshot_bytes = vec![0x88u8; 16];
     let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
@@ -4204,5 +4206,1280 @@ async fn test_direct_sql_immutability_and_operation_claims_completeness() {
         null_locator_err.to_string().contains("source_entry_id")
             || null_locator_err.to_string().contains("not-null"),
         "NULL source locator must be rejected: {null_locator_err}"
+    );
+}
+
+#[tokio::test]
+async fn test_deliver_message_router_concurrency_revocation_fails_closed() {
+    let harness = TestHarness::new("msg-revoc").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x22u8; 32];
+
+    let recipient = TestActor::generate();
+    recipient.seed(&harness.pool, now).await;
+
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        1,
+        &recipient,
+        None,
+        now,
+    )
+    .await;
+
+    let actor = TestActor::generate();
+    actor.seed(&harness.pool, now).await;
+
+    let message_id = Uuid::new_v4();
+    let msg_entry_id = Uuid::new_v4();
+    let (_, signed_req_bytes) =
+        make_message_body(convo_id, message_id, &actor, &group_id, vec![], now);
+
+    let mutation =
+        decode_and_verify_signed_mutation(&signed_req_bytes, actor.public_key.as_slice()).unwrap();
+    let received_at = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let built = build_verified_application_entry(
+        mutation,
+        CanonicalUuidV4::parse(&msg_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at,
+    )
+    .unwrap();
+    let entry_bytes = built.canonical_entry_bytes().to_vec();
+    let entry_sha256 = *built.accepted_payload_sha256();
+    let outer_fp = *built.outer_application_fingerprint();
+
+    let delivery_id = Uuid::new_v4();
+    let mut header_model = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id: convo_id,
+        sender_ds_did: harness.sequencer_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: harness.sequencer_ds_did.clone(),
+        sequencer_term: 1,
+        payload_sha256: [0u8; 32],
+    };
+    let locator_model = ValidatedEntryLocator {
+        entry_id: msg_entry_id,
+        seq: 2,
+        accepted_payload_sha256: entry_sha256,
+        outer_entry_fingerprint: outer_fp,
+    };
+
+    let msg_digest = compute_message_envelope_digest(
+        &header_model,
+        &recipient.did,
+        &locator_model,
+        &entry_bytes,
+        &signed_req_bytes,
+    )
+    .unwrap();
+    header_model.payload_sha256 = msg_digest;
+
+    let header_json = make_envelope_header_json(
+        delivery_id,
+        convo_id,
+        &harness.sequencer_ds_did,
+        LOCAL_DS_DID,
+        &harness.sequencer_ds_did,
+        1,
+        &msg_digest,
+    );
+    let locator_json = make_entry_locator_json(msg_entry_id, 2, &entry_sha256, &outer_fp);
+
+    let deliver_msg_body = json!({
+        "header": header_json,
+        "entryLocator": locator_json,
+        "recipientDid": recipient.did,
+        "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes) },
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
+    });
+
+    let jwt = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_MESSAGE_NSID,
+    );
+
+    // 1. Begin a concurrent transaction that locks the recipient's active leaf FOR UPDATE
+    //    and deactivates it (simulating concurrent leaf revocation).
+    let mut tx_revoke = harness.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.devices \
+         SET status = 'revoked', revoked_at = NOW() \
+         WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .execute(&mut *tx_revoke)
+    .await
+    .unwrap();
+    tx_revoke.commit().await.unwrap();
+    // 2. Deliver message must fail closed because recipient has no active member leaf
+    let (status, body, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+            Some(&jwt),
+            &deliver_msg_body,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "deliverMessage to revoked/deactivated leaf must fail with 403: {body:?}"
+    );
+    assert_eq!(body["error"], "UnauthorizedRecipient");
+}
+
+#[tokio::test]
+async fn test_deliver_welcome_router_concurrency_revocation_fails_closed() {
+    let harness = TestHarness::new("welcome-revoc").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x11u8; 32];
+    let creator = TestActor::generate();
+    creator.seed(&harness.pool, now).await;
+
+    let mut recipient = TestActor::generate();
+    recipient.did = creator.did.clone();
+    recipient.seed(&harness.pool, now).await;
+
+    let (creation_transition_id, _creation_entry_id, _, _, _, _) = seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        1,
+        &creator,
+        None,
+        now,
+    )
+    .await;
+
+    let fulfillment_transition_id = Uuid::new_v4();
+    let fulfillment_entry_id = fulfillment_transition_id;
+    let welcome_id = Uuid::new_v4();
+    let recovery_request_id = Uuid::new_v4();
+    let welcome_bytes = corpus_file("welcome.mls");
+    let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
+    let manifest_bytes = corpus_file("manifest.json");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
+    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let public_snapshot_bytes = vec![0x88u8; 16];
+    let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
+    let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
+    let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
+    let enc_key = vec![0x64u8; 1216];
+    let (tree_summary_bytes, tree_summary_sha256) = make_tree_summary_bytes(
+        &[0x63u8; 32],
+        &[
+            (0, &creator_credential, &creator.public_key, &enc_key),
+            (1, &recipient_credential, &recipient.public_key, &enc_key),
+        ],
+    );
+
+    let (_, signed_req_bytes) = make_leaf_recovery_fulfillment_body(
+        convo_id,
+        fulfillment_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &creator,
+        &group_id,
+        now,
+    );
+    let mutation =
+        decode_and_verify_signed_mutation(&signed_req_bytes, creator.public_key.as_slice())
+            .unwrap();
+    let received_at = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").unwrap();
+    let server_fields =
+        CanonicalControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let built = build_verified_control_entry(
+        mutation,
+        &endpoint,
+        CanonicalUuidV4::parse(&fulfillment_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at,
+        server_fields,
+    )
+    .unwrap();
+    let products = CanonicalControlEntryProducts::mint(&built).unwrap();
+    let entry_bytes = products.durable_json().to_vec();
+    let entry_sha256: [u8; 32] = Sha256::digest(&entry_bytes).into();
+    let outer_fp = *built.outer_control_fingerprint();
+
+    let mut tx = harness.pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // Seed key package
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_packages (
+            key_package_ref, wrapper_bytes, wrapper_sha256, init_key,
+            owner_did, owner_device_id, owner_key_id, owner_auth_generation,
+            not_before, not_after, status, terminal_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, repeat('w', 32)::bytea, digest(repeat('w', 32)::bytea, 'sha256'), repeat('k', 32)::bytea,
+            $2, $3, $4, 1,
+            $5 - INTERVAL '5 minutes', $5 + INTERVAL '1 hour', 'consumed', $6, $5, $5
+        )
+        "#,
+    )
+    .bind(&key_package_ref[..])
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed leaf recovery request
+    sqlx::query(
+        r#"
+        INSERT INTO chat.leaf_recovery_requests (
+            recovery_request_id, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation,
+            recovery_kind, source, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, reservation_request_id,
+            status, fulfilling_transition_id, terminal_at,
+            signed_request_bytes, signing_transcript_bytes, request_digest, signature,
+            requested_at, expires_at
+        ) VALUES (
+            $1, $2, 0, $3,
+            $4, $5, 1,
+            'add', 'acceptConversation', 0, $6, 0,
+            $7, $7, $1,
+            'fulfilled', $8, $9,
+            repeat('r', 32)::bytea, repeat('t', 32)::bytea, digest(repeat('t', 32)::bytea, 'sha256'), repeat('s', 64)::bytea,
+            $9, $9 + INTERVAL '5 minutes'
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed key package reservation
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_package_reservations (
+            recovery_request_id, key_package_ref, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation, recipient_did,
+            recipient_device_id, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, purpose, expires_at, status,
+            consumed_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, $2, $3, 0, $4,
+            $5, $6, 1, $4,
+            $5, 0, $7, 0,
+            $8, $8, 'leafRecovery', $9 + INTERVAL '5 minutes', 'consumed',
+            $10, $9, $9
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed generation_states for state_version 1
+    sqlx::query(
+        r#"
+        INSERT INTO chat.generation_states (
+            conversation_id, generation, state_version, group_id, epoch,
+            group_context_hash, confirmation_tag, lifecycle, state_kind,
+            producing_transition_id, public_snapshot_bytes, snapshot_sha256,
+            tree_summary_bytes, tree_summary_sha256, leaf_count, created_at
+        ) VALUES (
+            $1, 0, 1, $2, 1,
+            $5, $5, 'active', 'commit',
+            $3, $6, $7,
+            $8, $9, 2, $4
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .bind(&[0x32u8; 32])
+    .bind(&public_snapshot_bytes)
+    .bind(&public_snapshot_sha256[..])
+    .bind(&tree_summary_bytes)
+    .bind(&tree_summary_sha256[..])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let metadata_snapshot_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.metadata_snapshots (
+            metadata_snapshot_id, conversation_id, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            producing_transition_id, origin_transition_id, metadata_version,
+            nonce, ciphertext, ciphertext_sha256, ciphertext_size,
+            author_did, author_device_id, author_key_id, author_public_key,
+            author_auth_generation, author_origin_seq, author_role, author_device_status, created_at
+        ) VALUES (
+            $1, $2, 0, 1,
+            $3, 1, $4, $4,
+            $5, $6, 1,
+            $12, repeat('c', 16)::bytea, digest(repeat('c', 16)::bytea, 'sha256'), 16,
+            $7, $8, $9, $10,
+            1, 1, 'admin', 'active', $11
+        )
+        "#,
+    )
+    .bind(metadata_snapshot_id)
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(creation_transition_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&creator.public_key[..])
+    .bind(now)
+    .bind(&[0xE1_u8; 12])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.transitions (
+            transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, actor_role, actor_device_status, signed_request_bytes,
+            unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature,
+            prior_generation, prior_state_version, next_generation, next_state_version, metadata_snapshot_id, entry_seq, accepted_at
+        ) VALUES (
+            $1, $2, 'leafRecovery', $3, $4, $5,
+            1, 'admin', 'active', $6,
+            $7, $8, $9, $10,
+            0, 0, 0, 1, $11, 2, $12
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&signed_req_bytes)
+    .bind(built.mutation().canonical_projection())
+    .bind(built.mutation().transcript_bytes())
+    .bind(built.mutation().request_digest().as_slice())
+    .bind(built.mutation().signature().as_slice())
+    .bind(metadata_snapshot_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed entries
+    // Seed entries
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256,
+            signed_request_bytes, request_digest, signature,
+            server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, state_version, transition_id, received_at
+        ) VALUES (
+            $1, 2, $2, 'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+            $3, $4,
+            $5, $6, $7,
+            repeat('0', 1)::bytea, $8,
+            $9, $10, $11, 1,
+            0, 1, $12, $13
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(fulfillment_entry_id)
+    .bind(&entry_bytes)
+    .bind(&entry_sha256[..])
+    .bind(&signed_req_bytes)
+    .bind(built.mutation().request_digest().as_slice())
+    .bind(built.mutation().signature().as_slice())
+    .bind(&outer_fp[..])
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Update conversation & generation current_state_version = 1, next_entry_seq = 3
+    sqlx::query("UPDATE chat.conversations SET current_state_version = 1, next_entry_seq = 3 WHERE conversation_id = $1")
+        .bind(convo_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE chat.generations SET current_state_version = 1 WHERE conversation_id = $1")
+        .bind(convo_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    let recipient_leaf_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.member_devices (
+            leaf_period_id, participant_period_id, conversation_id, generation,
+            user_did, device_id, leaf_index, basic_credential, leaf_signature_key,
+            leaf_key_id, leaf_auth_generation, origin,
+            join_key_package_ref, joined_state_version, joined_transition_id,
+            joined_seq, active, created_at
+        ) VALUES (
+            $1, (SELECT participant_period_id FROM chat.participants WHERE conversation_id = $2 AND user_did = $3),
+            $2, 0, $3, $4, 1, $5,
+            $6, $7, 1, 'keyPackage',
+            $8, 1, $9, 2, TRUE, $10
+        )
+        "#,
+    )
+    .bind(recipient_leaf_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient_credential)
+    .bind(&recipient.public_key[..])
+    .bind(&recipient.key_id)
+    .bind(&key_package_ref[..])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_intervals (
+            membership_interval_id, conversation_id, generation, recipient_did, recipient_device_id,
+            start_seq, opening_kind, opening_transition_id, opening_outer_entry_fingerprint,
+            opening_state_version, opening_group_id, opening_epoch, opening_group_context_hash,
+            opening_confirmation_tag, opening_leaf_period_id, created_at
+        ) VALUES (
+            $1, $2, 0, $3, $4,
+            2, 'add', $5, $6,
+            1, $7, 1, $8,
+            $8, $9, $10
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(fulfillment_transition_id)
+    .bind(&outer_fp[..])
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(recipient_leaf_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed welcome bundle
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_bundles (
+            welcome_id, conversation_id, transition_id, entry_seq, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            wrapper_bytes, wrapper_sha256, created_at
+        ) VALUES (
+            $1, $2, $3, 2, 0, 1,
+            $4, 1, $7, $7,
+            $5, $6, $8
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(convo_id)
+    .bind(fulfillment_transition_id)
+    .bind(&group_id)
+    .bind(&welcome_bytes)
+    .bind(&welcome_sha256[..])
+    .bind(&[0x32u8; 32])
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // 11. Seed welcome delivery
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_deliveries (
+            welcome_id, recipient_did, recipient_device_id, recovery_request_id,
+            key_package_ref, expires_at, status
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6 + INTERVAL '1 hour', 'pending'
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let delivery_id = Uuid::new_v4();
+    let mut header_model = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id: convo_id,
+        sender_ds_did: harness.sequencer_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: harness.sequencer_ds_did.clone(),
+        sequencer_term: 1,
+        payload_sha256: [0u8; 32],
+    };
+    let locator_model = ValidatedEntryLocator {
+        entry_id: fulfillment_entry_id,
+        seq: 2,
+        accepted_payload_sha256: entry_sha256,
+        outer_entry_fingerprint: outer_fp,
+    };
+    let coordinates_dto = ConversationCoordinates {
+        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        generation: 0,
+        state_version: 1,
+        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        epoch: 1,
+        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        extra_data: None,
+    };
+
+    let welcome_digest = compute_welcome_envelope_digest(
+        &header_model,
+        &recipient.did,
+        recipient.device_id,
+        welcome_id,
+        recovery_request_id,
+        &key_package_ref,
+        &welcome_bytes,
+        &welcome_sha256,
+        &entry_bytes,
+        &signed_req_bytes,
+        &locator_model,
+        &coordinates_dto,
+        &public_snapshot_sha256,
+        &tree_summary_sha256,
+    )
+    .unwrap();
+    header_model.payload_sha256 = welcome_digest;
+
+    let header_json = make_envelope_header_json(
+        delivery_id,
+        convo_id,
+        &harness.sequencer_ds_did,
+        LOCAL_DS_DID,
+        &harness.sequencer_ds_did,
+        1,
+        &welcome_digest,
+    );
+    let locator_json = make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256, &outer_fp);
+
+    let deliver_welcome_body = json!({
+        "header": header_json,
+        "recipientDid": recipient.did,
+        "recipientDeviceId": recipient.device_id.to_string(),
+        "recoveryRequestId": recovery_request_id.to_string(),
+        "welcomeId": welcome_id.to_string(),
+        "welcomeBytes": { "$bytes": STANDARD.encode(&welcome_bytes) },
+        "welcomeSha256": { "$bytes": STANDARD.encode(&welcome_sha256) },
+        "keyPackageRef": { "$bytes": STANDARD.encode(&key_package_ref) },
+        "coordinates": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": 1,
+            "epoch": 1,
+            "groupId": { "$bytes": STANDARD.encode(&group_id) },
+            "groupContextHash": { "$bytes": STANDARD.encode(&[0x32u8; 32]) },
+            "confirmationTag": { "$bytes": STANDARD.encode(&[0x32u8; 32]) },
+            "lifecycle": "active",
+        },
+        "publicSnapshotSha256": { "$bytes": STANDARD.encode(&public_snapshot_sha256) },
+        "treeSummarySha256": { "$bytes": STANDARD.encode(&tree_summary_sha256) },
+        "entryLocator": locator_json,
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
+        "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes) },
+    });
+
+    let jwt = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+
+    let mut tx_revoke = harness.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.devices \
+         SET status = 'revoked', revoked_at = NOW() \
+         WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .execute(&mut *tx_revoke)
+    .await
+    .unwrap();
+    tx_revoke.commit().await.unwrap();
+    // Welcome delivery must fail closed with 400 MailboxNotProvisioned because leaf is not active
+    let (status, body, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt),
+            &deliver_welcome_body,
+        )
+        .await;
+    println!("deliver_welcome response: status={status}, body={body:?}");
+    assert!(
+        status.is_client_error(),
+        "deliverWelcome with revoked leaf must fail with client error: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
+    let harness = TestHarness::new("welcome-stale").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x11u8; 32];
+    let creator = TestActor::generate();
+    creator.seed(&harness.pool, now).await;
+
+    let mut recipient = TestActor::generate();
+    recipient.did = creator.did.clone();
+    recipient.seed(&harness.pool, now).await;
+
+    let (creation_transition_id, _creation_entry_id, _, _, _, _) = seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        1,
+        &creator,
+        None,
+        now,
+    )
+    .await;
+
+    let fulfillment_transition_id = Uuid::new_v4();
+    let fulfillment_entry_id = fulfillment_transition_id;
+    let welcome_id = Uuid::new_v4();
+    let recovery_request_id = Uuid::new_v4();
+    let welcome_bytes = corpus_file("welcome.mls");
+    let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
+    let manifest_bytes = corpus_file("manifest.json");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
+    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let public_snapshot_bytes = vec![0x88u8; 16];
+    let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
+    let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
+    let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
+    let enc_key = vec![0x64u8; 1216];
+    let (tree_summary_bytes, tree_summary_sha256) = make_tree_summary_bytes(
+        &[0x63u8; 32],
+        &[
+            (0, &creator_credential, &creator.public_key, &enc_key),
+            (1, &recipient_credential, &recipient.public_key, &enc_key),
+        ],
+    );
+
+    let (_, signed_req_bytes) = make_leaf_recovery_fulfillment_body(
+        convo_id,
+        fulfillment_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &creator,
+        &group_id,
+        now,
+    );
+    let mutation =
+        decode_and_verify_signed_mutation(&signed_req_bytes, creator.public_key.as_slice())
+            .unwrap();
+    let received_at = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").unwrap();
+    let server_fields =
+        CanonicalControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let built = build_verified_control_entry(
+        mutation,
+        &endpoint,
+        CanonicalUuidV4::parse(&fulfillment_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at,
+        server_fields,
+    )
+    .unwrap();
+    let products = CanonicalControlEntryProducts::mint(&built).unwrap();
+    let entry_bytes = products.durable_json().to_vec();
+    let entry_sha256: [u8; 32] = Sha256::digest(&entry_bytes).into();
+    let outer_fp = *built.outer_control_fingerprint();
+
+    let mut tx = harness.pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+    // Seed key package
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_packages (
+            key_package_ref, wrapper_bytes, wrapper_sha256, init_key,
+            owner_did, owner_device_id, owner_key_id, owner_auth_generation,
+            not_before, not_after, status, terminal_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, repeat('w', 32)::bytea, digest(repeat('w', 32)::bytea, 'sha256'), repeat('k', 32)::bytea,
+            $2, $3, $4, 1,
+            $5 - INTERVAL '5 minutes', $5 + INTERVAL '1 hour', 'consumed', $6, $5, $5
+        )
+        "#,
+    )
+    .bind(&key_package_ref[..])
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // 3. Seed leaf recovery request (fulfilled)
+    sqlx::query(
+        r#"
+        INSERT INTO chat.leaf_recovery_requests (
+            recovery_request_id, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation,
+            recovery_kind, source, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, reservation_request_id,
+            status, fulfilling_transition_id, terminal_at,
+            signed_request_bytes, signing_transcript_bytes, request_digest, signature,
+            requested_at, expires_at
+        ) VALUES (
+            $1, $2, 0, $3,
+            $4, $5, 1,
+            'add', 'acceptConversation', 0, $6, 0,
+            $7, $7, $1,
+            'fulfilled', $8, $9,
+            repeat('r', 32)::bytea, repeat('t', 32)::bytea, digest(repeat('t', 32)::bytea, 'sha256'), repeat('s', 64)::bytea,
+            $9, $9 + INTERVAL '5 minutes'
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // 4. Seed key package reservation (consumed)
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_package_reservations (
+            recovery_request_id, key_package_ref, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation, recipient_did,
+            recipient_device_id, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, purpose, expires_at, status,
+            consumed_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, $2, $3, 0, $4,
+            $5, $6, 1, $4,
+            $5, 0, $7, 0,
+            $8, $8, 'leafRecovery', $9 + INTERVAL '5 minutes', 'consumed',
+            $10, $9, $9
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let metadata_snapshot_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.metadata_snapshots (
+            metadata_snapshot_id, conversation_id, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            producing_transition_id, origin_transition_id, metadata_version,
+            nonce, ciphertext, ciphertext_sha256, ciphertext_size,
+            author_did, author_device_id, author_key_id, author_public_key,
+            author_auth_generation, author_origin_seq, author_role, author_device_status, created_at
+        ) VALUES (
+            $1, $2, 0, 1,
+            $3, 1, $4, $4,
+            $5, $6, 1,
+            $12, repeat('c', 16)::bytea, digest(repeat('c', 16)::bytea, 'sha256'), 16,
+            $7, $8, $9, $10,
+            1, 1, 'admin', 'active', $11
+        )
+        "#,
+    )
+    .bind(metadata_snapshot_id)
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(creation_transition_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&creator.public_key[..])
+    .bind(now)
+    .bind(&[0xE1_u8; 12])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed transition
+    sqlx::query(
+        r#"
+        INSERT INTO chat.transitions (
+            transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, actor_role, actor_device_status, signed_request_bytes,
+            unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature,
+            prior_generation, prior_state_version, next_generation, next_state_version, metadata_snapshot_id, entry_seq, accepted_at
+        ) VALUES (
+            $1, $2, 'leafRecovery', $3, $4, $5,
+            1, 'admin', 'active', $6,
+            $7, $8, $9, $10,
+            0, 0, 0, 1, $11, 2, $12
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&signed_req_bytes)
+    .bind(built.mutation().canonical_projection())
+    .bind(built.mutation().transcript_bytes())
+    .bind(built.mutation().request_digest().as_slice())
+    .bind(built.mutation().signature().as_slice())
+    .bind(metadata_snapshot_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed entry
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256,
+            signed_request_bytes, request_digest, signature,
+            server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, state_version, transition_id, received_at
+        ) VALUES (
+            $1, 2, $2, 'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+            $3, $4,
+            $5, $6, $7,
+            repeat('0', 1)::bytea, $8,
+            $9, $10, $11, 1,
+            0, 1, $12, $13
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(fulfillment_entry_id)
+    .bind(&entry_bytes)
+    .bind(&entry_sha256[..])
+    .bind(&signed_req_bytes)
+    .bind(built.mutation().request_digest().as_slice())
+    .bind(built.mutation().signature().as_slice())
+    .bind(&outer_fp[..])
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.conversations
+           SET current_state_version = 1,
+               next_entry_seq = 3
+         WHERE conversation_id = $1
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.generations
+           SET current_state_version = 1
+         WHERE conversation_id = $1 AND generation = 0
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // 8. Seed generation_states for state_version 1
+    sqlx::query(
+        r#"
+        INSERT INTO chat.generation_states (
+            conversation_id, generation, state_version, group_id, epoch,
+            group_context_hash, confirmation_tag, lifecycle, state_kind,
+            producing_transition_id, public_snapshot_bytes, snapshot_sha256,
+            tree_summary_bytes, tree_summary_sha256, leaf_count, created_at
+        ) VALUES (
+            $1, 0, 1, $2, 1,
+            $5, $5, 'active', 'commit',
+            $3, $6, $7,
+            $8, $9, 2, $4
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .bind(&[0x32u8; 32])
+    .bind(&public_snapshot_bytes)
+    .bind(&public_snapshot_sha256[..])
+    .bind(&tree_summary_bytes)
+    .bind(&tree_summary_sha256[..])
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed welcome bundle and delivery
+    let recipient_leaf_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.member_devices (
+            leaf_period_id, participant_period_id, conversation_id, generation,
+            user_did, device_id, leaf_index, basic_credential,
+            leaf_signature_key, leaf_key_id, leaf_auth_generation, origin,
+            join_key_package_ref, joined_state_version, joined_transition_id, joined_seq, active, created_at
+        ) VALUES (
+            $1, (SELECT participant_period_id FROM chat.participants WHERE conversation_id = $2 AND user_did = $3 AND current_membership), $2, 0,
+            $3, $4, 1, $5,
+            $6, $7, 1, 'keyPackage',
+            $8, 1, $9, 2, TRUE, $10
+        )
+        "#,
+    )
+    .bind(recipient_leaf_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient_credential)
+    .bind(&recipient.public_key[..])
+    .bind(&recipient.key_id)
+    .bind(&key_package_ref[..])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_intervals (
+            membership_interval_id, conversation_id, generation, recipient_did, recipient_device_id,
+            start_seq, opening_kind, opening_transition_id, opening_outer_entry_fingerprint,
+            opening_state_version, opening_group_id, opening_epoch, opening_group_context_hash,
+            opening_confirmation_tag, opening_leaf_period_id, created_at
+        ) VALUES (
+            $1, $2, 0, $3, $4,
+            2, 'add', $5, $6,
+            1, $7, 1, $8,
+            $8, $9, $10
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(fulfillment_transition_id)
+    .bind(&outer_fp[..])
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(recipient_leaf_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed welcome bundle
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_bundles (
+            welcome_id, conversation_id, transition_id, entry_seq, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            wrapper_bytes, wrapper_sha256, created_at
+        ) VALUES (
+            $1, $2, $3, 2, 0, 1,
+            $4, 1, $7, $7,
+            $5, $6, $8
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(convo_id)
+    .bind(fulfillment_transition_id)
+    .bind(&group_id)
+    .bind(&welcome_bytes)
+    .bind(&welcome_sha256[..])
+    .bind(&[0x32u8; 32])
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    // Seed welcome delivery
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_deliveries (
+            welcome_id, recipient_did, recipient_device_id, recovery_request_id,
+            key_package_ref, expires_at, status
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6 + INTERVAL '1 hour', 'pending'
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let welcome_digest = compute_welcome_envelope_digest(
+        &ValidatedEnvelopeHeader {
+            protocol_version: "1".to_string(),
+            delivery_id: Uuid::new_v4(),
+            conversation_id: convo_id,
+            sender_ds_did: harness.sequencer_ds_did.clone(),
+            receiver_ds_did: LOCAL_DS_DID.to_string(),
+            sequencer_did: harness.sequencer_ds_did.clone(),
+            sequencer_term: 1,
+            payload_sha256: [0u8; 32],
+        },
+        &recipient.did,
+        recipient.device_id,
+        welcome_id,
+        recovery_request_id,
+        &key_package_ref,
+        &welcome_bytes,
+        &welcome_sha256,
+        &entry_bytes,
+        &signed_req_bytes,
+        &ValidatedEntryLocator {
+            entry_id: fulfillment_entry_id,
+            seq: 2,
+            accepted_payload_sha256: entry_sha256,
+            outer_entry_fingerprint: outer_fp,
+        },
+        &ConversationCoordinates {
+            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
+                convo_id.hyphenated().to_string(),
+            ),
+            generation: 0,
+            state_version: 1,
+            epoch: 1,
+            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+            lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+            extra_data: None,
+        },
+        &public_snapshot_sha256,
+        &tree_summary_sha256,
+    )
+    .unwrap();
+
+    let delivery_id = Uuid::new_v4();
+    let header_json = make_envelope_header_json(
+        delivery_id,
+        convo_id,
+        &harness.sequencer_ds_did,
+        LOCAL_DS_DID,
+        &harness.sequencer_ds_did,
+        1,
+        &welcome_digest,
+    );
+    let locator_json = make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256, &outer_fp);
+
+    let deliver_welcome_body = json!({
+        "header": header_json,
+        "recipientDid": recipient.did,
+        "recipientDeviceId": recipient.device_id.to_string(),
+        "recoveryRequestId": recovery_request_id.to_string(),
+        "welcomeId": welcome_id.to_string(),
+        "welcomeBytes": { "$bytes": STANDARD.encode(&welcome_bytes) },
+        "welcomeSha256": { "$bytes": STANDARD.encode(&welcome_sha256) },
+        "keyPackageRef": { "$bytes": STANDARD.encode(&key_package_ref) },
+        "coordinates": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": 1,
+            "epoch": 1,
+            "groupId": { "$bytes": STANDARD.encode(&group_id) },
+            "groupContextHash": { "$bytes": STANDARD.encode(&[0x32u8; 32]) },
+            "confirmationTag": { "$bytes": STANDARD.encode(&[0x32u8; 32]) },
+            "lifecycle": "active",
+        },
+        "publicSnapshotSha256": { "$bytes": STANDARD.encode(&public_snapshot_sha256) },
+        "treeSummarySha256": { "$bytes": STANDARD.encode(&tree_summary_sha256) },
+        "entryLocator": locator_json,
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
+        "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes) },
+    });
+
+    let jwt = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+
+    // 1. Delivering welcome with stale / mismatched recoveryRequestId must fail with client error (400)
+    let mut stale_recovery_body = deliver_welcome_body.clone();
+    stale_recovery_body["recoveryRequestId"] = json!(Uuid::new_v4().to_string());
+    let (status_stale, body_stale, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt),
+            &stale_recovery_body,
+        )
+        .await;
+    assert!(
+        status_stale.is_client_error(),
+        "deliverWelcome with stale recoveryRequestId must fail: status={status_stale}, body={body_stale:?}"
+    );
+
+    // 2. Delivering welcome with stale / mismatched keyPackageRef must fail with client error (400)
+    let mut stale_kp_body = deliver_welcome_body.clone();
+    stale_kp_body["keyPackageRef"] = json!({ "$bytes": STANDARD.encode([0xEEu8; 32]) });
+    let (status_kp, body_kp, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt),
+            &stale_kp_body,
+        )
+        .await;
+    assert!(
+        status_kp.is_client_error(),
+        "deliverWelcome with mismatched keyPackageRef must fail: status={status_kp}, body={body_kp:?}"
+    );
+
+    // 3. Concurrently revoking the device before deliverWelcome arrives must fail with client error
+    let mut tx_revoke = harness.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE chat.devices \
+         SET status = 'revoked', revoked_at = NOW() \
+         WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .execute(&mut *tx_revoke)
+    .await
+    .unwrap();
+    tx_revoke.commit().await.unwrap();
+
+    let (status_revoked, body_revoked, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt),
+            &deliver_welcome_body,
+        )
+        .await;
+    assert!(
+        status_revoked.is_client_error(),
+        "deliverWelcome for revoked device must fail: status={status_revoked}, body={body_revoked:?}"
     );
 }

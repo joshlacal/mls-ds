@@ -59,11 +59,9 @@ pub async fn deliver_welcome(
         });
     }
 
-    let recipient_device_id_canonical =
-        CanonicalUuidV4::parse(msg.recipient_device_id.as_str()).map_err(|e| {
-            FederationError::InvalidEnvelope {
-                reason: format!("invalid recipientDeviceId: {e}"),
-            }
+    let recipient_device_id_canonical = CanonicalUuidV4::parse(msg.recipient_device_id.as_str())
+        .map_err(|e| FederationError::InvalidEnvelope {
+            reason: format!("invalid recipientDeviceId: {e}"),
         })?;
     let recipient_device_id =
         Uuid::from_str(recipient_device_id_canonical.as_str()).map_err(|_| {
@@ -72,23 +70,20 @@ pub async fn deliver_welcome(
             }
         })?;
 
-    let welcome_id_canonical =
-        CanonicalUuidV4::parse(msg.welcome_id.as_str()).map_err(|e| {
-            FederationError::InvalidEnvelope {
-                reason: format!("invalid welcomeId: {e}"),
-            }
-        })?;
+    let welcome_id_canonical = CanonicalUuidV4::parse(msg.welcome_id.as_str()).map_err(|e| {
+        FederationError::InvalidEnvelope {
+            reason: format!("invalid welcomeId: {e}"),
+        }
+    })?;
     let welcome_id = Uuid::from_str(welcome_id_canonical.as_str()).map_err(|_| {
         FederationError::InvalidEnvelope {
             reason: "invalid welcomeId UUID".to_string(),
         }
     })?;
 
-    let recovery_request_id_canonical =
-        CanonicalUuidV4::parse(msg.recovery_request_id.as_str()).map_err(|e| {
-            FederationError::InvalidEnvelope {
-                reason: format!("invalid recoveryRequestId: {e}"),
-            }
+    let recovery_request_id_canonical = CanonicalUuidV4::parse(msg.recovery_request_id.as_str())
+        .map_err(|e| FederationError::InvalidEnvelope {
+            reason: format!("invalid recoveryRequestId: {e}"),
         })?;
     let recovery_request_id =
         Uuid::from_str(recovery_request_id_canonical.as_str()).map_err(|_| {

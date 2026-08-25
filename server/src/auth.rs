@@ -2493,17 +2493,17 @@ mod federation_fixture_tests {
 
         // Verify resolution from cache
         let doc1 = AUTH_MIDDLEWARE
-            .resolve_did("did:web:ds1.local")
+            .resolve_did("did:web:ds1.catbird.blue")
             .await
             .expect("resolve ds1 did from cache");
-        assert_eq!(doc1.id, "did:web:ds1.local");
+        assert_eq!(doc1.id, "did:web:ds1.catbird.blue");
         let key1 = extract_p256_key(&doc1).expect("extract p256 key for ds1");
 
         let doc2 = AUTH_MIDDLEWARE
-            .resolve_did("did:web:ds2.local")
+            .resolve_did("did:web:ds2.catbird.blue")
             .await
             .expect("resolve ds2 did from cache");
-        assert_eq!(doc2.id, "did:web:ds2.local");
+        assert_eq!(doc2.id, "did:web:ds2.catbird.blue");
         let key2 = extract_p256_key(&doc2).expect("extract p256 key for ds2");
 
         // Verify matching private keys
@@ -2517,23 +2517,23 @@ mod federation_fixture_tests {
 
         // Test signing a request with DS1 key and verifying with AUTH_MIDDLEWARE
         let auth_client = crate::federation::ServiceAuthClient::from_es256_pem(
-            "did:web:ds1.local".to_string(),
+            "did:web:ds1.catbird.blue".to_string(),
             pem1.as_bytes(),
             Some("#atproto".to_string()),
         )
         .expect("create service auth client for ds1");
 
         let token = auth_client
-            .sign_request("did:web:ds2.local", "blue.catbird.mlsDS.healthCheck")
+            .sign_request("did:web:ds2.catbird.blue", "blue.catbird.mlsDS.healthCheck")
             .expect("sign request");
 
         // Verify the token using auth middleware
         let claims = AUTH_MIDDLEWARE
-            .verify_jwt_for_audience(&token, Some("did:web:ds2.local"))
+            .verify_jwt_for_audience(&token, Some("did:web:ds2.catbird.blue"))
             .await
             .expect("verify DS1 service JWT using cached DID doc");
-        assert_eq!(claims.iss, "did:web:ds1.local");
-        assert_eq!(claims.aud, "did:web:ds2.local");
+        assert_eq!(claims.iss, "did:web:ds1.catbird.blue");
+        assert_eq!(claims.aud, "did:web:ds2.catbird.blue");
         assert_eq!(
             claims.lxm.as_deref(),
             Some("blue.catbird.mlsDS.healthCheck")
@@ -2566,7 +2566,7 @@ mod federation_fixture_tests {
         let ds1_key_path = fixture_dir.join("ds1-key.pem");
 
         std::env::set_var("APP_ENV", "test");
-        std::env::set_var("SERVICE_DID", "did:web:ds1.local");
+        std::env::set_var("SERVICE_DID", "did:web:ds1.catbird.blue");
         std::env::set_var("FEDERATION_ENABLED", "true");
         std::env::set_var("FEDERATION_MODE", "allowlist");
         std::env::set_var("SIGNING_KEY_FILE", ds1_key_path.to_str().unwrap());
@@ -2574,7 +2574,7 @@ mod federation_fixture_tests {
 
         let fed_config = crate::federation::FederationConfig::from_env();
         assert!(fed_config.enabled);
-        assert_eq!(fed_config.self_did, "did:web:ds1.local");
+        assert_eq!(fed_config.self_did, "did:web:ds1.catbird.blue");
         assert!(fed_config.signing_key_pem.is_some());
 
         let caps = crate::federation::local_federation_capabilities();
@@ -2586,7 +2586,7 @@ mod federation_fixture_tests {
             .await
             .expect("health check ok");
         let value = res.0;
-        assert_eq!(value["did"], "did:web:ds1.local");
+        assert_eq!(value["did"], "did:web:ds1.catbird.blue");
         assert_eq!(value["version"], "1.0.0");
         let res_caps: Vec<String> = serde_json::from_value(value["federationCapabilities"].clone())
             .expect("parse caps array");
@@ -2603,7 +2603,7 @@ mod federation_fixture_tests {
     #[should_panic(expected = "could not be read")]
     async fn test_unreadable_signing_key_file_panics_in_every_environment() {
         let _guard = TEST_ENV_LOCK.lock().await;
-        std::env::set_var("SERVICE_DID", "did:web:ds1.local");
+        std::env::set_var("SERVICE_DID", "did:web:ds1.catbird.blue");
         std::env::set_var("SIGNING_KEY_FILE", "/nonexistent/path/to/signing_key.pem");
         let res = crate::federation::FederationConfig::from_env();
         std::env::remove_var("SIGNING_KEY_FILE");

@@ -1,20 +1,14 @@
 //! Integration and unit test suite for clean federation envelopes, digests, and receipts.
 
-use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
-use catbird_atproto::generated::blue_catbird::mlsDS::{
-    EntryLocatorV1, EnvelopeHeaderV1, FederationReceiptV1,
-};
-use chrono::{SecondsFormat, Utc};
+use catbird_atproto::generated::blue_catbird::mlsDS::{EntryLocatorV1, EnvelopeHeaderV1};
+use chrono::Utc;
 use p256::ecdsa::SigningKey;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use catbird_server::federation::ack::AckSigner;
 use catbird_server::federation::envelope::{
-    canonical_receipt_bytes, compute_commit_envelope_digest, compute_message_envelope_digest,
-    compute_welcome_envelope_digest, sign_receipt, validate_entry_locator,
-    validate_envelope_header, verify_receipt, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID,
-    SUBMIT_COMMIT_NSID,
+    compute_commit_envelope_digest, compute_message_envelope_digest, sign_receipt,
+    validate_entry_locator, validate_envelope_header, verify_receipt, DELIVER_MESSAGE_NSID,
 };
 use catbird_server::federation::errors::FederationError;
 
@@ -210,7 +204,7 @@ fn test_receipt_signing_and_verification() {
         1,
         envelope_sha256,
         result_sha256,
-        Some(locator),
+        locator,
         now,
     )
     .expect("sign receipt");

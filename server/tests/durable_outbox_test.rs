@@ -594,6 +594,7 @@ async fn record_failure_pre_increment_backoff_curve() {
             &pool,
             "notification_outbox",
             &row_id,
+            None,
             expected_attempts,
             created_at,
             "synthetic-backoff-test",

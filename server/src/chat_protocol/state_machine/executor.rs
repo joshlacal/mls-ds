@@ -6628,6 +6628,113 @@ async fn apply_leaf_recovery_fulfillment(
         },
     )
     .await?;
+    let recipient_did_str = device_did(welcome.recipient())?;
+    let self_base = crate::identity::service_did_base();
+    let participant_row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT ds_did FROM chat.participants \
+         WHERE conversation_id = $1 AND user_did = $2 \
+           AND current_membership = TRUE AND status IN ('pending', 'active')",
+    )
+    .bind(conversation_id)
+    .bind(&recipient_did_str)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|e| ExecutorError::Delivery(DeliveryRepositoryError::Database(e)))?;
+
+    let ds_did_opt = match participant_row {
+        None => {
+            tracing::error!(
+                %conversation_id,
+                recipient_did = %recipient_did_str,
+                "welcome emission failed: recipient participant is absent from conversation"
+            );
+            return Err(ExecutorError::InconsistentPlan(
+                "recipient participant not found in conversation for welcome emission",
+            ));
+        }
+        Some(ds_did_opt) => ds_did_opt,
+    };
+
+    let is_local = match &ds_did_opt {
+        None => true,
+        Some(ds) => {
+            let canonical_ds = crate::identity::canonical_did(ds);
+            crate::identity::dids_equivalent(&canonical_ds, &self_base)
+        }
+    };
+
+    if is_local {
+        tracing::debug!(
+            %conversation_id,
+            recipient_did = %recipient_did_str,
+            "welcome emission: recipient is local participant (NULL or self ds_did), skipping remote federation enqueue"
+        );
+    } else {
+        let target_ds_did = ds_did_opt.unwrap();
+        let pub_snap_sha: [u8; 32] = ctx
+            .spine
+            .public_snapshot_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| ExecutorError::InconsistentPlan("invalid public snapshot sha256"))?;
+        let tree_sum_sha: [u8; 32] = ctx
+            .spine
+            .tree_summary_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| ExecutorError::InconsistentPlan("invalid tree summary sha256"))?;
+
+        let coordinates = catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates {
+            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
+                conversation_id.hyphenated().to_string(),
+            ),
+            generation,
+            state_version,
+            epoch,
+            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(coordinate.group_id()),
+            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                coordinate.group_context_hash(),
+            ),
+            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+                coordinate.confirmation_tag(),
+            ),
+            lifecycle: jacquard_common::deps::smol_str::SmolStr::from(
+                match coordinate.lifecycle() {
+                    crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active => {
+                        "active"
+                    }
+                    crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Superseded => {
+                        "superseded"
+                    }
+                },
+            ),
+            extra_data: None,
+        };
+
+        crate::chat_protocol::repository::federation::enqueue_federated_welcome_job(
+            transaction,
+            conversation_id,
+            &target_ds_did,
+            &recipient_did_str,
+            device_uuid(welcome.recipient()),
+            welcome_id,
+            recovery_request_id,
+            &reserved_ref,
+            welcome.opaque_welcome(),
+            welcome.sha256(),
+            &append,
+            u64::try_from(seq_i64).unwrap(),
+            coordinates,
+            &pub_snap_sha,
+            &tree_sum_sha,
+            ctx.sequencer_term as u64,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(?e, "failed to enqueue federated welcome job");
+            ExecutorError::InconsistentPlan("failed to enqueue federated welcome job")
+        })?;
+    }
 
     // 11. Audience + events.
     let recipients = build_entry_recipients(&ctx.entry_recipients)?;

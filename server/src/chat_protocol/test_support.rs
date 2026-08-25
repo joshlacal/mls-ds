@@ -6,7 +6,11 @@
 
 #[cfg(any(test, feature = "test-support"))]
 pub use super::relationship_policy::AdmissionOperation;
-
+#[cfg(any(test, feature = "test-support"))]
+pub mod repository {
+    pub use crate::chat_protocol::repository::delivery::AppendEntry;
+    pub use crate::chat_protocol::repository::federation::*;
+}
 #[cfg(any(test, feature = "test-support"))]
 pub async fn execute_creation_with_routing_test(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,

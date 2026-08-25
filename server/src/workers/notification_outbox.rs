@@ -119,6 +119,7 @@ pub async fn run_notification_outbox_worker(pool: PgPool) {
                         &pool,
                         TABLE_NAME,
                         &row.id,
+                        None,
                         row.attempts,
                         row.created_at,
                         &err_msg,

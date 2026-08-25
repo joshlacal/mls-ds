@@ -65,6 +65,9 @@ struct Head {
     kind: String,
     direct_did_low: Option<String>,
     direct_did_high: Option<String>,
+    is_remote: bool,
+    sequencer_ds: Option<String>,
+    sequencer_term: i64,
 }
 
 fn uuid(value: Option<CanonicalValueRef<'_>>) -> Result<Uuid, MessageDeliveryError> {
@@ -118,6 +121,7 @@ async fn lock_head(
 ) -> Result<Head, MessageDeliveryError> {
     let row = sqlx::query(
         "SELECT c.kind, c.direct_did_low, c.direct_did_high, c.next_entry_seq, c.current_generation, c.current_state_version, \
+                c.is_remote, c.sequencer_ds, c.sequencer_term, \
                 g.group_id, s.epoch, s.group_context_hash, s.confirmation_tag, c.lifecycle \
            FROM chat.conversations c \
            JOIN chat.generations g ON g.conversation_id=c.conversation_id AND g.generation=c.current_generation \
@@ -157,6 +161,9 @@ async fn lock_head(
         kind: row.try_get("kind")?,
         direct_did_low: row.try_get("direct_did_low")?,
         direct_did_high: row.try_get("direct_did_high")?,
+        is_remote: row.try_get("is_remote")?,
+        sequencer_ds: row.try_get("sequencer_ds")?,
+        sequencer_term: row.try_get("sequencer_term")?,
     })
 }
 
@@ -527,7 +534,7 @@ pub(crate) async fn send<T: PublicTransport>(
     let outcome = delivery::resolve_application_send(
         tx,
         &delivery::ApplicationSend {
-            entry: append,
+            entry: append.clone(),
             signing_transcript_bytes: entry.mutation().transcript_bytes().to_vec(),
             outcome_bytes: response_bytes.clone(),
         },
@@ -549,6 +556,21 @@ pub(crate) async fn send<T: PublicTransport>(
     };
     if seq != head.next_seq {
         return Err(MessageDeliveryError::Invariant);
+    }
+    if !head.is_remote {
+        let _ =
+            crate::chat_protocol::repository::federation::enqueue_clean_federation_message_jobs(
+                tx,
+                expected.conversation_id,
+                &append,
+                seq,
+                head.sequencer_term as u64,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(?e, "failed to enqueue clean federation message jobs");
+                MessageDeliveryError::Invariant
+            })?;
     }
     if let Some(attachment) = attachment {
         let descriptor_bytes = projection.application_message().canonical_dag_cbor();

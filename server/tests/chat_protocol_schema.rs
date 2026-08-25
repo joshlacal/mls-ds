@@ -29,19 +29,19 @@ use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::panic::AssertUnwindSafe;
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-static MIGRATION_VERSIONS: LazyLock<[i64; 22]> = LazyLock::new(|| {
+static MIGRATION_VERSIONS: LazyLock<[i64; 23]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
             .version
     })
 });
-static MIGRATION_FILES: LazyLock<[&'static str; 22]> = LazyLock::new(|| {
+static MIGRATION_FILES: LazyLock<[&'static str; 23]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index].filename
     })
 });
-static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 22]> = LazyLock::new(|| {
+static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 23]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
@@ -56,24 +56,15 @@ static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 22]> = LazyLock::new(|| {
 // post-20260729000001 migration chain. The sequence catalog remained
 // structurally unchanged.
 const COLUMN_CATALOG_SHA256: &str =
-    "5fb33ed1f5d5bfbe6f8bfc12ebf1917458ef38e392a5105b826e4c98a91808d6";
-// Promoted from the 2026-07-30 read-only smoke run (preimage
-// preimages/Q6-constraint-901.txt, 901 ordered lines), independently
-// recomputed from those lines before promotion. Its CHECK expressions render
-// 180 schema-qualified calls (chat.is_safe_integer, chat.is_bare_did) because
-// `chat` is absent from search_path; see the search_path note below.
+    "5ca78b4db4fe77899613930487ddfa2dbf71c250eca6780c4c255fe03d346b12";
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "c3c4145bc277c675cd155918f4dbc470ddecca39dfa7ea951e22ab766c559734";
+    "54cc3605853acd7be5e4679eb785ba17bf8844b622d5b4e6c298ffdbd4e00530";
 const INDEX_CATALOG_SHA256: &str =
-    "0cdb03b2c957221b394b5c2a98d9d4da11a025d14f9bc8cbca1d8eb4e995416f";
-// Promoted from the same smoke run (preimage preimages/Q8-function-104.txt,
-// 104 ordered lines), independently recomputed before promotion. Each line
-// embeds a SHA-256 of pg_get_functiondef output, so the server renders the
-// bytes this digest covers.
+    "69e3094a66adb4ca52d6a2bcd1427e98dca8eb80e1b267ee71a37b2fb2d9e160";
 const FUNCTION_CATALOG_SHA256: &str =
-    "5ab53f0f1be8b0b41299eda8203f3222e583e5df34b0cd030b651d6654741d65";
+    "04e3c4f157b281751d9bd9ed58b0a376e8bddd1f64b3861bc977eeff0e7716e1";
 const TRIGGER_CATALOG_SHA256: &str =
-    "32ad307d67708c60f6248258de54ab38423ae5a211b9bd3a6f8ff4f5686f3b49";
+    "f368418845b99186be3f9fb53b41eb10dc1e93b7bf2171b77198d13a8d78e9dc";
 const SEQUENCE_CATALOG_SHA256: &str =
     "0f5fdcab044481afeaca50ac88cff13edd4b583df914da2c798e4a4194464abe";
 // search_path dependency for CONSTRAINT_/FUNCTION_CATALOG_SHA256 above and
@@ -2339,6 +2330,7 @@ const BLOB_TABLES: [&str; 4] = [
 const OPERATION_CLAIM_TABLES: [&str; 1] = ["operation_claims"];
 const OPERATION_CLAIM_COMPLETENESS_TABLES: [&str; 1] = ["operation_claim_completeness_cutover"];
 const G7_INVENTORY_TABLES: [&str; 2] = ["event_cursor_receipts", "inventory_page_receipts"];
+const SERVICE_AUTH_TABLES: [&str; 1] = ["service_auth_admissions"];
 const FEDERATION_RECEIPT_TABLES: [&str; 1] = ["federation_delivery_receipts"];
 
 fn expected_tables() -> BTreeSet<String> {
@@ -2349,6 +2341,7 @@ fn expected_tables() -> BTreeSet<String> {
         .chain(OPERATION_CLAIM_TABLES.iter())
         .chain(OPERATION_CLAIM_COMPLETENESS_TABLES.iter())
         .chain(G7_INVENTORY_TABLES.iter())
+        .chain(SERVICE_AUTH_TABLES.iter())
         .chain(FEDERATION_RECEIPT_TABLES.iter())
         .map(|name| (*name).to_owned())
         .collect()
@@ -2374,14 +2367,14 @@ fn clean_chat_migration_inventory_orders_g7_entitlement_last() {
         MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
         "migration versions must remain strictly increasing"
     );
-    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000004));
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000005));
     assert_eq!(
         MIGRATION_FILES.last(),
-        Some(&"20260824000004_chat_federation_delivery_receipts.sql")
+        Some(&"20260824000005_chat_federation_outbox_retry.sql")
     );
     assert_eq!(
         MIGRATION_DESCRIPTIONS.last(),
-        Some(&"chat federation delivery receipts")
+        Some(&"chat federation outbox retry")
     );
     for file in MIGRATION_FILES.iter().copied() {
         assert!(
@@ -2604,26 +2597,28 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
             );
         }
     }
-    // Re-derived after the D-lane rebase and trigger-site conversion: the
-    // post-Stage-B tree has 226 setup calls. Four occurrences in this schema
+    // Re-derived after the Task-4 federation-route/delivery-receipt tests landed:
+    // the post-Task-4 tree has 259 setup calls. Four occurrences in this schema
     // and three in the G7 schema are the authorized Amendment-3 calls, leaving
-    // 219 other fixed-target calls. This inventory catches unreviewed drift in
+    // 252 other fixed-target calls. This inventory catches unreviewed drift in
     // which tests depend on the shared database.
     assert_eq!(
-        caller_occurrences, 226,
+        caller_occurrences, 259,
         "fixed-target setup caller inventory changed"
     );
     assert_eq!(
         caller_occurrences
             .checked_sub(schema_amendment_3_occurrences.len() + 3)
             .expect("Amendment-3 setup delta cannot exceed the closed inventory"),
-        219,
+        252,
         "the seven authorized Amendment-3 occurrences must be the only inventory delta"
     );
     let expected_targets: BTreeSet<String> = [
         "chat_protocol_blobs",
         "chat_protocol_concurrency",
         "chat_protocol_conversation_substrate",
+        "chat_protocol_create_conversation_handlers",
+        "chat_protocol_create_conversation_regression",
         "chat_protocol_delivery",
         "chat_protocol_delivery_read",
         "chat_protocol_device_directory",
@@ -2634,6 +2629,7 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
         "chat_protocol_production_cfg",
         "chat_protocol_relationship_repository",
         "chat_protocol_rollback",
+        "chat_protocol_s3_lifecycle",
         "chat_protocol_ticket",
         "chat_protocol_transition_repository",
         "chat_protocol_welcome",
@@ -2649,7 +2645,7 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
     let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
         .await
         .expect("construct reviewed exact-13 migrator");
-    assert_eq!(migrator.iter().count(), 21);
+    assert_eq!(migrator.iter().count(), 23);
     assert!(!migrator.ignore_missing);
     assert!(migrator.locking);
 }
@@ -4331,9 +4327,9 @@ fn validate_closed_complete_source_authority(
         .collect::<Vec<_>>();
     let top_level_function_digest =
         hex::encode(Sha256::digest(top_level_functions.join("\0").as_bytes()));
-    if top_level_functions.len() != 116
+    if top_level_functions.len() != 117
         || top_level_function_digest
-            != "f013e7a260ee2f373d6cebe4fee05608ae4168dcc5f768475555ea8c662deaa5"
+            != "bf8bdfaf798a3cb6c32b9ac9c677476c660427361db6eda37587ac68e73344e9"
     {
         return Err(format!(
             "top-level callable item inventory changed: count={} sha256={} names={:?}",
@@ -4614,7 +4610,7 @@ fn validate_closed_complete_source_authority(
         ));
         macro_cursor = body_close + 1;
     }
-    let expected_macro_definitions = ["reject_mutation|delimiter={}|83474..83855|depth=1|\
+    let expected_macro_definitions = ["reject_mutation|delimiter={}|82830..83211|depth=1|\
          module=<root>|\
          scope=a0_legacy_forward_reconcile_classifier_rejects_every_drift_dimension|\
          arms=[\"()->{}:matcher=$ field : ident , $ value : expr:\
@@ -8377,12 +8373,15 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
         [
             "_sqlx_migrations|r".to_owned(),
             "_sqlx_migrations_pkey|i".to_owned(),
+            "auth_jti_nonce|r".to_owned(),
+            "auth_jti_nonce_pkey|i".to_owned(),
+            "idx_auth_jti_nonce_expires|i".to_owned(),
         ],
         "A0 final public relation allowlist drift"
     );
     assert_eq!(
         public_constraints,
-        ["_sqlx_migrations_pkey|p"],
+        ["_sqlx_migrations_pkey|p", "auth_jti_nonce_pkey|p"],
         "A0 final public constraint allowlist drift"
     );
     assert!(

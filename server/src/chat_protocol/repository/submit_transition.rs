@@ -488,6 +488,32 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         expected_seq,
         expected_coordinate.as_ref(),
     )?;
+    let convo_row: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(Uuid::from_bytes(*parsed.prior.conversation_id()))
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(SubmitTransitionFacadeError::Database)?;
+
+    if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
+        let accepted_request = admitted
+            .accepted_wrapper_bytes()
+            .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+        let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
+        crate::chat_protocol::repository::federation::enqueue_federated_commit_job(
+            transaction,
+            conversation_id,
+            &sequencer_ds,
+            accepted_request,
+            sequencer_term as u64,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(?e, "failed to enqueue federated commit job");
+            SubmitTransitionFacadeError::InvalidCanonicalMaterial
+        })?;
+    }
     let event_position = applied.event_positions.first().copied();
     complete_operation(
         transaction,

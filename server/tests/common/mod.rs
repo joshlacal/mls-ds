@@ -14,7 +14,6 @@ use sqlx::PgPool;
 pub mod chat_protocol;
 pub mod fresh_db;
 pub mod http_acceptance;
-
 /// Mint a private, freshly migrated database for one test case.
 ///
 /// This used to read `TEST_DATABASE_URL` — falling back to a hardcoded

@@ -18,5 +18,11 @@ base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
 catbird_mls = { path = "../../catbird-mls" }
+catbird-atproto = { path = "../../catbird-atproto" }
 hex = "0.4"
 ulid = "1.2.1"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+serde_ipld_dagcbor = "0.6"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }

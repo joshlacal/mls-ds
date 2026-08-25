@@ -29,22 +29,29 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use super::{mark_done, record_failure, try_reclaim, CLAIM_BATCH_SIZE, POLL_INTERVAL};
-
+use super::{
+    cleanup_dead_rows, record_failure, try_reclaim, CLAIM_BATCH_SIZE, DEAD_ROWS_MAX_AGE,
+    POLL_INTERVAL,
+};
+use crate::identity::canonical_did;
 const TABLE_NAME: &str = "federation_outbox";
 
 #[derive(Debug, Clone, FromRow)]
-struct FederationOutboxRow {
-    id: String,
-    conversation_id: String,
-    delivery_event_id: String,
-    target_service_did: String,
-    payload: Vec<u8>,
-    attempts: i32,
-    created_at: DateTime<Utc>,
+pub struct FederationOutboxRow {
+    pub id: String,
+    pub conversation_id: String,
+    pub delivery_event_id: Option<String>,
+    pub target_service_did: String,
+    pub method: String,
+    pub payload: Vec<u8>,
+    pub payload_sha256: Option<Vec<u8>>,
+    pub envelope_version: i32,
+    pub attempts: i32,
+    pub created_at: DateTime<Utc>,
+    pub claim_token: Option<Uuid>,
 }
-
 /// Worker entry point. Spawned at server startup from `main.rs`.
 ///
 /// Loops every [`POLL_INTERVAL`] seconds:
@@ -70,7 +77,7 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
         ticker.tick().await;
 
         try_reclaim(&pool, TABLE_NAME).await;
-
+        let _ = cleanup_dead_rows(&pool, TABLE_NAME, DEAD_ROWS_MAX_AGE).await;
         let claimed = match claim_due_rows(&pool, CLAIM_BATCH_SIZE).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -85,20 +92,15 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
 
         debug!(count = claimed.len(), "federation_outbox: claimed batch");
 
-        // Process each row sequentially. Spawning per-row would let one
-        // very-slow peer block another, but the existing sequential
-        // pattern matches blob_cleanup.rs and avoids a concurrent-write
-        // surprise on `record_failure`/`mark_done`.
         for row in claimed {
-            match dispatch(&row).await {
+            match handoff_to_outbound_queue(&pool, &row).await {
                 Ok(()) => {
-                    if let Err(e) = mark_done(&pool, TABLE_NAME, &row.id).await {
-                        error!(
-                            row_id = %row.id,
-                            error = ?e,
-                            "federation_outbox: mark_done failed"
-                        );
-                    }
+                    debug!(
+                        row_id = %row.id,
+                        target_did = %row.target_service_did,
+                        method = %row.method,
+                        "federation_outbox: atomic handoff completed, source marked done"
+                    );
                 }
                 Err(e) => {
                     let err_msg = format!("{e:#}");
@@ -106,6 +108,7 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
                         &pool,
                         TABLE_NAME,
                         &row.id,
+                        row.claim_token,
                         row.attempts,
                         row.created_at,
                         &err_msg,
@@ -119,7 +122,7 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
                                 attempts = row.attempts + 1,
                                 stored_status,
                                 error = %err_msg,
-                                "federation_outbox: dispatch failed; row transitioned"
+                                "federation_outbox: handoff failed; row transitioned"
                             );
                         }
                         Err(db_err) => {
@@ -143,7 +146,7 @@ pub async fn run_federation_outbox_worker(pool: PgPool) {
 /// Uses `FOR UPDATE SKIP LOCKED` so that horizontally-scaled workers
 /// don't double-claim a row. Without `SKIP LOCKED`, two replicas calling
 /// this concurrently would deadlock or block.
-async fn claim_due_rows(
+pub async fn claim_due_rows(
     pool: &PgPool,
     limit: i64,
 ) -> Result<Vec<FederationOutboxRow>, sqlx::Error> {
@@ -166,15 +169,22 @@ async fn claim_due_rows(
     }
 
     let ids: Vec<String> = candidates.into_iter().map(|(id,)| id).collect();
+    let claim_token = Uuid::new_v4();
 
     let rows: Vec<FederationOutboxRow> = sqlx::query_as(
         "UPDATE federation_outbox \
-         SET status = 'in_flight', updated_at = NOW() \
+         SET status = 'in_flight', \
+             claim_token = $2, \
+             claim_expires_at = NOW() + make_interval(secs => $3), \
+             updated_at = NOW() \
          WHERE id = ANY($1) \
          RETURNING id, conversation_id, delivery_event_id, target_service_did, \
-                   payload, attempts, created_at",
+                   method, payload, payload_sha256, envelope_version, \
+                   attempts, created_at, claim_token",
     )
     .bind(&ids)
+    .bind(claim_token)
+    .bind(super::IN_FLIGHT_VISIBILITY_TIMEOUT.as_secs() as f64)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -182,25 +192,74 @@ async fn claim_due_rows(
     Ok(rows)
 }
 
-/// Dispatch one federation outbox row.
-///
-/// TODO(phase-3-federation-wire): currently a stub that logs and returns
-/// success. The plan acceptance test only requires the row to transition
-/// to `done` on restart after a SIGKILL — see crate-level docs above.
-/// The real dispatch should call `federation::outbound::send_to_peer(...)`
-/// or similar; that's a follow-up because federation routing is itself
-/// out of scope for this plan.
-async fn dispatch(row: &FederationOutboxRow) -> anyhow::Result<()> {
-    debug!(
-        row_id = %row.id,
-        convo = %crate::crypto::redact_for_log(&row.conversation_id),
-        delivery_event_id = %row.delivery_event_id,
-        target_did = %row.target_service_did,
-        payload_bytes = row.payload.len(),
-        "federation_outbox: dispatching (stub)"
-    );
-    // Placeholder: the real wire-up calls into federation::outbound.
-    // A no-op success keeps the durable-row contract honest while
-    // federation routing itself is iterated in a follow-up.
+/// Atomically hand off one federation outbox row to `outbound_queue` and mark the source row `done`.
+pub async fn handoff_to_outbound_queue(
+    pool: &PgPool,
+    row: &FederationOutboxRow,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // 1. Replay check before caps: if outbound_queue already contains this stable ID,
+    //    skip insertion and mark source done immediately.
+    let already_enqueued: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM outbound_queue WHERE id = $1)")
+            .bind(&row.id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    if !already_enqueued {
+        let canonical_target_ds_did = canonical_did(&row.target_service_did).to_string();
+        let policy = crate::federation::peer_policy::enforce_outbound_peer_policy(
+            pool,
+            &canonical_target_ds_did,
+        )
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+
+        let (per_peer_cap, per_convo_cap) =
+            crate::federation::queue::current_pending_caps_from_env();
+        crate::federation::queue::enforce_pending_caps_with_pool(
+            pool,
+            &canonical_target_ds_did,
+            &row.conversation_id,
+            &policy,
+            per_peer_cap,
+            per_convo_cap,
+        )
+        .await
+        .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO outbound_queue \
+               (id, target_ds_did, target_endpoint, method, payload, convo_id, payload_sha256, envelope_version, status, next_retry_at, retry_count, max_retries, created_at) \
+             VALUES ($1, $2, '', $3, $4, $5, $6, $7, 'pending', NOW(), 0, 5, NOW()) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&row.id)
+        .bind(&canonical_target_ds_did)
+        .bind(&row.method)
+        .bind(&row.payload)
+        .bind(&row.conversation_id)
+        .bind(&row.payload_sha256)
+        .bind(row.envelope_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // 2. Mark source federation_outbox row as 'done' in the SAME transaction!
+    let updated = sqlx::query(
+        "UPDATE federation_outbox \
+         SET status = 'done', updated_at = NOW(), last_error = NULL \
+         WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
+    )
+    .bind(&row.id)
+    .bind(row.claim_token)
+    .execute(&mut *tx)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    tx.commit().await?;
     Ok(())
 }

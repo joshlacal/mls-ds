@@ -1,33 +1,51 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
+use super::envelope::{
+    verify_receipt, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
+};
 use super::errors::FederationError;
 use super::outbound::{DsResponse, OutboundClient, OutboundError};
 use super::peer_policy;
 use super::resolver::{DsResolver, ValidatedRemoteDestination};
 use crate::auth::AuthMiddleware;
-use crate::identity::canonical_did;
-
-const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV: &str =
+use crate::identity::{canonical_did, dids_equivalent, service_did_base};
+use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+pub const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV: &str =
     "FEDERATION_OUTBOUND_QUEUE_PER_PEER_PENDING_CAP";
-const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV: &str =
+pub const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV: &str =
     "FEDERATION_OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP";
-const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT: i64 = 500;
-const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_DEFAULT: i64 = 100;
-const OUTBOUND_QUEUE_PENDING_CAP_MAX: i64 = 100_000;
+pub const OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT: i64 = 500;
+pub const OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_DEFAULT: i64 = 100;
+pub const OUTBOUND_QUEUE_PENDING_CAP_MAX: i64 = 100_000;
 
-fn parse_pending_cap(raw: Option<&str>, default: i64) -> i64 {
+pub fn parse_pending_cap(raw: Option<&str>, default: i64) -> i64 {
     raw.and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(default)
         .clamp(1, OUTBOUND_QUEUE_PENDING_CAP_MAX)
 }
 
-fn pending_cap_from_env(var_name: &str, default: i64) -> i64 {
+pub fn pending_cap_from_env(var_name: &str, default: i64) -> i64 {
     parse_pending_cap(std::env::var(var_name).ok().as_deref(), default)
+}
+
+pub fn current_pending_caps_from_env() -> (i64, i64) {
+    let per_peer = pending_cap_from_env(
+        OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_ENV,
+        OUTBOUND_QUEUE_PER_PEER_PENDING_CAP_DEFAULT,
+    );
+    let per_convo = pending_cap_from_env(
+        OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_ENV,
+        OUTBOUND_QUEUE_PER_CONVO_PEER_PENDING_CAP_DEFAULT,
+    );
+    (per_peer, per_convo)
 }
 
 // ---------------------------------------------------------------------------
@@ -39,14 +57,18 @@ fn pending_cap_from_env(var_name: &str, default: i64) -> i64 {
 pub struct QueueItem {
     pub id: String,
     pub target_ds_did: String,
+    /// Pinned target endpoint URL (e.g. `https://ds.example.com`).
+    /// If empty (`""`), the endpoint is dynamically resolved and pinned from `target_ds_did` at attempt/send time via `DsResolver`.
     pub target_endpoint: String,
     pub method: String,
     pub payload: Vec<u8>,
     pub convo_id: String,
     pub retry_count: i32,
     pub max_retries: i32,
+    pub payload_sha256: Option<Vec<u8>>,
+    pub envelope_version: i32,
+    pub claim_token: Option<Uuid>,
 }
-
 // ---------------------------------------------------------------------------
 // Queue stats (monitoring)
 // ---------------------------------------------------------------------------
@@ -98,6 +120,9 @@ impl OutboundQueue {
     // -- Enqueue ----------------------------------------------------------------
 
     /// Enqueue a failed delivery for later retry.
+    ///
+    /// Pass an empty string `""` for `target_endpoint` to dynamically resolve and pin the endpoint
+    /// from `target_ds_did` at attempt time via `DsResolver`.
     pub async fn enqueue(
         &self,
         target_ds_did: &str,
@@ -149,112 +174,15 @@ impl OutboundQueue {
         convo_id: &str,
         policy: &peer_policy::PeerPolicy,
     ) -> Result<(), FederationError> {
-        let cap_ratio = policy
-            .configured_max_requests_per_minute
-            .zip(policy.max_requests_per_minute)
-            .map(|(configured, effective)| {
-                (effective as f64 / configured.max(1) as f64).clamp(0.05, 1.0)
-            })
-            .unwrap_or_else(|| match policy.risk_tier {
-                peer_policy::RiskTier::Low => 1.0,
-                peer_policy::RiskTier::Medium => 0.75,
-                peer_policy::RiskTier::High => 0.5,
-                peer_policy::RiskTier::Critical => 0.25,
-            });
-        let adaptive_peer_cap = ((self.per_peer_pending_cap as f64) * cap_ratio)
-            .floor()
-            .max(1.0) as i64;
-        let adaptive_convo_peer_cap = ((self.per_convo_peer_pending_cap as f64) * cap_ratio)
-            .floor()
-            .max(1.0) as i64;
-
-        let (peer_pending, convo_peer_pending): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*)::BIGINT AS peer_pending, \
-                    COUNT(*) FILTER (WHERE convo_id = $2)::BIGINT AS convo_peer_pending \
-             FROM outbound_queue \
-             WHERE status = 'pending' AND target_ds_did = $1",
+        enforce_pending_caps_with_pool(
+            &self.pool,
+            target_ds_did,
+            convo_id,
+            policy,
+            self.per_peer_pending_cap,
+            self.per_convo_peer_pending_cap,
         )
-        .bind(target_ds_did)
-        .bind(convo_id)
-        .fetch_one(&self.pool)
         .await
-        .map_err(FederationError::Database)?;
-
-        if peer_pending >= adaptive_peer_cap {
-            crate::metrics::record_federation_queue_capacity_rejection(
-                "peer",
-                policy.risk_tier.as_str(),
-            );
-            crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
-            warn!(
-                event = "federation_outbound_queue_enqueue_rejected",
-                scope = "peer",
-                target_ds = %crate::crypto::redact_for_log(target_ds_did),
-                convo_id = %crate::crypto::redact_for_log(convo_id),
-                risk_tier = %policy.risk_tier.as_str(),
-                pending = peer_pending,
-                cap = adaptive_peer_cap,
-                configured_cap = self.per_peer_pending_cap,
-                "Rejected outbound queue enqueue: per-peer pending cap exceeded"
-            );
-            if peer_policy::federation_alerts_enabled() {
-                error!(
-                    event = "federation_alert_hook",
-                    alert_type = "queue_capacity_rejection",
-                    scope = "peer",
-                    target_ds = %crate::crypto::redact_for_log(target_ds_did),
-                    risk_tier = %policy.risk_tier.as_str(),
-                    pending = peer_pending,
-                    cap = adaptive_peer_cap,
-                    "Federation alert hook emitted"
-                );
-            }
-            return Err(FederationError::OutboundQueuePeerCapExceeded {
-                target_ds_did: target_ds_did.to_string(),
-                pending: peer_pending,
-                limit: adaptive_peer_cap,
-            });
-        }
-
-        if convo_peer_pending >= adaptive_convo_peer_cap {
-            crate::metrics::record_federation_queue_capacity_rejection(
-                "conversation_peer",
-                policy.risk_tier.as_str(),
-            );
-            crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
-            warn!(
-                event = "federation_outbound_queue_enqueue_rejected",
-                scope = "conversation_peer",
-                target_ds = %crate::crypto::redact_for_log(target_ds_did),
-                convo_id = %crate::crypto::redact_for_log(convo_id),
-                risk_tier = %policy.risk_tier.as_str(),
-                pending = convo_peer_pending,
-                cap = adaptive_convo_peer_cap,
-                configured_cap = self.per_convo_peer_pending_cap,
-                "Rejected outbound queue enqueue: per-conversation per-peer pending cap exceeded"
-            );
-            if peer_policy::federation_alerts_enabled() {
-                error!(
-                    event = "federation_alert_hook",
-                    alert_type = "queue_capacity_rejection",
-                    scope = "conversation_peer",
-                    target_ds = %crate::crypto::redact_for_log(target_ds_did),
-                    convo_id = %crate::crypto::redact_for_log(convo_id),
-                    risk_tier = %policy.risk_tier.as_str(),
-                    pending = convo_peer_pending,
-                    cap = adaptive_convo_peer_cap,
-                    "Federation alert hook emitted"
-                );
-            }
-            return Err(FederationError::OutboundQueueConvoPeerCapExceeded {
-                target_ds_did: target_ds_did.to_string(),
-                convo_id: convo_id.to_string(),
-                pending: convo_peer_pending,
-                limit: adaptive_convo_peer_cap,
-            });
-        }
-
-        Ok(())
     }
 
     // -- Background worker ------------------------------------------------------
@@ -267,8 +195,34 @@ impl OutboundQueue {
         auth_sign: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
         shutdown: CancellationToken,
     ) {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        self.run_worker_with_intervals(
+            outbound,
+            auth_sign,
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+            crate::workers::DEAD_ROWS_MAX_AGE,
+            168,
+            shutdown,
+        )
+        .await;
+    }
+
+    /// Run the background retry worker with configurable intervals and retention limits.
+    pub async fn run_worker_with_intervals(
+        &self,
+        outbound: Arc<OutboundClient>,
+        auth_sign: Arc<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>,
+        poll_interval: Duration,
+        cleanup_interval: Duration,
+        dead_rows_max_age: Duration,
+        old_rows_max_age_hours: i64,
+        shutdown: CancellationToken,
+    ) {
+        let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut cleanup_timer = tokio::time::interval(cleanup_interval);
+        cleanup_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         info!("Outbound queue worker started");
 
@@ -281,6 +235,18 @@ impl OutboundQueue {
                         Err(e) => error!(error = %e, "Outbound queue worker error"),
                     }
                 }
+                _ = cleanup_timer.tick() => {
+                    match self.cleanup_dead(dead_rows_max_age).await {
+                        Ok(n) if n > 0 => info!(purged = n, "Cleaned up dead outbound queue rows"),
+                        Ok(_) => {}
+                        Err(e) => error!(error = %e, "Outbound queue cleanup_dead failed"),
+                    }
+                    match self.cleanup_old(old_rows_max_age_hours).await {
+                        Ok(n) if n > 0 => info!(purged = n, "Cleaned up old outbound queue rows"),
+                        Ok(_) => {}
+                        Err(e) => error!(error = %e, "Outbound queue cleanup_old failed"),
+                    }
+                }
                 _ = shutdown.cancelled() => {
                     info!("Outbound queue worker shutting down");
                     break;
@@ -291,53 +257,157 @@ impl OutboundQueue {
 
     // -- Batch processing -------------------------------------------------------
 
-    async fn process_pending_batch(
+    pub async fn claim_due_batch(&self, limit: i64) -> Result<Vec<QueueItem>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let candidates: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM outbound_queue \
+             WHERE status = 'pending' AND next_retry_at <= NOW() \
+             ORDER BY next_retry_at ASC \
+             LIMIT $1 \
+             FOR UPDATE SKIP LOCKED",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if candidates.is_empty() {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = candidates.into_iter().map(|(id,)| id).collect();
+        let claim_token = Uuid::new_v4();
+        let lease_secs = 120.0;
+
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            String,
+            i32,
+            i32,
+            Option<Vec<u8>>,
+            i32,
+            Option<Uuid>,
+        )> = sqlx::query_as(
+            "UPDATE outbound_queue \
+             SET status = 'in_flight', \
+                 claim_token = $2, \
+                 claim_expires_at = NOW() + make_interval(secs => $3) \
+             WHERE id = ANY($1) \
+             RETURNING id, target_ds_did, target_endpoint, method, payload, convo_id, \
+                       retry_count, max_retries, payload_sha256, envelope_version, claim_token",
+        )
+        .bind(&ids)
+        .bind(claim_token)
+        .bind(lease_secs)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    target_ds_did,
+                    target_endpoint,
+                    method,
+                    payload,
+                    convo_id,
+                    retry_count,
+                    max_retries,
+                    payload_sha256,
+                    envelope_version,
+                    claim_token,
+                )| QueueItem {
+                    id,
+                    target_ds_did,
+                    target_endpoint,
+                    method,
+                    payload,
+                    convo_id,
+                    retry_count,
+                    max_retries,
+                    payload_sha256,
+                    envelope_version,
+                    claim_token,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn reclaim_stuck_in_flight(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE outbound_queue \
+             SET status = 'pending', claim_token = NULL, claim_expires_at = NULL \
+             WHERE status = 'in_flight' \
+               AND (claim_expires_at <= NOW() OR (claim_expires_at IS NULL AND created_at < NOW() - make_interval(secs => 120)))",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn process_pending_batch(
         &self,
         outbound: &OutboundClient,
         auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
     ) -> Result<usize, sqlx::Error> {
-        let rows: Vec<(String, String, String, String, Vec<u8>, String, i32, i32)> =
-            sqlx::query_as(
-                "SELECT id, target_ds_did, target_endpoint, method, payload, convo_id, \
-                    retry_count, max_retries \
-             FROM outbound_queue \
-             WHERE status = 'pending' AND next_retry_at <= NOW() \
-             ORDER BY next_retry_at ASC \
-             LIMIT 10",
-            )
-            .fetch_all(&self.pool)
-            .await?;
-
-        let count = rows.len();
-        for (
-            id,
-            target_ds_did,
-            target_endpoint,
-            method,
-            payload,
-            convo_id,
-            retry_count,
-            max_retries,
-        ) in rows
-        {
-            let item = QueueItem {
-                id,
-                target_ds_did,
-                target_endpoint,
-                method,
-                payload,
-                convo_id,
-                retry_count,
-                max_retries,
-            };
-            self.process_item(&item, outbound, auth_sign).await;
+        let _ = self.reclaim_stuck_in_flight().await;
+        let items = self.claim_due_batch(10).await?;
+        let count = items.len();
+        for item in &items {
+            self.process_item(item, outbound, auth_sign).await;
         }
         Ok(count)
     }
 
     // -- Single item processing -------------------------------------------------
 
-    async fn process_item(
+    async fn handle_failure(&self, item: &QueueItem, error_msg: &str, is_transient: bool) {
+        if is_transient && item.retry_count < item.max_retries {
+            let delay = backoff_delay(item.retry_count);
+            warn!(
+                queue_id = %item.id,
+                retry = item.retry_count + 1,
+                next_retry_secs = delay.as_secs(),
+                error = %error_msg,
+                "Transient failure, scheduling next attempt"
+            );
+            let _ = self
+                .schedule_retry(
+                    &item.id,
+                    item.claim_token,
+                    item.retry_count + 1,
+                    error_msg,
+                    delay,
+                )
+                .await;
+        } else {
+            if is_transient {
+                warn!(
+                    queue_id = %item.id,
+                    retries = item.retry_count,
+                    error = %error_msg,
+                    "Transient failure exceeded max retries, marking dead"
+                );
+            } else {
+                warn!(
+                    queue_id = %item.id,
+                    error = %error_msg,
+                    "Permanent hostile failure, marking dead immediately (no resend)"
+                );
+            }
+            let _ = self.mark_dead(&item.id, item.claim_token, error_msg).await;
+        }
+    }
+
+    pub async fn process_item(
         &self,
         item: &QueueItem,
         outbound: &OutboundClient,
@@ -354,7 +424,11 @@ impl OutboundQueue {
                 "Peer policy denied outbound delivery for queued item; cancelling delivery"
             );
             let _ = self
-                .mark_failed(&item.id, &format!("Peer policy denied: {e}"))
+                .mark_failed(
+                    &item.id,
+                    item.claim_token,
+                    &format!("Peer policy denied: {e}"),
+                )
                 .await;
             return;
         }
@@ -373,7 +447,13 @@ impl OutboundQueue {
                     "Retryable destination resolution failure, scheduling next attempt"
                 );
                 let _ = self
-                    .schedule_retry(&item.id, item.retry_count + 1, &e.to_string(), delay)
+                    .schedule_retry(
+                        &item.id,
+                        item.claim_token,
+                        item.retry_count + 1,
+                        &e.to_string(),
+                        delay,
+                    )
                     .await;
                 return;
             }
@@ -385,7 +465,9 @@ impl OutboundQueue {
                     error = %e,
                     "Non-retryable destination resolution failure or max retries exceeded"
                 );
-                let _ = self.mark_failed(&item.id, &e.to_string()).await;
+                let _ = self
+                    .mark_failed(&item.id, item.claim_token, &e.to_string())
+                    .await;
                 return;
             }
         };
@@ -395,7 +477,11 @@ impl OutboundQueue {
             Err(e) => {
                 error!(queue_id = %item.id, error = %e, "Failed to sign outbound request");
                 let _ = self
-                    .mark_failed(&item.id, &format!("Auth signing failed: {e}"))
+                    .mark_failed(
+                        &item.id,
+                        item.claim_token,
+                        &format!("Auth signing failed: {e}"),
+                    )
                     .await;
                 return;
             }
@@ -406,7 +492,7 @@ impl OutboundQueue {
             Err(e) => {
                 error!(queue_id = %item.id, error = %e, "Invalid payload in queue");
                 let _ = self
-                    .mark_failed(&item.id, &format!("Invalid payload: {e}"))
+                    .mark_failed(&item.id, item.claim_token, &format!("Invalid payload: {e}"))
                     .await;
                 return;
             }
@@ -424,133 +510,264 @@ impl OutboundQueue {
                 "Peer policy denied outbound delivery immediately before procedure call; cancelling delivery"
             );
             let _ = self
-                .mark_failed(&item.id, &format!("Peer policy denied: {e}"))
+                .mark_failed(
+                    &item.id,
+                    item.claim_token,
+                    &format!("Peer policy denied: {e}"),
+                )
                 .await;
             return;
         }
+
         match outbound
             .call_procedure_pinned(&destination, &item.method, &token, &body)
             .await
         {
-            Ok(resp) if resp.accepted => {
-                debug!(queue_id = %item.id, "Retry delivery succeeded");
-                if let Some(ref ack) = resp.ack {
-                    // Validate ACK fields match the delivery we sent
-                    let fields_valid = ack.receiver_ds_did == item.target_ds_did
-                        && ack.convo_id == item.convo_id
-                        && expected_sequencer_term
-                            .map(|term| ack.sequencer_term == term)
-                            .unwrap_or(true);
-                    if !fields_valid {
+            Ok(resp) => {
+                let is_clean_endpoint = matches!(
+                    item.method.as_str(),
+                    DELIVER_MESSAGE_NSID | DELIVER_WELCOME_NSID | SUBMIT_COMMIT_NSID
+                );
+
+                if is_clean_endpoint {
+                    let Some(receipt) = resp.clean_receipt() else {
                         warn!(
                             queue_id = %item.id,
-                            expected_ds = %item.target_ds_did,
-                            got_ds = %ack.receiver_ds_did,
-                            expected_convo = %item.convo_id,
-                            got_convo = %ack.convo_id,
-                            expected_term = ?expected_sequencer_term,
-                            got_term = ack.sequencer_term,
-                            "Delivery ACK field mismatch — possible forgery, skipping storage"
+                            target_ds = %item.target_ds_did,
+                            method = %item.method,
+                            "Clean federation response missing FederationReceiptV1"
                         );
-                    } else {
-                        // Attempt DID-doc-based signature verification
-                        match self.auth_middleware.resolve_did(&ack.receiver_ds_did).await {
-                            Ok(did_doc) => {
-                                if let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc)
-                                {
-                                    if ack.verify(&verifying_key) {
-                                        debug!(
-                                            queue_id = %item.id,
-                                            "ACK signature verified for queue item"
-                                        );
-                                        if let Err(e) =
-                                            crate::db::store_delivery_ack(&self.pool, ack, true)
-                                                .await
-                                        {
-                                            warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
-                                        }
-                                    } else {
-                                        warn!(
-                                            queue_id = %item.id,
-                                            remote_ds = %crate::crypto::redact_for_log(&ack.receiver_ds_did),
-                                            "ACK signature verification FAILED — skipping storage"
-                                        );
-                                    }
-                                } else {
-                                    warn!(
-                                        queue_id = %item.id,
-                                        remote_ds = %crate::crypto::redact_for_log(&ack.receiver_ds_did),
-                                        "ACK stored as UNVERIFIED — no P-256 key found in DID doc for {}",
-                                        crate::crypto::redact_for_log(&ack.receiver_ds_did),
-                                    );
-                                    if let Err(e) =
-                                        crate::db::store_delivery_ack(&self.pool, ack, false).await
-                                    {
-                                        warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    queue_id = %item.id,
-                                    error = %e,
-                                    "ACK stored as UNVERIFIED — DID resolution failed for {}",
-                                    crate::crypto::redact_for_log(&ack.receiver_ds_did),
-                                );
-                                if let Err(e) =
-                                    crate::db::store_delivery_ack(&self.pool, ack, false).await
-                                {
-                                    warn!(queue_id = %item.id, error = %e, "Failed to store delivery ack");
+                        self.handle_failure(
+                            item,
+                            "Clean federation response missing FederationReceiptV1",
+                            true,
+                        )
+                        .await;
+                        return;
+                    };
+
+                    // Resolve receiver DS DID document
+                    let did_doc = match self
+                        .auth_middleware
+                        .resolve_did(receipt.receiver_ds_did.as_str())
+                        .await
+                    {
+                        Ok(doc) => doc,
+                        Err(e) => {
+                            let is_transient = matches!(
+                                e,
+                                crate::auth::AuthError::DidResolutionFailed(_)
+                                    | crate::auth::AuthError::RateLimitExceeded { .. }
+                            );
+                            warn!(queue_id = %item.id, error = %e, "Failed to resolve receiver DID");
+                            self.handle_failure(
+                                item,
+                                &format!(
+                                    "DID resolution failed for {}: {e}",
+                                    receipt.receiver_ds_did.as_str()
+                                ),
+                                is_transient,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+
+                    let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc) else {
+                        let error_msg = format!(
+                            "No P-256 key found in DID document for {}",
+                            receipt.receiver_ds_did.as_str()
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Missing P-256 key in DID doc");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    };
+
+                    // Verify cryptographic signature of receipt
+                    match verify_receipt(&receipt, &verifying_key) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let error_msg =
+                                "Receipt signature verification FAILED — invalid signature"
+                                    .to_string();
+                            warn!(queue_id = %item.id, remote_ds = %receipt.receiver_ds_did.as_str(), "Receipt signature verification FAILED");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
+                        Err(e) => {
+                            let error_msg = format!("Receipt verification error: {e}");
+                            warn!(queue_id = %item.id, error = %error_msg, "Receipt verification error");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
+                    }
+
+                    // Receipt signature is cryptographically valid.
+                    // Validate receipt fields against outbound item.
+                    // Any field mismatch on a signed receipt is permanent hostile -> dead immediately, no resend.
+                    if receipt.endpoint.as_str() != item.method {
+                        let error_msg = format!(
+                            "Receipt endpoint mismatch: expected {}, got {}",
+                            item.method,
+                            receipt.endpoint.as_str()
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK field mismatch — possible forgery");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
+
+                    if receipt.delivery_id.as_str() != item.id {
+                        let error_msg = format!(
+                            "Receipt deliveryId mismatch: expected {}, got {}",
+                            item.id,
+                            receipt.delivery_id.as_str()
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK field mismatch — possible forgery");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
+
+                    if receipt.conversation_id.as_str() != item.convo_id {
+                        let error_msg = format!(
+                            "Receipt conversationId mismatch: expected {}, got {}",
+                            item.convo_id,
+                            receipt.conversation_id.as_str()
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK field mismatch — possible forgery");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
+
+                    if !dids_equivalent(receipt.receiver_ds_did.as_str(), &item.target_ds_did) {
+                        let error_msg = format!(
+                            "Receipt receiverDsDid mismatch: expected {}, got {}",
+                            item.target_ds_did,
+                            receipt.receiver_ds_did.as_str()
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK field mismatch — possible forgery");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
+
+                    if let Some(expected_term) = expected_sequencer_term {
+                        if receipt.sequencer_term as u64 != expected_term {
+                            let error_msg = format!(
+                                "Receipt sequencerTerm mismatch: expected {}, got {}",
+                                expected_term, receipt.sequencer_term
+                            );
+                            warn!(queue_id = %item.id, error = %error_msg, "Delivery ACK field mismatch — possible forgery");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
+                    }
+
+                    // Recompute endpoint envelope digest from item.payload and compare against receipt.envelope_sha256
+                    let expected_envelope_digest = match recompute_envelope_digest_from_payload(
+                        &item.method,
+                        &item.payload,
+                    ) {
+                        Ok(digest) => digest,
+                        Err(e) => {
+                            let error_msg =
+                                format!("Failed to recompute envelope digest from payload: {e}");
+                            warn!(queue_id = %item.id, error = %error_msg, "Payload in queue could not be parsed for envelope digest");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
+                    };
+
+                    if receipt.envelope_sha256.as_ref() != &expected_envelope_digest[..] {
+                        let error_msg = format!(
+                            "Receipt envelope_sha256 mismatch: expected {}, got {}",
+                            hex::encode(expected_envelope_digest),
+                            hex::encode(receipt.envelope_sha256.as_ref()),
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Receipt envelope digest mismatch — possible forgery");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
+
+                    debug!(queue_id = %item.id, "Receipt signature, fields, and envelope digest verified successfully");
+                    match self
+                        .persist_receipt_and_mark_delivered(item, &receipt, &resp.response_bytes)
+                        .await
+                    {
+                        Ok(true) => {
+                            debug!(queue_id = %item.id, "Receipt persisted and queue item marked delivered atomically");
+                        }
+                        Ok(false) => {
+                            warn!(queue_id = %item.id, "Queue item claim lost before marking delivered; skipping");
+                        }
+                        Err(e) => {
+                            error!(queue_id = %item.id, error = %e, "Failed to persist verified receipt or mark delivered in DB");
+                            self.handle_failure(
+                                item,
+                                &format!("Receipt DB persistence failure: {e}"),
+                                true,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                } else if resp.accepted {
+                    // Legacy delivery ack verification
+                    if let Some(ref ack) = resp.ack {
+                        let fields_valid = ack.receiver_ds_did == item.target_ds_did
+                            && ack.convo_id == item.convo_id
+                            && expected_sequencer_term
+                                .map(|term| ack.sequencer_term == term)
+                                .unwrap_or(true);
+                        if !fields_valid {
+                            warn!(
+                                queue_id = %item.id,
+                                expected_ds = %item.target_ds_did,
+                                got_ds = %ack.receiver_ds_did,
+                                "Delivery ACK field mismatch — possible forgery"
+                            );
+                        } else if let Ok(did_doc) =
+                            self.auth_middleware.resolve_did(&ack.receiver_ds_did).await
+                        {
+                            if let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc) {
+                                if ack.verify(&verifying_key) {
+                                    let _ =
+                                        crate::db::store_delivery_ack(&self.pool, ack, true).await;
                                 }
                             }
                         }
                     }
+                    let _ = self.mark_delivered(&item.id, item.claim_token).await;
+                } else {
+                    let rejection_category = classify_remote_rejection_category(
+                        resp.reason_code.as_deref(),
+                        resp.error.as_deref(),
+                        resp.message.as_deref(),
+                    );
+                    crate::metrics::record_federation_rejection_reason(rejection_category);
+                    let reason = resp
+                        .reason_code
+                        .or(resp.message)
+                        .unwrap_or_else(|| "rejected".to_string());
+                    warn!(
+                        queue_id = %item.id,
+                        reason = %reason,
+                        rejection_category,
+                        "Remote DS rejected delivery"
+                    );
+                    let _ = self.mark_failed(&item.id, item.claim_token, &reason).await;
                 }
-                let _ = self.mark_delivered(&item.id).await;
             }
-            Ok(resp) => {
-                let rejection_category = classify_remote_rejection_category(
-                    resp.reason_code.as_deref(),
-                    resp.error.as_deref(),
-                    resp.message.as_deref(),
-                );
-                crate::metrics::record_federation_rejection_reason(rejection_category);
-                let reason = resp
-                    .reason_code
-                    .or(resp.message)
-                    .unwrap_or_else(|| "rejected".to_string());
-                warn!(
-                    queue_id = %item.id,
-                    reason = %reason,
-                    rejection_category,
-                    "Remote DS rejected delivery"
-                );
-                let _ = self.mark_failed(&item.id, &reason).await;
-            }
-            Err(e) if e.is_retryable() && item.retry_count < item.max_retries => {
-                let delay = backoff_delay(item.retry_count);
-                warn!(
-                    queue_id = %item.id,
-                    retry = item.retry_count + 1,
-                    next_retry_secs = delay.as_secs(),
-                    error = %e,
-                    "Retryable failure, scheduling next attempt"
-                );
-                let _ = self
-                    .schedule_retry(&item.id, item.retry_count + 1, &e.to_string(), delay)
-                    .await;
+            Err(e) if e.is_retryable() => {
+                self.handle_failure(item, &e.to_string(), true).await;
             }
             Err(e) => {
-                error!(
-                    queue_id = %item.id,
-                    retries = item.retry_count,
-                    error = %e,
-                    "Non-retryable or max retries exceeded"
-                );
-                let _ = self.mark_failed(&item.id, &e.to_string()).await;
+                self.handle_failure(item, &e.to_string(), false).await;
             }
         }
     }
+    /// Resolve and pin target remote destination for a queue item.
+    ///
+    /// If `target_endpoint` is empty (`""`), resolves and pins dynamically from `target_ds_did` via `DsResolver`.
+    /// If `target_endpoint` is present, attempts `resolve_ds_destination` first, falling back to resolving from the endpoint.
     async fn resolve_target_destination(
         &self,
         item: &QueueItem,
@@ -681,55 +898,135 @@ impl OutboundQueue {
     }
     // -- Status mutations -------------------------------------------------------
 
-    async fn mark_delivered(&self, id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE outbound_queue SET status = 'delivered' WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn mark_failed(&self, id: &str, error_msg: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE outbound_queue SET status = 'failed', last_error = $2 WHERE id = $1")
-            .bind(id)
-            .bind(error_msg)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn schedule_retry(
+    pub async fn mark_delivered(
         &self,
         id: &str,
+        claim_token: Option<Uuid>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE outbound_queue \
+             SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
+             WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
+        )
+        .bind(id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+    pub async fn persist_receipt_and_mark_delivered(
+        &self,
+        item: &QueueItem,
+        receipt: &FederationReceiptV1,
+        response_bytes: &[u8],
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        store_federation_receipt_conn(&mut *tx, receipt, response_bytes).await?;
+
+        let result = sqlx::query(
+            "UPDATE outbound_queue \
+             SET status = 'delivered', claim_token = NULL, claim_expires_at = NULL \
+             WHERE id = $1 AND ($2::uuid IS NULL OR claim_token = $2)",
+        )
+        .bind(&item.id)
+        .bind(item.claim_token)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn mark_failed(
+        &self,
+        id: &str,
+        claim_token: Option<Uuid>,
+        error_msg: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE outbound_queue \
+             SET status = 'failed', last_error = $2, claim_token = NULL, claim_expires_at = NULL \
+             WHERE id = $1 AND ($3::uuid IS NULL OR claim_token = $3)",
+        )
+        .bind(id)
+        .bind(error_msg)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_dead(
+        &self,
+        id: &str,
+        claim_token: Option<Uuid>,
+        error_msg: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE outbound_queue \
+             SET status = 'dead', last_error = $2, claim_token = NULL, claim_expires_at = NULL \
+             WHERE id = $1 AND ($3::uuid IS NULL OR claim_token = $3)",
+        )
+        .bind(id)
+        .bind(error_msg)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn schedule_retry(
+        &self,
+        id: &str,
+        claim_token: Option<Uuid>,
         new_count: i32,
         error_msg: &str,
         delay: Duration,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             "UPDATE outbound_queue \
-             SET retry_count = $2, last_error = $3, \
-                 next_retry_at = NOW() + make_interval(secs => $4) \
-             WHERE id = $1",
+             SET status = 'pending', retry_count = $2, last_error = $3, \
+                 next_retry_at = NOW() + make_interval(secs => $4), \
+                 claim_token = NULL, claim_expires_at = NULL \
+             WHERE id = $1 AND ($5::uuid IS NULL OR claim_token = $5)",
         )
         .bind(id)
         .bind(new_count)
         .bind(error_msg)
         .bind(delay.as_secs() as f64)
+        .bind(claim_token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
-
     // -- Maintenance ------------------------------------------------------------
 
-    /// Delete old delivered/failed items older than `max_age_hours`.
+    /// Delete old delivered/failed/dead items older than `max_age_hours`.
     pub async fn cleanup_old(&self, max_age_hours: i64) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             "DELETE FROM outbound_queue \
-             WHERE status IN ('delivered', 'failed') \
-               AND created_at < NOW() - make_interval(hours => $1)",
+             WHERE status IN ('delivered', 'failed', 'dead') \
+               AND created_at < NOW() - make_interval(hours => $1::integer)",
         )
-        .bind(max_age_hours as f64)
+        .bind(max_age_hours as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete dead rows older than `max_age`.
+    pub async fn cleanup_dead(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM outbound_queue \
+             WHERE status = 'dead' \
+               AND created_at < NOW() - make_interval(secs => $1)",
+        )
+        .bind(max_age.as_secs() as f64)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -759,11 +1056,330 @@ impl OutboundQueue {
 
 fn extract_expected_sequencer_term(method: &str, body: &serde_json::Value) -> Option<u64> {
     match method {
-        "blue.catbird.mlsDS.deliverMessage" | "blue.catbird.mlsDS.submitCommit" => body
-            .get("sequencerTerm")
-            .and_then(serde_json::Value::as_u64),
+        DELIVER_MESSAGE_NSID | DELIVER_WELCOME_NSID | SUBMIT_COMMIT_NSID => body
+            .get("header")
+            .and_then(|h| h.get("sequencerTerm"))
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                body.get("sequencerTerm")
+                    .and_then(serde_json::Value::as_u64)
+            }),
         _ => None,
     }
+}
+
+pub fn recompute_envelope_digest_from_payload(
+    method: &str,
+    payload_bytes: &[u8],
+) -> Result<[u8; 32], FederationError> {
+    use super::envelope::{
+        compute_commit_envelope_digest, compute_message_envelope_digest,
+        compute_welcome_envelope_digest, validate_entry_locator, validate_envelope_header,
+    };
+    use catbird_atproto::generated::blue_catbird::mlsDS::{
+        deliver_message::DeliverMessage, deliver_welcome::DeliverWelcome,
+        submit_commit::SubmitCommit,
+    };
+
+    match method {
+        DELIVER_MESSAGE_NSID => {
+            let msg: DeliverMessage<jacquard_common::DefaultStr> =
+                serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
+            let header = validate_envelope_header(&msg.header)?;
+            let locator = validate_entry_locator(&msg.entry_locator)?;
+            compute_message_envelope_digest(
+                &header,
+                msg.recipient_did.as_str(),
+                &locator,
+                msg.entry_bytes.as_ref(),
+                msg.signed_request_bytes.as_ref(),
+            )
+        }
+        DELIVER_WELCOME_NSID => {
+            let msg: DeliverWelcome<jacquard_common::DefaultStr> =
+                serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
+            let header = validate_envelope_header(&msg.header)?;
+            let locator = validate_entry_locator(&msg.entry_locator)?;
+            let recipient_device_id =
+                Uuid::from_str(msg.recipient_device_id.as_str()).map_err(|_| {
+                    FederationError::InvalidEnvelope {
+                        reason: "invalid recipientDeviceId".to_string(),
+                    }
+                })?;
+            let welcome_id = Uuid::from_str(msg.welcome_id.as_str()).map_err(|_| {
+                FederationError::InvalidEnvelope {
+                    reason: "invalid welcomeId".to_string(),
+                }
+            })?;
+            let recovery_request_id =
+                Uuid::from_str(msg.recovery_request_id.as_str()).map_err(|_| {
+                    FederationError::InvalidEnvelope {
+                        reason: "invalid recoveryRequestId".to_string(),
+                    }
+                })?;
+            if msg.key_package_ref.len() != 32
+                || msg.welcome_sha256.len() != 32
+                || msg.public_snapshot_sha256.len() != 32
+                || msg.tree_summary_sha256.len() != 32
+            {
+                return Err(FederationError::InvalidEnvelope {
+                    reason: "invalid crypto byte array length in deliverWelcome payload"
+                        .to_string(),
+                });
+            }
+            let mut key_package_ref = [0u8; 32];
+            key_package_ref.copy_from_slice(&msg.key_package_ref);
+            let mut welcome_sha256 = [0u8; 32];
+            welcome_sha256.copy_from_slice(&msg.welcome_sha256);
+            let mut public_snapshot_sha256 = [0u8; 32];
+            public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256);
+            let mut tree_summary_sha256 = [0u8; 32];
+            tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256);
+
+            compute_welcome_envelope_digest(
+                &header,
+                msg.recipient_did.as_str(),
+                recipient_device_id,
+                welcome_id,
+                recovery_request_id,
+                &key_package_ref,
+                msg.welcome_bytes.as_ref(),
+                &welcome_sha256,
+                msg.entry_bytes.as_ref(),
+                msg.signed_request_bytes.as_ref(),
+                &locator,
+                &msg.coordinates,
+                &public_snapshot_sha256,
+                &tree_summary_sha256,
+            )
+        }
+        SUBMIT_COMMIT_NSID => {
+            let msg: SubmitCommit<jacquard_common::DefaultStr> =
+                serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
+            let header = validate_envelope_header(&msg.header)?;
+            compute_commit_envelope_digest(&header, msg.signed_request_bytes.as_ref())
+        }
+        _ => Err(FederationError::InvalidEnvelope {
+            reason: format!("unsupported clean federation method: {method}"),
+        }),
+    }
+}
+
+pub async fn store_federation_receipt_conn(
+    conn: &mut sqlx::PgConnection,
+    receipt: &FederationReceiptV1,
+    response_bytes: &[u8],
+) -> Result<(), sqlx::Error> {
+    let delivery_id = match Uuid::from_str(receipt.delivery_id.as_str()) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid delivery_id in receipt: {e}"
+            )))
+        }
+    };
+    let conversation_id = match Uuid::from_str(receipt.conversation_id.as_str()) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid conversation_id in receipt: {e}"
+            )))
+        }
+    };
+    let source_entry_id = match Uuid::from_str(receipt.source_locator.entry_id.as_str()) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid source_entry_id in receipt: {e}"
+            )))
+        }
+    };
+    let completed_at = match DateTime::parse_from_rfc3339(receipt.completed_at.as_str()) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(e) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "invalid completed_at in receipt: {e}"
+            )))
+        }
+    };
+    let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
+
+    let existing: Option<(
+        String,
+        Uuid,
+        String,
+        String,
+        String,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Uuid,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    )> = sqlx::query_as(
+        "SELECT endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did, \
+                sequencer_did, sequencer_term, envelope_sha256, result_sha256, \
+                source_entry_id, source_entry_seq, source_entry_fingerprint, \
+                response_bytes, response_sha256, receipt_signature \
+           FROM chat.federation_delivery_receipts \
+          WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    if let Some((
+        stored_endpoint,
+        stored_convo,
+        stored_sender,
+        stored_receiver,
+        stored_sequencer,
+        stored_term,
+        stored_envelope_sha256,
+        stored_result_sha256,
+        stored_source_entry_id,
+        stored_source_entry_seq,
+        stored_source_entry_fingerprint,
+        stored_response_bytes,
+        stored_response_sha256,
+        stored_signature,
+    )) = existing
+    {
+        if stored_endpoint != receipt.endpoint.as_str()
+            || stored_convo != conversation_id
+            || stored_sender != receipt.sender_ds_did.as_str()
+            || stored_receiver != receipt.receiver_ds_did.as_str()
+            || stored_sequencer != receipt.sequencer_did.as_str()
+            || stored_term != receipt.sequencer_term as i64
+            || stored_envelope_sha256 != receipt.envelope_sha256.as_ref()
+            || stored_result_sha256 != receipt.result_sha256.as_ref()
+            || stored_source_entry_id != source_entry_id
+            || stored_source_entry_seq != receipt.source_locator.seq as i64
+            || stored_source_entry_fingerprint
+                != receipt.source_locator.outer_entry_fingerprint.as_ref()
+            || stored_response_bytes != response_bytes
+            || stored_response_sha256 != &response_sha256[..]
+            || stored_signature != receipt.signature.as_ref()
+        {
+            return Err(sqlx::Error::Protocol(format!(
+                "Receipt conflict for delivery_id {delivery_id}: existing receipt bytes or metadata differ"
+            )));
+        }
+        return Ok(());
+    }
+
+    let insert_res = sqlx::query(
+        "INSERT INTO chat.federation_delivery_receipts ( \
+            delivery_id, endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did, \
+            sequencer_did, sequencer_term, envelope_sha256, result_sha256, \
+            source_entry_id, source_entry_seq, source_entry_fingerprint, \
+            response_bytes, response_sha256, receipt_signature, completed_at \
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+    )
+    .bind(delivery_id)
+    .bind(receipt.endpoint.as_str())
+    .bind(conversation_id)
+    .bind(receipt.sender_ds_did.as_str())
+    .bind(receipt.receiver_ds_did.as_str())
+    .bind(receipt.sequencer_did.as_str())
+    .bind(receipt.sequencer_term as i64)
+    .bind(receipt.envelope_sha256.as_ref())
+    .bind(receipt.result_sha256.as_ref())
+    .bind(source_entry_id)
+    .bind(receipt.source_locator.seq as i64)
+    .bind(receipt.source_locator.outer_entry_fingerprint.as_ref())
+    .bind(response_bytes)
+    .bind(&response_sha256[..])
+    .bind(receipt.signature.as_ref())
+    .bind(completed_at)
+    .execute(&mut *conn)
+    .await;
+
+    match insert_res {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            let row: Option<(
+                String,
+                Uuid,
+                String,
+                String,
+                String,
+                i64,
+                Vec<u8>,
+                Vec<u8>,
+                Uuid,
+                i64,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+            )> = sqlx::query_as(
+                "SELECT endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did, \
+                        sequencer_did, sequencer_term, envelope_sha256, result_sha256, \
+                        source_entry_id, source_entry_seq, source_entry_fingerprint, \
+                        response_bytes, response_sha256, receipt_signature \
+                   FROM chat.federation_delivery_receipts \
+                  WHERE delivery_id = $1",
+            )
+            .bind(delivery_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+            if let Some((
+                stored_endpoint,
+                stored_convo,
+                stored_sender,
+                stored_receiver,
+                stored_sequencer,
+                stored_term,
+                stored_envelope_sha256,
+                stored_result_sha256,
+                stored_source_entry_id,
+                stored_source_entry_seq,
+                stored_source_entry_fingerprint,
+                stored_response_bytes,
+                stored_response_sha256,
+                stored_signature,
+            )) = row
+            {
+                if stored_endpoint != receipt.endpoint.as_str()
+                    || stored_convo != conversation_id
+                    || stored_sender != receipt.sender_ds_did.as_str()
+                    || stored_receiver != receipt.receiver_ds_did.as_str()
+                    || stored_sequencer != receipt.sequencer_did.as_str()
+                    || stored_term != receipt.sequencer_term as i64
+                    || stored_envelope_sha256 != receipt.envelope_sha256.as_ref()
+                    || stored_result_sha256 != receipt.result_sha256.as_ref()
+                    || stored_source_entry_id != source_entry_id
+                    || stored_source_entry_seq != receipt.source_locator.seq as i64
+                    || stored_source_entry_fingerprint
+                        != receipt.source_locator.outer_entry_fingerprint.as_ref()
+                    || stored_response_bytes != response_bytes
+                    || stored_response_sha256 != &response_sha256[..]
+                    || stored_signature != receipt.signature.as_ref()
+                {
+                    return Err(sqlx::Error::Protocol(format!(
+                        "Receipt conflict on concurrent insert for delivery_id {delivery_id}"
+                    )));
+                }
+                Ok(())
+            } else {
+                Err(sqlx::Error::Database(db_err))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+pub async fn store_federation_receipt(
+    pool: &PgPool,
+    receipt: &FederationReceiptV1,
+    response_bytes: &[u8],
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    store_federation_receipt_conn(&mut conn, receipt, response_bytes).await
 }
 
 fn classify_remote_rejection_category(
@@ -867,8 +1483,10 @@ mod tests {
             convo_id: "convo-1".to_string(),
             retry_count: 0,
             max_retries: 5,
+            payload_sha256: None,
+            envelope_version: 1,
+            claim_token: None,
         };
-
         let endpoint = queue.resolve_target_endpoint(&item).await.unwrap();
         assert_eq!(endpoint, "https://127.0.0.1:3001");
     }
@@ -888,7 +1506,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -986,7 +1606,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1059,8 +1681,10 @@ mod tests {
             convo_id: "convo-test-dns-temp".to_string(),
             retry_count: 0,
             max_retries: 5,
+            payload_sha256: None,
+            envelope_version: 1,
+            claim_token: None,
         };
-
         let outbound = OutboundClient::new(1, 1);
         let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
 
@@ -1104,7 +1728,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1176,8 +1802,10 @@ mod tests {
             convo_id: "convo-test-nxdomain".to_string(),
             retry_count: 0,
             max_retries: 5,
+            payload_sha256: None,
+            envelope_version: 1,
+            claim_token: None,
         };
-
         let outbound = OutboundClient::new(1, 1);
         let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
 
@@ -1216,7 +1844,9 @@ mod tests {
         )
         .execute(&mut *conn)
         .await;
-        sqlx::migrate!("./migrations")
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.set_ignore_missing(true);
+        migrator
             .run(&mut *conn)
             .await
             .expect("migrations must succeed");
@@ -1290,8 +1920,10 @@ mod tests {
             convo_id: "convo-test-503".to_string(),
             retry_count: 0,
             max_retries: 5,
+            payload_sha256: None,
+            envelope_version: 1,
+            claim_token: None,
         };
-
         let outbound = OutboundClient::new(1, 1);
         let auth_sign = Arc::new(|_target: &str, _method: &str| Ok("test-jwt".to_string()));
 
@@ -1368,8 +2000,10 @@ mod tests {
             convo_id: "convo-test-404".to_string(),
             retry_count: 0,
             max_retries: 5,
+            payload_sha256: None,
+            envelope_version: 1,
+            claim_token: None,
         };
-
         queue_404
             .process_item(&item_404, &outbound, auth_sign.as_ref())
             .await;
@@ -1383,4 +2017,119 @@ mod tests {
         assert_eq!(status_404, "failed", "404 must fail immediately");
         assert_eq!(retry_count_404, 0, "Retry count must remain 0 for 404");
     }
+}
+
+/// Shared pending caps enforcement helper using a connection/pool.
+pub async fn enforce_pending_caps_with_pool(
+    pool: &PgPool,
+    target_ds_did: &str,
+    convo_id: &str,
+    policy: &peer_policy::PeerPolicy,
+    per_peer_pending_cap: i64,
+    per_convo_peer_pending_cap: i64,
+) -> Result<(), FederationError> {
+    let cap_ratio = policy
+        .configured_max_requests_per_minute
+        .zip(policy.max_requests_per_minute)
+        .map(|(configured, effective)| {
+            (effective as f64 / configured.max(1) as f64).clamp(0.05, 1.0)
+        })
+        .unwrap_or_else(|| match policy.risk_tier {
+            peer_policy::RiskTier::Low => 1.0,
+            peer_policy::RiskTier::Medium => 0.75,
+            peer_policy::RiskTier::High => 0.5,
+            peer_policy::RiskTier::Critical => 0.25,
+        });
+    let adaptive_peer_cap = ((per_peer_pending_cap as f64) * cap_ratio).floor().max(1.0) as i64;
+    let adaptive_convo_peer_cap = ((per_convo_peer_pending_cap as f64) * cap_ratio)
+        .floor()
+        .max(1.0) as i64;
+
+    let (peer_pending, convo_peer_pending): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT AS peer_pending, \
+                COUNT(*) FILTER (WHERE convo_id = $2)::BIGINT AS convo_peer_pending \
+         FROM outbound_queue \
+         WHERE status = 'pending' AND target_ds_did = $1",
+    )
+    .bind(target_ds_did)
+    .bind(convo_id)
+    .fetch_one(pool)
+    .await
+    .map_err(FederationError::Database)?;
+
+    if peer_pending >= adaptive_peer_cap {
+        crate::metrics::record_federation_queue_capacity_rejection(
+            "peer",
+            policy.risk_tier.as_str(),
+        );
+        crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
+        warn!(
+            event = "federation_outbound_queue_enqueue_rejected",
+            scope = "peer",
+            target_ds = %crate::crypto::redact_for_log(target_ds_did),
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            risk_tier = %policy.risk_tier.as_str(),
+            pending = peer_pending,
+            cap = adaptive_peer_cap,
+            configured_cap = per_peer_pending_cap,
+            "Rejected outbound queue enqueue: per-peer pending cap exceeded"
+        );
+        if peer_policy::federation_alerts_enabled() {
+            error!(
+                event = "federation_alert_hook",
+                alert_type = "queue_capacity_rejection",
+                scope = "peer",
+                target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                risk_tier = %policy.risk_tier.as_str(),
+                pending = peer_pending,
+                cap = adaptive_peer_cap,
+                "Federation alert hook emitted"
+            );
+        }
+        return Err(FederationError::OutboundQueuePeerCapExceeded {
+            target_ds_did: target_ds_did.to_string(),
+            pending: peer_pending,
+            limit: adaptive_peer_cap,
+        });
+    }
+
+    if convo_peer_pending >= adaptive_convo_peer_cap {
+        crate::metrics::record_federation_queue_capacity_rejection(
+            "conversation_peer",
+            policy.risk_tier.as_str(),
+        );
+        crate::metrics::record_federation_rejection_reason("queue_capacity_exceeded");
+        warn!(
+            event = "federation_outbound_queue_enqueue_rejected",
+            scope = "conversation_peer",
+            target_ds = %crate::crypto::redact_for_log(target_ds_did),
+            convo_id = %crate::crypto::redact_for_log(convo_id),
+            risk_tier = %policy.risk_tier.as_str(),
+            pending = convo_peer_pending,
+            cap = adaptive_convo_peer_cap,
+            configured_cap = per_convo_peer_pending_cap,
+            "Rejected outbound queue enqueue: per-conversation per-peer pending cap exceeded"
+        );
+        if peer_policy::federation_alerts_enabled() {
+            error!(
+                event = "federation_alert_hook",
+                alert_type = "queue_capacity_rejection",
+                scope = "conversation_peer",
+                target_ds = %crate::crypto::redact_for_log(target_ds_did),
+                convo_id = %crate::crypto::redact_for_log(convo_id),
+                risk_tier = %policy.risk_tier.as_str(),
+                pending = convo_peer_pending,
+                cap = adaptive_convo_peer_cap,
+                "Federation alert hook emitted"
+            );
+        }
+        return Err(FederationError::OutboundQueueConvoPeerCapExceeded {
+            target_ds_did: target_ds_did.to_string(),
+            convo_id: convo_id.to_string(),
+            pending: convo_peer_pending,
+            limit: adaptive_convo_peer_cap,
+        });
+    }
+
+    Ok(())
 }

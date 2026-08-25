@@ -410,6 +410,8 @@ impl DsEndpoint {
 pub struct OutboundQueueItem {
     pub id: String,
     pub target_ds_did: String,
+    /// Pinned target endpoint URL (e.g. `https://ds.example.com`).
+    /// If empty (`""`), the endpoint is resolved and pinned from `target_ds_did` at attempt/send time via `DsResolver`.
     pub target_endpoint: String,
     pub method: String,
     pub payload: Vec<u8>,

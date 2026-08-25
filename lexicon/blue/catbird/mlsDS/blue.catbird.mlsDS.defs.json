@@ -107,6 +107,7 @@
         "sequencerTerm",
         "envelopeSha256",
         "resultSha256",
+        "sourceLocator",
         "completedAt",
         "signature"
       ],

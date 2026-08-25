@@ -673,6 +673,23 @@ impl fmt::Debug for CompletedIdempotentResponse {
     }
 }
 
+impl CompletedIdempotentResponse {
+    /// Build a completed replay from an already-validated idempotency row for the
+    /// federated path. The caller (prelude) has already verified the exact claim
+    /// binding and the response digest.
+    pub(crate) fn for_federated_replay(completed_status: i32, response_bytes: Vec<u8>) -> Self {
+        let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
+        Self {
+            status: completed_status,
+            response_bytes,
+            response_sha256,
+            event_position: None,
+            completed_at: DateTime::<Utc>::from_timestamp_millis(0)
+                .expect("Unix epoch is a valid UTC timestamp"),
+        }
+    }
+}
+
 /// Sealed projection of the registration/key rows locked in the caller-owned
 /// business transaction. Downstream planners consume this value instead of
 /// issuing a second query with a different lock order.
