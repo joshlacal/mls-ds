@@ -761,6 +761,7 @@ mod tests {
     #[tokio::test]
     async fn pinned_query_connects_only_to_validated_addresses() {
         use axum::http::HeaderMap;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -788,8 +789,16 @@ mod tests {
                 }
             }),
         );
-        let approved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let approved_addr = approved_listener.local_addr().unwrap();
+
+        // Bind decoy to 127.0.0.1:<port>
+        let decoy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = decoy_listener.local_addr().unwrap().port();
+        let decoy_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        // Bind approved to [::1]:<same port>
+        let approved_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
+        let approved_listener = TcpListener::bind(approved_addr).await.unwrap();
+
         tokio::spawn(async move {
             axum::serve(approved_listener, approved_router)
                 .await
@@ -806,22 +815,19 @@ mod tests {
                 }
             }),
         );
-        let decoy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let decoy_addr = decoy_listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(decoy_listener, decoy_router).await.unwrap();
         });
 
-        // Demonstrate ordinary / hostile DNS resolution would hit decoy_addr
+        let test_url = format!("http://peer.example:{port}/xrpc/{TEST_METHOD}");
+
+        // Hostile control client resolves peer.example to decoy_addr on the same port
         let hostile_dns_client = Client::builder()
             .resolve_to_addrs("peer.example", &[decoy_addr])
             .build()
             .unwrap();
         let decoy_resp: serde_json::Value = hostile_dns_client
-            .get(format!(
-                "http://peer.example:{}/xrpc/{TEST_METHOD}",
-                decoy_addr.port()
-            ))
+            .get(&test_url)
             .send()
             .await
             .unwrap()
@@ -832,10 +838,9 @@ mod tests {
         assert_eq!(decoy_hits.load(Ordering::SeqCst), 1);
         decoy_hits.store(0, Ordering::SeqCst);
 
-        // Validated pinned client connects strictly to approved_addr, ignoring hostile DNS
+        // Production ValidatedRemoteDestination uses the exact same URL and pins addrs strictly to approved_addr
         let destination = ValidatedRemoteDestination {
-            url: url::Url::parse(&format!("http://peer.example:{}/", approved_addr.port()))
-                .unwrap(),
+            url: url::Url::parse(&format!("http://peer.example:{port}/")).unwrap(),
             host: "peer.example".to_string(),
             addrs: vec![approved_addr],
         };
