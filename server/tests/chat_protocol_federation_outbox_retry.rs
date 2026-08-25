@@ -17,7 +17,7 @@
 //! 14. Receiver dedupe and at-least-once safety
 
 #![allow(dead_code)]
-
+#![recursion_limit = "256"]
 mod common;
 
 use std::sync::Arc;
@@ -33,8 +33,9 @@ use catbird_server::chat_protocol::test_support::repository::{
 };
 use catbird_server::federation::ack::AckSigner;
 use catbird_server::federation::envelope::{
-    sign_receipt, ValidatedEntryLocator, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID,
-    SUBMIT_COMMIT_NSID,
+    compute_commit_envelope_digest, compute_message_envelope_digest,
+    compute_welcome_envelope_digest, sign_receipt, ValidatedEntryLocator,
+    ValidatedEnvelopeHeader, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use catbird_server::federation::outbound::OutboundClient;
 use catbird_server::federation::queue::OutboundQueue;
@@ -1237,7 +1238,7 @@ async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_ma
         &service_did_base(),
         1,
         expected_envelope_digest,
-        [99u8; 32],
+        Sha256::digest(b"{\"accepted\":true}").into(),
         source_locator,
         Utc::now(),
     )
@@ -1474,7 +1475,7 @@ async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_res
         &service_did_base(),
         1,
         expected_envelope_digest,
-        [99u8; 32],
+        Sha256::digest(b"{\"accepted\":true}").into(),
         source_locator,
         Utc::now(),
     )
@@ -2774,6 +2775,127 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
         )
         .unwrap();
 
+    let b64_32 = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    let b64_48 = base64::engine::general_purpose::STANDARD.encode([1u8; 48]);
+    let b64_12 = base64::engine::general_purpose::STANDARD.encode([1u8; 12]);
+    let b64_64 = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
+    let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
+    let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
+
+    let entry_id_str = Uuid::new_v4().to_string();
+    let st_expected_json = format!(r#"{{
+        "coordinates": {{
+            "confirmationTag": {{"$bytes": "{b64_32}"}},
+            "conversationId": "{convo_id}",
+            "epoch": 1,
+            "generation": 0,
+            "groupContextHash": {{"$bytes": "{b64_32}"}},
+            "groupId": {{"$bytes": "{b64_32}"}},
+            "lifecycle": "active",
+            "stateVersion": 1
+        }},
+        "entry": {{
+            "$type": "blue.catbird.chat.defs#commitEntry",
+            "conversationId": "{convo_id}",
+            "entryId": "{entry_id_str}",
+            "receivedAt": "2026-08-25T12:00:00Z",
+            "seq": 1,
+            "signedRequest": {{
+                "body": {{
+                    "$type": "blue.catbird.chat.defs#commitTransitionBody",
+                    "signatureDomain": "CATBIRD-CHAT-COMMIT\u0000",
+                    "transitionId": "{entry_id_str}",
+                    "idempotencyKey": "{entry_id_str}",
+                    "actorDid": "did:plc:alice",
+                    "actorDeviceId": "{entry_id_str}",
+                    "keyId": "k-1",
+                    "authGeneration": 1,
+                    "signedAt": "2026-08-25T12:00:00Z",
+                    "conversationId": "{convo_id}",
+                    "prior": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 0,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "next": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 1,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 1,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "aad": {{
+                        "protocolVersion": "1",
+                        "conversationId": {b16},
+                        "generation": 0,
+                        "transitionId": {b16},
+                        "prior": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "stateVersion": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 0,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}},
+                            "lifecycle": "active"
+                        }}
+                    }},
+                    "manifest": {{
+                        "participantChanges": [],
+                        "leafChanges": []
+                    }},
+                    "commit": {{
+                        "framing": "mlsMessage",
+                        "contentType": "publicMessageCommit",
+                        "bytes": {{"$bytes": "{b64_48}"}},
+                        "sha256": {b32_arr}
+                    }},
+                    "metadataSnapshot": {{
+                        "coordinate": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 1,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}}
+                        }},
+                        "originTransitionId": "{entry_id_str}",
+                        "metadataVersion": 1,
+                        "nonce": {{"$bytes": "{b64_12}"}},
+                        "ciphertext": {{"$bytes": "{b64_48}"}},
+                        "ciphertextSha256": {b32_arr},
+                        "ciphertextSize": 48,
+                        "authorProof": {{
+                            "authorDid": "did:plc:alice",
+                            "authorDeviceId": "{entry_id_str}",
+                            "authorKeyId": "k-1",
+                            "signaturePublicKey": {{"$bytes": "{b64_32}"}},
+                            "authGenerationAtOrigin": 1,
+                            "originTransitionId": "{entry_id_str}",
+                            "originSeq": 1,
+                            "roleAtOrigin": "admin",
+                            "deviceStatusAtOrigin": "active"
+                        }}
+                    }}
+                }},
+                "signature": {{"$bytes": "{b64_64}"}}
+            }}
+        }},
+        "welcomes": []
+    }}"#);
+    let st_dto: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput =
+        serde_json::from_str(&st_expected_json).unwrap();
+    let canonical_result_bytes = serde_json::to_vec(&st_dto).unwrap();
+    let expected_result_sha256: [u8; 32] = Sha256::digest(&canonical_result_bytes).into();
+
     let valid_receipt = sign_receipt(
         &signer,
         SUBMIT_COMMIT_NSID,
@@ -2784,35 +2906,123 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
         &peer_did,
         1,
         expected_envelope_digest,
-        [0x88u8; 32],
+        expected_result_sha256,
         source_locator,
         Utc::now(),
     )
     .unwrap();
 
-    // SubmitCommitOutput has coordinates, commitEntry, welcomes, and receipt — WITHOUT an "accepted" field!
-    let raw_http_response = serde_json::json!({
-        "coordinates": {
-            "conversationId": convo_id,
-            "generation": 1,
-            "stateVersion": 2,
-            "epoch": 2,
-            "groupId": base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]),
-            "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0x22u8; 32]),
-            "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0x33u8; 32]),
-            "lifecycle": "active"
-        },
-        "commitEntry": {
-            "entryId": Uuid::new_v4().to_string(),
-            "seq": 5,
-            "acceptedPayloadSha256": base64::engine::general_purpose::STANDARD.encode([0x55u8; 32]),
-            "outerEntryFingerprint": base64::engine::general_purpose::STANDARD.encode([0x66u8; 32])
-        },
-        "welcomes": [],
-        "receipt": valid_receipt
-    });
-    let raw_http_bytes = serde_json::to_vec(&raw_http_response).unwrap();
-
+    let raw_http_response_str = format!(r#"{{
+        "commitEntry": {{
+            "conversationId": "{convo_id}",
+            "entryId": "{entry_id_str}",
+            "receivedAt": "2026-08-25T12:00:00Z",
+            "seq": 1,
+            "signedRequest": {{
+                "body": {{
+                    "$type": "blue.catbird.chat.defs#commitTransitionBody",
+                    "signatureDomain": "CATBIRD-CHAT-COMMIT\u0000",
+                    "transitionId": "{entry_id_str}",
+                    "idempotencyKey": "{entry_id_str}",
+                    "actorDid": "did:plc:alice",
+                    "actorDeviceId": "{entry_id_str}",
+                    "keyId": "k-1",
+                    "authGeneration": 1,
+                    "signedAt": "2026-08-25T12:00:00Z",
+                    "conversationId": "{convo_id}",
+                    "prior": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 0,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "next": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 1,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 1,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "aad": {{
+                        "protocolVersion": "1",
+                        "conversationId": {b16},
+                        "generation": 0,
+                        "transitionId": {b16},
+                        "prior": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "stateVersion": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 0,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}},
+                            "lifecycle": "active"
+                        }}
+                    }},
+                    "manifest": {{
+                        "participantChanges": [],
+                        "leafChanges": []
+                    }},
+                    "commit": {{
+                        "framing": "mlsMessage",
+                        "contentType": "publicMessageCommit",
+                        "bytes": {{"$bytes": "{b64_48}"}},
+                        "sha256": {b32_arr}
+                    }},
+                    "metadataSnapshot": {{
+                        "coordinate": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 1,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}}
+                        }},
+                        "originTransitionId": "{entry_id_str}",
+                        "metadataVersion": 1,
+                        "nonce": {{"$bytes": "{b64_12}"}},
+                        "ciphertext": {{"$bytes": "{b64_48}"}},
+                        "ciphertextSha256": {b32_arr},
+                        "ciphertextSize": 48,
+                        "authorProof": {{
+                            "authorDid": "did:plc:alice",
+                            "authorDeviceId": "{entry_id_str}",
+                            "authorKeyId": "k-1",
+                            "signaturePublicKey": {{"$bytes": "{b64_32}"}},
+                            "authGenerationAtOrigin": 1,
+                            "originTransitionId": "{entry_id_str}",
+                            "originSeq": 1,
+                            "roleAtOrigin": "admin",
+                            "deviceStatusAtOrigin": "active"
+                        }}
+                    }}
+                }},
+                "signature": {{"$bytes": "{b64_64}"}}
+            }}
+        }},
+        "coordinates": {{
+            "confirmationTag": {{"$bytes": "{b64_32}"}},
+            "conversationId": "{convo_id}",
+            "epoch": 1,
+            "generation": 0,
+            "groupContextHash": {{"$bytes": "{b64_32}"}},
+            "groupId": {{"$bytes": "{b64_32}"}},
+            "lifecycle": "active",
+            "stateVersion": 1
+        }},
+        "receipt": {},
+        "welcomes": []
+    }}"#,
+    serde_json::to_string(&valid_receipt).unwrap()
+    );
+    let raw_http_bytes = raw_http_response_str.into_bytes();
     let resp_body_bytes = raw_http_bytes.clone();
     let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
         let b = resp_body_bytes.clone();
@@ -3225,4 +3435,639 @@ async fn test_store_federation_receipt_db_conflict_exact_compares_digest_and_byt
     .expect_err("conflicting envelope digest must error");
 
     assert!(err_envelope.to_string().contains("Receipt conflict"));
+}
+#[tokio::test]
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_welcome_is_permanent_dead() {
+    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    ensure_federation_peers_table(&pool).await;
+
+    let peer_did = format!("did:web:peer-welcome-{}.example.com", Uuid::new_v4().as_simple());
+    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
+    let auth_mw = AuthMiddleware::new();
+    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+         VALUES ($1, 'allow', 100, NOW(), NOW())",
+    )
+    .bind(&peer_did)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let item_id = Uuid::new_v4().to_string();
+    let convo_id = Uuid::new_v4().to_string();
+    let delivery_id = Uuid::parse_str(&item_id).unwrap();
+    let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+
+    let source_locator = ValidatedEntryLocator {
+        entry_id: Uuid::new_v4(),
+        seq: 1,
+        accepted_payload_sha256: [1u8; 32],
+        outer_entry_fingerprint: [2u8; 32],
+    };
+
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome::<jacquard_common::DefaultStr> {
+        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
+            protocol_version: "1".into(),
+            delivery_id: delivery_id.to_string().into(),
+            conversation_id: convo_id.clone().into(),
+            sender_ds_did: service_did_base().into(),
+            receiver_ds_did: peer_did.clone().into(),
+            sequencer_did: service_did_base().into(),
+            sequencer_term: 1,
+            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            extra_data: None,
+        },
+        recipient_did: jacquard_common::types::string::Did::new_owned("did:plc:alice".to_string()).unwrap(),
+        recipient_device_id: Uuid::new_v4().to_string().into(),
+        recovery_request_id: None,
+        coordinates: catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates {
+            conversation_id: convo_id.clone().into(),
+            epoch: 1,
+            generation: 0,
+            state_version: 1,
+            lifecycle: catbird_atproto::generated::blue_catbird::chat::Lifecycle::Active,
+            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[1u8; 32]),
+            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[2u8; 32]),
+            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[3u8; 32]),
+            extra_data: None,
+        },
+        welcome_id: Uuid::new_v4().to_string().into(),
+        welcome_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"welcome"),
+        welcome_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&Sha256::digest(b"welcome")),
+        key_package_ref: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[11u8; 32]),
+        tree_summary_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[12u8; 32]),
+        public_snapshot_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[13u8; 32]),
+        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-signed-request-bytes"),
+        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
+            entry_id: jacquard_common::deps::smol_str::SmolStr::from(source_locator.entry_id.to_string()),
+            seq: source_locator.seq as i64,
+            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.accepted_payload_sha256),
+            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.outer_entry_fingerprint),
+            extra_data: None,
+        },
+        extra_data: None,
+    };
+    let payload = serde_json::to_vec(&msg).unwrap();
+    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+        DELIVER_WELCOME_NSID,
+        &payload,
+    )
+    .unwrap();
+
+    // Validly signed receipt, but with WRONG result_sha256
+    let wrong_result_sha256 = [0xeeu8; 32];
+    let wrong_receipt = sign_receipt(
+        &signer,
+        DELIVER_WELCOME_NSID,
+        delivery_id,
+        convo_uuid,
+        &service_did_base(),
+        &peer_did,
+        &service_did_base(),
+        1,
+        envelope_digest,
+        wrong_result_sha256,
+        source_locator,
+        Utc::now(),
+    )
+    .unwrap();
+
+    let raw_http_response = serde_json::json!({
+        "accepted": true,
+        "receipt": wrong_receipt,
+    });
+    let raw_http_bytes = serde_json::to_vec(&raw_http_response).unwrap();
+
+    let resp_body_bytes = raw_http_bytes.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
+        let b = resp_body_bytes.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
+
+    sqlx::query(
+        "INSERT INTO outbound_queue (
+            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    )
+    .bind(&item_id)
+    .bind(&peer_did)
+    .bind(DELIVER_WELCOME_NSID)
+    .bind(&payload)
+    .bind(&convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed = queue.claim_due_batch(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let outbound = OutboundClient::new(2, 2);
+    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
+
+    queue
+        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
+        .await;
+
+    let (status, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
+            .bind(&item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(status, "dead", "wrong result_sha256 must mark deliverWelcome dead immediately");
+    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
+
+    // Assert no receipt was persisted
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
+}
+
+#[tokio::test]
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_message_is_permanent_dead() {
+    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    ensure_federation_peers_table(&pool).await;
+
+    let peer_did = format!("did:web:peer-msg-{}.example.com", Uuid::new_v4().as_simple());
+    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
+    let auth_mw = AuthMiddleware::new();
+    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+         VALUES ($1, 'allow', 100, NOW(), NOW())",
+    )
+    .bind(&peer_did)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let item_id = Uuid::new_v4().to_string();
+    let convo_id = Uuid::new_v4().to_string();
+    let delivery_id = Uuid::parse_str(&item_id).unwrap();
+    let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+
+    let source_locator = ValidatedEntryLocator {
+        entry_id: Uuid::new_v4(),
+        seq: 1,
+        accepted_payload_sha256: [1u8; 32],
+        outer_entry_fingerprint: [2u8; 32],
+    };
+
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<jacquard_common::DefaultStr> {
+        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
+            protocol_version: "1".into(),
+            delivery_id: delivery_id.to_string().into(),
+            conversation_id: convo_id.clone().into(),
+            sender_ds_did: service_did_base().into(),
+            receiver_ds_did: peer_did.clone().into(),
+            sequencer_did: service_did_base().into(),
+            sequencer_term: 1,
+            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            extra_data: None,
+        },
+        recipient_did: jacquard_common::types::string::Did::new_owned("did:plc:bob".to_string()).unwrap(),
+        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
+            entry_id: jacquard_common::deps::smol_str::SmolStr::from(source_locator.entry_id.to_string()),
+            seq: source_locator.seq as i64,
+            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.accepted_payload_sha256),
+            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(&source_locator.outer_entry_fingerprint),
+            extra_data: None,
+        },
+        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-signed-request-bytes"),
+        extra_data: None,
+    };
+    let payload = serde_json::to_vec(&msg).unwrap();
+    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+        DELIVER_MESSAGE_NSID,
+        &payload,
+    )
+    .unwrap();
+
+    // Validly signed receipt, but with WRONG result_sha256
+    let wrong_result_sha256 = [0xeeu8; 32];
+    let wrong_receipt = sign_receipt(
+        &signer,
+        DELIVER_MESSAGE_NSID,
+        delivery_id,
+        convo_uuid,
+        &service_did_base(),
+        &peer_did,
+        &service_did_base(),
+        1,
+        envelope_digest,
+        wrong_result_sha256,
+        source_locator,
+        Utc::now(),
+    )
+    .unwrap();
+
+    let raw_http_response = serde_json::json!({
+        "accepted": true,
+        "receipt": wrong_receipt,
+    });
+    let raw_http_bytes = serde_json::to_vec(&raw_http_response).unwrap();
+
+    let resp_body_bytes = raw_http_bytes.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
+        let b = resp_body_bytes.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
+
+    sqlx::query(
+        "INSERT INTO outbound_queue (
+            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    )
+    .bind(&item_id)
+    .bind(&peer_did)
+    .bind(DELIVER_MESSAGE_NSID)
+    .bind(&payload)
+    .bind(&convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed = queue.claim_due_batch(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let outbound = OutboundClient::new(2, 2);
+    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
+
+    queue
+        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
+        .await;
+
+    let (status, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
+            .bind(&item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(status, "dead", "wrong result_sha256 must mark deliverMessage dead immediately");
+    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
+
+    // Assert no receipt was persisted
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
+}
+
+#[tokio::test]
+async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_commit_is_permanent_dead() {
+    let (pool, _guard) = fresh_clean_protocol_db(DB_PREFIX, 4).await;
+    ensure_federation_peers_table(&pool).await;
+
+    let peer_did = format!("did:web:peer-commit-{}.example.com", Uuid::new_v4().as_simple());
+    let (signer, _verifying_key, _sk) = test_signer(&peer_did);
+    let auth_mw = AuthMiddleware::new();
+    cache_peer_did_doc(&auth_mw, &peer_did, &_verifying_key).await;
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, trust_score, created_at, updated_at) \
+         VALUES ($1, 'allow', 100, NOW(), NOW())",
+    )
+    .bind(&peer_did)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let item_id = Uuid::new_v4().to_string();
+    let convo_id = Uuid::new_v4().to_string();
+    let delivery_id = Uuid::parse_str(&item_id).unwrap();
+    let convo_uuid = Uuid::parse_str(&convo_id).unwrap();
+
+    let source_locator = ValidatedEntryLocator {
+        entry_id: Uuid::new_v4(),
+        seq: 1,
+        accepted_payload_sha256: [1u8; 32],
+        outer_entry_fingerprint: [2u8; 32],
+    };
+
+    let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<jacquard_common::DefaultStr> {
+        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
+            protocol_version: "1".into(),
+            delivery_id: delivery_id.to_string().into(),
+            conversation_id: convo_id.clone().into(),
+            sender_ds_did: service_did_base().into(),
+            receiver_ds_did: peer_did.clone().into(),
+            sequencer_did: service_did_base().into(),
+            sequencer_term: 1,
+            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            extra_data: None,
+        },
+        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"fake-signed-request"),
+        extra_data: None,
+    };
+    let payload = serde_json::to_vec(&msg).unwrap();
+    let envelope_digest = catbird_server::federation::queue::recompute_envelope_digest_from_payload(
+        SUBMIT_COMMIT_NSID,
+        &payload,
+    )
+    .unwrap();
+
+    // Validly signed receipt, but with WRONG result_sha256
+    let wrong_result_sha256 = [0xeeu8; 32];
+    let wrong_receipt = sign_receipt(
+        &signer,
+        SUBMIT_COMMIT_NSID,
+        delivery_id,
+        convo_uuid,
+        &service_did_base(),
+        &peer_did,
+        &service_did_base(),
+        1,
+        envelope_digest,
+        wrong_result_sha256,
+        source_locator,
+        Utc::now(),
+    )
+    .unwrap();
+
+    let b64_32 = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+    let b64_48 = base64::engine::general_purpose::STANDARD.encode([1u8; 48]);
+    let b64_12 = base64::engine::general_purpose::STANDARD.encode([1u8; 12]);
+    let b64_64 = base64::engine::general_purpose::STANDARD.encode([1u8; 64]);
+    let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
+    let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
+
+    let json_str = format!(r#"{{
+        "commitEntry": {{
+            "conversationId": "{convo_id}",
+            "entryId": "{item_id}",
+            "receivedAt": "2026-08-25T12:00:00Z",
+            "seq": 1,
+            "signedRequest": {{
+                "body": {{
+                    "$type": "blue.catbird.chat.defs#commitTransitionBody",
+                    "signatureDomain": "CATBIRD-CHAT-COMMIT\u0000",
+                    "transitionId": "{item_id}",
+                    "idempotencyKey": "{item_id}",
+                    "actorDid": "did:plc:alice",
+                    "actorDeviceId": "{item_id}",
+                    "keyId": "k-1",
+                    "authGeneration": 1,
+                    "signedAt": "2026-08-25T12:00:00Z",
+                    "conversationId": "{convo_id}",
+                    "prior": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 0,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "next": {{
+                        "conversationId": "{convo_id}",
+                        "generation": 0,
+                        "stateVersion": 1,
+                        "groupId": {{"$bytes": "{b64_32}"}},
+                        "epoch": 1,
+                        "groupContextHash": {{"$bytes": "{b64_32}"}},
+                        "confirmationTag": {{"$bytes": "{b64_32}"}},
+                        "lifecycle": "active"
+                    }},
+                    "aad": {{
+                        "protocolVersion": "1",
+                        "conversationId": {b16},
+                        "generation": 0,
+                        "transitionId": {b16},
+                        "prior": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "stateVersion": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 0,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}},
+                            "lifecycle": "active"
+                        }}
+                    }},
+                    "manifest": {{
+                        "participantChanges": [],
+                        "leafChanges": []
+                    }},
+                    "commit": {{
+                        "framing": "mlsMessage",
+                        "contentType": "publicMessageCommit",
+                        "bytes": {{"$bytes": "{b64_48}"}},
+                        "sha256": {b32_arr}
+                    }},
+                    "metadataSnapshot": {{
+                        "coordinate": {{
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 1,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}}
+                        }},
+                        "originTransitionId": "{item_id}",
+                        "metadataVersion": 1,
+                        "nonce": {{"$bytes": "{b64_12}"}},
+                        "ciphertext": {{"$bytes": "{b64_48}"}},
+                        "ciphertextSha256": {b32_arr},
+                        "ciphertextSize": 48,
+                        "authorProof": {{
+                            "authorDid": "did:plc:alice",
+                            "authorDeviceId": "{item_id}",
+                            "authorKeyId": "k-1",
+                            "signaturePublicKey": {{"$bytes": "{b64_32}"}},
+                            "authGenerationAtOrigin": 1,
+                            "originTransitionId": "{item_id}",
+                            "originSeq": 1,
+                            "roleAtOrigin": "admin",
+                            "deviceStatusAtOrigin": "active"
+                        }}
+                    }}
+                }},
+                "signature": {{"$bytes": "{b64_64}"}}
+            }}
+        }},
+        "coordinates": {{
+            "confirmationTag": {{"$bytes": "{b64_32}"}},
+            "conversationId": "{convo_id}",
+            "epoch": 1,
+            "generation": 0,
+            "groupContextHash": {{"$bytes": "{b64_32}"}},
+            "groupId": {{"$bytes": "{b64_32}"}},
+            "lifecycle": "active",
+            "stateVersion": 1
+        }},
+        "receipt": {},
+        "welcomes": []
+    }}"#,
+    serde_json::to_string(&wrong_receipt).unwrap()
+    );
+    let raw_http_bytes = json_str.into_bytes();
+
+    let resp_body_bytes = raw_http_bytes.clone();
+    let app = axum::Router::new().fallback(axum::routing::post(move |_: axum::body::Bytes| {
+        let b = resp_body_bytes.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        }
+    }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            pool.clone(),
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let queue = OutboundQueue::new(pool.clone(), auth_mw, resolver);
+
+    sqlx::query(
+        "INSERT INTO outbound_queue (
+            id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, max_retries, next_retry_at
+         ) VALUES ($1, $2, '', $3, $4, $5, 'pending', 0, 5, NOW() - INTERVAL '1 second')",
+    )
+    .bind(&item_id)
+    .bind(&peer_did)
+    .bind(SUBMIT_COMMIT_NSID)
+    .bind(&payload)
+    .bind(&convo_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed = queue.claim_due_batch(10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let outbound = OutboundClient::new(2, 2);
+    let auth_sign = Arc::new(|_t: &str, _m: &str| Ok("test-token".to_string()));
+
+    queue
+        .process_item(&claimed[0], &outbound, auth_sign.as_ref())
+        .await;
+
+    let (status, last_error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM outbound_queue WHERE id = $1")
+            .bind(&item_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(status, "dead", "wrong result_sha256 must mark submitCommit dead immediately");
+    assert!(last_error.unwrap().contains("result_sha256 mismatch"));
+
+    // Assert no receipt was persisted
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
+    )
+    .bind(delivery_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "No receipt must be persisted for hostile wrong result hash");
 }

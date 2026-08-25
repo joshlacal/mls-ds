@@ -1002,7 +1002,7 @@ impl DsResolver {
         deadline: tokio::time::Instant,
     ) -> Result<serde_json::Value, FederationError> {
         let url = repo_record_url(pds_endpoint, user_did, collection, rkey);
-        let dest = validate_and_resolve_destination(&url, None).await?;
+        let dest = self.resolve_endpoint_destination(&url).await?;
         let resp =
             send_hardened_resolution_request(&dest, deadline, user_did, "HTTP request failed")
                 .await?;
@@ -1251,7 +1251,7 @@ impl DsResolver {
             });
         };
 
-        let dest = validate_and_resolve_destination(&did_doc_url, None).await?;
+        let dest = self.resolve_endpoint_destination(&did_doc_url).await?;
         let deadline = checked_outbound_deadline(did, Duration::from_secs(10))?;
 
         let resp =
@@ -1284,55 +1284,70 @@ impl DsResolver {
         did: &str,
     ) -> Result<Vec<Vec<u8>>, FederationError> {
         let deadline = checked_outbound_deadline(did, outbound_timeout())?;
+        let resolver = self.clone();
         let resolution = complete_authority_resolution_with_deadline(
             || self.resolve_did_to_pds(did),
-            |pds_endpoint| async move {
-                let list_records_url = format!(
-                    "{}/xrpc/com.atproto.repo.listRecords",
-                    pds_endpoint.trim_end_matches('/')
-                );
+            move |pds_endpoint| {
+                let resolver = resolver.clone();
                 let did_owned = did.to_string();
-                let http = self.http.clone();
+                async move {
+                    let base_url = format!(
+                        "{}/xrpc/com.atproto.repo.listRecords",
+                        pds_endpoint.trim_end_matches('/')
+                    );
 
-                collect_authoritative_device_key_pages(
-                    move |cursor| {
-                        let http = http.clone();
-                        let list_records_url = list_records_url.clone();
-                        let did = did_owned.clone();
-                        async move {
-                            let mut request = http.get(list_records_url).query(&[
-                                ("repo", did.as_str()),
-                                ("collection", "blue.catbird.chat.device"),
-                                ("limit", AUTHORITY_PAGE_SIZE_PARAM),
-                            ]);
-                            if let Some(cursor) = cursor.as_deref() {
-                                request = request.query(&[("cursor", cursor)]);
-                            }
+                    collect_authoritative_device_key_pages(
+                        move |cursor| {
+                            let resolver = resolver.clone();
+                            let base_url = base_url.clone();
+                            let did = did_owned.clone();
+                            async move {
+                                let mut parsed_url =
+                                    url::Url::parse(&base_url).map_err(|_| ())?;
+                                {
+                                    let mut query = parsed_url.query_pairs_mut();
+                                    query.append_pair("repo", did.as_str());
+                                    query.append_pair("collection", "blue.catbird.chat.device");
+                                    query.append_pair("limit", AUTHORITY_PAGE_SIZE_PARAM);
+                                    if let Some(cursor) = cursor.as_deref() {
+                                        query.append_pair("cursor", cursor);
+                                    }
+                                }
 
-                            let response = tokio::time::timeout_at(deadline, request.send())
+                                let destination = resolver
+                                    .resolve_endpoint_destination(parsed_url.as_str())
+                                    .await
+                                    .map_err(|_| ())?;
+                                let response = send_hardened_resolution_request(
+                                    &destination,
+                                    deadline,
+                                    did.as_str(),
+                                    "PDS device-record page",
+                                )
                                 .await
-                                .map_err(|_| ())?
                                 .map_err(|_| ())?;
-                            if !response.status().is_success() {
-                                return Err(());
+
+                                if !response.status().is_success() {
+                                    return Err(());
+                                }
+                                decode_json_bounded(
+                                    response,
+                                    ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
+                                )
+                                .await
+                                .map_err(|_| ())
                             }
-                            decode_json_bounded(
-                                response,
-                                ResponseBodyBudget::new(PROFILE_OR_DEVICE_MAX_BYTES, deadline),
-                            )
-                            .await
-                            .map_err(|_| ())
-                        }
-                    },
-                    deadline,
-                )
-                .await
-                .map_err(|_| FederationError::ResolutionFailed {
-                    did: did.to_string(),
-                    kind: ResolutionFailureKind::InvalidPayload(
-                        "PDS device-record pagination was incomplete".to_string(),
-                    ),
-                })
+                        },
+                        deadline,
+                    )
+                    .await
+                    .map_err(|_| FederationError::ResolutionFailed {
+                        did: did.to_string(),
+                        kind: ResolutionFailureKind::InvalidPayload(
+                            "PDS device-record pagination was incomplete".to_string(),
+                        ),
+                    })
+                }
             },
             deadline,
         )
@@ -1360,9 +1375,8 @@ impl DsResolver {
         Ok(())
     }
 
-    /// Clean up expired cache entries from both mappings and endpoints tables.
     pub async fn cleanup_expired(&self) -> Result<u64, FederationError> {
-        let mut deleted = 0;
+        let mut deleted = 0u64;
         let r1 = sqlx::query("DELETE FROM did_ds_mappings WHERE expires_at < NOW()")
             .execute(&self.pool)
             .await?;
@@ -1375,7 +1389,7 @@ impl DsResolver {
     }
 
     async fn validate_remote_url(&self, url_str: &str) -> Result<(), FederationError> {
-        validate_and_resolve_destination(url_str, None)
+        self.resolve_endpoint_destination(url_str)
             .await
             .map(|_| ())
     }
@@ -2535,6 +2549,161 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn authorized_device_pagination_revalidates_every_page_destination() {
+        std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
+        std::env::set_var("APP_ENV", "test");
+        use axum::extract::Query;
+        use axum::response::{IntoResponse, Json};
+        use axum::routing::get;
+        use axum::Router;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let forbidden_hits = Arc::new(AtomicUsize::new(0));
+        let forbidden_hits_cb = forbidden_hits.clone();
+        let pds_page2_hits = Arc::new(AtomicUsize::new(0));
+        let pds_page2_hits_cb = pds_page2_hits.clone();
+
+        let page1_validated = Arc::new(AtomicBool::new(false));
+        let page1_validated_cb = page1_validated.clone();
+        let page2_validated = Arc::new(AtomicBool::new(false));
+        let page2_validated_cb = page2_validated.clone();
+
+        let forbidden_router = Router::new().route(
+            "/xrpc/com.atproto.repo.listRecords",
+            get(move || {
+                let hits = forbidden_hits_cb.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "records": [] })).into_response()
+                }
+            }),
+        );
+        let forbidden_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forbidden_addr = forbidden_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(forbidden_listener, forbidden_router).await;
+        });
+
+        let pds_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pds_addr = pds_listener.local_addr().unwrap();
+
+        let pds_router = Router::new()
+            .route(
+                "/.well-known/did.json",
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "id": "did:web:alice.example",
+                        "service": [{
+                            "id": "#atproto_pds",
+                            "type": "AtprotoPersonalDataServer",
+                            "serviceEndpoint": format!("http://127.0.0.1:{}", pds_addr.port())
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/xrpc/com.atproto.repo.listRecords",
+                get(move |Query(params): Query<HashMap<String, String>>| {
+                    let p2_hits = pds_page2_hits_cb.clone();
+                    async move {
+                        if params.get("cursor").is_none() {
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "records": [authoritative_record(&[0x41; 32])],
+                                    "cursor": "cursor-page-2",
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            p2_hits.fetch_add(1, Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "records": [],
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(pds_listener, pds_router).await;
+        });
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://localhost/nonexistent_resolver_test")
+            .expect("lazy pool");
+
+        let forbidden_addr_copy = forbidden_addr;
+        let resolver = DsResolver::new(
+            pool,
+            reqwest::Client::new(),
+            "did:web:self.example.com".to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |target: &str| {
+            if target.contains("cursor=cursor-page-2") {
+                page2_validated_cb.store(true, Ordering::SeqCst);
+                Some(Box::pin(async move {
+                    Err(FederationError::ResolutionFailed {
+                        did: "did:web:alice.example".to_string(),
+                        kind: ResolutionFailureKind::SsrfBlocked(
+                            format!("Forbidden destination address: {forbidden_addr_copy}")
+                        ),
+                    })
+                }))
+            } else if target.contains("com.atproto.repo.listRecords") {
+                page1_validated_cb.store(true, Ordering::SeqCst);
+                let query_str = target.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+                let target_url = url::Url::parse(&format!(
+                    "http://127.0.0.1:{}/xrpc/com.atproto.repo.listRecords{query_str}",
+                    pds_addr.port()
+                )).unwrap();
+                Some(Box::pin(async move {
+                    Ok(ValidatedRemoteDestination {
+                        url: target_url,
+                        host: "127.0.0.1".to_string(),
+                        addrs: vec![pds_addr],
+                    })
+                }))
+            } else if target.contains("did.json") {
+                let target_url = url::Url::parse(&format!(
+                    "http://127.0.0.1:{}/.well-known/did.json",
+                    pds_addr.port()
+                )).unwrap();
+                Some(Box::pin(async move {
+                    Ok(ValidatedRemoteDestination {
+                        url: target_url,
+                        host: "127.0.0.1".to_string(),
+                        addrs: vec![pds_addr],
+                    })
+                }))
+            } else {
+                let target_url = url::Url::parse(target).ok()?;
+                Some(Box::pin(async move {
+                    Ok(ValidatedRemoteDestination {
+                        url: target_url,
+                        host: "127.0.0.1".to_string(),
+                        addrs: vec![pds_addr],
+                    })
+                }))
+            }
+        }));
+
+        let result = resolver.resolve_authorized_device_keys("did:web:alice.example").await;
+        assert!(result.is_err());
+        assert!(page1_validated.load(Ordering::SeqCst), "page 1 must be validated via destination resolver");
+        assert!(page2_validated.load(Ordering::SeqCst), "page 2 must be re-validated via destination resolver");
+        assert_eq!(pds_page2_hits.load(Ordering::SeqCst), 0, "forbidden page 2 must not receive request");
+        assert_eq!(forbidden_hits.load(Ordering::SeqCst), 0);
     }
 
     #[allow(clippy::redundant_closure)]

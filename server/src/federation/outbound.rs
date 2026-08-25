@@ -118,18 +118,7 @@ impl OutboundClient {
         debug!(method, host = %destination.host, "Outbound pinned DS call");
         let deadline = self.deadline(method)?;
 
-        let client = Client::builder()
-            .connect_timeout(self.connect_timeout)
-            .timeout(self.request_timeout)
-            .user_agent("catbird-mls-ds/1.0")
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(&destination.host, &destination.addrs)
-            .build()
-            .map_err(|e| OutboundError::RequestFailed {
-                endpoint: destination.host.clone(),
-                reason: format!("Failed to build pinned HTTP client: {e}"),
-            })?;
+        let client = self.build_pinned_client(destination)?;
         let send = client
             .post(&url)
             .header("Authorization", format!("Bearer {auth_token}"))
@@ -213,6 +202,69 @@ impl OutboundClient {
                 method: method.to_string(),
             })
         }
+    }
+    /// Make an authenticated XRPC query call returning raw JSON with pinned SSRF-validated socket addresses.
+    pub async fn call_query_json_pinned(
+        &self,
+        destination: &ValidatedRemoteDestination,
+        method: &str,
+        auth_token: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, OutboundError> {
+        let endpoint = destination.url.as_str().trim_end_matches('/');
+        let url = format!("{}/xrpc/{}", endpoint, method);
+        debug!(method, host = %destination.host, "Outbound pinned DS query (raw json)");
+        let deadline = self.deadline(method)?;
+
+        let client = self.build_pinned_client(destination)?;
+        let send = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {auth_token}"))
+            .query(params)
+            .send();
+        let resp = tokio::time::timeout_at(deadline, send)
+            .await
+            .map_err(|_| timeout_error(method))?
+            .map_err(|error| classify_ordinary_reqwest_error(error, method))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            decode_json_bounded(
+                resp,
+                ResponseBodyBudget::new(ORDINARY_DS_CONTROL_MAX_BYTES, deadline),
+            )
+            .await
+            .map_err(|error| map_ordinary_body_error(error, method))
+        } else {
+            let body = summarize_error_body(resp, deadline)
+                .await
+                .map(|summary| summary.to_string())
+                .unwrap_or_else(|error| format!("error response metadata unavailable: {error}"));
+            Err(OutboundError::RemoteError {
+                status: status.as_u16(),
+                body,
+                endpoint: destination.host.clone(),
+                method: method.to_string(),
+            })
+        }
+    }
+
+    fn build_pinned_client(
+        &self,
+        destination: &ValidatedRemoteDestination,
+    ) -> Result<Client, OutboundError> {
+        Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .user_agent("catbird-mls-ds/1.0")
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&destination.host, &destination.addrs)
+            .build()
+            .map_err(|e| OutboundError::RequestFailed {
+                endpoint: destination.host.clone(),
+                reason: format!("Failed to build pinned HTTP client: {e}"),
+            })
     }
 
     /// Check if a remote DS is reachable.
@@ -775,5 +827,112 @@ mod tests {
         assert!(!resp.accepted);
         assert_eq!(resp.error.as_deref(), Some("ConflictDetected"));
         assert_eq!(resp.message.as_deref(), Some("epoch mismatch"));
+    }
+
+    #[tokio::test]
+    async fn pinned_query_connects_only_to_validated_addresses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use axum::http::HeaderMap;
+
+        let approved_hits = Arc::new(AtomicUsize::new(0));
+        let approved_hits_cb = approved_hits.clone();
+
+        let route = format!("/xrpc/{TEST_METHOD}");
+        let router = Router::new().route(
+            &route,
+            get(move |headers: HeaderMap| {
+                let hits = approved_hits_cb.clone();
+                async move {
+                    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
+                    assert!(
+                        host == "peer.example" || host.starts_with("peer.example:"),
+                        "host header must retain original host, got {host}"
+                    );
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "success": true }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let approved_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let destination = ValidatedRemoteDestination {
+            url: url::Url::parse(&format!("http://peer.example:{}/", approved_addr.port())).unwrap(),
+            host: "peer.example".to_string(),
+            addrs: vec![approved_addr],
+        };
+
+        let client = OutboundClient::new(1, 1);
+        let result = client
+            .call_query_json_pinned(&destination, TEST_METHOD, "token", &[("k", "v")])
+            .await
+            .unwrap();
+
+        assert_eq!(result, json!({ "success": true }));
+        assert_eq!(approved_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_query_rejects_http_redirects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let decoy_hits = Arc::new(AtomicUsize::new(0));
+        let decoy_hits_cb = decoy_hits.clone();
+
+        let decoy_router = Router::new().route(
+            &format!("/xrpc/{TEST_METHOD}"),
+            get(move || {
+                let hits = decoy_hits_cb.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "secret": "decoy" }))
+                }
+            }),
+        );
+        let decoy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(decoy_listener, decoy_router).await.unwrap();
+        });
+
+        let redirect_target = format!("http://127.0.0.1:{}/xrpc/{}", decoy_addr.port(), TEST_METHOD);
+        let redirect_router = Router::new().route(
+            &format!("/xrpc/{TEST_METHOD}"),
+            get(move || {
+                let target = redirect_target.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", target)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let approved_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, redirect_router).await.unwrap();
+        });
+
+        let destination = ValidatedRemoteDestination {
+            url: url::Url::parse(&format!("http://peer.example:{}/", approved_addr.port())).unwrap(),
+            host: "peer.example".to_string(),
+            addrs: vec![approved_addr],
+        };
+
+        let client = OutboundClient::new(1, 1);
+        let error = client
+            .call_query_json_pinned(&destination, TEST_METHOD, "token", &[])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundError::RemoteError { status: 302, .. }));
+        assert_eq!(decoy_hits.load(Ordering::SeqCst), 0);
     }
 }

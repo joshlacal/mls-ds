@@ -4,6 +4,11 @@ use p256::pkcs8::DecodePrivateKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::envelope::{DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID};
+use super::errors::FederationError;
+use catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput;
+use catbird_atproto::generated::blue_catbird::chat::ConversationEntry;
+use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommitOutput;
 /// The only verification method clients may resolve for V1 sequencer receipts.
 ///
 /// The DID document itself is published by the edge/operations layer. The
@@ -305,6 +310,34 @@ pub fn canonical_receipt_bytes(
     buf.extend_from_slice(sequencer_did.as_bytes());
     buf.extend_from_slice(&issued_at.to_be_bytes());
     buf
+}
+
+/// Reconstruct the canonical method-specific result bytes for verification against receipt `resultSha256`.
+pub(crate) fn result_bytes_for_receipt(
+    method: &str,
+    response_bytes: &[u8],
+) -> Result<Vec<u8>, FederationError> {
+    match method {
+        DELIVER_WELCOME_NSID | DELIVER_MESSAGE_NSID => Ok(b"{\"accepted\":true}".to_vec()),
+        SUBMIT_COMMIT_NSID => {
+            let output: SubmitCommitOutput =
+                serde_json::from_slice(response_bytes).map_err(|e| FederationError::InvalidEnvelope {
+                    reason: format!("failed to parse submitCommit response for receipt result: {e}"),
+                })?;
+            let st_output = SubmitTransitionOutput {
+                coordinates: output.coordinates,
+                entry: ConversationEntry::CommitEntry(Box::new(output.commit_entry)),
+                welcomes: vec![],
+                extra_data: None,
+            };
+            serde_json::to_vec(&st_output).map_err(|e| FederationError::InvalidEnvelope {
+                reason: format!("failed to serialize reconstructed submitTransition response: {e}"),
+            })
+        }
+        _ => Err(FederationError::InvalidEnvelope {
+            reason: format!("unsupported method for receipt result reconstruction: {method}"),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -793,5 +826,167 @@ mod tests {
             deserialized.verify(&vk),
             "deserialized receipt should verify"
         );
+    }
+
+    #[test]
+    fn result_bytes_for_receipt_deliver_welcome_and_message() {
+        let welcome_bytes = result_bytes_for_receipt(DELIVER_WELCOME_NSID, b"{}").unwrap();
+        assert_eq!(welcome_bytes, b"{\"accepted\":true}");
+
+        let msg_bytes = result_bytes_for_receipt(DELIVER_MESSAGE_NSID, b"{\"extra\":\"value\"}").unwrap();
+        assert_eq!(msg_bytes, b"{\"accepted\":true}");
+    }
+
+    #[test]
+    fn result_bytes_for_receipt_submit_commit() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let b64_32 = STANDARD.encode([1u8; 32]);
+        let b64_48 = STANDARD.encode([1u8; 48]);
+        let b64_12 = STANDARD.encode([1u8; 12]);
+        let b64_64 = STANDARD.encode([1u8; 64]);
+        let b0_32 = STANDARD.encode([0u8; 32]);
+        let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
+        let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
+
+        let json_str = format!(r#"{{
+            "commitEntry": {{
+                "conversationId": "convo-1",
+                "entryId": "entry-1",
+                "receivedAt": "2026-08-25T12:00:00Z",
+                "seq": 1,
+                "signedRequest": {{
+                    "body": {{
+                        "$type": "blue.catbird.chat.defs#commitTransitionBody",
+                        "signatureDomain": "CATBIRD-CHAT-COMMIT\u0000",
+                        "transitionId": "t-1",
+                        "idempotencyKey": "idem-1",
+                        "actorDid": "did:plc:alice",
+                        "actorDeviceId": "dev-1",
+                        "keyId": "k-1",
+                        "authGeneration": 1,
+                        "signedAt": "2026-08-25T12:00:00Z",
+                        "conversationId": "convo-1",
+                        "prior": {{
+                            "conversationId": "convo-1",
+                            "generation": 0,
+                            "stateVersion": 0,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 0,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}},
+                            "lifecycle": "active"
+                        }},
+                        "next": {{
+                            "conversationId": "convo-1",
+                            "generation": 0,
+                            "stateVersion": 1,
+                            "groupId": {{"$bytes": "{b64_32}"}},
+                            "epoch": 1,
+                            "groupContextHash": {{"$bytes": "{b64_32}"}},
+                            "confirmationTag": {{"$bytes": "{b64_32}"}},
+                            "lifecycle": "active"
+                        }},
+                        "aad": {{
+                            "protocolVersion": "1",
+                            "conversationId": {b16},
+                            "generation": 0,
+                            "transitionId": {b16},
+                            "prior": {{
+                                "conversationId": {b16},
+                                "generation": 0,
+                                "stateVersion": 0,
+                                "groupId": {{"$bytes": "{b64_32}"}},
+                                "epoch": 0,
+                                "groupContextHash": {{"$bytes": "{b64_32}"}},
+                                "confirmationTag": {{"$bytes": "{b64_32}"}},
+                                "lifecycle": "active"
+                            }}
+                        }},
+                        "manifest": {{
+                            "participantChanges": [],
+                            "leafChanges": []
+                        }},
+                        "commit": {{
+                            "framing": "mlsMessage",
+                            "contentType": "publicMessageCommit",
+                            "bytes": {{"$bytes": "{b64_48}"}},
+                            "sha256": {b32_arr}
+                        }},
+                        "metadataSnapshot": {{
+                            "coordinate": {{
+                                "conversationId": {b16},
+                                "generation": 0,
+                                "groupId": {{"$bytes": "{b64_32}"}},
+                                "epoch": 1,
+                                "groupContextHash": {{"$bytes": "{b64_32}"}},
+                                "confirmationTag": {{"$bytes": "{b64_32}"}}
+                            }},
+                            "originTransitionId": "t-0",
+                            "metadataVersion": 1,
+                            "nonce": {{"$bytes": "{b64_12}"}},
+                            "ciphertext": {{"$bytes": "{b64_48}"}},
+                            "ciphertextSha256": {b32_arr},
+                            "ciphertextSize": 48,
+                            "authorProof": {{
+                                "authorDid": "did:plc:alice",
+                                "authorDeviceId": "dev-1",
+                                "authorKeyId": "k-1",
+                                "signaturePublicKey": {{"$bytes": "{b64_32}"}},
+                                "authGenerationAtOrigin": 1,
+                                "originTransitionId": "t-0",
+                                "originSeq": 1,
+                                "roleAtOrigin": "admin",
+                                "deviceStatusAtOrigin": "active"
+                            }}
+                        }}
+                    }},
+                    "signature": {{"$bytes": "{b64_64}"}}
+                }}
+            }},
+            "coordinates": {{
+                "confirmationTag": {{"$bytes": "{b64_32}"}},
+                "conversationId": "convo-1",
+                "epoch": 1,
+                "generation": 0,
+                "groupContextHash": {{"$bytes": "{b64_32}"}},
+                "groupId": {{"$bytes": "{b64_32}"}},
+                "lifecycle": "active",
+                "stateVersion": 1
+            }},
+            "receipt": {{
+                "protocolVersion": "1",
+                "deliveryId": "deliv-1",
+                "endpoint": "blue.catbird.mlsDS.submitCommit",
+                "conversationId": "convo-1",
+                "senderDsDid": "did:web:sender.example",
+                "receiverDsDid": "did:web:receiver.example",
+                "sequencerDid": "did:web:sequencer.example",
+                "sequencerTerm": 1,
+                "envelopeSha256": {{"$bytes": "{b0_32}"}},
+                "resultSha256": {{"$bytes": "{b0_32}"}},
+                "sourceLocator": {{
+                    "entryId": "entry-1",
+                    "seq": 1,
+                    "acceptedPayloadSha256": {{"$bytes": "{b64_32}"}},
+                    "outerEntryFingerprint": {{"$bytes": "{b64_32}"}}
+                }},
+                "signature": {{"$bytes": "{b64_64}"}},
+                "completedAt": "2026-08-25T12:00:00Z"
+            }},
+            "welcomes": []
+        }}"#);
+        let resp_bytes = json_str.into_bytes();
+        let result = result_bytes_for_receipt(SUBMIT_COMMIT_NSID, &resp_bytes).unwrap();
+
+        let parsed_st: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(parsed_st["coordinates"]["epoch"], 1);
+        assert_eq!(parsed_st["entry"]["seq"], 1);
+    }
+
+    #[test]
+    fn result_bytes_for_receipt_rejects_unknown_method_and_malformed_json() {
+        assert!(result_bytes_for_receipt("blue.catbird.mlsDS.unknown", b"{}").is_err());
+        assert!(result_bytes_for_receipt(SUBMIT_COMMIT_NSID, b"not json").is_err());
     }
 }

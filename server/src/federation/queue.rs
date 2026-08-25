@@ -6,6 +6,7 @@ use super::envelope::{
     verify_receipt, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
 use super::errors::FederationError;
+use super::receipt::result_bytes_for_receipt;
 use super::outbound::{DsResponse, OutboundClient, OutboundError};
 use super::peer_policy;
 use super::resolver::{DsResolver, ValidatedRemoteDestination};
@@ -686,8 +687,28 @@ impl OutboundQueue {
                         self.handle_failure(item, &error_msg, false).await;
                         return;
                     }
+                    let result_bytes = match result_bytes_for_receipt(&item.method, &resp.response_bytes) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let error_msg = format!("Failed to reconstruct result bytes for receipt: {e}");
+                            warn!(queue_id = %item.id, error = %error_msg, "Response could not be parsed for result verification");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
+                    };
+                    let result_sha256: [u8; 32] = sha2::Sha256::digest(&result_bytes).into();
+                    if receipt.result_sha256.as_ref() != &result_sha256[..] {
+                        let error_msg = format!(
+                            "Receipt result_sha256 mismatch: expected {}, got {}",
+                            hex::encode(result_sha256),
+                            hex::encode(receipt.result_sha256.as_ref()),
+                        );
+                        warn!(queue_id = %item.id, error = %error_msg, "Receipt result digest mismatch — possible forgery / permanent hostile response");
+                        self.handle_failure(item, &error_msg, false).await;
+                        return;
+                    }
 
-                    debug!(queue_id = %item.id, "Receipt signature, fields, and envelope digest verified successfully");
+                    debug!(queue_id = %item.id, "Receipt signature, fields, envelope digest, and result digest verified successfully");
                     match self
                         .persist_receipt_and_mark_delivered(item, &receipt, &resp.response_bytes)
                         .await

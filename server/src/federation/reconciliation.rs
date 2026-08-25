@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -11,7 +8,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{
-    outbound::OutboundClient, peer_policy, resolver::DsResolver, CAPABILITY_RECONCILIATION_V1,
+    outbound::OutboundClient, peer_policy,
+    resolver::{self, DsResolver, ValidatedRemoteDestination},
+    CAPABILITY_RECONCILIATION_V1,
 };
 use crate::identity::canonical_did;
 use crate::util::outbound_body::{
@@ -23,7 +22,6 @@ const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
 const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
 const EVENTS_PAGE_LIMIT: i64 = 500;
 
-static DISCOVERY_CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
 
 /// Decoded `getConvoDigest` response from a peer DS.
 ///
@@ -243,12 +241,15 @@ async fn reconcile_conversation_internal(
     peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
         .await
         .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
-
     let endpoint = resolver
         .resolve_ds_did(sequencer_ds)
         .await
         .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
-    let discovery_payload = fetch_discovery_payload(&endpoint.endpoint).await;
+    let destination = resolver
+        .resolve_ds_destination(sequencer_ds)
+        .await
+        .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
+    let discovery_payload = fetch_discovery_payload(&destination).await;
     if !super::target_supports_capability(
         CAPABILITY_RECONCILIATION_V1,
         endpoint.federation_capabilities.as_deref(),
@@ -265,13 +266,12 @@ async fn reconcile_conversation_internal(
             known_caps
         ));
     }
-    let endpoint = endpoint.endpoint;
 
     let digest_token = auth_sign(sequencer_ds, DIGEST_NSID)
         .map_err(|e| format!("failed to sign digest request: {e}"))?;
     let digest_json = outbound
-        .call_query_json(
-            &endpoint,
+        .call_query_json_pinned(
+            &destination,
             DIGEST_NSID,
             &digest_token,
             &[("convoId", convo_id)],
@@ -311,8 +311,8 @@ async fn reconcile_conversation_internal(
             let after_seq_s = after_seq.to_string();
             let limit_s = EVENTS_PAGE_LIMIT.to_string();
             let events_json = outbound
-                .call_query_json(
-                    &endpoint,
+                .call_query_json_pinned(
+                    &destination,
                     EVENTS_NSID,
                     &events_token,
                     &[
@@ -423,31 +423,33 @@ async fn reconcile_conversation_internal(
     Ok(())
 }
 
-async fn fetch_discovery_payload(endpoint: &str) -> Option<serde_json::Value> {
-    fetch_discovery_payload_with_timeout(endpoint, Duration::from_secs(10)).await
-}
-
-fn discovery_client() -> Option<&'static reqwest::Client> {
-    DISCOVERY_CLIENT
-        .get_or_init(|| reqwest::Client::builder().build().ok())
-        .as_ref()
+async fn fetch_discovery_payload(
+    destination: &ValidatedRemoteDestination,
+) -> Option<serde_json::Value> {
+    fetch_discovery_payload_with_timeout(destination, Duration::from_secs(10)).await
 }
 
 async fn fetch_discovery_payload_with_timeout(
-    endpoint: &str,
+    destination: &ValidatedRemoteDestination,
     timeout: Duration,
 ) -> Option<serde_json::Value> {
     let deadline = tokio::time::Instant::now().checked_add(timeout)?;
-    let url = format!(
-        "{}/xrpc/{}",
-        endpoint.trim_end_matches('/'),
-        HEALTH_CHECK_NSID
-    );
-    let client = discovery_client()?;
-    let resp = tokio::time::timeout_at(deadline, client.get(&url).send())
-        .await
-        .ok()?
-        .ok()?;
+    let endpoint = destination.url.as_str().trim_end_matches('/');
+    let url = format!("{}/xrpc/{}", endpoint, HEALTH_CHECK_NSID);
+    let parsed_url = url::Url::parse(&url).ok()?;
+    let discovery_dest = ValidatedRemoteDestination {
+        url: parsed_url,
+        host: destination.host.clone(),
+        addrs: destination.addrs.clone(),
+    };
+    let resp = resolver::send_hardened_resolution_request(
+        &discovery_dest,
+        deadline,
+        &destination.host,
+        "healthCheck discovery",
+    )
+    .await
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -800,6 +802,7 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::federation::resolver::ValidatedRemoteDestination;
     use axum::{
         body::Body,
         http::{Response, StatusCode},
@@ -812,13 +815,17 @@ mod tests {
     use std::convert::Infallible;
     use tokio::net::TcpListener;
 
-    async fn spawn_discovery_server(router: Router) -> String {
+    async fn spawn_discovery_server(router: Router) -> ValidatedRemoteDestination {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        format!("http://{address}")
+        ValidatedRemoteDestination {
+            url: url::Url::parse(&format!("http://127.0.0.1:{}/", address.port())).unwrap(),
+            host: "127.0.0.1".to_string(),
+            addrs: vec![address],
+        }
     }
 
     #[tokio::test]
@@ -943,10 +950,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reconciliation_discovery_uses_pinned_destination() {
+        use axum::http::HeaderMap;
+
+        let expected = json!({ "capabilities": [CAPABILITY_RECONCILIATION_V1] });
+        let body = expected.to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            &format!("/xrpc/{HEALTH_CHECK_NSID}"),
+            get(move |headers: HeaderMap| {
+                let body = body.clone();
+                async move {
+                    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
+                    assert!(
+                        host == "peer.example.com" || host.starts_with("peer.example.com:"),
+                        "host header must retain original host, got {host}"
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let destination = ValidatedRemoteDestination {
+            url: url::Url::parse(&format!("http://peer.example.com:{}/", addr.port())).unwrap(),
+            host: "peer.example.com".to_string(),
+            addrs: vec![addr],
+        };
+
+        // Note: fetch_discovery_payload in production will accept &ValidatedRemoteDestination
+        // For now, let's call fetch_discovery_payload with destination endpoint to watch it fail or type check
+        let discovery = fetch_discovery_payload(&destination).await;
+        assert_eq!(discovery, Some(expected));
+    }
+
+    #[test]
+    fn reconciliation_does_not_contain_unpinned_http_client() {
+        let source = include_str!("reconciliation.rs");
+        let discovery_client_sym = ["DISCOVERY", "_CLIENT"].concat();
+        let client_builder_sym = ["Client::", "builder"].concat();
+        let unpinned_get_sym = [".get(&", "url).send()"].concat();
+        assert!(!source.contains(&discovery_client_sym), "must not contain discovery client static");
+        assert!(!source.contains(&client_builder_sym), "must not build client");
+        assert!(!source.contains(&unpinned_get_sym), "must not send unpinned get");
+    }
+
     #[test]
     fn discovery_has_no_unbounded_collector_and_event_queries_remain_separate() {
         let source = include_str!("reconciliation.rs");
-        let query_call = [".call_query", "_json("].concat();
+        let query_call = [".call_query", "_json_pinned("].concat();
         assert_eq!(source.matches(&query_call).count(), 2);
         for suffix in [".json()", ".bytes()", ".text()"] {
             let needle = ["resp", suffix].concat();
@@ -963,17 +1022,6 @@ mod tests {
         for log_macro in ["debug!(", "info!(", "warn!(", "error!("] {
             assert!(!discovery.contains(log_macro));
         }
-    }
-
-    #[test]
-    fn discovery_client_is_process_reused_and_fallible() {
-        let source = include_str!("reconciliation.rs");
-        let fallible_static = ["OnceLock<Option<", "reqwest::Client>>"].concat();
-        assert_eq!(source.matches(&fallible_static).count(), 1);
-
-        let first = discovery_client().expect("test client should build");
-        let second = discovery_client().expect("test client should remain available");
-        assert!(std::ptr::eq(first, second));
     }
 
     #[test]

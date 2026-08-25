@@ -381,6 +381,64 @@ pub async fn fresh_clean_protocol_db(
     .execute(&mut *migration_connection)
     .await
     .expect("authorize operation-claim activation on the migration connection");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS federation_outbox (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            delivery_event_id TEXT,
+            target_service_did TEXT NOT NULL,
+            payload BYTEA NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status TEXT NOT NULL DEFAULT 'pending',
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("pre-create federation_outbox");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS outbound_queue (
+            id TEXT PRIMARY KEY,
+            target_ds_did TEXT NOT NULL,
+            target_endpoint TEXT NOT NULL,
+            method TEXT NOT NULL,
+            payload BYTEA NOT NULL,
+            convo_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            next_retry_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_error TEXT
+        )",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("pre-create outbound_queue");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS notification_outbox (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            delivery_event_id TEXT,
+            recipient_did TEXT NOT NULL,
+            recipient_device_id TEXT,
+            channel TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'sse',
+            payload BYTEA NOT NULL,
+            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status TEXT NOT NULL DEFAULT 'pending',
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(&mut *migration_connection)
+    .await
+    .expect("pre-create notification_outbox");
     let migration_result = migrator.run_direct(&mut *migration_connection).await;
     sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *migration_connection)
