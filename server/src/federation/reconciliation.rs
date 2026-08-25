@@ -802,7 +802,6 @@ fn hash_len_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::federation::resolver::ValidatedRemoteDestination;
     use axum::{
         body::Body,
         http::{Response, StatusCode},
@@ -988,8 +987,6 @@ mod tests {
             addrs: vec![addr],
         };
 
-        // Note: fetch_discovery_payload in production will accept &ValidatedRemoteDestination
-        // For now, let's call fetch_discovery_payload with destination endpoint to watch it fail or type check
         let discovery = fetch_discovery_payload(&destination).await;
         assert_eq!(discovery, Some(expected));
     }

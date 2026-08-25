@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::ack::DeliveryAck;
 use super::receipt::SequencerReceipt;
