@@ -98,7 +98,11 @@ pub async fn run_reconciliation_worker(
     self_did: String,
     shutdown: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let interval_secs = std::env::var("RECONCILIATION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!("Federation reconciliation worker started");
 
@@ -550,38 +554,41 @@ async fn apply_remote_clean_events(
             .clone()
             .unwrap_or_else(|| payload_sha256.to_vec());
 
-        let (actor_did, actor_device_id, actor_key_id, actor_auth_gen) = if !signed_req.is_empty() {
-            if let Ok(mutation) =
-                crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed_req)
-            {
-                let did = mutation.actor_did().as_str().to_string();
-                let dev_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
-                let key_id = mutation.key_id().as_str().to_string();
-                let auth_gen = mutation.auth_generation() as i64;
-                (did, dev_id, key_id, auth_gen)
-            } else {
-                (
-                    "did:web:unknown.actor".to_string(),
-                    uuid::Uuid::nil(),
-                    "unknown".to_string(),
-                    1i64,
-                )
-            }
-        } else {
-            (
-                "did:web:unknown.actor".to_string(),
-                uuid::Uuid::nil(),
-                "unknown".to_string(),
-                1i64,
-            )
-        };
-
         let empty_server_fields =
             serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
                 .unwrap_or_default();
 
-        let req_digest = Sha256::digest(&signed_req).to_vec();
-        let signature = vec![0u8; 64];
+        // For an application entry, the wire protocol carries only the signed
+        // request. The `chat.message_sends` side row that the deferred
+        // `entries_message_send_fk` requires is derived deterministically from
+        // the canonical signed mutation (transcript, request digest, signature)
+        // and the delivered payload — mirroring `deliver_message_replication`'s
+        // `append_exact_application_entry` side row. This is the same material
+        // the sequencer DS persisted when it accepted the send, so a remote
+        // mailbox reconciles to a byte-identical row.
+        let mut actor_did_final = "did:web:unknown.actor".to_string();
+        let mut actor_device_id_final = uuid::Uuid::nil();
+        let mut actor_key_id_final = "unknown".to_string();
+        let mut actor_auth_gen_final = 1i64;
+        let mut request_digest_bytes = Sha256::digest(&signed_req).to_vec();
+        let mut signature_bytes = vec![0u8; 64];
+        let mut transcript_bytes: Vec<u8> = Vec::new();
+        if !signed_req.is_empty() {
+            if let Ok(mutation) =
+                crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed_req)
+            {
+                actor_did_final = mutation.actor_did().as_str().to_string();
+                actor_device_id_final =
+                    uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
+                actor_key_id_final = mutation.key_id().as_str().to_string();
+                actor_auth_gen_final = mutation.auth_generation() as i64;
+                request_digest_bytes = mutation.request_digest().to_vec();
+                signature_bytes = mutation.signature().to_vec();
+                transcript_bytes = mutation.transcript_bytes().to_vec();
+            }
+        }
+        let req_digest = request_digest_bytes;
+        let signature = signature_bytes;
 
         sqlx::query(
             r#"
@@ -612,16 +619,59 @@ async fn apply_remote_clean_events(
         .bind(&signature)
         .bind(&empty_server_fields)
         .bind(&outer_fp)
-        .bind(&actor_did)
-        .bind(actor_device_id)
-        .bind(&actor_key_id)
-        .bind(actor_auth_gen)
+        .bind(&actor_did_final)
+        .bind(actor_device_id_final)
+        .bind(&actor_key_id_final)
+        .bind(actor_auth_gen_final)
         .bind(event.epoch)
         .bind(message_id)
         .bind(event.created_at)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
+
+        // Mirror the accepted send's `chat.message_sends` row so the deferred
+        // `entries_message_send_fk` (and the `message_sends_application_entry_fk`
+        // back-reference) hold. The `entries_message_identity_uq` on the entry
+        // guarantees at most one send per (conversation, message), so this
+        // insert is idempotent under replay.
+        if let Some(mid) = message_id {
+            let outcome_bytes = serde_json::to_vec(&serde_json::json!({
+                "entry": {
+                    "entryId": entry_id.to_string(),
+                    "conversationId": convo_id.to_string(),
+                    "seq": event.seq,
+                    "signedRequest": serde_json::from_slice::<serde_json::Value>(&signed_req)
+                        .unwrap_or(serde_json::Value::Null),
+                    "receivedAt": event.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                }
+            }))
+            .map_err(|e| format!("failed to serialize reconciled send outcome: {e}"))?;
+            let outcome_sha = Sha256::digest(&outcome_bytes).to_vec();
+            sqlx::query(
+                r#"
+                INSERT INTO chat.message_sends (
+                    conversation_id, message_id, signed_request_bytes,
+                    signing_transcript_bytes, request_digest, signature, status,
+                    accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', $7, $8, $9, $10)
+                ON CONFLICT (conversation_id, message_id) DO NOTHING
+                "#,
+            )
+            .bind(convo_id)
+            .bind(mid)
+            .bind(&signed_req)
+            .bind(&transcript_bytes)
+            .bind(&req_digest)
+            .bind(&signature)
+            .bind(event.seq)
+            .bind(&outcome_bytes)
+            .bind(&outcome_sha)
+            .bind(event.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("failed to insert reconciled message_sends row: {e}"))?;
+        }
 
         // Advance next_entry_seq in chat.conversations
         sqlx::query(
