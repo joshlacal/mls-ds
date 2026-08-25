@@ -639,7 +639,10 @@ impl AuthMiddleware {
             );
             return Ok(cached.doc);
         }
-
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(cached) = AUTH_MIDDLEWARE.did_cache.get(did).await {
+            return Ok(cached.doc);
+        }
         debug!(
             did = %crate::crypto::redact_for_log(did),
             "Resolving DID document"

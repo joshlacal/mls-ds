@@ -1,4 +1,5 @@
 pub mod ack;
+pub mod commit_submitter;
 pub mod declaration_client;
 pub mod envelope;
 pub mod errors;
@@ -15,6 +16,7 @@ pub mod transfer;
 pub mod upstream;
 
 pub use ack::*;
+pub use commit_submitter::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use envelope::*;
 pub use errors::{FederationError, ResolutionFailureKind};

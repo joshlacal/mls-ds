@@ -779,6 +779,24 @@ async fn main() -> anyhow::Result<()> {
         auth::AuthMiddleware::new(),
         resolver.clone(),
     ));
+    let commit_submitter = if fed_config.enabled {
+        let auth = service_auth.as_ref().unwrap_or_else(|| {
+            panic!(
+                "Refusing to start: federation is enabled but service_auth is unavailable for RemoteCommitSubmitter"
+            );
+        });
+        Some(Arc::new(
+            federation::commit_submitter::RemoteCommitSubmitter::new(
+                db_pool.clone(),
+                resolver.clone(),
+                outbound.clone(),
+                auth.clone(),
+                auth::AuthMiddleware::new(),
+            ),
+        ))
+    } else {
+        None
+    };
 
     // Receipt issuance has its own key and fixed DID verification method.
     // Issue mode fails startup closed; SIGNING_KEY_PEM is comparison-only and
@@ -884,9 +902,10 @@ async fn main() -> anyhow::Result<()> {
     // config becomes mandatory and its absence fails startup loudly rather than
     // silently 500-ing requests.
     let chat_runtime = Arc::new(
-        catbird_server::handlers::chat::ChatRuntime::from_env_with_resolver(
+        catbird_server::handlers::chat::ChatRuntime::from_env_with_federation(
             sse_state.clone(),
             resolver.clone(),
+            commit_submitter,
         )
         .unwrap_or_else(|error| {
             tracing::error!("clean-chat runtime configuration rejected: {error}");

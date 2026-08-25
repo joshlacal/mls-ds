@@ -28,14 +28,13 @@ use catbird_server::auth::{
     cache_test_did_document, AuthMiddleware, DidDocument, PublicKeyJwk, VerificationMethod,
 };
 use catbird_server::chat_protocol::test_support::repository::{
-    enqueue_clean_federation_message_jobs, enqueue_federated_commit_job,
-    enqueue_federated_welcome_job, AppendEntry,
+    build_federated_commit_envelope, derive_submit_commit_delivery_id,
+    enqueue_clean_federation_message_jobs, enqueue_federated_welcome_job, AppendEntry,
 };
 use catbird_server::federation::ack::AckSigner;
 use catbird_server::federation::envelope::{
-    compute_commit_envelope_digest, compute_message_envelope_digest,
-    compute_welcome_envelope_digest, sign_receipt, ValidatedEntryLocator, ValidatedEnvelopeHeader,
-    DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
+    sign_receipt, ValidatedEntryLocator, DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID,
+    SUBMIT_COMMIT_NSID,
 };
 use catbird_server::federation::outbound::OutboundClient;
 use catbird_server::federation::queue::OutboundQueue;
@@ -2130,67 +2129,70 @@ async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_r
 }
 
 #[tokio::test]
-async fn test_mailbox_commit_targeting_remote_sequencer_creates_typed_outbox_job_and_rollback() {
+async fn test_submit_commit_has_no_asynchronous_outbox_or_queue_job() {
     let (pool, _guard) = fresh_legacy_pool(DB_PREFIX, 4, 1).await;
     ensure_federation_peers_table(&pool).await;
 
     let convo_id = Uuid::new_v4();
+    let transition_id = Uuid::new_v4();
     let sequencer_ds = "did:web:sequencer.ds.example.com";
     let signed_request_bytes = b"{\"type\":\"signedCommitTransition\",\"signature\":\"valid_sig\"}";
 
-    let mut tx = pool.begin().await.unwrap();
+    // 1. Prove deterministic delivery ID derivation
+    let delivery_id1 = derive_submit_commit_delivery_id(convo_id, transition_id, sequencer_ds);
+    let delivery_id2 = derive_submit_commit_delivery_id(convo_id, transition_id, sequencer_ds);
+    assert_eq!(
+        delivery_id1, delivery_id2,
+        "Delivery ID must be deterministic"
+    );
+    assert_eq!(
+        delivery_id1.get_version_num(),
+        4,
+        "Delivery ID must be UUIDv4"
+    );
 
-    // Provision remote mailbox conversation
-    sqlx::query(
-        "INSERT INTO chat.conversations (
-            conversation_id, kind, lifecycle, current_generation, current_state_version,
-            next_entry_seq, created_at, is_remote, sequencer_ds, sequencer_term
-         ) VALUES ($1, 'group', 'active', 0, 0, 1, NOW(), TRUE, $2, 3)",
+    // 2. Build pure synchronous envelope without database side-effects
+    let envelope = build_federated_commit_envelope(
+        convo_id,
+        transition_id,
+        sequencer_ds,
+        signed_request_bytes,
+        3,
     )
-    .bind(convo_id)
-    .bind(sequencer_ds)
-    .execute(&mut *tx)
-    .await
     .unwrap();
 
-    let job_delivery_id =
-        enqueue_federated_commit_job(&mut tx, convo_id, sequencer_ds, signed_request_bytes, 3)
-            .await
-            .unwrap();
+    assert_eq!(
+        envelope.header.delivery_id.as_str(),
+        delivery_id1.to_string()
+    );
+    assert_eq!(
+        envelope.header.conversation_id.as_str(),
+        convo_id.to_string()
+    );
+    assert_eq!(envelope.header.sequencer_term, 3);
+    assert_eq!(envelope.signed_request_bytes.as_ref(), signed_request_bytes);
 
-    // Verify outbox row exists in tx
-    let row = sqlx::query(
-        "SELECT id, conversation_id, target_service_did, method, payload, payload_sha256, status \
-         FROM federation_outbox WHERE id = $1",
-    )
-    .bind(job_delivery_id.to_string())
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-
-    let method: String = row.get("method");
-    let target_ds: String = row.get("target_service_did");
-    let status: String = row.get("status");
-    let payload_sha: Vec<u8> = row.get("payload_sha256");
-
-    assert_eq!(method, SUBMIT_COMMIT_NSID);
-    assert_eq!(target_ds, sequencer_ds);
-    assert_eq!(status, "pending");
-    assert_eq!(payload_sha.len(), 32);
-
-    // Rollback transaction - proves atomic creation with transaction rollback
-    tx.rollback().await.unwrap();
-
-    let count_after_rollback: i64 =
+    // 3. Verify NO outbox or queue jobs exist anywhere for this commit
+    let outbox_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM federation_outbox WHERE conversation_id = $1")
             .bind(convo_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
-
     assert_eq!(
-        count_after_rollback, 0,
-        "Rollback must leave no federation_outbox commit job behind"
+        outbox_count, 0,
+        "submitCommit must never insert into federation_outbox"
+    );
+
+    let queue_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbound_queue WHERE convo_id = $1")
+            .bind(convo_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        queue_count, 0,
+        "submitCommit must never insert into outbound_queue"
     );
 }
 #[tokio::test]

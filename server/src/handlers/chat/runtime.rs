@@ -24,6 +24,7 @@ pub struct ChatRuntime {
     cursor_sealer: Option<CursorSealer>,
     subscription_endpoint: Option<String>,
     resolver: Option<Arc<crate::federation::DsResolver>>,
+    commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
 }
 
 impl fmt::Debug for ChatRuntime {
@@ -39,6 +40,10 @@ impl fmt::Debug for ChatRuntime {
                 &self.subscription_endpoint.is_some(),
             )
             .field("resolver_configured", &self.resolver.is_some())
+            .field(
+                "commit_submitter_configured",
+                &self.commit_submitter.is_some(),
+            )
             .finish()
     }
 }
@@ -84,6 +89,7 @@ impl ChatRuntime {
             cursor_sealer,
             subscription_endpoint,
             resolver: None,
+            commit_submitter: None,
         })
     }
 
@@ -105,12 +111,41 @@ impl ChatRuntime {
         self.resolver.as_ref()
     }
 
+    pub fn from_env_with_federation(
+        sse_state: Arc<SseState>,
+        resolver: Arc<crate::federation::DsResolver>,
+        commit_submitter: Option<Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>>,
+    ) -> Result<Self, String> {
+        let mut runtime = Self::from_env_with_resolver(sse_state, resolver)?;
+        runtime.commit_submitter = commit_submitter;
+        Ok(runtime)
+    }
+
+    pub fn with_commit_submitter(
+        mut self,
+        submitter: Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>,
+    ) -> Self {
+        self.commit_submitter = Some(submitter);
+        self
+    }
+
+    pub fn commit_submitter(
+        &self,
+    ) -> Option<&Arc<crate::federation::commit_submitter::RemoteCommitSubmitter>> {
+        self.commit_submitter.as_ref()
+    }
+
     /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at
     /// startup, whether to spawn the clean-chat background workers at all: while
     /// the gate is off nothing in this tree may touch `chat.*`, and a worker that
     /// was merely spawned-and-no-opping would still hold a timer.
     pub fn cutover_enabled(&self) -> bool {
         self.cutover_enabled
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn relationship_authority_for_test(&self) -> &Arc<ProductionRelationshipAuthority> {
+        &self.relationship_authority
     }
 
     pub(crate) fn relationship_authority(&self) -> &Arc<ProductionRelationshipAuthority> {

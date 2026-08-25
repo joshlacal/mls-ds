@@ -147,8 +147,11 @@ impl IntoResponse for ChatFailure {
 /// everything else the XRPC default 400.
 fn protocol_http_status(code: ChatProtocolErrorCode) -> StatusCode {
     use ChatProtocolErrorCode::{
-        AccountSessionExpired, DeviceBindingMismatch, DeviceNotRegistered, DeviceRevoked,
-        InvalidSignature, NotAuthorized, RateLimited, RelationshipPolicyUnavailable,
+        AccountSessionExpired, AcknowledgementConflict, AuthenticationGenerationConflict,
+        CancellationConflict, ConversationAlreadyExists, DeviceBindingMismatch,
+        DeviceNotRegistered, DeviceRevoked, IdempotencyConflict, InvalidSignature,
+        LeaveAlreadyPending, NotAuthorized, RateLimited, RelationshipPolicyUnavailable,
+        ResetAlreadyPending, StaleCoordinates,
     };
     match code {
         AccountSessionExpired
@@ -159,6 +162,14 @@ fn protocol_http_status(code: ChatProtocolErrorCode) -> StatusCode {
         | DeviceNotRegistered => StatusCode::UNAUTHORIZED,
         RateLimited => StatusCode::TOO_MANY_REQUESTS,
         RelationshipPolicyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        AcknowledgementConflict
+        | AuthenticationGenerationConflict
+        | CancellationConflict
+        | ConversationAlreadyExists
+        | IdempotencyConflict
+        | LeaveAlreadyPending
+        | ResetAlreadyPending
+        | StaleCoordinates => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     }
 }

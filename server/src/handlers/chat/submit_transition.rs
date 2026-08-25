@@ -93,9 +93,13 @@ async fn submit(
         .begin()
         .await
         .map_err(|_| ChatFailure::storage(ENDPOINT))?;
-    let prepared = prelude::prepare_signed_operation(&mut transaction, admission)
-        .await
-        .map_err(|error| context::operation_prelude_failure(ENDPOINT, error))?;
+    let prepared = match prelude::prepare_signed_operation(&mut transaction, admission).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("PRELUDE PREPARE ERROR ON CALL: {e:?}");
+            return Err(context::operation_prelude_failure(ENDPOINT, e));
+        }
+    };
     let mutation_kind = prepared
         .mutation_kind()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
@@ -113,6 +117,7 @@ async fn submit(
                 prepared,
                 runtime.relationship_authority().as_ref(),
                 routing_intent,
+                runtime.commit_submitter().map(|s| s.as_ref()),
             )
             .await
             .map_err(|error| submit_failure(mutation_kind, error))?;
@@ -194,6 +199,49 @@ fn submit_failure(
         E::StateMachine(s) => map_state_machine_error(mutation_kind, s),
         E::MissingMutation | E::UnsupportedMutation | E::InvalidCanonicalMaterial => {
             ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
+        }
+        E::Federation(fed_error) => {
+            tracing::warn!(?fed_error, "submitTransition remote federation error");
+            match fed_error {
+                crate::federation::FederationError::CommitConflict { .. }
+                | crate::federation::FederationError::DeliveryConflict { .. }
+                | crate::federation::FederationError::SequenceConflict { .. }
+                | crate::federation::FederationError::RemoteError { status: 409, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::StaleCoordinates)
+                }
+                crate::federation::FederationError::UnauthorizedParticipantDs { .. }
+                | crate::federation::FederationError::UnauthorizedRecipient { .. }
+                | crate::federation::FederationError::AuthFailed { .. }
+                | crate::federation::FederationError::RemoteError { status: 401, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::NotAuthorized)
+                }
+                crate::federation::FederationError::TermStale { .. }
+                | crate::federation::FederationError::InvalidCommitFraming { .. }
+                | crate::federation::FederationError::InvalidEnvelope { .. }
+                | crate::federation::FederationError::RemoteError { status: 400, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
+                }
+                crate::federation::FederationError::ConversationNotFound { .. }
+                | crate::federation::FederationError::RecipientNotFound { .. }
+                | crate::federation::FederationError::RemoteError { status: 404, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::ConversationNotFound)
+                }
+                crate::federation::FederationError::DsUnreachable { .. }
+                | crate::federation::FederationError::ResolutionFailed { .. }
+                | crate::federation::FederationError::SignerUnavailable
+                | crate::federation::FederationError::RemoteError { status: 503, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
+                }
+                crate::federation::FederationError::OutboundQueuePeerCapExceeded { .. }
+                | crate::federation::FederationError::OutboundQueueConvoPeerCapExceeded {
+                    ..
+                }
+                | crate::federation::FederationError::RemoteError { status: 429, .. } => {
+                    ChatFailure::protocol(ENDPOINT, C::RateLimited)
+                }
+                crate::federation::FederationError::Database(_) => ChatFailure::storage(ENDPOINT),
+                _ => ChatFailure::invariant(ENDPOINT),
+            }
         }
         E::Conversation(_) | E::ExecutionContext(_) | E::Executor(_) => {
             ChatFailure::invariant(ENDPOINT)

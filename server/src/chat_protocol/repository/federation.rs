@@ -2662,20 +2662,44 @@ pub async fn enqueue_federated_welcome_job(
     Ok(delivery_id)
 }
 
-/// Enqueue a `blue.catbird.mlsDS.submitCommit` job from a mailbox to a sequencer.
-pub async fn enqueue_federated_commit_job(
-    tx: &mut Transaction<'_, Postgres>,
+/// Derive a deterministic canonical UUIDv4 delivery ID for submitCommit.
+pub fn derive_submit_commit_delivery_id(
     conversation_id: Uuid,
+    transition_id: Uuid,
+    sequencer_ds_did: &str,
+) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"blue.catbird.mlsDS.submitCommit\0");
+    hasher.update(conversation_id.as_bytes());
+    hasher.update(transition_id.as_bytes());
+    hasher.update(canonical_did(sequencer_ds_did).as_bytes());
+    let digest = hasher.finalize();
+    let mut uuid_bytes: [u8; 16] = digest[..16].try_into().expect("slice has length 16");
+    uuid_bytes[6] = (uuid_bytes[6] & 0x0f) | 0x40;
+    uuid_bytes[8] = (uuid_bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(uuid_bytes)
+}
+
+/// Build a deterministic `blue.catbird.mlsDS.submitCommit` envelope from a mailbox to a sequencer.
+pub fn build_federated_commit_envelope(
+    conversation_id: Uuid,
+    transition_id: Uuid,
     sequencer_ds_did: &str,
     signed_request_bytes: &[u8],
     sequencer_term: u64,
-) -> Result<Uuid, FederationError> {
+) -> Result<
+    catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit<
+        jacquard_common::DefaultStr,
+    >,
+    FederationError,
+> {
     use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
     use jacquard_common::deps::bytes::Bytes;
     use jacquard_common::deps::smol_str::SmolStr;
     use jacquard_common::types::string::Did;
 
-    let delivery_id = Uuid::new_v4();
+    let delivery_id =
+        derive_submit_commit_delivery_id(conversation_id, transition_id, sequencer_ds_did);
     let self_base_did = service_did_base();
     let target = canonical_did(sequencer_ds_did).to_string();
 
@@ -2721,19 +2745,5 @@ pub async fn enqueue_federated_commit_job(
         extra_data: None,
     };
 
-    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
-    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
-
-    insert_federation_outbox_job(
-        tx,
-        delivery_id,
-        conversation_id,
-        sequencer_ds_did,
-        SUBMIT_COMMIT_NSID,
-        &payload,
-        &payload_sha256,
-    )
-    .await?;
-
-    Ok(delivery_id)
+    Ok(msg)
 }
