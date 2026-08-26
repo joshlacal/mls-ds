@@ -155,7 +155,7 @@ async fn lock_head(
         return Err(MessageDeliveryError::InvalidCoordinates);
     }
     if super::core::is_conversation_quarantined(tx, expected.conversation_id).await? {
-        return Err(MessageDeliveryError::InvalidCoordinates);
+        return Err(MessageDeliveryError::IdempotencyConflict);
     }
     let next_seq: i64 = row.try_get("next_entry_seq")?;
     Ok(Head {

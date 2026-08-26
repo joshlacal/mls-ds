@@ -53,6 +53,7 @@ use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row as _;
 use tower_util::ServiceExt;
 use transcript::{
     build_verified_application_entry, build_verified_control_entry,
@@ -2902,6 +2903,440 @@ fn make_corpus_commit_body(
     wrapper["signature"] = Value::String(STANDARD.encode(sig.to_bytes()));
     let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
     (wrapper, signed_bytes)
+}
+fn make_message_body_with_coordinates(
+    convo_id: Uuid,
+    message_id: Uuid,
+    actor: &TestActor,
+    group_id: &[u8],
+    state_version: i64,
+    epoch: i64,
+    group_context_hash: &[u8; 32],
+    confirmation_tag: &[u8; 32],
+    attachments: Vec<Value>,
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let msg_bytes = vec![0x31u8; 8];
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#applicationSendBody",
+        "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0}",
+        "messageId": message_id.to_string(),
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "prior": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": state_version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active"
+        },
+        "aad": {
+            "protocolVersion": "1",
+            "conversationId": STANDARD.encode(convo_id.as_bytes()),
+            "generation": 0,
+            "messageId": STANDARD.encode(message_id.as_bytes()),
+            "prior": {
+                "conversationId": STANDARD.encode(convo_id.as_bytes()),
+                "generation": 0,
+                "stateVersion": state_version,
+                "groupId": STANDARD.encode(group_id),
+                "epoch": epoch,
+                "groupContextHash": STANDARD.encode(group_context_hash),
+                "confirmationTag": STANDARD.encode(confirmation_tag),
+                "lifecycle": "active"
+            }
+        },
+        "applicationMessage": {
+            "framing": "mlsMessage",
+            "contentType": "privateMessageApplication",
+            "bytes": STANDARD.encode(&msg_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(&msg_bytes))
+        },
+        "blobBindings": attachments,
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = Value::String(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
+fn make_typing_body(
+    convo_id: Uuid,
+    typing_id: Uuid,
+    actor: &TestActor,
+    group_id: &[u8],
+    state_version: i64,
+    epoch: i64,
+    group_context_hash: &[u8; 32],
+    confirmation_tag: &[u8; 32],
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#typingBody",
+        "signatureDomain": "CATBIRD-CHAT-TYPING\u{0}",
+        "typingId": typing_id.to_string(),
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "coordinates": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": state_version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active"
+        },
+        "isTyping": true,
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = json!(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
+fn make_leave_request_body(
+    convo_id: Uuid,
+    leave_req_id: Uuid,
+    actor: &TestActor,
+    group_id: &[u8],
+    state_version: i64,
+    epoch: i64,
+    group_context_hash: &[u8; 32],
+    confirmation_tag: &[u8; 32],
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#leaveRequestBody",
+        "signatureDomain": "CATBIRD-CHAT-LEAVE-REQUEST\u{0}",
+        "leaveRequestId": leave_req_id.to_string(),
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "prior": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": state_version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active"
+        },
+        "idempotencyKey": leave_req_id.to_string(),
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = json!(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
+fn make_device_revocation_body(
+    actor: &TestActor,
+    target_device_id: Uuid,
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let idemp = Uuid::new_v4();
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#deviceRevocationBody",
+        "signatureDomain": "CATBIRD-CHAT-DEVICE-REVOKE\u{0}",
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "targetDeviceId": target_device_id.to_string(),
+        "targetAuthGeneration": 1,
+        "idempotencyKey": idemp.to_string(),
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = json!(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
+fn make_welcome_acknowledgement_body(
+    convo_id: Uuid,
+    welcome_id: Uuid,
+    transition_seq: i64,
+    actor: &TestActor,
+    group_id: &[u8],
+    state_version: i64,
+    epoch: i64,
+    group_context_hash: &[u8; 32],
+    confirmation_tag: &[u8; 32],
+    now: DateTime<Utc>,
+) -> (Value, Vec<u8>) {
+    let idemp = Uuid::new_v4();
+    let unsigned = json!({
+        "$type": "blue.catbird.chat.defs#welcomeAcknowledgementBody",
+        "signatureDomain": "CATBIRD-CHAT-WELCOME-ACK\u{0}",
+        "welcomeId": welcome_id.to_string(),
+        "transitionSeq": transition_seq,
+        "actorDid": actor.did,
+        "actorDeviceId": actor.device_id.to_string(),
+        "keyId": actor.key_id,
+        "authGeneration": 1,
+        "coordinates": {
+            "conversationId": convo_id.to_string(),
+            "generation": 0,
+            "stateVersion": state_version,
+            "groupId": STANDARD.encode(group_id),
+            "epoch": epoch,
+            "groupContextHash": STANDARD.encode(group_context_hash),
+            "confirmationTag": STANDARD.encode(confirmation_tag),
+            "lifecycle": "active"
+        },
+        "idempotencyKey": idemp.to_string(),
+        "signedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
+
+    let mut wrapper = json!({
+        "body": unsigned,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned_bytes = serde_json::to_vec(&wrapper).unwrap();
+    let mutation = decode_canonical_signed_mutation(&unsigned_bytes).unwrap();
+    let sig: ed25519_dalek::Signature = actor.signing_key.sign(mutation.transcript_bytes());
+    wrapper["signature"] = json!(STANDARD.encode(sig.to_bytes()));
+    let signed_bytes = serde_json::to_vec(&wrapper).unwrap();
+    (wrapper, signed_bytes)
+}
+
+async fn assert_applied_suffix_entry_and_message_send_exact_fields(
+    pool: &DbPool,
+    convo_id: Uuid,
+    expected_seq: i64,
+    expected_entry_id: Uuid,
+    expected_message_id: Uuid,
+    expected_actor: &TestActor,
+    expected_entry_bytes: &[u8],
+    expected_entry_sha256: &[u8],
+    expected_signed_req_bytes: &[u8],
+    expected_outer_fp: &[u8],
+    expected_transcript_bytes: &[u8],
+    expected_request_digest: &[u8],
+    expected_signature: &[u8],
+) {
+    let row = sqlx::query(
+        r#"
+        SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch,
+               entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256,
+               signed_request_bytes, request_digest, signature, outer_entry_fingerprint,
+               actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+               generation, message_id, received_at
+        FROM chat.entries
+        WHERE conversation_id = $1 AND seq = $2
+        "#,
+    )
+    .bind(convo_id)
+    .bind(expected_seq)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    let seq: i64 = row.get("seq");
+    let epoch: i64 = row.get("epoch");
+    let entry_id: Uuid = row.get("entry_id");
+    let entry_kind: String = row.get("entry_kind");
+    let accepted_payload_bytes: Vec<u8> = row.get("accepted_payload_bytes");
+    let accepted_payload_sha256: Vec<u8> = row.get("accepted_payload_sha256");
+    let signed_request_bytes: Vec<u8> = row.get("signed_request_bytes");
+    let request_digest: Vec<u8> = row.get("request_digest");
+    let signature: Vec<u8> = row.get("signature");
+    let outer_entry_fingerprint: Vec<u8> = row.get("outer_entry_fingerprint");
+    let actor_did: String = row.get("actor_did");
+    let actor_device_id: Uuid = row.get("actor_device_id");
+    let actor_key_id: String = row.get("actor_key_id");
+    let actor_auth_generation: i64 = row.get("actor_auth_generation");
+    let generation: i64 = row.get("generation");
+    let message_id: Uuid = row.get("message_id");
+    let received_at: DateTime<Utc> = row.get("received_at");
+
+    assert_eq!(seq, expected_seq, "seq mismatch at seq {expected_seq}");
+    assert_eq!(epoch, 0, "epoch mismatch at seq {expected_seq}");
+    assert_eq!(
+        entry_id, expected_entry_id,
+        "entry_id mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        entry_kind, "blue.catbird.chat.defs#applicationEntry",
+        "entry_kind mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        accepted_payload_bytes.as_slice(),
+        expected_entry_bytes,
+        "accepted_payload_bytes mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        accepted_payload_sha256.as_slice(),
+        expected_entry_sha256,
+        "accepted_payload_sha256 mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        signed_request_bytes.as_slice(),
+        expected_signed_req_bytes,
+        "signed_request_bytes mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        request_digest.as_slice(),
+        expected_request_digest,
+        "request_digest mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        signature.as_slice(),
+        expected_signature,
+        "signature mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        outer_entry_fingerprint.as_slice(),
+        expected_outer_fp,
+        "outer_entry_fingerprint mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        actor_did, expected_actor.did,
+        "actor_did mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        actor_device_id, expected_actor.device_id,
+        "actor_device_id mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        actor_key_id, expected_actor.key_id,
+        "actor_key_id mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        actor_auth_generation, 1,
+        "actor_auth_generation mismatch at seq {expected_seq}"
+    );
+    assert_eq!(generation, 0, "generation mismatch at seq {expected_seq}");
+    assert_eq!(
+        message_id, expected_message_id,
+        "message_id mismatch at seq {expected_seq}"
+    );
+
+    let expected_outcome_bytes = serde_json::to_vec(&serde_json::json!({
+        "entry": {
+            "entryId": expected_entry_id.to_string(),
+            "conversationId": convo_id.to_string(),
+            "seq": expected_seq,
+            "signedRequest": serde_json::from_slice::<serde_json::Value>(expected_signed_req_bytes).unwrap_or(serde_json::Value::Null),
+            "receivedAt": received_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+        }
+    }))
+    .unwrap();
+
+    let expected_outcome_sha256 = Sha256::digest(&expected_outcome_bytes).to_vec();
+
+    let send: (
+        Uuid,
+        Uuid,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+    ) = sqlx::query_as(
+        r#"
+        SELECT conversation_id, message_id, signed_request_bytes,
+               signing_transcript_bytes, request_digest, signature,
+               status, accepted_entry_seq, outcome_bytes, outcome_sha256
+        FROM chat.message_sends
+        WHERE conversation_id = $1 AND message_id = $2
+        "#,
+    )
+    .bind(convo_id)
+    .bind(expected_message_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        send.0, convo_id,
+        "message_sends conversation_id mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.1, expected_message_id,
+        "message_sends message_id mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.2, expected_signed_req_bytes,
+        "message_sends signed_request_bytes mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.3.as_slice(),
+        expected_transcript_bytes,
+        "message_sends signing_transcript_bytes mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.4.as_slice(),
+        expected_request_digest,
+        "message_sends request_digest mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.5.as_slice(),
+        expected_signature,
+        "message_sends signature mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.6, "accepted",
+        "message_sends status mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.7, expected_seq,
+        "message_sends accepted_entry_seq mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.8, expected_outcome_bytes,
+        "message_sends outcome_bytes mismatch at seq {expected_seq}"
+    );
+    assert_eq!(
+        send.9.as_slice(),
+        expected_outcome_sha256.as_slice(),
+        "message_sends outcome_sha256 mismatch at seq {expected_seq}"
+    );
 }
 
 // =============================================================================
@@ -7852,6 +8287,22 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
             .unwrap();
     assert_eq!(entry_count, 2, "suffix entry must be applied to DS2");
 
+    assert_applied_suffix_entry_and_message_send_exact_fields(
+        &harness.pool,
+        convo_id,
+        2,
+        msg_entry_id_2,
+        msg_id_2,
+        &alice,
+        &ciphertext_2,
+        &payload_sha256_2,
+        &signed_req_bytes_2,
+        &outer_fp_2,
+        built_2.mutation().transcript_bytes(),
+        built_2.mutation().request_digest().as_slice(),
+        built_2.mutation().signature().as_slice(),
+    )
+    .await;
     let sync_state: (String, i64, Option<String>) = sqlx::query_as(
         "SELECT status, last_seq, quarantine_reason FROM federation_sync_state WHERE convo_id = $1",
     )
@@ -8566,8 +9017,13 @@ async fn test_quarantine_vs_blocked_mailbox_writer_ordering_rejects_and_preserve
 
     let before = capture_mailbox_snapshot(&harness.pool).await;
 
-    // 1. Hold the row lock on chat.conversations
+    // 1. Hold the row lock on chat.conversations and record the holder's backend PID
     let mut tx_lock = harness.pool.begin().await.unwrap();
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx_lock)
+        .await
+        .unwrap();
+
     let _: (bool,) = sqlx::query_as(
         "SELECT is_remote FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
     )
@@ -8590,8 +9046,37 @@ async fn test_quarantine_vs_blocked_mailbox_writer_ordering_rejects_and_preserve
         .await
     });
 
-    // Brief yield so the writer enters the handler and blocks on FOR UPDATE
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Poll PostgreSQL lock state until the writer backend is blocked by the holder PID
+    let start = std::time::Instant::now();
+    let mut blocked = false;
+    let mut blocked_pid = 0;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let blocked_row: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT pid
+            FROM pg_stat_activity
+            WHERE $1 = ANY(pg_blocking_pids(pid))
+              AND pid != $1
+            "#,
+        )
+        .bind(holder_pid)
+        .fetch_optional(&harness.pool)
+        .await
+        .unwrap();
+
+        if let Some((pid,)) = blocked_row {
+            blocked = true;
+            blocked_pid = pid;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        blocked,
+        "production writer (pid {}) must be blocked by holder pid {} on chat.conversations row lock",
+        blocked_pid,
+        holder_pid
+    );
 
     // 3. Update federation_sync_state to quarantined
     sqlx::query(
@@ -8615,8 +9100,6 @@ async fn test_quarantine_vs_blocked_mailbox_writer_ordering_rejects_and_preserve
 
     // 4. Release the row lock
     tx_lock.commit().await.unwrap();
-
-    // 5. Observe writer unblocks and rejects with 409 DeliveryConflict
     let (status, body, _) = writer_handle.await.unwrap();
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(
@@ -8986,6 +9469,19 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     .await
     .unwrap();
 
+    struct GeneratedSuffix {
+        seq: i64,
+        msg_entry_id: Uuid,
+        msg_id: Uuid,
+        ciphertext: Vec<u8>,
+        payload_sha256: [u8; 32],
+        signed_req_bytes: Vec<u8>,
+        outer_fp: [u8; 32],
+        transcript_bytes: Vec<u8>,
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+    }
+
     // Generate 505 suffix events (seq 2..=506)
     let mut all_events = Vec::with_capacity(506);
     all_events.push(serde_json::json!({
@@ -9005,6 +9501,8 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     let mut all_digest_rows = Vec::with_capacity(506);
     all_digest_rows.push(local_row_1);
 
+    let mut generated_suffix = Vec::with_capacity(505);
+
     for seq in 2..=506 {
         let msg_id = Uuid::new_v4();
         let msg_entry_id = Uuid::new_v4();
@@ -9012,6 +9510,9 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             make_message_body(convo_id, msg_id, &alice, &group_id, vec![], now);
         let mutation =
             decode_and_verify_signed_mutation(&signed_req_bytes, &alice.public_key).unwrap();
+        let transcript_bytes = mutation.transcript_bytes().to_vec();
+        let request_digest = *mutation.request_digest();
+        let signature = *mutation.signature();
         let received_at = TrustedRequestInstant::from_canonical_for_test(
             CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
         );
@@ -9024,8 +9525,8 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
         )
         .unwrap();
         let ciphertext = built.canonical_entry_bytes().to_vec();
-        let payload_sha256 = built.accepted_payload_sha256().to_vec();
-        let outer_fp = built.outer_application_fingerprint().to_vec();
+        let payload_sha256 = *built.accepted_payload_sha256();
+        let outer_fp = *built.outer_application_fingerprint();
 
         all_digest_rows.push(CleanDigestRow {
             seq: seq as i64,
@@ -9033,9 +9534,9 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             entry_id: msg_entry_id,
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
             accepted_payload_bytes: ciphertext.clone(),
-            accepted_payload_sha256: payload_sha256.clone(),
+            accepted_payload_sha256: payload_sha256.to_vec(),
             signed_request_bytes: signed_req_bytes.clone(),
-            outer_entry_fingerprint: outer_fp.clone(),
+            outer_entry_fingerprint: outer_fp.to_vec(),
             received_at: now,
         });
 
@@ -9052,6 +9553,19 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes)},
             "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp)}
         }));
+
+        generated_suffix.push(GeneratedSuffix {
+            seq: seq as i64,
+            msg_entry_id,
+            msg_id,
+            ciphertext,
+            payload_sha256,
+            signed_req_bytes,
+            outer_fp,
+            transcript_bytes,
+            request_digest,
+            signature,
+        });
     }
 
     let total_digest_sha256 = compute_clean_convo_digest(&all_digest_rows);
@@ -9075,15 +9589,36 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     let page3_events = all_events[260..390].to_vec();
     let page4_events = all_events[390..506].to_vec();
 
+    let pagination_requests: Arc<tokio::sync::Mutex<Vec<(i64, i64)>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let pagination_requests_clone = pagination_requests.clone();
+
     let convo_id_clone = convo_id_str.clone();
     let app = axum::Router::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.getConvoDigest",
             axum::routing::get({
                 let d = serde_json::to_vec(&digest_output).unwrap();
-                move || {
+                let exp_cid = convo_id_clone.clone();
+                move |headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let b = d.clone();
+                    let exp_c = exp_cid.clone();
                     async move {
+                        let auth_hdr = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
+                        if auth_hdr != "Bearer test-token" {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(r#"{"error":"NotAuthorized","message":"invalid token"}"#))
+                                .unwrap();
+                        }
+                        if params.get("convoId").map(|s| s.as_str()) != Some(&exp_c) {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(r#"{"error":"InvalidRequest","message":"invalid convoId"}"#))
+                                .unwrap();
+                        }
                         axum::response::Response::builder()
                             .status(200)
                             .header("content-type", "application/json")
@@ -9100,26 +9635,72 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
                 let p2 = page2_events.clone();
                 let p3 = page3_events.clone();
                 let p4 = page4_events.clone();
-                let c_id = convo_id_clone.clone();
-                move |axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                let exp_cid = convo_id_clone.clone();
+                let req_recorder = pagination_requests_clone.clone();
+                move |headers: axum::http::HeaderMap, axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let p1_c = p1.clone();
                     let p2_c = p2.clone();
                     let p3_c = p3.clone();
                     let p4_c = p4.clone();
-                    let c_id_c = c_id.clone();
+                    let exp_c = exp_cid.clone();
+                    let recorder = req_recorder.clone();
                     async move {
-                        let from_seq: i64 = params.get("afterSeq").or_else(|| params.get("fromSeqExclusive")).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let auth_hdr = headers.get("authorization").and_then(|h| h.to_str().ok()).unwrap_or("");
+                        if auth_hdr != "Bearer test-token" {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(r#"{"error":"NotAuthorized","message":"invalid token"}"#))
+                                .unwrap();
+                        }
+                        if params.get("convoId").map(|s| s.as_str()) != Some(&exp_c) {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(r#"{"error":"InvalidRequest","message":"invalid convoId"}"#))
+                                .unwrap();
+                        }
+                        let limit: i64 = match params.get("limit").and_then(|s| s.parse().ok()) {
+                            Some(l) if l > 0 && l <= 500 => l,
+                            _ => {
+                                return axum::response::Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .header("content-type", "application/json")
+                                    .body(axum::body::Body::from(r#"{"error":"InvalidRequest","message":"invalid limit"}"#))
+                                    .unwrap();
+                            }
+                        };
+                        let from_seq: i64 = match params.get("afterSeq").or_else(|| params.get("fromSeqExclusive")).and_then(|s| s.parse().ok()) {
+                            Some(s) => s,
+                            None => {
+                                return axum::response::Response::builder()
+                                    .status(StatusCode::BAD_REQUEST)
+                                    .header("content-type", "application/json")
+                                    .body(axum::body::Body::from(r#"{"error":"InvalidRequest","message":"missing afterSeq"}"#))
+                                    .unwrap();
+                            }
+                        };
+
                         let (events, to_seq) = if from_seq == 0 {
                             (p1_c, 130)
                         } else if from_seq == 130 {
                             (p2_c, 260)
                         } else if from_seq == 260 {
                             (p3_c, 390)
-                        } else {
+                        } else if from_seq == 390 {
                             (p4_c, 506)
+                        } else {
+                            return axum::response::Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(r#"{"error":"InvalidRequest","message":"unexpected afterSeq"}"#))
+                                .unwrap();
                         };
+
+                        recorder.lock().await.push((from_seq, limit));
+
                         let payload = serde_json::json!({
-                            "convoId": c_id_c,
+                            "convoId": exp_c,
                             "fromSeqExclusive": from_seq,
                             "toSeqInclusive": to_seq,
                             "events": events
@@ -9214,6 +9795,17 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
         passes
     );
 
+    // Verify exact authenticated pagination sequence
+    let reqs = pagination_requests.lock().await.clone();
+    assert!(
+        reqs.len() >= 4,
+        "must have made at least 4 pagination requests"
+    );
+    assert_eq!(reqs[0], (0, 500));
+    assert_eq!(reqs[1], (130, 500));
+    assert_eq!(reqs[2], (260, 500));
+    assert_eq!(reqs[3], (390, 500));
+
     let final_next_seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
     )
@@ -9223,7 +9815,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     .unwrap();
     assert_eq!(final_next_seq, 507, "next_entry_seq must advance to 507");
 
-    // Suffix fidelity: verify all 506 rows match full immutable fields in chat.entries
+    // Suffix fidelity: verify all 505 suffix rows match full immutable fields in chat.entries and chat.message_sends
     let entry_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM chat.entries WHERE conversation_id = $1")
             .bind(convo_id)
@@ -9231,11 +9823,29 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             .await
             .unwrap();
     assert_eq!(entry_count, 506);
+
+    for item in &generated_suffix {
+        assert_applied_suffix_entry_and_message_send_exact_fields(
+            &harness.pool,
+            convo_id,
+            item.seq,
+            item.msg_entry_id,
+            item.msg_id,
+            &alice,
+            &item.ciphertext,
+            &item.payload_sha256,
+            &item.signed_req_bytes,
+            &item.outer_fp,
+            &item.transcript_bytes,
+            &item.request_digest,
+            &item.signature,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn test_reconciliation_inconsistent_remote_digest_or_discontinuous_page_gives_zero_writes_and_no_quarantine(
-) {
+async fn test_reconciliation_inconsistent_remote_digest_gives_zero_writes_and_no_quarantine() {
     let harness = TestHarness::new("recon-inconsistent").await;
     let now = Utc::now();
     let convo_id = Uuid::new_v4();
@@ -9266,7 +9876,7 @@ async fn test_reconciliation_inconsistent_remote_digest_or_discontinuous_page_gi
     .await
     .unwrap();
 
-    // Case A: Advertised digest SHA does NOT match the events stream
+    // Advertised digest SHA does NOT match the events stream
     let convo_id_str = convo_id.to_string();
     let seq_did_clone = harness.sequencer_ds_did.clone();
     let digest_output = GetConvoDigestOutput {
@@ -9414,6 +10024,435 @@ async fn test_reconciliation_inconsistent_remote_digest_or_discontinuous_page_gi
 }
 
 #[tokio::test]
+async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quarantine() {
+    let harness = TestHarness::new("recon-oversized").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x67u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    // Generate 501 events in one page (> 500 limit)
+    let mut oversized_events = Vec::with_capacity(501);
+    oversized_events.push(serde_json::json!({
+        "seq": 1,
+        "epoch": local_row_1.epoch,
+        "msgId": local_row_1.entry_id.to_string(),
+        "messageType": local_row_1.entry_kind,
+        "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+        "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+        "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "entryId": local_row_1.entry_id.to_string(),
+        "entryKind": local_row_1.entry_kind,
+        "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+        "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+    }));
+
+    for seq in 2..=501 {
+        let msg_id = Uuid::new_v4();
+        let msg_entry_id = Uuid::new_v4();
+        let (_, signed_req_bytes) =
+            make_message_body(convo_id, msg_id, &alice, &group_id, vec![], now);
+        let mutation =
+            decode_and_verify_signed_mutation(&signed_req_bytes, &alice.public_key).unwrap();
+        let received_at = TrustedRequestInstant::from_canonical_for_test(
+            CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+        );
+        let built = build_verified_application_entry(
+            mutation,
+            CanonicalUuidV4::parse(&msg_entry_id.to_string()).unwrap(),
+            CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+            seq as u64,
+            &received_at,
+        )
+        .unwrap();
+        let ciphertext = built.canonical_entry_bytes().to_vec();
+        let outer_fp = built.outer_application_fingerprint().to_vec();
+
+        oversized_events.push(serde_json::json!({
+            "seq": seq,
+            "epoch": 0,
+            "msgId": msg_id.to_string(),
+            "messageType": "blue.catbird.chat.defs#applicationEntry",
+            "ciphertext": {"$bytes": STANDARD.encode(&ciphertext)},
+            "paddedSize": ciphertext.len() as i64,
+            "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "entryId": msg_entry_id.to_string(),
+            "entryKind": "blue.catbird.chat.defs#applicationEntry",
+            "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes)},
+            "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp)}
+        }));
+    }
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 501,
+        event_count: 501,
+        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        generated_at: now,
+    };
+
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 501,
+        "events": oversized_events
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail on oversized peer page (>500 limit)"
+    );
+
+    let sync_state: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM federation_sync_state WHERE convo_id = $1")
+            .bind(&convo_id_str)
+            .fetch_optional(&harness.pool)
+            .await
+            .unwrap();
+    assert!(
+        sync_state.is_none() || sync_state.unwrap().0 != "quarantined",
+        "oversized peer page must NOT quarantine"
+    );
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "oversized peer page must leave all clean tables byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_writes_and_no_quarantine(
+) {
+    let harness = TestHarness::new("recon-discont").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x68u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let msg_id_3 = Uuid::new_v4();
+    let msg_entry_id_3 = Uuid::new_v4();
+    let (_, signed_req_bytes_3) =
+        make_message_body(convo_id, msg_id_3, &alice, &group_id, vec![], now);
+    let mutation_3 =
+        decode_and_verify_signed_mutation(&signed_req_bytes_3, &alice.public_key).unwrap();
+    let received_at_3 = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let built_3 = build_verified_application_entry(
+        mutation_3,
+        CanonicalUuidV4::parse(&msg_entry_id_3.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        3, // Note seq 3 skipping seq 2!
+        &received_at_3,
+    )
+    .unwrap();
+    let ciphertext_3 = built_3.canonical_entry_bytes().to_vec();
+    let outer_fp_3 = built_3.outer_application_fingerprint().to_vec();
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 3,
+        event_count: 2,
+        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        generated_at: now,
+    };
+
+    // Events page has sequence 1 followed by sequence 3 (discontinuous!)
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 3,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            },
+            {
+                "seq": 3, // Discontinuous: expected 2, got 3
+                "epoch": 0,
+                "msgId": msg_id_3.to_string(),
+                "messageType": "blue.catbird.chat.defs#applicationEntry",
+                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_3)},
+                "paddedSize": ciphertext_3.len() as i64,
+                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": msg_entry_id_3.to_string(),
+                "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_3)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_3)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail on discontinuous peer page"
+    );
+
+    let sync_state: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM federation_sync_state WHERE convo_id = $1")
+            .bind(&convo_id_str)
+            .fetch_optional(&harness.pool)
+            .await
+            .unwrap();
+    assert!(
+        sync_state.is_none() || sync_state.unwrap().0 != "quarantined",
+        "discontinuous peer page must NOT quarantine"
+    );
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "discontinuous peer page must leave all clean tables byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
 async fn test_reconciliation_concurrent_local_head_movement_aborts_without_writes_or_quarantine() {
     let harness = TestHarness::new("recon-concur-head").await;
     let now = Utc::now();
@@ -9429,7 +10468,7 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
         Some(&harness.sequencer_ds_did),
         0,
         &alice,
-        Some(&harness.sender_ds_did),
+        None,
         now,
     )
     .await;
@@ -9541,8 +10580,60 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
         ]
     });
 
-    let pool_clone = harness.pool.clone();
-    let convo_id_for_hook = convo_id;
+    let delivery_id_c = Uuid::new_v4();
+    let mut header_model_c = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id: delivery_id_c,
+        conversation_id: convo_id,
+        sender_ds_did: harness.sequencer_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: harness.sequencer_ds_did.clone(),
+        sequencer_term: 0,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
+        payload_sha256: [0u8; 32],
+    };
+    let locator_model_c = ValidatedEntryLocator {
+        entry_id: msg_entry_id_2,
+        seq: 2,
+        accepted_payload_sha256: *built_2.accepted_payload_sha256(),
+        outer_entry_fingerprint: *built_2.outer_application_fingerprint(),
+    };
+    let msg_digest_c = compute_message_envelope_digest(
+        &header_model_c,
+        &alice.did,
+        &locator_model_c,
+        &ciphertext_2,
+        &signed_req_bytes_2,
+    )
+    .unwrap();
+    header_model_c.payload_sha256 = msg_digest_c;
+
+    let deliver_msg_body_c = json!({
+        "header": make_envelope_header_json(
+            delivery_id_c,
+            convo_id,
+            &harness.sequencer_ds_did,
+            LOCAL_DS_DID,
+            &harness.sequencer_ds_did,
+            0,
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &msg_digest_c,
+        ),
+        "entryLocator": make_entry_locator_json(msg_entry_id_2, 2, built_2.accepted_payload_sha256(), built_2.outer_application_fingerprint()),
+        "recipientDid": alice.did,
+        "entryBytes": { "$bytes": STANDARD.encode(&ciphertext_2) },
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes_2) },
+    });
+    let jwt_c = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_MESSAGE_NSID,
+    );
+
+    let router_for_hook = harness.router.clone();
     let app = axum::Router::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.getConvoDigest",
@@ -9565,86 +10656,28 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
             axum::routing::get({
                 let events_bytes = serde_json::to_vec(&events_output).unwrap();
                 let shared_ctx = Arc::new((
-                    pool_clone,
-                    convo_id_for_hook,
-                    alice.did.clone(),
-                    alice.device_id,
-                    alice.key_id.clone(),
-                    alice.signing_key.clone(),
-                    alice.public_key,
-                    group_id.clone(),
-                    now,
+                    router_for_hook,
+                    jwt_c,
+                    deliver_msg_body_c,
                     events_bytes,
                 ));
                 move || {
                     let ctx = shared_ctx.clone();
                     async move {
-                        // Concurrent local entry insertion during the events fetch!
-                        let (ref p, convo_id_h, ref a_did, a_dev, ref a_kid, ref a_sk, a_pk, ref gid, now_t, ref b) = *ctx;
-                        let actor_h = TestActor {
-                            did: a_did.clone(),
-                            device_id: a_dev,
-                            key_id: a_kid.clone(),
-                            signing_key: a_sk.clone(),
-                            public_key: a_pk,
-                        };
-                        let msg_id_c = Uuid::new_v4();
-                        let (_, signed_req_bytes_c) = make_message_body(convo_id_h, msg_id_c, &actor_h, gid, vec![], now_t);
-                        let rec_at_c = TrustedRequestInstant::from_canonical_for_test(
-                            CanonicalTimestamp::parse(&now_t.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+                        // Concurrent local entry insertion through the production router during events fetch!
+                        let (r, jwt_h, deliver_body_h, b) = &*ctx;
+                        let (status, body, _) = send_json_to_router(
+                            r,
+                            "/xrpc/blue.catbird.mlsDS.deliverMessage",
+                            Some(jwt_h),
+                            deliver_body_h,
+                        )
+                        .await;
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "concurrent deliverMessage via production router must succeed: {body:?}"
                         );
-                        let mutation_c = decode_and_verify_signed_mutation(&signed_req_bytes_c, &actor_h.public_key).unwrap();
-                        let built_c = build_verified_application_entry(
-                            mutation_c,
-                            CanonicalUuidV4::parse(&msg_id_c.to_string()).unwrap(),
-                            CanonicalUuidV4::parse(&convo_id_h.to_string()).unwrap(),
-                            2,
-                            &rec_at_c,
-                        )
-                        .unwrap();
-                        let entry_bytes_c = built_c.canonical_entry_bytes().to_vec();
-                        let entry_sha256_c = *built_c.accepted_payload_sha256();
-                        let outer_fp_c = *built_c.outer_application_fingerprint();
-                        let outcome_bytes = b"{}".to_vec();
-                        let outcome_sha256 = Sha256::digest(&outcome_bytes).to_vec();
-                        let mut tx_c = p.begin().await.unwrap();
-                        sqlx::query(
-                            "INSERT INTO chat.message_sends (conversation_id, message_id, signed_request_bytes, signing_transcript_bytes, request_digest, signature, status, accepted_entry_seq, outcome_bytes, outcome_sha256, received_at) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', 2, $7, $8, NOW())"
-                        )
-                        .bind(convo_id_h)
-                        .bind(msg_id_c)
-                        .bind(&signed_req_bytes_c)
-                        .bind(built_c.mutation().transcript_bytes())
-                        .bind(built_c.mutation().request_digest().as_slice())
-                        .bind(built_c.mutation().signature().as_slice())
-                        .bind(&outcome_bytes)
-                        .bind(&outcome_sha256)
-                        .execute(&mut *tx_c)
-                        .await
-                        .unwrap();
-                        sqlx::query(
-                            "INSERT INTO chat.entries (conversation_id, seq, entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, signed_request_bytes, request_digest, signature, server_fields_bytes, outer_entry_fingerprint, actor_did, actor_device_id, actor_key_id, actor_auth_generation, generation, message_id, received_at) VALUES ($1, 2, $2, 'blue.catbird.chat.defs#applicationEntry', $3, $4, $5, $6, $7, '\\xa0', $8, $9, $10, $11, 1, 0, $2, NOW())"
-                        )
-                        .bind(convo_id_h)
-                        .bind(msg_id_c)
-                        .bind(&entry_bytes_c)
-                        .bind(&entry_sha256_c.to_vec())
-                        .bind(&signed_req_bytes_c)
-                        .bind(built_c.mutation().request_digest().as_slice())
-                        .bind(built_c.mutation().signature().as_slice())
-                        .bind(&outer_fp_c.to_vec())
-                        .bind(a_did)
-                        .bind(a_dev)
-                        .bind(a_kid)
-                        .execute(&mut *tx_c)
-                        .await
-                        .unwrap();
-                        sqlx::query("UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1")
-                            .bind(convo_id_h)
-                            .execute(&mut *tx_c)
-                            .await
-                            .unwrap();
-                        tx_c.commit().await.unwrap();
 
                         axum::response::Response::builder()
                             .status(200)
@@ -9882,28 +10915,462 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
     let convo_id = Uuid::new_v4();
     let group_id = vec![0x99u8; 32];
 
-    let recipient = TestActor::generate();
+    let creator = TestActor::generate();
+    creator.seed(&harness.pool, now).await;
+
+    let mut recipient = TestActor::generate();
+    recipient.did = creator.did.clone();
     recipient.seed(&harness.pool, now).await;
 
-    seed_conversation_structure(
+    let (creation_transition_id, _, _, _, _, _) = seed_conversation_structure(
         &harness.pool,
         convo_id,
         &group_id,
         true,
         Some(&harness.sequencer_ds_did),
         1,
-        &recipient,
+        &creator,
         None,
         now,
     )
     .await;
+
+    let creator_p256 = random_p256();
+    cache_did_key(&creator.did, &creator_p256).await;
+
+    let mint_client_jwt = |endpoint_nsid: &str| {
+        let now_ts = Utc::now().timestamp();
+        sign_jwt(
+            json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", creator.did)}),
+            json!({
+                "iss": creator.did,
+                "sub": creator.did,
+                "aud": AUDIENCE,
+                "lxm": endpoint_nsid,
+                "iat": now_ts,
+                "exp": now_ts + 60,
+                "jti": Uuid::new_v4().to_string(),
+            }),
+            &creator_p256,
+        )
+    };
+
+    // Seed welcome provenance tables so deliverWelcome passes provenance checks and tests the quarantine gate
+    let fulfillment_transition_id = Uuid::new_v4();
+    let fulfillment_entry_id = fulfillment_transition_id;
+    let welcome_id = Uuid::new_v4();
+    let recovery_request_id = Uuid::new_v4();
+    let welcome_bytes = corpus_file("welcome.mls");
+    let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
+    let manifest_bytes = corpus_file("manifest.json");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
+    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let public_snapshot_bytes = vec![0x88u8; 16];
+    let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
+    let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
+    let enc_key = vec![0x64u8; 1216];
+    let (tree_summary_bytes, tree_summary_sha256) = make_tree_summary_bytes(
+        &[0x63u8; 32],
+        &[
+            (0, &creator_credential, &creator.public_key, &enc_key),
+            (1, &recipient_credential, &recipient.public_key, &enc_key),
+        ],
+    );
+    let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
+    let (_, signed_req_bytes_w) = make_leaf_recovery_fulfillment_body(
+        convo_id,
+        fulfillment_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &creator,
+        &group_id,
+        now,
+    );
+    let mutation_w =
+        decode_and_verify_signed_mutation(&signed_req_bytes_w, &creator.public_key).unwrap();
+    let rec_at_w = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let endpoint_w = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").unwrap();
+    let s_fields_w =
+        CanonicalControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let built_w = build_verified_control_entry(
+        mutation_w,
+        &endpoint_w,
+        CanonicalUuidV4::parse(&fulfillment_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &rec_at_w,
+        s_fields_w,
+    )
+    .unwrap();
+    let products_w = CanonicalControlEntryProducts::mint(&built_w).unwrap();
+    let entry_bytes_w = products_w.durable_json().to_vec();
+    let entry_sha256_w: [u8; 32] = Sha256::digest(&entry_bytes_w).into();
+    let outer_fp_w = *built_w.outer_control_fingerprint();
+
+    let mut tx_w = harness.pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx_w)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_packages (
+            key_package_ref, wrapper_bytes, wrapper_sha256, init_key,
+            owner_did, owner_device_id, owner_key_id, owner_auth_generation,
+            not_before, not_after, status, terminal_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, repeat('w', 32)::bytea, digest(repeat('w', 32)::bytea, 'sha256'), repeat('k', 32)::bytea,
+            $2, $3, $4, 1,
+            $5 - INTERVAL '5 minutes', $5 + INTERVAL '1 hour', 'consumed', $6, $5, $5
+        )
+        "#,
+    )
+    .bind(&key_package_ref[..])
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.leaf_recovery_requests (
+            recovery_request_id, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation,
+            recovery_kind, source, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, reservation_request_id,
+            status, fulfilling_transition_id, terminal_at,
+            signed_request_bytes, signing_transcript_bytes, request_digest, signature,
+            requested_at, expires_at
+        ) VALUES (
+            $1, $2, 0, $3,
+            $4, $5, 1,
+            'add', 'acceptConversation', 0, $6, 0,
+            $7, $7, $1,
+            'fulfilled', $8, $9,
+            repeat('r', 32)::bytea, repeat('t', 32)::bytea, digest(repeat('t', 32)::bytea, 'sha256'), repeat('s', 64)::bytea,
+            $9, $9 + INTERVAL '5 minutes'
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_package_reservations (
+            recovery_request_id, key_package_ref, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation, recipient_did,
+            recipient_device_id, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, purpose, expires_at, status,
+            consumed_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, $2, $3, 0, $4,
+            $5, $6, 1, $4,
+            $5, 0, $7, 0,
+            $8, $8, 'leafRecovery', $9 + INTERVAL '5 minutes', 'consumed',
+            $10, $9, $9
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    let meta_snap_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.metadata_snapshots (
+            metadata_snapshot_id, conversation_id, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            producing_transition_id, origin_transition_id, metadata_version,
+            nonce, ciphertext, ciphertext_sha256, ciphertext_size,
+            author_did, author_device_id, author_key_id, author_public_key,
+            author_auth_generation, author_origin_seq, author_role, author_device_status, created_at
+        ) VALUES (
+            $1, $2, 0, 1,
+            $3, 1, $4, $4,
+            $5, $6, 1,
+            $12, repeat('c', 16)::bytea, digest(repeat('c', 16)::bytea, 'sha256'), 16,
+            $7, $8, $9, $10,
+            1, 1, 'admin', 'active', $11
+        )
+        "#,
+    )
+    .bind(meta_snap_id)
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(creation_transition_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&creator.public_key[..])
+    .bind(now)
+    .bind(&[0xE1_u8; 12])
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.transitions (
+            transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, actor_role, actor_device_status, signed_request_bytes,
+            unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature,
+            prior_generation, prior_state_version, next_generation, next_state_version, metadata_snapshot_id, entry_seq, accepted_at
+        ) VALUES (
+            $1, $2, 'leafRecovery', $3, $4, $5,
+            1, 'admin', 'active', $6,
+            $7, $8, $9, $10,
+            0, 0, 0, 1, $11, 2, $12
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&signed_req_bytes_w)
+    .bind(built_w.mutation().canonical_projection())
+    .bind(built_w.mutation().transcript_bytes())
+    .bind(built_w.mutation().request_digest().as_slice())
+    .bind(built_w.mutation().signature().as_slice())
+    .bind(meta_snap_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256,
+            signed_request_bytes, request_digest, signature,
+            server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, state_version, transition_id, received_at
+        ) VALUES (
+            $1, 2, $2, 'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+            $3, $4,
+            $5, $6, $7,
+            repeat('0', 1)::bytea, $8,
+            $9, $10, $11, 1,
+            0, 1, $12, $13
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(fulfillment_entry_id)
+    .bind(&entry_bytes_w)
+    .bind(&entry_sha256_w[..])
+    .bind(&signed_req_bytes_w)
+    .bind(built_w.mutation().request_digest().as_slice())
+    .bind(built_w.mutation().signature().as_slice())
+    .bind(&outer_fp_w[..])
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.conversations
+           SET current_state_version = 1,
+               next_entry_seq = 3
+         WHERE conversation_id = $1
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.generations
+           SET current_state_version = 1
+         WHERE conversation_id = $1 AND generation = 0
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.generation_states (
+            conversation_id, generation, state_version, group_id, epoch,
+            group_context_hash, confirmation_tag, lifecycle, state_kind,
+            producing_transition_id, public_snapshot_bytes, snapshot_sha256,
+            tree_summary_bytes, tree_summary_sha256, leaf_count, created_at
+        ) VALUES (
+            $1, 0, 1, $2, 1,
+            $5, $5, 'active', 'commit',
+            $3, $6, $7,
+            $8, $9, 2, $4
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .bind(&[0x32u8; 32])
+    .bind(&public_snapshot_bytes)
+    .bind(&public_snapshot_sha256[..])
+    .bind(&tree_summary_bytes)
+    .bind(&tree_summary_sha256[..])
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    let recipient_leaf_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.member_devices (
+            leaf_period_id, participant_period_id, conversation_id, generation,
+            user_did, device_id, leaf_index, basic_credential,
+            leaf_signature_key, leaf_key_id, leaf_auth_generation, origin,
+            join_key_package_ref, joined_state_version, joined_transition_id, joined_seq, active, created_at
+        ) VALUES (
+            $1, (SELECT participant_period_id FROM chat.participants WHERE conversation_id = $2 AND user_did = $3 AND current_membership), $2, 0,
+            $3, $4, 1, $5,
+            $6, $7, 1, 'keyPackage',
+            $8, 1, $9, 2, TRUE, $10
+        )
+        "#,
+    )
+    .bind(recipient_leaf_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient_credential)
+    .bind(&recipient.public_key[..])
+    .bind(&recipient.key_id)
+    .bind(&key_package_ref[..])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_intervals (
+            membership_interval_id, conversation_id, generation, recipient_did, recipient_device_id,
+            start_seq, opening_kind, opening_transition_id, opening_outer_entry_fingerprint,
+            opening_state_version, opening_group_id, opening_epoch, opening_group_context_hash,
+            opening_confirmation_tag, opening_leaf_period_id, created_at
+        ) VALUES (
+            $1, $2, 0, $3, $4,
+            2, 'add', $5, $6,
+            1, $7, 1, $8,
+            $8, $9, $10
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(fulfillment_transition_id)
+    .bind(&outer_fp_w[..])
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(recipient_leaf_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_bundles (
+            welcome_id, conversation_id, transition_id, entry_seq, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            wrapper_bytes, wrapper_sha256, created_at
+        ) VALUES (
+            $1, $2, $3, 2, 0, 1,
+            $4, 1, $7, $7,
+            $5, $6, $8
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(convo_id)
+    .bind(fulfillment_transition_id)
+    .bind(&group_id)
+    .bind(&welcome_bytes)
+    .bind(&welcome_sha256[..])
+    .bind(&[0x32u8; 32])
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_deliveries (
+            welcome_id, recipient_did, recipient_device_id, recovery_request_id,
+            key_package_ref, expires_at, status
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6 + INTERVAL '1 hour', 'pending'
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    tx_w.commit().await.unwrap();
 
     // Quarantine the conversation
     sqlx::query(
         r#"
         INSERT INTO federation_sync_state
             (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status, quarantined_at, quarantine_reason, first_mismatch_seq)
-        VALUES ($1, $2, 1, 1, 0, '\x00', NOW(), 1, NOW(), 'quarantined', NOW(), 'prefix_mismatch', 2)
+        VALUES ($1, $2, 1, 2, 0, '\x00', NOW(), 1, NOW(), 'quarantined', NOW(), 'prefix_mismatch', 3)
         "#,
     )
     .bind(convo_id.to_string())
@@ -9912,7 +11379,8 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
     .await
     .unwrap();
 
-    // 1. deliverMessage against quarantined conversation -> 409 DeliveryConflict
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+    // 1. DS deliverMessage against quarantined conversation -> 409 DeliveryConflict
     let actor = TestActor::generate();
     actor.seed(&harness.pool, now).await;
     let message_id = Uuid::new_v4();
@@ -9928,7 +11396,7 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
         mutation,
         CanonicalUuidV4::parse(&msg_entry_id.to_string()).unwrap(),
         CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
-        2,
+        3,
         &received_at,
     )
     .unwrap();
@@ -9953,7 +11421,7 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
     };
     let locator_model = ValidatedEntryLocator {
         entry_id: msg_entry_id,
-        seq: 2,
+        seq: 3,
         accepted_payload_sha256: entry_sha256,
         outer_entry_fingerprint: outer_fp,
     };
@@ -9978,12 +11446,12 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
             &now.to_rfc3339_opts(SecondsFormat::Millis, true),
             &msg_digest,
         ),
-        "entryLocator": make_entry_locator_json(msg_entry_id, 2, &entry_sha256, &outer_fp),
+        "entryLocator": make_entry_locator_json(msg_entry_id, 3, &entry_sha256, &outer_fp),
         "recipientDid": recipient.did,
         "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes) },
         "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
     });
-    let jwt = harness.mint_jwt_for(
+    let jwt_ds_msg = harness.mint_jwt_for(
         &harness.sequencer_ds_did,
         &harness.sequencer_ds_key,
         DELIVER_MESSAGE_NSID,
@@ -9991,20 +11459,275 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
     let (status, body, _) = harness
         .send_json(
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
-            Some(&jwt),
+            Some(&jwt_ds_msg),
             &deliver_msg_body,
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"].as_str(), Some("DeliveryConflict"));
 
-    // 2. GET getConvoDigest against quarantined conversation -> 409 DeliveryConflict
+    // 2. DS deliverWelcome against quarantined conversation -> 409 DeliveryConflict
+    let mut header_model_w = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id: Uuid::new_v4(),
+        conversation_id: convo_id,
+        sender_ds_did: harness.sequencer_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: harness.sequencer_ds_did.clone(),
+        sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
+        payload_sha256: [0u8; 32],
+    };
+    let locator_model_w = ValidatedEntryLocator {
+        entry_id: fulfillment_entry_id,
+        seq: 2,
+        accepted_payload_sha256: entry_sha256_w,
+        outer_entry_fingerprint: outer_fp_w,
+    };
+    let coordinates_dto = ConversationCoordinates {
+        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        generation: 0,
+        state_version: 1,
+        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        epoch: 1,
+        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        extra_data: None,
+    };
+    let welcome_digest = compute_welcome_envelope_digest(
+        &header_model_w,
+        &recipient.did,
+        recipient.device_id,
+        welcome_id,
+        recovery_request_id,
+        &key_package_ref,
+        &welcome_bytes,
+        &welcome_sha256,
+        &entry_bytes_w,
+        &signed_req_bytes_w,
+        &locator_model_w,
+        &coordinates_dto,
+        &public_snapshot_sha256,
+        &tree_summary_sha256,
+    )
+    .unwrap();
+    header_model_w.payload_sha256 = welcome_digest;
+    let coordinates_json = make_coordinates_json(convo_id, &group_id, 1, 1);
+    let deliver_welcome_body = json!({
+        "header": make_envelope_header_json(
+            header_model_w.delivery_id,
+            convo_id,
+            &harness.sequencer_ds_did,
+            LOCAL_DS_DID,
+            &harness.sequencer_ds_did,
+            1,
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &welcome_digest,
+        ),
+        "entryLocator": make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256_w, &outer_fp_w),
+        "coordinates": coordinates_json,
+        "welcomeId": welcome_id.to_string(),
+        "recoveryRequestId": recovery_request_id.to_string(),
+        "keyPackageRef": { "$bytes": STANDARD.encode(key_package_ref) },
+        "recipientDid": recipient.did,
+        "recipientDeviceId": recipient.device_id.to_string(),
+        "welcomeBytes": { "$bytes": STANDARD.encode(&welcome_bytes) },
+        "welcomeSha256": { "$bytes": STANDARD.encode(welcome_sha256) },
+        "publicSnapshotSha256": { "$bytes": STANDARD.encode(public_snapshot_sha256) },
+        "treeSummarySha256": { "$bytes": STANDARD.encode(tree_summary_sha256) },
+        "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes_w) },
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes_w) },
+    });
+    let jwt_ds_w = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+    let (status_w, body_w, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt_ds_w),
+            &deliver_welcome_body,
+        )
+        .await;
+    assert_eq!(
+        status_w,
+        StatusCode::CONFLICT,
+        "deliverWelcome failed: {body_w:?}"
+    );
+    assert_eq!(body_w["error"].as_str(), Some("DeliveryConflict"));
+
+    // 3. Client sendMessage against quarantined conversation -> 409 IdempotencyConflict
+    let client_msg_id = Uuid::new_v4();
+    let (client_msg_body, _) = make_message_body_with_coordinates(
+        convo_id,
+        client_msg_id,
+        &creator,
+        &group_id,
+        1,
+        1,
+        &[0x32u8; 32],
+        &[0x32u8; 32],
+        vec![],
+        now,
+    );
+    let jwt_send = mint_client_jwt("blue.catbird.chat.sendMessage");
+    let (status_send, body_send, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.sendMessage",
+        Some(&jwt_send),
+        &json!({ "signedRequest": client_msg_body }),
+    )
+    .await;
+    assert_eq!(
+        status_send,
+        StatusCode::BAD_REQUEST,
+        "sendMessage failed: {body_send:?}"
+    );
+    assert_eq!(body_send["error"].as_str(), Some("IdempotencyConflict"));
+
+    // 4. Client publishTyping against quarantined conversation -> 409 IdempotencyConflict
+    let typing_id = Uuid::new_v4();
+    let (typing_body, _) = make_typing_body(
+        convo_id,
+        typing_id,
+        &creator,
+        &group_id,
+        1,
+        1,
+        &[0x32u8; 32],
+        &[0x32u8; 32],
+        now,
+    );
+    let jwt_typing = mint_client_jwt("blue.catbird.chat.publishTyping");
+    let (status_typing, body_typing, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.publishTyping",
+        Some(&jwt_typing),
+        &json!({ "signedRequest": typing_body }),
+    )
+    .await;
+    assert_eq!(
+        status_typing,
+        StatusCode::BAD_REQUEST,
+        "publishTyping failed: {body_typing:?}"
+    );
+    assert_eq!(body_typing["error"].as_str(), Some("IdempotencyConflict"));
+
+    // 5. Client acceptConversation against quarantined conversation -> 409 StaleCoordinates
+    let acc_tr_id = Uuid::new_v4();
+    let rec_req_id = Uuid::new_v4();
+    let (acc_body, _) = make_acceptance_body(
+        convo_id,
+        acc_tr_id,
+        rec_req_id,
+        creation_transition_id,
+        &creator,
+        &creator,
+        &group_id,
+        &[0x32u8; 32],
+        &[0x32u8; 32],
+        now,
+    );
+    let jwt_acc = mint_client_jwt("blue.catbird.chat.acceptConversation");
+    let (status_acc, body_acc, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.acceptConversation",
+        Some(&jwt_acc),
+        &json!({ "signedRequest": acc_body }),
+    )
+    .await;
+    assert_eq!(
+        status_acc,
+        StatusCode::BAD_REQUEST,
+        "acceptConversation failed: {body_acc:?}"
+    );
+    assert_eq!(body_acc["error"].as_str(), Some("StaleCoordinates"));
+
+    // 6. Client requestLeave against quarantined conversation -> 409 StaleCoordinates
+    let leave_id = Uuid::new_v4();
+    let (leave_body, _) = make_leave_request_body(
+        convo_id,
+        leave_id,
+        &creator,
+        &group_id,
+        1,
+        1,
+        &[0x32u8; 32],
+        &[0x32u8; 32],
+        now,
+    );
+    let jwt_leave = mint_client_jwt("blue.catbird.chat.requestLeave");
+    let (status_leave, body_leave, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.requestLeave",
+        Some(&jwt_leave),
+        &json!({ "signedRequest": leave_body }),
+    )
+    .await;
+    assert_eq!(
+        status_leave,
+        StatusCode::BAD_REQUEST,
+        "requestLeave failed: {body_leave:?}"
+    );
+    assert_eq!(body_leave["error"].as_str(), Some("StaleCoordinates"));
+
+    // 7. Client revokeDevice against quarantined conversation -> 409 IdempotencyConflict
+    let (revoke_body, _) = make_device_revocation_body(&creator, creator.device_id, now);
+    let jwt_revoke = mint_client_jwt("blue.catbird.chat.revokeDevice");
+    let (status_revoke, body_revoke, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.revokeDevice",
+        Some(&jwt_revoke),
+        &json!({ "signedRequest": revoke_body }),
+    )
+    .await;
+    assert_eq!(
+        status_revoke,
+        StatusCode::BAD_REQUEST,
+        "revokeDevice failed: {body_revoke:?}"
+    );
+    assert_eq!(body_revoke["error"].as_str(), Some("IdempotencyConflict"));
+
+    // 8. Client acknowledgeWelcome against quarantined conversation -> 409 AcknowledgementConflict
+    let ack_welcome_id = Uuid::new_v4();
+    let (ack_body, _) = make_welcome_acknowledgement_body(
+        convo_id,
+        ack_welcome_id,
+        2,
+        &creator,
+        &group_id,
+        1,
+        1,
+        &[0x32u8; 32],
+        &[0x32u8; 32],
+        now,
+    );
+    let jwt_ack = mint_client_jwt("blue.catbird.chat.acknowledgeWelcome");
+    let (status_ack, body_ack, _) = send_json_to_router(
+        &harness.router,
+        "/xrpc/blue.catbird.chat.acknowledgeWelcome",
+        Some(&jwt_ack),
+        &json!({ "signedRequest": ack_body }),
+    )
+    .await;
+    assert_eq!(
+        status_ack,
+        StatusCode::BAD_REQUEST,
+        "acknowledgeWelcome failed: {body_ack:?}"
+    );
+    assert_eq!(body_ack["error"].as_str(), Some("AcknowledgementConflict"));
+    // 9. GET getConvoDigest against quarantined conversation -> 409 DeliveryConflict
     let digest_jwt = harness.mint_jwt_for(
         &harness.sequencer_ds_did,
         &harness.sequencer_ds_key,
         "blue.catbird.mlsDS.getConvoDigest",
     );
-    let req = Request::builder()
+    let req_d = Request::builder()
         .method("GET")
         .uri(format!(
             "/xrpc/blue.catbird.mlsDS.getConvoDigest?convoId={}",
@@ -10013,16 +11736,16 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
         .header("authorization", format!("Bearer {digest_jwt}"))
         .body(Body::empty())
         .unwrap();
-    let resp = harness.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let resp_d = harness.router.clone().oneshot(req_d).await.unwrap();
+    assert_eq!(resp_d.status(), StatusCode::CONFLICT);
 
-    // 3. GET getConvoEvents against quarantined conversation -> 409 DeliveryConflict
+    // 10. GET getConvoEvents against quarantined conversation -> 409 DeliveryConflict
     let events_jwt = harness.mint_jwt_for(
         &harness.sequencer_ds_did,
         &harness.sequencer_ds_key,
         "blue.catbird.mlsDS.getConvoEvents",
     );
-    let req2 = Request::builder()
+    let req_e = Request::builder()
         .method("GET")
         .uri(format!(
             "/xrpc/blue.catbird.mlsDS.getConvoEvents?convoId={}&fromSeqExclusive=0",
@@ -10031,8 +11754,15 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
         .header("authorization", format!("Bearer {events_jwt}"))
         .body(Body::empty())
         .unwrap();
-    let resp2 = harness.router.clone().oneshot(req2).await.unwrap();
-    assert_eq!(resp2.status(), StatusCode::CONFLICT);
+    let resp_e = harness.router.clone().oneshot(req_e).await.unwrap();
+    assert_eq!(resp_e.status(), StatusCode::CONFLICT);
+
+    // Full mailbox state must be byte-for-byte unchanged after all rejected calls
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "quarantined conversation must reject all shared writers and readers with generic conflicts while preserving state byte-for-byte"
+    );
 }
 
 #[tokio::test]
@@ -10041,26 +11771,29 @@ async fn test_ds_delivery_replay_cannot_bypass_quarantine() {
     let now = Utc::now();
     let convo_id = Uuid::new_v4();
     let group_id = vec![0xAAu8; 32];
+    let creator = TestActor::generate();
+    creator.seed(&harness.pool, now).await;
 
-    let recipient = TestActor::generate();
+    let mut recipient = TestActor::generate();
+    recipient.did = creator.did.clone();
     recipient.seed(&harness.pool, now).await;
 
-    seed_conversation_structure(
+    let (creation_transition_id, _, _, _, _, _) = seed_conversation_structure(
         &harness.pool,
         convo_id,
         &group_id,
         true,
         Some(&harness.sequencer_ds_did),
         1,
-        &recipient,
+        &creator,
         None,
         now,
     )
     .await;
-
     let actor = TestActor::generate();
     actor.seed(&harness.pool, now).await;
 
+    // A. Setup deliverMessage
     let message_id = Uuid::new_v4();
     let msg_entry_id = Uuid::new_v4();
     let (_, signed_req_bytes) =
@@ -10129,33 +11862,532 @@ async fn test_ds_delivery_replay_cannot_bypass_quarantine() {
         "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes) },
         "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
     });
-    let jwt = harness.mint_jwt_for(
+    let jwt_msg = harness.mint_jwt_for(
         &harness.sequencer_ds_did,
         &harness.sequencer_ds_key,
         DELIVER_MESSAGE_NSID,
     );
 
-    // 1. Initial delivery succeeds and records delivery receipt
+    // 1. Initial message delivery succeeds and records delivery receipt
     let (status1, _, _) = harness
         .send_json(
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
-            Some(&jwt),
+            Some(&jwt_msg),
             &deliver_msg_body,
         )
         .await;
     assert_eq!(status1, StatusCode::OK);
 
-    // 2. Quarantine conversation
+    // B. Setup deliverWelcome at seq 3
+    let welcome_id = Uuid::new_v4();
+    let recovery_request_id = Uuid::new_v4();
+    let fulfillment_transition_id = Uuid::new_v4();
+    let fulfillment_entry_id = fulfillment_transition_id;
+    let welcome_bytes = corpus_file("welcome.mls");
+    let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
+    let manifest_bytes = corpus_file("manifest.json");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
+    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let public_snapshot_bytes = vec![0x88u8; 16];
+    let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
+    let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
+    let enc_key = vec![0x64u8; 1216];
+    let (tree_summary_bytes, tree_summary_sha256) = make_tree_summary_bytes(
+        &[0x63u8; 32],
+        &[
+            (0, &creator_credential, &creator.public_key, &enc_key),
+            (1, &recipient_credential, &recipient.public_key, &enc_key),
+        ],
+    );
+    let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
+    let (_, signed_req_bytes_w) = make_leaf_recovery_fulfillment_body(
+        convo_id,
+        fulfillment_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &creator,
+        &group_id,
+        now,
+    );
+    let mutation_w =
+        decode_and_verify_signed_mutation(&signed_req_bytes_w, &creator.public_key).unwrap();
+    let rec_at_w = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let endpoint_w = ValidatedChatNsid::parse("blue.catbird.chat.submitTransition").unwrap();
+    let s_fields_w =
+        CanonicalControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let built_w = build_verified_control_entry(
+        mutation_w,
+        &endpoint_w,
+        CanonicalUuidV4::parse(&fulfillment_entry_id.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        3,
+        &rec_at_w,
+        s_fields_w,
+    )
+    .unwrap();
+    let products_w = CanonicalControlEntryProducts::mint(&built_w).unwrap();
+    let entry_bytes_w = products_w.durable_json().to_vec();
+    let entry_sha256_w: [u8; 32] = Sha256::digest(&entry_bytes_w).into();
+    let outer_fp_w = *built_w.outer_control_fingerprint();
+    let mut tx_w = harness.pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *tx_w)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_packages (
+            key_package_ref, wrapper_bytes, wrapper_sha256, init_key,
+            owner_did, owner_device_id, owner_key_id, owner_auth_generation,
+            not_before, not_after, status, terminal_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, repeat('w', 32)::bytea, digest(repeat('w', 32)::bytea, 'sha256'), repeat('k', 32)::bytea,
+            $2, $3, $4, 1,
+            $5 - INTERVAL '5 minutes', $5 + INTERVAL '1 hour', 'consumed', $6, $5, $5
+        )
+        "#,
+    )
+    .bind(&key_package_ref[..])
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.leaf_recovery_requests (
+            recovery_request_id, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation,
+            recovery_kind, source, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, reservation_request_id,
+            status, fulfilling_transition_id, terminal_at,
+            signed_request_bytes, signing_transcript_bytes, request_digest, signature,
+            requested_at, expires_at
+        ) VALUES (
+            $1, $2, 0, $3,
+            $4, $5, 1,
+            'add', 'acceptConversation', 0, $6, 0,
+            $7, $7, $1,
+            'fulfilled', $8, $9,
+            repeat('r', 32)::bytea, repeat('t', 32)::bytea, digest(repeat('t', 32)::bytea, 'sha256'), repeat('s', 64)::bytea,
+            $9, $9 + INTERVAL '5 minutes'
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.key_package_reservations (
+            recovery_request_id, key_package_ref, conversation_id, generation, requester_did,
+            requester_device_id, requester_key_id, requester_auth_generation, recipient_did,
+            recipient_device_id, bound_state_version, bound_group_id, bound_epoch,
+            bound_group_context_hash, bound_confirmation_tag, purpose, expires_at, status,
+            consumed_transition_id, terminal_at, created_at
+        ) VALUES (
+            $1, $2, $3, 0, $4,
+            $5, $6, 1, $4,
+            $5, 0, $7, 0,
+            $8, $8, 'leafRecovery', $9 + INTERVAL '5 minutes', 'consumed',
+            $10, $9, $9
+        )
+        "#,
+    )
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient.key_id)
+    .bind(&group_id)
+    .bind(&[0u8; 32])
+    .bind(now)
+    .bind(fulfillment_transition_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+    let meta_snap_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.metadata_snapshots (
+            metadata_snapshot_id, conversation_id, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            producing_transition_id, origin_transition_id, metadata_version,
+            nonce, ciphertext, ciphertext_sha256, ciphertext_size,
+            author_did, author_device_id, author_key_id, author_public_key,
+            author_auth_generation, author_origin_seq, author_role, author_device_status, created_at
+        ) VALUES (
+            $1, $2, 0, 1,
+            $3, 1, $4, $4,
+            $5, $6, 1,
+            $12, repeat('c', 16)::bytea, digest(repeat('c', 16)::bytea, 'sha256'), 16,
+            $7, $8, $9, $10,
+            1, 1, 'admin', 'active', $11
+        )
+        "#,
+    )
+    .bind(meta_snap_id)
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(fulfillment_transition_id)
+    .bind(creation_transition_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&creator.public_key[..])
+    .bind(now)
+    .bind(&[0xE1_u8; 12])
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.transitions (
+            transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id,
+            actor_auth_generation, actor_role, actor_device_status, signed_request_bytes,
+            unsigned_projection_bytes, signing_transcript_bytes, request_digest, signature,
+            prior_generation, prior_state_version, next_generation, next_state_version, metadata_snapshot_id, entry_seq, accepted_at
+        ) VALUES (
+            $1, $2, 'leafRecovery', $3, $4, $5,
+            1, 'admin', 'active', $6,
+            $7, $8, $9, $10,
+            0, 0, 0, 1, $11, 3, $12
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(&signed_req_bytes_w)
+    .bind(built_w.mutation().canonical_projection())
+    .bind(built_w.mutation().transcript_bytes())
+    .bind(built_w.mutation().request_digest().as_slice())
+    .bind(built_w.mutation().signature().as_slice())
+    .bind(meta_snap_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256,
+            signed_request_bytes, request_digest, signature,
+            server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, state_version, transition_id, received_at
+        ) VALUES (
+            $1, 3, $2, 'blue.catbird.chat.defs#leafRecoveryFulfillmentEntry',
+            $3, $4,
+            $5, $6, $7,
+            repeat('0', 1)::bytea, $8,
+            $9, $10, $11, 1,
+            0, 1, $12, $13
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(fulfillment_entry_id)
+    .bind(&entry_bytes_w)
+    .bind(&entry_sha256_w[..])
+    .bind(&signed_req_bytes_w)
+    .bind(built_w.mutation().request_digest().as_slice())
+    .bind(built_w.mutation().signature().as_slice())
+    .bind(&outer_fp_w[..])
+    .bind(&creator.did)
+    .bind(creator.device_id)
+    .bind(&creator.key_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.generation_states (
+            conversation_id, generation, state_version, group_id, epoch,
+            group_context_hash, confirmation_tag, lifecycle, state_kind,
+            producing_transition_id, public_snapshot_bytes, snapshot_sha256,
+            tree_summary_bytes, tree_summary_sha256, leaf_count, created_at
+        ) VALUES (
+            $1, 0, 1, $2, 1,
+            $5, $5, 'active', 'commit',
+            $3, $6, $7,
+            $8, $9, 2, $4
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(&group_id)
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .bind(&[0x32u8; 32])
+    .bind(&public_snapshot_bytes)
+    .bind(&public_snapshot_sha256[..])
+    .bind(&tree_summary_bytes)
+    .bind(&tree_summary_sha256[..])
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    let recipient_leaf_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.member_devices (
+            leaf_period_id, participant_period_id, conversation_id, generation,
+            user_did, device_id, leaf_index, basic_credential,
+            leaf_signature_key, leaf_key_id, leaf_auth_generation, origin,
+            join_key_package_ref, joined_state_version, joined_transition_id, joined_seq, active, created_at
+        ) VALUES (
+            $1, (SELECT participant_period_id FROM chat.participants WHERE conversation_id = $2 AND user_did = $3 AND current_membership), $2, 0,
+            $3, $4, 1, $5,
+            $6, $7, 1, 'keyPackage',
+            $8, 1, $9, 3, TRUE, $10
+        )
+        "#,
+    )
+    .bind(recipient_leaf_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(&recipient_credential)
+    .bind(&recipient.public_key[..])
+    .bind(&recipient.key_id)
+    .bind(&key_package_ref[..])
+    .bind(fulfillment_transition_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.application_intervals (
+            membership_interval_id, conversation_id, generation, recipient_did, recipient_device_id,
+            start_seq, opening_kind, opening_transition_id, opening_outer_entry_fingerprint,
+            opening_state_version, opening_group_id, opening_epoch, opening_group_context_hash,
+            opening_confirmation_tag, opening_leaf_period_id, created_at
+        ) VALUES (
+            $1, $2, 0, $3, $4,
+            3, 'add', $5, $6,
+            1, $7, 1, $8,
+            $8, $9, $10
+        )
+        "#,
+    )
+    .bind(fulfillment_transition_id)
+    .bind(convo_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(fulfillment_transition_id)
+    .bind(&outer_fp_w[..])
+    .bind(&group_id)
+    .bind(&[0x32u8; 32])
+    .bind(recipient_leaf_id)
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.generations
+           SET current_state_version = 1
+         WHERE conversation_id = $1 AND generation = 0
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE chat.conversations
+           SET current_state_version = 1,
+               next_entry_seq = 4
+         WHERE conversation_id = $1
+        "#,
+    )
+    .bind(convo_id)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_bundles (
+            welcome_id, conversation_id, transition_id, entry_seq, generation, state_version,
+            group_id, epoch, group_context_hash, confirmation_tag,
+            wrapper_bytes, wrapper_sha256, created_at
+        ) VALUES (
+            $1, $2, $3, 3, 0, 1,
+            $4, 1, $7, $7,
+            $5, $6, $8
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(convo_id)
+    .bind(fulfillment_transition_id)
+    .bind(&group_id)
+    .bind(&welcome_bytes)
+    .bind(&welcome_sha256[..])
+    .bind(&[0x32u8; 32])
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.welcome_deliveries (
+            welcome_id, recipient_did, recipient_device_id, recovery_request_id,
+            key_package_ref, expires_at, status
+        ) VALUES (
+            $1, $2, $3, $4,
+            $5, $6 + INTERVAL '1 hour', 'pending'
+        )
+        "#,
+    )
+    .bind(welcome_id)
+    .bind(&recipient.did)
+    .bind(recipient.device_id)
+    .bind(recovery_request_id)
+    .bind(&key_package_ref[..])
+    .bind(now)
+    .execute(&mut *tx_w)
+    .await
+    .unwrap();
+
+    tx_w.commit().await.unwrap();
+
+    let mut header_model_w = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id: Uuid::new_v4(),
+        conversation_id: convo_id,
+        sender_ds_did: harness.sequencer_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: harness.sequencer_ds_did.clone(),
+        sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
+        payload_sha256: [0u8; 32],
+    };
+    let locator_model_w = ValidatedEntryLocator {
+        entry_id: fulfillment_entry_id,
+        seq: 3,
+        accepted_payload_sha256: entry_sha256_w,
+        outer_entry_fingerprint: outer_fp_w,
+    };
+    let coordinates_dto_w = ConversationCoordinates {
+        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        generation: 0,
+        state_version: 1,
+        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        epoch: 1,
+        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
+        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        extra_data: None,
+    };
+    let welcome_digest = compute_welcome_envelope_digest(
+        &header_model_w,
+        &recipient.did,
+        recipient.device_id,
+        welcome_id,
+        recovery_request_id,
+        &key_package_ref,
+        &welcome_bytes,
+        &welcome_sha256,
+        &entry_bytes_w,
+        &signed_req_bytes_w,
+        &locator_model_w,
+        &coordinates_dto_w,
+        &public_snapshot_sha256,
+        &tree_summary_sha256,
+    )
+    .unwrap();
+    header_model_w.payload_sha256 = welcome_digest;
+    let coordinates_json = make_coordinates_json(convo_id, &group_id, 1, 1);
+    let deliver_welcome_body = json!({
+        "header": make_envelope_header_json(
+            header_model_w.delivery_id,
+            convo_id,
+            &harness.sequencer_ds_did,
+            LOCAL_DS_DID,
+            &harness.sequencer_ds_did,
+            1,
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &welcome_digest,
+        ),
+        "entryLocator": make_entry_locator_json(fulfillment_entry_id, 3, &entry_sha256_w, &outer_fp_w),
+        "coordinates": coordinates_json,
+        "welcomeId": welcome_id.to_string(),
+        "recoveryRequestId": recovery_request_id.to_string(),
+        "keyPackageRef": { "$bytes": STANDARD.encode(key_package_ref) },
+        "recipientDid": recipient.did,
+        "recipientDeviceId": recipient.device_id.to_string(),
+        "welcomeBytes": { "$bytes": STANDARD.encode(&welcome_bytes) },
+        "welcomeSha256": { "$bytes": STANDARD.encode(welcome_sha256) },
+        "publicSnapshotSha256": { "$bytes": STANDARD.encode(public_snapshot_sha256) },
+        "treeSummarySha256": { "$bytes": STANDARD.encode(tree_summary_sha256) },
+        "entryBytes": { "$bytes": STANDARD.encode(&entry_bytes_w) },
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes_w) },
+    });
+    let jwt_w = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+
+    // 2. Initial welcome delivery succeeds and records delivery receipt
+    let (status_w, _, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt_w),
+            &deliver_welcome_body,
+        )
+        .await;
+    assert_eq!(status_w, StatusCode::OK);
+
+    // 3. Quarantine conversation
     sqlx::query(
         r#"
         INSERT INTO federation_sync_state
             (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status, quarantined_at, quarantine_reason, first_mismatch_seq)
-        VALUES ($1, $2, 1, 2, 0, '\x00', NOW(), 1, NOW(), 'quarantined', NOW(), 'prefix_mismatch', 3)
+        VALUES ($1, $2, 1, 3, 0, '\x00', NOW(), 1, NOW(), 'quarantined', NOW(), 'prefix_mismatch', 4)
         ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
             status = 'quarantined',
             quarantined_at = NOW(),
             quarantine_reason = 'prefix_mismatch',
-            first_mismatch_seq = 3,
+            first_mismatch_seq = 4,
             updated_at = NOW()
         "#,
     )
@@ -10165,48 +12397,67 @@ async fn test_ds_delivery_replay_cannot_bypass_quarantine() {
     .await
     .unwrap();
 
-    // 3. Replay deliverMessage: MUST reject with 409 DeliveryConflict, NOT return cached success
-    let jwt_replay = harness.mint_jwt_for(
+    let before_replay = capture_mailbox_snapshot(&harness.pool).await;
+
+    // 4. Replay deliverMessage: MUST reject with 409 DeliveryConflict, NOT return cached success
+    let jwt_replay_msg = harness.mint_jwt_for(
         &harness.sequencer_ds_did,
         &harness.sequencer_ds_key,
         DELIVER_MESSAGE_NSID,
     );
-    let (status2, body2, _) = harness
+    let (status2_m, body2_m, _) = harness
         .send_json(
             "/xrpc/blue.catbird.mlsDS.deliverMessage",
-            Some(&jwt_replay),
+            Some(&jwt_replay_msg),
             &deliver_msg_body,
         )
         .await;
-    assert_eq!(status2, StatusCode::CONFLICT);
-    assert_eq!(body2["error"].as_str(), Some("DeliveryConflict"));
+    assert_eq!(status2_m, StatusCode::CONFLICT);
+    assert_eq!(body2_m["error"].as_str(), Some("DeliveryConflict"));
+
+    // 5. Replay deliverWelcome: MUST reject with 409 DeliveryConflict, NOT return cached success
+    let jwt_replay_w = harness.mint_jwt_for(
+        &harness.sequencer_ds_did,
+        &harness.sequencer_ds_key,
+        DELIVER_WELCOME_NSID,
+    );
+    let (status2_w, body2_w, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            Some(&jwt_replay_w),
+            &deliver_welcome_body,
+        )
+        .await;
+    assert_eq!(status2_w, StatusCode::CONFLICT);
+    assert_eq!(body2_w["error"].as_str(), Some("DeliveryConflict"));
+
+    // State snapshot must remain unchanged after delivery replays on quarantined conversation
+    let after_replay = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after_replay, before_replay,
+        "replaying delivery on quarantined conversation must leave state byte-for-byte unchanged"
+    );
 }
 
 #[tokio::test]
 async fn test_local_sequencer_negative_control_remains_writable() {
     let harness = TestHarness::new("local-writable").await;
     let now = Utc::now();
-    let convo_id = Uuid::new_v4();
-    let group_id = vec![0xBBu8; 32];
 
-    let alice = TestActor::generate();
-    alice.seed(&harness.pool, now).await;
-
-    // Seed local-sequencer conversation (is_remote = false)
-    seed_conversation_structure(
-        &harness.pool,
+    let (
         convo_id,
-        &group_id,
-        false, // is_remote = false
-        None,
-        0,
-        &alice,
-        None,
-        now,
-    )
-    .await;
+        creation_transition_id,
+        generic_transition_id,
+        alice,
+        _bob,
+        group_id,
+        committed_group_context_hash,
+        committed_confirmation_tag,
+        generic_group_context_hash,
+        generic_confirmation_tag,
+    ) = seed_corpus_conversation_at_added(&harness.pool, &harness.sender_ds_did, None, now).await;
 
-    // A local conversation is not quarantined and can advance next_entry_seq normally
+    // A local conversation is not quarantined
     let is_quarantined: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id = $1 AND status = 'quarantined')",
     )
@@ -10219,89 +12470,79 @@ async fn test_local_sequencer_negative_control_remains_writable() {
         "local sequencer conversation must not be quarantined"
     );
 
-    // Local conversation can append an entry and advance next_entry_seq
-    let msg_id_2 = Uuid::new_v4();
-    let msg_entry_id_2 = Uuid::new_v4();
-    let (_, signed_req_bytes_2) =
-        make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
-    let mutation_2 =
-        decode_and_verify_signed_mutation(&signed_req_bytes_2, &alice.public_key).unwrap();
-    let received_at_2 = TrustedRequestInstant::from_canonical_for_test(
-        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    let commit_bytes = corpus_file("commit-generic-public.mls");
+    let (_, signed_req_bytes) = make_corpus_commit_body(
+        convo_id,
+        generic_transition_id,
+        creation_transition_id,
+        &alice.did,
+        alice.device_id,
+        &alice.key_id,
+        &alice.public_key,
+        &alice.signing_key,
+        &group_id,
+        &committed_group_context_hash,
+        &committed_confirmation_tag,
+        &generic_group_context_hash,
+        &generic_confirmation_tag,
+        &commit_bytes,
+        now,
     );
-    let built_2 = build_verified_application_entry(
-        mutation_2,
-        CanonicalUuidV4::parse(&msg_entry_id_2.to_string()).unwrap(),
-        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
-        2,
-        &received_at_2,
-    )
-    .unwrap();
-    let entry_bytes_2 = built_2.canonical_entry_bytes().to_vec();
-    let entry_sha256_2 = *built_2.accepted_payload_sha256();
-    let outer_fp_2 = *built_2.outer_application_fingerprint();
 
-    let mut tx = harness.pool.begin().await.unwrap();
-    let outcome_bytes = b"{}".to_vec();
-    let outcome_sha256 = Sha256::digest(&outcome_bytes).to_vec();
-    sqlx::query(
-        r#"
-        INSERT INTO chat.message_sends (
-            conversation_id, message_id, signed_request_bytes,
-            signing_transcript_bytes, request_digest, signature, status,
-            accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', 2, $7, $8, $9)
-        "#,
-    )
-    .bind(convo_id)
-    .bind(msg_id_2)
-    .bind(&signed_req_bytes_2)
-    .bind(built_2.mutation().transcript_bytes())
-    .bind(built_2.mutation().request_digest().as_slice())
-    .bind(built_2.mutation().signature().as_slice())
-    .bind(&outcome_bytes)
-    .bind(&outcome_sha256)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"
-        INSERT INTO chat.entries (
-            conversation_id, seq, entry_id, entry_kind,
-            accepted_payload_bytes, accepted_payload_sha256, signed_request_bytes,
-            request_digest, signature, server_fields_bytes, outer_entry_fingerprint,
-            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
-            generation, message_id, received_at
-        ) VALUES (
-            $1, 2, $2, 'blue.catbird.chat.defs#applicationEntry',
-            $3, $4, $5, $6, $7, '\xa0', $8, $9, $10, $11, 1, 0, $12, $13
+    let delivery_id = Uuid::new_v4();
+    let mut header_model = ValidatedEnvelopeHeader {
+        protocol_version: "1".to_string(),
+        delivery_id,
+        conversation_id: convo_id,
+        sender_ds_did: harness.sender_ds_did.clone(),
+        receiver_ds_did: LOCAL_DS_DID.to_string(),
+        sequencer_did: LOCAL_DS_DID.to_string(),
+        sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         )
-        "#,
-    )
-    .bind(convo_id)
-    .bind(msg_entry_id_2)
-    .bind(&entry_bytes_2)
-    .bind(&entry_sha256_2.to_vec())
-    .bind(&signed_req_bytes_2)
-    .bind(built_2.mutation().request_digest().as_slice())
-    .bind(built_2.mutation().signature().as_slice())
-    .bind(&outer_fp_2.to_vec())
-    .bind(&alice.did)
-    .bind(alice.device_id)
-    .bind(&alice.key_id)
-    .bind(msg_id_2)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    .unwrap();
+        .unwrap(),
+        payload_sha256: [0u8; 32],
+    };
 
-    sqlx::query("UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1")
-        .bind(convo_id)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    let commit_digest = compute_commit_envelope_digest(&header_model, &signed_req_bytes).unwrap();
+    header_model.payload_sha256 = commit_digest;
+
+    let header_json = make_envelope_header_json(
+        delivery_id,
+        convo_id,
+        &harness.sender_ds_did,
+        LOCAL_DS_DID,
+        LOCAL_DS_DID,
+        1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        &commit_digest,
+    );
+
+    let submit_commit_body = json!({
+        "header": header_json,
+        "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) },
+    });
+
+    let jwt = harness.mint_jwt_for(
+        &harness.sender_ds_did,
+        &harness.sender_ds_key,
+        SUBMIT_COMMIT_NSID,
+    );
+
+    let (status, body, _) = harness
+        .send_json(
+            "/xrpc/blue.catbird.mlsDS.submitCommit",
+            Some(&jwt),
+            &submit_commit_body,
+        )
+        .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "submitCommit on local sequencer conversation must succeed: {body:?}"
+    );
 
     let next_seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
@@ -10310,5 +12551,14 @@ async fn test_local_sequencer_negative_control_remains_writable() {
     .fetch_one(&harness.pool)
     .await
     .unwrap();
-    assert_eq!(next_seq, 3);
+    assert_eq!(next_seq, 6, "next_entry_seq must advance to 6");
+
+    let entry_kind: String = sqlx::query_scalar(
+        "SELECT entry_kind FROM chat.entries WHERE conversation_id = $1 AND seq = 5",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(entry_kind, "blue.catbird.chat.defs#commitEntry");
 }
