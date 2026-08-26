@@ -1951,19 +1951,16 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             reason: format!("cannot parse submit transition: {e:?}"),
         })?;
 
-    // 3. Hydrate locked conversation state and plan commit transition.
     let trusted_instant = TrustedRequestInstant::from_datetime(Utc::now()).map_err(|e| {
         FederationError::InvalidEnvelope {
             reason: format!("invalid instant: {e}"),
         }
     })?;
     let now = trusted_instant.datetime();
-
     let tx_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
         .await
         .map_err(FederationError::Database)?;
-
     let aggregate = super::core::hydrate_locked_conversation_state(tx, header.conversation_id, now)
         .await
         .map_err(|e| FederationError::InvalidEnvelope {
@@ -2152,7 +2149,6 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             return Ok(output);
         }
     };
-
     let entry = build_verified_control_entry(
         mutation,
         &endpoint,
@@ -2171,7 +2167,6 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     .map_err(|e| FederationError::InvalidEnvelope {
         reason: format!("cannot build verified control entry: {e:?}"),
     })?;
-
     let request_digest = *entry.mutation().request_digest();
     let signature = *entry.mutation().signature();
     let outer_control_fingerprint = *entry.outer_control_fingerprint();

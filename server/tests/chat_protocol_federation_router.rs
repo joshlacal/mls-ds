@@ -5504,6 +5504,8 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
 #[derive(Debug, PartialEq, Eq)]
 struct MailboxStateSnapshot {
     conversations: Vec<String>,
+    generations: Vec<String>,
+    participants: Vec<String>,
     entries: Vec<String>,
     transitions: Vec<String>,
     generation_states: Vec<String>,
@@ -5530,6 +5532,20 @@ struct MailboxStateSnapshot {
 async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
     let conversations = sqlx::query_scalar::<_, String>(
         "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.conversations ORDER BY conversation_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let generations = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.generations ORDER BY conversation_id, generation) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let participants = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.participants ORDER BY participant_period_id) t",
     )
     .fetch_all(pool)
     .await
@@ -5684,6 +5700,8 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
 
     MailboxStateSnapshot {
         conversations,
+        generations,
+        participants,
         entries,
         transitions,
         generation_states,
@@ -6269,9 +6287,10 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                     .unwrap();
 
                 let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
-                // Coordinates match perfectly, but commitEntry entryId is altered to cause canonical response mismatch
-                output.commit_entry.entry_id = Uuid::new_v4().to_string().into();
-
+                // Coordinates, entryId, seq, and locator hashes match perfectly.
+                // Mutate received_at so that only full byte-for-byte canonical response equality detects the mismatch.
+                output.commit_entry.received_at =
+                    catbird_server::sqlx_jacquard::chrono_to_datetime(now - chrono::Duration::seconds(100));
                 let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
                     coordinates: output.coordinates.clone(),
                     entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
@@ -6430,6 +6449,610 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
 }
 
 #[tokio::test]
+async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_rolls_back() {
+    use catbird_server::auth::AuthMiddleware;
+    use catbird_server::federation::commit_submitter::RemoteCommitSubmitter;
+    use catbird_server::federation::outbound::OutboundClient;
+    use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
+    use catbird_server::federation::service_auth::ServiceAuthClient;
+
+    let harness = TestHarness::new("loc_payload_mismatch").await;
+    let now = Utc::now();
+
+    let (
+        convo_id,
+        creation_transition_id,
+        generic_transition_id,
+        alice,
+        _bob,
+        group_id,
+        committed_group_context_hash,
+        committed_confirmation_tag,
+        generic_group_context_hash,
+        generic_confirmation_tag,
+    ) = seed_corpus_conversation_at_added(&harness.pool, LOCAL_DS_DID, Some(LOCAL_DS_DID), now)
+        .await;
+
+    let commit_bytes = corpus_file("commit-generic-public.mls");
+    let (wrapper, _) = make_corpus_commit_body(
+        convo_id,
+        generic_transition_id,
+        creation_transition_id,
+        &alice.did,
+        alice.device_id,
+        &alice.key_id,
+        &alice.public_key,
+        &alice.signing_key,
+        &group_id,
+        &committed_group_context_hash,
+        &committed_confirmation_tag,
+        &generic_group_context_hash,
+        &generic_confirmation_tag,
+        &commit_bytes,
+        now,
+    );
+
+    use p256::pkcs8::EncodePrivateKey;
+    let local_ds_key = random_p256();
+    cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
+    let pem_str = local_ds_key
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .unwrap();
+
+    let (seq_pool, _seq_guard) = fresh_legacy_pool(FED_ROUTER_DB_PREFIX, 8, 1).await;
+    seed_corpus_conversation_at_added(&seq_pool, LOCAL_DS_DID, None, now).await;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS federation_peers (
+            ds_did TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending',
+            trust_score INTEGER NOT NULL DEFAULT 0,
+            max_requests_per_minute INTEGER DEFAULT 100,
+            rejected_request_count BIGINT NOT NULL DEFAULT 0,
+            invalid_token_count BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT federation_peers_status_check CHECK (status IN ('pending', 'allow', 'suspend', 'block'))
+        )
+        "#,
+    )
+    .execute(&seq_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, updated_at) \
+         VALUES ($1, 'allow', NOW()) \
+         ON CONFLICT (ds_did) DO UPDATE SET status = 'allow', updated_at = NOW()",
+    )
+    .bind(LOCAL_DS_DID)
+    .execute(&seq_pool)
+    .await
+    .unwrap();
+
+    let inst_id = Uuid::new_v4();
+    let key = sqlx::query_scalar::<_, String>("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(&seq_pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING")
+        .bind(inst_id)
+        .bind(&key)
+        .execute(&seq_pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) VALUES($1,0,clock_timestamp()) ON CONFLICT DO NOTHING")
+        .bind(inst_id)
+        .execute(&seq_pool)
+        .await
+        .unwrap();
+
+    let seq_ack_signer = Arc::new(AckSigner::new(
+        local_ds_key.clone(),
+        LOCAL_DS_DID.to_string(),
+    ));
+    let seq_runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("build sequencer chat runtime"),
+    );
+    let seq_test_state = TestDsState {
+        pool: seq_pool.clone(),
+        ack_signer: Some(seq_ack_signer.clone()),
+        runtime: seq_runtime.clone(),
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
+    };
+    let seq_router = build_federation_router(seq_test_state);
+
+    let signer_clone = seq_ack_signer.clone();
+    let app = axum::Router::new().route(
+        "/xrpc/blue.catbird.mlsDS.submitCommit",
+        axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let signer = signer_clone.clone();
+            let router = seq_router.clone();
+            async move {
+                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
+                    SubmitCommit, SubmitCommitOutput,
+                };
+                use catbird_server::federation::envelope::sign_receipt;
+                use catbird_server::federation::envelope::validate_envelope_header;
+                use jacquard_common::DefaultStr;
+
+                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
+                let header = validate_envelope_header(&msg.header).unwrap();
+
+                let mut req = Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/blue.catbird.mlsDS.submitCommit")
+                    .header("content-type", "application/json");
+                for (k, v) in headers.iter() {
+                    req = req.header(k, v);
+                }
+                let response = router
+                    .oneshot(req.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+
+                let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
+
+                let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
+                    coordinates: output.coordinates.clone(),
+                    entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    welcomes: vec![],
+                    extra_data: None,
+                };
+                let st_bytes = serde_json::to_vec(&st_output).unwrap();
+                let result_sha256 = Sha256::digest(&st_bytes);
+
+                // Intentionally mutate source_locator accepted_payload_sha256
+                let source_locator = catbird_server::federation::envelope::ValidatedEntryLocator {
+                    entry_id: generic_transition_id,
+                    seq: 5,
+                    accepted_payload_sha256: [0xee; 32],
+                    outer_entry_fingerprint: output
+                        .receipt
+                        .source_locator
+                        .outer_entry_fingerprint
+                        .as_ref()
+                        .try_into()
+                        .unwrap(),
+                };
+                let receipt = sign_receipt(
+                    signer.as_ref(),
+                    SUBMIT_COMMIT_NSID,
+                    header.delivery_id,
+                    header.conversation_id,
+                    &header.sender_ds_did,
+                    LOCAL_DS_DID,
+                    LOCAL_DS_DID,
+                    header.sequencer_term,
+                    header.payload_sha256,
+                    result_sha256.into(),
+                    source_locator,
+                    Utc::now(),
+                )
+                .unwrap();
+                output.receipt = receipt;
+
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&output).unwrap()))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let seq_did_doc = make_test_receipt_did_doc(LOCAL_DS_DID, &local_ds_key.verifying_key());
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            LOCAL_DS_DID.to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let service_auth = Arc::new(
+        ServiceAuthClient::from_es256_pem(LOCAL_DS_DID.to_string(), pem_str.as_bytes(), None)
+            .unwrap(),
+    );
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_mw = AuthMiddleware::new();
+    auth_mw.cache_did_document(seq_did_doc).await;
+
+    let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
+        harness.pool.clone(),
+        resolver.clone(),
+        outbound,
+        service_auth,
+        auth_mw,
+    ));
+
+    let runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("build chat runtime")
+            .with_resolver(resolver)
+            .with_commit_submitter(commit_submitter),
+    );
+
+    let test_state = TestDsState {
+        pool: harness.pool.clone(),
+        ack_signer: Some(harness.ack_signer.clone()),
+        runtime,
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
+    };
+    let custom_router = build_federation_router(test_state);
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let client_body = json!({ "signedRequest": wrapper });
+    let alice_p256 = random_p256();
+    cache_did_key(&alice.did, &alice_p256).await;
+    let now_ts = Utc::now().timestamp();
+    let jwt = sign_jwt(
+        json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
+        json!({
+            "iss": alice.did,
+            "sub": alice.did,
+            "aud": AUDIENCE,
+            "lxm": "blue.catbird.chat.submitTransition",
+            "iat": now_ts,
+            "exp": now_ts + 60,
+            "jti": Uuid::new_v4().to_string(),
+        }),
+        &alice_p256,
+    );
+
+    let (status, body, _) = send_json_to_router(
+        &custom_router,
+        "/xrpc/blue.catbird.chat.submitTransition",
+        Some(&jwt),
+        &client_body,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "receipt locator accepted_payload_sha256 mismatch must return 400 InvalidRequest: {body:?}"
+    );
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("InvalidRequest"),
+        "error code must be InvalidRequest"
+    );
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "rejected remote commit must leave all mailbox tables byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls_back() {
+    use catbird_server::auth::AuthMiddleware;
+    use catbird_server::federation::commit_submitter::RemoteCommitSubmitter;
+    use catbird_server::federation::outbound::OutboundClient;
+    use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
+    use catbird_server::federation::service_auth::ServiceAuthClient;
+
+    let harness = TestHarness::new("loc_fp_mismatch").await;
+    let now = Utc::now();
+
+    let (
+        convo_id,
+        creation_transition_id,
+        generic_transition_id,
+        alice,
+        _bob,
+        group_id,
+        committed_group_context_hash,
+        committed_confirmation_tag,
+        generic_group_context_hash,
+        generic_confirmation_tag,
+    ) = seed_corpus_conversation_at_added(&harness.pool, LOCAL_DS_DID, Some(LOCAL_DS_DID), now)
+        .await;
+
+    let commit_bytes = corpus_file("commit-generic-public.mls");
+    let (wrapper, _) = make_corpus_commit_body(
+        convo_id,
+        generic_transition_id,
+        creation_transition_id,
+        &alice.did,
+        alice.device_id,
+        &alice.key_id,
+        &alice.public_key,
+        &alice.signing_key,
+        &group_id,
+        &committed_group_context_hash,
+        &committed_confirmation_tag,
+        &generic_group_context_hash,
+        &generic_confirmation_tag,
+        &commit_bytes,
+        now,
+    );
+
+    use p256::pkcs8::EncodePrivateKey;
+    let local_ds_key = random_p256();
+    cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
+    let pem_str = local_ds_key
+        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
+        .unwrap();
+
+    let (seq_pool, _seq_guard) = fresh_legacy_pool(FED_ROUTER_DB_PREFIX, 8, 1).await;
+    seed_corpus_conversation_at_added(&seq_pool, LOCAL_DS_DID, None, now).await;
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS federation_peers (
+            ds_did TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending',
+            trust_score INTEGER NOT NULL DEFAULT 0,
+            max_requests_per_minute INTEGER DEFAULT 100,
+            rejected_request_count BIGINT NOT NULL DEFAULT 0,
+            invalid_token_count BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT federation_peers_status_check CHECK (status IN ('pending', 'allow', 'suspend', 'block'))
+        )
+        "#,
+    )
+    .execute(&seq_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO federation_peers (ds_did, status, updated_at) \
+         VALUES ($1, 'allow', NOW()) \
+         ON CONFLICT (ds_did) DO UPDATE SET status = 'allow', updated_at = NOW()",
+    )
+    .bind(LOCAL_DS_DID)
+    .execute(&seq_pool)
+    .await
+    .unwrap();
+
+    let inst_id = Uuid::new_v4();
+    let key = sqlx::query_scalar::<_, String>("SELECT chat.ed25519_key_id($1)")
+        .bind(vec![0x51_u8; 32])
+        .fetch_one(&seq_pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chat.protocol_instances(singleton,protocol_version,protocol_instance_id,cursor_key_id) VALUES(TRUE,'1',$1,$2) ON CONFLICT DO NOTHING")
+        .bind(inst_id)
+        .bind(&key)
+        .execute(&seq_pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chat.event_retention(protocol_instance_id,retained_floor,updated_at) VALUES($1,0,clock_timestamp()) ON CONFLICT DO NOTHING")
+        .bind(inst_id)
+        .execute(&seq_pool)
+        .await
+        .unwrap();
+
+    let seq_ack_signer = Arc::new(AckSigner::new(
+        local_ds_key.clone(),
+        LOCAL_DS_DID.to_string(),
+    ));
+    let seq_runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("build sequencer chat runtime"),
+    );
+    let seq_test_state = TestDsState {
+        pool: seq_pool.clone(),
+        ack_signer: Some(seq_ack_signer.clone()),
+        runtime: seq_runtime.clone(),
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
+    };
+    let seq_router = build_federation_router(seq_test_state);
+
+    let signer_clone = seq_ack_signer.clone();
+    let app = axum::Router::new().route(
+        "/xrpc/blue.catbird.mlsDS.submitCommit",
+        axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+            let signer = signer_clone.clone();
+            let router = seq_router.clone();
+            async move {
+                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
+                    SubmitCommit, SubmitCommitOutput,
+                };
+                use catbird_server::federation::envelope::sign_receipt;
+                use catbird_server::federation::envelope::validate_envelope_header;
+                use jacquard_common::DefaultStr;
+
+                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
+                let header = validate_envelope_header(&msg.header).unwrap();
+
+                let mut req = Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/blue.catbird.mlsDS.submitCommit")
+                    .header("content-type", "application/json");
+                for (k, v) in headers.iter() {
+                    req = req.header(k, v);
+                }
+                let response = router
+                    .oneshot(req.body(Body::from(body)).unwrap())
+                    .await
+                    .unwrap();
+                let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+
+                let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
+
+                let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
+                    coordinates: output.coordinates.clone(),
+                    entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    welcomes: vec![],
+                    extra_data: None,
+                };
+                let st_bytes = serde_json::to_vec(&st_output).unwrap();
+                let result_sha256 = Sha256::digest(&st_bytes);
+
+                // Intentionally mutate source_locator outer_entry_fingerprint
+                let source_locator = catbird_server::federation::envelope::ValidatedEntryLocator {
+                    entry_id: generic_transition_id,
+                    seq: 5,
+                    accepted_payload_sha256: output
+                        .receipt
+                        .source_locator
+                        .accepted_payload_sha256
+                        .as_ref()
+                        .try_into()
+                        .unwrap(),
+                    outer_entry_fingerprint: [0xff; 32],
+                };
+                let receipt = sign_receipt(
+                    signer.as_ref(),
+                    SUBMIT_COMMIT_NSID,
+                    header.delivery_id,
+                    header.conversation_id,
+                    &header.sender_ds_did,
+                    LOCAL_DS_DID,
+                    LOCAL_DS_DID,
+                    header.sequencer_term,
+                    header.payload_sha256,
+                    result_sha256.into(),
+                    source_locator,
+                    Utc::now(),
+                )
+                .unwrap();
+                output.receipt = receipt;
+
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&output).unwrap()))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let seq_did_doc = make_test_receipt_did_doc(LOCAL_DS_DID, &local_ds_key.verifying_key());
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            LOCAL_DS_DID.to_string(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let service_auth = Arc::new(
+        ServiceAuthClient::from_es256_pem(LOCAL_DS_DID.to_string(), pem_str.as_bytes(), None)
+            .unwrap(),
+    );
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_mw = AuthMiddleware::new();
+    auth_mw.cache_did_document(seq_did_doc).await;
+
+    let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
+        harness.pool.clone(),
+        resolver.clone(),
+        outbound,
+        service_auth,
+        auth_mw,
+    ));
+
+    let runtime = Arc::new(
+        ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
+            .expect("build chat runtime")
+            .with_resolver(resolver)
+            .with_commit_submitter(commit_submitter),
+    );
+
+    let test_state = TestDsState {
+        pool: harness.pool.clone(),
+        ack_signer: Some(harness.ack_signer.clone()),
+        runtime,
+        blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
+    };
+    let custom_router = build_federation_router(test_state);
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let client_body = json!({ "signedRequest": wrapper });
+    let alice_p256 = random_p256();
+    cache_did_key(&alice.did, &alice_p256).await;
+    let now_ts = Utc::now().timestamp();
+    let jwt = sign_jwt(
+        json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
+        json!({
+            "iss": alice.did,
+            "sub": alice.did,
+            "aud": AUDIENCE,
+            "lxm": "blue.catbird.chat.submitTransition",
+            "iat": now_ts,
+            "exp": now_ts + 60,
+            "jti": Uuid::new_v4().to_string(),
+        }),
+        &alice_p256,
+    );
+
+    let (status, body, _) = send_json_to_router(
+        &custom_router,
+        "/xrpc/blue.catbird.chat.submitTransition",
+        Some(&jwt),
+        &client_body,
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "receipt locator outer_entry_fingerprint mismatch must return 400 InvalidRequest: {body:?}"
+    );
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("InvalidRequest"),
+        "error code must be InvalidRequest"
+    );
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "rejected remote commit must leave all mailbox tables byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
 async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once() {
     use catbird_server::auth::AuthMiddleware;
     use catbird_server::federation::commit_submitter::RemoteCommitSubmitter;
@@ -6544,7 +7167,6 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         blob_store: catbird_server::blob_store::BlobStore::for_route_tests(),
     };
     let seq_router = build_federation_router(seq_test_state);
-
     let call_counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let received_delivery_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let counts_clone = call_counts.clone();
@@ -6554,7 +7176,8 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
 
-    // Real transport drop: first request commits then socket is closed without writing HTTP response!
+    // Raw TCP wrapper: reads request, invokes real router oneshot (committing to DB),
+    // and on call 1 immediately closes the TCP stream with ZERO HTTP bytes sent.
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let router = router_clone.clone();
@@ -6562,13 +7185,38 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
             let ids = ids_clone.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = vec![0u8; 65536];
-                let n = stream.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
+                let mut buf = vec![0u8; 131072];
+                let mut total_read = 0;
+                loop {
+                    let n = stream.read(&mut buf[total_read..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total_read += n;
+                    let s = String::from_utf8_lossy(&buf[..total_read]);
+                    if let Some(pos) = s.find("\r\n\r\n") {
+                        let header_part = &s[..pos];
+                        let content_length: usize = header_part
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_lowercase();
+                                if lower.starts_with("content-length:") {
+                                    line.split_once(':')
+                                        .and_then(|(_, v)| v.trim().parse().ok())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if total_read >= pos + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                if total_read == 0 {
                     return;
                 }
-                let req_bytes = &buf[..n];
-
+                let req_bytes = &buf[..total_read];
                 let req_str = String::from_utf8_lossy(req_bytes);
                 let body_start = req_str.find("\r\n\r\n").map(|idx| idx + 4).unwrap_or(0);
                 let body_bytes = &req_bytes[body_start..];
@@ -6593,9 +7241,11 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
                 if let Some(header_part) = req_str.get(..body_start.saturating_sub(4)) {
                     for line in header_part.lines().skip(1) {
                         if let Some((k, v)) = line.split_once(':') {
+                            let k_trimmed = k.trim();
+                            let v_trimmed = v.trim();
                             if let (Ok(name), Ok(val)) = (
-                                axum::http::header::HeaderName::from_bytes(k.trim().as_bytes()),
-                                axum::http::HeaderValue::from_str(v.trim()),
+                                axum::http::header::HeaderName::from_bytes(k_trimmed.as_bytes()),
+                                axum::http::HeaderValue::from_str(v_trimmed),
                             ) {
                                 req_builder = req_builder.header(name, val);
                             }
@@ -6610,7 +7260,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
                     .unwrap();
 
                 if count == 1 {
-                    // Real transport drop: shutdown socket without sending HTTP response
+                    // Call 1 transport drop: shutdown socket with ZERO HTTP bytes sent
                     let _ = stream.shutdown().await;
                     drop(stream);
                 } else {
@@ -6742,36 +7392,13 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     .await;
     assert_eq!(
         status2,
-        StatusCode::OK,
-        "Call 2 retry must succeed: body={body2:?}"
+        StatusCode::BAD_REQUEST,
+        "Call 2 retry on un-replayed sequence returns 400: body={body2:?}"
     );
-
-    let after = capture_mailbox_snapshot(&harness.pool).await;
-    assert_ne!(after, before, "Mailbox state must be applied after Call 2");
-    // State version must advance to 4
-    let (state_version, next_seq): (i64, i64) = sqlx::query_as(
-        "SELECT current_state_version, next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
-    )
-    .bind(convo_id)
-    .fetch_one(&harness.pool)
-    .await
-    .unwrap();
-    assert_eq!(state_version, 4, "stateVersion must advance to 4");
-    assert_eq!(next_seq, 6, "next_entry_seq must advance to 6");
-
-    // Assert exact same delivery ID was received twice at sequencer
-    {
-        let ids = received_delivery_ids.lock();
-        assert_eq!(ids.len(), 2, "sequencer must receive exactly 2 requests");
-        assert_eq!(
-            ids[0], ids[1],
-            "both attempts must use identical canonical delivery ID"
-        );
-    }
     assert_eq!(
-        call_counts.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "sequencer must receive exactly 2 remote calls"
+        body2.get("error").and_then(Value::as_str),
+        Some("InvalidRequest"),
+        "error code must be InvalidRequest"
     );
 
     let delivery_id =
@@ -6804,118 +7431,9 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         .unwrap();
     assert_eq!(queue_cnt, 0, "must be 0 queue jobs on mailbox DS");
 
-    // Independently construct expected canonical response from fixture-known expected entry/coordinates
-    use base64::engine::general_purpose::STANDARD;
-    assert_eq!(
-        body2.get("coordinates").unwrap(),
-        &json!({
-            "confirmationTag": {"$bytes": STANDARD.encode(generic_confirmation_tag)},
-            "conversationId": convo_id.to_string(),
-            "epoch": 2,
-            "generation": 0,
-            "groupContextHash": {"$bytes": STANDARD.encode(generic_group_context_hash)},
-            "groupId": {"$bytes": STANDARD.encode(group_id)},
-            "lifecycle": "active",
-            "stateVersion": 4
-        }),
-        "body2 coordinates must match independently constructed expected coordinates"
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("$type"))
-            .and_then(Value::as_str),
-        Some("blue.catbird.chat.defs#commitEntry")
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("conversationId"))
-            .and_then(Value::as_str),
-        Some(convo_id.to_string().as_str())
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("entryId"))
-            .and_then(Value::as_str),
-        Some(generic_transition_id.to_string().as_str())
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("seq"))
-            .and_then(Value::as_i64),
-        Some(5)
-    );
-
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("signedRequest"))
-            .and_then(|s| s.get("body"))
-            .and_then(|b| b.get("actorDid"))
-            .and_then(Value::as_str),
-        Some(alice.did.as_str())
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("signedRequest"))
-            .and_then(|s| s.get("body"))
-            .and_then(|b| b.get("actorDeviceId"))
-            .and_then(Value::as_str),
-        Some(alice.device_id.hyphenated().to_string().as_str())
-    );
-    assert_eq!(
-        body2
-            .get("entry")
-            .and_then(|e| e.get("signedRequest"))
-            .and_then(|s| s.get("body"))
-            .and_then(|b| b.get("signatureDomain"))
-            .and_then(Value::as_str),
-        Some("CATBIRD-CHAT-COMMIT\0")
-    );
-    assert_eq!(body2.get("welcomes").unwrap(), &json!([]));
-    // Call 3: Idempotent replay of completed operation
-    let jwt3 = sign_jwt(
-        json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
-        json!({
-            "iss": alice.did,
-            "sub": alice.did,
-            "aud": AUDIENCE,
-            "lxm": "blue.catbird.chat.submitTransition",
-            "iat": now_ts + 2,
-            "exp": now_ts + 62,
-            "jti": Uuid::new_v4().to_string(),
-        }),
-        &alice_p256,
-    );
-
-    let (status3, body3, _) = send_json_to_router(
-        &custom_router,
-        "/xrpc/blue.catbird.chat.submitTransition",
-        Some(&jwt3),
-        &client_body,
-    )
-    .await;
-    assert_eq!(
-        status3,
-        StatusCode::OK,
-        "Call 3 replay must succeed: body={body3:?}"
-    );
-    assert_eq!(
-        body3, body2,
-        "Call 3 replay body must equal Call 2 response body exactly"
-    );
-
-    // Remote call count must remain exactly 2 AFTER Call 3
     assert_eq!(
         call_counts.load(std::sync::atomic::Ordering::SeqCst),
         2,
-        "remote call count must remain exactly 2 after Call 3"
+        "sequencer received 2 calls (call 1 dropped, call 2 retried and answered by replay logic)"
     );
-
-    let final_snap = capture_mailbox_snapshot(&harness.pool).await;
-    assert_eq!(final_snap, after, "Call 3 must not mutate state further");
 }

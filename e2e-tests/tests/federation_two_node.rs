@@ -33,7 +33,8 @@ const DELIVER_WELCOME_NSID: &str = "blue.catbird.mlsDS.deliverWelcome";
 const SUBMIT_COMMIT_NSID: &str = "blue.catbird.mlsDS.submitCommit";
 
 // Corpus crypto-wire fixtures for canonical commit verification
-const MANIFEST_BYTES: &[u8] = include_bytes!("../../server/tests/fixtures/crypto-wire/manifest.json");
+const MANIFEST_BYTES: &[u8] =
+    include_bytes!("../../server/tests/fixtures/crypto-wire/manifest.json");
 const GENESIS_PUBLIC_STATE: &[u8] =
     include_bytes!("../../server/tests/fixtures/crypto-wire/genesis-public-state.bin");
 const COMMITTED_PUBLIC_STATE: &[u8] =
@@ -46,15 +47,13 @@ const COMMIT_PUBLIC_MLS: &[u8] =
     include_bytes!("../../server/tests/fixtures/crypto-wire/commit-public.mls");
 
 const ALICE_SIGNING_SEED: [u8; 32] = [
-    0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85, 0x55,
-    0xa6, 0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e, 0x8c, 0x6b,
-    0x12, 0x8d,
+    0x38, 0x8f, 0x37, 0x73, 0x57, 0x9e, 0x8a, 0x2b, 0x5d, 0x57, 0x2d, 0x3b, 0x19, 0x85, 0x55, 0xa6,
+    0x93, 0x6f, 0xb7, 0xf0, 0x13, 0xb8, 0x58, 0xe2, 0x69, 0xf6, 0x4f, 0x6e, 0x8c, 0x6b, 0x12, 0x8d,
 ];
 
 const BOB_SIGNING_SEED: [u8; 32] = [
-    0xd4, 0xa1, 0xc4, 0x8e, 0x33, 0x92, 0x40, 0x8e, 0x24, 0x40, 0x90, 0x3f, 0xc5, 0x67, 0x8d,
-    0xa5, 0x69, 0x98, 0xeb, 0x66, 0xeb, 0xb8, 0xa9, 0x64, 0xa7, 0xe4, 0xe4, 0xc2, 0xad, 0x82,
-    0xe9, 0xb5,
+    0xd4, 0xa1, 0xc4, 0x8e, 0x33, 0x92, 0x40, 0x8e, 0x24, 0x40, 0x90, 0x3f, 0xc5, 0x67, 0x8d, 0xa5,
+    0x69, 0x98, 0xeb, 0x66, 0xeb, 0xb8, 0xa9, 0x64, 0xa7, 0xe4, 0xe4, 0xc2, 0xad, 0x82, 0xe9, 0xb5,
 ];
 
 fn hex_array<const N: usize>(value: &str) -> [u8; N] {
@@ -287,6 +286,10 @@ fn compute_commit_envelope_digest(
     let signed_req_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
     buf.extend_from_slice(&signed_req_sha256);
 
+    let canonical: Value = serde_json::from_slice(signed_request_bytes).unwrap();
+    let signed_at = canonical["signedAt"].as_str().unwrap();
+    lp_bytes(signed_at.as_bytes(), &mut buf);
+
     Sha256::digest(&buf).into()
 }
 
@@ -416,7 +419,12 @@ fn make_creation_body_with_invitee(
             }
         }));
     }
-    participants.sort_by(|a, b| a["userDid"].as_str().unwrap().cmp(b["userDid"].as_str().unwrap()));
+    participants.sort_by(|a, b| {
+        a["userDid"]
+            .as_str()
+            .unwrap()
+            .cmp(b["userDid"].as_str().unwrap())
+    });
     let unsigned = json!({
         "$type": "blue.catbird.chat.defs#creationBody",
         "signatureDomain": "CATBIRD-CHAT-CREATE\u{0000}",
@@ -548,8 +556,11 @@ fn make_acceptance_body(
 
     let unsigned_bytes = serde_json::to_vec(&unsigned).unwrap();
     let strict = decode_strict_json(&unsigned_bytes).unwrap();
-    let projected = project_signed_body(SignedMutationKind::ParticipantAcceptance, &strict).unwrap();
-    let mutation = SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &projected).unwrap();
+    let projected =
+        project_signed_body(SignedMutationKind::ParticipantAcceptance, &strict).unwrap();
+    let mutation =
+        SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &projected)
+            .unwrap();
     let sig = actor.signing_key.sign(mutation.bytes());
     let wrapper = json!({
         "body": unsigned,
@@ -690,8 +701,11 @@ fn make_leaf_recovery_fulfillment_body(
 
     let unsigned_bytes = serde_json::to_vec(&unsigned).unwrap();
     let strict = decode_strict_json(&unsigned_bytes).unwrap();
-    let projected = project_signed_body(SignedMutationKind::LeafRecoveryFulfillment, &strict).unwrap();
-    let mutation = SigningTranscript::build_for(SignedMutationKind::LeafRecoveryFulfillment, &projected).unwrap();
+    let projected =
+        project_signed_body(SignedMutationKind::LeafRecoveryFulfillment, &strict).unwrap();
+    let mutation =
+        SigningTranscript::build_for(SignedMutationKind::LeafRecoveryFulfillment, &projected)
+            .unwrap();
     let sig = actor.signing_key.sign(mutation.bytes());
     let wrapper = json!({
         "body": unsigned,
@@ -809,7 +823,8 @@ fn make_corpus_commit_body(
     let unsigned_bytes = serde_json::to_vec(&unsigned).unwrap();
     let strict = decode_strict_json(&unsigned_bytes).unwrap();
     let projected = project_signed_body(SignedMutationKind::CommitTransition, &strict).unwrap();
-    let mutation = SigningTranscript::build_for(SignedMutationKind::CommitTransition, &projected).unwrap();
+    let mutation =
+        SigningTranscript::build_for(SignedMutationKind::CommitTransition, &projected).unwrap();
     let sig = actor_signing_key.sign(mutation.bytes());
     let wrapper = json!({
         "body": unsigned,
@@ -878,7 +893,8 @@ fn make_message_body(
     let unsigned_bytes = serde_json::to_vec(&unsigned).unwrap();
     let strict = decode_strict_json(&unsigned_bytes).unwrap();
     let projected = project_signed_body(SignedMutationKind::ApplicationSend, &strict).unwrap();
-    let mutation = SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &projected).unwrap();
+    let mutation =
+        SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &projected).unwrap();
     let sig = actor.signing_key.sign(mutation.bytes());
     let wrapper = json!({
         "body": unsigned,
@@ -919,15 +935,25 @@ async fn take_db_snapshot(
         ds1_entries: count_table(ds1_pg, "SELECT count(*) FROM chat.entries").await?,
         ds1_conversations: count_table(ds1_pg, "SELECT count(*) FROM chat.conversations").await?,
         ds1_participants: count_table(ds1_pg, "SELECT count(*) FROM chat.participants").await?,
-        ds1_generation_states: count_table(ds1_pg, "SELECT count(*) FROM chat.generation_states").await?,
-        ds1_receipts: count_table(ds1_pg, "SELECT count(*) FROM chat.federation_delivery_receipts").await?,
+        ds1_generation_states: count_table(ds1_pg, "SELECT count(*) FROM chat.generation_states")
+            .await?,
+        ds1_receipts: count_table(
+            ds1_pg,
+            "SELECT count(*) FROM chat.federation_delivery_receipts",
+        )
+        .await?,
         ds1_outbound_queue: count_table(ds1_pg, "SELECT count(*) FROM outbound_queue").await?,
         ds1_outbox: count_table(ds1_pg, "SELECT count(*) FROM federation_outbox").await?,
         ds2_entries: count_table(ds2_pg, "SELECT count(*) FROM chat.entries").await?,
         ds2_conversations: count_table(ds2_pg, "SELECT count(*) FROM chat.conversations").await?,
         ds2_participants: count_table(ds2_pg, "SELECT count(*) FROM chat.participants").await?,
-        ds2_generation_states: count_table(ds2_pg, "SELECT count(*) FROM chat.generation_states").await?,
-        ds2_receipts: count_table(ds2_pg, "SELECT count(*) FROM chat.federation_delivery_receipts").await?,
+        ds2_generation_states: count_table(ds2_pg, "SELECT count(*) FROM chat.generation_states")
+            .await?,
+        ds2_receipts: count_table(
+            ds2_pg,
+            "SELECT count(*) FROM chat.federation_delivery_receipts",
+        )
+        .await?,
         ds2_outbound_queue: count_table(ds2_pg, "SELECT count(*) FROM outbound_queue").await?,
         ds2_outbox: count_table(ds2_pg, "SELECT count(*) FROM federation_outbox").await?,
     })
@@ -946,7 +972,10 @@ async fn run_test_scenario() -> Result<()> {
 
     println!("=== STEP 0: Booting Two-Node Federated Cluster ===");
     let cluster = boot_two_node_cluster().await?;
-    println!("✓ Booted DS1 at {} and DS2 at {}", cluster.ds1_url, cluster.ds2_url);
+    println!(
+        "✓ Booted DS1 at {} and DS2 at {}",
+        cluster.ds1_url, cluster.ds2_url
+    );
 
     // ──────────────────────────────────────────────────────────────────────────
     // STEP 1: Peer Registration via Authenticated Admin API
@@ -960,7 +989,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp1 = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer", cluster.ds1_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {ds1_admin_jwt}"))
         .json(&json!({
             "dsDid": cluster.ds2_service_did,
@@ -984,7 +1016,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp2 = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds2_admin_jwt}"))
         .json(&json!({
             "dsDid": cluster.ds1_service_did,
@@ -1008,7 +1043,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let list_resp1: Value = cluster
         .http_client
-        .get(format!("{}/xrpc/blue.catbird.mlsDS.getFederationPeers", cluster.ds1_url))
+        .get(format!(
+            "{}/xrpc/blue.catbird.mlsDS.getFederationPeers",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {list_jwt1}"))
         .send()
         .await?
@@ -1016,7 +1054,9 @@ async fn run_test_scenario() -> Result<()> {
         .await?;
     let peers1 = list_resp1["peers"].as_array().expect("peers array");
     assert!(
-        peers1.iter().any(|p| p["dsDid"] == cluster.ds2_service_did && p["status"] == "allow"),
+        peers1
+            .iter()
+            .any(|p| p["dsDid"] == cluster.ds2_service_did && p["status"] == "allow"),
         "DS1 peer list must include DS2 as allow: {list_resp1:?}"
     );
 
@@ -1027,7 +1067,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let list_resp2: Value = cluster
         .http_client
-        .get(format!("{}/xrpc/blue.catbird.mlsDS.getFederationPeers", cluster.ds2_url))
+        .get(format!(
+            "{}/xrpc/blue.catbird.mlsDS.getFederationPeers",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {list_jwt2}"))
         .send()
         .await?
@@ -1035,7 +1078,9 @@ async fn run_test_scenario() -> Result<()> {
         .await?;
     let peers2 = list_resp2["peers"].as_array().expect("peers array");
     assert!(
-        peers2.iter().any(|p| p["dsDid"] == cluster.ds1_service_did && p["status"] == "allow"),
+        peers2
+            .iter()
+            .any(|p| p["dsDid"] == cluster.ds1_service_did && p["status"] == "allow"),
         "DS2 peer list must include DS1 as allow: {list_resp2:?}"
     );
     println!("✓ Verified getFederationPeers on both nodes");
@@ -1153,7 +1198,6 @@ async fn run_test_scenario() -> Result<()> {
         )
         .await?;
 
-
     // Seed Principals and Devices on DS1 & DS2
     for pg in [&ds1_pg, &ds2_pg] {
         pg.execute(
@@ -1208,15 +1252,30 @@ async fn run_test_scenario() -> Result<()> {
 
     // 1. Creation body & entry (Seq 1)
     let (_, creation_signed_req) = make_creation_body_with_invitee(
-        convo_id, creation_entry_id, &alice, Some(&bob), &group_id, &genesis_gch, &genesis_ctag, &group_info_bytes, &public_snapshot_bytes, now,
+        convo_id,
+        creation_entry_id,
+        &alice,
+        Some(&bob),
+        &group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        &group_info_bytes,
+        &public_snapshot_bytes,
+        now,
     );
     let creation_wrapper = SignedWrapper::decode(&creation_signed_req).unwrap();
-    let creation_projected = project_signed_body(SignedMutationKind::Creation, &creation_wrapper.body).unwrap();
-    let creation_mutation = SigningTranscript::build_for(SignedMutationKind::Creation, &creation_projected).unwrap();
+    let creation_projected =
+        project_signed_body(SignedMutationKind::Creation, &creation_wrapper.body).unwrap();
+    let creation_mutation =
+        SigningTranscript::build_for(SignedMutationKind::Creation, &creation_projected).unwrap();
     let creation_unsigned_proj = creation_mutation.canonical_projection().to_vec();
     let creation_transcript = creation_mutation.bytes().to_vec();
     let creation_request_digest = creation_mutation.request_digest().to_vec();
-    let creation_sig = alice.signing_key.sign(&creation_transcript).to_bytes().to_vec();
+    let creation_sig = alice
+        .signing_key
+        .sign(&creation_transcript)
+        .to_bytes()
+        .to_vec();
     let mut creation_sig_arr = [0u8; 64];
     creation_sig_arr.copy_from_slice(&creation_sig);
     let creation_row = EntryRow {
@@ -1232,7 +1291,8 @@ async fn run_test_scenario() -> Result<()> {
         ControlEntryKind::Creation,
         &creation_row,
         &creation_server_fields,
-    ).unwrap();
+    )
+    .unwrap();
     let creation_outer_fp = *creation_fp_obj.fingerprint().as_bytes();
     let creation_outer_fp_vec = creation_outer_fp.to_vec();
     let creation_wrapper_json: Value = serde_json::from_slice(&creation_signed_req).unwrap();
@@ -1250,11 +1310,23 @@ async fn run_test_scenario() -> Result<()> {
     let acc_transition_id = Uuid::new_v4();
     let acc_entry_id = acc_transition_id;
     let (_, acc_signed_req) = make_acceptance_body(
-        convo_id, acc_transition_id, recovery_request_id, creation_transition_id, &bob, &alice, &group_id, &genesis_gch, &genesis_ctag, now,
+        convo_id,
+        acc_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &bob,
+        &alice,
+        &group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        now,
     );
     let acc_wrapper = SignedWrapper::decode(&acc_signed_req).unwrap();
-    let acc_projected = project_signed_body(SignedMutationKind::ParticipantAcceptance, &acc_wrapper.body).unwrap();
-    let acc_mutation = SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &acc_projected).unwrap();
+    let acc_projected =
+        project_signed_body(SignedMutationKind::ParticipantAcceptance, &acc_wrapper.body).unwrap();
+    let acc_mutation =
+        SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &acc_projected)
+            .unwrap();
     let acc_unsigned_proj = acc_mutation.canonical_projection().to_vec();
     let acc_transcript = acc_mutation.bytes().to_vec();
     let acc_digest = acc_mutation.request_digest().to_vec();
@@ -1270,19 +1342,27 @@ async fn run_test_scenario() -> Result<()> {
         received_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
     };
     let recovery_value = CanonicalValue::Map(BTreeMap::from([
-        ("keyPackageRef".to_owned(), CanonicalValue::Bytes(key_package_ref.to_vec())),
-        ("recoveryRequestId".to_owned(), CanonicalValue::Uuid(*recovery_request_id.as_bytes())),
+        (
+            "keyPackageRef".to_owned(),
+            CanonicalValue::Bytes(key_package_ref.to_vec()),
+        ),
+        (
+            "recoveryRequestId".to_owned(),
+            CanonicalValue::Uuid(*recovery_request_id.as_bytes()),
+        ),
     ]));
     let acc_server_fields = ControlServerFields::single(
         ControlEntryKind::ParticipantAcceptance,
         "recovery",
         recovery_value,
-    ).unwrap();
+    )
+    .unwrap();
     let acc_fp_obj = control_entry_fingerprint(
         ControlEntryKind::ParticipantAcceptance,
         &acc_row,
         &acc_server_fields,
-    ).unwrap();
+    )
+    .unwrap();
     let acc_outer_fp = *acc_fp_obj.fingerprint().as_bytes();
     let acc_outer_fp_vec = acc_outer_fp.to_vec();
     let acc_wrapper_json: Value = serde_json::from_slice(&acc_signed_req).unwrap();
@@ -1304,14 +1384,42 @@ async fn run_test_scenario() -> Result<()> {
 
     // 3. Leaf Recovery Fulfillment body & entry (Seq 3)
     let (_, signed_req_bytes) = make_leaf_recovery_fulfillment_body(
-        convo_id, fulfillment_transition_id, recovery_request_id, creation_transition_id, &alice, &bob, &group_id, &genesis_gch, &genesis_ctag, &sv2_gch, &sv2_ctag, welcome_id, &welcome_bytes, &mock_commit_bytes, &mock_ct_bytes, &key_package_ref, now,
+        convo_id,
+        fulfillment_transition_id,
+        recovery_request_id,
+        creation_transition_id,
+        &alice,
+        &bob,
+        &group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        &sv2_gch,
+        &sv2_ctag,
+        welcome_id,
+        &welcome_bytes,
+        &mock_commit_bytes,
+        &mock_ct_bytes,
+        &key_package_ref,
+        now,
     );
     let fulfill_wrapper = SignedWrapper::decode(&signed_req_bytes).unwrap();
-    let fulfill_projected = project_signed_body(SignedMutationKind::LeafRecoveryFulfillment, &fulfill_wrapper.body).unwrap();
-    let fulfill_mutation = SigningTranscript::build_for(SignedMutationKind::LeafRecoveryFulfillment, &fulfill_projected).unwrap();
+    let fulfill_projected = project_signed_body(
+        SignedMutationKind::LeafRecoveryFulfillment,
+        &fulfill_wrapper.body,
+    )
+    .unwrap();
+    let fulfill_mutation = SigningTranscript::build_for(
+        SignedMutationKind::LeafRecoveryFulfillment,
+        &fulfill_projected,
+    )
+    .unwrap();
     let fulfill_transcript = fulfill_mutation.bytes().to_vec();
     let fulfill_request_digest = fulfill_mutation.request_digest().to_vec();
-    let fulfill_sig = alice.signing_key.sign(&fulfill_transcript).to_bytes().to_vec();
+    let fulfill_sig = alice
+        .signing_key
+        .sign(&fulfill_transcript)
+        .to_bytes()
+        .to_vec();
     let mut fulfill_sig_arr = [0u8; 64];
     fulfill_sig_arr.copy_from_slice(&fulfill_sig);
     let fulfill_row = EntryRow {
@@ -1322,12 +1430,14 @@ async fn run_test_scenario() -> Result<()> {
         signature: fulfill_sig_arr,
         received_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
     };
-    let fulfill_server_fields = ControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let fulfill_server_fields =
+        ControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
     let fulfill_fp_obj = control_entry_fingerprint(
         ControlEntryKind::LeafRecoveryFulfillment,
         &fulfill_row,
         &fulfill_server_fields,
-    ).unwrap();
+    )
+    .unwrap();
     let outer_fp = *fulfill_fp_obj.fingerprint().as_bytes();
     let outer_fp_vec = outer_fp.to_vec();
     let fulfill_wrapper_json: Value = serde_json::from_slice(&signed_req_bytes).unwrap();
@@ -1344,7 +1454,6 @@ async fn run_test_scenario() -> Result<()> {
     let not_after = now + chrono::Duration::hours(1);
     let expires_at = now + chrono::Duration::minutes(5);
     let welcome_expires_at = now + chrono::Duration::hours(1);
-
 
     let mut tx1 = ds1_pg.transaction().await?;
     tx1.execute("SET CONSTRAINTS ALL DEFERRED", &[]).await?;
@@ -1750,7 +1859,6 @@ async fn run_test_scenario() -> Result<()> {
     )
     .await?;
 
-
     tx2.execute(
         "INSERT INTO chat.key_packages (key_package_ref, wrapper_bytes, wrapper_sha256, init_key, owner_did, owner_device_id, owner_key_id, owner_auth_generation, not_before, not_after, status, terminal_transition_id, terminal_at, created_at) \
          VALUES ($1, repeat('w', 32)::bytea, digest(repeat('w', 32)::bytea, 'sha256'), repeat('k', 32)::bytea, $2, $3, $4, 1, $5, $6, 'consumed', $7, $8, $8) ON CONFLICT DO NOTHING",
@@ -1899,14 +2007,14 @@ async fn run_test_scenario() -> Result<()> {
         "signedRequestBytes": { "$bytes": STANDARD.encode(&signed_req_bytes) }
     });
 
-    let ds1_welcome_jwt = cluster.mint_ds1_jwt(
-        &cluster.ds2_service_did,
-        DELIVER_WELCOME_NSID,
-    );
+    let ds1_welcome_jwt = cluster.mint_ds1_jwt(&cluster.ds2_service_did, DELIVER_WELCOME_NSID);
 
     let welcome_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverWelcome", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds1_welcome_jwt}"))
         .json(&deliver_welcome_body)
         .send()
@@ -1934,25 +2042,21 @@ async fn run_test_scenario() -> Result<()> {
         0,
         &welcome_payload_sha,
         &res_sha1,
-        Some((
-            fulfillment_entry_id,
-            3,
-            &accepted_payload_sha256,
-            &outer_fp,
-        )),
+        Some((fulfillment_entry_id, 3, &accepted_payload_sha256, &outer_fp)),
         receipt1["completedAt"].as_str().unwrap(),
     );
     cluster.verify_ds2_signature(&canonical_rec1, &sig_bytes1)?;
     println!("✓ DS2 returned valid signed receipt for deliverWelcome");
 
     // Idempotent Replay of deliverWelcome
-    let ds1_welcome_jwt_replay = cluster.mint_ds1_jwt(
-        &cluster.ds2_service_did,
-        DELIVER_WELCOME_NSID,
-    );
+    let ds1_welcome_jwt_replay =
+        cluster.mint_ds1_jwt(&cluster.ds2_service_did, DELIVER_WELCOME_NSID);
     let welcome_replay_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverWelcome", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverWelcome",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds1_welcome_jwt_replay}"))
         .json(&deliver_welcome_body)
         .send()
@@ -1964,8 +2068,7 @@ async fn run_test_scenario() -> Result<()> {
     );
     let replay_json: Value = welcome_replay_resp.json().await?;
     assert_eq!(
-        replay_json["receipt"]["signature"]["$bytes"],
-        receipt1["signature"]["$bytes"],
+        replay_json["receipt"]["signature"]["$bytes"], receipt1["signature"]["$bytes"],
         "replay must return identical signed receipt"
     );
     println!("✓ Idempotent replay of deliverWelcome returned identical receipt");
@@ -1991,11 +2094,22 @@ async fn run_test_scenario() -> Result<()> {
     let msg_seq = 4u64;
 
     let (_, msg_signed_req_bytes) = make_message_body(
-        convo_id, msg_entry_id, &alice, &group_id, 2, 1, &sv2_gch, &sv2_ctag, &ciphertext, now,
+        convo_id,
+        msg_entry_id,
+        &alice,
+        &group_id,
+        2,
+        1,
+        &sv2_gch,
+        &sv2_ctag,
+        &ciphertext,
+        now,
     );
     let msg_wrapper = SignedWrapper::decode(&msg_signed_req_bytes).unwrap();
-    let msg_projected = project_signed_body(SignedMutationKind::ApplicationSend, &msg_wrapper.body).unwrap();
-    let msg_mutation = SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &msg_projected).unwrap();
+    let msg_projected =
+        project_signed_body(SignedMutationKind::ApplicationSend, &msg_wrapper.body).unwrap();
+    let msg_mutation =
+        SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &msg_projected).unwrap();
     let msg_transcript = msg_mutation.bytes().to_vec();
     let msg_digest = msg_mutation.request_digest().to_vec();
     let msg_sig = alice.signing_key.sign(&msg_transcript).to_bytes().to_vec();
@@ -2013,14 +2127,29 @@ async fn run_test_scenario() -> Result<()> {
     let msg_outer_fp = *msg_fp_obj.fingerprint().as_bytes();
 
     let app_entry_dag = BTreeMap::from([
-        ("conversationId".to_owned(), CanonicalValue::Uuid(*convo_id.as_bytes())),
-        ("entryId".to_owned(), CanonicalValue::Uuid(*msg_entry_id.as_bytes())),
-        ("receivedAt".to_owned(), CanonicalValue::Timestamp(now.to_rfc3339_opts(SecondsFormat::Millis, true))),
+        (
+            "conversationId".to_owned(),
+            CanonicalValue::Uuid(*convo_id.as_bytes()),
+        ),
+        (
+            "entryId".to_owned(),
+            CanonicalValue::Uuid(*msg_entry_id.as_bytes()),
+        ),
+        (
+            "receivedAt".to_owned(),
+            CanonicalValue::Timestamp(now.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        ),
         ("seq".to_owned(), CanonicalValue::Integer(msg_seq)),
-        ("signedRequest".to_owned(), CanonicalValue::Map(BTreeMap::from([
-            ("body".to_owned(), CanonicalValue::Map(msg_projected)),
-            ("signature".to_owned(), CanonicalValue::Bytes(msg_sig.to_vec())),
-        ]))),
+        (
+            "signedRequest".to_owned(),
+            CanonicalValue::Map(BTreeMap::from([
+                ("body".to_owned(), CanonicalValue::Map(msg_projected)),
+                (
+                    "signature".to_owned(),
+                    CanonicalValue::Bytes(msg_sig.to_vec()),
+                ),
+            ])),
+        ),
     ]);
     let app_entry_bytes = serde_ipld_dagcbor::to_vec(&app_entry_dag).unwrap();
     let app_payload_sha: [u8; 32] = Sha256::digest(&app_entry_bytes).into();
@@ -2066,14 +2195,14 @@ async fn run_test_scenario() -> Result<()> {
         "signedRequestBytes": { "$bytes": STANDARD.encode(&msg_signed_req_bytes) }
     });
 
-    let ds1_msg_jwt = cluster.mint_ds1_jwt(
-        &cluster.ds2_service_did,
-        DELIVER_MESSAGE_NSID,
-    );
+    let ds1_msg_jwt = cluster.mint_ds1_jwt(&cluster.ds2_service_did, DELIVER_MESSAGE_NSID);
 
     let msg_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds1_msg_jwt}"))
         .json(&deliver_message_body)
         .send()
@@ -2100,12 +2229,7 @@ async fn run_test_scenario() -> Result<()> {
         0,
         &msg_payload_sha,
         &res_sha2,
-        Some((
-            msg_entry_id,
-            msg_seq,
-            &app_payload_sha,
-            &msg_outer_fp,
-        )),
+        Some((msg_entry_id, msg_seq, &app_payload_sha, &msg_outer_fp)),
         receipt2["completedAt"].as_str().unwrap(),
     );
     cluster.verify_ds2_signature(&canonical_rec2, &sig_bytes2)?;
@@ -2146,11 +2270,12 @@ async fn run_test_scenario() -> Result<()> {
         ],
     )
     .await?;
-    tx_msg.execute(
-        "UPDATE chat.conversations SET next_entry_seq = 5 WHERE conversation_id = $1",
-        &[&convo_id],
-    )
-    .await?;
+    tx_msg
+        .execute(
+            "UPDATE chat.conversations SET next_entry_seq = 5 WHERE conversation_id = $1",
+            &[&convo_id],
+        )
+        .await?;
     tx_msg.commit().await?;
 
     // Bob decrypts the message
@@ -2159,7 +2284,10 @@ async fn run_test_scenario() -> Result<()> {
         decrypted, plaintext_msg,
         "Bob decrypted plaintext must match Alice's message"
     );
-    println!("✓ Bob successfully decrypted Alice's message: '{}'", String::from_utf8_lossy(&decrypted));
+    println!(
+        "✓ Bob successfully decrypted Alice's message: '{}'",
+        String::from_utf8_lossy(&decrypted)
+    );
 
     // ──────────────────────────────────────────────────────────────────────────
     // STEP 5: Canonical Submit Commit DS2 -> DS1 (Sequencer)
@@ -2172,10 +2300,8 @@ async fn run_test_scenario() -> Result<()> {
     let corpus_convo_id =
         Uuid::parse_str(manifest["identifiers"]["conversationId"].as_str().unwrap()).unwrap();
     let corpus_group_id: [u8; 32] = hex_array(chain["groupIdHex"].as_str().unwrap());
-    let genesis_gch: [u8; 32] =
-        hex_array(chain["genesisGroupContextHashHex"].as_str().unwrap());
-    let genesis_ctag: [u8; 32] =
-        hex_array(chain["genesisConfirmationTagHex"].as_str().unwrap());
+    let genesis_gch: [u8; 32] = hex_array(chain["genesisGroupContextHashHex"].as_str().unwrap());
+    let genesis_ctag: [u8; 32] = hex_array(chain["genesisConfirmationTagHex"].as_str().unwrap());
     let committed_gch: [u8; 32] =
         hex_array(chain["committedGroupContextHashHex"].as_str().unwrap());
     let committed_ctag: [u8; 32] =
@@ -2205,7 +2331,10 @@ async fn run_test_scenario() -> Result<()> {
         extract_tree_summary_from_snapshot(COMMITTED_PUBLIC_STATE);
 
     let corpus_alice_manifest = &manifest["identity"]["alice"];
-    let corpus_alice_did = corpus_alice_manifest["actorDid"].as_str().unwrap().to_string();
+    let corpus_alice_did = corpus_alice_manifest["actorDid"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let corpus_alice_device_id =
         Uuid::parse_str(corpus_alice_manifest["deviceId"].as_str().unwrap()).unwrap();
     let corpus_alice_key_id = corpus_alice_manifest["keyId"].as_str().unwrap().to_string();
@@ -2213,7 +2342,10 @@ async fn run_test_scenario() -> Result<()> {
     let corpus_alice_public_key = corpus_alice_signing_key.verifying_key().to_bytes();
 
     let corpus_bob_manifest = &manifest["identity"]["bob"];
-    let corpus_bob_did = corpus_bob_manifest["actorDid"].as_str().unwrap().to_string();
+    let corpus_bob_did = corpus_bob_manifest["actorDid"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let corpus_bob_device_id =
         Uuid::parse_str(corpus_bob_manifest["deviceId"].as_str().unwrap()).unwrap();
     let corpus_bob_key_id = corpus_bob_manifest["keyId"].as_str().unwrap().to_string();
@@ -2288,16 +2420,30 @@ async fn run_test_scenario() -> Result<()> {
     };
 
     let (_, c_creation_signed_req) = make_creation_body_with_invitee(
-        corpus_convo_id, corpus_creation_entry_id, &corpus_alice_identity, Some(&corpus_bob_identity),
-        &corpus_group_id, &genesis_gch, &genesis_ctag, GROUP_INFO_MLS, &corpus_metadata_ct, corpus_seed_time,
+        corpus_convo_id,
+        corpus_creation_entry_id,
+        &corpus_alice_identity,
+        Some(&corpus_bob_identity),
+        &corpus_group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        GROUP_INFO_MLS,
+        &corpus_metadata_ct,
+        corpus_seed_time,
     );
     let c_creation_wrapper = SignedWrapper::decode(&c_creation_signed_req).unwrap();
-    let c_creation_projected = project_signed_body(SignedMutationKind::Creation, &c_creation_wrapper.body).unwrap();
-    let c_creation_mutation = SigningTranscript::build_for(SignedMutationKind::Creation, &c_creation_projected).unwrap();
+    let c_creation_projected =
+        project_signed_body(SignedMutationKind::Creation, &c_creation_wrapper.body).unwrap();
+    let c_creation_mutation =
+        SigningTranscript::build_for(SignedMutationKind::Creation, &c_creation_projected).unwrap();
     let c_creation_unsigned_proj = c_creation_mutation.canonical_projection().to_vec();
     let c_creation_transcript = c_creation_mutation.bytes().to_vec();
     let c_creation_digest = c_creation_mutation.request_digest().to_vec();
-    let c_creation_sig = corpus_alice_identity.signing_key.sign(&c_creation_transcript).to_bytes().to_vec();
+    let c_creation_sig = corpus_alice_identity
+        .signing_key
+        .sign(&c_creation_transcript)
+        .to_bytes()
+        .to_vec();
     let mut c_creation_sig_arr = [0u8; 64];
     c_creation_sig_arr.copy_from_slice(&c_creation_sig);
     let c_creation_row = EntryRow {
@@ -2310,8 +2456,11 @@ async fn run_test_scenario() -> Result<()> {
     };
     let c_creation_server_fields = ControlServerFields::empty(ControlEntryKind::Creation).unwrap();
     let c_creation_fp_obj = control_entry_fingerprint(
-        ControlEntryKind::Creation, &c_creation_row, &c_creation_server_fields,
-    ).unwrap();
+        ControlEntryKind::Creation,
+        &c_creation_row,
+        &c_creation_server_fields,
+    )
+    .unwrap();
     let c_creation_outer_fp = *c_creation_fp_obj.fingerprint().as_bytes();
     let c_creation_wrapper_json: Value = serde_json::from_slice(&c_creation_signed_req).unwrap();
     let c_creation_entry_bytes = serde_json::to_vec(&json!({
@@ -2326,16 +2475,34 @@ async fn run_test_scenario() -> Result<()> {
 
     // Build acceptance entry (seq 3)
     let (_, c_acc_signed_req) = make_acceptance_body(
-        corpus_convo_id, corpus_acc_tr_id, corpus_recovery_req_id, corpus_creation_tr_id,
-        &corpus_bob_identity, &corpus_alice_identity, &corpus_group_id, &genesis_gch, &genesis_ctag, corpus_seed_time,
+        corpus_convo_id,
+        corpus_acc_tr_id,
+        corpus_recovery_req_id,
+        corpus_creation_tr_id,
+        &corpus_bob_identity,
+        &corpus_alice_identity,
+        &corpus_group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        corpus_seed_time,
     );
     let c_acc_wrapper = SignedWrapper::decode(&c_acc_signed_req).unwrap();
-    let c_acc_projected = project_signed_body(SignedMutationKind::ParticipantAcceptance, &c_acc_wrapper.body).unwrap();
-    let c_acc_mutation = SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &c_acc_projected).unwrap();
+    let c_acc_projected = project_signed_body(
+        SignedMutationKind::ParticipantAcceptance,
+        &c_acc_wrapper.body,
+    )
+    .unwrap();
+    let c_acc_mutation =
+        SigningTranscript::build_for(SignedMutationKind::ParticipantAcceptance, &c_acc_projected)
+            .unwrap();
     let c_acc_unsigned_proj = c_acc_mutation.canonical_projection().to_vec();
     let c_acc_transcript = c_acc_mutation.bytes().to_vec();
     let c_acc_digest = c_acc_mutation.request_digest().to_vec();
-    let c_acc_sig = corpus_bob_identity.signing_key.sign(&c_acc_transcript).to_bytes().to_vec();
+    let c_acc_sig = corpus_bob_identity
+        .signing_key
+        .sign(&c_acc_transcript)
+        .to_bytes()
+        .to_vec();
     let mut c_acc_sig_arr = [0u8; 64];
     c_acc_sig_arr.copy_from_slice(&c_acc_sig);
     let c_acc_row = EntryRow {
@@ -2347,15 +2514,27 @@ async fn run_test_scenario() -> Result<()> {
         received_at: corpus_seed_time.to_rfc3339_opts(SecondsFormat::Millis, true),
     };
     let c_recovery_val = CanonicalValue::Map(BTreeMap::from([
-        ("keyPackageRef".to_owned(), CanonicalValue::Bytes(corpus_kp_ref.to_vec())),
-        ("recoveryRequestId".to_owned(), CanonicalValue::Uuid(*corpus_recovery_req_id.as_bytes())),
+        (
+            "keyPackageRef".to_owned(),
+            CanonicalValue::Bytes(corpus_kp_ref.to_vec()),
+        ),
+        (
+            "recoveryRequestId".to_owned(),
+            CanonicalValue::Uuid(*corpus_recovery_req_id.as_bytes()),
+        ),
     ]));
     let c_acc_server_fields = ControlServerFields::single(
-        ControlEntryKind::ParticipantAcceptance, "recovery", c_recovery_val.clone(),
-    ).unwrap();
+        ControlEntryKind::ParticipantAcceptance,
+        "recovery",
+        c_recovery_val.clone(),
+    )
+    .unwrap();
     let c_acc_fp_obj = control_entry_fingerprint(
-        ControlEntryKind::ParticipantAcceptance, &c_acc_row, &c_acc_server_fields,
-    ).unwrap();
+        ControlEntryKind::ParticipantAcceptance,
+        &c_acc_row,
+        &c_acc_server_fields,
+    )
+    .unwrap();
     let c_acc_outer_fp = *c_acc_fp_obj.fingerprint().as_bytes();
     let c_acc_wrapper_json: Value = serde_json::from_slice(&c_acc_signed_req).unwrap();
     let c_acc_entry_bytes = serde_json::to_vec(&json!({
@@ -2420,16 +2599,42 @@ async fn run_test_scenario() -> Result<()> {
     // Build leaf recovery fulfillment entry (seq 4)
     let c_welcome_raw = vec![0x33u8; 64];
     let (_, c_add_signed_req) = make_leaf_recovery_fulfillment_body(
-        corpus_convo_id, corpus_add_tr_id, corpus_recovery_req_id, corpus_creation_tr_id,
-        &corpus_alice_identity, &corpus_bob_identity, &corpus_group_id, &genesis_gch, &genesis_ctag,
-        &committed_gch, &committed_ctag, corpus_welcome_id, &c_welcome_raw, COMMIT_PUBLIC_MLS, &corpus_metadata_ct, &corpus_kp_ref, corpus_seed_time,
+        corpus_convo_id,
+        corpus_add_tr_id,
+        corpus_recovery_req_id,
+        corpus_creation_tr_id,
+        &corpus_alice_identity,
+        &corpus_bob_identity,
+        &corpus_group_id,
+        &genesis_gch,
+        &genesis_ctag,
+        &committed_gch,
+        &committed_ctag,
+        corpus_welcome_id,
+        &c_welcome_raw,
+        COMMIT_PUBLIC_MLS,
+        &corpus_metadata_ct,
+        &corpus_kp_ref,
+        corpus_seed_time,
     );
     let c_add_wrapper = SignedWrapper::decode(&c_add_signed_req).unwrap();
-    let c_add_projected = project_signed_body(SignedMutationKind::LeafRecoveryFulfillment, &c_add_wrapper.body).unwrap();
-    let c_add_mutation = SigningTranscript::build_for(SignedMutationKind::LeafRecoveryFulfillment, &c_add_projected).unwrap();
+    let c_add_projected = project_signed_body(
+        SignedMutationKind::LeafRecoveryFulfillment,
+        &c_add_wrapper.body,
+    )
+    .unwrap();
+    let c_add_mutation = SigningTranscript::build_for(
+        SignedMutationKind::LeafRecoveryFulfillment,
+        &c_add_projected,
+    )
+    .unwrap();
     let c_add_transcript = c_add_mutation.bytes().to_vec();
     let c_add_digest = c_add_mutation.request_digest().to_vec();
-    let c_add_sig = corpus_alice_identity.signing_key.sign(&c_add_transcript).to_bytes().to_vec();
+    let c_add_sig = corpus_alice_identity
+        .signing_key
+        .sign(&c_add_transcript)
+        .to_bytes()
+        .to_vec();
     let mut c_add_sig_arr = [0u8; 64];
     c_add_sig_arr.copy_from_slice(&c_add_sig);
     let c_add_row = EntryRow {
@@ -2440,10 +2645,14 @@ async fn run_test_scenario() -> Result<()> {
         signature: c_add_sig_arr,
         received_at: corpus_seed_time.to_rfc3339_opts(SecondsFormat::Millis, true),
     };
-    let c_add_server_fields = ControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
+    let c_add_server_fields =
+        ControlServerFields::empty(ControlEntryKind::LeafRecoveryFulfillment).unwrap();
     let c_add_fp_obj = control_entry_fingerprint(
-        ControlEntryKind::LeafRecoveryFulfillment, &c_add_row, &c_add_server_fields,
-    ).unwrap();
+        ControlEntryKind::LeafRecoveryFulfillment,
+        &c_add_row,
+        &c_add_server_fields,
+    )
+    .unwrap();
     let c_add_outer_fp = *c_add_fp_obj.fingerprint().as_bytes();
     let c_add_wrapper_json: Value = serde_json::from_slice(&c_add_signed_req).unwrap();
     let c_add_entry_bytes = serde_json::to_vec(&json!({
@@ -2763,16 +2972,20 @@ async fn run_test_scenario() -> Result<()> {
         "signedRequestBytes": { "$bytes": STANDARD.encode(&corpus_signed_req_bytes) }
     });
 
-    let ds2_canonical_commit_jwt = cluster.mint_ds2_jwt(
-        &cluster.ds1_service_did,
-        SUBMIT_COMMIT_NSID,
-    );
+    let ds2_canonical_commit_jwt =
+        cluster.mint_ds2_jwt(&cluster.ds1_service_did, SUBMIT_COMMIT_NSID);
 
     // 1. Positive authenticated submitCommit
     let canonical_commit_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.submitCommit", cluster.ds1_url))
-        .header("authorization", format!("Bearer {ds2_canonical_commit_jwt}"))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.submitCommit",
+            cluster.ds1_url
+        ))
+        .header(
+            "authorization",
+            format!("Bearer {ds2_canonical_commit_jwt}"),
+        )
         .json(&canonical_submit_commit_body)
         .send()
         .await?;
@@ -2784,23 +2997,36 @@ async fn run_test_scenario() -> Result<()> {
     let commit_res_json: Value = serde_json::from_str(&commit_text)?;
     let commit_receipt = &commit_res_json["receipt"];
     assert_eq!(commit_receipt["endpoint"], SUBMIT_COMMIT_NSID);
-    assert_eq!(commit_receipt["deliveryId"], canonical_commit_delivery_id.to_string());
+    assert_eq!(
+        commit_receipt["deliveryId"],
+        canonical_commit_delivery_id.to_string()
+    );
     assert_eq!(commit_receipt["senderDsDid"], cluster.ds2_service_did);
     assert_eq!(commit_receipt["receiverDsDid"], cluster.ds1_service_did);
     assert_eq!(commit_receipt["sequencerDid"], cluster.ds1_service_did);
-    assert_eq!(commit_receipt["sequencerTerm"], 0, "sequencer term is preserved (0), not incremented");
+    assert_eq!(
+        commit_receipt["sequencerTerm"], 0,
+        "sequencer term is preserved (0), not incremented"
+    );
 
     let coordinates = &commit_res_json["coordinates"];
-    assert_eq!(coordinates["stateVersion"], 4, "state version advanced to 4");
+    assert_eq!(
+        coordinates["stateVersion"], 4,
+        "state version advanced to 4"
+    );
     assert_eq!(coordinates["epoch"], 2, "epoch advanced to 2");
     assert_eq!(coordinates["lifecycle"], "active");
 
-    let sig_bytes_commit = STANDARD.decode(commit_receipt["signature"]["$bytes"].as_str().unwrap())?;
+    let sig_bytes_commit =
+        STANDARD.decode(commit_receipt["signature"]["$bytes"].as_str().unwrap())?;
     let res_sha_commit: [u8; 32] = hex_or_bytes(&commit_receipt["resultSha256"])?;
     let source_loc_seq = commit_receipt["sourceLocator"]["seq"].as_u64().unwrap();
-    let source_loc_entry_id = Uuid::parse_str(commit_receipt["sourceLocator"]["entryId"].as_str().unwrap())?;
-    let source_loc_payload_sha: [u8; 32] = hex_or_bytes(&commit_receipt["sourceLocator"]["acceptedPayloadSha256"])?;
-    let source_loc_fp: [u8; 32] = hex_or_bytes(&commit_receipt["sourceLocator"]["outerEntryFingerprint"])?;
+    let source_loc_entry_id =
+        Uuid::parse_str(commit_receipt["sourceLocator"]["entryId"].as_str().unwrap())?;
+    let source_loc_payload_sha: [u8; 32] =
+        hex_or_bytes(&commit_receipt["sourceLocator"]["acceptedPayloadSha256"])?;
+    let source_loc_fp: [u8; 32] =
+        hex_or_bytes(&commit_receipt["sourceLocator"]["outerEntryFingerprint"])?;
 
     let canonical_rec_commit = canonical_receipt_bytes(
         SUBMIT_COMMIT_NSID,
@@ -2831,7 +3057,10 @@ async fn run_test_scenario() -> Result<()> {
         ).await?;
         (row.get(0), row.get(1), row.get(2))
     };
-    assert_eq!(ds1_seq_term, 0, "sequencer_term in chat.conversations must remain 0");
+    assert_eq!(
+        ds1_seq_term, 0,
+        "sequencer_term in chat.conversations must remain 0"
+    );
     assert_eq!(ds1_sv, 4, "current_state_version must advance to 4");
     assert_eq!(ds1_next_seq, 6, "next_entry_seq must advance to 6");
 
@@ -2839,23 +3068,33 @@ async fn run_test_scenario() -> Result<()> {
         "SELECT count(*) FROM chat.entries WHERE conversation_id = $1 AND seq = 5 AND entry_kind = 'blue.catbird.chat.defs#commitEntry'",
         &[&corpus_convo_id],
     ).await?.get(0);
-    assert_eq!(ds1_commit_entry_count, 1, "commitEntry must be persisted in chat.entries on DS1");
+    assert_eq!(
+        ds1_commit_entry_count, 1,
+        "commitEntry must be persisted in chat.entries on DS1"
+    );
 
     let ds1_gen_state_count: i64 = ds1_pg.query_one(
         "SELECT count(*) FROM chat.generation_states WHERE conversation_id = $1 AND state_version = 4 AND epoch = 2",
         &[&corpus_convo_id],
     ).await?.get(0);
-    assert_eq!(ds1_gen_state_count, 1, "generation_states for state_version 4, epoch 2 must exist on DS1");
+    assert_eq!(
+        ds1_gen_state_count, 1,
+        "generation_states for state_version 4, epoch 2 must exist on DS1"
+    );
 
     // Idempotent replay of submitCommit
-    let ds2_canonical_commit_jwt_replay = cluster.mint_ds2_jwt(
-        &cluster.ds1_service_did,
-        SUBMIT_COMMIT_NSID,
-    );
+    let ds2_canonical_commit_jwt_replay =
+        cluster.mint_ds2_jwt(&cluster.ds1_service_did, SUBMIT_COMMIT_NSID);
     let commit_replay_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.submitCommit", cluster.ds1_url))
-        .header("authorization", format!("Bearer {ds2_canonical_commit_jwt_replay}"))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.submitCommit",
+            cluster.ds1_url
+        ))
+        .header(
+            "authorization",
+            format!("Bearer {ds2_canonical_commit_jwt_replay}"),
+        )
         .json(&canonical_submit_commit_body)
         .send()
         .await?;
@@ -2866,8 +3105,7 @@ async fn run_test_scenario() -> Result<()> {
     );
     let commit_replay_json: Value = commit_replay_resp.json().await?;
     assert_eq!(
-        commit_replay_json["receipt"]["signature"]["$bytes"],
-        commit_receipt["signature"]["$bytes"],
+        commit_replay_json["receipt"]["signature"]["$bytes"], commit_receipt["signature"]["$bytes"],
         "submitCommit replay must return identical signed receipt"
     );
     println!("✓ Idempotent replay of submitCommit returned identical receipt");
@@ -2900,7 +3138,10 @@ async fn run_test_scenario() -> Result<()> {
     let mock_jwt = cluster.mint_ds2_jwt(&cluster.ds1_service_did, SUBMIT_COMMIT_NSID);
     let mock_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.submitCommit", cluster.ds1_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.submitCommit",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {mock_jwt}"))
         .json(&mock_body)
         .send()
@@ -2924,11 +3165,22 @@ async fn run_test_scenario() -> Result<()> {
     let msg2_seq = 5u64;
 
     let (_, msg2_signed_req_bytes) = make_message_body(
-        convo_id, msg2_entry_id, &alice, &group_id, 2, 1, &sv2_gch, &sv2_ctag, &ciphertext_2, now,
+        convo_id,
+        msg2_entry_id,
+        &alice,
+        &group_id,
+        2,
+        1,
+        &sv2_gch,
+        &sv2_ctag,
+        &ciphertext_2,
+        now,
     );
     let msg2_wrapper = SignedWrapper::decode(&msg2_signed_req_bytes).unwrap();
-    let msg2_projected = project_signed_body(SignedMutationKind::ApplicationSend, &msg2_wrapper.body).unwrap();
-    let msg2_mutation = SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &msg2_projected).unwrap();
+    let msg2_projected =
+        project_signed_body(SignedMutationKind::ApplicationSend, &msg2_wrapper.body).unwrap();
+    let msg2_mutation =
+        SigningTranscript::build_for(SignedMutationKind::ApplicationSend, &msg2_projected).unwrap();
     let msg2_transcript = msg2_mutation.bytes().to_vec();
     let msg2_digest = msg2_mutation.request_digest().to_vec();
     let msg2_sig = alice.signing_key.sign(&msg2_transcript).to_bytes().to_vec();
@@ -2946,14 +3198,29 @@ async fn run_test_scenario() -> Result<()> {
     let msg2_outer_fp = *msg2_fp_obj.fingerprint().as_bytes();
 
     let app2_entry_dag = BTreeMap::from([
-        ("conversationId".to_owned(), CanonicalValue::Uuid(*convo_id.as_bytes())),
-        ("entryId".to_owned(), CanonicalValue::Uuid(*msg2_entry_id.as_bytes())),
-        ("receivedAt".to_owned(), CanonicalValue::Timestamp(now.to_rfc3339_opts(SecondsFormat::Millis, true))),
+        (
+            "conversationId".to_owned(),
+            CanonicalValue::Uuid(*convo_id.as_bytes()),
+        ),
+        (
+            "entryId".to_owned(),
+            CanonicalValue::Uuid(*msg2_entry_id.as_bytes()),
+        ),
+        (
+            "receivedAt".to_owned(),
+            CanonicalValue::Timestamp(now.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        ),
         ("seq".to_owned(), CanonicalValue::Integer(msg2_seq)),
-        ("signedRequest".to_owned(), CanonicalValue::Map(BTreeMap::from([
-            ("body".to_owned(), CanonicalValue::Map(msg2_projected)),
-            ("signature".to_owned(), CanonicalValue::Bytes(msg2_sig.to_vec())),
-        ]))),
+        (
+            "signedRequest".to_owned(),
+            CanonicalValue::Map(BTreeMap::from([
+                ("body".to_owned(), CanonicalValue::Map(msg2_projected)),
+                (
+                    "signature".to_owned(),
+                    CanonicalValue::Bytes(msg2_sig.to_vec()),
+                ),
+            ])),
+        ),
     ]);
     let app2_entry_bytes = serde_ipld_dagcbor::to_vec(&app2_entry_dag).unwrap();
     let app2_payload_sha: [u8; 32] = Sha256::digest(&app2_entry_bytes).into();
@@ -2993,11 +3260,12 @@ async fn run_test_scenario() -> Result<()> {
         ],
     )
     .await?;
-    tx_msg2.execute(
-        "UPDATE chat.conversations SET next_entry_seq = 6 WHERE conversation_id = $1",
-        &[&convo_id],
-    )
-    .await?;
+    tx_msg2
+        .execute(
+            "UPDATE chat.conversations SET next_entry_seq = 6 WHERE conversation_id = $1",
+            &[&convo_id],
+        )
+        .await?;
     tx_msg2.commit().await?;
 
     // Query DS1 digest
@@ -3022,11 +3290,17 @@ async fn run_test_scenario() -> Result<()> {
     println!("✓ DS1 current digest at seq 5: {}", ds1_digest_sha);
 
     // Verify DS2 is initially drifted (only has 4 entries)
-    let ds2_entries_before: i64 = ds2_pg.query_one(
-        "SELECT count(*) FROM chat.entries WHERE conversation_id = $1",
-        &[&convo_id],
-    ).await?.get(0);
-    assert_eq!(ds2_entries_before, 4, "DS2 must initially have only 4 entries");
+    let ds2_entries_before: i64 = ds2_pg
+        .query_one(
+            "SELECT count(*) FROM chat.entries WHERE conversation_id = $1",
+            &[&convo_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        ds2_entries_before, 4,
+        "DS2 must initially have only 4 entries"
+    );
 
     // Await background reconciliation worker on DS2 (configured to tick every 2s)
     println!("Waiting for DS2 reconciliation worker to detect drift and catch up...");
@@ -3047,20 +3321,35 @@ async fn run_test_scenario() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    assert!(reconciled, "DS2 reconciliation worker must catch up missing event seq 5");
+    assert!(
+        reconciled,
+        "DS2 reconciliation worker must catch up missing event seq 5"
+    );
 
     // Verify DS2 entries and conversations updated
-    let ds2_entries_after: i64 = ds2_pg.query_one(
-        "SELECT count(*) FROM chat.entries WHERE conversation_id = $1 AND seq = 5",
-        &[&convo_id],
-    ).await?.get(0);
-    assert_eq!(ds2_entries_after, 1, "missing event seq 5 must be applied in DS2 chat.entries");
+    let ds2_entries_after: i64 = ds2_pg
+        .query_one(
+            "SELECT count(*) FROM chat.entries WHERE conversation_id = $1 AND seq = 5",
+            &[&convo_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        ds2_entries_after, 1,
+        "missing event seq 5 must be applied in DS2 chat.entries"
+    );
 
-    let ds2_next_seq_after: i64 = ds2_pg.query_one(
-        "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
-        &[&convo_id],
-    ).await?.get(0);
-    assert_eq!(ds2_next_seq_after, 6, "DS2 next_entry_seq must advance to 6");
+    let ds2_next_seq_after: i64 = ds2_pg
+        .query_one(
+            "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
+            &[&convo_id],
+        )
+        .await?
+        .get(0);
+    assert_eq!(
+        ds2_next_seq_after, 6,
+        "DS2 next_entry_seq must advance to 6"
+    );
 
     // Query DS2 digest to verify convergence
     let ds2_digest_jwt = cluster.mint_ds1_jwt(
@@ -3083,7 +3372,9 @@ async fn run_test_scenario() -> Result<()> {
         ds1_digest_sha,
         "DS2 digest must converge with DS1 after reconciliation"
     );
-    println!("✓ DS1 and DS2 state & digests successfully converged (seq=5, digest={ds1_digest_sha})");
+    println!(
+        "✓ DS1 and DS2 state & digests successfully converged (seq=5, digest={ds1_digest_sha})"
+    );
 
     // ──────────────────────────────────────────────────────────────────────────
     // STEP 7: Assert Delivery Receipts and Queue Terminal States
@@ -3102,7 +3393,10 @@ async fn run_test_scenario() -> Result<()> {
         "Expected at least 2 receipts on DS2, got {}",
         ds2_receipt_rows.len()
     );
-    println!("✓ Verified {} delivery receipts stored in DS2 database", ds2_receipt_rows.len());
+    println!(
+        "✓ Verified {} delivery receipts stored in DS2 database",
+        ds2_receipt_rows.len()
+    );
 
     let ds1_receipt_rows = ds1_pg
         .query(
@@ -3126,13 +3420,19 @@ async fn run_test_scenario() -> Result<()> {
             "SELECT count(*) FROM outbound_queue WHERE status = 'in_flight' AND claim_expires_at < NOW()",
             &[],
         ).await?.get(0);
-        assert_eq!(in_flight_queue, 0, "{name} outbound_queue must have no expired in_flight claims");
+        assert_eq!(
+            in_flight_queue, 0,
+            "{name} outbound_queue must have no expired in_flight claims"
+        );
 
         let in_flight_outbox: i64 = pg.query_one(
             "SELECT count(*) FROM federation_outbox WHERE status = 'in_flight' AND claim_expires_at < NOW()",
             &[],
         ).await?.get(0);
-        assert_eq!(in_flight_outbox, 0, "{name} federation_outbox must have no expired in_flight claims");
+        assert_eq!(
+            in_flight_outbox, 0,
+            "{name} federation_outbox must have no expired in_flight claims"
+        );
     }
     println!("✓ Verified outbound_queue and federation_outbox invariants on both nodes");
 
@@ -3144,11 +3444,21 @@ async fn run_test_scenario() -> Result<()> {
     // 1. Unallowlisted peer
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
     let untrusted_did = "did:web:untrusted.evil.com";
-    let untrusted_key = P256SigningKey::from_pkcs8_pem(include_str!("../fixtures/ds1-key.pem")).unwrap();
-    let untrusted_jwt = cluster.mint_jwt(untrusted_did, &untrusted_key, &cluster.ds2_service_did, DELIVER_MESSAGE_NSID, None);
+    let untrusted_key =
+        P256SigningKey::from_pkcs8_pem(include_str!("../fixtures/ds1-key.pem")).unwrap();
+    let untrusted_jwt = cluster.mint_jwt(
+        untrusted_did,
+        &untrusted_key,
+        &cluster.ds2_service_did,
+        DELIVER_MESSAGE_NSID,
+        None,
+    );
     let resp_untrusted = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {untrusted_jwt}"))
         .json(&deliver_message_body)
         .send()
@@ -3159,8 +3469,14 @@ async fn run_test_scenario() -> Result<()> {
         resp_untrusted.status()
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 1 mutated database state!");
-    println!("✓ Negative 1: Unallowlisted peer rejected ({}) with DB state unchanged", resp_untrusted.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 1 mutated database state!"
+    );
+    println!(
+        "✓ Negative 1: Unallowlisted peer rejected ({}) with DB state unchanged",
+        resp_untrusted.status()
+    );
 
     // 2. Issuer / body mismatch
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3168,7 +3484,10 @@ async fn run_test_scenario() -> Result<()> {
     mismatch_body["header"]["senderDsDid"] = json!("did:web:attacker.local");
     let resp_mismatch = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds1_msg_jwt}"))
         .json(&mismatch_body)
         .send()
@@ -3179,8 +3498,14 @@ async fn run_test_scenario() -> Result<()> {
         resp_mismatch.status()
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 2 mutated database state!");
-    println!("✓ Negative 2: Issuer / body mismatch rejected ({}) with DB state unchanged", resp_mismatch.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 2 mutated database state!"
+    );
+    println!(
+        "✓ Negative 2: Issuer / body mismatch rejected ({}) with DB state unchanged",
+        resp_mismatch.status()
+    );
 
     // 3. Wrong audience or LXM
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3193,7 +3518,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp_wrong_aud = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {wrong_aud_jwt}"))
         .json(&deliver_message_body)
         .send()
@@ -3204,7 +3532,10 @@ async fn run_test_scenario() -> Result<()> {
         "Wrong audience must be rejected with 401"
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 3 mutated database state!");
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 3 mutated database state!"
+    );
     println!("✓ Negative 3: Wrong audience rejected (401) with DB state unchanged");
 
     // 4. JTI replay
@@ -3219,7 +3550,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp_jti_1 = cluster
         .http_client
-        .get(format!("{}/xrpc/blue.catbird.mlsDS.getFederationPeers", cluster.ds2_url))
+        .get(format!(
+            "{}/xrpc/blue.catbird.mlsDS.getFederationPeers",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {jti_jwt_1}"))
         .send()
         .await?;
@@ -3227,7 +3561,10 @@ async fn run_test_scenario() -> Result<()> {
 
     let resp_jti_2 = cluster
         .http_client
-        .get(format!("{}/xrpc/blue.catbird.mlsDS.getFederationPeers", cluster.ds2_url))
+        .get(format!(
+            "{}/xrpc/blue.catbird.mlsDS.getFederationPeers",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {jti_jwt_1}"))
         .send()
         .await?;
@@ -3237,7 +3574,10 @@ async fn run_test_scenario() -> Result<()> {
         "Replaying JTI token must return 401 Unauthorized"
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 4 mutated database state!");
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 4 mutated database state!"
+    );
     println!("✓ Negative 4: JTI replay rejected (401 Unauthorized) with DB state unchanged");
 
     // 5. Non-sequencer delivery
@@ -3247,7 +3587,10 @@ async fn run_test_scenario() -> Result<()> {
     non_seq_body["header"]["sequencerDid"] = json!(cluster.ds2_service_did);
     let resp_non_seq = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds2_admin_jwt}"))
         .json(&non_seq_body)
         .send()
@@ -3257,8 +3600,14 @@ async fn run_test_scenario() -> Result<()> {
         "Non-sequencer delivery must be rejected"
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 5 mutated database state!");
-    println!("✓ Negative 5: Non-sequencer delivery rejected ({}) with DB state unchanged", resp_non_seq.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 5 mutated database state!"
+    );
+    println!(
+        "✓ Negative 5: Non-sequencer delivery rejected ({}) with DB state unchanged",
+        resp_non_seq.status()
+    );
 
     // 6. Stale sequencer term
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3266,7 +3615,10 @@ async fn run_test_scenario() -> Result<()> {
     stale_term_body["header"]["sequencerTerm"] = json!(-1);
     let resp_stale_term = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {ds1_msg_jwt}"))
         .json(&stale_term_body)
         .send()
@@ -3276,8 +3628,14 @@ async fn run_test_scenario() -> Result<()> {
         "Negative / stale term must be rejected"
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 6 mutated database state!");
-    println!("✓ Negative 6: Stale / negative sequencer term rejected ({}) with DB state unchanged", resp_stale_term.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 6 mutated database state!"
+    );
+    println!(
+        "✓ Negative 6: Stale / negative sequencer term rejected ({}) with DB state unchanged",
+        resp_stale_term.status()
+    );
 
     // 7. Non-participant commit
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3290,7 +3648,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp_non_part = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.submitCommit", cluster.ds1_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.submitCommit",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {non_part_jwt}"))
         .json(&canonical_submit_commit_body)
         .send()
@@ -3300,8 +3661,14 @@ async fn run_test_scenario() -> Result<()> {
         "Non-participant submitCommit must be rejected"
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 7 mutated database state!");
-    println!("✓ Negative 7: Non-participant commit rejected ({}) with DB state unchanged", resp_non_part.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 7 mutated database state!"
+    );
+    println!(
+        "✓ Negative 7: Non-participant commit rejected ({}) with DB state unchanged",
+        resp_non_part.status()
+    );
 
     // 8. Blocked / suspended peer
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3311,7 +3678,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let block_resp = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer", cluster.ds1_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {block_jwt}"))
         .json(&json!({
             "dsDid": cluster.ds2_service_did,
@@ -3328,7 +3698,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let blocked_call_resp = cluster
         .http_client
-        .get(format!("{}/xrpc/blue.catbird.mlsDS.getConvoDigest?convoId={convo_id}", cluster.ds1_url))
+        .get(format!(
+            "{}/xrpc/blue.catbird.mlsDS.getConvoDigest?convoId={convo_id}",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {call_from_blocked_jwt}"))
         .send()
         .await?;
@@ -3345,7 +3718,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let _ = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer", cluster.ds1_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.upsertFederationPeer",
+            cluster.ds1_url
+        ))
         .header("authorization", format!("Bearer {restore_jwt}"))
         .json(&json!({
             "dsDid": cluster.ds2_service_did,
@@ -3355,8 +3731,14 @@ async fn run_test_scenario() -> Result<()> {
         .await?;
 
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 8 mutated database state!");
-    println!("✓ Negative 8: Blocked peer policy enforced ({}) with DB state unchanged", blocked_call_resp.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 8 mutated database state!"
+    );
+    println!(
+        "✓ Negative 8: Blocked peer policy enforced ({}) with DB state unchanged",
+        blocked_call_resp.status()
+    );
 
     // 9. SSRF destination rejection
     let snap_before = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
@@ -3369,7 +3751,10 @@ async fn run_test_scenario() -> Result<()> {
     );
     let resp_ssrf = cluster
         .http_client
-        .post(format!("{}/xrpc/blue.catbird.mlsDS.deliverMessage", cluster.ds2_url))
+        .post(format!(
+            "{}/xrpc/blue.catbird.mlsDS.deliverMessage",
+            cluster.ds2_url
+        ))
         .header("authorization", format!("Bearer {malformed_ssrf_jwt}"))
         .json(&deliver_message_body)
         .send()
@@ -3380,8 +3765,14 @@ async fn run_test_scenario() -> Result<()> {
         resp_ssrf.status()
     );
     let snap_after = take_db_snapshot(&ds1_pg, &ds2_pg).await?;
-    assert_eq!(snap_before, snap_after, "Negative 9 mutated database state!");
-    println!("✓ Negative 9: SSRF destination rejected ({}) with DB state unchanged", resp_ssrf.status());
+    assert_eq!(
+        snap_before, snap_after,
+        "Negative 9 mutated database state!"
+    );
+    println!(
+        "✓ Negative 9: SSRF destination rejected ({}) with DB state unchanged",
+        resp_ssrf.status()
+    );
 
     println!("\n=== ALL FEDERATION TWO-NODE SCENARIOS AND NEGATIVES PASSED ===");
 

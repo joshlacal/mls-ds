@@ -324,6 +324,14 @@ pub fn compute_commit_envelope_digest(
     let signed_req_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
     buf.extend_from_slice(&signed_req_sha256);
 
+    // Extract and bind canonical signed_at from the signedRequest mutation (fail closed)
+    let canonical =
+        crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_request_bytes)
+            .map_err(|e| FederationError::InvalidEnvelope {
+                reason: format!("cannot decode canonical signed mutation: {e}"),
+            })?;
+    lp_bytes(canonical.signed_at().as_str().as_bytes(), &mut buf);
+
     let digest: [u8; 32] = Sha256::digest(&buf).into();
     Ok(digest)
 }

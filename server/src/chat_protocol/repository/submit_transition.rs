@@ -377,7 +377,6 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     };
     let prelude = prelude.verify_submit_transition_operation(parsed.transition_id, &mutation)?;
     let scope_authority = prelude.scope_authority();
-
     let aggregate = hydrate_locked_conversation_state(
         transaction,
         Uuid::from_bytes(*parsed.prior.conversation_id()),
@@ -391,7 +390,6 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     {
         return Err(SubmitTransitionFacadeError::CandidateScopeDrift);
     }
-
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate)?;
     let registration = hydration.locked_registration_from_scope_authority(scope_authority)?;
     let terminal_packages = hydrate_terminal_recovery_packages(transaction, &aggregate).await?;
@@ -405,7 +403,6 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(SubmitTransitionFacadeError::Database)?;
-
     let entry = build_verified_control_entry(
         mutation,
         authority.endpoint(),
@@ -417,6 +414,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     )?;
     let outer_entry_fingerprint = *entry.outer_control_fingerprint();
     let products = CanonicalControlEntryProducts::mint(&entry)?;
+    let accepted_payload_sha256: [u8; 32] = Sha256::digest(products.durable_json()).into();
     let planned = match admitted.kind() {
         SignedMutationKind::CommitTransition => {
             hydration.plan_commit_entry(&aggregate, entry, &registration, terminal_packages)?
@@ -522,9 +520,14 @@ async fn execute_first_submit_transition<T: PublicTransport>(
                 &envelope,
                 expected_entry_id,
                 expected_seq,
+                accepted_payload_sha256,
+                outer_entry_fingerprint,
             )
             .await?;
 
+        if verified.submit_transition_response_bytes.as_slice() != local_response.as_bytes() {
+            return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
+        }
         let succ = plan
             .successor_coordinate()
             .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;

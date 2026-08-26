@@ -55,6 +55,8 @@ impl RemoteCommitSubmitter {
         envelope: &SubmitCommit<DefaultStr>,
         expected_entry_id: uuid::Uuid,
         expected_seq: u64,
+        expected_accepted_payload_sha256: [u8; 32],
+        expected_outer_entry_fingerprint: [u8; 32],
     ) -> Result<VerifiedSubmitCommit, FederationError> {
         let destination = self
             .resolver
@@ -253,6 +255,20 @@ impl RemoteCommitSubmitter {
         {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt/output seq mismatch with local expected seq".to_string(),
+            });
+        }
+        if receipt.source_locator.accepted_payload_sha256.as_ref()
+            != &expected_accepted_payload_sha256[..]
+        {
+            return Err(FederationError::InvalidEnvelope {
+                reason: "receipt source_locator accepted_payload_sha256 mismatch".to_string(),
+            });
+        }
+        if receipt.source_locator.outer_entry_fingerprint.as_ref()
+            != &expected_outer_entry_fingerprint[..]
+        {
+            return Err(FederationError::InvalidEnvelope {
+                reason: "receipt source_locator outer_entry_fingerprint mismatch".to_string(),
             });
         }
         Ok(VerifiedSubmitCommit {

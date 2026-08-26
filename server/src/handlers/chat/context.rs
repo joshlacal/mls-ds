@@ -77,7 +77,7 @@ fn service_auth_failure(endpoint: ChatEndpoint, error: AuthError) -> ChatFailure
     tracing::warn!(
         endpoint = endpoint.nsid(),
         error = ?error,
-        "clean-chat service auth failed"
+        "service-auth principal verification failed"
     );
     match error {
         AuthError::TokenExpired => {
@@ -180,7 +180,6 @@ pub(crate) async fn admit_signed_operation_only(
         .await
         .map_err(|error| auth_repository_failure(endpoint, error))
 }
-/// Operation-only enrollment admission. This consumes replay evidence but
 /// cannot surface completed response bytes; the caller-owned operation prelude
 /// must first reserve the global operation and lock the enrollment slot.
 pub(crate) async fn admit_enrollment_operation_only(

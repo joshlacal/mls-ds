@@ -28,7 +28,6 @@ use catbird_server::auth::{
     cache_test_did_document, AuthMiddleware, DidDocument, PublicKeyJwk, VerificationMethod,
 };
 use catbird_server::chat_protocol::test_support::repository::{
-    build_federated_commit_envelope, derive_submit_commit_delivery_id,
     enqueue_clean_federation_message_jobs, enqueue_federated_welcome_job, AppendEntry,
 };
 use catbird_server::federation::ack::AckSigner;
@@ -2663,10 +2662,9 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     .unwrap();
 
     let item_id = Uuid::new_v4().to_string();
-    let convo_id = Uuid::new_v4().to_string();
+    let conversation_id = Uuid::new_v4();
+    let convo_id = conversation_id.to_string();
     let delivery_id = Uuid::parse_str(&item_id).unwrap();
-    let conversation_id = Uuid::parse_str(&convo_id).unwrap();
-
     let entry_id = Uuid::new_v4();
     let source_locator = ValidatedEntryLocator {
         entry_id,
@@ -2675,6 +2673,112 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
         outer_entry_fingerprint: [0x66u8; 32],
     };
     seed_genesis_conversation_for_test(&pool, conversation_id, entry_id, &source_locator).await;
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+    let signing_key = Ed25519SigningKey::from_bytes(&[42u8; 32]);
+    let actor_public_key = signing_key.verifying_key().to_bytes();
+    let actor_key_id_thumbprint =
+        catbird_server::chat_protocol::test_support::ed25519_key_id(&actor_public_key).unwrap();
+    let actor_key_id = actor_key_id_thumbprint.as_str();
+    let nonce = vec![0x78u8; 12];
+    let ciphertext = vec![0x88u8; 48];
+    let commit_bytes = vec![0x99u8; 48];
+    let zero_32 = vec![0u8; 32];
+    let commit_body_val = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#commitTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-COMMIT\u{0000}",
+        "transitionId": entry_id.to_string(),
+        "idempotencyKey": entry_id.to_string(),
+        "actorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "actorDeviceId": entry_id.to_string(),
+        "keyId": actor_key_id,
+        "authGeneration": 1,
+        "signedAt": "2026-08-25T12:00:00.000Z",
+        "prior": {
+            "conversationId": convo_id,
+            "generation": 0,
+            "stateVersion": 3,
+            "groupId": STANDARD.encode(&zero_32),
+            "epoch": 1,
+            "groupContextHash": STANDARD.encode(&zero_32),
+            "confirmationTag": STANDARD.encode(&zero_32),
+            "lifecycle": "active"
+        },
+        "next": {
+            "conversationId": convo_id,
+            "generation": 0,
+            "stateVersion": 4,
+            "groupId": STANDARD.encode(&zero_32),
+            "epoch": 2,
+            "groupContextHash": STANDARD.encode(&zero_32),
+            "confirmationTag": STANDARD.encode(&zero_32),
+            "lifecycle": "active"
+        },
+        "aad": {
+            "protocolVersion": "1",
+            "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+            "generation": 0,
+            "transitionId": STANDARD.encode(entry_id.as_bytes()),
+            "prior": {
+                "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+                "generation": 0,
+                "stateVersion": 3,
+                "groupId": STANDARD.encode(&zero_32),
+                "epoch": 1,
+                "groupContextHash": STANDARD.encode(&zero_32),
+                "confirmationTag": STANDARD.encode(&zero_32),
+                "lifecycle": "active"
+            }
+        },
+        "manifest": {
+            "participantChanges": [],
+            "leafChanges": []
+        },
+        "commit": {
+            "framing": "mlsMessage",
+            "contentType": "publicMessageCommit",
+            "bytes": STANDARD.encode(&commit_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(&commit_bytes))
+        },
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(conversation_id.as_bytes()),
+                "generation": 0,
+                "groupId": STANDARD.encode(&zero_32),
+                "epoch": 2,
+                "groupContextHash": STANDARD.encode(&zero_32),
+                "confirmationTag": STANDARD.encode(&zero_32),
+            },
+            "originTransitionId": entry_id.to_string(),
+            "metadataVersion": 1,
+            "nonce": STANDARD.encode(&nonce),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": {
+                "authorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "authorDeviceId": entry_id.to_string(),
+                "authorKeyId": actor_key_id,
+                "signaturePublicKey": STANDARD.encode(&actor_public_key),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": entry_id.to_string(),
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active"
+            }
+        }
+    });
+    let mut wrapper_val = serde_json::json!({
+        "body": commit_body_val,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&wrapper_val).unwrap();
+    let canonical =
+        catbird_server::chat_protocol::test_support::decode_canonical_signed_mutation(&unsigned)
+            .unwrap();
+    let sig = signing_key.sign(canonical.transcript_bytes());
+    wrapper_val["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
+    let valid_signed_req = serde_json::to_vec(&wrapper_val).unwrap();
     let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<
         jacquard_common::DefaultStr,
     > {
@@ -2693,7 +2797,7 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
             extra_data: None,
         },
         signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"signed-commit-request-bytes",
+            &valid_signed_req,
         ),
         extra_data: None,
     };
@@ -2712,7 +2816,7 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     let b16 = serde_json::to_string(&vec![1u8; 16]).unwrap();
     let b32_arr = serde_json::to_string(&vec![1u8; 32]).unwrap();
 
-    let entry_id_str = Uuid::new_v4().to_string();
+    let entry_id_str = entry_id.to_string();
     let st_expected_json = format!(
         r#"{{
         "coordinates": {{
@@ -3725,18 +3829,124 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
     let (signer, verifying_key, _) = test_signer(&peer_did);
 
     let source_locator = ValidatedEntryLocator {
-        entry_id: Uuid::new_v4(),
+        entry_id: delivery_id,
         seq: 1,
-        accepted_payload_sha256: [1u8; 32],
-        outer_entry_fingerprint: [2u8; 32],
+        accepted_payload_sha256: [0x55u8; 32],
+        outer_entry_fingerprint: [0x66u8; 32],
     };
+    use base64::engine::general_purpose::STANDARD;
+    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+    let signing_key = Ed25519SigningKey::from_bytes(&[42u8; 32]);
+    let actor_public_key = signing_key.verifying_key().to_bytes();
+    let actor_key_id_thumbprint =
+        catbird_server::chat_protocol::test_support::ed25519_key_id(&actor_public_key).unwrap();
+    let actor_key_id = actor_key_id_thumbprint.as_str();
+    let nonce = vec![0x78u8; 12];
+    let ciphertext = vec![0x88u8; 48];
+    let commit_bytes = vec![0x99u8; 48];
+    let zero_32 = vec![0u8; 32];
+    let commit_body_val = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#commitTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-COMMIT\u{0000}",
+        "transitionId": item_id.clone(),
+        "idempotencyKey": item_id.clone(),
+        "actorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "actorDeviceId": item_id.clone(),
+        "keyId": actor_key_id,
+        "authGeneration": 1,
+        "signedAt": "2026-08-25T12:00:00.000Z",
+        "prior": {
+            "conversationId": convo_id.clone(),
+            "generation": 0,
+            "stateVersion": 3,
+            "groupId": STANDARD.encode(&zero_32),
+            "epoch": 1,
+            "groupContextHash": STANDARD.encode(&zero_32),
+            "confirmationTag": STANDARD.encode(&zero_32),
+            "lifecycle": "active"
+        },
+        "next": {
+            "conversationId": convo_id.clone(),
+            "generation": 0,
+            "stateVersion": 4,
+            "groupId": STANDARD.encode(&zero_32),
+            "epoch": 2,
+            "groupContextHash": STANDARD.encode(&zero_32),
+            "confirmationTag": STANDARD.encode(&zero_32),
+            "lifecycle": "active"
+        },
+        "aad": {
+            "protocolVersion": "1",
+            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+            "generation": 0,
+            "transitionId": STANDARD.encode(delivery_id.as_bytes()),
+            "prior": {
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                "generation": 0,
+                "stateVersion": 3,
+                "groupId": STANDARD.encode(&zero_32),
+                "epoch": 1,
+                "groupContextHash": STANDARD.encode(&zero_32),
+                "confirmationTag": STANDARD.encode(&zero_32),
+                "lifecycle": "active"
+            }
+        },
+        "manifest": {
+            "participantChanges": [],
+            "leafChanges": []
+        },
+        "commit": {
+            "framing": "mlsMessage",
+            "contentType": "publicMessageCommit",
+            "bytes": STANDARD.encode(&commit_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(&commit_bytes))
+        },
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                "generation": 0,
+                "groupId": STANDARD.encode(&zero_32),
+                "epoch": 2,
+                "groupContextHash": STANDARD.encode(&zero_32),
+                "confirmationTag": STANDARD.encode(&zero_32),
+            },
+            "originTransitionId": item_id.clone(),
+            "metadataVersion": 1,
+            "nonce": STANDARD.encode(&nonce),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": {
+                "authorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+                "authorDeviceId": item_id.clone(),
+                "authorKeyId": actor_key_id,
+                "signaturePublicKey": STANDARD.encode(&actor_public_key),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": item_id.clone(),
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active"
+            }
+        }
+    });
+    let mut wrapper_val = serde_json::json!({
+        "body": commit_body_val,
+        "signature": STANDARD.encode([0u8; 64]),
+    });
+    let unsigned = serde_json::to_vec(&wrapper_val).unwrap();
+    let canonical =
+        catbird_server::chat_protocol::test_support::decode_canonical_signed_mutation(&unsigned)
+            .unwrap();
+    let sig = signing_key.sign(canonical.transcript_bytes());
+    wrapper_val["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
+    let valid_signed_req = serde_json::to_vec(&wrapper_val).unwrap();
 
     let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<
         jacquard_common::DefaultStr,
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
-            delivery_id: delivery_id.to_string().into(),
+            delivery_id: item_id.clone().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
             receiver_ds_did: peer_did.clone().into(),
@@ -3746,7 +3956,7 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
             extra_data: None,
         },
         signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"fake-signed-request",
+            &valid_signed_req,
         ),
         extra_data: None,
     };

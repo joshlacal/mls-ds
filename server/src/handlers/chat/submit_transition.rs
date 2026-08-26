@@ -43,9 +43,10 @@ pub(super) async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    submit(&pool, &runtime, &headers, &body)
-        .await
-        .unwrap_or_else(IntoResponse::into_response)
+    match submit(&pool, &runtime, &headers, &body).await {
+        Ok(response) => response,
+        Err(failure) => failure.into_response(),
+    }
 }
 
 async fn submit(
@@ -144,7 +145,6 @@ fn submit_failure(
     mutation_kind: SignedMutationKind,
     error: SubmitTransitionFacadeError,
 ) -> ChatFailure {
-    eprintln!("SUBMIT FAILURE IN HANDLER: {error:?}");
     tracing::error!(
         "submit_failure: mutation_kind={:?}, error={:?}",
         mutation_kind,
@@ -158,7 +158,6 @@ fn submit_failure(
     use RecoveryPackageHydrationError as P;
     use RelationshipRepositoryError as R;
     use SubmitTransitionFacadeError as E;
-
     match error {
         E::Database(_)
         | E::RecoveryPackage(P::Database(_))
@@ -228,13 +227,6 @@ fn submit_failure(
                 | crate::federation::FederationError::SignerUnavailable
                 | crate::federation::FederationError::RemoteError { status: 503, .. } => {
                     ChatFailure::protocol(ENDPOINT, C::RelationshipPolicyUnavailable)
-                }
-                crate::federation::FederationError::OutboundQueuePeerCapExceeded { .. }
-                | crate::federation::FederationError::OutboundQueueConvoPeerCapExceeded {
-                    ..
-                }
-                | crate::federation::FederationError::RemoteError { status: 429, .. } => {
-                    ChatFailure::protocol(ENDPOINT, C::RateLimited)
                 }
                 crate::federation::FederationError::Database(_) => ChatFailure::storage(ENDPOINT),
                 _ => ChatFailure::invariant(ENDPOINT),
