@@ -5846,6 +5846,34 @@ async fn send_json_to_router(
     (status, value, headers)
 }
 
+/// Like [`send_json_to_router`] but returns the raw response body bytes.
+async fn send_json_to_router_raw(
+    router: &Router,
+    uri: &str,
+    jwt: Option<&str>,
+    body: &Value,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = jwt {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let body_bytes = serde_json::to_vec(body).unwrap();
+    let request = builder.body(Body::from(body_bytes)).unwrap();
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("collect response body");
+    (status, bytes.to_vec())
+}
+
 #[tokio::test]
 async fn test_remote_commit_rejected_order_leaves_mailbox_state_byte_for_byte_unchanged() {
     use catbird_server::auth::AuthMiddleware;
@@ -7436,22 +7464,26 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         &alice_p256,
     );
 
-    let (status2, body2, _) = send_json_to_router(
+    let (status2_raw, body2_raw) = send_json_to_router_raw(
         &custom_router,
         "/xrpc/blue.catbird.chat.submitTransition",
         Some(&jwt2),
         &client_body,
     )
     .await;
+    let body2: Value = serde_json::from_slice(&body2_raw).unwrap_or(Value::Null);
     assert_eq!(
-        status2,
+        status2_raw,
         StatusCode::OK,
-        "Call 2 retry after dropped response must succeed: status={status2}, body={body2:?}"
+        "Call 2 retry after dropped response must succeed: status={status2_raw}, body={body2:?}"
     );
     assert!(
         body2.get("error").is_none(),
         "Call 2 must not carry an error code: body={body2:?}"
     );
+
+    // Call 2 applied exactly once: mailbox state is now committed.
+    let after_call2 = capture_mailbox_snapshot(&harness.pool).await;
 
     let delivery_id =
         catbird_server::chat_protocol::test_support::repository::derive_submit_commit_delivery_id(
@@ -7500,6 +7532,30 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         .await
         .unwrap();
     assert_eq!(queue_cnt, 0, "must be 0 queue jobs on mailbox DS");
+    let chat_outbox_cnt: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.outbox")
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        chat_outbox_cnt, 2,
+        "commit apply must schedule exactly the 2 expected chat.outbox delivery work rows (stream + notification)"
+    );
+
+    // "Applied exactly once": the seeded corpus has 4 entries + 4 transitions;
+    // the single commit apply adds exactly 1 of each.
+    let transition_cnt: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.transitions")
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        transition_cnt, 5,
+        "exactly 1 transition added by the commit apply"
+    );
+    let entry_cnt: i64 = sqlx::query_scalar("SELECT count(*) FROM chat.entries")
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(entry_cnt, 5, "exactly 1 entry added by the commit apply");
 
     assert_eq!(
         call_counts.load(std::sync::atomic::Ordering::SeqCst),
@@ -7522,7 +7578,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         }),
         &alice_p256,
     );
-    let (status3, body3, _) = send_json_to_router(
+    let (status3_raw, body3_raw) = send_json_to_router_raw(
         &custom_router,
         "/xrpc/blue.catbird.chat.submitTransition",
         Some(&jwt3),
@@ -7530,13 +7586,20 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     )
     .await;
     assert_eq!(
-        status3,
+        status3_raw,
         StatusCode::OK,
-        "Call 3 local replay must succeed: status={status3}, body={body3:?}"
+        "Call 3 local replay must succeed: status={status3_raw}"
     );
     assert_eq!(
-        body3, body2,
-        "Call 3 local replay must return byte-identical response to Call 2"
+        body3_raw, body2_raw,
+        "Call 3 local replay must return byte-identical raw response to Call 2"
+    );
+    // Local replay must not write anything: mailbox state after Call 3 equals
+    // the state after Call 2's single apply.
+    let after_call3 = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after_call3, after_call2,
+        "Call 3 local replay must leave mailbox state byte-for-byte unchanged"
     );
     assert_eq!(
         call_counts.load(std::sync::atomic::Ordering::SeqCst),

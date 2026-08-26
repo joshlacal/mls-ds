@@ -1968,6 +1968,7 @@ async fn run_test_scenario() -> Result<()> {
         "receiverDsDid": cluster.ds2_service_did,
         "sequencerDid": cluster.ds1_service_did,
         "sequencerTerm": 0,
+        "receivedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
         "payloadSha256": { "$bytes": STANDARD.encode(&welcome_payload_sha) }
     });
 
@@ -2175,6 +2176,7 @@ async fn run_test_scenario() -> Result<()> {
         "receiverDsDid": cluster.ds2_service_did,
         "sequencerDid": cluster.ds1_service_did,
         "sequencerTerm": 0,
+        "receivedAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
         "payloadSha256": { "$bytes": STANDARD.encode(&msg_payload_sha) }
     });
 
