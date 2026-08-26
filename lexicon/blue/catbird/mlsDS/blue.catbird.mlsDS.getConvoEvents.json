@@ -94,7 +94,30 @@
           "type": "string",
           "format": "datetime",
           "description": "Creation timestamp"
-        }
+        },
+        "entryId": { "type": "string" },
+        "entryKind": {
+          "type": "string",
+          "knownValues": [
+            "blue.catbird.chat.defs#applicationEntry",
+            "blue.catbird.chat.defs#commitEntry",
+            "blue.catbird.chat.defs#policyEntry",
+            "blue.catbird.chat.defs#metadataEntry",
+            "blue.catbird.chat.defs#creationEntry",
+            "blue.catbird.chat.defs#participantAcceptanceEntry",
+            "blue.catbird.chat.defs#conversationCloseEntry",
+            "blue.catbird.chat.defs#resetRequestEntry",
+            "blue.catbird.chat.defs#resetActivationEntry",
+            "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+            "blue.catbird.chat.defs#leaveRequestEntry",
+            "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+            "blue.catbird.chat.defs#leaveCancellationEntry",
+            "blue.catbird.chat.defs#leaveCommitFulfillmentEntry"
+          ]
+        },
+        "acceptedPayloadSha256": { "type": "bytes", "minLength": 32, "maxLength": 32 },
+        "signedRequest": { "type": "bytes", "minLength": 1, "maxLength": 1048576 },
+        "outerFingerprint": { "type": "bytes", "minLength": 32, "maxLength": 32 }
       }
     }
   }

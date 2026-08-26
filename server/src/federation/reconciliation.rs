@@ -60,7 +60,112 @@ struct RemoteConvoEvents {
     events: Vec<RemoteEvent>,
 }
 
-#[derive(Debug, Deserialize)]
+pub(crate) use crate::chat_protocol::transcript::CleanEntryKind;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum StrictCleanRemoteEventError {
+    #[error("missing required clean event field: {0}")]
+    MissingField(&'static str),
+    #[error("invalid entry id: {0}")]
+    InvalidEntryId(String),
+    #[error("invalid or unknown entry kind: {0}")]
+    InvalidEntryKind(String),
+    #[error("invalid accepted payload hash length: expected 32, got {0}")]
+    InvalidAcceptedPayloadHashLength(usize),
+    #[error("accepted payload hash mismatch")]
+    AcceptedPayloadHashMismatch,
+    #[error("invalid signed request length: {0}")]
+    InvalidSignedRequestLength(usize),
+    #[error("invalid outer fingerprint length: expected 32, got {0}")]
+    InvalidOuterFingerprintLength(usize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StrictCleanRemoteEvent {
+    pub(crate) seq: i64,
+    pub(crate) generation: i64,
+    pub(crate) entry_id: uuid::Uuid,
+    pub(crate) entry_kind: CleanEntryKind,
+    pub(crate) accepted_payload_bytes: Vec<u8>,
+    pub(crate) accepted_payload_sha256: [u8; 32],
+    pub(crate) signed_request: Vec<u8>,
+    pub(crate) outer_fingerprint: [u8; 32],
+    pub(crate) received_at: DateTime<Utc>,
+}
+
+impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
+    type Error = StrictCleanRemoteEventError;
+
+    fn try_from(event: RemoteEvent) -> Result<Self, Self::Error> {
+        let entry_id_str = event
+            .entry_id
+            .ok_or(StrictCleanRemoteEventError::MissingField("entryId"))?;
+        let entry_id = uuid::Uuid::parse_str(&entry_id_str)
+            .map_err(|_| StrictCleanRemoteEventError::InvalidEntryId(entry_id_str))?;
+
+        let entry_kind_str = event
+            .entry_kind
+            .ok_or(StrictCleanRemoteEventError::MissingField("entryKind"))?;
+        let entry_kind = CleanEntryKind::from_type_id(&entry_kind_str)
+            .ok_or_else(|| StrictCleanRemoteEventError::InvalidEntryKind(entry_kind_str))?;
+
+        let hash_bytes =
+            event
+                .accepted_payload_sha256
+                .ok_or(StrictCleanRemoteEventError::MissingField(
+                    "acceptedPayloadSha256",
+                ))?;
+        if hash_bytes.len() != 32 {
+            return Err(
+                StrictCleanRemoteEventError::InvalidAcceptedPayloadHashLength(hash_bytes.len()),
+            );
+        }
+        let mut accepted_payload_sha256 = [0u8; 32];
+        accepted_payload_sha256.copy_from_slice(&hash_bytes);
+
+        use sha2::Digest;
+        let computed_hash: [u8; 32] = sha2::Sha256::digest(&event.ciphertext).into();
+        if computed_hash != accepted_payload_sha256 {
+            return Err(StrictCleanRemoteEventError::AcceptedPayloadHashMismatch);
+        }
+
+        let signed_request = event
+            .signed_request
+            .ok_or(StrictCleanRemoteEventError::MissingField("signedRequest"))?;
+        if signed_request.is_empty() || signed_request.len() > 1_048_576 {
+            return Err(StrictCleanRemoteEventError::InvalidSignedRequestLength(
+                signed_request.len(),
+            ));
+        }
+
+        let fp_bytes = event
+            .outer_fingerprint
+            .ok_or(StrictCleanRemoteEventError::MissingField(
+                "outerFingerprint",
+            ))?;
+        if fp_bytes.len() != 32 {
+            return Err(StrictCleanRemoteEventError::InvalidOuterFingerprintLength(
+                fp_bytes.len(),
+            ));
+        }
+        let mut outer_fingerprint = [0u8; 32];
+        outer_fingerprint.copy_from_slice(&fp_bytes);
+
+        Ok(StrictCleanRemoteEvent {
+            seq: event.seq,
+            generation: event.epoch,
+            entry_id,
+            entry_kind,
+            accepted_payload_bytes: event.ciphertext,
+            accepted_payload_sha256,
+            signed_request,
+            outer_fingerprint,
+            received_at: event.created_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteEvent {
     pub seq: i64,
@@ -76,11 +181,12 @@ pub(crate) struct RemoteEvent {
     #[serde(default)]
     pub entry_kind: Option<String>,
     #[serde(default, with = "crate::atproto_bytes::option")]
+    pub accepted_payload_sha256: Option<Vec<u8>>,
+    #[serde(default, with = "crate::atproto_bytes::option")]
     pub signed_request: Option<Vec<u8>>,
     #[serde(default, with = "crate::atproto_bytes::option")]
     pub outer_fingerprint: Option<Vec<u8>>,
 }
-
 #[derive(Debug)]
 struct LocalDigestState {
     last_seq: i64,
@@ -1679,5 +1785,212 @@ mod tests {
             !source.contains(&silent_max),
             "max() silently accepts a full page that does not advance the cursor"
         );
+    }
+
+    #[test]
+    fn clean_entry_kind_parses_all_fourteen_kinds_and_rejects_shorthand() {
+        assert_eq!(CleanEntryKind::ALL.len(), 14);
+        for kind in CleanEntryKind::ALL {
+            let type_id = kind.type_id();
+            assert!(type_id.starts_with("blue.catbird.chat.defs#"));
+            assert_eq!(CleanEntryKind::from_type_id(type_id), Some(kind));
+        }
+
+        // Shorthand and unknown kinds must fail closed
+        assert_eq!(CleanEntryKind::from_type_id("applicationEntry"), None);
+        assert_eq!(CleanEntryKind::from_type_id("creationEntry"), None);
+        assert_eq!(
+            CleanEntryKind::from_type_id("blue.catbird.chat.defs#unknownEntry"),
+            None
+        );
+        assert_eq!(CleanEntryKind::from_type_id(""), None);
+    }
+
+    #[test]
+    fn strict_clean_remote_event_from_complete_clean_event_succeeds() {
+        use sha2::Digest;
+        let ciphertext = vec![10, 20, 30, 40];
+        let payload_hash: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
+        let event = RemoteEvent {
+            seq: 1,
+            epoch: 0,
+            msg_id: "msg-1".to_string(),
+            message_type: "blue.catbird.chat.defs#creationEntry".to_string(),
+            ciphertext: ciphertext.clone(),
+            padded_size: 4,
+            created_at: Utc::now(),
+            entry_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            entry_kind: Some("blue.catbird.chat.defs#creationEntry".to_string()),
+            accepted_payload_sha256: Some(payload_hash.to_vec()),
+            signed_request: Some(vec![1; 64]),
+            outer_fingerprint: Some(vec![2; 32]),
+        };
+
+        let strict = StrictCleanRemoteEvent::try_from(event).expect("must convert strictly");
+        assert_eq!(strict.seq, 1);
+        assert_eq!(strict.generation, 0);
+        assert_eq!(
+            strict.entry_id,
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
+        );
+        assert_eq!(strict.entry_kind, CleanEntryKind::Creation);
+        assert_eq!(strict.accepted_payload_bytes, ciphertext);
+        assert_eq!(strict.accepted_payload_sha256, payload_hash);
+        assert_eq!(strict.signed_request, vec![1; 64]);
+        assert_eq!(strict.outer_fingerprint, [2u8; 32]);
+    }
+
+    #[test]
+    fn strict_clean_remote_event_missing_any_field_fails() {
+        use sha2::Digest;
+        let ciphertext = vec![1, 2, 3];
+        let payload_hash: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
+        let base_event = RemoteEvent {
+            seq: 1,
+            epoch: 0,
+            msg_id: "msg-1".to_string(),
+            message_type: "blue.catbird.chat.defs#applicationEntry".to_string(),
+            ciphertext,
+            padded_size: 3,
+            created_at: Utc::now(),
+            entry_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            entry_kind: Some("blue.catbird.chat.defs#applicationEntry".to_string()),
+            accepted_payload_sha256: Some(payload_hash.to_vec()),
+            signed_request: Some(vec![1; 64]),
+            outer_fingerprint: Some(vec![2; 32]),
+        };
+
+        // Missing entry_id
+        let mut e = base_event.clone();
+        e.entry_id = None;
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::MissingField("entryId"))
+        ));
+
+        // Missing entry_kind
+        let mut e = base_event.clone();
+        e.entry_kind = None;
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::MissingField("entryKind"))
+        ));
+
+        // Missing accepted_payload_sha256
+        let mut e = base_event.clone();
+        e.accepted_payload_sha256 = None;
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::MissingField(
+                "acceptedPayloadSha256"
+            ))
+        ));
+
+        // Missing signed_request
+        let mut e = base_event.clone();
+        e.signed_request = None;
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::MissingField("signedRequest"))
+        ));
+
+        // Missing outer_fingerprint
+        let mut e = base_event.clone();
+        e.outer_fingerprint = None;
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::MissingField(
+                "outerFingerprint"
+            ))
+        ));
+    }
+
+    #[test]
+    fn strict_clean_remote_event_validation_negatives() {
+        use sha2::Digest;
+        let ciphertext = vec![1, 2, 3];
+        let payload_hash: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
+        let base = RemoteEvent {
+            seq: 1,
+            epoch: 0,
+            msg_id: "msg-1".to_string(),
+            message_type: "blue.catbird.chat.defs#applicationEntry".to_string(),
+            ciphertext,
+            padded_size: 3,
+            created_at: Utc::now(),
+            entry_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            entry_kind: Some("blue.catbird.chat.defs#applicationEntry".to_string()),
+            accepted_payload_sha256: Some(payload_hash.to_vec()),
+            signed_request: Some(vec![1; 64]),
+            outer_fingerprint: Some(vec![2; 32]),
+        };
+
+        // Invalid entry_id (not a UUID)
+        let mut e = base.clone();
+        e.entry_id = Some("not-a-uuid".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryId(_))
+        ));
+
+        // Shorthand entry_kind
+        let mut e = base.clone();
+        e.entry_kind = Some("applicationEntry".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryKind(_))
+        ));
+
+        // Unknown entry_kind
+        let mut e = base.clone();
+        e.entry_kind = Some("blue.catbird.chat.defs#unknownEntry".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryKind(_))
+        ));
+
+        // Wrong accepted_payload_sha256 length (31 bytes)
+        let mut e = base.clone();
+        e.accepted_payload_sha256 = Some(vec![0; 31]);
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidAcceptedPayloadHashLength(31))
+        ));
+
+        // Wrong outer_fingerprint length (33 bytes)
+        let mut e = base.clone();
+        e.outer_fingerprint = Some(vec![0; 33]);
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidOuterFingerprintLength(
+                33
+            ))
+        ));
+
+        // Empty signed_request (0 bytes)
+        let mut e = base.clone();
+        e.signed_request = Some(vec![]);
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidSignedRequestLength(0))
+        ));
+
+        // Oversized signed_request (> 1_048_576 bytes)
+        let mut e = base.clone();
+        e.signed_request = Some(vec![0; 1_048_577]);
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidSignedRequestLength(
+                1_048_577
+            ))
+        ));
+
+        // Accepted payload hash mismatch
+        let mut e = base.clone();
+        e.accepted_payload_sha256 = Some(vec![0xFF; 32]);
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::AcceptedPayloadHashMismatch)
+        ));
     }
 }

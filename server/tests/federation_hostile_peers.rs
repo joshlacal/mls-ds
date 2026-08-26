@@ -19,9 +19,9 @@ use uuid::Uuid;
 
 use catbird_server::db::{init_db, DbConfig};
 use catbird_server::federation::{
-    AckSigner, Sequencer, SequencerTransfer, TransferError, TransferResult,
+    AckSigner, DsResolver, Sequencer, SequencerTransfer, TransferError, TransferResult,
 };
-use catbird_server::handlers;
+use catbird_server::handlers::{self, chat::ChatRuntime};
 use catbird_server::realtime::SseState;
 
 #[derive(Clone, FromRef)]
@@ -30,8 +30,9 @@ struct TestState {
     sse_state: Arc<SseState>,
     ack_signer: Option<Arc<AckSigner>>,
     sequencer: Arc<Sequencer>,
+    resolver: Arc<DsResolver>,
+    runtime: Arc<ChatRuntime>,
 }
-
 #[derive(Debug, Serialize)]
 struct ServiceClaims<'a> {
     iss: &'a str,
@@ -114,13 +115,28 @@ async fn setup_test_db() -> Option<(PgPool, common::fresh_db::DisposableDatabase
 fn test_router(pool: PgPool) -> Router {
     let self_did =
         std::env::var("SERVICE_DID").unwrap_or_else(|_| "did:web:test.ds.local".to_string());
+    let sse_state = Arc::new(SseState::new(64));
+    let resolver = Arc::new(DsResolver::new(
+        pool.clone(),
+        reqwest::Client::new(),
+        self_did.clone(),
+        "https://test.ds.local".to_string(),
+        None,
+        300,
+    ));
+    let runtime = Arc::new(
+        ChatRuntime::from_env(sse_state.clone())
+            .expect("build chat runtime")
+            .with_resolver(resolver.clone()),
+    );
     let state = TestState {
         db_pool: pool.clone(),
-        sse_state: Arc::new(SseState::new(64)),
+        sse_state,
         ack_signer: None,
         sequencer: Arc::new(Sequencer::new(pool, self_did)),
+        resolver,
+        runtime,
     };
-
     Router::<TestState>::new()
         .route(
             "/xrpc/blue.catbird.mlsDS.deliverMessage",

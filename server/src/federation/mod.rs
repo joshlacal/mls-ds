@@ -102,6 +102,7 @@ fn federation_mode_override() -> &'static RwLock<Option<FederationMode>> {
 
 pub const CAPABILITY_BASELINE: &str = "baseline";
 pub const CAPABILITY_RECONCILIATION_V1: &str = "reconciliation-v1";
+pub const CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1: &str = "canonical-prefix-bootstrap-v1";
 const DEFAULT_FEDERATION_CAPABILITIES: &[&str] = &[CAPABILITY_BASELINE];
 
 fn normalize_capability(raw: &str) -> Option<String> {
@@ -213,7 +214,7 @@ pub fn target_supports_capability(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_capabilities_csv, target_supports_capability, FederationMode};
+    use super::*;
     use serde_json::json;
 
     #[test]
@@ -261,6 +262,29 @@ mod tests {
             "external-commits-v1",
             None,
             Some(&payload)
+        ));
+    }
+
+    #[test]
+    fn canonical_prefix_bootstrap_capability_reported_only_when_configured() {
+        let default_caps = local_federation_capabilities();
+        assert!(
+            !default_caps.contains(&CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string()),
+            "default capabilities must stay conservative and exclude prefix bootstrap"
+        );
+
+        let payload = json!({
+            "federationCapabilities": [CAPABILITY_BASELINE, CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1]
+        });
+        assert!(target_supports_capability(
+            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1,
+            None,
+            Some(&payload)
+        ));
+        assert!(!target_supports_capability(
+            CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1,
+            None,
+            Some(&json!({ "federationCapabilities": [CAPABILITY_BASELINE] }))
         ));
     }
 }

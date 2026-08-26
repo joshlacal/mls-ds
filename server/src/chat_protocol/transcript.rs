@@ -2503,8 +2503,8 @@ macro_rules! control_entry_kinds {
             pub const fn type_id(self) -> &'static str { match self { $(Self::$variant => concat!("blue.catbird.chat.defs#", $entry)),+ } }
             pub const fn signed_kind(self) -> SignedMutationKind { match self { $(Self::$variant => SignedMutationKind::$signed),+ } }
             const fn server_field(self) -> Option<&'static str> { match self { $(Self::$variant => $server),+ } }
-            fn from_type_id(value: &str) -> Option<Self> { match value { $(concat!("blue.catbird.chat.defs#", $entry) => Some(Self::$variant)),+, _ => None } }
-            fn from_signed_kind(value: SignedMutationKind) -> Option<Self> {
+            pub(crate) fn from_type_id(value: &str) -> Option<Self> { match value { $(concat!("blue.catbird.chat.defs#", $entry) => Some(Self::$variant)),+, _ => None } }
+            pub(crate) fn from_signed_kind(value: SignedMutationKind) -> Option<Self> {
                 Self::ALL.into_iter().find(|kind| kind.signed_kind() == value)
             }
         }
@@ -2575,6 +2575,109 @@ impl ControlEntryKind {
             | Self::LeafRecoveryFulfillment
             | Self::ZeroLeafLeave
             | Self::LeaveCommitFulfillment => "blue.catbird.chat.submitTransition",
+        }
+    }
+}
+
+pub const APPLICATION_ENTRY_TYPE_ID: &str = "blue.catbird.chat.defs#applicationEntry";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanEntryKind {
+    Application,
+    Commit,
+    Policy,
+    Metadata,
+    Creation,
+    ParticipantAcceptance,
+    ConversationClose,
+    ResetRequest,
+    ResetActivation,
+    LeafRecoveryFulfillment,
+    LeaveRequest,
+    ZeroLeafLeave,
+    LeaveCancellation,
+    LeaveCommitFulfillment,
+}
+
+impl CleanEntryKind {
+    pub(crate) const ALL: [Self; 14] = [
+        Self::Application,
+        Self::Commit,
+        Self::Policy,
+        Self::Metadata,
+        Self::Creation,
+        Self::ParticipantAcceptance,
+        Self::ConversationClose,
+        Self::ResetRequest,
+        Self::ResetActivation,
+        Self::LeafRecoveryFulfillment,
+        Self::LeaveRequest,
+        Self::ZeroLeafLeave,
+        Self::LeaveCancellation,
+        Self::LeaveCommitFulfillment,
+    ];
+
+    pub(crate) const fn type_id(self) -> &'static str {
+        match self {
+            Self::Application => APPLICATION_ENTRY_TYPE_ID,
+            Self::Commit => ControlEntryKind::Commit.type_id(),
+            Self::Policy => ControlEntryKind::Policy.type_id(),
+            Self::Metadata => ControlEntryKind::Metadata.type_id(),
+            Self::Creation => ControlEntryKind::Creation.type_id(),
+            Self::ParticipantAcceptance => ControlEntryKind::ParticipantAcceptance.type_id(),
+            Self::ConversationClose => ControlEntryKind::ConversationClose.type_id(),
+            Self::ResetRequest => ControlEntryKind::ResetRequest.type_id(),
+            Self::ResetActivation => ControlEntryKind::ResetActivation.type_id(),
+            Self::LeafRecoveryFulfillment => ControlEntryKind::LeafRecoveryFulfillment.type_id(),
+            Self::LeaveRequest => ControlEntryKind::LeaveRequest.type_id(),
+            Self::ZeroLeafLeave => ControlEntryKind::ZeroLeafLeave.type_id(),
+            Self::LeaveCancellation => ControlEntryKind::LeaveCancellation.type_id(),
+            Self::LeaveCommitFulfillment => ControlEntryKind::LeaveCommitFulfillment.type_id(),
+        }
+    }
+
+    pub(crate) fn from_type_id(value: &str) -> Option<Self> {
+        if value == APPLICATION_ENTRY_TYPE_ID {
+            Some(Self::Application)
+        } else {
+            ControlEntryKind::from_type_id(value).map(Self::from_control_kind)
+        }
+    }
+
+    pub(crate) fn as_control_kind(self) -> Option<ControlEntryKind> {
+        match self {
+            Self::Application => None,
+            Self::Commit => Some(ControlEntryKind::Commit),
+            Self::Policy => Some(ControlEntryKind::Policy),
+            Self::Metadata => Some(ControlEntryKind::Metadata),
+            Self::Creation => Some(ControlEntryKind::Creation),
+            Self::ParticipantAcceptance => Some(ControlEntryKind::ParticipantAcceptance),
+            Self::ConversationClose => Some(ControlEntryKind::ConversationClose),
+            Self::ResetRequest => Some(ControlEntryKind::ResetRequest),
+            Self::ResetActivation => Some(ControlEntryKind::ResetActivation),
+            Self::LeafRecoveryFulfillment => Some(ControlEntryKind::LeafRecoveryFulfillment),
+            Self::LeaveRequest => Some(ControlEntryKind::LeaveRequest),
+            Self::ZeroLeafLeave => Some(ControlEntryKind::ZeroLeafLeave),
+            Self::LeaveCancellation => Some(ControlEntryKind::LeaveCancellation),
+            Self::LeaveCommitFulfillment => Some(ControlEntryKind::LeaveCommitFulfillment),
+        }
+    }
+
+    pub(crate) const fn from_control_kind(kind: ControlEntryKind) -> Self {
+        match kind {
+            ControlEntryKind::Commit => Self::Commit,
+            ControlEntryKind::Policy => Self::Policy,
+            ControlEntryKind::Metadata => Self::Metadata,
+            ControlEntryKind::Creation => Self::Creation,
+            ControlEntryKind::ParticipantAcceptance => Self::ParticipantAcceptance,
+            ControlEntryKind::ConversationClose => Self::ConversationClose,
+            ControlEntryKind::ResetRequest => Self::ResetRequest,
+            ControlEntryKind::ResetActivation => Self::ResetActivation,
+            ControlEntryKind::LeafRecoveryFulfillment => Self::LeafRecoveryFulfillment,
+            ControlEntryKind::LeaveRequest => Self::LeaveRequest,
+            ControlEntryKind::ZeroLeafLeave => Self::ZeroLeafLeave,
+            ControlEntryKind::LeaveCancellation => Self::LeaveCancellation,
+            ControlEntryKind::LeaveCommitFulfillment => Self::LeaveCommitFulfillment,
         }
     }
 }
@@ -3608,5 +3711,31 @@ impl VerifiedControlEntry {
     }
     pub fn mutation(&self) -> &VerifiedSignedMutation {
         &self.mutation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_entry_kind_matches_all_fourteen_definitions() {
+        assert_eq!(CleanEntryKind::ALL.len(), 14);
+        for kind in CleanEntryKind::ALL {
+            let type_id = kind.type_id();
+            assert!(type_id.starts_with("blue.catbird.chat.defs#"));
+            assert_eq!(CleanEntryKind::from_type_id(type_id), Some(kind));
+
+            if let Some(control) = kind.as_control_kind() {
+                assert_eq!(CleanEntryKind::from_control_kind(control), kind);
+                assert_eq!(control.type_id(), type_id);
+            } else {
+                assert_eq!(kind, CleanEntryKind::Application);
+                assert_eq!(type_id, APPLICATION_ENTRY_TYPE_ID);
+            }
+        }
+
+        assert_eq!(CleanEntryKind::from_type_id("invalid"), None);
+        assert_eq!(CleanEntryKind::from_type_id("applicationEntry"), None);
     }
 }

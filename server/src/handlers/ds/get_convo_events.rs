@@ -38,6 +38,12 @@ pub struct ConvoEventEntry {
         skip_serializing_if = "Option::is_none",
         with = "crate::atproto_bytes::option"
     )]
+    pub accepted_payload_sha256: Option<Vec<u8>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::atproto_bytes::option"
+    )]
     pub signed_request: Option<Vec<u8>>,
     #[serde(
         default,
@@ -75,6 +81,7 @@ struct CleanEventRow {
     message_id: Option<uuid::Uuid>,
     entry_kind: String,
     accepted_payload_bytes: Vec<u8>,
+    accepted_payload_sha256: Vec<u8>,
     signed_request_bytes: Vec<u8>,
     outer_entry_fingerprint: Vec<u8>,
     received_at: DateTime<Utc>,
@@ -110,6 +117,7 @@ pub async fn get_convo_events(
                    message_id, \
                    entry_kind, \
                    accepted_payload_bytes, \
+                   accepted_payload_sha256, \
                    signed_request_bytes, \
                    outer_entry_fingerprint, \
                    received_at \
@@ -143,6 +151,7 @@ pub async fn get_convo_events(
                         created_at: row.received_at,
                         entry_id: Some(row.entry_id.to_string()),
                         entry_kind: Some(row.entry_kind),
+                        accepted_payload_sha256: Some(row.accepted_payload_sha256),
                         signed_request: Some(row.signed_request_bytes),
                         outer_fingerprint: Some(row.outer_entry_fingerprint),
                     }
@@ -184,6 +193,7 @@ pub async fn get_convo_events(
                     created_at: row.created_at,
                     entry_id: None,
                     entry_kind: None,
+                    accepted_payload_sha256: None,
                     signed_request: None,
                     outer_fingerprint: None,
                 })
@@ -202,4 +212,91 @@ pub async fn get_convo_events(
 
     super::deliver_message::record_ds_outcome(&pool, &requester_ds, result.is_ok()).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    #[test]
+    fn clean_event_serialization_emits_all_five_fields_with_atproto_bytes() {
+        let entry = ConvoEventEntry {
+            seq: 1,
+            epoch: 0,
+            msg_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            message_type: "blue.catbird.chat.defs#creationEntry".to_string(),
+            ciphertext: vec![1, 2, 3, 4],
+            padded_size: 4,
+            created_at: Utc.timestamp_opt(1700000000, 0).unwrap(),
+            entry_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            entry_kind: Some("blue.catbird.chat.defs#creationEntry".to_string()),
+            accepted_payload_sha256: Some(vec![5; 32]),
+            signed_request: Some(vec![6; 20]),
+            outer_fingerprint: Some(vec![7; 32]),
+        };
+
+        let serialized = serde_json::to_value(&entry).expect("must serialize");
+        let obj = serialized.as_object().expect("must be object");
+
+        assert_eq!(obj.get("seq"), Some(&json!(1)));
+        assert_eq!(obj.get("epoch"), Some(&json!(0)));
+        assert_eq!(
+            obj.get("entryId"),
+            Some(&json!("00000000-0000-0000-0000-000000000001"))
+        );
+        assert_eq!(
+            obj.get("entryKind"),
+            Some(&json!("blue.catbird.chat.defs#creationEntry"))
+        );
+
+        // ATProto byte objects
+        assert!(obj.get("ciphertext").unwrap().get("$bytes").is_some());
+        assert!(obj
+            .get("acceptedPayloadSha256")
+            .unwrap()
+            .get("$bytes")
+            .is_some());
+        assert!(obj.get("signedRequest").unwrap().get("$bytes").is_some());
+        assert!(obj.get("outerFingerprint").unwrap().get("$bytes").is_some());
+    }
+
+    #[test]
+    fn legacy_event_serialization_omits_all_five_clean_fields() {
+        let entry = ConvoEventEntry {
+            seq: 2,
+            epoch: 1,
+            msg_id: "legacy-msg-1".to_string(),
+            message_type: "app".to_string(),
+            ciphertext: vec![9, 8, 7],
+            padded_size: 3,
+            created_at: Utc.timestamp_opt(1700000000, 0).unwrap(),
+            entry_id: None,
+            entry_kind: None,
+            accepted_payload_sha256: None,
+            signed_request: None,
+            outer_fingerprint: None,
+        };
+
+        let serialized = serde_json::to_value(&entry).expect("must serialize");
+        let obj = serialized.as_object().expect("must be object");
+
+        assert_eq!(obj.get("seq"), Some(&json!(2)));
+        assert_eq!(obj.get("epoch"), Some(&json!(1)));
+        assert!(obj.get("entryId").is_none());
+        assert!(obj.get("entryKind").is_none());
+        assert!(obj.get("acceptedPayloadSha256").is_none());
+        assert!(obj.get("signedRequest").is_none());
+        assert!(obj.get("outerFingerprint").is_none());
+
+        let deserialized: ConvoEventEntry =
+            serde_json::from_value(serialized).expect("must deserialize");
+        assert_eq!(deserialized.seq, 2);
+        assert_eq!(deserialized.entry_id, None);
+        assert_eq!(deserialized.entry_kind, None);
+        assert_eq!(deserialized.accepted_payload_sha256, None);
+        assert_eq!(deserialized.signed_request, None);
+        assert_eq!(deserialized.outer_fingerprint, None);
+    }
 }
