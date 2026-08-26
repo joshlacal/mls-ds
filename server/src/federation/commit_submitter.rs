@@ -53,6 +53,8 @@ impl RemoteCommitSubmitter {
         sequencer_ds_did: &str,
         sequencer_term: u64,
         envelope: &SubmitCommit<DefaultStr>,
+        expected_entry_id: uuid::Uuid,
+        expected_seq: u64,
     ) -> Result<VerifiedSubmitCommit, FederationError> {
         let destination = self
             .resolver
@@ -117,11 +119,7 @@ impl RemoteCommitSubmitter {
         let matching_vm = did_doc
             .verification_method
             .iter()
-            .find(|vm| {
-                vm.id == super::RECEIPT_VERIFICATION_METHOD
-                    || vm.id.ends_with("#mls-receipt-1")
-                    || vm.id == format!("{}#mls-receipt-1", receipt.receiver_ds_did.as_str())
-            })
+            .find(|vm| vm.id == super::RECEIPT_VERIFICATION_METHOD)
             .ok_or_else(|| FederationError::AuthFailed {
                 reason: format!(
                     "no verification method matching {} in DID document for {}",
@@ -130,7 +128,13 @@ impl RemoteCommitSubmitter {
                 ),
             })?;
 
-        if !dids_equivalent(&matching_vm.controller, receipt.receiver_ds_did.as_str()) {
+        let method_owner = super::RECEIPT_VERIFICATION_METHOD
+            .split_once('#')
+            .map(|(did, _)| did)
+            .unwrap_or(super::RECEIPT_VERIFICATION_METHOD);
+        if !dids_equivalent(&matching_vm.controller, method_owner)
+            || !dids_equivalent(&matching_vm.controller, receipt.receiver_ds_did.as_str())
+        {
             return Err(FederationError::AuthFailed {
                 reason: format!(
                     "receipt verification method controller mismatch: expected {}, got {}",
@@ -215,12 +219,19 @@ impl RemoteCommitSubmitter {
                 ),
             });
         }
+        if receipt.sequencer_term as u64 != sequencer_term {
+            return Err(FederationError::InvalidEnvelope {
+                reason: format!(
+                    "receipt sequencerTerm mismatch: expected {sequencer_term}, got {}",
+                    receipt.sequencer_term
+                ),
+            });
+        }
         if receipt.envelope_sha256.as_ref() != envelope.header.payload_sha256.as_ref() {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt envelope_sha256 mismatch".to_string(),
             });
         }
-
         let submit_transition_response_bytes =
             result_bytes_for_receipt(SUBMIT_COMMIT_NSID, &resp.response_bytes)?;
         let result_sha256: [u8; 32] = Sha256::digest(&submit_transition_response_bytes).into();
@@ -230,17 +241,20 @@ impl RemoteCommitSubmitter {
             });
         }
 
-        if receipt.source_locator.entry_id.as_str() != output.commit_entry.entry_id.as_str() {
+        if receipt.source_locator.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
+            || output.commit_entry.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
+        {
             return Err(FederationError::InvalidEnvelope {
-                reason: "receipt source_locator entry_id mismatch with commit_entry".to_string(),
+                reason: "receipt/output entry_id mismatch with local expected entry_id".to_string(),
             });
         }
-        if receipt.source_locator.seq as i64 != output.commit_entry.seq {
+        if receipt.source_locator.seq as u64 != expected_seq
+            || output.commit_entry.seq as u64 != expected_seq
+        {
             return Err(FederationError::InvalidEnvelope {
-                reason: "receipt source_locator seq mismatch with commit_entry".to_string(),
+                reason: "receipt/output seq mismatch with local expected seq".to_string(),
             });
         }
-
         Ok(VerifiedSubmitCommit {
             output,
             submit_transition_response_bytes,

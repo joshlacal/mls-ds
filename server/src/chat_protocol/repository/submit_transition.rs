@@ -121,11 +121,7 @@ impl SubmitTransitionCanonicalResponse {
         let _: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
             match serde_json::from_slice(&bytes) {
                 Ok(o) => o,
-                Err(e) => {
-                    eprintln!(
-                        "CANONICAL RESPONSE DTO ERROR: {e:?}, bytes={}",
-                        String::from_utf8_lossy(&bytes)
-                    );
+                Err(_) => {
                     return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
                 }
             };
@@ -420,7 +416,6 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
     )?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
-
     let planned = match admitted.kind() {
         SignedMutationKind::CommitTransition => {
             hydration.plan_commit_entry(&aggregate, entry, &registration, terminal_packages)?
@@ -488,6 +483,10 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     };
     let plan = planned.into_persistence_plan()?;
     let local_response = canonical_response_from_plan(&plan, products.canonical_response_json())?;
+    if !local_response.validates() {
+        return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
+    }
+
     if let Some((true, Some(sequencer_ds), sequencer_term)) = convo_row {
         let submitter = commit_submitter.ok_or_else(|| {
             SubmitTransitionFacadeError::Federation(
@@ -516,15 +515,14 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         // ponytail: the remote call holds the conversation lock; split admission into a durable
         // pending state only if measured federation latency makes this a throughput bottleneck.
         let verified = submitter
-            .submit(&sequencer_ds, sequencer_term as u64, &envelope)
+            .submit(
+                &sequencer_ds,
+                sequencer_term as u64,
+                &envelope,
+                expected_entry_id,
+                expected_seq,
+            )
             .await?;
-
-        if verified.output.commit_entry.entry_id.as_str()
-            != expected_entry_id.hyphenated().to_string()
-            || verified.output.commit_entry.seq as u64 != expected_seq
-        {
-            return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
-        }
 
         let succ = plan
             .successor_coordinate()
