@@ -82,15 +82,83 @@ pub(crate) enum StrictCleanRemoteEventError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StrictCleanRemoteEvent {
-    pub(crate) seq: i64,
-    pub(crate) generation: i64,
-    pub(crate) entry_id: uuid::Uuid,
-    pub(crate) entry_kind: CleanEntryKind,
-    pub(crate) accepted_payload_bytes: Vec<u8>,
-    pub(crate) accepted_payload_sha256: [u8; 32],
-    pub(crate) signed_request: Vec<u8>,
-    pub(crate) outer_fingerprint: [u8; 32],
-    pub(crate) received_at: DateTime<Utc>,
+    seq: i64,
+    generation: i64,
+    entry_id: uuid::Uuid,
+    entry_kind: CleanEntryKind,
+    accepted_payload_bytes: Vec<u8>,
+    accepted_payload_sha256: [u8; 32],
+    signed_request: Vec<u8>,
+    outer_fingerprint: [u8; 32],
+    received_at: DateTime<Utc>,
+}
+
+impl StrictCleanRemoteEvent {
+    pub(crate) fn seq(&self) -> i64 {
+        self.seq
+    }
+
+    pub(crate) fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    pub(crate) fn entry_id(&self) -> uuid::Uuid {
+        self.entry_id
+    }
+
+    pub(crate) fn entry_kind(&self) -> &CleanEntryKind {
+        &self.entry_kind
+    }
+
+    pub(crate) fn entry_kind_str(&self) -> &'static str {
+        self.entry_kind.as_str()
+    }
+
+    pub(crate) fn accepted_payload_bytes(&self) -> &[u8] {
+        &self.accepted_payload_bytes
+    }
+
+    pub(crate) fn accepted_payload_sha256(&self) -> &[u8; 32] {
+        &self.accepted_payload_sha256
+    }
+
+    pub(crate) fn signed_request(&self) -> &[u8] {
+        &self.signed_request
+    }
+
+    pub(crate) fn outer_fingerprint(&self) -> &[u8; 32] {
+        &self.outer_fingerprint
+    }
+
+    pub(crate) fn received_at(&self) -> DateTime<Utc> {
+        self.received_at
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        i64,
+        i64,
+        uuid::Uuid,
+        CleanEntryKind,
+        Vec<u8>,
+        [u8; 32],
+        Vec<u8>,
+        [u8; 32],
+        DateTime<Utc>,
+    ) {
+        (
+            self.seq,
+            self.generation,
+            self.entry_id,
+            self.entry_kind,
+            self.accepted_payload_bytes,
+            self.accepted_payload_sha256,
+            self.signed_request,
+            self.outer_fingerprint,
+            self.received_at,
+        )
+    }
 }
 
 impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
@@ -101,8 +169,10 @@ impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
             .entry_id
             .ok_or(StrictCleanRemoteEventError::MissingField("entryId"))?;
         let entry_id = uuid::Uuid::parse_str(&entry_id_str)
-            .map_err(|_| StrictCleanRemoteEventError::InvalidEntryId(entry_id_str))?;
-
+            .map_err(|_| StrictCleanRemoteEventError::InvalidEntryId(entry_id_str.clone()))?;
+        if entry_id.to_string() != entry_id_str {
+            return Err(StrictCleanRemoteEventError::InvalidEntryId(entry_id_str));
+        }
         let entry_kind_str = event
             .entry_kind
             .ok_or(StrictCleanRemoteEventError::MissingField("entryKind"))?;
@@ -567,7 +637,7 @@ async fn reconcile_clean_conversation(
     let mut remote_last_epoch = 0_i64;
 
     let mut first_mismatch: Option<(i64, &'static str)> = None;
-    let mut retained_suffix_chunk: Vec<RemoteEvent> = Vec::new();
+    let mut retained_suffix_chunk: Vec<StrictCleanRemoteEvent> = Vec::new();
     let mut retained_bytes: usize = 0;
 
     let mut cursor = 0_i64;
@@ -637,76 +707,66 @@ async fn reconcile_clean_conversation(
 
         let mut expected_seq = cursor + 1;
         for event in page.events {
-            if event.seq != expected_seq {
+            let strict_event = StrictCleanRemoteEvent::try_from(event)
+                .map_err(|e| format!("clean remote event failed strict conversion: {e}"))?;
+
+            if strict_event.seq() != expected_seq {
                 return Err(format!(
                     "events page sequence discontinuity: expected {expected_seq}, got {}",
-                    event.seq
+                    strict_event.seq()
                 ));
             }
             expected_seq += 1;
 
-            let eid = if let Some(s) = &event.entry_id {
-                uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?
-            } else {
-                return Err(format!("missing entryId in clean event seq {}", event.seq));
-            };
-            let ekind = event
-                .entry_kind
-                .as_deref()
-                .ok_or_else(|| format!("missing entryKind in clean event seq {}", event.seq))?;
-            let sreq = event
-                .signed_request
-                .as_deref()
-                .ok_or_else(|| format!("missing signedRequest in clean event seq {}", event.seq))?;
-            let ofp = event.outer_fingerprint.as_deref().ok_or_else(|| {
-                format!("missing outerFingerprint in clean event seq {}", event.seq)
-            })?;
-
             remote_hasher.update_event(
-                event.seq,
-                event.epoch,
-                eid,
-                ekind,
-                &event.ciphertext,
-                sreq,
-                ofp,
-                event.created_at,
+                strict_event.seq(),
+                strict_event.generation(),
+                strict_event.entry_id(),
+                strict_event.entry_kind_str(),
+                strict_event.accepted_payload_bytes(),
+                strict_event.signed_request(),
+                strict_event.outer_fingerprint(),
+                strict_event.received_at(),
             );
             remote_scanned_count += 1;
-            remote_last_seq = event.seq;
-            remote_last_epoch = event.epoch;
+            remote_last_seq = strict_event.seq();
+            remote_last_epoch = strict_event.generation();
 
-            if event.seq <= local_snapshot.last_seq {
+            if strict_event.seq() <= local_snapshot.last_seq {
                 if first_mismatch.is_none() {
-                    let local_row = local_chunk_map.get(&event.seq);
+                    let local_row = local_chunk_map.get(&strict_event.seq());
                     let mismatch = match local_row {
                         None => true,
                         Some(lr) => {
-                            let payload_sha = Sha256::digest(&event.ciphertext);
-                            lr.seq != event.seq
-                                || lr.entry_id != eid
-                                || lr.epoch != event.epoch
-                                || lr.entry_kind != ekind
-                                || lr.accepted_payload_bytes != event.ciphertext
-                                || lr.signed_request_bytes != sreq
-                                || lr.outer_entry_fingerprint != ofp
-                                || lr.accepted_payload_sha256 != payload_sha.as_slice()
+                            lr.seq != strict_event.seq()
+                                || lr.entry_id != strict_event.entry_id()
+                                || lr.epoch != strict_event.generation()
+                                || lr.entry_kind != strict_event.entry_kind_str()
+                                || lr.accepted_payload_bytes
+                                    != strict_event.accepted_payload_bytes()
+                                || lr.signed_request_bytes != strict_event.signed_request()
+                                || lr.outer_entry_fingerprint != strict_event.outer_fingerprint()
+                                || lr.accepted_payload_sha256
+                                    != strict_event.accepted_payload_sha256().as_slice()
                                 || lr.received_at.timestamp_millis()
-                                    != event.created_at.timestamp_millis()
+                                    != strict_event.received_at().timestamp_millis()
                         }
                     };
                     if mismatch {
-                        first_mismatch = Some((event.seq, "prefix_mismatch"));
+                        first_mismatch = Some((strict_event.seq(), "prefix_mismatch"));
                     }
                 }
             } else {
                 if first_mismatch.is_none()
                     && retained_suffix_chunk.len() < EVENTS_PAGE_LIMIT as usize
                 {
-                    let event_len = event.ciphertext.len() + sreq.len() + ofp.len() + 200;
+                    let event_len = strict_event.accepted_payload_bytes().len()
+                        + strict_event.signed_request().len()
+                        + strict_event.outer_fingerprint().len()
+                        + 200;
                     if retained_bytes + event_len <= ORDINARY_DS_CONTROL_MAX_BYTES {
                         retained_bytes += event_len;
-                        retained_suffix_chunk.push(event);
+                        retained_suffix_chunk.push(strict_event);
                     }
                 }
             }
@@ -868,7 +928,7 @@ async fn reconcile_clean_conversation(
 
             apply_remote_clean_events(&mut tx, convo_uuid, &retained_suffix_chunk).await?;
 
-            let new_last_seq = retained_suffix_chunk.last().map_or(after_seq, |e| e.seq);
+            let new_last_seq = retained_suffix_chunk.last().map_or(after_seq, |e| e.seq());
             sqlx::query(
                 "UPDATE chat.conversations SET next_entry_seq = GREATEST(next_entry_seq, $2 + 1) WHERE conversation_id = $1",
             )
@@ -1142,51 +1202,32 @@ async fn apply_remote_events(
 async fn apply_remote_clean_events(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     convo_id: uuid::Uuid,
-    events: &[RemoteEvent],
+    events: &[StrictCleanRemoteEvent],
 ) -> Result<(), String> {
     let convo_id_string = convo_id.to_string();
     for event in events {
-        let entry_id_str = event
-            .entry_id
-            .as_deref()
-            .ok_or_else(|| format!("missing entryId in clean event seq {}", event.seq))?;
-        let entry_id = uuid::Uuid::parse_str(entry_id_str)
-            .map_err(|e| format!("invalid entryId in clean event seq {}: {e}", event.seq))?;
+        let entry_id = event.entry_id();
+        let entry_id_str = entry_id.to_string();
 
-        let entry_kind = event
-            .entry_kind
-            .as_deref()
-            .ok_or_else(|| format!("missing entryKind in clean event seq {}", event.seq))?;
-
-        if entry_kind != "blue.catbird.chat.defs#applicationEntry" {
+        if *event.entry_kind() != CleanEntryKind::Application {
             return Err(format!(
-                "unsupported clean event kind during reconciliation: {entry_kind}"
+                "unsupported clean event kind during reconciliation: {}",
+                event.entry_kind_str()
             ));
         }
 
-        let signed_req = event.signed_request.as_deref().ok_or_else(|| {
-            format!(
-                "missing signedRequest for application entry seq {}",
-                event.seq
-            )
-        })?;
-
-        let outer_fp = event.outer_fingerprint.as_deref().ok_or_else(|| {
-            format!(
-                "missing outerFingerprint for application entry seq {}",
-                event.seq
-            )
-        })?;
+        let signed_req = event.signed_request();
+        let outer_fp = event.outer_fingerprint();
 
         let mutation =
             crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_req)
-                .map_err(|e| format!("invalid signedRequest for seq {}: {e:?}", event.seq))?;
+                .map_err(|e| format!("invalid signedRequest for seq {}: {e:?}", event.seq()))?;
 
         let actor_did = mutation.actor_did().as_str();
         let actor_device_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
         let actor_key_id = mutation.key_id().as_str();
         let actor_auth_gen = mutation.auth_generation() as i64;
-        let payload_sha256: [u8; 32] = Sha256::digest(&event.ciphertext).into();
+        let payload_sha256 = event.accepted_payload_sha256();
 
         let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
             r#"
@@ -1203,44 +1244,41 @@ async fn apply_remote_clean_events(
         .bind(actor_key_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| format!("failed to fetch device key for seq {}: {e}", event.seq))?;
+        .map_err(|e| format!("failed to fetch device key for seq {}: {e}", event.seq()))?;
 
         let Some((actor_public_key, enrollment_auth_generation)) = key_row else {
             return Err(format!(
                 "actor device key {actor_key_id} not provisioned or revoked on destination DS for seq {}",
-                event.seq
+                event.seq()
             ));
         };
 
         if actor_auth_gen != enrollment_auth_generation {
             return Err(format!(
                 "auth_generation mismatch for seq {}: expected {enrollment_auth_generation}, got {actor_auth_gen}",
-                event.seq
+                event.seq()
             ));
         }
 
         let verified_entry = crate::chat_protocol::transcript::decode_and_verify_application_entry(
-            &event.ciphertext,
+            event.accepted_payload_bytes(),
             &actor_public_key,
         )
         .map_err(|e| {
             format!(
                 "application entry verification failed for seq {}: {e:?}",
-                event.seq
+                event.seq()
             )
         })?;
 
-        let outer_fp_32: [u8; 32] = outer_fp
-            .try_into()
-            .map_err(|_| format!("invalid outerFingerprint length for seq {}", event.seq))?;
-
+        let outer_fp_32 = *event.outer_fingerprint();
         let req_digest_32: &[u8; 32] = mutation.request_digest();
         let sig_64: &[u8; 64] = mutation.signature();
 
         let rebound_entry = crate::chat_protocol::transcript::rebind_persisted_application_entry(
             verified_entry,
-            &event.ciphertext,
-            &payload_sha256,
+            event.accepted_payload_bytes(),
+            payload_sha256,
             signed_req,
             req_digest_32,
             sig_64,
@@ -1250,7 +1288,7 @@ async fn apply_remote_clean_events(
         .map_err(|e| {
             format!(
                 "application entry rebind failed for seq {}: {e:?}",
-                event.seq
+                event.seq()
             )
         })?;
 
@@ -1259,7 +1297,7 @@ async fn apply_remote_clean_events(
             _ => {
                 return Err(format!(
                     "not an application send mutation for seq {}",
-                    event.seq
+                    event.seq()
                 ))
             }
         };
@@ -1270,16 +1308,16 @@ async fn apply_remote_clean_events(
                 "verified entry conversation_id {} does not match convo_id {} for seq {}",
                 rebound_entry.conversation_id().as_str(),
                 convo_id,
-                event.seq
+                event.seq()
             ));
         }
 
-        if rebound_entry.seq() != event.seq as u64 {
+        if rebound_entry.seq() != event.seq() as u64 {
             return Err(format!(
                 "verified entry seq {} does not match event seq {} for seq {}",
                 rebound_entry.seq(),
-                event.seq,
-                event.seq
+                event.seq(),
+                event.seq()
             ));
         }
 
@@ -1287,34 +1325,34 @@ async fn apply_remote_clean_events(
             return Err(format!(
                 "verified entry entry_id {} does not match event entry_id {entry_id_str} for seq {}",
                 rebound_entry.entry_id().as_str(),
-                event.seq
+                event.seq()
             ));
         }
 
         if rebound_entry.received_at().datetime().timestamp_millis()
-            != event.created_at.timestamp_millis()
+            != event.received_at().timestamp_millis()
         {
             return Err(format!(
                 "verified entry received_at {} does not match event created_at {} for seq {}",
                 rebound_entry.received_at().as_str(),
                 event
-                    .created_at
+                    .received_at()
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                event.seq
+                event.seq()
             ));
         }
 
         if rebound_entry.outer_application_fingerprint() != &outer_fp_32 {
             return Err(format!(
                 "verified entry outer fingerprint mismatch for seq {}",
-                event.seq
+                event.seq()
             ));
         }
 
-        if rebound_entry.accepted_payload_sha256() != &payload_sha256 {
+        if rebound_entry.accepted_payload_sha256() != payload_sha256 {
             return Err(format!(
                 "verified entry payload sha256 mismatch for seq {}",
-                event.seq
+                event.seq()
             ));
         }
 
@@ -1325,7 +1363,7 @@ async fn apply_remote_clean_events(
         let append_entry = crate::chat_protocol::repository::delivery::AppendEntry {
             conversation_id: convo_id,
             entry_id,
-            entry_kind: entry_kind.to_string(),
+            entry_kind: event.entry_kind_str().to_string(),
             accepted_payload_bytes: rebound_entry.canonical_entry_bytes().to_vec(),
             accepted_payload_sha256: rebound_entry.accepted_payload_sha256().to_vec(),
             signed_request_bytes: signed_req.to_vec(),
@@ -1339,7 +1377,7 @@ async fn apply_remote_clean_events(
             ),
             actor_key_id: rebound_entry.mutation().key_id().as_str().to_string(),
             actor_auth_generation: rebound_entry.mutation().auth_generation() as i64,
-            generation: Some(event.epoch),
+            generation: Some(event.generation()),
             state_version: None,
             transition_id: None,
             message_id: Some(message_id),
@@ -1349,16 +1387,16 @@ async fn apply_remote_clean_events(
         crate::chat_protocol::repository::delivery::append_entry_at(
             tx,
             &append_entry,
-            event.seq as u64,
+            event.seq() as u64,
         )
         .await
-        .map_err(|e| format!("failed to append entry at seq {}: {e:?}", event.seq))?;
+        .map_err(|e| format!("failed to append entry at seq {}: {e:?}", event.seq()))?;
 
         let outcome_bytes = serde_json::to_vec(&serde_json::json!({
             "entry": {
                 "entryId": rebound_entry.entry_id().as_str(),
                 "conversationId": convo_id_string.as_str(),
-                "seq": event.seq,
+                "seq": event.seq(),
                 "signedRequest": serde_json::from_slice::<serde_json::Value>(signed_req)
                     .unwrap_or(serde_json::Value::Null),
                 "receivedAt": rebound_entry.received_at().as_str()
@@ -1382,13 +1420,18 @@ async fn apply_remote_clean_events(
         .bind(mutation.transcript_bytes())
         .bind(&append_entry.request_digest)
         .bind(&append_entry.signature)
-        .bind(event.seq)
+        .bind(event.seq())
         .bind(&outcome_bytes)
         .bind(&outcome_sha256)
         .bind(rebound_entry.received_at().datetime())
         .execute(&mut **tx)
         .await
-        .map_err(|e| format!("failed to insert message_sends for seq {}: {e}", event.seq))?;
+        .map_err(|e| {
+            format!(
+                "failed to insert message_sends for seq {}: {e}",
+                event.seq()
+            )
+        })?;
     }
     Ok(())
 }
@@ -1827,17 +1870,21 @@ mod tests {
         };
 
         let strict = StrictCleanRemoteEvent::try_from(event).expect("must convert strictly");
-        assert_eq!(strict.seq, 1);
-        assert_eq!(strict.generation, 0);
+        assert_eq!(strict.seq(), 1);
+        assert_eq!(strict.generation(), 0);
         assert_eq!(
-            strict.entry_id,
+            strict.entry_id(),
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
         );
-        assert_eq!(strict.entry_kind, CleanEntryKind::Creation);
-        assert_eq!(strict.accepted_payload_bytes, ciphertext);
-        assert_eq!(strict.accepted_payload_sha256, payload_hash);
-        assert_eq!(strict.signed_request, vec![1; 64]);
-        assert_eq!(strict.outer_fingerprint, [2u8; 32]);
+        assert_eq!(*strict.entry_kind(), CleanEntryKind::Creation);
+        assert_eq!(
+            strict.entry_kind_str(),
+            "blue.catbird.chat.defs#creationEntry"
+        );
+        assert_eq!(strict.accepted_payload_bytes(), ciphertext.as_slice());
+        assert_eq!(*strict.accepted_payload_sha256(), payload_hash);
+        assert_eq!(strict.signed_request(), vec![1; 64].as_slice());
+        assert_eq!(*strict.outer_fingerprint(), [2u8; 32]);
     }
 
     #[test]
@@ -1928,6 +1975,38 @@ mod tests {
         // Invalid entry_id (not a UUID)
         let mut e = base.clone();
         e.entry_id = Some("not-a-uuid".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryId(_))
+        ));
+
+        // Non-canonical UUID: uppercase
+        let mut e = base.clone();
+        e.entry_id = Some("00000000-0000-0000-0000-00000000000a".to_uppercase());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryId(_))
+        ));
+
+        // Non-canonical UUID: simple (no hyphens)
+        let mut e = base.clone();
+        e.entry_id = Some("00000000000000000000000000000001".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryId(_))
+        ));
+
+        // Non-canonical UUID: braced
+        let mut e = base.clone();
+        e.entry_id = Some("{00000000-0000-0000-0000-000000000001}".to_string());
+        assert!(matches!(
+            StrictCleanRemoteEvent::try_from(e),
+            Err(StrictCleanRemoteEventError::InvalidEntryId(_))
+        ));
+
+        // Non-canonical UUID: URN
+        let mut e = base.clone();
+        e.entry_id = Some("urn:uuid:00000000-0000-0000-0000-000000000001".to_string());
         assert!(matches!(
             StrictCleanRemoteEvent::try_from(e),
             Err(StrictCleanRemoteEventError::InvalidEntryId(_))

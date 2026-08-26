@@ -8173,6 +8173,7 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             },
@@ -8186,6 +8187,7 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_entry_id_2.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
             }
@@ -8505,6 +8507,7 @@ async fn test_reconciliation_same_last_seq_differing_fingerprint_quarantines_wit
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             },
@@ -8518,6 +8521,7 @@ async fn test_reconciliation_same_last_seq_differing_fingerprint_quarantines_wit
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_id_2_remote.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2_remote)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2_remote)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&payload_sha256_2_remote)}
             }
@@ -8797,6 +8801,7 @@ async fn test_reconciliation_local_ahead_of_sequencer_quarantines_without_trunca
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             }
@@ -9266,6 +9271,7 @@ async fn test_reconciliation_two_event_suffix_with_second_event_malformed_rolls_
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             },
@@ -9279,6 +9285,7 @@ async fn test_reconciliation_two_event_suffix_with_second_event_malformed_rolls_
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_entry_id_2.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
             },
@@ -9292,6 +9299,7 @@ async fn test_reconciliation_two_event_suffix_with_second_event_malformed_rolls_
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_entry_id_3.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_3)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_3)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_3)}
             }
@@ -9500,6 +9508,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
         "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "entryId": local_row_1.entry_id.to_string(),
         "entryKind": local_row_1.entry_kind,
+        "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
         "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
         "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
     }));
@@ -9556,10 +9565,10 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
             "entryId": msg_entry_id.to_string(),
             "entryKind": "blue.catbird.chat.defs#applicationEntry",
+            "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256)},
             "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes)},
             "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp)}
         }));
-
         generated_suffix.push(GeneratedSuffix {
             seq: seq as i64,
             msg_entry_id,
@@ -9918,6 +9927,7 @@ async fn test_reconciliation_inconsistent_remote_digest_gives_zero_writes_and_no
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             }
@@ -10079,6 +10089,7 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
         "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         "entryId": local_row_1.entry_id.to_string(),
         "entryKind": local_row_1.entry_kind,
+        "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
         "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
         "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
     }));
@@ -10104,6 +10115,7 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
             now,
         );
 
+        let payload_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
         oversized_events.push(serde_json::json!({
             "seq": seq,
             "epoch": 0,
@@ -10114,11 +10126,11 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
             "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
             "entryId": msg_entry_id.to_string(),
             "entryKind": "blue.catbird.chat.defs#applicationEntry",
+            "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256)},
             "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes)},
             "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp)}
         }));
     }
-
     let calculated_digest_sha256 = hasher.finalize();
 
     let convo_id_str = convo_id.to_string();
@@ -10304,8 +10316,8 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
     )
     .unwrap();
     let ciphertext_3 = built_3.canonical_entry_bytes().to_vec();
+    let payload_sha256_3 = built_3.accepted_payload_sha256().to_vec();
     let outer_fp_3 = built_3.outer_application_fingerprint().to_vec();
-
     let mut hasher = catbird_server::handlers::ds::get_convo_digest::CleanConvoDigestHasher::new();
     hasher.update_row(&local_row_1);
     hasher.update_event(
@@ -10349,6 +10361,7 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             },
@@ -10362,6 +10375,7 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_entry_id_3.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_3)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_3)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_3)}
             }
@@ -10588,6 +10602,7 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
                 "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": local_row_1.entry_id.to_string(),
                 "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
                 "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
             },
@@ -10601,6 +10616,7 @@ async fn test_reconciliation_concurrent_local_head_movement_aborts_without_write
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 "entryId": msg_entry_id_2.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2)},
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
                 "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
             }
@@ -12588,4 +12604,943 @@ async fn test_local_sequencer_negative_control_remains_writable() {
     .await
     .unwrap();
     assert_eq!(entry_kind, "blue.catbird.chat.defs#commitEntry");
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow, Clone)]
+struct FullMailboxEntryRow {
+    conversation_id: Uuid,
+    seq: i64,
+    generation: Option<i64>,
+    entry_id: Uuid,
+    entry_kind: String,
+    accepted_payload_bytes: Vec<u8>,
+    accepted_payload_sha256: Vec<u8>,
+    signed_request_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+    outer_entry_fingerprint: Vec<u8>,
+    actor_did: String,
+    actor_device_id: Uuid,
+    actor_key_id: String,
+    actor_auth_generation: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow, Clone)]
+struct FullMailboxConversationRow {
+    conversation_id: Uuid,
+    kind: String,
+    lifecycle: String,
+    current_generation: i64,
+    current_state_version: i64,
+    next_entry_seq: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow, Clone)]
+struct FullMailboxMessageSendRow {
+    conversation_id: Uuid,
+    message_id: Uuid,
+    signed_request_bytes: Vec<u8>,
+    request_digest: Vec<u8>,
+    signature: Vec<u8>,
+    status: String,
+    accepted_entry_seq: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow, Clone)]
+struct FullMailboxEventRow {
+    event_position: i64,
+    event_id: Uuid,
+    event_kind: String,
+    payload_bytes: Vec<u8>,
+    payload_sha256: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow, Clone)]
+struct FullMailboxSyncStateRow {
+    convo_id: String,
+    sequencer_ds_did: String,
+    sequencer_term: i64,
+    last_seq: i64,
+    last_epoch: i64,
+    last_digest: Vec<u8>,
+    status: String,
+    quarantine_reason: Option<String>,
+    first_mismatch_seq: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct FullMailboxSnapshot {
+    entries: Vec<FullMailboxEntryRow>,
+    conversations: Vec<FullMailboxConversationRow>,
+    message_sends: Vec<FullMailboxMessageSendRow>,
+    events: Vec<FullMailboxEventRow>,
+    sync_states: Vec<FullMailboxSyncStateRow>,
+}
+
+async fn capture_full_mailbox_snapshot(pool: &DbPool, convo_id: Uuid) -> FullMailboxSnapshot {
+    let entries = sqlx::query_as::<_, FullMailboxEntryRow>(
+        "SELECT conversation_id, CAST(seq AS BIGINT) AS seq, CAST(generation AS BIGINT) AS generation, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, request_digest, signature, outer_entry_fingerprint, \
+                actor_did, actor_device_id, actor_key_id, CAST(actor_auth_generation AS BIGINT) AS actor_auth_generation \
+         FROM chat.entries WHERE conversation_id = $1 ORDER BY seq ASC",
+    )
+    .bind(convo_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let conversations = sqlx::query_as::<_, FullMailboxConversationRow>(
+        "SELECT conversation_id, kind, lifecycle, \
+                CAST(current_generation AS BIGINT) AS current_generation, \
+                CAST(current_state_version AS BIGINT) AS current_state_version, \
+                CAST(next_entry_seq AS BIGINT) AS next_entry_seq \
+         FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(convo_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let message_sends = sqlx::query_as::<_, FullMailboxMessageSendRow>(
+        "SELECT conversation_id, message_id, signed_request_bytes, \
+                request_digest, signature, status, CAST(accepted_entry_seq AS BIGINT) AS accepted_entry_seq \
+         FROM chat.message_sends WHERE conversation_id = $1 ORDER BY message_id ASC",
+    )
+    .bind(convo_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let events = sqlx::query_as::<_, FullMailboxEventRow>(
+        "SELECT CAST(event_position AS BIGINT) AS event_position, event_id, event_kind, \
+                payload_bytes, payload_sha256 \
+         FROM chat.events ORDER BY event_position ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let convo_id_str = convo_id.to_string();
+    let sync_states = sqlx::query_as::<_, FullMailboxSyncStateRow>(
+        "SELECT convo_id, sequencer_ds_did, CAST(sequencer_term AS BIGINT) AS sequencer_term, \
+                CAST(last_seq AS BIGINT) AS last_seq, CAST(last_epoch AS BIGINT) AS last_epoch, \
+                last_digest, status, quarantine_reason, CAST(first_mismatch_seq AS BIGINT) AS first_mismatch_seq \
+         FROM federation_sync_state WHERE convo_id = $1",
+    )
+    .bind(&convo_id_str)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    FullMailboxSnapshot {
+        entries,
+        conversations,
+        message_sends,
+        events,
+        sync_states,
+    }
+}
+
+#[tokio::test]
+async fn test_reconciliation_missing_accepted_payload_sha256_suffix_fails_before_clean_import_or_comparison_write(
+) {
+    let harness = TestHarness::new("recon-missing-hash").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let msg_id_2 = Uuid::new_v4();
+    let msg_entry_id_2 = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2) =
+        make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
+    let mutation_2 =
+        decode_and_verify_signed_mutation(&signed_req_bytes_2, &alice.public_key).unwrap();
+    let received_at_2 = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let built_2 = build_verified_application_entry(
+        mutation_2,
+        CanonicalUuidV4::parse(&msg_entry_id_2.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at_2,
+    )
+    .unwrap();
+    let ciphertext_2 = built_2.canonical_entry_bytes().to_vec();
+    let outer_fp_2 = built_2.outer_application_fingerprint().to_vec();
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let pre_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+
+    let remote_row_2 = CleanDigestRow {
+        seq: 2,
+        epoch: 0,
+        entry_id: msg_entry_id_2,
+        entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+        accepted_payload_bytes: ciphertext_2.clone(),
+        accepted_payload_sha256: built_2.accepted_payload_sha256().to_vec(),
+        signed_request_bytes: signed_req_bytes_2.clone(),
+        outer_entry_fingerprint: outer_fp_2.clone(),
+        received_at: now,
+    };
+
+    let remote_rows = vec![local_row_1.clone(), remote_row_2];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 2,
+        event_count: 2,
+        digest_sha256: remote_digest_sha256.clone(),
+        generated_at: now,
+    };
+
+    // Event 2 is MISSING acceptedPayloadSha256
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 2,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            },
+            {
+                "seq": 2,
+                "epoch": 0,
+                "msgId": msg_id_2.to_string(),
+                "messageType": "blue.catbird.chat.defs#applicationEntry",
+                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
+                "paddedSize": ciphertext_2.len() as i64,
+                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": msg_entry_id_2.to_string(),
+                "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail when remote event is missing acceptedPayloadSha256"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("acceptedPayloadSha256"),
+        "error must cite missing acceptedPayloadSha256, got: {err}"
+    );
+
+    let post_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+    assert_eq!(
+        pre_snapshot, post_snapshot,
+        "full mailbox rows must be byte-for-byte unchanged after rejection"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_mismatched_accepted_payload_sha256_suffix_fails_before_clean_import_or_comparison_write(
+) {
+    let harness = TestHarness::new("recon-mismatched-hash").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let msg_id_2 = Uuid::new_v4();
+    let msg_entry_id_2 = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2) =
+        make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
+    let mutation_2 =
+        decode_and_verify_signed_mutation(&signed_req_bytes_2, &alice.public_key).unwrap();
+    let received_at_2 = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let built_2 = build_verified_application_entry(
+        mutation_2,
+        CanonicalUuidV4::parse(&msg_entry_id_2.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at_2,
+    )
+    .unwrap();
+    let ciphertext_2 = built_2.canonical_entry_bytes().to_vec();
+    let outer_fp_2 = built_2.outer_application_fingerprint().to_vec();
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let pre_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+
+    let remote_row_2 = CleanDigestRow {
+        seq: 2,
+        epoch: 0,
+        entry_id: msg_entry_id_2,
+        entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+        accepted_payload_bytes: ciphertext_2.clone(),
+        accepted_payload_sha256: built_2.accepted_payload_sha256().to_vec(),
+        signed_request_bytes: signed_req_bytes_2.clone(),
+        outer_entry_fingerprint: outer_fp_2.clone(),
+        received_at: now,
+    };
+
+    let remote_rows = vec![local_row_1.clone(), remote_row_2];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 2,
+        event_count: 2,
+        digest_sha256: remote_digest_sha256.clone(),
+        generated_at: now,
+    };
+
+    // Event 2 has a MISMATCHED acceptedPayloadSha256
+    let forged_hash = vec![0xeeu8; 32];
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 2,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            },
+            {
+                "seq": 2,
+                "epoch": 0,
+                "msgId": msg_id_2.to_string(),
+                "messageType": "blue.catbird.chat.defs#applicationEntry",
+                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
+                "paddedSize": ciphertext_2.len() as i64,
+                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": msg_entry_id_2.to_string(),
+                "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&forged_hash)},
+                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail when remote event has mismatched acceptedPayloadSha256"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("accepted payload hash mismatch"),
+        "error must cite accepted payload hash mismatch, got: {err}"
+    );
+
+    let post_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+    assert_eq!(
+        pre_snapshot, post_snapshot,
+        "full mailbox rows must be byte-for-byte unchanged after rejection"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_missing_accepted_payload_sha256_overlap_fails_before_comparison_write()
+{
+    let harness = TestHarness::new("recon-missing-hash-ovl").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let pre_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+
+    let remote_rows = vec![local_row_1.clone()];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 1,
+        event_count: 1,
+        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        generated_at: now,
+    };
+
+    // Overlap event 1 is MISSING acceptedPayloadSha256
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 1,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail when overlap event is missing acceptedPayloadSha256"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("acceptedPayloadSha256"),
+        "error must cite missing acceptedPayloadSha256, got: {err}"
+    );
+
+    let post_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+    assert_eq!(
+        pre_snapshot, post_snapshot,
+        "full mailbox rows must be byte-for-byte unchanged after rejection"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_mismatched_accepted_payload_sha256_overlap_fails_before_comparison_write(
+) {
+    let harness = TestHarness::new("recon-mismatched-hash-ovl").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let pre_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 1,
+        event_count: 1,
+        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+        generated_at: now,
+    };
+
+    // Overlap event 1 has a MISMATCHED acceptedPayloadSha256
+    let forged_hash = vec![0xeeu8; 32];
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 1,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&forged_hash)},
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_err(),
+        "reconciliation must fail when overlap event has mismatched acceptedPayloadSha256"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("accepted payload hash mismatch"),
+        "error must cite accepted payload hash mismatch, got: {err}"
+    );
+
+    let post_snapshot = capture_full_mailbox_snapshot(&harness.pool, convo_id).await;
+    assert_eq!(
+        pre_snapshot, post_snapshot,
+        "full mailbox rows must be byte-for-byte unchanged after rejection"
+    );
 }

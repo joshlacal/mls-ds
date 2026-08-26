@@ -2636,6 +2636,10 @@ impl CleanEntryKind {
         }
     }
 
+    pub(crate) const fn as_str(self) -> &'static str {
+        self.type_id()
+    }
+
     pub(crate) fn from_type_id(value: &str) -> Option<Self> {
         if value == APPLICATION_ENTRY_TYPE_ID {
             Some(Self::Application)
