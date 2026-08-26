@@ -60,7 +60,7 @@ struct RemoteConvoEvents {
     events: Vec<RemoteEvent>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteEvent {
     pub seq: i64,
@@ -404,15 +404,10 @@ async fn reconcile_clean_conversation(
             ));
         }
 
-        let is_quarantined: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id = $1 AND status = 'quarantined')",
-        )
-        .bind(&convo_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        if is_quarantined {
+        if crate::chat_protocol::repository::core::is_conversation_quarantined(&mut tx, convo_uuid)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             return Err(format!("conversation {convo_id} is quarantined"));
         }
 
@@ -535,7 +530,7 @@ async fn reconcile_clean_conversation(
         };
 
         let mut expected_seq = cursor + 1;
-        for event in &page.events {
+        for event in page.events {
             if event.seq != expected_seq {
                 return Err(format!(
                     "events page sequence discontinuity: expected {expected_seq}, got {}",
@@ -605,13 +600,13 @@ async fn reconcile_clean_conversation(
                     let event_len = event.ciphertext.len() + sreq.len() + ofp.len() + 200;
                     if retained_bytes + event_len <= ORDINARY_DS_CONTROL_MAX_BYTES {
                         retained_bytes += event_len;
-                        retained_suffix_chunk.push(event.clone());
+                        retained_suffix_chunk.push(event);
                     }
                 }
             }
         }
 
-        if page.events.last().unwrap().seq != page.to_seq_inclusive {
+        if expected_seq - 1 != page.to_seq_inclusive {
             return Err(format!(
                 "events page last seq mismatch with to_seq_inclusive"
             ));
@@ -745,15 +740,12 @@ async fn reconcile_clean_conversation(
                 ));
             }
 
-            let is_quarantined: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id = $1 AND status = 'quarantined')",
+            if crate::chat_protocol::repository::core::is_conversation_quarantined(
+                &mut tx, convo_uuid,
             )
-            .bind(&convo_id)
-            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| e.to_string())?;
-
-            if is_quarantined {
+            .map_err(|e| e.to_string())?
+            {
                 return Err(format!("conversation {convo_id} is quarantined"));
             }
 
@@ -1046,6 +1038,7 @@ async fn apply_remote_clean_events(
     convo_id: uuid::Uuid,
     events: &[RemoteEvent],
 ) -> Result<(), String> {
+    let convo_id_string = convo_id.to_string();
     for event in events {
         let entry_id_str = event
             .entry_id
@@ -1083,13 +1076,10 @@ async fn apply_remote_clean_events(
             crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_req)
                 .map_err(|e| format!("invalid signedRequest for seq {}: {e:?}", event.seq))?;
 
-        let actor_did = mutation.actor_did().as_str().to_string();
+        let actor_did = mutation.actor_did().as_str();
         let actor_device_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
-        let actor_key_id = mutation.key_id().as_str().to_string();
+        let actor_key_id = mutation.key_id().as_str();
         let actor_auth_gen = mutation.auth_generation() as i64;
-        let req_digest = mutation.request_digest().to_vec();
-        let signature = mutation.signature().to_vec();
-        let transcript_bytes = mutation.transcript_bytes().to_vec();
         let payload_sha256: [u8; 32] = Sha256::digest(&event.ciphertext).into();
 
         let key_row: Option<(Vec<u8>, i64)> = sqlx::query_as(
@@ -1102,9 +1092,9 @@ async fn apply_remote_clean_events(
              FOR UPDATE
             "#,
         )
-        .bind(&actor_did)
+        .bind(actor_did)
         .bind(actor_device_id)
-        .bind(&actor_key_id)
+        .bind(actor_key_id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|e| format!("failed to fetch device key for seq {}: {e}", event.seq))?;
@@ -1169,7 +1159,7 @@ async fn apply_remote_clean_events(
         };
         let message_id = uuid::Uuid::from_bytes(*projection.message_id().as_bytes());
 
-        if rebound_entry.conversation_id().as_str() != convo_id.to_string() {
+        if rebound_entry.conversation_id().as_str() != convo_id_string {
             return Err(format!(
                 "verified entry conversation_id {} does not match convo_id {} for seq {}",
                 rebound_entry.conversation_id().as_str(),
@@ -1261,7 +1251,7 @@ async fn apply_remote_clean_events(
         let outcome_bytes = serde_json::to_vec(&serde_json::json!({
             "entry": {
                 "entryId": rebound_entry.entry_id().as_str(),
-                "conversationId": convo_id.to_string(),
+                "conversationId": convo_id_string.as_str(),
                 "seq": event.seq,
                 "signedRequest": serde_json::from_slice::<serde_json::Value>(signed_req)
                     .unwrap_or(serde_json::Value::Null),
@@ -1283,7 +1273,7 @@ async fn apply_remote_clean_events(
         .bind(convo_id)
         .bind(message_id)
         .bind(signed_req)
-        .bind(&transcript_bytes)
+        .bind(mutation.transcript_bytes())
         .bind(&append_entry.request_digest)
         .bind(&append_entry.signature)
         .bind(event.seq)

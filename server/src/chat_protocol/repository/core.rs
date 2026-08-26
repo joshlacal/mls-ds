@@ -10336,16 +10336,11 @@ pub(crate) fn certify_no_terminal_proofs(
     Ok(Vec::new())
 }
 
-/// Hydrate, validate, and seal one active or terminal conversation graph under
-/// the caller's transaction-local conversation-row lock.
-///
-/// The returned guard remains valid only while `transaction` remains open. This
-/// function never begins, commits, or rolls back a transaction.
 pub(crate) async fn is_conversation_quarantined(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
-    let quarantined: bool = sqlx::query_scalar(
+    sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM federation_sync_state
             WHERE convo_id = $1 AND status = 'quarantined'
@@ -10353,9 +10348,14 @@ pub(crate) async fn is_conversation_quarantined(
     )
     .bind(conversation_id.to_string())
     .fetch_one(&mut **transaction)
-    .await?;
-    Ok(quarantined)
+    .await
 }
+
+/// Hydrate, validate, and seal one active or terminal conversation graph under
+/// the caller's transaction-local conversation-row lock.
+///
+/// The returned guard remains valid only while `transaction` remains open. This
+/// function never begins, commits, or rolls back a transaction.
 
 #[allow(dead_code)]
 pub(crate) async fn hydrate_locked_conversation_state(
