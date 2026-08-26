@@ -3156,6 +3156,7 @@ async fn assert_applied_suffix_entry_and_message_send_exact_fields(
     expected_transcript_bytes: &[u8],
     expected_request_digest: &[u8],
     expected_signature: &[u8],
+    expected_received_at: DateTime<Utc>,
 ) {
     let row = sqlx::query(
         r#"
@@ -3191,7 +3192,11 @@ async fn assert_applied_suffix_entry_and_message_send_exact_fields(
     let generation: i64 = row.get("generation");
     let message_id: Uuid = row.get("message_id");
     let received_at: DateTime<Utc> = row.get("received_at");
-
+    assert_eq!(
+        received_at.timestamp_millis(),
+        expected_received_at.timestamp_millis(),
+        "received_at timestamp mismatch at seq {expected_seq}"
+    );
     assert_eq!(seq, expected_seq, "seq mismatch at seq {expected_seq}");
     assert_eq!(epoch, 0, "epoch mismatch at seq {expected_seq}");
     assert_eq!(
@@ -3260,7 +3265,7 @@ async fn assert_applied_suffix_entry_and_message_send_exact_fields(
             "conversationId": convo_id.to_string(),
             "seq": expected_seq,
             "signedRequest": serde_json::from_slice::<serde_json::Value>(expected_signed_req_bytes).unwrap_or(serde_json::Value::Null),
-            "receivedAt": received_at.to_rfc3339_opts(SecondsFormat::Millis, true)
+            "receivedAt": expected_received_at.to_rfc3339_opts(SecondsFormat::Millis, true)
         }
     }))
     .unwrap();
@@ -8301,6 +8306,7 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
         built_2.mutation().transcript_bytes(),
         built_2.mutation().request_digest().as_slice(),
         built_2.mutation().signature().as_slice(),
+        now,
     )
     .await;
     let sync_state: (String, i64, Option<String>) = sqlx::query_as(
@@ -9797,15 +9803,20 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
 
     // Verify exact authenticated pagination sequence
     let reqs = pagination_requests.lock().await.clone();
-    assert!(
-        reqs.len() >= 4,
-        "must have made at least 4 pagination requests"
+    assert_eq!(
+        reqs,
+        vec![
+            (0, 500),
+            (130, 500),
+            (260, 500),
+            (390, 500),
+            (0, 500),
+            (130, 500),
+            (260, 500),
+            (390, 500)
+        ],
+        "pagination requests must match exact two-pass chunked sequence"
     );
-    assert_eq!(reqs[0], (0, 500));
-    assert_eq!(reqs[1], (130, 500));
-    assert_eq!(reqs[2], (260, 500));
-    assert_eq!(reqs[3], (390, 500));
-
     let final_next_seq: i64 = sqlx::query_scalar(
         "SELECT next_entry_seq FROM chat.conversations WHERE conversation_id = $1",
     )
@@ -9839,6 +9850,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             &item.transcript_bytes,
             &item.request_digest,
             &item.signature,
+            now,
         )
         .await;
     }
@@ -10071,26 +10083,26 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
         "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
     }));
 
+    let mut hasher = catbird_server::handlers::ds::get_convo_digest::CleanConvoDigestHasher::new();
+    hasher.update_row(&local_row_1);
+
     for seq in 2..=501 {
         let msg_id = Uuid::new_v4();
         let msg_entry_id = Uuid::new_v4();
-        let (_, signed_req_bytes) =
-            make_message_body(convo_id, msg_id, &alice, &group_id, vec![], now);
-        let mutation =
-            decode_and_verify_signed_mutation(&signed_req_bytes, &alice.public_key).unwrap();
-        let received_at = TrustedRequestInstant::from_canonical_for_test(
-            CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+        let ciphertext = vec![0x31u8; 8];
+        let signed_req_bytes = vec![0x32u8; 8];
+        let outer_fp = vec![0x33u8; 32];
+
+        hasher.update_event(
+            seq,
+            0,
+            msg_entry_id,
+            "blue.catbird.chat.defs#applicationEntry",
+            &ciphertext,
+            &signed_req_bytes,
+            &outer_fp,
+            now,
         );
-        let built = build_verified_application_entry(
-            mutation,
-            CanonicalUuidV4::parse(&msg_entry_id.to_string()).unwrap(),
-            CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
-            seq as u64,
-            &received_at,
-        )
-        .unwrap();
-        let ciphertext = built.canonical_entry_bytes().to_vec();
-        let outer_fp = built.outer_application_fingerprint().to_vec();
 
         oversized_events.push(serde_json::json!({
             "seq": seq,
@@ -10107,6 +10119,8 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
         }));
     }
 
+    let calculated_digest_sha256 = hasher.finalize();
+
     let convo_id_str = convo_id.to_string();
     let seq_did_clone = harness.sequencer_ds_did.clone();
     let digest_output = GetConvoDigestOutput {
@@ -10116,8 +10130,7 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
         epoch: 0,
         last_seq: 501,
         event_count: 501,
-        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-            .to_string(),
+        digest_sha256: calculated_digest_sha256,
         generated_at: now,
     };
 
@@ -10216,9 +10229,10 @@ async fn test_reconciliation_oversized_peer_page_gives_zero_writes_and_no_quaran
     )
     .await;
 
+    let err = res.expect_err("reconciliation must fail on oversized peer page (>500 limit)");
     assert!(
-        res.is_err(),
-        "reconciliation must fail on oversized peer page (>500 limit)"
+        err.contains("events page exceeded requested limit: got 501, max 500"),
+        "expected page limit error, got: {err}"
     );
 
     let sync_state: Option<(String,)> =
@@ -10292,6 +10306,20 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
     let ciphertext_3 = built_3.canonical_entry_bytes().to_vec();
     let outer_fp_3 = built_3.outer_application_fingerprint().to_vec();
 
+    let mut hasher = catbird_server::handlers::ds::get_convo_digest::CleanConvoDigestHasher::new();
+    hasher.update_row(&local_row_1);
+    hasher.update_event(
+        3,
+        0,
+        msg_entry_id_3,
+        "blue.catbird.chat.defs#applicationEntry",
+        &ciphertext_3,
+        &signed_req_bytes_3,
+        &outer_fp_3,
+        now,
+    );
+    let calculated_digest_sha256 = hasher.finalize();
+
     let convo_id_str = convo_id.to_string();
     let seq_did_clone = harness.sequencer_ds_did.clone();
     let digest_output = GetConvoDigestOutput {
@@ -10301,8 +10329,7 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
         epoch: 0,
         last_seq: 3,
         event_count: 2,
-        digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
-            .to_string(),
+        digest_sha256: calculated_digest_sha256,
         generated_at: now,
     };
 
@@ -10429,11 +10456,11 @@ async fn test_reconciliation_discontinuous_or_out_of_order_peer_page_gives_zero_
     )
     .await;
 
+    let err = res.expect_err("reconciliation must fail on discontinuous peer page");
     assert!(
-        res.is_err(),
-        "reconciliation must fail on discontinuous peer page"
+        err.contains("events page sequence discontinuity: expected 2, got 3"),
+        "expected sequence discontinuity error, got: {err}"
     );
-
     let sync_state: Option<(String,)> =
         sqlx::query_as("SELECT status FROM federation_sync_state WHERE convo_id = $1")
             .bind(&convo_id_str)
