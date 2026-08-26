@@ -102,7 +102,7 @@ pub async fn get_convo_events(
         let from_seq = query.after_seq.unwrap_or(0).max(0);
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-        let (events, to_seq_inclusive) = if state.is_clean {
+        let events = if state.is_clean {
             let convo_uuid = uuid::Uuid::parse_str(&query.convo_id).map_err(|_| {
                 FederationError::ConversationNotFound {
                     convo_id: query.convo_id.clone(),
@@ -157,8 +157,7 @@ pub async fn get_convo_events(
                     }
                 })
                 .collect();
-            let to_seq = events.last().map(|e| e.seq).unwrap_or(from_seq);
-            (events, to_seq)
+            events
         } else {
             let rows: Vec<LegacyEventRow> = sqlx::query_as::<_, LegacyEventRow>(
                 "SELECT \
@@ -198,9 +197,9 @@ pub async fn get_convo_events(
                     outer_fingerprint: None,
                 })
                 .collect();
-            let to_seq = events.last().map(|e| e.seq).unwrap_or(from_seq);
-            (events, to_seq)
+            events
         };
+        let to_seq_inclusive = events.last().map(|event| event.seq).unwrap_or(from_seq);
         Ok(Json(GetConvoEventsOutput {
             convo_id: state.convo_id,
             from_seq_exclusive: from_seq,
@@ -251,15 +250,17 @@ mod tests {
             Some(&json!("blue.catbird.chat.defs#creationEntry"))
         );
 
-        // ATProto byte objects
-        assert!(obj.get("ciphertext").unwrap().get("$bytes").is_some());
-        assert!(obj
-            .get("acceptedPayloadSha256")
-            .unwrap()
-            .get("$bytes")
-            .is_some());
-        assert!(obj.get("signedRequest").unwrap().get("$bytes").is_some());
-        assert!(obj.get("outerFingerprint").unwrap().get("$bytes").is_some());
+        for field in [
+            "ciphertext",
+            "acceptedPayloadSha256",
+            "signedRequest",
+            "outerFingerprint",
+        ] {
+            assert!(
+                obj[field].get("$bytes").is_some(),
+                "{field} must use an ATProto byte object"
+            );
+        }
     }
 
     #[test]
@@ -284,19 +285,28 @@ mod tests {
 
         assert_eq!(obj.get("seq"), Some(&json!(2)));
         assert_eq!(obj.get("epoch"), Some(&json!(1)));
-        assert!(obj.get("entryId").is_none());
-        assert!(obj.get("entryKind").is_none());
-        assert!(obj.get("acceptedPayloadSha256").is_none());
-        assert!(obj.get("signedRequest").is_none());
-        assert!(obj.get("outerFingerprint").is_none());
+        for field in [
+            "entryId",
+            "entryKind",
+            "acceptedPayloadSha256",
+            "signedRequest",
+            "outerFingerprint",
+        ] {
+            assert!(obj.get(field).is_none(), "{field} must be omitted");
+        }
 
         let deserialized: ConvoEventEntry =
             serde_json::from_value(serialized).expect("must deserialize");
         assert_eq!(deserialized.seq, 2);
-        assert_eq!(deserialized.entry_id, None);
-        assert_eq!(deserialized.entry_kind, None);
-        assert_eq!(deserialized.accepted_payload_sha256, None);
-        assert_eq!(deserialized.signed_request, None);
-        assert_eq!(deserialized.outer_fingerprint, None);
+        assert_eq!(
+            (
+                deserialized.entry_id,
+                deserialized.entry_kind,
+                deserialized.accepted_payload_sha256,
+                deserialized.signed_request,
+                deserialized.outer_fingerprint,
+            ),
+            (None, None, None, None, None)
+        );
     }
 }

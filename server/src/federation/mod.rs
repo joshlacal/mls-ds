@@ -269,7 +269,9 @@ mod tests {
     fn canonical_prefix_bootstrap_capability_reported_only_when_configured() {
         let default_caps = local_federation_capabilities();
         assert!(
-            !default_caps.contains(&CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1.to_string()),
+            !default_caps
+                .iter()
+                .any(|cap| cap == CAPABILITY_CANONICAL_PREFIX_BOOTSTRAP_V1),
             "default capabilities must stay conservative and exclude prefix bootstrap"
         );
 

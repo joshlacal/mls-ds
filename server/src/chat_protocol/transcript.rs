@@ -2636,34 +2636,11 @@ impl CleanEntryKind {
         }
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
-        self.type_id()
-    }
-
     pub(crate) fn from_type_id(value: &str) -> Option<Self> {
         if value == APPLICATION_ENTRY_TYPE_ID {
             Some(Self::Application)
         } else {
             ControlEntryKind::from_type_id(value).map(Self::from_control_kind)
-        }
-    }
-
-    pub(crate) fn as_control_kind(self) -> Option<ControlEntryKind> {
-        match self {
-            Self::Application => None,
-            Self::Commit => Some(ControlEntryKind::Commit),
-            Self::Policy => Some(ControlEntryKind::Policy),
-            Self::Metadata => Some(ControlEntryKind::Metadata),
-            Self::Creation => Some(ControlEntryKind::Creation),
-            Self::ParticipantAcceptance => Some(ControlEntryKind::ParticipantAcceptance),
-            Self::ConversationClose => Some(ControlEntryKind::ConversationClose),
-            Self::ResetRequest => Some(ControlEntryKind::ResetRequest),
-            Self::ResetActivation => Some(ControlEntryKind::ResetActivation),
-            Self::LeafRecoveryFulfillment => Some(ControlEntryKind::LeafRecoveryFulfillment),
-            Self::LeaveRequest => Some(ControlEntryKind::LeaveRequest),
-            Self::ZeroLeafLeave => Some(ControlEntryKind::ZeroLeafLeave),
-            Self::LeaveCancellation => Some(ControlEntryKind::LeaveCancellation),
-            Self::LeaveCommitFulfillment => Some(ControlEntryKind::LeaveCommitFulfillment),
         }
     }
 
@@ -3729,14 +3706,16 @@ mod tests {
             let type_id = kind.type_id();
             assert!(type_id.starts_with("blue.catbird.chat.defs#"));
             assert_eq!(CleanEntryKind::from_type_id(type_id), Some(kind));
-
-            if let Some(control) = kind.as_control_kind() {
-                assert_eq!(CleanEntryKind::from_control_kind(control), kind);
-                assert_eq!(control.type_id(), type_id);
-            } else {
-                assert_eq!(kind, CleanEntryKind::Application);
-                assert_eq!(type_id, APPLICATION_ENTRY_TYPE_ID);
-            }
+        }
+        assert_eq!(
+            CleanEntryKind::Application.type_id(),
+            APPLICATION_ENTRY_TYPE_ID
+        );
+        for control in ControlEntryKind::ALL {
+            assert_eq!(
+                CleanEntryKind::from_control_kind(control).type_id(),
+                control.type_id()
+            );
         }
 
         assert_eq!(CleanEntryKind::from_type_id("invalid"), None);
