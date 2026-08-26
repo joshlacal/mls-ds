@@ -38,13 +38,25 @@ CREATE INDEX IF NOT EXISTS idx_outbound_queue_lease
 
 -- 3. Extend federation_sync_state with sticky quarantine fields
 ALTER TABLE federation_sync_state
-    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'healthy'
-        CHECK (status IN ('healthy', 'quarantined')),
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'healthy',
     ADD COLUMN IF NOT EXISTS quarantined_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS quarantine_reason TEXT
-        CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('prefix_mismatch', 'local_ahead')),
-    ADD COLUMN IF NOT EXISTS first_mismatch_seq BIGINT
-        CHECK (first_mismatch_seq IS NULL OR first_mismatch_seq > 0);
+    ADD COLUMN IF NOT EXISTS quarantine_reason TEXT,
+    ADD COLUMN IF NOT EXISTS first_mismatch_seq BIGINT;
+
+ALTER TABLE federation_sync_state DROP CONSTRAINT IF EXISTS federation_sync_state_status_check;
+ALTER TABLE federation_sync_state
+    ADD CONSTRAINT federation_sync_state_status_check
+    CHECK (status IN ('healthy', 'quarantined'));
+
+ALTER TABLE federation_sync_state DROP CONSTRAINT IF EXISTS federation_sync_state_quarantine_reason_check;
+ALTER TABLE federation_sync_state
+    ADD CONSTRAINT federation_sync_state_quarantine_reason_check
+    CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('prefix_mismatch', 'local_ahead'));
+
+ALTER TABLE federation_sync_state DROP CONSTRAINT IF EXISTS federation_sync_state_first_mismatch_seq_check;
+ALTER TABLE federation_sync_state
+    ADD CONSTRAINT federation_sync_state_first_mismatch_seq_check
+    CHECK (first_mismatch_seq IS NULL OR first_mismatch_seq > 0);
 
 ALTER TABLE federation_sync_state DROP CONSTRAINT IF EXISTS federation_sync_state_quarantine_shape_check;
 ALTER TABLE federation_sync_state

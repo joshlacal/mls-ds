@@ -49,7 +49,7 @@ pub(crate) struct LegacyDigestRow {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Clone, Debug, FromRow)]
 pub struct CleanDigestRow {
     pub seq: i64,
     pub epoch: i64,

@@ -8408,7 +8408,9 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
             "auth_jti_nonce_pkey|p".to_owned(),
             "federation_outbox_pkey|p".to_owned(),
             "federation_outbox_status_check|c".to_owned(),
+            "federation_sync_state_first_mismatch_seq_check|c".to_owned(),
             "federation_sync_state_pkey|p".to_owned(),
+            "federation_sync_state_quarantine_reason_check|c".to_owned(),
             "federation_sync_state_quarantine_shape_check|c".to_owned(),
             "federation_sync_state_status_check|c".to_owned(),
             "outbound_queue_pkey|p".to_owned(),
@@ -10125,7 +10127,15 @@ async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
         &[
             (
                 "quarantine status check",
-                compact_sql.contains("CHECK (status IN ('healthy', 'quarantined'))"),
+                compact_sql.contains("CONSTRAINT federation_sync_state_status_check CHECK (status IN ('healthy', 'quarantined'))"),
+            ),
+            (
+                "quarantine reason check",
+                compact_sql.contains("CONSTRAINT federation_sync_state_quarantine_reason_check CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('prefix_mismatch', 'local_ahead'))"),
+            ),
+            (
+                "quarantine first mismatch seq check",
+                compact_sql.contains("CONSTRAINT federation_sync_state_first_mismatch_seq_check CHECK (first_mismatch_seq IS NULL OR first_mismatch_seq > 0)"),
             ),
             (
                 "quarantine shape check",
@@ -10133,6 +10143,41 @@ async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
             ),
         ],
     );
+
+    // Fresh database quarantine schema and constraint enforcement proof
+    let fresh_db = crate::common::fresh_db::fresh_fully_migrated_db("chat_fedoutbox_").await;
+    let fresh_pool = fresh_db.connect(2).await;
+    let mut fresh_conn = fresh_pool
+        .acquire()
+        .await
+        .expect("acquire fresh connection");
+
+    let fresh_constraints: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT conname
+          FROM pg_constraint
+         WHERE conrelid = 'public.federation_sync_state'::regclass
+         ORDER BY conname
+        "#,
+    )
+    .fetch_all(&mut *fresh_conn)
+    .await
+    .expect("query constraints on fresh DB");
+
+    assert_eq!(
+        fresh_constraints,
+        vec![
+            "federation_sync_state_first_mismatch_seq_check",
+            "federation_sync_state_pkey",
+            "federation_sync_state_quarantine_reason_check",
+            "federation_sync_state_quarantine_shape_check",
+            "federation_sync_state_status_check",
+        ],
+        "fresh schema federation_sync_state constraints must exactly match"
+    );
+
+    fresh_conn.close().await.expect("close fresh conn");
+    fresh_pool.close().await;
 
     connection.close().await.expect("close connection");
     pool.close().await;

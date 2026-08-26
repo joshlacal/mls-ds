@@ -293,20 +293,6 @@ pub async fn deliver_welcome_mailbox(
         });
     }
 
-    if let Some(cached_bytes) = check_delivery_receipt(
-        tx,
-        DELIVER_WELCOME_NSID,
-        &header,
-        &envelope_digest,
-        Some(&entry_locator),
-    )
-    .await?
-    {
-        let cached_output: DeliverWelcomeOutput =
-            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
-        return Ok(cached_output);
-    }
-
     // 1. One locked exact provenance join locking all relevant tables:
     // welcome_deliveries, welcome_bundles, key_packages, key_package_reservations,
     // devices, participants, conversations, transitions, entries, generation_states.
@@ -413,6 +399,19 @@ pub async fn deliver_welcome_mailbox(
         return Err(FederationError::DeliveryConflict {
             reason: format!("conversation {} is quarantined", header.conversation_id),
         });
+    }
+    if let Some(cached_bytes) = check_delivery_receipt(
+        tx,
+        DELIVER_WELCOME_NSID,
+        &header,
+        &envelope_digest,
+        Some(&entry_locator),
+    )
+    .await?
+    {
+        let cached_output: DeliverWelcomeOutput =
+            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
+        return Ok(cached_output);
     }
 
     let d_status = r.d_status;
@@ -1056,20 +1055,6 @@ pub async fn deliver_message_replication(
         });
     }
 
-    if let Some(cached_bytes) = check_delivery_receipt(
-        tx,
-        DELIVER_MESSAGE_NSID,
-        &header,
-        &envelope_digest,
-        Some(&locator),
-    )
-    .await?
-    {
-        let cached_output: DeliverMessageOutput =
-            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
-        return Ok(cached_output);
-    }
-
     // 1. Lock conversation and verify remote mailbox routing and exact term.
     let convo_row: Option<(bool, Option<String>, i64, i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         r#"
@@ -1115,6 +1100,19 @@ pub async fn deliver_message_replication(
         return Err(FederationError::DeliveryConflict {
             reason: format!("conversation {} is quarantined", header.conversation_id),
         });
+    }
+    if let Some(cached_bytes) = check_delivery_receipt(
+        tx,
+        DELIVER_MESSAGE_NSID,
+        &header,
+        &envelope_digest,
+        Some(&locator),
+    )
+    .await?
+    {
+        let cached_output: DeliverMessageOutput =
+            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
+        return Ok(cached_output);
     }
 
     if !is_remote

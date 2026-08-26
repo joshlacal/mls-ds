@@ -1169,16 +1169,55 @@ async fn apply_remote_clean_events(
         };
         let message_id = uuid::Uuid::from_bytes(*projection.message_id().as_bytes());
 
-        let entry_id_canonical = crate::chat_protocol::validation::CanonicalUuidV4::parse(
-            rebound_entry.entry_id().as_str(),
-        )
-        .map_err(|_| format!("invalid entry_id in entry for seq {}", event.seq))?;
-        let verified_entry_id = uuid::Uuid::parse_str(entry_id_canonical.as_str())
-            .map_err(|_| format!("invalid entry_id uuid for seq {}", event.seq))?;
-
-        if verified_entry_id != entry_id {
+        if rebound_entry.conversation_id().as_str() != convo_id.to_string() {
             return Err(format!(
-                "verified entry_id {verified_entry_id} does not match event entry_id {entry_id} for seq {}",
+                "verified entry conversation_id {} does not match convo_id {} for seq {}",
+                rebound_entry.conversation_id().as_str(),
+                convo_id,
+                event.seq
+            ));
+        }
+
+        if rebound_entry.seq() != event.seq as u64 {
+            return Err(format!(
+                "verified entry seq {} does not match event seq {} for seq {}",
+                rebound_entry.seq(),
+                event.seq,
+                event.seq
+            ));
+        }
+
+        if rebound_entry.entry_id().as_str() != entry_id_str {
+            return Err(format!(
+                "verified entry entry_id {} does not match event entry_id {entry_id_str} for seq {}",
+                rebound_entry.entry_id().as_str(),
+                event.seq
+            ));
+        }
+
+        if rebound_entry.received_at().datetime().timestamp_millis()
+            != event.created_at.timestamp_millis()
+        {
+            return Err(format!(
+                "verified entry received_at {} does not match event created_at {} for seq {}",
+                rebound_entry.received_at().as_str(),
+                event
+                    .created_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                event.seq
+            ));
+        }
+
+        if rebound_entry.outer_application_fingerprint() != &outer_fp_32 {
+            return Err(format!(
+                "verified entry outer fingerprint mismatch for seq {}",
+                event.seq
+            ));
+        }
+
+        if rebound_entry.accepted_payload_sha256() != &payload_sha256 {
+            return Err(format!(
+                "verified entry payload sha256 mismatch for seq {}",
                 event.seq
             ));
         }
@@ -1191,22 +1230,24 @@ async fn apply_remote_clean_events(
             conversation_id: convo_id,
             entry_id,
             entry_kind: entry_kind.to_string(),
-            accepted_payload_bytes: event.ciphertext.clone(),
-            accepted_payload_sha256: payload_sha256.to_vec(),
+            accepted_payload_bytes: rebound_entry.canonical_entry_bytes().to_vec(),
+            accepted_payload_sha256: rebound_entry.accepted_payload_sha256().to_vec(),
             signed_request_bytes: signed_req.to_vec(),
-            request_digest: req_digest,
-            signature,
+            request_digest: rebound_entry.mutation().request_digest().to_vec(),
+            signature: rebound_entry.mutation().signature().to_vec(),
             server_fields_bytes,
-            outer_entry_fingerprint: outer_fp.to_vec(),
-            actor_did,
-            actor_device_id,
-            actor_key_id,
-            actor_auth_generation: actor_auth_gen,
+            outer_entry_fingerprint: rebound_entry.outer_application_fingerprint().to_vec(),
+            actor_did: rebound_entry.mutation().actor_did().as_str().to_string(),
+            actor_device_id: uuid::Uuid::from_bytes(
+                *rebound_entry.mutation().actor_device_id().as_bytes(),
+            ),
+            actor_key_id: rebound_entry.mutation().key_id().as_str().to_string(),
+            actor_auth_generation: rebound_entry.mutation().auth_generation() as i64,
             generation: Some(event.epoch),
             state_version: None,
             transition_id: None,
             message_id: Some(message_id),
-            received_at: event.created_at,
+            received_at: rebound_entry.received_at().datetime(),
         };
 
         crate::chat_protocol::repository::delivery::append_entry_at(
@@ -1219,12 +1260,12 @@ async fn apply_remote_clean_events(
 
         let outcome_bytes = serde_json::to_vec(&serde_json::json!({
             "entry": {
-                "entryId": entry_id.to_string(),
+                "entryId": rebound_entry.entry_id().as_str(),
                 "conversationId": convo_id.to_string(),
                 "seq": event.seq,
                 "signedRequest": serde_json::from_slice::<serde_json::Value>(signed_req)
                     .unwrap_or(serde_json::Value::Null),
-                "receivedAt": event.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                "receivedAt": rebound_entry.received_at().as_str()
             }
         }))
         .map_err(|e| format!("failed to serialize reconciled send outcome: {e}"))?;
@@ -1248,7 +1289,7 @@ async fn apply_remote_clean_events(
         .bind(event.seq)
         .bind(&outcome_bytes)
         .bind(&outcome_sha256)
-        .bind(event.created_at)
+        .bind(rebound_entry.received_at().datetime())
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("failed to insert message_sends for seq {}: {e}", event.seq))?;
