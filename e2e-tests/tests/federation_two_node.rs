@@ -271,6 +271,7 @@ fn compute_commit_envelope_digest(
     receiver_ds_did: &str,
     sequencer_did: &str,
     sequencer_term: u64,
+    received_at: &str,
     signed_request_bytes: &[u8],
 ) -> [u8; 32] {
     let mut buf = Vec::with_capacity(512);
@@ -282,13 +283,10 @@ fn compute_commit_envelope_digest(
     lp_bytes(receiver_ds_did.as_bytes(), &mut buf);
     lp_bytes(sequencer_did.as_bytes(), &mut buf);
     buf.extend_from_slice(&sequencer_term.to_be_bytes());
+    lp_bytes(received_at.as_bytes(), &mut buf);
 
     let signed_req_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
     buf.extend_from_slice(&signed_req_sha256);
-
-    let canonical: Value = serde_json::from_slice(signed_request_bytes).unwrap();
-    let signed_at = canonical["signedAt"].as_str().unwrap();
-    lp_bytes(signed_at.as_bytes(), &mut buf);
 
     Sha256::digest(&buf).into()
 }
@@ -2946,6 +2944,7 @@ async fn run_test_scenario() -> Result<()> {
     );
 
     let canonical_commit_delivery_id = Uuid::new_v4();
+    let canonical_commit_received_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let canonical_commit_payload_sha = compute_commit_envelope_digest(
         canonical_commit_delivery_id,
         corpus_convo_id,
@@ -2953,6 +2952,7 @@ async fn run_test_scenario() -> Result<()> {
         &cluster.ds1_service_did,
         &cluster.ds1_service_did,
         0,
+        &canonical_commit_received_at,
         &corpus_signed_req_bytes,
     );
 
@@ -2964,6 +2964,7 @@ async fn run_test_scenario() -> Result<()> {
         "receiverDsDid": cluster.ds1_service_did,
         "sequencerDid": cluster.ds1_service_did,
         "sequencerTerm": 0,
+        "receivedAt": canonical_commit_received_at,
         "payloadSha256": { "$bytes": STANDARD.encode(&canonical_commit_payload_sha) }
     });
 
@@ -3113,6 +3114,7 @@ async fn run_test_scenario() -> Result<()> {
     // Negative: Corrupted / mock commit bytes rejected by canonical executor
     let mock_delivery_id = Uuid::new_v4();
     let mock_bytes = vec![0x5au8; 8];
+    let mock_received_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let mock_payload_sha = compute_commit_envelope_digest(
         mock_delivery_id,
         corpus_convo_id,
@@ -3120,6 +3122,7 @@ async fn run_test_scenario() -> Result<()> {
         &cluster.ds1_service_did,
         &cluster.ds1_service_did,
         0,
+        &mock_received_at,
         &mock_bytes,
     );
     let mock_body = json!({
@@ -3131,6 +3134,7 @@ async fn run_test_scenario() -> Result<()> {
             "receiverDsDid": cluster.ds1_service_did,
             "sequencerDid": cluster.ds1_service_did,
             "sequencerTerm": 0,
+            "receivedAt": mock_received_at,
             "payloadSha256": { "$bytes": STANDARD.encode(&mock_payload_sha) }
         },
         "signedRequestBytes": { "$bytes": STANDARD.encode(&mock_bytes) }

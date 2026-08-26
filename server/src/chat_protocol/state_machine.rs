@@ -4240,6 +4240,19 @@ impl HydrationAuthority {
         &self,
         scope: &ScopeBoundBusinessAuthority,
     ) -> Result<LockedRegistrationProjection, StateMachineError> {
+        self.locked_registration_from_scope_authority_at(scope, scope.trusted_instant())
+    }
+
+    /// Same projection as [`Self::locked_registration_from_scope_authority`] but
+    /// with an explicit trusted-read instant. Remote commit transitions use the
+    /// client's `signedAt` (validated ±5min at admission and fixed by the signed
+    /// request) so the mailbox and sequencer canonicalize byte-identical
+    /// registration material across retries.
+    pub(crate) fn locked_registration_from_scope_authority_at(
+        &self,
+        scope: &ScopeBoundBusinessAuthority,
+        trusted_read_at_instant: DateTime<Utc>,
+    ) -> Result<LockedRegistrationProjection, StateMachineError> {
         if scope.actor_class() != RepositoryAuthorityClass::ExistingDevice
             || scope.actor_device_id().get_version_num() != 4
         {
@@ -4282,7 +4295,7 @@ impl HydrationAuthority {
             .try_into()
             .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
         let trusted_read_at =
-            ServerTimestamp::from_unix_millis(scope.trusted_instant().timestamp_millis())?;
+            ServerTimestamp::from_unix_millis(trusted_read_at_instant.timestamp_millis())?;
 
         if scope
             .principals()

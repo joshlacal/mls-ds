@@ -377,10 +377,32 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     };
     let prelude = prelude.verify_submit_transition_operation(parsed.transition_id, &mutation)?;
     let scope_authority = prelude.scope_authority();
+
+    let convo_row: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
+    )
+    .bind(Uuid::from_bytes(*parsed.prior.conversation_id()))
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(SubmitTransitionFacadeError::Database)?;
+
+    // Remote conversations must canonicalize byte-identical entry material to
+    // the sequencer across retries. The client's signedAt is fixed by the
+    // signed request (validated ±5min at admission), so it is the only
+    // deterministic instant; the envelope carries it as receivedAt and the
+    // sequencer consumes it as its trusted instant. Non-remote conversations
+    // keep the captured admission instant.
+    let is_remote = convo_row.as_ref().map_or(false, |(r, _, _)| *r);
+    let effective_instant = if is_remote {
+        TrustedRequestInstant::from_canonical(mutation.signed_at().clone())
+    } else {
+        authority.trusted_instant().clone()
+    };
+
     let aggregate = hydrate_locked_conversation_state(
         transaction,
         Uuid::from_bytes(*parsed.prior.conversation_id()),
-        scope_authority.trusted_instant(),
+        effective_instant.datetime(),
     )
     .await?;
     if aggregate.head().transaction_id() != scope_authority.transaction_id()
@@ -391,25 +413,21 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         return Err(SubmitTransitionFacadeError::CandidateScopeDrift);
     }
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate)?;
-    let registration = hydration.locked_registration_from_scope_authority(scope_authority)?;
+    let registration = hydration.locked_registration_from_scope_authority_at(
+        scope_authority,
+        effective_instant.datetime(),
+    )?;
     let terminal_packages = hydrate_terminal_recovery_packages(transaction, &aggregate).await?;
     let expected_entry_id = parsed.transition_id;
     let expected_seq = aggregate.head().next_entry_seq();
 
-    let convo_row: Option<(bool, Option<String>, i64)> = sqlx::query_as(
-        "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
-    )
-    .bind(Uuid::from_bytes(*parsed.prior.conversation_id()))
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(SubmitTransitionFacadeError::Database)?;
     let entry = build_verified_control_entry(
         mutation,
         authority.endpoint(),
         canonical_uuid_v4(parsed.transition_id)?,
         canonical_uuid_v4(Uuid::from_bytes(*parsed.prior.conversation_id()))?,
         expected_seq,
-        authority.trusted_instant(),
+        &effective_instant,
         CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
     )?;
     let outer_entry_fingerprint = *entry.outer_control_fingerprint();
@@ -509,6 +527,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
                 &sequencer_ds,
                 accepted_request,
                 sequencer_term as u64,
+                effective_instant.as_canonical(),
             )?;
 
         // ponytail: the remote call holds the conversation lock; split admission into a durable

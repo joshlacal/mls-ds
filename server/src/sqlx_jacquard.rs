@@ -43,6 +43,30 @@ pub fn chrono_to_datetime(dt: DateTime<Utc>) -> Datetime {
     Datetime::new(dt.fixed_offset())
 }
 
+/// Convert a canonical clean-chat timestamp (exact 24-char millis UTC grammar)
+/// to jacquard `Datetime`, preserving the exact serialized spelling.
+///
+/// `Datetime::new` re-serializes with microsecond precision, which breaks the
+/// canonical 24-char millis form the envelope digest binds. `FromStr` keeps
+/// the input spelling verbatim, so this is the only spelling-preserving
+/// conversion for canonical timestamps.
+pub fn canonical_to_datetime(
+    value: &crate::chat_protocol::validation::CanonicalTimestamp,
+) -> Datetime {
+    value
+        .as_str()
+        .parse()
+        .expect("canonical timestamp is a valid AT Protocol datetime")
+}
+
+/// Convert `chrono::DateTime<Utc>` to jacquard `Datetime` in the canonical
+/// 24-char millis spelling (not `Datetime::new`'s microsecond form).
+pub fn chrono_to_canonical_datetime(dt: DateTime<Utc>) -> Datetime {
+    let text = dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    text.parse()
+        .expect("canonical millis datetime is a valid AT Protocol datetime")
+}
+
 /// Convert jacquard `Datetime` to `chrono::DateTime<Utc>`.
 pub fn datetime_to_chrono(dt: &Datetime) -> DateTime<Utc> {
     let fixed: &chrono::DateTime<chrono::FixedOffset> = dt.as_ref();

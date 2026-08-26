@@ -1183,6 +1183,9 @@ async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_ma
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
             conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
             sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
@@ -1420,6 +1423,9 @@ async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_res
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
             conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
             sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
@@ -2784,6 +2790,9 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
             conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
             sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
@@ -3262,6 +3271,9 @@ async fn test_recomputed_envelope_digest_mismatch_marks_dead_immediately() {
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
             conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
             sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
@@ -3617,6 +3629,9 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
@@ -3739,6 +3754,9 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_me
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),
@@ -3946,6 +3964,9 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
     > {
         header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
             protocol_version: "1".into(),
+            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+                chrono::Utc::now(),
+            ),
             delivery_id: item_id.clone().into(),
             conversation_id: convo_id.clone().into(),
             sender_ds_did: service_did_base().into(),

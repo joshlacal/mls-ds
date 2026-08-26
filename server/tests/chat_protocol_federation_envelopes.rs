@@ -23,6 +23,7 @@ fn test_signer(did: &str) -> (AckSigner, p256::ecdsa::VerifyingKey) {
 fn sample_header() -> EnvelopeHeaderV1 {
     EnvelopeHeaderV1 {
         protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
+        received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(chrono::Utc::now()),
         delivery_id: jacquard_common::deps::smol_str::SmolStr::from(
             Uuid::new_v4().hyphenated().to_string(),
         ),

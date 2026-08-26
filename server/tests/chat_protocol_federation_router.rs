@@ -2099,6 +2099,7 @@ fn make_envelope_header_json(
     receiver_ds: &str,
     sequencer_ds: &str,
     sequencer_term: i64,
+    received_at: &str,
     payload_sha256: &[u8; 32],
 ) -> Value {
     json!({
@@ -2109,6 +2110,7 @@ fn make_envelope_header_json(
         "receiverDsDid": receiver_ds,
         "sequencerDid": sequencer_ds,
         "sequencerTerm": sequencer_term,
+        "receivedAt": received_at,
         "payloadSha256": { "$bytes": STANDARD.encode(payload_sha256) },
     })
 }
@@ -3358,6 +3360,10 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: harness.sequencer_ds_did.clone(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let locator_model = ValidatedEntryLocator {
@@ -3404,6 +3410,7 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &welcome_digest,
     );
     let locator_json = make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256, &outer_fp);
@@ -3553,6 +3560,10 @@ async fn test_deliver_message_router_authenticated_positive_replay_and_idempoten
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: harness.sequencer_ds_did.clone(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let locator_model = ValidatedEntryLocator {
@@ -3579,6 +3590,7 @@ async fn test_deliver_message_router_authenticated_positive_replay_and_idempoten
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &msg_digest,
     );
     let locator_json = make_entry_locator_json(msg_entry_id, 2, &entry_sha256, &outer_fp);
@@ -3811,6 +3823,10 @@ async fn test_deliver_message_router_with_attachment_binding() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: harness.sequencer_ds_did.clone(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let locator_model = ValidatedEntryLocator {
@@ -3837,6 +3853,7 @@ async fn test_deliver_message_router_with_attachment_binding() {
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &msg_digest,
     );
     let locator_json = make_entry_locator_json(msg_entry_id, 2, &entry_sha256, &outer_fp);
@@ -3941,6 +3958,10 @@ async fn test_submit_commit_router_authenticated_positive_and_replay() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: LOCAL_DS_DID.to_string(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
 
@@ -3954,6 +3975,7 @@ async fn test_submit_commit_router_authenticated_positive_and_replay() {
         LOCAL_DS_DID,
         LOCAL_DS_DID,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &commit_digest,
     );
 
@@ -4043,6 +4065,10 @@ async fn test_submit_commit_router_rejects_mock_and_corrupted_bytes() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: LOCAL_DS_DID.to_string(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let mock_digest =
@@ -4054,6 +4080,7 @@ async fn test_submit_commit_router_rejects_mock_and_corrupted_bytes() {
         LOCAL_DS_DID,
         LOCAL_DS_DID,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &mock_digest,
     );
     let mock_body = json!({
@@ -4283,6 +4310,10 @@ async fn test_deliver_message_router_concurrency_revocation_fails_closed() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: harness.sequencer_ds_did.clone(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let locator_model = ValidatedEntryLocator {
@@ -4309,6 +4340,7 @@ async fn test_deliver_message_router_concurrency_revocation_fails_closed() {
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &msg_digest,
     );
     let locator_json = make_entry_locator_json(msg_entry_id, 2, &entry_sha256, &outer_fp);
@@ -4801,6 +4833,10 @@ async fn test_deliver_welcome_router_concurrency_revocation_fails_closed() {
         receiver_ds_did: LOCAL_DS_DID.to_string(),
         sequencer_did: harness.sequencer_ds_did.clone(),
         sequencer_term: 1,
+        received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+            &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+        )
+        .unwrap(),
         payload_sha256: [0u8; 32],
     };
     let locator_model = ValidatedEntryLocator {
@@ -4847,6 +4883,7 @@ async fn test_deliver_welcome_router_concurrency_revocation_fails_closed() {
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &welcome_digest,
     );
     let locator_json = make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256, &outer_fp);
@@ -5365,6 +5402,10 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
             receiver_ds_did: LOCAL_DS_DID.to_string(),
             sequencer_did: harness.sequencer_ds_did.clone(),
             sequencer_term: 1,
+            received_at: catbird_server::chat_protocol::test_support::CanonicalTimestamp::parse(
+                &now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            )
+            .unwrap(),
             payload_sha256: [0u8; 32],
         },
         &recipient.did,
@@ -5408,6 +5449,7 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
         LOCAL_DS_DID,
         &harness.sequencer_ds_did,
         1,
+        &now.to_rfc3339_opts(SecondsFormat::Millis, true),
         &welcome_digest,
     );
     let locator_json = make_entry_locator_json(fulfillment_entry_id, 2, &entry_sha256, &outer_fp);
@@ -5525,6 +5567,7 @@ struct MailboxStateSnapshot {
     reset_requests: Vec<String>,
     leave_requests: Vec<String>,
     leaf_recovery_requests: Vec<String>,
+    chat_outbox: Vec<String>,
     outbox: Vec<String>,
     queue: Vec<String>,
 }
@@ -5684,6 +5727,13 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
     .await
     .unwrap();
 
+    let chat_outbox = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.outbox ORDER BY event_position) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
     let outbox = sqlx::query_scalar::<_, String>(
         "SELECT to_jsonb(t)::text FROM (SELECT * FROM federation_outbox ORDER BY id) t",
     )
@@ -5721,6 +5771,7 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
         reset_requests,
         leave_requests,
         leaf_recovery_requests,
+        chat_outbox,
         outbox,
         queue,
     }
@@ -7368,7 +7419,9 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         "Mailbox state must be completely unchanged after dropped response rollback"
     );
 
-    // Call 2: Client retries with fresh service auth token but identical signedRequest
+    // Call 2: Client retries with fresh service auth token but identical signedRequest.
+    // The sequencer already committed the entry on call 1 (its response was dropped),
+    // so the retry must succeed and apply exactly once.
     let jwt2 = sign_jwt(
         json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
         json!({
@@ -7392,13 +7445,12 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     .await;
     assert_eq!(
         status2,
-        StatusCode::BAD_REQUEST,
-        "Call 2 retry on un-replayed sequence returns 400: body={body2:?}"
+        StatusCode::OK,
+        "Call 2 retry after dropped response must succeed: status={status2}, body={body2:?}"
     );
-    assert_eq!(
-        body2.get("error").and_then(Value::as_str),
-        Some("InvalidRequest"),
-        "error code must be InvalidRequest"
+    assert!(
+        body2.get("error").is_none(),
+        "Call 2 must not carry an error code: body={body2:?}"
     );
 
     let delivery_id =
@@ -7407,6 +7459,24 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
             generic_transition_id,
             LOCAL_DS_DID,
         );
+    let delivery_id_str = delivery_id.to_string();
+
+    // Both remote calls must carry the deterministic delivery ID.
+    {
+        let ids = received_delivery_ids.lock();
+        assert_eq!(
+            ids.len(),
+            2,
+            "sequencer must have received exactly 2 envelopes (call 1 dropped, call 2 retried)"
+        );
+        for id in ids.iter() {
+            assert_eq!(
+                id, &delivery_id_str,
+                "every remote envelope must carry the deterministic delivery ID"
+            );
+        }
+    }
+
     let receipt_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.federation_delivery_receipts WHERE delivery_id = $1",
     )
@@ -7435,5 +7505,42 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         call_counts.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "sequencer received 2 calls (call 1 dropped, call 2 retried and answered by replay logic)"
+    );
+
+    // Call 3: local mailbox replay of the same signedRequest must return the
+    // byte-identical response WITHOUT any new remote call.
+    let jwt3 = sign_jwt(
+        json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
+        json!({
+            "iss": alice.did,
+            "sub": alice.did,
+            "aud": AUDIENCE,
+            "lxm": "blue.catbird.chat.submitTransition",
+            "iat": now_ts,
+            "exp": now_ts + 60,
+            "jti": Uuid::new_v4().to_string(),
+        }),
+        &alice_p256,
+    );
+    let (status3, body3, _) = send_json_to_router(
+        &custom_router,
+        "/xrpc/blue.catbird.chat.submitTransition",
+        Some(&jwt3),
+        &client_body,
+    )
+    .await;
+    assert_eq!(
+        status3,
+        StatusCode::OK,
+        "Call 3 local replay must succeed: status={status3}, body={body3:?}"
+    );
+    assert_eq!(
+        body3, body2,
+        "Call 3 local replay must return byte-identical response to Call 2"
+    );
+    assert_eq!(
+        call_counts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "Call 3 local replay must NOT trigger a new remote call"
     );
 }

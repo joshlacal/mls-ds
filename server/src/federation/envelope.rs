@@ -15,7 +15,9 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::chat_protocol::validation::{BareDid, CanonicalUuidV4, MAX_SAFE_INTEGER};
+use crate::chat_protocol::validation::{
+    BareDid, CanonicalTimestamp, CanonicalUuidV4, MAX_SAFE_INTEGER,
+};
 use crate::federation::ack::AckSigner;
 use crate::federation::errors::FederationError;
 
@@ -43,6 +45,7 @@ pub struct ValidatedEnvelopeHeader {
     pub receiver_ds_did: String,
     pub sequencer_did: String,
     pub sequencer_term: u64,
+    pub received_at: CanonicalTimestamp,
     pub payload_sha256: [u8; 32],
 }
 
@@ -117,6 +120,12 @@ pub fn validate_envelope_header(
     }
     let sequencer_term = header.sequencer_term as u64;
 
+    let received_at = CanonicalTimestamp::parse(header.received_at.as_str()).map_err(|e| {
+        FederationError::InvalidEnvelope {
+            reason: format!("invalid receivedAt: {e}"),
+        }
+    })?;
+
     if header.payload_sha256.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "payloadSha256 must be exactly 32 bytes".to_string(),
@@ -133,6 +142,7 @@ pub fn validate_envelope_header(
         receiver_ds_did: receiver_did.as_str().to_string(),
         sequencer_did: sequencer_did.as_str().to_string(),
         sequencer_term,
+        received_at,
         payload_sha256,
     })
 }
@@ -319,18 +329,11 @@ pub fn compute_commit_envelope_digest(
     lp_bytes(header.receiver_ds_did.as_bytes(), &mut buf);
     lp_bytes(header.sequencer_did.as_bytes(), &mut buf);
     buf.extend_from_slice(&header.sequencer_term.to_be_bytes());
+    lp_bytes(header.received_at.as_str().as_bytes(), &mut buf);
 
     // Endpoint-specific fields:
     let signed_req_sha256: [u8; 32] = Sha256::digest(signed_request_bytes).into();
     buf.extend_from_slice(&signed_req_sha256);
-
-    // Extract and bind canonical signed_at from the signedRequest mutation (fail closed)
-    let canonical =
-        crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_request_bytes)
-            .map_err(|e| FederationError::InvalidEnvelope {
-                reason: format!("cannot decode canonical signed mutation: {e}"),
-            })?;
-    lp_bytes(canonical.signed_at().as_str().as_bytes(), &mut buf);
 
     let digest: [u8; 32] = Sha256::digest(&buf).into();
     Ok(digest)

@@ -46,8 +46,8 @@ use crate::chat_protocol::transcript::{
     VerifiedApplicationEntry, VerifiedMutationProjection, VerifiedSignedMutation,
 };
 use crate::chat_protocol::validation::{
-    BareDid, CanonicalUuidV4, KeyThumbprint, TrustedRequestInstant, ValidatedChatNsid,
-    MAX_SAFE_INTEGER,
+    BareDid, CanonicalTimestamp, CanonicalUuidV4, KeyThumbprint, TrustedRequestInstant,
+    ValidatedChatNsid, MAX_SAFE_INTEGER,
 };
 use crate::federation::ack::AckSigner;
 use crate::federation::envelope::{
@@ -1951,11 +1951,13 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             reason: format!("cannot parse submit transition: {e:?}"),
         })?;
 
-    let trusted_instant = TrustedRequestInstant::from_datetime(Utc::now()).map_err(|e| {
-        FederationError::InvalidEnvelope {
-            reason: format!("invalid instant: {e}"),
-        }
-    })?;
+    // The canonical entry instant is the mailbox's admission instant carried
+    // in the envelope header and bound into the envelope digest. The mailbox
+    // validated it against its captured trusted instant window, and the
+    // sequencer re-verifies the envelope digest above, so this value is
+    // bounded and authenticated. Using it here makes the sequencer
+    // canonicalize byte-identical entry material to the mailbox.
+    let trusted_instant = TrustedRequestInstant::from_canonical(header.received_at.clone());
     let now = trusted_instant.datetime();
     let tx_id: String = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
@@ -2393,6 +2395,15 @@ pub async fn enqueue_federated_message_job(
                 reason: "invalid outer_entry_fingerprint length".to_string(),
             })?,
     };
+    let received_at = CanonicalTimestamp::parse(
+        &entry
+            .received_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .map_err(|e| FederationError::InvalidEnvelope {
+        reason: format!("invalid entry receivedAt: {e}"),
+    })?;
+
     let envelope_header_for_digest = ValidatedEnvelopeHeader {
         protocol_version: "1".to_string(),
         delivery_id,
@@ -2401,6 +2412,7 @@ pub async fn enqueue_federated_message_job(
         receiver_ds_did: canonical_did(target_ds_did).to_string(),
         sequencer_did: self_base_did.clone(),
         sequencer_term,
+        received_at: received_at.clone(),
         payload_sha256: [0u8; 32],
     };
 
@@ -2433,6 +2445,7 @@ pub async fn enqueue_federated_message_job(
                 }
             })?,
             sequencer_term: sequencer_term as i64,
+            received_at: crate::sqlx_jacquard::chrono_to_canonical_datetime(entry.received_at),
             payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
             extra_data: None,
         },
@@ -2562,6 +2575,15 @@ pub async fn enqueue_federated_welcome_job(
             })?,
     };
 
+    let received_at = CanonicalTimestamp::parse(
+        &entry
+            .received_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .map_err(|e| FederationError::InvalidEnvelope {
+        reason: format!("invalid entry receivedAt: {e}"),
+    })?;
+
     let envelope_header_for_digest = ValidatedEnvelopeHeader {
         protocol_version: "1".to_string(),
         delivery_id,
@@ -2570,6 +2592,7 @@ pub async fn enqueue_federated_welcome_job(
         receiver_ds_did: canonical_did(target_ds_did).to_string(),
         sequencer_did: self_base_did.clone(),
         sequencer_term,
+        received_at: received_at.clone(),
         payload_sha256: [0u8; 32],
     };
 
@@ -2611,6 +2634,7 @@ pub async fn enqueue_federated_welcome_job(
                 }
             })?,
             sequencer_term: sequencer_term as i64,
+            received_at: crate::sqlx_jacquard::chrono_to_canonical_datetime(entry.received_at),
             payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
             extra_data: None,
         },
@@ -2682,6 +2706,7 @@ pub fn build_federated_commit_envelope(
     sequencer_ds_did: &str,
     signed_request_bytes: &[u8],
     sequencer_term: u64,
+    received_at: &CanonicalTimestamp,
 ) -> Result<
     catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit<
         jacquard_common::DefaultStr,
@@ -2706,6 +2731,7 @@ pub fn build_federated_commit_envelope(
         receiver_ds_did: target.clone(),
         sequencer_did: target.clone(),
         sequencer_term,
+        received_at: received_at.clone(),
         payload_sha256: [0u8; 32],
     };
 
@@ -2733,6 +2759,7 @@ pub fn build_federated_commit_envelope(
                 }
             })?,
             sequencer_term: sequencer_term as i64,
+            received_at: crate::sqlx_jacquard::canonical_to_datetime(received_at),
             payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
             extra_data: None,
         },

@@ -296,6 +296,14 @@ impl TrustedRequestInstant {
         Ok(Self(CanonicalTimestamp::parse(&text)?))
     }
 
+    /// Construct from an already validated canonical timestamp. Production
+    /// callers must only pass a value that was validated against a captured
+    /// trusted instant (or bound into a verified envelope digest); this
+    /// constructor never samples the clock itself.
+    pub(crate) fn from_canonical(value: CanonicalTimestamp) -> Self {
+        Self(value)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_canonical_for_test(value: CanonicalTimestamp) -> Self {
         Self(value)

@@ -10,6 +10,8 @@ pub use super::relationship_policy::AdmissionOperation;
 pub use super::transcript::decode_canonical_signed_mutation;
 #[cfg(any(test, feature = "test-support"))]
 pub use super::validation::ed25519_key_id;
+#[cfg(any(test, feature = "test-support"))]
+pub use super::validation::CanonicalTimestamp;
 pub mod repository {
     pub use crate::chat_protocol::repository::delivery::AppendEntry;
     pub use crate::chat_protocol::repository::federation::*;
