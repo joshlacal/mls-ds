@@ -112,7 +112,15 @@ fn map_failure(endpoint: ChatEndpoint, error: LeaveFacadeError) -> ChatFailure {
     match error {
         E::Database(_) | E::Authorization(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
-        E::Conversation(_) => ChatFailure::protocol(endpoint, C::ConversationNotFound),
+        E::Conversation(error) => match error {
+            crate::chat_protocol::repository::core::ConversationStateHydrationError::Database(_) => {
+                ChatFailure::storage(endpoint)
+            }
+            crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch => {
+                ChatFailure::protocol(endpoint, C::StaleCoordinates)
+            }
+            _ => ChatFailure::protocol(endpoint, C::ConversationNotFound),
+        },
         E::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::Database(_))
         | E::ExecutionContext(crate::chat_protocol::repository::execution_context::ExecutionContextHydrationError::Database(_))
         | E::Executor(crate::chat_protocol::state_machine::ExecutorError::Transition(crate::chat_protocol::repository::transition::TransitionRepositoryError::Database(_))) => ChatFailure::storage(endpoint),

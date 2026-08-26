@@ -60,7 +60,7 @@ struct RemoteConvoEvents {
     events: Vec<RemoteEvent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteEvent {
     pub seq: i64,
@@ -150,14 +150,13 @@ async fn run_once(
             continue;
         }
         let convo_id_str = convo_uuid.to_string();
-        if let Err(e) = reconcile_conversation_internal(
+        if let Err(e) = reconcile_conversation(
             pool,
             resolver,
             outbound,
             auth_sign,
             &convo_id_str,
             &sequencer_ds,
-            true,
         )
         .await
         {
@@ -208,6 +207,18 @@ async fn run_once(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CleanDriftDecision {
+    InSync,
+    ApplySuffix {
+        after_seq: i64,
+    },
+    Quarantine {
+        first_mismatch_seq: i64,
+        reason: &'static str,
+    },
+}
+
 pub async fn reconcile_conversation(
     pool: &PgPool,
     resolver: &DsResolver,
@@ -216,17 +227,554 @@ pub async fn reconcile_conversation(
     convo_id: &str,
     sequencer_ds: &str,
 ) -> Result<(), String> {
-    let is_clean = uuid::Uuid::parse_str(convo_id).is_ok();
-    reconcile_conversation_internal(
-        pool,
-        resolver,
-        outbound,
-        auth_sign,
-        convo_id,
-        sequencer_ds,
-        is_clean,
+    if let Ok(convo_uuid) = uuid::Uuid::parse_str(convo_id) {
+        peer_policy::enforce_outbound_peer_policy(pool, sequencer_ds)
+            .await
+            .map_err(|e| format!("peer policy denied outbound reconciliation: {e}"))?;
+        let endpoint = resolver
+            .resolve_ds_did(sequencer_ds)
+            .await
+            .map_err(|e| format!("resolve sequencer endpoint failed: {e}"))?;
+        let destination = resolver
+            .resolve_ds_destination(sequencer_ds)
+            .await
+            .map_err(|e| format!("resolve sequencer destination failed: {e}"))?;
+        let discovery_payload = fetch_discovery_payload(&destination).await;
+        if !super::target_supports_capability(
+            CAPABILITY_RECONCILIATION_V1,
+            endpoint.federation_capabilities.as_deref(),
+            discovery_payload.as_ref(),
+        ) {
+            let known_caps = super::known_target_capabilities(
+                endpoint.federation_capabilities.as_deref(),
+                discovery_payload.as_ref(),
+            )
+            .unwrap_or_default();
+            return Err(format!(
+                "target DS missing required capability '{CAPABILITY_RECONCILIATION_V1}' (did={}, advertised={:?})",
+                crate::crypto::redact_for_log(sequencer_ds),
+                known_caps
+            ));
+        }
+        reconcile_clean_conversation(
+            pool,
+            convo_uuid,
+            sequencer_ds,
+            &destination,
+            outbound,
+            auth_sign,
+        )
+        .await
+    } else {
+        reconcile_conversation_internal(
+            pool,
+            resolver,
+            outbound,
+            auth_sign,
+            convo_id,
+            sequencer_ds,
+            false,
+        )
+        .await
+    }
+}
+async fn query_remote_digest(
+    outbound: &OutboundClient,
+    destination: &ValidatedRemoteDestination,
+    token: &str,
+    convo_id: &str,
+) -> Result<RemoteConvoDigest, String> {
+    let json = outbound
+        .call_query_json_pinned(destination, DIGEST_NSID, token, &[("convoId", convo_id)])
+        .await
+        .map_err(|e| format!("digest query failed: {e}"))?;
+    serde_json::from_value(json).map_err(|e| format!("invalid digest response: {e}"))
+}
+
+async fn query_remote_events(
+    outbound: &OutboundClient,
+    destination: &ValidatedRemoteDestination,
+    token: &str,
+    convo_id: &str,
+    after_seq: i64,
+    limit: i64,
+) -> Result<RemoteConvoEvents, String> {
+    let after_seq_s = after_seq.to_string();
+    let limit_s = limit.to_string();
+    let json = outbound
+        .call_query_json_pinned(
+            destination,
+            EVENTS_NSID,
+            token,
+            &[
+                ("convoId", convo_id),
+                ("afterSeq", &after_seq_s),
+                ("limit", &limit_s),
+            ],
+        )
+        .await
+        .map_err(|e| format!("events query failed: {e}"))?;
+    serde_json::from_value(json).map_err(|e| format!("invalid events response: {e}"))
+}
+
+async fn reconcile_clean_conversation(
+    pool: &PgPool,
+    convo_uuid: uuid::Uuid,
+    sequencer_ds: &str,
+    destination: &ValidatedRemoteDestination,
+    outbound: &OutboundClient,
+    auth_sign: &(dyn Fn(&str, &str) -> Result<String, String> + Send + Sync),
+) -> Result<(), String> {
+    let convo_id = convo_uuid.to_string();
+
+    // 1. Validate remote digest
+    let digest_token = auth_sign(sequencer_ds, DIGEST_NSID)
+        .map_err(|e| format!("failed to sign digest request: {e}"))?;
+    let remote_digest =
+        query_remote_digest(outbound, destination, &digest_token, &convo_id).await?;
+
+    let stored_routing: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+        "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1",
     )
+    .bind(convo_uuid)
+    .fetch_optional(pool)
     .await
+    .map_err(|e| e.to_string())?;
+
+    let Some((is_remote, stored_seq_ds, stored_term)) = stored_routing else {
+        return Err(format!("clean conversation {convo_id} not found locally"));
+    };
+
+    if !is_remote {
+        return Err(format!(
+            "clean conversation {convo_id} is not a remote mailbox"
+        ));
+    }
+
+    if remote_digest.convo_id != convo_id {
+        return Err(format!(
+            "remote digest convo_id mismatch: expected {}, got {}",
+            convo_id, remote_digest.convo_id
+        ));
+    }
+
+    let stored_seq_ds_str = stored_seq_ds.unwrap_or_default();
+    if canonical_did(&remote_digest.sequencer_ds_did) != canonical_did(&stored_seq_ds_str) {
+        return Err(format!(
+            "remote digest sequencer DID mismatch: expected {}, got {}",
+            stored_seq_ds_str, remote_digest.sequencer_ds_did
+        ));
+    }
+
+    if remote_digest.sequencer_term != stored_term {
+        return Err(format!(
+            "remote digest sequencer term mismatch: expected {}, got {}",
+            stored_term, remote_digest.sequencer_term
+        ));
+    }
+
+    // 2. Compute local clean snapshot in Phase A
+    let local_snapshot = local_clean_digest_state(pool, convo_uuid)
+        .await
+        .map_err(|e| format!("local clean digest failed: {e}"))?;
+
+    let is_same = local_snapshot.digest_sha256 == remote_digest.digest_sha256
+        && local_snapshot.last_seq == remote_digest.last_seq
+        && local_snapshot.event_count == remote_digest.event_count;
+
+    if is_same {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let locked_convo: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+            "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+        )
+        .bind(convo_uuid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let Some((is_rem, locked_ds, locked_term)) = locked_convo else {
+            return Err(format!("conversation {convo_id} missing under lock"));
+        };
+        if !is_rem
+            || canonical_did(&locked_ds.unwrap_or_default()) != canonical_did(&stored_seq_ds_str)
+            || locked_term != stored_term
+        {
+            return Err(format!(
+                "conversation {convo_id} routing changed concurrently"
+            ));
+        }
+
+        let is_quarantined: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id = $1 AND status = 'quarantined')",
+        )
+        .bind(&convo_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if is_quarantined {
+            return Err(format!("conversation {convo_id} is quarantined"));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO federation_sync_state
+                (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), 0, NOW(), 'healthy')
+             ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
+                sequencer_term = EXCLUDED.sequencer_term,
+                last_seq = EXCLUDED.last_seq,
+                last_epoch = EXCLUDED.last_epoch,
+                last_digest = EXCLUDED.last_digest,
+                last_reconciled_at = NOW(),
+                updated_at = NOW()
+             WHERE federation_sync_state.status = 'healthy'
+            "#,
+        )
+        .bind(&convo_id)
+        .bind(canonical_did(&remote_digest.sequencer_ds_did))
+        .bind(remote_digest.sequencer_term)
+        .bind(local_snapshot.last_seq)
+        .bind(local_snapshot.last_epoch)
+        .bind(hex::decode(&local_snapshot.digest_sha256).unwrap_or_default())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    metrics::counter!("federation_reconciliation_drift_total", 1, "convo_id" => convo_id.clone());
+
+    let local_entries: Vec<crate::handlers::ds::get_convo_digest::CleanDigestRow> = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 ORDER BY seq ASC",
+    )
+    .bind(convo_uuid)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let local_map: std::collections::BTreeMap<
+        i64,
+        crate::handlers::ds::get_convo_digest::CleanDigestRow,
+    > = local_entries
+        .into_iter()
+        .map(|row| (row.seq, row))
+        .collect();
+
+    let mut remote_hasher = crate::handlers::ds::get_convo_digest::CleanConvoDigestHasher::new();
+    let mut remote_scanned_count = 0_i64;
+    let mut remote_last_seq = 0_i64;
+    let mut remote_last_epoch = 0_i64;
+
+    let mut first_mismatch: Option<(i64, &'static str)> = None;
+    let mut retained_suffix_chunk: Vec<RemoteEvent> = Vec::new();
+    let mut retained_bytes: usize = 0;
+
+    let mut cursor = 0_i64;
+    while cursor < remote_digest.last_seq {
+        let events_token = auth_sign(sequencer_ds, EVENTS_NSID)
+            .map_err(|e| format!("failed to sign events request: {e}"))?;
+        let page = query_remote_events(
+            outbound,
+            destination,
+            &events_token,
+            &convo_id,
+            cursor,
+            EVENTS_PAGE_LIMIT,
+        )
+        .await?;
+        if page.events.is_empty() {
+            return Err(format!(
+                "events page was empty before reaching remote head (cursor={cursor}, remote_last_seq={})",
+                remote_digest.last_seq
+            ));
+        }
+
+        if page.convo_id != convo_id {
+            return Err(format!("events page convo_id mismatch"));
+        }
+
+        if page.from_seq_exclusive != cursor {
+            return Err(format!("events page from_seq_exclusive mismatch"));
+        }
+
+        if page.to_seq_inclusive > remote_digest.last_seq || page.to_seq_inclusive <= cursor {
+            return Err(format!("events page to_seq_inclusive out of bounds"));
+        }
+
+        let mut expected_seq = cursor + 1;
+        for event in &page.events {
+            if event.seq != expected_seq {
+                return Err(format!(
+                    "events page sequence discontinuity: expected {expected_seq}, got {}",
+                    event.seq
+                ));
+            }
+            expected_seq += 1;
+
+            let eid = if let Some(ref s) = event.entry_id {
+                uuid::Uuid::parse_str(s).map_err(|e| e.to_string())?
+            } else {
+                uuid::Uuid::parse_str(&event.msg_id).map_err(|e| e.to_string())?
+            };
+            let ekind = event.entry_kind.as_deref().unwrap_or(&event.message_type);
+            let sreq = event.signed_request.as_deref().unwrap_or(&[]);
+            let ofp = event.outer_fingerprint.as_deref().unwrap_or(&[]);
+
+            remote_hasher.update_event(
+                event.seq,
+                event.epoch,
+                eid,
+                ekind,
+                &event.ciphertext,
+                sreq,
+                ofp,
+                event.created_at,
+            );
+            remote_scanned_count += 1;
+            remote_last_seq = event.seq;
+            remote_last_epoch = event.epoch;
+
+            if event.seq <= local_snapshot.last_seq {
+                if first_mismatch.is_none() {
+                    let local_row = local_map.get(&event.seq);
+                    let mismatch = match local_row {
+                        None => true,
+                        Some(lr) => {
+                            let payload_sha = Sha256::digest(&event.ciphertext);
+                            lr.seq != event.seq
+                                || lr.entry_id != eid
+                                || lr.epoch != event.epoch
+                                || lr.entry_kind != ekind
+                                || lr.accepted_payload_bytes != event.ciphertext
+                                || lr.signed_request_bytes != sreq
+                                || lr.outer_entry_fingerprint != ofp
+                                || lr.accepted_payload_sha256 != payload_sha.as_slice()
+                                || lr.received_at.timestamp_millis()
+                                    != event.created_at.timestamp_millis()
+                        }
+                    };
+                    if mismatch {
+                        first_mismatch = Some((event.seq, "prefix_mismatch"));
+                    }
+                }
+            } else {
+                if first_mismatch.is_none()
+                    && retained_suffix_chunk.len() < EVENTS_PAGE_LIMIT as usize
+                {
+                    let event_len = event.ciphertext.len() + sreq.len() + ofp.len() + 200;
+                    if retained_bytes + event_len <= ORDINARY_DS_CONTROL_MAX_BYTES {
+                        retained_bytes += event_len;
+                        retained_suffix_chunk.push(event.clone());
+                    }
+                }
+            }
+        }
+
+        if page.events.last().unwrap().seq != page.to_seq_inclusive {
+            return Err(format!(
+                "events page last seq mismatch with to_seq_inclusive"
+            ));
+        }
+
+        cursor = page.to_seq_inclusive;
+    }
+
+    if remote_scanned_count != remote_digest.event_count
+        || remote_last_seq != remote_digest.last_seq
+        || (remote_digest.last_seq > 0 && remote_last_epoch != remote_digest.epoch)
+    {
+        return Err(format!(
+            "scanned remote events do not match remote digest counts"
+        ));
+    }
+
+    let computed_remote_digest = remote_hasher.finalize();
+    if computed_remote_digest != remote_digest.digest_sha256 {
+        return Err(format!(
+            "recomputed remote digest does not match advertised digest"
+        ));
+    }
+
+    let decision = if let Some((mismatch_seq, reason)) = first_mismatch {
+        CleanDriftDecision::Quarantine {
+            first_mismatch_seq: mismatch_seq,
+            reason,
+        }
+    } else if remote_digest.last_seq < local_snapshot.last_seq {
+        CleanDriftDecision::Quarantine {
+            first_mismatch_seq: remote_digest.last_seq + 1,
+            reason: "local_ahead",
+        }
+    } else if remote_digest.last_seq > local_snapshot.last_seq {
+        CleanDriftDecision::ApplySuffix {
+            after_seq: local_snapshot.last_seq,
+        }
+    } else {
+        CleanDriftDecision::InSync
+    };
+
+    match decision {
+        CleanDriftDecision::InSync => Ok(()),
+        CleanDriftDecision::Quarantine {
+            first_mismatch_seq,
+            reason,
+        } => {
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            let locked_convo: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+                "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+            )
+            .bind(convo_uuid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let Some((_is_rem, _locked_ds, _locked_term)) = locked_convo else {
+                return Err(format!("conversation {convo_id} missing under lock"));
+            };
+
+            let current_local = local_clean_digest_state_tx(&mut tx, convo_uuid)
+                .await
+                .map_err(|e| e.to_string())?;
+            if current_local.last_seq != local_snapshot.last_seq
+                || current_local.digest_sha256 != local_snapshot.digest_sha256
+            {
+                return Err(format!("concurrent local head movement during quarantine"));
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO federation_sync_state
+                    (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status, quarantined_at, quarantine_reason, first_mismatch_seq)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, NOW(), 'quarantined', NOW(), $7, $8)
+                 ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
+                    quarantined_at = COALESCE(federation_sync_state.quarantined_at, EXCLUDED.quarantined_at),
+                    quarantine_reason = COALESCE(federation_sync_state.quarantine_reason, EXCLUDED.quarantine_reason),
+                    first_mismatch_seq = COALESCE(federation_sync_state.first_mismatch_seq, EXCLUDED.first_mismatch_seq),
+                    status = 'quarantined',
+                    drift_count = federation_sync_state.drift_count + 1,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&convo_id)
+            .bind(canonical_did(&remote_digest.sequencer_ds_did))
+            .bind(remote_digest.sequencer_term)
+            .bind(local_snapshot.last_seq)
+            .bind(local_snapshot.last_epoch)
+            .bind(hex::decode(&local_snapshot.digest_sha256).unwrap_or_default())
+            .bind(reason)
+            .bind(first_mismatch_seq)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            tx.commit().await.map_err(|e| e.to_string())?;
+            metrics::counter!("federation_reconciliation_quarantine_total", 1, "convo_id" => convo_id.clone(), "reason" => reason.to_string());
+            Ok(())
+        }
+        CleanDriftDecision::ApplySuffix { after_seq } => {
+            let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+            let locked_convo: Option<(bool, Option<String>, i64)> = sqlx::query_as(
+                "SELECT is_remote, sequencer_ds, sequencer_term FROM chat.conversations WHERE conversation_id = $1 FOR UPDATE",
+            )
+            .bind(convo_uuid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let Some((is_rem, locked_ds, locked_term)) = locked_convo else {
+                return Err(format!("conversation {convo_id} missing under lock"));
+            };
+            if !is_rem
+                || canonical_did(&locked_ds.unwrap_or_default())
+                    != canonical_did(&stored_seq_ds_str)
+                || locked_term != stored_term
+            {
+                return Err(format!(
+                    "conversation {convo_id} routing changed concurrently"
+                ));
+            }
+
+            let is_quarantined: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM federation_sync_state WHERE convo_id = $1 AND status = 'quarantined')",
+            )
+            .bind(&convo_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if is_quarantined {
+                return Err(format!("conversation {convo_id} is quarantined"));
+            }
+
+            let current_local = local_clean_digest_state_tx(&mut tx, convo_uuid)
+                .await
+                .map_err(|e| e.to_string())?;
+            if current_local.last_seq != local_snapshot.last_seq
+                || current_local.digest_sha256 != local_snapshot.digest_sha256
+            {
+                return Err(format!(
+                    "concurrent local head movement during suffix apply"
+                ));
+            }
+
+            apply_remote_clean_events(&mut tx, convo_uuid, &retained_suffix_chunk).await?;
+
+            let new_last_seq = retained_suffix_chunk.last().map_or(after_seq, |e| e.seq);
+            sqlx::query(
+                "UPDATE chat.conversations SET next_entry_seq = GREATEST(next_entry_seq, $2 + 1) WHERE conversation_id = $1",
+            )
+            .bind(convo_uuid)
+            .bind(new_last_seq)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let new_local = local_clean_digest_state_tx(&mut tx, convo_uuid)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let update_res = sqlx::query(
+                r#"
+                INSERT INTO federation_sync_state
+                    (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, NOW(), 'healthy')
+                 ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
+                    sequencer_term = EXCLUDED.sequencer_term,
+                    last_seq = EXCLUDED.last_seq,
+                    last_epoch = EXCLUDED.last_epoch,
+                    last_digest = EXCLUDED.last_digest,
+                    last_reconciled_at = NOW(),
+                    drift_count = federation_sync_state.drift_count + 1,
+                    updated_at = NOW()
+                 WHERE federation_sync_state.status = 'healthy'
+                "#,
+            )
+            .bind(&convo_id)
+            .bind(canonical_did(&remote_digest.sequencer_ds_did))
+            .bind(remote_digest.sequencer_term)
+            .bind(new_local.last_seq)
+            .bind(new_local.last_epoch)
+            .bind(hex::decode(&new_local.digest_sha256).unwrap_or_default())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if update_res.rows_affected() == 0 {
+                return Err(format!(
+                    "failed to update healthy sync state (quarantined concurrently)"
+                ));
+            }
+
+            tx.commit().await.map_err(|e| e.to_string())?;
+            metrics::counter!("federation_reconciliation_applied_total", 1, "convo_id" => convo_id.clone());
+            Ok(())
+        }
+    }
 }
 
 async fn reconcile_conversation_internal(
@@ -269,28 +817,11 @@ async fn reconcile_conversation_internal(
 
     let digest_token = auth_sign(sequencer_ds, DIGEST_NSID)
         .map_err(|e| format!("failed to sign digest request: {e}"))?;
-    let digest_json = outbound
-        .call_query_json_pinned(
-            &destination,
-            DIGEST_NSID,
-            &digest_token,
-            &[("convoId", convo_id)],
-        )
+    let remote_digest =
+        query_remote_digest(outbound, &destination, &digest_token, convo_id).await?;
+    let mut local_state = local_legacy_digest_state(pool, convo_id)
         .await
-        .map_err(|e| format!("digest query failed: {e}"))?;
-    let remote_digest: RemoteConvoDigest =
-        serde_json::from_value(digest_json).map_err(|e| format!("invalid digest response: {e}"))?;
-
-    let mut local_state = if is_clean {
-        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
-        local_clean_digest_state(pool, convo_uuid)
-            .await
-            .map_err(|e| format!("local clean digest failed: {e}"))?
-    } else {
-        local_legacy_digest_state(pool, convo_id)
-            .await
-            .map_err(|e| format!("local legacy digest failed: {e}"))?
-    };
+        .map_err(|e| format!("local legacy digest failed: {e}"))?;
     let drifted = local_state.digest_sha256 != remote_digest.digest_sha256
         || local_state.last_seq != remote_digest.last_seq
         || local_state.event_count != remote_digest.event_count;
@@ -308,24 +839,15 @@ async fn reconcile_conversation_internal(
         loop {
             let events_token = auth_sign(sequencer_ds, EVENTS_NSID)
                 .map_err(|e| format!("failed to sign events request: {e}"))?;
-            let after_seq_s = after_seq.to_string();
-            let limit_s = EVENTS_PAGE_LIMIT.to_string();
-            let events_json = outbound
-                .call_query_json_pinned(
-                    &destination,
-                    EVENTS_NSID,
-                    &events_token,
-                    &[
-                        ("convoId", convo_id),
-                        ("afterSeq", &after_seq_s),
-                        ("limit", &limit_s),
-                    ],
-                )
-                .await
-                .map_err(|e| format!("events query failed: {e}"))?;
-            let page: RemoteConvoEvents = serde_json::from_value(events_json)
-                .map_err(|e| format!("invalid events response: {e}"))?;
-
+            let page = query_remote_events(
+                outbound,
+                &destination,
+                &events_token,
+                convo_id,
+                after_seq,
+                EVENTS_PAGE_LIMIT,
+            )
+            .await?;
             if page.events.is_empty() {
                 break;
             }
@@ -335,64 +857,33 @@ async fn reconcile_conversation_internal(
                     page.to_seq_inclusive
                 ));
             }
-            if is_clean {
-                let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
-                apply_remote_clean_events(pool, convo_uuid, &page.events)
-                    .await
-                    .map_err(|e| format!("apply clean events failed: {e}"))?;
-            } else {
-                apply_remote_events(pool, convo_id, &page.events)
-                    .await
-                    .map_err(|e| format!("apply legacy events failed: {e}"))?;
-            }
+            apply_remote_events(pool, convo_id, &page.events)
+                .await
+                .map_err(|e| format!("apply legacy events failed: {e}"))?;
             after_seq = page.to_seq_inclusive;
             if page.events.len() < EVENTS_PAGE_LIMIT as usize {
                 break;
             }
         }
 
-        if is_clean {
-            let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| e.to_string())?;
-            sqlx::query(
-                "UPDATE chat.conversations \
-                 SET sequencer_term = GREATEST(sequencer_term, $2), \
-                     sequencer_ds = $3 \
-                 WHERE conversation_id = $1",
-            )
-            .bind(convo_uuid)
-            .bind(remote_digest.sequencer_term)
-            .bind(canonical_did(&remote_digest.sequencer_ds_did))
-            .execute(pool)
-            .await
-            .map_err(|e| {
-                format!("failed to update chat.conversations after reconciliation: {e}")
-            })?;
+        sqlx::query(
+            "UPDATE conversations \
+             SET current_epoch = GREATEST(current_epoch, $2), \
+                 sequencer_term = GREATEST(COALESCE(sequencer_term, 0), $3), \
+                 sequencer_ds = $4 \
+             WHERE id = $1",
+        )
+        .bind(convo_id)
+        .bind(remote_digest.epoch)
+        .bind(remote_digest.sequencer_term)
+        .bind(canonical_did(&remote_digest.sequencer_ds_did))
+        .execute(pool)
+        .await
+        .map_err(|e| format!("failed to update conversation state after reconciliation: {e}"))?;
 
-            local_state = local_clean_digest_state(pool, convo_uuid)
-                .await
-                .map_err(|e| format!("local clean digest after reconcile failed: {e}"))?;
-        } else {
-            sqlx::query(
-                "UPDATE conversations \
-                 SET current_epoch = GREATEST(current_epoch, $2), \
-                     sequencer_term = GREATEST(COALESCE(sequencer_term, 0), $3), \
-                     sequencer_ds = $4 \
-                 WHERE id = $1",
-            )
-            .bind(convo_id)
-            .bind(remote_digest.epoch)
-            .bind(remote_digest.sequencer_term)
-            .bind(canonical_did(&remote_digest.sequencer_ds_did))
-            .execute(pool)
+        local_state = local_legacy_digest_state(pool, convo_id)
             .await
-            .map_err(|e| {
-                format!("failed to update conversation state after reconciliation: {e}")
-            })?;
-
-            local_state = local_legacy_digest_state(pool, convo_id)
-                .await
-                .map_err(|e| format!("local legacy digest after reconcile failed: {e}"))?;
-        }
+            .map_err(|e| format!("local legacy digest after reconcile failed: {e}"))?;
     }
 
     let drift_increment = if drifted { 1_i64 } else { 0_i64 };
@@ -505,43 +996,14 @@ async fn apply_remote_events(
     Ok(())
 }
 async fn apply_remote_clean_events(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     convo_id: uuid::Uuid,
     events: &[RemoteEvent],
 ) -> Result<(), String> {
-    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
     for event in events {
-        let seq_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM chat.entries WHERE conversation_id = $1 AND seq = $2)",
-        )
-        .bind(convo_id)
-        .bind(event.seq)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        if seq_exists {
-            continue;
-        }
-
-        let entry_id = if let Some(ref eid) = event.entry_id {
-            uuid::Uuid::parse_str(eid).map_err(|e| e.to_string())?
-        } else if let Ok(u) = uuid::Uuid::parse_str(&event.msg_id) {
-            u
-        } else {
-            uuid::Uuid::new_v4()
-        };
-
-        let message_id = if event.message_type == "blue.catbird.chat.defs#applicationEntry"
-            || event.message_type == "app"
-        {
-            uuid::Uuid::parse_str(&event.msg_id).ok()
-        } else {
-            None
-        };
-
-        let entry_kind = if event.message_type == "app" {
+        let entry_kind = if let Some(ek) = &event.entry_kind {
+            ek.clone()
+        } else if event.message_type == "app" {
             "blue.catbird.chat.defs#applicationEntry".to_string()
         } else if event.message_type == "commit" {
             "blue.catbird.chat.defs#commitEntry".to_string()
@@ -549,48 +1011,46 @@ async fn apply_remote_clean_events(
             event.message_type.clone()
         };
 
+        if entry_kind != "blue.catbird.chat.defs#applicationEntry" {
+            return Err(format!(
+                "unsupported clean event kind during reconciliation: {entry_kind}"
+            ));
+        }
+
+        let signed_req = event.signed_request.as_deref().ok_or_else(|| {
+            format!(
+                "missing signedRequest for application entry seq {}",
+                event.seq
+            )
+        })?;
+        let mutation =
+            crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_req)
+                .map_err(|e| format!("invalid signedRequest for seq {}: {e:?}", event.seq))?;
+
+        let actor_did = mutation.actor_did().as_str().to_string();
+        let actor_device_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
+        let actor_key_id = mutation.key_id().as_str().to_string();
+        let actor_auth_gen = mutation.auth_generation() as i64;
+        let req_digest = mutation.request_digest().to_vec();
+        let signature = mutation.signature().to_vec();
+        let transcript_bytes = mutation.transcript_bytes().to_vec();
         let payload_sha256: [u8; 32] = Sha256::digest(&event.ciphertext).into();
-        let signed_req = event.signed_request.clone().unwrap_or_default();
         let outer_fp = event
             .outer_fingerprint
             .clone()
             .unwrap_or_else(|| payload_sha256.to_vec());
 
-        let empty_server_fields =
-            serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
-                .unwrap_or_default();
+        let entry_id = if let Some(eid) = &event.entry_id {
+            uuid::Uuid::parse_str(eid).map_err(|e| e.to_string())?
+        } else {
+            uuid::Uuid::parse_str(&event.msg_id).map_err(|e| e.to_string())?
+        };
 
-        // For an application entry, the wire protocol carries only the signed
-        // request. The `chat.message_sends` side row that the deferred
-        // `entries_message_send_fk` requires is derived deterministically from
-        // the canonical signed mutation (transcript, request digest, signature)
-        // and the delivered payload — mirroring `deliver_message_replication`'s
-        // `append_exact_application_entry` side row. This is the same material
-        // the sequencer DS persisted when it accepted the send, so a remote
-        // mailbox reconciles to a byte-identical row.
-        let mut actor_did_final = "did:web:unknown.actor".to_string();
-        let mut actor_device_id_final = uuid::Uuid::nil();
-        let mut actor_key_id_final = "unknown".to_string();
-        let mut actor_auth_gen_final = 1i64;
-        let mut request_digest_bytes = Sha256::digest(&signed_req).to_vec();
-        let mut signature_bytes = vec![0u8; 64];
-        let mut transcript_bytes: Vec<u8> = Vec::new();
-        if !signed_req.is_empty() {
-            if let Ok(mutation) =
-                crate::chat_protocol::transcript::decode_canonical_signed_mutation(&signed_req)
-            {
-                actor_did_final = mutation.actor_did().as_str().to_string();
-                actor_device_id_final =
-                    uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
-                actor_key_id_final = mutation.key_id().as_str().to_string();
-                actor_auth_gen_final = mutation.auth_generation() as i64;
-                request_digest_bytes = mutation.request_digest().to_vec();
-                signature_bytes = mutation.signature().to_vec();
-                transcript_bytes = mutation.transcript_bytes().to_vec();
-            }
-        }
-        let req_digest = request_digest_bytes;
-        let signature = signature_bytes;
+        let message_id = uuid::Uuid::parse_str(&event.msg_id).map_err(|e| e.to_string())?;
+
+        let server_fields_bytes =
+            serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
+                .map_err(|e| e.to_string())?;
 
         sqlx::query(
             r#"
@@ -607,7 +1067,6 @@ async fn apply_remote_clean_events(
                 $12, $13, $14, $15,
                 $16, $17, $18
             )
-            ON CONFLICT (conversation_id, seq) DO NOTHING
             "#,
         )
         .bind(convo_id)
@@ -616,81 +1075,58 @@ async fn apply_remote_clean_events(
         .bind(&entry_kind)
         .bind(&event.ciphertext)
         .bind(&payload_sha256[..])
-        .bind(&signed_req)
+        .bind(signed_req)
         .bind(&req_digest)
         .bind(&signature)
-        .bind(&empty_server_fields)
+        .bind(&server_fields_bytes)
         .bind(&outer_fp)
-        .bind(&actor_did_final)
-        .bind(actor_device_id_final)
-        .bind(&actor_key_id_final)
-        .bind(actor_auth_gen_final)
+        .bind(&actor_did)
+        .bind(actor_device_id)
+        .bind(&actor_key_id)
+        .bind(actor_auth_gen)
         .bind(event.epoch)
         .bind(message_id)
         .bind(event.created_at)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("failed to insert entry seq {}: {e}", event.seq))?;
 
-        // Mirror the accepted send's `chat.message_sends` row so the deferred
-        // `entries_message_send_fk` (and the `message_sends_application_entry_fk`
-        // back-reference) hold. The `entries_message_identity_uq` on the entry
-        // guarantees at most one send per (conversation, message), so this
-        // insert is idempotent under replay.
-        if let Some(mid) = message_id {
-            let outcome_bytes = serde_json::to_vec(&serde_json::json!({
-                "entry": {
-                    "entryId": entry_id.to_string(),
-                    "conversationId": convo_id.to_string(),
-                    "seq": event.seq,
-                    "signedRequest": serde_json::from_slice::<serde_json::Value>(&signed_req)
-                        .unwrap_or(serde_json::Value::Null),
-                    "receivedAt": event.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                }
-            }))
-            .map_err(|e| format!("failed to serialize reconciled send outcome: {e}"))?;
-            let outcome_sha = Sha256::digest(&outcome_bytes).to_vec();
-            sqlx::query(
-                r#"
-                INSERT INTO chat.message_sends (
-                    conversation_id, message_id, signed_request_bytes,
-                    signing_transcript_bytes, request_digest, signature, status,
-                    accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', $7, $8, $9, $10)
-                ON CONFLICT (conversation_id, message_id) DO NOTHING
-                "#,
-            )
-            .bind(convo_id)
-            .bind(mid)
-            .bind(&signed_req)
-            .bind(&transcript_bytes)
-            .bind(&req_digest)
-            .bind(&signature)
-            .bind(event.seq)
-            .bind(&outcome_bytes)
-            .bind(&outcome_sha)
-            .bind(event.created_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("failed to insert reconciled message_sends row: {e}"))?;
-        }
+        let outcome_bytes = serde_json::to_vec(&serde_json::json!({
+            "entry": {
+                "entryId": entry_id.to_string(),
+                "conversationId": convo_id.to_string(),
+                "seq": event.seq,
+                "signedRequest": serde_json::from_slice::<serde_json::Value>(signed_req)
+                    .unwrap_or(serde_json::Value::Null),
+                "receivedAt": event.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            }
+        }))
+        .map_err(|e| format!("failed to serialize reconciled send outcome: {e}"))?;
+        let outcome_sha256 = Sha256::digest(&outcome_bytes).to_vec();
 
-        // Advance next_entry_seq in chat.conversations
         sqlx::query(
             r#"
-            UPDATE chat.conversations
-               SET next_entry_seq = GREATEST(next_entry_seq, $2 + 1)
-             WHERE conversation_id = $1
+            INSERT INTO chat.message_sends (
+                conversation_id, message_id, signed_request_bytes,
+                signing_transcript_bytes, request_digest, signature, status,
+                accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', $7, $8, $9, $10)
             "#,
         )
         .bind(convo_id)
+        .bind(message_id)
+        .bind(signed_req)
+        .bind(&transcript_bytes)
+        .bind(&req_digest)
+        .bind(&signature)
         .bind(event.seq)
-        .execute(&mut *tx)
+        .bind(&outcome_bytes)
+        .bind(&outcome_sha256)
+        .bind(event.created_at)
+        .execute(&mut **tx)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("failed to insert message_sends for seq {}: {e}", event.seq))?;
     }
-
-    tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -720,6 +1156,7 @@ async fn local_clean_digest_state(
            entry_id, \
            entry_kind, \
            accepted_payload_bytes, \
+           accepted_payload_sha256, \
            signed_request_bytes, \
            outer_entry_fingerprint, \
            received_at \
@@ -729,6 +1166,54 @@ async fn local_clean_digest_state(
         )
         .bind(convo_id)
         .fetch_all(pool)
+        .await?;
+
+    let digest_sha256 = crate::handlers::ds::get_convo_digest::compute_clean_convo_digest(&rows);
+
+    Ok(LocalDigestState {
+        last_seq,
+        last_epoch,
+        event_count,
+        digest_sha256,
+    })
+}
+
+async fn local_clean_digest_state_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    convo_id: uuid::Uuid,
+) -> Result<LocalDigestState, sqlx::Error> {
+    let stats = sqlx::query(
+        "SELECT \
+           CAST(COALESCE(MAX(seq), 0) AS BIGINT) AS last_seq, \
+           CAST(COALESCE(MAX(generation), 0) AS BIGINT) AS last_epoch, \
+           CAST(COUNT(*) AS BIGINT) AS event_count \
+         FROM chat.entries WHERE conversation_id = $1",
+    )
+    .bind(convo_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let last_seq: i64 = stats.try_get("last_seq")?;
+    let last_epoch: i64 = stats.try_get("last_epoch")?;
+    let event_count: i64 = stats.try_get("event_count")?;
+
+    let rows: Vec<crate::handlers::ds::get_convo_digest::CleanDigestRow> =
+        sqlx::query_as::<_, crate::handlers::ds::get_convo_digest::CleanDigestRow>(
+            "SELECT \
+           CAST(seq AS BIGINT) AS seq, \
+           CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+           entry_id, \
+           entry_kind, \
+           accepted_payload_bytes, \
+           accepted_payload_sha256, \
+           signed_request_bytes, \
+           outer_entry_fingerprint, \
+           received_at \
+         FROM chat.entries \
+         WHERE conversation_id = $1 \
+         ORDER BY seq ASC",
+        )
+        .bind(convo_id)
+        .fetch_all(&mut **tx)
         .await?;
 
     let digest_sha256 = crate::handlers::ds::get_convo_digest::compute_clean_convo_digest(&rows);

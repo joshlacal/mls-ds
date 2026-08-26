@@ -252,7 +252,7 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 2
             },
             CleanProtocol13ManifestEntry {
                 filename: "20260824000005_chat_federation_outbox_retry.sql",
-                reviewed_sha384: "b1d27a2592853d871977c976fec511c5a39f015b8f6a225e63652374ea9da42c4d07773ca3d269c76e1da753d469a66f",
+                reviewed_sha384: "0321bc46edabad8945c4e23baeb7a1d8972be46dd25e81d88e1dfe1b62c9a8d525ae113764dbb9f65e7dee5bea221a8e",
                 migration: Migration::new(
                     20260824000005,
                     Cow::Borrowed("chat federation outbox retry"),

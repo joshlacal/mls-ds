@@ -2335,6 +2335,8 @@ const FEDERATION_RECEIPT_TABLES: [&str; 1] = ["federation_delivery_receipts"];
 const PUBLIC_FEDERATION_TRANSPORT_RELATIONS: &[&str] = &[
     "federation_outbox",
     "federation_outbox_pkey",
+    "federation_sync_state",
+    "federation_sync_state_pkey",
     "idx_federation_outbox_due_v2",
     "idx_federation_outbox_lease",
     "outbound_queue",
@@ -8387,6 +8389,8 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
             "auth_jti_nonce_pkey|i".to_owned(),
             "federation_outbox|r".to_owned(),
             "federation_outbox_pkey|i".to_owned(),
+            "federation_sync_state|r".to_owned(),
+            "federation_sync_state_pkey|i".to_owned(),
             "idx_auth_jti_nonce_expires|i".to_owned(),
             "idx_federation_outbox_due_v2|i".to_owned(),
             "idx_federation_outbox_lease|i".to_owned(),
@@ -8403,7 +8407,9 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
             "_sqlx_migrations_pkey|p".to_owned(),
             "auth_jti_nonce_pkey|p".to_owned(),
             "federation_outbox_pkey|p".to_owned(),
-            "federation_outbox_status_check|c".to_owned(),
+            "federation_sync_state_pkey|p".to_owned(),
+            "federation_sync_state_quarantine_shape_check|c".to_owned(),
+            "federation_sync_state_status_check|c".to_owned(),
             "outbound_queue_pkey|p".to_owned(),
             "outbound_queue_status_check|c".to_owned(),
         ],
@@ -10109,6 +10115,20 @@ async fn clean_chat_schema_preserves_all_core_invariants_and_receipt_table() {
             (
                 "idx_outbound_queue_lease is partial on status = 'in_flight'",
                 compact_sql.contains("CREATE INDEX IF NOT EXISTS idx_outbound_queue_lease ON outbound_queue(claim_expires_at) WHERE status = 'in_flight'"),
+            ),
+        ],
+    );
+
+    assert_source_contract(
+        "federation sync state quarantine constraints",
+        &[
+            (
+                "quarantine status check",
+                compact_sql.contains("CHECK (status IN ('healthy', 'quarantined'))"),
+            ),
+            (
+                "quarantine shape check",
+                compact_sql.contains("CONSTRAINT federation_sync_state_quarantine_shape_check"),
             ),
         ],
     );

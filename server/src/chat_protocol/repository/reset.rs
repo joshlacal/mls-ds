@@ -2480,6 +2480,9 @@ fn map_aggregate_error(error: ConversationStateHydrationError) -> ResetRepositor
             ResetRepositoryError::ConversationNotActive
         }
         ConversationStateHydrationError::ResetWork(_) => ResetRepositoryError::InvalidResetRow,
+        ConversationStateHydrationError::ReadSetMismatch => {
+            ResetRepositoryError::CompareAndSetConflict
+        }
         ConversationStateHydrationError::Database(error)
         | ConversationStateHydrationError::Head(ConversationHeadHydrationError::Database(error)) => {
             ResetRepositoryError::Database(error)

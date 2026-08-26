@@ -10341,19 +10341,38 @@ pub(crate) fn certify_no_terminal_proofs(
 ///
 /// The returned guard remains valid only while `transaction` remains open. This
 /// function never begins, commits, or rolls back a transaction.
+pub(crate) async fn is_conversation_quarantined(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let quarantined: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM federation_sync_state
+            WHERE convo_id = $1 AND status = 'quarantined'
+        )",
+    )
+    .bind(conversation_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(quarantined)
+}
+
 #[allow(dead_code)]
 pub(crate) async fn hydrate_locked_conversation_state(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
     locked_at: DateTime<Utc>,
 ) -> Result<LockedConversationStateGuard, ConversationStateHydrationError> {
+    if is_conversation_quarantined(transaction, conversation_id).await? {
+        return Err(ConversationStateHydrationError::ReadSetMismatch);
+    }
+
     let head = hydrate_locked_conversation_head(transaction, conversation_id, locked_at)
         .await
         .map_err(ConversationStateHydrationError::Head)?;
     let Some(head_coordinate) = head.prior_coordinate() else {
         return Err(ConversationStateHydrationError::ReadSetMismatch);
     };
-
     let kind_and_lifecycle: Option<(String, String)> =
         sqlx::query_as("SELECT kind,lifecycle FROM chat.conversations WHERE conversation_id=$1")
             .bind(conversation_id)

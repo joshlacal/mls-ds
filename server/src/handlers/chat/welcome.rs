@@ -146,6 +146,17 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
         | E::ExecutionHydration(
             crate::chat_protocol::repository::execution_context::ExecutionContextHydrationError::Database(_),
         ) => ChatFailure::storage(endpoint),
+        E::Aggregate(crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch) => {
+            match endpoint {
+                ChatEndpoint::AcknowledgeWelcome => {
+                    ChatFailure::protocol(endpoint, C::AcknowledgementConflict)
+                }
+                ChatEndpoint::RejectWelcome => {
+                    ChatFailure::protocol(endpoint, C::RejectionConflict)
+                }
+                _ => ChatFailure::invariant(endpoint),
+            }
+        }
         E::Aggregate(_)
         | E::WelcomeLock(_)
         | E::StateMachine(_)

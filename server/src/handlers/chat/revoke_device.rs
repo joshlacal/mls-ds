@@ -93,6 +93,9 @@ fn revocation_failure(error: DeviceRevocationFacadeError) -> ChatFailure {
         E::AuthenticationGenerationConflict => {
             ChatFailure::protocol(ENDPOINT, C::AuthenticationGenerationConflict)
         }
+        E::Conversation(
+            crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch,
+        ) => ChatFailure::protocol(ENDPOINT, C::IdempotencyConflict),
         E::G6Prelude(_)
         | E::Conversation(_)
         | E::TargetProjection

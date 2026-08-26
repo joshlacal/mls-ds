@@ -89,6 +89,9 @@ fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> C
             crate::chat_protocol::repository::core::ConversationStateHydrationError::Database(_) => {
                 ChatFailure::storage(endpoint)
             }
+            crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch => {
+                ChatFailure::protocol(endpoint, C::StaleCoordinates)
+            }
             _ => ChatFailure::protocol(endpoint, C::ConversationNotFound),
         },
         E::RecoveryPackage(error) => match error {

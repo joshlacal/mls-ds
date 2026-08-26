@@ -39,8 +39,13 @@ use catbird_server::federation::envelope::{
     compute_welcome_envelope_digest, ValidatedEntryLocator, ValidatedEnvelopeHeader,
     DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID,
 };
+use catbird_server::federation::outbound::OutboundClient;
+use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestination};
 use catbird_server::federation::FederationMode;
 use catbird_server::handlers::chat::ChatRuntime;
+use catbird_server::handlers::ds::get_convo_digest::{
+    compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput,
+};
 use catbird_server::storage::DbPool;
 use chrono::{DateTime, SecondsFormat, Utc};
 use common::fresh_db::{fresh_legacy_pool, DisposableDatabase};
@@ -5570,6 +5575,7 @@ struct MailboxStateSnapshot {
     chat_outbox: Vec<String>,
     outbox: Vec<String>,
     queue: Vec<String>,
+    message_sends: Vec<String>,
 }
 
 async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
@@ -5748,6 +5754,13 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
     .await
     .unwrap();
 
+    let message_sends = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.message_sends ORDER BY conversation_id, message_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
     MailboxStateSnapshot {
         conversations,
         generations,
@@ -5774,6 +5787,7 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
         chat_outbox,
         outbox,
         queue,
+        message_sends,
     }
 }
 
@@ -7605,5 +7619,825 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         call_counts.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "Call 3 local replay must NOT trigger a new remote call"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converges() {
+    let harness = TestHarness::new("recon-suffix").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    let msg_id_2 = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2) =
+        make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
+    let ciphertext_2 = vec![0x31u8; 8];
+    let payload_sha256_2 = Sha256::digest(&ciphertext_2).to_vec();
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let remote_row_2 = CleanDigestRow {
+        seq: 2,
+        epoch: 0,
+        entry_id: msg_id_2,
+        entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+        accepted_payload_bytes: ciphertext_2.clone(),
+        accepted_payload_sha256: payload_sha256_2.clone(),
+        signed_request_bytes: signed_req_bytes_2.clone(),
+        outer_entry_fingerprint: payload_sha256_2.clone(),
+        received_at: now,
+    };
+
+    let remote_rows = vec![
+        CleanDigestRow {
+            seq: local_row_1.seq,
+            epoch: local_row_1.epoch,
+            entry_id: local_row_1.entry_id,
+            entry_kind: local_row_1.entry_kind.clone(),
+            accepted_payload_bytes: local_row_1.accepted_payload_bytes.clone(),
+            accepted_payload_sha256: local_row_1.accepted_payload_sha256.clone(),
+            signed_request_bytes: local_row_1.signed_request_bytes.clone(),
+            outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
+            received_at: local_row_1.received_at,
+        },
+        remote_row_2,
+    ];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 2,
+        event_count: 2,
+        digest_sha256: remote_digest_sha256.clone(),
+        generated_at: now,
+    };
+
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 2,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            },
+            {
+                "seq": 2,
+                "epoch": 0,
+                "msgId": msg_id_2.to_string(),
+                "messageType": "blue.catbird.chat.defs#applicationEntry",
+                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
+                "paddedSize": ciphertext_2.len() as i64,
+                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": msg_id_2.to_string(),
+                "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&payload_sha256_2)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_ok(),
+        "reconcile_conversation must succeed: {:?}",
+        res
+    );
+
+    let entry_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chat.entries WHERE conversation_id = $1")
+            .bind(convo_id)
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(entry_count, 2, "suffix entry must be applied to DS2");
+
+    let sync_state: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT status, last_seq, quarantine_reason FROM federation_sync_state WHERE convo_id = $1",
+    )
+    .bind(&convo_id_str)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_state.0, "healthy");
+    assert_eq!(sync_state.1, 2);
+    assert_eq!(sync_state.2, None);
+}
+
+#[tokio::test]
+async fn test_reconciliation_same_last_seq_differing_fingerprint_quarantines_without_clean_table_mutation(
+) {
+    let harness = TestHarness::new("recon-mismatch").await;
+    let now = Utc::now();
+
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    // Seed an entry at seq 2 on local DS2
+    let msg_id_2_local = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2_local) =
+        make_message_body(convo_id, msg_id_2_local, &alice, &group_id, vec![], now);
+    let ciphertext_2_local = vec![0x31u8; 8];
+    let payload_sha256_2_local = Sha256::digest(&ciphertext_2_local).to_vec();
+
+    let mutation_local = decode_canonical_signed_mutation(&signed_req_bytes_2_local).unwrap();
+    let req_digest_local = mutation_local.request_digest().to_vec();
+    let sig_bytes_local = mutation_local.signature().to_vec();
+    let transcript_local = mutation_local.transcript_bytes().to_vec();
+
+    let outcome_bytes_local = serde_json::to_vec(&serde_json::json!({
+        "entry": {
+            "entryId": msg_id_2_local.to_string(),
+            "conversationId": convo_id.to_string(),
+            "seq": 2,
+            "signedRequest": serde_json::from_slice::<serde_json::Value>(&signed_req_bytes_2_local).unwrap(),
+            "receivedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        }
+    }))
+    .unwrap();
+    let outcome_sha_local = Sha256::digest(&outcome_bytes_local).to_vec();
+
+    let mut tx = harness.pool.begin().await.unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256, signed_request_bytes,
+            request_digest, signature, server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, message_id, received_at
+        ) VALUES (
+            $1, 2, $2, 'blue.catbird.chat.defs#applicationEntry',
+            $3, $4, $5,
+            $6, $7, '\xa0', $8,
+            $9, $10, $11, 1,
+            0, $2, $12
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(msg_id_2_local)
+    .bind(&ciphertext_2_local)
+    .bind(&payload_sha256_2_local)
+    .bind(&signed_req_bytes_2_local)
+    .bind(&req_digest_local)
+    .bind(&sig_bytes_local)
+    .bind(&payload_sha256_2_local)
+    .bind(&alice.did)
+    .bind(alice.device_id)
+    .bind(&alice.key_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.message_sends (
+            conversation_id, message_id, signed_request_bytes,
+            signing_transcript_bytes, request_digest, signature, status,
+            accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', 2, $7, $8, $9)
+        "#,
+    )
+    .bind(convo_id)
+    .bind(msg_id_2_local)
+    .bind(&signed_req_bytes_2_local)
+    .bind(&transcript_local)
+    .bind(&req_digest_local)
+    .bind(&sig_bytes_local)
+    .bind(&outcome_bytes_local)
+    .bind(&outcome_sha_local)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1")
+        .bind(convo_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Sequencer DS1 has seq 2 with DIFFERENT payload
+    let msg_id_2_remote = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2_remote) =
+        make_message_body(convo_id, msg_id_2_remote, &alice, &group_id, vec![], now);
+    let ciphertext_2_remote = vec![0x99u8; 8];
+    let payload_sha256_2_remote = Sha256::digest(&ciphertext_2_remote).to_vec();
+
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let remote_row_2 = CleanDigestRow {
+        seq: 2,
+        epoch: 0,
+        entry_id: msg_id_2_remote,
+        entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
+        accepted_payload_bytes: ciphertext_2_remote.clone(),
+        accepted_payload_sha256: payload_sha256_2_remote.clone(),
+        signed_request_bytes: signed_req_bytes_2_remote.clone(),
+        outer_entry_fingerprint: payload_sha256_2_remote.clone(),
+        received_at: now,
+    };
+
+    let remote_rows = vec![
+        CleanDigestRow {
+            seq: local_row_1.seq,
+            epoch: local_row_1.epoch,
+            entry_id: local_row_1.entry_id,
+            entry_kind: local_row_1.entry_kind.clone(),
+            accepted_payload_bytes: local_row_1.accepted_payload_bytes.clone(),
+            accepted_payload_sha256: local_row_1.accepted_payload_sha256.clone(),
+            signed_request_bytes: local_row_1.signed_request_bytes.clone(),
+            outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
+            received_at: local_row_1.received_at,
+        },
+        remote_row_2,
+    ];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 2,
+        event_count: 2,
+        digest_sha256: remote_digest_sha256.clone(),
+        generated_at: now,
+    };
+
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 2,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            },
+            {
+                "seq": 2,
+                "epoch": 0,
+                "msgId": msg_id_2_remote.to_string(),
+                "messageType": "blue.catbird.chat.defs#applicationEntry",
+                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2_remote)},
+                "paddedSize": ciphertext_2_remote.len() as i64,
+                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": msg_id_2_remote.to_string(),
+                "entryKind": "blue.catbird.chat.defs#applicationEntry",
+                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2_remote)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&payload_sha256_2_remote)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "reconcile_conversation must succeed (quarantine recorded): {:?}",
+        res
+    );
+
+    let sync_state: (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, quarantine_reason, first_mismatch_seq FROM federation_sync_state WHERE convo_id = $1",
+    )
+    .bind(&convo_id_str)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_state.0, "quarantined");
+    assert_eq!(sync_state.1.as_deref(), Some("prefix_mismatch"));
+    assert_eq!(sync_state.2, Some(2));
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "quarantined conversation must leave all clean tables byte-for-byte unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_reconciliation_local_ahead_of_sequencer_quarantines_without_truncation_or_overwrite()
+{
+    let harness = TestHarness::new("recon-ahead").await;
+    let now = Utc::now();
+    let convo_id = Uuid::new_v4();
+    let group_id = vec![0x42u8; 32];
+    let alice = TestActor::generate();
+    alice.seed(&harness.pool, now).await;
+    seed_conversation_structure(
+        &harness.pool,
+        convo_id,
+        &group_id,
+        true,
+        Some(&harness.sequencer_ds_did),
+        0,
+        &alice,
+        Some(&harness.sender_ds_did),
+        now,
+    )
+    .await;
+
+    // Seed entry at seq 2 on local DS2
+    let msg_id_2_local = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_2_local) =
+        make_message_body(convo_id, msg_id_2_local, &alice, &group_id, vec![], now);
+    let ciphertext_2_local = vec![0x31u8; 8];
+    let payload_sha256_2_local = Sha256::digest(&ciphertext_2_local).to_vec();
+
+    let mutation_local = decode_canonical_signed_mutation(&signed_req_bytes_2_local).unwrap();
+    let req_digest_local = mutation_local.request_digest().to_vec();
+    let sig_bytes_local = mutation_local.signature().to_vec();
+    let transcript_local = mutation_local.transcript_bytes().to_vec();
+
+    let outcome_bytes_local = serde_json::to_vec(&serde_json::json!({
+        "entry": {
+            "entryId": msg_id_2_local.to_string(),
+            "conversationId": convo_id.to_string(),
+            "seq": 2,
+            "signedRequest": serde_json::from_slice::<serde_json::Value>(&signed_req_bytes_2_local).unwrap(),
+            "receivedAt": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        }
+    }))
+    .unwrap();
+    let outcome_sha_local = Sha256::digest(&outcome_bytes_local).to_vec();
+
+    let mut tx = harness.pool.begin().await.unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO chat.entries (
+            conversation_id, seq, entry_id, entry_kind,
+            accepted_payload_bytes, accepted_payload_sha256, signed_request_bytes,
+            request_digest, signature, server_fields_bytes, outer_entry_fingerprint,
+            actor_did, actor_device_id, actor_key_id, actor_auth_generation,
+            generation, message_id, received_at
+        ) VALUES (
+            $1, 2, $2, 'blue.catbird.chat.defs#applicationEntry',
+            $3, $4, $5,
+            $6, $7, '\xa0', $8,
+            $9, $10, $11, 1,
+            0, $2, $12
+        )
+        "#,
+    )
+    .bind(convo_id)
+    .bind(msg_id_2_local)
+    .bind(&ciphertext_2_local)
+    .bind(&payload_sha256_2_local)
+    .bind(&signed_req_bytes_2_local)
+    .bind(&req_digest_local)
+    .bind(&sig_bytes_local)
+    .bind(&payload_sha256_2_local)
+    .bind(&alice.did)
+    .bind(alice.device_id)
+    .bind(&alice.key_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO chat.message_sends (
+            conversation_id, message_id, signed_request_bytes,
+            signing_transcript_bytes, request_digest, signature, status,
+            accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', 2, $7, $8, $9)
+        "#,
+    )
+    .bind(convo_id)
+    .bind(msg_id_2_local)
+    .bind(&signed_req_bytes_2_local)
+    .bind(&transcript_local)
+    .bind(&req_digest_local)
+    .bind(&sig_bytes_local)
+    .bind(&outcome_bytes_local)
+    .bind(&outcome_sha_local)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE chat.conversations SET next_entry_seq = 3 WHERE conversation_id = $1")
+        .bind(convo_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Sequencer DS1 has only seq 1
+    let local_row_1: CleanDigestRow = sqlx::query_as(
+        "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
+                entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
+                signed_request_bytes, outer_entry_fingerprint, received_at \
+         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+    )
+    .bind(convo_id)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+
+    let remote_rows = vec![CleanDigestRow {
+        seq: local_row_1.seq,
+        epoch: local_row_1.epoch,
+        entry_id: local_row_1.entry_id,
+        entry_kind: local_row_1.entry_kind.clone(),
+        accepted_payload_bytes: local_row_1.accepted_payload_bytes.clone(),
+        accepted_payload_sha256: local_row_1.accepted_payload_sha256.clone(),
+        signed_request_bytes: local_row_1.signed_request_bytes.clone(),
+        outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
+        received_at: local_row_1.received_at,
+    }];
+    let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
+
+    let convo_id_str = convo_id.to_string();
+    let seq_did_clone = harness.sequencer_ds_did.clone();
+    let digest_output = GetConvoDigestOutput {
+        convo_id: convo_id_str.clone(),
+        sequencer_ds_did: seq_did_clone.clone(),
+        sequencer_term: 0,
+        epoch: 0,
+        last_seq: 1,
+        event_count: 1,
+        digest_sha256: remote_digest_sha256.clone(),
+        generated_at: now,
+    };
+
+    let events_output = serde_json::json!({
+        "convoId": convo_id_str,
+        "fromSeqExclusive": 0,
+        "toSeqInclusive": 1,
+        "events": [
+            {
+                "seq": 1,
+                "epoch": local_row_1.epoch,
+                "msgId": local_row_1.entry_id.to_string(),
+                "messageType": local_row_1.entry_kind,
+                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
+                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
+                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "entryId": local_row_1.entry_id.to_string(),
+                "entryKind": local_row_1.entry_kind,
+                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
+                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
+            }
+        ]
+    });
+
+    let app = axum::Router::new()
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoDigest",
+            axum::routing::get({
+                let d = serde_json::to_vec(&digest_output).unwrap();
+                move || {
+                    let b = d.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.getConvoEvents",
+            axum::routing::get({
+                let e = serde_json::to_vec(&events_output).unwrap();
+                move || {
+                    let b = e.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(b))
+                            .unwrap()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/xrpc/blue.catbird.mlsDS.healthCheck",
+            axum::routing::get(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"status":"ok","capabilities":["reconciliation-v1","blue.catbird.mlsDS.reconciliation.v1"]}"#,
+                    ))
+                    .unwrap()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let resolver = Arc::new(
+        DsResolver::new(
+            harness.pool.clone(),
+            reqwest::Client::new(),
+            harness.sender_ds_did.clone(),
+            "https://self.example.com".to_string(),
+            None,
+            3600,
+        )
+        .with_destination_resolver_hook(Arc::new(move |_endpoint| {
+            let port = local_addr.port();
+            Some(Box::pin(async move {
+                Ok(ValidatedRemoteDestination {
+                    url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+                    host: "127.0.0.1".to_string(),
+                    addrs: vec![local_addr],
+                })
+            }))
+        })),
+    );
+
+    let outbound = Arc::new(OutboundClient::new(2, 2));
+    let auth_sign = Arc::new(move |_target: &str, _nsid: &str| Ok("test-token".to_string()));
+
+    let before = capture_mailbox_snapshot(&harness.pool).await;
+
+    let res = catbird_server::federation::reconciliation::reconcile_conversation(
+        &harness.pool,
+        &resolver,
+        &outbound,
+        auth_sign.as_ref(),
+        &convo_id_str,
+        &harness.sequencer_ds_did,
+    )
+    .await;
+
+    assert!(
+        res.is_ok(),
+        "reconcile_conversation must succeed (quarantine recorded): {:?}",
+        res
+    );
+
+    let sync_state: (String, Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT status, quarantine_reason, first_mismatch_seq FROM federation_sync_state WHERE convo_id = $1",
+    )
+    .bind(&convo_id_str)
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(sync_state.0, "quarantined");
+    assert_eq!(sync_state.1.as_deref(), Some("local_ahead"));
+    assert_eq!(sync_state.2, Some(2));
+
+    let after = capture_mailbox_snapshot(&harness.pool).await;
+    assert_eq!(
+        after, before,
+        "quarantined local-ahead conversation must leave all clean tables byte-for-byte unchanged"
     );
 }

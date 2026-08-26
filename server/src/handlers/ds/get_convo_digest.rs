@@ -50,12 +50,13 @@ pub(crate) struct LegacyDigestRow {
 }
 
 #[derive(Debug, FromRow)]
-pub(crate) struct CleanDigestRow {
+pub struct CleanDigestRow {
     pub seq: i64,
     pub epoch: i64,
     pub entry_id: uuid::Uuid,
     pub entry_kind: String,
     pub accepted_payload_bytes: Vec<u8>,
+    pub accepted_payload_sha256: Vec<u8>,
     pub signed_request_bytes: Vec<u8>,
     pub outer_entry_fingerprint: Vec<u8>,
     pub received_at: DateTime<Utc>,
@@ -108,6 +109,23 @@ pub(crate) async fn authorize_convo_read(
                         "DS {} is not authorized to read reconciliation state for {}",
                         requester_ds, convo_id
                     ),
+                });
+            }
+
+            let is_quarantined: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM federation_sync_state
+                    WHERE convo_id = $1 AND status = 'quarantined'
+                )",
+            )
+            .bind(convo_id)
+            .fetch_one(pool)
+            .await
+            .map_err(FederationError::Database)?;
+
+            if is_quarantined {
+                return Err(FederationError::DeliveryConflict {
+                    reason: format!("conversation {} is quarantined", convo_id),
                 });
             }
 
@@ -205,6 +223,7 @@ pub async fn get_convo_digest(
                    entry_id, \
                    entry_kind, \
                    accepted_payload_bytes, \
+                   accepted_payload_sha256, \
                    signed_request_bytes, \
                    outer_entry_fingerprint, \
                    received_at \
@@ -270,20 +289,61 @@ pub async fn get_convo_digest(
     result
 }
 
-pub(crate) fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"CATBIRD-CLEAN-CONVO-DIGEST-V1:");
-    for row in rows {
-        hasher.update(row.seq.to_be_bytes());
-        hasher.update(row.epoch.to_be_bytes());
-        hasher.update(row.entry_id.as_bytes());
-        hash_len_prefixed(&mut hasher, row.entry_kind.as_bytes());
-        hash_len_prefixed(&mut hasher, &row.accepted_payload_bytes);
-        hash_len_prefixed(&mut hasher, &row.signed_request_bytes);
-        hasher.update(&row.outer_entry_fingerprint);
-        hasher.update(row.received_at.timestamp_millis().to_be_bytes());
+#[derive(Default)]
+pub struct CleanConvoDigestHasher {
+    hasher: Sha256,
+}
+
+impl CleanConvoDigestHasher {
+    pub fn new() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"CATBIRD-CLEAN-CONVO-DIGEST-V1:");
+        Self { hasher }
     }
-    hex::encode(hasher.finalize())
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_event(
+        &mut self,
+        seq: i64,
+        epoch: i64,
+        entry_id: uuid::Uuid,
+        entry_kind: &str,
+        accepted_payload_bytes: &[u8],
+        signed_request_bytes: &[u8],
+        outer_entry_fingerprint: &[u8],
+        received_at: DateTime<Utc>,
+    ) {
+        self.hasher.update(seq.to_be_bytes());
+        self.hasher.update(epoch.to_be_bytes());
+        self.hasher.update(entry_id.as_bytes());
+        hash_len_prefixed(&mut self.hasher, entry_kind.as_bytes());
+        hash_len_prefixed(&mut self.hasher, accepted_payload_bytes);
+        hash_len_prefixed(&mut self.hasher, signed_request_bytes);
+        self.hasher.update(outer_entry_fingerprint);
+        self.hasher
+            .update(received_at.timestamp_millis().to_be_bytes());
+    }
+
+    pub fn finalize(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
+    let mut hasher = CleanConvoDigestHasher::new();
+    for row in rows {
+        hasher.update_event(
+            row.seq,
+            row.epoch,
+            row.entry_id,
+            &row.entry_kind,
+            &row.accepted_payload_bytes,
+            &row.signed_request_bytes,
+            &row.outer_entry_fingerprint,
+            row.received_at,
+        );
+    }
+    hasher.finalize()
 }
 
 pub(crate) fn compute_legacy_convo_digest(rows: &[LegacyDigestRow]) -> String {

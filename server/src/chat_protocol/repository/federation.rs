@@ -292,6 +292,14 @@ pub async fn deliver_welcome_mailbox(
             reason: "payloadSha256 does not match computed envelope digest".to_string(),
         });
     }
+    let is_quarantined = super::core::is_conversation_quarantined(tx, header.conversation_id)
+        .await
+        .map_err(FederationError::Database)?;
+    if is_quarantined {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!("conversation {} is quarantined", header.conversation_id),
+        });
+    }
 
     if let Some(cached_bytes) = check_delivery_receipt(
         tx,
@@ -1045,6 +1053,14 @@ pub async fn deliver_message_replication(
     if header.payload_sha256 != envelope_digest {
         return Err(FederationError::InvalidEnvelope {
             reason: "payloadSha256 does not match computed envelope digest".to_string(),
+        });
+    }
+    let is_quarantined = super::core::is_conversation_quarantined(tx, header.conversation_id)
+        .await
+        .map_err(FederationError::Database)?;
+    if is_quarantined {
+        return Err(FederationError::DeliveryConflict {
+            reason: format!("conversation {} is quarantined", header.conversation_id),
         });
     }
 
