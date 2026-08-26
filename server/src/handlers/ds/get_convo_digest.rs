@@ -323,16 +323,8 @@ impl CleanConvoDigestHasher {
         self.hasher
             .update(received_at.timestamp_millis().to_be_bytes());
     }
-
-    pub fn finalize(self) -> String {
-        hex::encode(self.hasher.finalize())
-    }
-}
-
-pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
-    let mut hasher = CleanConvoDigestHasher::new();
-    for row in rows {
-        hasher.update_event(
+    pub fn update_row(&mut self, row: &CleanDigestRow) {
+        self.update_event(
             row.seq,
             row.epoch,
             row.entry_id,
@@ -342,6 +334,17 @@ pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
             &row.outer_entry_fingerprint,
             row.received_at,
         );
+    }
+
+    pub fn finalize(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+pub fn compute_clean_convo_digest(rows: &[CleanDigestRow]) -> String {
+    let mut hasher = CleanConvoDigestHasher::new();
+    for row in rows {
+        hasher.update_row(row);
     }
     hasher.finalize()
 }

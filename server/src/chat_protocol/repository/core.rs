@@ -10363,13 +10363,13 @@ pub(crate) async fn hydrate_locked_conversation_state(
     conversation_id: Uuid,
     locked_at: DateTime<Utc>,
 ) -> Result<LockedConversationStateGuard, ConversationStateHydrationError> {
-    if is_conversation_quarantined(transaction, conversation_id).await? {
-        return Err(ConversationStateHydrationError::ReadSetMismatch);
-    }
-
     let head = hydrate_locked_conversation_head(transaction, conversation_id, locked_at)
         .await
         .map_err(ConversationStateHydrationError::Head)?;
+
+    if is_conversation_quarantined(transaction, conversation_id).await? {
+        return Err(ConversationStateHydrationError::ReadSetMismatch);
+    }
     let Some(head_coordinate) = head.prior_coordinate() else {
         return Err(ConversationStateHydrationError::ReadSetMismatch);
     };

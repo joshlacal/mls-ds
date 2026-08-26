@@ -7645,10 +7645,25 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     .await;
 
     let msg_id_2 = Uuid::new_v4();
+    let msg_entry_id_2 = Uuid::new_v4();
     let (_msg_val, signed_req_bytes_2) =
         make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
-    let ciphertext_2 = vec![0x31u8; 8];
-    let payload_sha256_2 = Sha256::digest(&ciphertext_2).to_vec();
+    let mutation_2 =
+        decode_and_verify_signed_mutation(&signed_req_bytes_2, &alice.public_key).unwrap();
+    let received_at_2 = TrustedRequestInstant::from_canonical_for_test(
+        CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
+    );
+    let built_2 = build_verified_application_entry(
+        mutation_2,
+        CanonicalUuidV4::parse(&msg_entry_id_2.to_string()).unwrap(),
+        CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
+        2,
+        &received_at_2,
+    )
+    .unwrap();
+    let ciphertext_2 = built_2.canonical_entry_bytes().to_vec();
+    let payload_sha256_2 = built_2.accepted_payload_sha256().to_vec();
+    let outer_fp_2 = built_2.outer_application_fingerprint().to_vec();
 
     let local_row_1: CleanDigestRow = sqlx::query_as(
         "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
@@ -7664,12 +7679,12 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     let remote_row_2 = CleanDigestRow {
         seq: 2,
         epoch: 0,
-        entry_id: msg_id_2,
+        entry_id: msg_entry_id_2,
         entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
         accepted_payload_bytes: ciphertext_2.clone(),
         accepted_payload_sha256: payload_sha256_2.clone(),
         signed_request_bytes: signed_req_bytes_2.clone(),
-        outer_entry_fingerprint: payload_sha256_2.clone(),
+        outer_entry_fingerprint: outer_fp_2.clone(),
         received_at: now,
     };
 
@@ -7728,10 +7743,10 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
                 "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
                 "paddedSize": ciphertext_2.len() as i64,
                 "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": msg_id_2.to_string(),
+                "entryId": msg_entry_id_2.to_string(),
                 "entryKind": "blue.catbird.chat.defs#applicationEntry",
                 "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&payload_sha256_2)}
+                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
             }
         ]
     });

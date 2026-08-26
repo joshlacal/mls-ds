@@ -8407,6 +8407,7 @@ async fn a0_assert_post_clean_catalog(connection: &mut PgConnection) -> String {
             "_sqlx_migrations_pkey|p".to_owned(),
             "auth_jti_nonce_pkey|p".to_owned(),
             "federation_outbox_pkey|p".to_owned(),
+            "federation_outbox_status_check|c".to_owned(),
             "federation_sync_state_pkey|p".to_owned(),
             "federation_sync_state_quarantine_shape_check|c".to_owned(),
             "federation_sync_state_status_check|c".to_owned(),
