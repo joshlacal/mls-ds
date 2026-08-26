@@ -144,6 +144,7 @@ fn submit_failure(
     mutation_kind: SignedMutationKind,
     error: SubmitTransitionFacadeError,
 ) -> ChatFailure {
+    eprintln!("SUBMIT FAILURE IN HANDLER: {error:?}");
     tracing::error!(
         "submit_failure: mutation_kind={:?}, error={:?}",
         mutation_kind,

@@ -82,7 +82,8 @@ impl RemoteCommitSubmitter {
                     reason: "submitCommit request timed out".to_string(),
                 });
             }
-            Err(OutboundError::ConnectionFailed { reason, .. }) => {
+            Err(OutboundError::ConnectionFailed { reason, .. })
+            | Err(OutboundError::RequestFailed { reason, .. }) => {
                 return Err(FederationError::DsUnreachable {
                     endpoint: destination.host,
                     reason,
@@ -240,7 +241,6 @@ impl RemoteCommitSubmitter {
                 reason: "receipt result_sha256 mismatch".to_string(),
             });
         }
-
         if receipt.source_locator.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
             || output.commit_entry.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
         {

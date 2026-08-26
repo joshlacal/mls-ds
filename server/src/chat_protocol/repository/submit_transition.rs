@@ -415,6 +415,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         authority.trusted_instant(),
         CanonicalControlServerFields::empty(control_kind(admitted.kind())?)?,
     )?;
+    let outer_entry_fingerprint = *entry.outer_control_fingerprint();
     let products = CanonicalControlEntryProducts::mint(&entry)?;
     let planned = match admitted.kind() {
         SignedMutationKind::CommitTransition => {
@@ -527,6 +528,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         let succ = plan
             .successor_coordinate()
             .ok_or(SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+
         if verified.output.coordinates.epoch as u64 != succ.epoch()
             || verified.output.coordinates.state_version as u64 != succ.state_version()
             || verified.output.coordinates.group_id.as_ref() != succ.group_id()
@@ -536,7 +538,6 @@ async fn execute_first_submit_transition<T: PublicTransport>(
             return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
         }
     }
-
     let (plan, response, accepted_control_entry_bytes) =
         (plan, local_response, products.durable_json().to_vec());
     let expected_coordinate = plan.successor_coordinate().copied();

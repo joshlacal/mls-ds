@@ -5501,125 +5501,182 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
-struct ReceiptRowSnapshot {
-    delivery_id: Uuid,
-    endpoint_nsid: String,
-    conversation_id: Uuid,
-    sender_ds_did: String,
-    receiver_ds_did: String,
-    sequencer_did: String,
-    sequencer_term: i64,
-    envelope_sha256: Vec<u8>,
-    result_sha256: Vec<u8>,
-    source_entry_id: Uuid,
-    source_entry_seq: i64,
-    source_entry_fingerprint: Vec<u8>,
-    response_bytes: Vec<u8>,
-    response_sha256: Vec<u8>,
-    receipt_signature: Vec<u8>,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct MailboxStateSnapshot {
-    conversations: Vec<(
-        Uuid,
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        bool,
-        Option<String>,
-        i64,
-    )>,
-    entries: Vec<(Uuid, i64, Uuid, String, Vec<u8>, Vec<u8>)>,
-    transitions: Vec<(Uuid, Uuid, String, String, Uuid, String, i64, Vec<u8>)>,
-    generation_states: Vec<(Uuid, i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>)>,
-    operation_claims: Vec<(Uuid, String, String, String, Vec<u8>, Vec<u8>, Vec<u8>)>,
-    idempotency_records: Vec<(String, String, Uuid, i32, Vec<u8>, Vec<u8>)>,
-    events: Vec<(i64, Uuid, String, Vec<u8>, Vec<u8>, Uuid)>,
-    delivery_receipts: Vec<ReceiptRowSnapshot>,
-    outbox: Vec<(String, String, String, Vec<u8>, i32, Option<String>, String)>,
-    queue: Vec<(
-        String,
-        String,
-        String,
-        String,
-        Vec<u8>,
-        String,
-        String,
-        i32,
-        Option<String>,
-    )>,
+    conversations: Vec<String>,
+    entries: Vec<String>,
+    transitions: Vec<String>,
+    generation_states: Vec<String>,
+    metadata_snapshots: Vec<String>,
+    entry_recipients: Vec<String>,
+    events: Vec<String>,
+    event_recipients: Vec<String>,
+    member_devices: Vec<String>,
+    application_intervals: Vec<String>,
+    operation_claims: Vec<String>,
+    idempotency_records: Vec<String>,
+    delivery_receipts: Vec<String>,
+    recovery_work_items: Vec<String>,
+    welcome_bundles: Vec<String>,
+    welcome_deliveries: Vec<String>,
+    welcome_dispositions: Vec<String>,
+    reset_requests: Vec<String>,
+    leave_requests: Vec<String>,
+    leaf_recovery_requests: Vec<String>,
+    outbox: Vec<String>,
+    queue: Vec<String>,
 }
 
 async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
-    let conversations = sqlx::query_as::<_, (Uuid, String, String, i64, i64, i64, bool, Option<String>, i64)>(
-        "SELECT conversation_id, kind, lifecycle, current_generation, current_state_version, next_entry_seq, is_remote, sequencer_ds, sequencer_term FROM chat.conversations ORDER BY conversation_id"
+    let conversations = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.conversations ORDER BY conversation_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let entries = sqlx::query_as::<_, (Uuid, i64, Uuid, String, Vec<u8>, Vec<u8>)>(
-        "SELECT conversation_id, seq, entry_id, entry_kind, accepted_payload_sha256, outer_entry_fingerprint FROM chat.entries ORDER BY conversation_id, seq"
+    let entries = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.entries ORDER BY conversation_id, seq) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let transitions = sqlx::query_as::<_, (Uuid, Uuid, String, String, Uuid, String, i64, Vec<u8>)>(
-        "SELECT transition_id, conversation_id, kind, actor_did, actor_device_id, actor_key_id, actor_auth_generation, request_digest FROM chat.transitions ORDER BY transition_id"
+    let transitions = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.transitions ORDER BY transition_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let generation_states = sqlx::query_as::<_, (Uuid, i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>)>(
-        "SELECT conversation_id, generation, state_version, epoch, group_id, group_context_hash, confirmation_tag FROM chat.generation_states ORDER BY conversation_id, generation, state_version"
+    let generation_states = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.generation_states ORDER BY conversation_id, generation, state_version) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let operation_claims = sqlx::query_as::<_, (Uuid, String, String, String, Vec<u8>, Vec<u8>, Vec<u8>)>(
-        "SELECT operation_id, principal_did, endpoint_nsid, mutation_kind, request_digest, accepted_request_sha256, signature FROM chat.operation_claims ORDER BY operation_id"
+    let metadata_snapshots = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.metadata_snapshots ORDER BY metadata_snapshot_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let idempotency_records = sqlx::query_as::<_, (String, String, Uuid, i32, Vec<u8>, Vec<u8>)>(
-        "SELECT principal_did, endpoint_nsid, operation_id, completed_status, response_bytes, response_sha256 FROM chat.idempotency_records ORDER BY principal_did, endpoint_nsid, operation_id"
+    let entry_recipients = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.entry_recipients ORDER BY conversation_id, seq, user_did, device_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let events = sqlx::query_as::<_, (i64, Uuid, String, Vec<u8>, Vec<u8>, Uuid)>(
-        "SELECT event_position, event_id, event_kind, payload_bytes, payload_sha256, protocol_instance_id FROM chat.events ORDER BY event_position",
+    let events = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.events ORDER BY event_position) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let delivery_receipts = sqlx::query_as::<_, ReceiptRowSnapshot>(
-        "SELECT delivery_id, endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did, sequencer_did, sequencer_term, envelope_sha256, result_sha256, source_entry_id, source_entry_seq, source_entry_fingerprint, response_bytes, response_sha256, receipt_signature FROM chat.federation_delivery_receipts ORDER BY delivery_id"
+    let event_recipients = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.event_recipients ORDER BY event_position, user_did, device_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let outbox = sqlx::query_as::<_, (String, String, String, Vec<u8>, i32, Option<String>, String)>(
-        "SELECT id, conversation_id, status, payload, attempts, last_error, target_service_did FROM federation_outbox ORDER BY id",
+    let member_devices = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.member_devices ORDER BY leaf_period_id) t",
     )
     .fetch_all(pool)
     .await
     .unwrap();
 
-    let queue = sqlx::query_as::<_, (String, String, String, String, Vec<u8>, String, String, i32, Option<String>)>(
-        "SELECT id, target_ds_did, target_endpoint, method, payload, convo_id, status, retry_count, last_error FROM outbound_queue ORDER BY id",
+    let application_intervals = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.application_intervals ORDER BY membership_interval_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let operation_claims = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.operation_claims ORDER BY operation_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let idempotency_records = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.idempotency_records ORDER BY principal_did, endpoint_nsid, operation_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let delivery_receipts = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.federation_delivery_receipts ORDER BY delivery_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let recovery_work_items = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.recovery_work_items ORDER BY recovery_work_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let welcome_bundles = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.welcome_bundles ORDER BY welcome_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let welcome_deliveries = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.welcome_deliveries ORDER BY welcome_id, recipient_did, recipient_device_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let welcome_dispositions = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.welcome_dispositions ORDER BY welcome_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let reset_requests = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.reset_requests ORDER BY reset_request_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let leave_requests = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.leave_requests ORDER BY leave_request_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let leaf_recovery_requests = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM chat.leaf_recovery_requests ORDER BY recovery_request_id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let outbox = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM federation_outbox ORDER BY id) t",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let queue = sqlx::query_scalar::<_, String>(
+        "SELECT to_jsonb(t)::text FROM (SELECT * FROM outbound_queue ORDER BY id) t",
     )
     .fetch_all(pool)
     .await
@@ -5630,10 +5687,22 @@ async fn capture_mailbox_snapshot(pool: &DbPool) -> MailboxStateSnapshot {
         entries,
         transitions,
         generation_states,
+        metadata_snapshots,
+        entry_recipients,
+        events,
+        event_recipients,
+        member_devices,
+        application_intervals,
         operation_claims,
         idempotency_records,
-        events,
         delivery_receipts,
+        recovery_work_items,
+        welcome_bundles,
+        welcome_deliveries,
+        welcome_dispositions,
+        reset_requests,
+        leave_requests,
+        leaf_recovery_requests,
         outbox,
         queue,
     }
@@ -6096,15 +6165,12 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
     );
 
     use p256::pkcs8::EncodePrivateKey;
-    let sequencer_key = random_p256();
-    cache_did_key(LOCAL_DS_DID, &sequencer_key).await;
-    let pem_str = sequencer_key
+    let local_ds_key = random_p256();
+    cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
+    let pem_str = local_ds_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
         .unwrap();
-    let seq_ack_signer = Arc::new(AckSigner::new(
-        sequencer_key.clone(),
-        LOCAL_DS_DID.to_string(),
-    ));
+
     let (seq_pool, _seq_guard) = fresh_legacy_pool(FED_ROUTER_DB_PREFIX, 8, 1).await;
     seed_corpus_conversation_at_added(&seq_pool, LOCAL_DS_DID, None, now).await;
     sqlx::query(
@@ -6154,6 +6220,10 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         .await
         .unwrap();
 
+    let seq_ack_signer = Arc::new(AckSigner::new(
+        local_ds_key.clone(),
+        LOCAL_DS_DID.to_string(),
+    ));
     let seq_runtime = Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build sequencer chat runtime"),
@@ -6199,8 +6269,8 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                     .unwrap();
 
                 let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
-                // Alter coordinates epoch to cause mismatch
-                output.coordinates.epoch = 999;
+                // Coordinates match perfectly, but commitEntry entryId is altered to cause canonical response mismatch
+                output.commit_entry.entry_id = Uuid::new_v4().to_string().into();
 
                 let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
                     coordinates: output.coordinates.clone(),
@@ -6260,7 +6330,7 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         let _ = axum::serve(listener, app).await;
     });
 
-    let seq_did_doc = make_test_receipt_did_doc(LOCAL_DS_DID, &sequencer_key.verifying_key());
+    let seq_did_doc = make_test_receipt_did_doc(LOCAL_DS_DID, &local_ds_key.verifying_key());
     let resolver = Arc::new(
         DsResolver::new(
             harness.pool.clone(),
@@ -6282,11 +6352,6 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
         })),
     );
 
-    let local_ds_key = random_p256();
-    cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
-    let pem_str = local_ds_key
-        .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
-        .unwrap();
     let service_auth = Arc::new(
         ServiceAuthClient::from_es256_pem(LOCAL_DS_DID.to_string(), pem_str.as_bytes(), None)
             .unwrap(),
@@ -6484,68 +6549,82 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     let received_delivery_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let counts_clone = call_counts.clone();
     let ids_clone = received_delivery_ids.clone();
+    let router_clone = seq_router.clone();
 
-    // Route sequencer requests through real DS submitCommit router
-    let app = axum::Router::new().route(
-        "/xrpc/blue.catbird.mlsDS.submitCommit",
-        axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = listener.local_addr().unwrap();
+
+    // Real transport drop: first request commits then socket is closed without writing HTTP response!
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let router = router_clone.clone();
             let counts = counts_clone.clone();
             let ids = ids_clone.clone();
-            let router = seq_router.clone();
-            async move {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req_bytes = &buf[..n];
+
+                let req_str = String::from_utf8_lossy(req_bytes);
+                let body_start = req_str.find("\r\n\r\n").map(|idx| idx + 4).unwrap_or(0);
+                let body_bytes = &req_bytes[body_start..];
+
                 let count = counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
                 use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
                 use catbird_server::federation::envelope::validate_envelope_header;
                 use jacquard_common::DefaultStr;
 
-                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
-                let header = validate_envelope_header(&msg.header).unwrap();
-
-                {
-                    let mut guard = ids.lock();
-                    guard.push(header.delivery_id.to_string());
+                if let Ok(msg) = serde_json::from_slice::<SubmitCommit<DefaultStr>>(body_bytes) {
+                    if let Ok(header) = validate_envelope_header(&msg.header) {
+                        let mut guard = ids.lock();
+                        guard.push(header.delivery_id.to_string());
+                    }
                 }
 
-                let mut req = Request::builder()
+                let mut req_builder = Request::builder()
                     .method("POST")
                     .uri("/xrpc/blue.catbird.mlsDS.submitCommit")
                     .header("content-type", "application/json");
-                for (k, v) in headers.iter() {
-                    req = req.header(k, v);
+                if let Some(header_part) = req_str.get(..body_start.saturating_sub(4)) {
+                    for line in header_part.lines().skip(1) {
+                        if let Some((k, v)) = line.split_once(':') {
+                            if let (Ok(name), Ok(val)) = (
+                                axum::http::header::HeaderName::from_bytes(k.trim().as_bytes()),
+                                axum::http::HeaderValue::from_str(v.trim()),
+                            ) {
+                                req_builder = req_builder.header(name, val);
+                            }
+                        }
+                    }
                 }
-                let response = router
-                    .oneshot(req.body(Body::from(body)).unwrap())
-                    .await
-                    .unwrap();
+                let axum_req = req_builder.body(Body::from(body_bytes.to_vec())).unwrap();
+                let response = router.oneshot(axum_req).await.unwrap();
                 let status = response.status();
                 let resp_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
                     .unwrap();
 
                 if count == 1 {
-                    axum::response::Response::builder()
-                        .status(503)
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(
-                            b"{\"error\":\"RelationshipPolicyUnavailable\"}".to_vec(),
-                        ))
-                        .unwrap()
+                    // Real transport drop: shutdown socket without sending HTTP response
+                    let _ = stream.shutdown().await;
+                    drop(stream);
                 } else {
-                    axum::response::Response::builder()
-                        .status(status)
-                        .header("content-type", "application/json")
-                        .body(axum::body::Body::from(resp_bytes))
-                        .unwrap()
+                    let http_response = format!(
+                        "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        status.as_u16(),
+                        resp_bytes.len()
+                    );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                    let _ = stream.write_all(&resp_bytes).await;
+                    let _ = stream.flush().await;
                 }
-            }
-        }),
-    );
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let local_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+            });
+        }
     });
 
     let resolver = Arc::new(
@@ -6630,7 +6709,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     assert_eq!(
         status1,
         StatusCode::SERVICE_UNAVAILABLE,
-        "Call 1 must fail due to dropped response: status={status1}, body={body1:?}"
+        "Call 1 must fail due to dropped transport response: status={status1}, body={body1:?}"
     );
     // Mailbox state must be completely unchanged after Call 1 rollback
     let middle = capture_mailbox_snapshot(&harness.pool).await;
@@ -6725,6 +6804,79 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         .unwrap();
     assert_eq!(queue_cnt, 0, "must be 0 queue jobs on mailbox DS");
 
+    // Independently construct expected canonical response from fixture-known expected entry/coordinates
+    use base64::engine::general_purpose::STANDARD;
+    assert_eq!(
+        body2.get("coordinates").unwrap(),
+        &json!({
+            "confirmationTag": {"$bytes": STANDARD.encode(generic_confirmation_tag)},
+            "conversationId": convo_id.to_string(),
+            "epoch": 2,
+            "generation": 0,
+            "groupContextHash": {"$bytes": STANDARD.encode(generic_group_context_hash)},
+            "groupId": {"$bytes": STANDARD.encode(group_id)},
+            "lifecycle": "active",
+            "stateVersion": 4
+        }),
+        "body2 coordinates must match independently constructed expected coordinates"
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("$type"))
+            .and_then(Value::as_str),
+        Some("blue.catbird.chat.defs#commitEntry")
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("conversationId"))
+            .and_then(Value::as_str),
+        Some(convo_id.to_string().as_str())
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("entryId"))
+            .and_then(Value::as_str),
+        Some(generic_transition_id.to_string().as_str())
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("seq"))
+            .and_then(Value::as_i64),
+        Some(5)
+    );
+
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("signedRequest"))
+            .and_then(|s| s.get("body"))
+            .and_then(|b| b.get("actorDid"))
+            .and_then(Value::as_str),
+        Some(alice.did.as_str())
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("signedRequest"))
+            .and_then(|s| s.get("body"))
+            .and_then(|b| b.get("actorDeviceId"))
+            .and_then(Value::as_str),
+        Some(alice.device_id.hyphenated().to_string().as_str())
+    );
+    assert_eq!(
+        body2
+            .get("entry")
+            .and_then(|e| e.get("signedRequest"))
+            .and_then(|s| s.get("body"))
+            .and_then(|b| b.get("signatureDomain"))
+            .and_then(Value::as_str),
+        Some("CATBIRD-CHAT-COMMIT\0")
+    );
+    assert_eq!(body2.get("welcomes").unwrap(), &json!([]));
     // Call 3: Idempotent replay of completed operation
     let jwt3 = sign_jwt(
         json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto", alice.did)}),
@@ -6752,7 +6904,17 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
         StatusCode::OK,
         "Call 3 replay must succeed: body={body3:?}"
     );
-    assert_eq!(body3, body2, "Call 3 replay body must equal Call 2");
+    assert_eq!(
+        body3, body2,
+        "Call 3 replay body must equal Call 2 response body exactly"
+    );
+
+    // Remote call count must remain exactly 2 AFTER Call 3
+    assert_eq!(
+        call_counts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "remote call count must remain exactly 2 after Call 3"
+    );
 
     let final_snap = capture_mailbox_snapshot(&harness.pool).await;
     assert_eq!(final_snap, after, "Call 3 must not mutate state further");
