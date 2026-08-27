@@ -38,7 +38,7 @@ DECLARE
     v_retention_instance_id UUID;
     v_completeness_count BIGINT;
     v_table_count INT;
-    v_actual_table TEXT;
+    v_expected_table TEXT;
     v_semantic_table TEXT;
     v_row_count BIGINT;
     v_uuid_pattern TEXT := '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
@@ -181,6 +181,16 @@ DECLARE
     v_expected_semantic_tables TEXT[];
     v_expected_all_tables TEXT[];
 
+    -- Public transport tables scanned for Clean Chat identifiers: (table, id column)
+    v_transport_targets TEXT[] := ARRAY[
+        ['federation_outbox', 'conversation_id'],
+        ['outbound_queue', 'convo_id'],
+        ['federation_sync_state', 'convo_id']
+    ];
+    v_transport_pair TEXT[];
+    v_transport_table TEXT;
+    v_transport_column TEXT;
+
     v_rec RECORD;
     v_idx INT := 1;
 BEGIN
@@ -266,14 +276,14 @@ BEGIN
     v_expected_all_tables := ARRAY['protocol_instances', 'event_retention', 'operation_claim_completeness_cutover'] || v_expected_semantic_tables;
 
     -- Check for missing expected tables
-    FOREACH v_actual_table IN ARRAY v_expected_all_tables
+    FOREACH v_expected_table IN ARRAY v_expected_all_tables
     LOOP
         IF NOT EXISTS (
             SELECT 1 FROM pg_catalog.pg_tables
-            WHERE schemaname = 'chat' AND tablename = v_actual_table
+            WHERE schemaname = 'chat' AND tablename = v_expected_table
         ) THEN
             RAISE EXCEPTION 'preflight failed: missing expected table chat.% in % mode',
-                v_actual_table, v_mode;
+                v_expected_table, v_mode;
         END IF;
     END LOOP;
 
@@ -377,53 +387,35 @@ BEGIN
     -- -------------------------------------------------------------------------
     -- 6. Verify public transport and federation tables contain zero Clean Chat UUIDv4 rows
     -- -------------------------------------------------------------------------
-    -- 6a. public.federation_outbox
-    IF to_regclass('public.federation_outbox') IS NOT NULL THEN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'federation_outbox' AND column_name = 'conversation_id'
-        ) THEN
-            SELECT COUNT(*) INTO v_row_count
-            FROM public.federation_outbox
-            WHERE conversation_id ~ v_uuid_pattern;
+    FOREACH v_transport_pair SLICE 1 IN ARRAY v_transport_targets
+    LOOP
+        v_transport_table := v_transport_pair[1];
+        v_transport_column := v_transport_pair[2];
 
-            IF v_row_count > 0 THEN
-                RAISE EXCEPTION 'preflight failed: public.federation_outbox contains % Clean Chat UUIDv4 row(s)', v_row_count;
-            END IF;
+        -- Legacy deployments may lack the table or the identifier column entirely.
+        IF to_regclass('public.' || quote_ident(v_transport_table)) IS NULL THEN
+            CONTINUE;
         END IF;
-    END IF;
 
-    -- 6b. public.outbound_queue
-    IF to_regclass('public.outbound_queue') IS NOT NULL THEN
-        IF EXISTS (
+        IF NOT EXISTS (
             SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'outbound_queue' AND column_name = 'convo_id'
+            WHERE table_schema = 'public'
+              AND table_name = v_transport_table
+              AND column_name = v_transport_column
         ) THEN
-            SELECT COUNT(*) INTO v_row_count
-            FROM public.outbound_queue
-            WHERE convo_id ~ v_uuid_pattern;
-
-            IF v_row_count > 0 THEN
-                RAISE EXCEPTION 'preflight failed: public.outbound_queue contains % Clean Chat UUIDv4 row(s)', v_row_count;
-            END IF;
+            CONTINUE;
         END IF;
-    END IF;
 
-    -- 6c. public.federation_sync_state
-    IF to_regclass('public.federation_sync_state') IS NOT NULL THEN
-        IF EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'federation_sync_state' AND column_name = 'convo_id'
-        ) THEN
-            SELECT COUNT(*) INTO v_row_count
-            FROM public.federation_sync_state
-            WHERE convo_id ~ v_uuid_pattern;
+        EXECUTE format(
+            'SELECT COUNT(*) FROM public.%I WHERE %I ~ $1',
+            v_transport_table, v_transport_column
+        ) INTO v_row_count USING v_uuid_pattern;
 
-            IF v_row_count > 0 THEN
-                RAISE EXCEPTION 'preflight failed: public.federation_sync_state contains % Clean Chat UUIDv4 row(s)', v_row_count;
-            END IF;
+        IF v_row_count > 0 THEN
+            RAISE EXCEPTION 'preflight failed: public.% contains % Clean Chat UUIDv4 row(s)',
+                v_transport_table, v_row_count;
         END IF;
-    END IF;
+    END LOOP;
 
     RAISE NOTICE 'preflight passed: clean chat zero-state verified in % mode', v_mode;
 END;

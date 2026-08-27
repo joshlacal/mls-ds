@@ -72,14 +72,58 @@ async fn ensure_public_transport_prerequisites(conn: &mut sqlx::PgConnection) {
     .expect("create public transport tables prerequisites");
 }
 
-/// Set up a disposable database with pre-cutover migrations (first 19 migrations).
-async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase, Uuid) {
+/// Apply `migrator` to a fresh disposable database, then initialize the infrastructure rows
+/// the preflight requires: the protocol singleton and its bound zero-floor retention row.
+async fn setup_db(migrator: Migrator) -> (PgPool, DisposableDatabase) {
     let database = DisposableDatabase::mint(SHARED_LEGACY_DB_PREFIX).await;
-    let pre_cutover_entries: Vec<Migration> = CLEAN_PROTOCOL_13_MANIFEST[0..19]
-        .iter()
-        .map(|entry| entry.migration.clone())
-        .collect();
+    let pool = database.connect(5).await;
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("acquire connection for migration");
 
+    ensure_public_transport_prerequisites(&mut conn).await;
+
+    sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
+        .execute(&mut *conn)
+        .await
+        .expect("authorize operation claim activation");
+
+    migrator
+        .run_direct(&mut *conn)
+        .await
+        .expect("apply migrations");
+
+    sqlx::query("RESET chat.operation_claim_activation_approved")
+        .execute(&mut *conn)
+        .await
+        .expect("reset activation");
+
+    let protocol_instance_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO chat.protocol_instances (singleton, protocol_version, protocol_instance_id, cursor_key_id)
+         VALUES (TRUE, '1', $1, $2)",
+    )
+    .bind(protocol_instance_id)
+    .bind(CURSOR_KEY_ID)
+    .execute(&mut *conn)
+    .await
+    .expect("insert protocol instance singleton");
+
+    sqlx::query(
+        "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at)
+         VALUES ($1, 0, clock_timestamp())",
+    )
+    .bind(protocol_instance_id)
+    .execute(&mut *conn)
+    .await
+    .expect("insert event retention row");
+
+    (pool, database)
+}
+
+/// Set up a disposable database with pre-cutover migrations (first 19 migrations).
+async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
     #[derive(Debug)]
     struct PreCutoverSource(Vec<Migration>);
     impl<'s> MigrationSource<'s> for PreCutoverSource {
@@ -88,109 +132,24 @@ async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase, Uuid) {
         }
     }
 
+    let pre_cutover_entries = CLEAN_PROTOCOL_13_MANIFEST[0..19]
+        .iter()
+        .map(|entry| entry.migration.clone())
+        .collect();
     let migrator = Migrator::new(PreCutoverSource(pre_cutover_entries))
         .await
         .expect("build pre-cutover migrator");
 
-    let pool = database.connect(5).await;
-    let mut conn = pool
-        .acquire()
-        .await
-        .expect("acquire connection for migration");
-
-    ensure_public_transport_prerequisites(&mut conn).await;
-
-    sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-        .execute(&mut *conn)
-        .await
-        .expect("authorize operation claim activation");
-
-    migrator
-        .run_direct(&mut *conn)
-        .await
-        .expect("apply pre-cutover migrations");
-
-    sqlx::query("RESET chat.operation_claim_activation_approved")
-        .execute(&mut *conn)
-        .await
-        .expect("reset activation");
-
-    // Initialize infrastructure rows
-    let protocol_instance_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO chat.protocol_instances (singleton, protocol_version, protocol_instance_id, cursor_key_id)
-         VALUES (TRUE, '1', $1, $2)",
-    )
-    .bind(protocol_instance_id)
-    .bind(CURSOR_KEY_ID)
-    .execute(&mut *conn)
-    .await
-    .expect("insert protocol instance singleton");
-
-    sqlx::query(
-        "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at)
-         VALUES ($1, 0, clock_timestamp())",
-    )
-    .bind(protocol_instance_id)
-    .execute(&mut *conn)
-    .await
-    .expect("insert event retention row");
-
-    (pool, database, protocol_instance_id)
+    setup_db(migrator).await
 }
 
 /// Set up a disposable database with post-migration migrations (all 23 migrations).
-async fn setup_post_migration_db() -> (PgPool, DisposableDatabase, Uuid) {
-    let database = DisposableDatabase::mint(SHARED_LEGACY_DB_PREFIX).await;
+async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
     let migrator = reviewed_clean_protocol_migrator()
         .await
         .expect("build post-migration migrator");
 
-    let pool = database.connect(5).await;
-    let mut conn = pool
-        .acquire()
-        .await
-        .expect("acquire connection for migration");
-
-    ensure_public_transport_prerequisites(&mut conn).await;
-
-    sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
-        .execute(&mut *conn)
-        .await
-        .expect("authorize operation claim activation");
-
-    migrator
-        .run_direct(&mut *conn)
-        .await
-        .expect("apply post-migration migrations");
-
-    sqlx::query("RESET chat.operation_claim_activation_approved")
-        .execute(&mut *conn)
-        .await
-        .expect("reset activation");
-
-    // Initialize infrastructure rows
-    let protocol_instance_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO chat.protocol_instances (singleton, protocol_version, protocol_instance_id, cursor_key_id)
-         VALUES (TRUE, '1', $1, $2)",
-    )
-    .bind(protocol_instance_id)
-    .bind(CURSOR_KEY_ID)
-    .execute(&mut *conn)
-    .await
-    .expect("insert protocol instance singleton");
-
-    sqlx::query(
-        "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at)
-         VALUES ($1, 0, clock_timestamp())",
-    )
-    .bind(protocol_instance_id)
-    .execute(&mut *conn)
-    .await
-    .expect("insert event retention row");
-
-    (pool, database, protocol_instance_id)
+    setup_db(migrator).await
 }
 
 /// Execute the preflight SQL gate.
@@ -198,8 +157,9 @@ async fn run_preflight(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(PREFLIGHT_SQL).execute(pool).await.map(|_| ())
 }
 
-/// Helper to insert a row into a semantic table by disabling its triggers and dropping constraints.
-async fn seed_dirty_semantic_table(pool: &PgPool, table_name: &str, insert_sql: &str) {
+/// Insert one row into `chat.<table_name>` by unbinding its triggers and constraints, then
+/// assert the preflight rejects that table as dirty.
+async fn assert_dirty_semantic_table_rejected(pool: &PgPool, table_name: &str, insert_sql: &str) {
     let unbind_sql = format!(
         "DO $$
         DECLARE
@@ -221,6 +181,15 @@ async fn seed_dirty_semantic_table(pool: &PgPool, table_name: &str, insert_sql: 
         .execute(pool)
         .await
         .expect("insert dirty row into semantic table");
+
+    let err = run_preflight(pool)
+        .await
+        .expect_err(&format!("preflight must fail on dirty {table_name} table"));
+    assert!(
+        err.to_string()
+            .contains(&format!("semantic table chat.{table_name} is dirty")),
+        "unexpected error: {err}"
+    );
 }
 
 // =============================================================================
@@ -229,7 +198,7 @@ async fn seed_dirty_semantic_table(pool: &PgPool, table_name: &str, insert_sql: 
 
 #[tokio::test]
 async fn test_preflight_passes_on_pristine_pre_cutover_database() {
-    let (pool, _db, _inst_id) = setup_pre_cutover_db().await;
+    let (pool, _db) = setup_pre_cutover_db().await;
     let result = run_preflight(&pool).await;
     assert!(
         result.is_ok(),
@@ -240,7 +209,7 @@ async fn test_preflight_passes_on_pristine_pre_cutover_database() {
 
 #[tokio::test]
 async fn test_preflight_passes_on_pristine_post_migration_database() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let result = run_preflight(&pool).await;
     assert!(
         result.is_ok(),
@@ -251,7 +220,7 @@ async fn test_preflight_passes_on_pristine_post_migration_database() {
 
 #[tokio::test]
 async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
 
     // Snapshot migration ledger
     let ledger_before: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
@@ -300,7 +269,7 @@ async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
 
 #[tokio::test]
 async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
 
     // Seed non-UUID legacy rows
     sqlx::query(
@@ -346,7 +315,7 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
 
 #[tokio::test]
 async fn test_preflight_fails_when_protocol_singleton_is_missing() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("ALTER TABLE chat.event_retention DISABLE TRIGGER ALL;")
         .execute(&pool)
         .await
@@ -381,7 +350,7 @@ async fn test_preflight_fails_when_protocol_singleton_is_missing() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_protocol_version_is_not_v1() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
         "ALTER TABLE chat.protocol_instances DISABLE TRIGGER protocol_instances_immutable;",
     )
@@ -407,7 +376,7 @@ async fn test_preflight_fails_when_protocol_version_is_not_v1() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_event_retention_floor_is_nonzero() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
         "ALTER TABLE chat.event_retention DISABLE TRIGGER event_retention_identity_immutable;",
     )
@@ -435,7 +404,7 @@ async fn test_preflight_fails_when_event_retention_floor_is_nonzero() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_event_retention_is_unlinked() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
         "ALTER TABLE chat.event_retention DISABLE TRIGGER event_retention_identity_immutable;",
     )
@@ -464,7 +433,7 @@ async fn test_preflight_fails_when_event_retention_is_unlinked() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_completeness_cutover_has_nonzero_receipts() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("ALTER TABLE chat.operation_claim_completeness_cutover DISABLE TRIGGER operation_claim_completeness_cutover_immutable;")
         .execute(&pool)
         .await
@@ -488,7 +457,7 @@ async fn test_preflight_fails_when_completeness_cutover_has_nonzero_receipts() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_devices_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let did = "did:web:alice.example.com";
     let dev_id = Uuid::new_v4();
 
@@ -525,7 +494,7 @@ async fn test_preflight_fails_when_devices_table_is_dirty() {
 
 #[tokio::test]
 async fn test_preflight_fails_when_key_packages_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.key_packages (
             key_package_ref, wrapper_bytes, wrapper_sha256, init_key,
@@ -549,20 +518,12 @@ async fn test_preflight_fails_when_key_packages_table_is_dirty() {
         cursor_key = CURSOR_KEY_ID
     );
 
-    seed_dirty_semantic_table(&pool, "key_packages", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty key_packages table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.key_packages is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "key_packages", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_generation_states_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.generation_states (
             conversation_id, generation, state_version, group_id, epoch,
@@ -586,20 +547,12 @@ async fn test_preflight_fails_when_generation_states_table_is_dirty() {
         trans_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "generation_states", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty generation_states table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.generation_states is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "generation_states", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_relationship_projection_relationships_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.relationship_projection_relationships (
             projection_id, actor_did, other_did, blocking, blocked_by, blocking_by_list,
@@ -615,21 +568,17 @@ async fn test_preflight_fails_when_relationship_projection_relationships_table_i
         proj_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "relationship_projection_relationships", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result
-        .expect_err("preflight must fail on dirty relationship_projection_relationships table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.relationship_projection_relationships is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(
+        &pool,
+        "relationship_projection_relationships",
+        &insert_sql,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_relationship_projection_declarations_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.relationship_projection_declarations (
             projection_id, recipient_did, resolved_pds_origin, service_id, fetch_revision,
@@ -646,21 +595,17 @@ async fn test_preflight_fails_when_relationship_projection_declarations_table_is
         proj_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "relationship_projection_declarations", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result
-        .expect_err("preflight must fail on dirty relationship_projection_declarations table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.relationship_projection_declarations is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(
+        &pool,
+        "relationship_projection_declarations",
+        &insert_sql,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_transitions_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.transitions (
             transition_id, conversation_id, kind, actor_did, actor_device_id,
@@ -681,20 +626,12 @@ async fn test_preflight_fails_when_transitions_table_is_dirty() {
         cursor_key = CURSOR_KEY_ID
     );
 
-    seed_dirty_semantic_table(&pool, "transitions", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty transitions table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.transitions is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "transitions", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_entries_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.entries (
             conversation_id, seq, entry_id, entry_kind,
@@ -718,20 +655,12 @@ async fn test_preflight_fails_when_entries_table_is_dirty() {
         cursor_key = CURSOR_KEY_ID
     );
 
-    seed_dirty_semantic_table(&pool, "entries", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty entries table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.entries is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "entries", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_welcome_bundles_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.welcome_bundles (
             welcome_id, conversation_id, transition_id, entry_seq, generation, state_version,
@@ -751,20 +680,12 @@ async fn test_preflight_fails_when_welcome_bundles_table_is_dirty() {
         trans_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "welcome_bundles", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty welcome_bundles table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.welcome_bundles is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "welcome_bundles", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_outbox_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.outbox (
             outbox_id, event_position, work_kind, status, attempt_count, next_attempt_at, created_at
@@ -774,20 +695,12 @@ async fn test_preflight_fails_when_outbox_table_is_dirty() {
         outbox_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "outbox", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty outbox table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.outbox is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "outbox", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_conversations_table_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.conversations (
             conversation_id, kind, lifecycle, current_generation, current_state_version,
@@ -799,20 +712,12 @@ async fn test_preflight_fails_when_conversations_table_is_dirty() {
         convo_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "conversations", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty conversations");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.conversations is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "conversations", &insert_sql).await;
 }
 
 #[tokio::test]
 async fn test_preflight_fails_when_federation_delivery_receipts_is_dirty() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     let insert_sql = format!(
         "INSERT INTO chat.federation_delivery_receipts (
             delivery_id, endpoint_nsid, conversation_id, sender_ds_did, receiver_ds_did,
@@ -836,15 +741,7 @@ async fn test_preflight_fails_when_federation_delivery_receipts_is_dirty() {
         entry_id = Uuid::new_v4()
     );
 
-    seed_dirty_semantic_table(&pool, "federation_delivery_receipts", &insert_sql).await;
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty federation_delivery_receipts");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.federation_delivery_receipts is dirty"),
-        "unexpected error: {err}"
-    );
+    assert_dirty_semantic_table_rejected(&pool, "federation_delivery_receipts", &insert_sql).await;
 }
 
 // =============================================================================
@@ -853,7 +750,7 @@ async fn test_preflight_fails_when_federation_delivery_receipts_is_dirty() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_dirty_unsuccessful_migration() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
         "UPDATE public._sqlx_migrations SET success = FALSE WHERE version = 20260824000005;",
     )
@@ -871,7 +768,7 @@ async fn test_preflight_fails_on_dirty_unsuccessful_migration() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_checksum_mismatch() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex') WHERE version = 20260824000005;")
         .execute(&pool)
         .await
@@ -887,7 +784,7 @@ async fn test_preflight_fails_on_checksum_mismatch() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_description_mismatch() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("UPDATE public._sqlx_migrations SET description = 'tampered description' WHERE version = 20260824000005;")
         .execute(&pool)
         .await
@@ -903,7 +800,7 @@ async fn test_preflight_fails_on_description_mismatch() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_unexpected_extra_migration() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
         "INSERT INTO public._sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
          VALUES (20260901000001, 'unauthorized future migration', clock_timestamp(), TRUE, decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex'), 100);",
@@ -923,7 +820,7 @@ async fn test_preflight_fails_on_unexpected_extra_migration() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_missing_migration() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = 20260824000005;")
         .execute(&pool)
         .await
@@ -940,7 +837,7 @@ async fn test_preflight_fails_on_missing_migration() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_unexpected_extra_table_in_chat_schema() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("CREATE TABLE chat.unauthorized_extra_table (id INT PRIMARY KEY);")
         .execute(&pool)
         .await
@@ -957,7 +854,7 @@ async fn test_preflight_fails_on_unexpected_extra_table_in_chat_schema() {
 
 #[tokio::test]
 async fn test_preflight_fails_on_missing_table_in_chat_schema() {
-    let (pool, _db, _inst_id) = setup_post_migration_db().await;
+    let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("DROP TABLE chat.service_auth_admissions CASCADE;")
         .execute(&pool)
         .await
@@ -974,7 +871,7 @@ async fn test_preflight_fails_on_missing_table_in_chat_schema() {
 
 #[tokio::test]
 async fn test_pre_cutover_fails_if_post_table_federation_delivery_receipts_exists() {
-    let (pool, _db, _inst_id) = setup_pre_cutover_db().await;
+    let (pool, _db) = setup_pre_cutover_db().await;
     sqlx::query("CREATE TABLE chat.federation_delivery_receipts (id INT PRIMARY KEY);")
         .execute(&pool)
         .await
@@ -997,7 +894,7 @@ async fn test_pre_cutover_fails_if_post_table_federation_delivery_receipts_exist
 #[tokio::test]
 async fn test_preflight_fails_on_clean_chat_uuid_in_federation_outbox_for_all_statuses() {
     for status in ["pending", "in_flight", "done", "failed", "dead"] {
-        let (pool, _db, _inst_id) = setup_post_migration_db().await;
+        let (pool, _db) = setup_post_migration_db().await;
         let clean_convo_uuid = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO public.federation_outbox (id, conversation_id, status)
@@ -1025,7 +922,7 @@ async fn test_preflight_fails_on_clean_chat_uuid_in_federation_outbox_for_all_st
 #[tokio::test]
 async fn test_preflight_fails_on_clean_chat_uuid_in_outbound_queue_for_all_statuses() {
     for status in ["pending", "in_flight", "delivered", "failed", "dead"] {
-        let (pool, _db, _inst_id) = setup_post_migration_db().await;
+        let (pool, _db) = setup_post_migration_db().await;
         let clean_convo_uuid = Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, convo_id, status)
@@ -1052,7 +949,7 @@ async fn test_preflight_fails_on_clean_chat_uuid_in_outbound_queue_for_all_statu
 #[tokio::test]
 async fn test_preflight_fails_on_clean_chat_uuid_in_federation_sync_state_for_all_statuses() {
     for status in ["healthy", "quarantined"] {
-        let (pool, _db, _inst_id) = setup_post_migration_db().await;
+        let (pool, _db) = setup_post_migration_db().await;
         let clean_convo_uuid = Uuid::new_v4().to_string();
 
         if status == "healthy" {
