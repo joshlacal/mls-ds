@@ -62,15 +62,6 @@ struct TrustedCorpusIdentifiers {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TrustedCorpusChain {
-    generation: u64,
-    genesis_state_version: u64,
-    genesis_epoch: u64,
-    genesis_group_context_hash_hex: String,
-    genesis_confirmation_tag_hex: String,
-    committed_state_version: u64,
-    committed_epoch: u64,
-    committed_group_context_hash_hex: String,
-    committed_confirmation_tag_hex: String,
     group_id_hex: String,
 }
 
@@ -80,12 +71,13 @@ struct TrustedCorpusManifest {
     chain: TrustedCorpusChain,
 }
 
-fn frozen_now() -> u64 {
+fn now_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after Unix epoch")
         .as_secs()
 }
+
 fn hex_array<const N: usize>(value: &str) -> [u8; N] {
     hex::decode(value)
         .expect("valid test hex")
@@ -131,7 +123,7 @@ fn create_schema2_fixtures() -> (Schema2Fixture, Schema2Fixture) {
         .store(provider.storage())
         .expect("store alice signer");
     let alice_signature_key = alice_signer.to_public_vec();
-    let now = frozen_now();
+    let now = now_unix_seconds();
     let config = MlsGroupCreateConfig::builder()
         .ciphersuite(Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519)
         .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
@@ -378,57 +370,6 @@ fn parse_valid_snapshot(bytes: &[u8]) -> RawSnapshot {
         storage_version,
         records,
     }
-}
-
-fn json_bytes(value: &serde_json::Value) -> Vec<u8> {
-    value
-        .as_array()
-        .expect("trusted fixture byte array")
-        .iter()
-        .map(|byte| {
-            u8::try_from(byte.as_u64().expect("trusted fixture byte")).expect("trusted fixture u8")
-        })
-        .collect()
-}
-
-fn trusted_tree_summary(encoded: &[u8]) -> PublicGroupSnapshotTreeSummary {
-    let raw = parse_valid_snapshot(encoded);
-    let group_context = raw
-        .records
-        .iter()
-        .find(|(key, _)| key.starts_with(b"GroupContext"))
-        .map(|(_, value)| serde_json::from_slice::<serde_json::Value>(value).expect("GroupContext"))
-        .expect("GroupContext record");
-    let tree_hash: [u8; 32] = json_bytes(&group_context["tree_hash"]["vec"])
-        .try_into()
-        .expect("trusted 32-byte tree hash");
-    let tree = raw
-        .records
-        .iter()
-        .find(|(key, _)| key.starts_with(b"Tree"))
-        .map(|(_, value)| serde_json::from_slice::<serde_json::Value>(value).expect("Tree"))
-        .expect("Tree record");
-    let leaves = tree["tree"]["leaf_nodes"]
-        .as_array()
-        .expect("trusted leaf array")
-        .iter()
-        .enumerate()
-        .filter_map(|(leaf_index, stored)| {
-            let node = stored.get("node")?;
-            if node.is_null() {
-                return None;
-            }
-            let payload = &node["payload"];
-            assert_eq!(payload["credential"]["credential_type"], "Basic");
-            Some(PublicGroupSnapshotLeaf::new(
-                u32::try_from(leaf_index).expect("trusted leaf index"),
-                json_bytes(&payload["credential"]["serialized_credential_content"]["vec"]),
-                json_bytes(&payload["signature_key"]["value"]["vec"]),
-                json_bytes(&payload["encryption_key"]["key"]["vec"]),
-            ))
-        })
-        .collect();
-    PublicGroupSnapshotTreeSummary::new(tree_hash, leaves)
 }
 
 fn push_u16_len(output: &mut Vec<u8>, value: &[u8]) {
