@@ -567,7 +567,7 @@ fn main() -> Result<()> {
         "containsSecrets": false
     });
 
-    let payload_files: [(&str, &'static str, Option<u16>, Option<u64>); 23] = [
+    let payload_files: [(&str, &'static str, Option<u16>, Option<u64>); 27] = [
         ("key-package.mls", "mlsMessageKeyPackage", Some(5), None),
         ("key-package-inner.tls", "innerKeyPackageTls", None, None),
         ("key-package-ref.bin", "rfc9420KeyPackageRef", None, None),
@@ -619,7 +619,7 @@ fn main() -> Result<()> {
             "commit-metadata-appdata-public.mls",
             "mlsMessagePublicCommit",
             Some(1),
-            Some(2),
+            Some(1),
         ),
         (
             "own-pending-commit.mls",
@@ -676,6 +676,30 @@ fn main() -> Result<()> {
             None,
             Some(0),
         ),
+        (
+            "transition-metadata-sv1.cbor",
+            "canonicalDagCborSignedMetadataTransition",
+            None,
+            Some(0),
+        ),
+        (
+            "transition-policy-sv2.cbor",
+            "canonicalDagCborSignedPolicyTransition",
+            None,
+            Some(0),
+        ),
+        (
+            "transition-metadata-sv6.cbor",
+            "canonicalDagCborSignedMetadataTransition",
+            None,
+            Some(3),
+        ),
+        (
+            "transition-policy-sv7.cbor",
+            "canonicalDagCborSignedPolicyTransition",
+            None,
+            Some(3),
+        ),
     ];
 
     let mut file_manifest = Map::new();
@@ -731,6 +755,7 @@ fn main() -> Result<()> {
         "openmlsForkRevision": EXPECTED_FORK_REVISION,
     });
 
+    let file_count = file_manifest.len();
     manifest["publicSnapshots"] = public_snapshots_profile;
     manifest["files"] = Value::Object(file_manifest);
 
@@ -745,6 +770,6 @@ fn main() -> Result<()> {
     final_manifest_bytes.push(b'\n');
     write_atomic(&target_dir.join("manifest.json"), &final_manifest_bytes)?;
 
-    println!("Sealed 23 payload files + manifest.json successfully!");
+    println!("Sealed {file_count} payload files + manifest.json successfully!");
     Ok(())
 }

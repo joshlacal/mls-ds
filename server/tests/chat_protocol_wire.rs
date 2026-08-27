@@ -4122,4 +4122,17 @@ fn sealed_crypto_wire_v09_corpus_consumer_validation() {
     let rejoin_welcome_bytes = fs::read(fixture_dir.join("rejoin-welcome.mls")).unwrap();
     let _ = validate_welcome(&rejoin_welcome_bytes, MAX_WELCOME_WIRE_BYTES)
         .expect("validate rejoin welcome failed");
+
+    // 9. State-only metadata and policy transitions validation
+    for (filename, expected_kind) in [
+        ("creation-signed-request.cbor", "creationBody"),
+        ("transition-metadata-sv1.cbor", "metadataTransitionBody"),
+        ("transition-policy-sv2.cbor", "policyTransitionBody"),
+        ("transition-metadata-sv6.cbor", "metadataTransitionBody"),
+        ("transition-policy-sv7.cbor", "policyTransitionBody"),
+    ] {
+        let transition_bytes = fs::read(fixture_dir.join(filename)).unwrap();
+        assert!(transition_bytes.len() > 50, "{filename} too short");
+        assert_eq!(transition_bytes[0], 0xa2, "{filename} not DAG-CBOR map");
+    }
 }
