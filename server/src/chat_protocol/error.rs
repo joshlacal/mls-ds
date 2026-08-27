@@ -1,9 +1,9 @@
-// Closed error vocabulary for the clean chat protocol.
-//
-// Protocol-facing failures are represented by [`ChatProtocolErrorCode`].
-// Storage and invariant failures deliberately live in [`ErrorExposure`] and
-// have no protocol code, so internal details cannot become an accidental XRPC
-// error string.
+//! Closed error vocabulary for the clean chat protocol.
+//!
+//! Protocol-facing failures are represented by [`ChatProtocolErrorCode`].
+//! Storage and invariant failures deliberately live in [`ErrorExposure`] and
+//! have no protocol code, so internal details cannot become an accidental XRPC
+//! error string.
 
 use std::fmt;
 use std::str::FromStr;

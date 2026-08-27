@@ -1,8 +1,8 @@
-// Bounded, exact MLS wire validation for the clean chat protocol.
-//
-// All functions in this module accept a complete RFC 9420 `MLSMessage`, not
-// a raw inner object. The clean protocol is deliberately closed to MLS 1.0
-// and the XWing ciphersuite.
+//! Bounded, exact MLS wire validation for the clean chat protocol.
+//!
+//! All functions in this module accept a complete RFC 9420 `MLSMessage`, not
+//! a raw inner object. The clean protocol is deliberately closed to MLS 1.0
+//! and the XWing ciphersuite.
 
 use std::{
     collections::{HashMap, HashSet},

@@ -1,8 +1,8 @@
-// Durable clean-chat subscription reads.
-//
-// `chat.events` is the only durable source. `chat.event_recipients` freezes
-// entitlement for an exact device, so this reader never rediscovers a current
-// conversation membership and cannot accidentally broaden a historical event.
+//! Durable clean-chat subscription reads.
+//!
+//! `chat.events` is the only durable source. `chat.event_recipients` freezes
+//! entitlement for an exact device, so this reader never rediscovers a current
+//! conversation membership and cannot accidentally broaden a historical event.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use catbird_atproto::generated::blue_catbird::chat::{

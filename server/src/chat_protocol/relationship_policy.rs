@@ -1,9 +1,9 @@
-// Fail-closed relationship and declaration authority for `blue.catbird.chat`.
-//
-// This module deliberately has no dependency on the superseded MLS-chat
-// policy, federation, authentication, handlers, or tables.  Network evidence
-// is collected outside a mutation transaction and becomes usable only after
-// the complete, exact projection is fenced again under that transaction.
+//! Fail-closed relationship and declaration authority for `blue.catbird.chat`.
+//!
+//! This module deliberately has no dependency on the superseded MLS-chat
+//! policy, federation, authentication, handlers, or tables.  Network evidence
+//! is collected outside a mutation transaction and becomes usable only after
+//! the complete, exact projection is fenced again under that transaction.
 
 use crate::util::outbound_body;
 

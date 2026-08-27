@@ -1,9 +1,9 @@
-// Transaction-owning G6 device-revocation facade.
-//
-// This is the only production seam that composes the complete G6 read/lock
-// order, pure batch planner, canonical prewrite execution capsule, and exact
-// completed-replay validation. It never begins or commits the caller's outer
-// transaction and never accepts caller-authored execution artifacts.
+//! Transaction-owning G6 device-revocation facade.
+//!
+//! This is the only production seam that composes the complete G6 read/lock
+//! order, pure batch planner, canonical prewrite execution capsule, and exact
+//! completed-replay validation. It never begins or commits the caller's outer
+//! transaction and never accepts caller-authored execution artifacts.
 
 use chrono::{DateTime, Utc};
 use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};

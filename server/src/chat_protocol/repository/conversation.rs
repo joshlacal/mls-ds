@@ -1,9 +1,9 @@
-// Repository-owned `getConversationState` read.
-//
-// The handler supplies only a sealed read admission and the public
-// conversation UUID.  This facade spends the one ordinary-read attempt,
-// locks and authorizes the exact requester device, and keeps that transaction
-// open while projecting the state and pending control-plane requests.
+//! Repository-owned `getConversationState` read.
+//!
+//! The handler supplies only a sealed read admission and the public
+//! conversation UUID.  This facade spends the one ordinary-read attempt,
+//! locks and authorizes the exact requester device, and keeps that transaction
+//! open while projecting the state and pending control-plane requests.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use jacquard_common::{deps::smol_str::SmolStr, types::string::Did};

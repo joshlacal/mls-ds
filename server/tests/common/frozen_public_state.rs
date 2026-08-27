@@ -264,10 +264,13 @@ fn encode_schema2_snapshot(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     }
     encoded
 }
+pub(crate) fn schema2_snapshot(snapshot: &[u8]) -> Vec<u8> {
+    let raw = parse_snapshot(snapshot);
+    encode_schema2_snapshot(&raw.records)
+}
 
 fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> ActivePublicState {
-    let raw = parse_snapshot(&snapshot);
-    let schema2_snapshot = encode_schema2_snapshot(&raw.records);
+    let schema2_snapshot = schema2_snapshot(&snapshot);
     let binding = PublicGroupSnapshotBinding::new(
         *coordinate.conversation_id(),
         coordinate.generation(),

@@ -1,4 +1,4 @@
-// Clean-cutover chat protocol primitives.
+//! Clean-cutover chat protocol primitives.
 
 use std::panic::AssertUnwindSafe;
 
@@ -73,7 +73,11 @@ pub(crate) fn xwing_kem_output_is_valid(bytes: &[u8]) -> bool {
         && x25519_component_is_canonical_and_usable(&bytes[XWING_X25519_KEM_OUTPUT_OFFSET..])
 }
 
+#[cfg(not(any(test, feature = "test-support")))]
 mod cursor;
+#[cfg(any(test, feature = "test-support"))]
+pub mod cursor;
+
 pub(crate) use cursor::{
     mint_capability_token, CursorCodecError, CursorSealer, OsSecureRandom, SealedCapability,
     SealerBinding, SecureRandom,
@@ -84,25 +88,68 @@ pub(crate) use cursor::{
 /// non-Clone, cannot be constructed outside this module, and do not represent
 /// device authority until the repository atomically consumes all replay keys
 /// and validates stored device state in the same transaction.
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod dpop;
+#[cfg(any(test, feature = "test-support"))]
+pub mod dpop;
+
 pub mod error;
 pub mod federation_routing;
 pub use federation_routing::{
     resolve_participant_routing, ConversationRoutingIntent, FederationRoutingError,
     ParticipantRoutingIntent,
 };
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod model;
+#[cfg(any(test, feature = "test-support"))]
+pub mod model;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod public_state;
+#[cfg(any(test, feature = "test-support"))]
+pub mod public_state;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod read_authority;
+#[cfg(any(test, feature = "test-support"))]
+pub mod read_authority;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod read_projection;
+#[cfg(any(test, feature = "test-support"))]
+pub mod read_projection;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod relationship_policy;
+#[cfg(any(test, feature = "test-support"))]
+pub mod relationship_policy;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod repository;
+#[cfg(any(test, feature = "test-support"))]
+pub mod repository;
+
 pub mod snapshot;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod state_machine;
 #[cfg(any(test, feature = "test-support"))]
+pub mod state_machine;
+
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod transcript;
+#[cfg(any(test, feature = "test-support"))]
+pub mod transcript;
+
+#[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod validation;
+#[cfg(any(test, feature = "test-support"))]
+pub mod validation;
+
 pub mod wire;
 
 /// Non-shipping executable proof runners. Only zero-authority scenario

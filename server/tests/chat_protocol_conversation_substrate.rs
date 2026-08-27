@@ -6,350 +6,21 @@ mod executor_seed;
 #[path = "common/frozen_public_state.rs"]
 mod frozen_public_state;
 
-pub use catbird_server::{auth, federation, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
     pub(crate) use crate::chat_protocol::repository::*;
 }
-
 #[allow(dead_code)]
 mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
 }
 
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
-
-mod chat_protocol {
-    pub(crate) use crate::cursor::*;
-    pub(crate) use crate::model::*;
-    pub(crate) use crate::transcript::*;
-    pub(crate) use crate::validation::*;
-
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod federation_routing {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/federation_routing.rs"
-        ));
-    }
-    pub mod read_authority {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/read_authority.rs"
-        ));
-    }
-    pub mod read_projection {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/read_projection.rs"
-        ));
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod coordinate {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/coordinate.rs"
-            ));
-        }
-        pub mod conversation {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/conversation.rs"
-            ));
-        }
-        pub mod entry_read {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/entry_read.rs"
-            ));
-        }
-        pub mod message_delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/message_delivery.rs"
-            ));
-        }
-        pub mod subscription {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/subscription.rs"
-            ));
-        }
-        pub mod ticket {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/ticket.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod welcome {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/welcome.rs"
-            ));
-        }
-        pub mod welcome_terminal {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/welcome_terminal.rs"
-            ));
-        }
-        pub mod expiry_sweep {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/expiry_sweep.rs"
-            ));
-        }
-        pub mod device_directory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/device_directory.rs"
-            ));
-        }
-        pub mod federation {
-            use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
-            use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
-            use jacquard_common::DefaultStr;
-            use uuid::Uuid;
-
-            #[allow(clippy::too_many_arguments)]
-            pub(crate) async fn enqueue_federated_welcome_job(
-                _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                _conversation_id: Uuid,
-                _target_ds_did: &str,
-                _recipient_did_str: &str,
-                _recipient_device_id: Uuid,
-                _welcome_id: Uuid,
-                _recovery_request_id: Uuid,
-                _reserved_ref: &[u8; 32],
-                _opaque_welcome: &[u8],
-                _sha256: &[u8; 32],
-                _append: &super::delivery::AppendEntry,
-                _seq: u64,
-                _coordinates: ConversationCoordinates,
-                _pub_snap_sha: &[u8; 32],
-                _tree_sum_sha: &[u8; 32],
-                _sequencer_term: u64,
-            ) -> Result<Uuid, super::super::state_machine::ExecutorError> {
-                Ok(Uuid::nil())
-            }
-
-            pub(crate) async fn enqueue_clean_federation_message_jobs(
-                _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-                _conversation_id: Uuid,
-                _entry: &super::delivery::AppendEntry,
-                _seq: u64,
-                _sequencer_term: u64,
-            ) -> Result<usize, catbird_server::federation::errors::FederationError> {
-                Ok(0)
-            }
-
-            pub(crate) fn build_federated_commit_envelope(
-                _conversation_id: Uuid,
-                _transition_id: Uuid,
-                _sequencer_ds_did: &str,
-                _signed_request_bytes: &[u8],
-                _sequencer_term: u64,
-                _received_at: &crate::validation::CanonicalTimestamp,
-            ) -> Result<SubmitCommit<DefaultStr>, catbird_server::federation::errors::FederationError>
-            {
-                Err(
-                    catbird_server::federation::errors::FederationError::InvalidEnvelope {
-                        reason: "test stub".to_string(),
-                    },
-                )
-            }
-        }
-        pub mod acceptance {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/acceptance.rs"
-            ));
-        }
-        pub mod creation {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/creation.rs"
-            ));
-        }
-        pub mod leave {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/leave.rs"
-            ));
-        }
-        pub mod reset {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/reset.rs"
-            ));
-        }
-        pub mod revocation {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/revocation.rs"
-            ));
-        }
-        pub mod submit_transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/submit_transition.rs"
-            ));
-        }
-    }
-
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-}
+pub use crate::chat_protocol::relationship_policy as relationship_policy_source;
 
 mod welcome_terminal_facade_contract {
     use super::chat_protocol::repository::welcome_terminal::{
@@ -2289,7 +1960,18 @@ mod historical_signed_path {
         let verifying = signing_key.verifying_key().to_bytes();
         let actor = sample_actor();
 
-        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let append = HydrationAuthority::for_test_with_locked(
+            conversation_id,
+            "tx-test".into(),
+            Some(coordinate),
+            1,
+            crate::chat_protocol::state_machine::ServerTimestamp::from_trusted_request_instant(
+                &trusted_received_at(),
+            )
+            .unwrap(),
+            [0x11; 32],
+        )
+        .unwrap();
         let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
 
         for raw in all_kinds(&coordinate, &actor, &signing_key) {
@@ -2324,13 +2006,23 @@ mod historical_signed_path {
 
         let raw = leaf_recovery_request_raw(&coordinate, &actor, uuid_v4_bytes(0x31), &signing_key);
         let mutation = decode_and_verify_signed_mutation(&raw, &verifying).unwrap();
-        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let append = HydrationAuthority::for_test_with_locked(
+            conversation_id,
+            "tx-test".into(),
+            Some(coordinate),
+            1,
+            crate::chat_protocol::state_machine::ServerTimestamp::from_trusted_request_instant(
+                &trusted_received_at(),
+            )
+            .unwrap(),
+            [0x11; 32],
+        )
+        .unwrap();
         let envelope =
             DurableSignedRequestEnvelope::new(conversation_id, &trusted_received_at()).unwrap();
         let admitted = append.signed_request(envelope, mutation).unwrap();
         let digest = *admitted.durable_row_digest();
         let row = || PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, digest).unwrap();
-
         let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
 
         // Wrong historical key.
@@ -2388,7 +2080,18 @@ mod historical_signed_path {
         let verifying = signing_key.verifying_key().to_bytes();
         let actor = sample_actor();
 
-        let append = HydrationAuthority::new(conversation_id).unwrap();
+        let append = HydrationAuthority::for_test_with_locked(
+            conversation_id,
+            "tx-test".into(),
+            Some(coordinate),
+            1,
+            crate::chat_protocol::state_machine::ServerTimestamp::from_trusted_request_instant(
+                &trusted_received_at(),
+            )
+            .unwrap(),
+            [0x11; 32],
+        )
+        .unwrap();
         let historical = HistoricalRehydrationAuthority::new(conversation_id, 9).unwrap();
 
         for raw in all_kinds(&coordinate, &actor, &signing_key) {
@@ -2398,7 +2101,6 @@ mod historical_signed_path {
             let admitted = append.signed_request(envelope, mutation).unwrap();
             let digest = *admitted.durable_row_digest();
             let row = PersistedSignedRequestRow::new(conversation_id, RECEIVED_AT, digest).unwrap();
-
             // Row path: the digest is supplied from the durable row.
             let row_path = historical
                 .hydrate_historical_signed_request(row, &raw, &verifying)
@@ -2886,7 +2588,56 @@ mod historical_control_path {
                 &public_key,
             )
             .unwrap();
-            let append = HydrationAuthority::new(cid).unwrap();
+            let expected_prior = match entry_for_digest.mutation().projection() {
+                VerifiedMutationProjection::Creation(_) => None,
+                VerifiedMutationProjection::CommitTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::PolicyTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ParticipantAcceptance(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::MetadataTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ResetActivation(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeafRecoveryFulfillment(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ConversationClose(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ZeroLeafLeave(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveCommitFulfillment(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ResetRequest(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveRequest(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveCancellation(_) => None,
+                _ => None,
+            };
+            let append = HydrationAuthority::for_test_with_locked(
+                cid,
+                "tx-test".into(),
+                expected_prior,
+                seq,
+                crate::chat_protocol::state_machine::ServerTimestamp::from_canonical_stored(
+                    entry_for_digest.received_at().as_str(),
+                )
+                .unwrap(),
+                [0x11; 32],
+            )
+            .unwrap();
             // The certified append-time minter fixes the digest the row must
             // carry. Every one of the 13 control-entry kinds — including the 6
             // metadata-bearing arms healed by the parse_metadata_snapshot fix
@@ -2904,7 +2655,6 @@ mod historical_control_path {
                     .unwrap()
                     .durable_row_digest(),
             };
-
             cases.push(ControlCase {
                 entry_kind: case["entryKind"].as_str().unwrap().to_owned(),
                 cid,
@@ -3037,10 +2787,64 @@ mod historical_control_path {
         // All 13 control-entry kinds: 10 transition arms + 3 control-request arms.
         assert_eq!(cases.len(), 13);
         for case in &cases {
-            let append = HydrationAuthority::new(case.cid).unwrap();
-            // Certified append-time re-hydration (head binding cfg'd out under
-            // test). Every kind mints full evidence — the 6 metadata-bearing arms
-            // are healed by the parse_metadata_snapshot fix.
+            let public_row_value: Value = serde_json::from_slice(&case.public_row_json).unwrap();
+            let received_at_str = public_row_value["receivedAt"].as_str().unwrap();
+            let entry_for_digest = rebind_persisted_control_entry(
+                decode_and_verify_control_entry(&case.public_row_json, &case.public_key).unwrap(),
+                &case.raw_wrapper,
+                &case.public_key,
+            )
+            .unwrap();
+            let expected_prior = match entry_for_digest.mutation().projection() {
+                VerifiedMutationProjection::Creation(_) => None,
+                VerifiedMutationProjection::CommitTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::PolicyTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ParticipantAcceptance(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::MetadataTransition(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ResetActivation(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeafRecoveryFulfillment(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ConversationClose(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ZeroLeafLeave(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveCommitFulfillment(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::ResetRequest(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveRequest(v) => {
+                    crate::chat_protocol::state_machine::closed_coordinate(&v.prior()).ok()
+                }
+                VerifiedMutationProjection::LeaveCancellation(_) => None,
+                _ => None,
+            };
+            let append = HydrationAuthority::for_test_with_locked(
+                case.cid,
+                "tx-test".into(),
+                expected_prior,
+                case.seq,
+                crate::chat_protocol::state_machine::ServerTimestamp::from_canonical_stored(
+                    received_at_str,
+                )
+                .unwrap(),
+                [0x11; 32],
+            )
+            .unwrap();
             let certified = append
                 .hydrate_persisted_control(case.row(), &case.public_key)
                 .unwrap_or_else(|e| {
@@ -10440,7 +10244,9 @@ mod historical_control_loader {
             );
             assert_eq!(
                 add.next().snapshot(),
-                corpus_file("committed-public-state.bin"),
+                crate::frozen_public_state::schema2_snapshot(&corpus_file(
+                    "committed-public-state.bin"
+                )),
                 "processed Add snapshot is byte-exact with the committed corpus artifact"
             );
             let added = add.into_next();
@@ -10464,7 +10270,9 @@ mod historical_control_loader {
             );
             assert_eq!(
                 generic_commit.next().snapshot(),
-                corpus_file("committed-generic-public-state.bin"),
+                crate::frozen_public_state::schema2_snapshot(&corpus_file(
+                    "committed-generic-public-state.bin"
+                )),
                 "processed generic snapshot is byte-exact with the committed corpus artifact"
             );
             let generic = generic_commit.into_next();
@@ -10490,7 +10298,9 @@ mod historical_control_loader {
             );
             assert_eq!(
                 remove.next().snapshot(),
-                corpus_file("committed-remove-public-state.bin"),
+                crate::frozen_public_state::schema2_snapshot(&corpus_file(
+                    "committed-remove-public-state.bin"
+                )),
                 "processed Remove snapshot is byte-exact with the committed corpus artifact"
             );
             let removed = remove.into_next();
@@ -10531,7 +10341,9 @@ mod historical_control_loader {
             );
             assert_eq!(
                 rejoin.next().snapshot(),
-                corpus_file("committed-rejoin-public-state.bin"),
+                crate::frozen_public_state::schema2_snapshot(&corpus_file(
+                    "committed-rejoin-public-state.bin"
+                )),
                 "processed rejoin snapshot is byte-exact with the committed corpus artifact"
             );
             let rejoined = rejoin.into_next();

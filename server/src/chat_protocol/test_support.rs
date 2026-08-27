@@ -1,8 +1,8 @@
-// Test support helpers for clean-chat protocol tests.
-//
-// Provides deterministic relationship projection fixtures and mock transports
-// without exposing production authority or relaxing crate-private visibility in
-// production binaries.
+//! Test support helpers for clean-chat protocol tests.
+//!
+//! Provides deterministic relationship projection fixtures and mock transports
+//! without exposing production authority or relaxing crate-private visibility in
+//! production binaries.
 
 #[cfg(any(test, feature = "test-support"))]
 pub use super::relationship_policy::AdmissionOperation;

@@ -1,9 +1,9 @@
-// Transaction-bound composition for the non-Recovery `submitTransition` union.
-//
-// The public handler is deliberately kept outside this module. It may choose
-// this facade after global signed-operation arbitration, serialize the exact
-// returned bytes, and commit the caller-owned outer transaction. It may not
-// assemble planner inputs, executor artifacts, or replay bytes.
+//! Transaction-bound composition for the non-Recovery `submitTransition` union.
+//!
+//! The public handler is deliberately kept outside this module. It may choose
+//! this facade after global signed-operation arbitration, serialize the exact
+//! returned bytes, and commit the caller-owned outer transaction. It may not
+//! assemble planner inputs, executor artifacts, or replay bytes.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;

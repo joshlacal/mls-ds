@@ -1,4 +1,4 @@
-// Exact, reject-rather-than-normalize validation for clean chat values.
+//! Exact, reject-rather-than-normalize validation for clean chat values.
 
 use std::{collections::BTreeSet, fmt};
 

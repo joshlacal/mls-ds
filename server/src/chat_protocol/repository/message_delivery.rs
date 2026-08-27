@@ -1,11 +1,11 @@
-// Business admission for the clean application-send and typing procedures.
-//
-// This module is deliberately transaction-scoped: authentication and the
-// operation prelude have already consumed replay evidence and locked the
-// actor authority before either function is called.  Conversation state and
-// the actor's concrete MLS interval are then read under the same transaction
-// and all coordinate fields are compared, rather than comparing only a
-// generation or state version.
+//! Business admission for the clean application-send and typing procedures.
+//!
+//! This module is deliberately transaction-scoped: authentication and the
+//! operation prelude have already consumed replay evidence and locked the
+//! actor authority before either function is called.  Conversation state and
+//! the actor's concrete MLS interval are then read under the same transaction
+//! and all coordinate fields are compared, rather than comparing only a
+//! generation or state version.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};

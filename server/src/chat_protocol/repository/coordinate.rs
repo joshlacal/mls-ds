@@ -1,19 +1,19 @@
-// Canonical JSON representation for coordinate-bearing response DTOs.
-//
-// The chat lexicon declares these fields as `bytes`. Jacquard's generated
-// `ConversationCoordinates` uses `serde_bytes_helper`, whose JSON contract is
-// an object containing `$bytes` and a standard-base64 string. It is not the
-// bare string form. Every response endpoint carrying coordinates must use
-// this helper so creation, submitTransition, acceptance, leave, and reset
-// cannot drift independently.
-//
-// Two entry points, because the callers do not share a lifecycle
-// precondition. `submitTransition` legitimately reports a superseded
-// coordinate — superseding prior state is what a transition does. Creation and
-// acceptance must not: a non-active coordinate there is a violated invariant,
-// and both rejected it before this logic was centralised. Keeping that guard
-// here rather than at the call sites means it cannot drift either, which is
-// the same reason the encoding lives here.
+//! Canonical JSON representation for coordinate-bearing response DTOs.
+//!
+//! The chat lexicon declares these fields as `bytes`. Jacquard's generated
+//! `ConversationCoordinates` uses `serde_bytes_helper`, whose JSON contract is
+//! an object containing `$bytes` and a standard-base64 string. It is not the
+//! bare string form. Every response endpoint carrying coordinates must use
+//! this helper so creation, submitTransition, acceptance, leave, and reset
+//! cannot drift independently.
+//!
+//! Two entry points, because the callers do not share a lifecycle
+//! precondition. `submitTransition` legitimately reports a superseded
+//! coordinate — superseding prior state is what a transition does. Creation and
+//! acceptance must not: a non-active coordinate there is a violated invariant,
+//! and both rejected it before this logic was centralised. Keeping that guard
+//! here rather than at the call sites means it cannot drift either, which is
+//! the same reason the encoding lives here.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
