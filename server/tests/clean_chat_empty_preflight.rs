@@ -1,25 +1,25 @@
 //! Integration tests for Clean Chat zero-state preflight gate.
 //!
-//! Tests both pre-cutover (19 migrations, max 20260821000001) and
-//! post-migration (23 migrations, max 20260824000005) modes against disposable
+//! Tests both pre-cutover (74 migrations, max 20260821000001) and
+//! post-migration (79 migrations, max 20260824000005) modes against disposable
 //! PostgreSQL databases.
 //!
 //! Verifies:
 //!   - GREEN exact pre-cutover and post-migration modes.
-//!   - RED on dirty semantic tables: devices, key_packages, generation_states,
-//!     relationship_projection_relationships, relationship_projection_declarations,
-//!     transitions, entries, welcome_bundles, outbox, federation_delivery_receipts.
-//!   - RED on infrastructure anomalies.
-//!   - RED on migration catalog / checksum / dirty drift.
-//!   - RED on unexpected or missing tables in chat schema.
-//!   - RED on Clean Chat lowercase UUIDv4 rows in federation_outbox, outbound_queue,
-//!     federation_sync_state across all reachable statuses.
+//!   - Strict read-only verification (explicit READ ONLY transaction, zero mutations, row snapshots preserved).
 //!   - GREEN on legacy non-UUID rows in public transport tables.
-//!   - Strict read-only verification (zero database mutations).
+//!   - RED on infrastructure anomalies and NULL drift.
+//!   - RED on dirty semantic tables: devices (independently without principal), key_packages,
+//!     generation_states, relationship_projection_relationships, relationship_projection_declarations,
+//!     transitions, entries, welcome_bundles, outbox, conversations, federation_delivery_receipts.
+//!   - RED on migration catalog / checksum / dirty / count drift.
+//!   - RED on unexpected or missing tables / views in chat schema.
+//!   - RED on Clean Chat lowercase UUIDv4 rows in federation_outbox, outbound_queue,
+//!     federation_sync_state across all reachable statuses in both post-migration and pre-cutover modes.
+//!   - RED on missing public transport tables, missing identifier columns, or non-text-compatible column types.
 
 mod common;
 
-use common::chat_protocol::{reviewed_clean_protocol_migrator, CLEAN_PROTOCOL_13_MANIFEST};
 use common::fresh_db::{DisposableDatabase, SHARED_LEGACY_DB_PREFIX};
 use sqlx::error::BoxDynError;
 use sqlx::migrate::{Migration, MigrationSource, Migrator};
@@ -28,49 +28,6 @@ use uuid::Uuid;
 
 const PREFLIGHT_SQL: &str = include_str!("../scripts/assert_clean_chat_empty.sql");
 const CURSOR_KEY_ID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-async fn ensure_public_transport_prerequisites(conn: &mut sqlx::PgConnection) {
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS public.delivery_events (
-            id TEXT PRIMARY KEY,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-        );
-        CREATE TABLE IF NOT EXISTS public.federation_outbox (
-            id TEXT PRIMARY KEY,
-            conversation_id TEXT NOT NULL,
-            delivery_event_id TEXT REFERENCES public.delivery_events(id),
-            status TEXT NOT NULL DEFAULT 'pending',
-            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            attempts INT NOT NULL DEFAULT 0,
-            max_attempts INT NOT NULL DEFAULT 10,
-            last_error TEXT,
-            backoff_exponent INT NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS public.outbound_queue (
-            id TEXT PRIMARY KEY,
-            target_ds_did TEXT NOT NULL,
-            target_endpoint TEXT NOT NULL,
-            convo_id TEXT NOT NULL,
-            payload BYTEA NOT NULL DEFAULT decode('', 'hex'),
-            created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            next_retry_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-            retry_count INT NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'pending',
-            error TEXT
-        );
-        CREATE TABLE IF NOT EXISTS public.federation_sync_state (
-            convo_id TEXT PRIMARY KEY,
-            sequencer_ds_did TEXT NOT NULL,
-            sequencer_term BIGINT NOT NULL DEFAULT 0,
-            last_synced_event_id TEXT,
-            last_synced_seq BIGINT,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-        );",
-    )
-    .execute(&mut *conn)
-    .await
-    .expect("create public transport tables prerequisites");
-}
 
 /// Apply `migrator` to a fresh disposable database, then initialize the infrastructure rows
 /// the preflight requires: the protocol singleton and its bound zero-floor retention row.
@@ -81,8 +38,6 @@ async fn setup_db(migrator: Migrator) -> (PgPool, DisposableDatabase) {
         .acquire()
         .await
         .expect("acquire connection for migration");
-
-    ensure_public_transport_prerequisites(&mut conn).await;
 
     sqlx::query("SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'")
         .execute(&mut *conn)
@@ -122,33 +77,44 @@ async fn setup_db(migrator: Migrator) -> (PgPool, DisposableDatabase) {
     (pool, database)
 }
 
-/// Set up a disposable database with pre-cutover migrations (first 19 migrations).
-async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
-    #[derive(Debug)]
-    struct PreCutoverSource(Vec<Migration>);
-    impl<'s> MigrationSource<'s> for PreCutoverSource {
-        fn resolve(self) -> futures::future::BoxFuture<'s, Result<Vec<Migration>, BoxDynError>> {
-            Box::pin(async move { Ok(self.0) })
-        }
-    }
+#[derive(Debug)]
+struct MigrationSliceSource(Vec<Migration>);
 
-    let pre_cutover_entries = CLEAN_PROTOCOL_13_MANIFEST[0..19]
+impl<'s> MigrationSource<'s> for MigrationSliceSource {
+    fn resolve(self) -> futures::future::BoxFuture<'s, Result<Vec<Migration>, BoxDynError>> {
+        Box::pin(async move { Ok(self.0) })
+    }
+}
+
+/// Set up a disposable database with pre-cutover migrations (74 migrations up to 20260821000001).
+async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
+    let full_migrator = sqlx::migrate!("./migrations");
+    let pre_cutover_entries: Vec<Migration> = full_migrator
+        .migrations
         .iter()
-        .map(|entry| entry.migration.clone())
+        .filter(|m| m.version <= 20260821000001)
+        .cloned()
         .collect();
-    let migrator = Migrator::new(PreCutoverSource(pre_cutover_entries))
+    assert_eq!(
+        pre_cutover_entries.len(),
+        74,
+        "pre-cutover catalog must contain exactly 74 migrations"
+    );
+    let migrator = Migrator::new(MigrationSliceSource(pre_cutover_entries))
         .await
         .expect("build pre-cutover migrator");
 
     setup_db(migrator).await
 }
 
-/// Set up a disposable database with post-migration migrations (all 23 migrations).
+/// Set up a disposable database with post-migration migrations (all 79 migrations).
 async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
-    let migrator = reviewed_clean_protocol_migrator()
-        .await
-        .expect("build post-migration migrator");
-
+    let migrator = sqlx::migrate!("./migrations");
+    assert_eq!(
+        migrator.migrations.len(),
+        79,
+        "post-migration catalog must contain exactly 79 migrations"
+    );
     setup_db(migrator).await
 }
 
@@ -222,6 +188,34 @@ async fn test_preflight_passes_on_pristine_post_migration_database() {
 async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
     let (pool, _db) = setup_post_migration_db().await;
 
+    // Seed legacy non-UUID transport rows so data tables have rows to preserve
+    sqlx::query(
+        "INSERT INTO public.federation_outbox (id, conversation_id, target_service_did, payload, status)
+         VALUES ('outbox-ro-1', 'legacy-convo-read-only', 'did:web:target.example.com', decode('', 'hex'), 'pending')
+         ON CONFLICT (id) DO NOTHING;",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy federation_outbox row");
+
+    sqlx::query(
+        "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
+         VALUES ('queue-ro-1', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'legacy-convo-read-only', 'delivered')
+         ON CONFLICT (id) DO NOTHING;",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy outbound_queue row");
+
+    sqlx::query(
+        "INSERT INTO public.federation_sync_state (convo_id, sequencer_ds_did, status)
+         VALUES ('legacy-convo-read-only', 'did:web:example.com', 'healthy')
+         ON CONFLICT (convo_id, sequencer_ds_did) DO NOTHING;",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy federation_sync_state row");
+
     // Snapshot migration ledger
     let ledger_before: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
         "SELECT version, description, success, checksum FROM public._sqlx_migrations ORDER BY version",
@@ -229,18 +223,83 @@ async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
     .fetch_all(&pool)
     .await
     .expect("read ledger before");
-
     // Snapshot table list in chat schema
-    let tables_before: Vec<String> = sqlx::query_scalar(
-        "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'chat' ORDER BY tablename",
+    let tables_before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.relname, c.relkind::text
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'chat' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+         ORDER BY c.relname",
     )
     .fetch_all(&pool)
     .await
     .expect("read tables before");
 
-    // Execute preflight
-    let result = run_preflight(&pool).await;
-    assert!(result.is_ok(), "preflight must pass");
+    // Snapshot infrastructure tables
+    let proto_before: Vec<(bool, String, Uuid, String)> = sqlx::query_as(
+        "SELECT singleton, protocol_version, protocol_instance_id, cursor_key_id FROM chat.protocol_instances",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read protocol instances before");
+
+    let retention_before: Vec<(Uuid, i64)> =
+        sqlx::query_as("SELECT protocol_instance_id, retained_floor FROM chat.event_retention")
+            .fetch_all(&pool)
+            .await
+            .expect("read event retention before");
+
+    let completeness_before: Vec<(bool, i64)> = sqlx::query_as(
+        "SELECT singleton, legacy_receipt_count FROM chat.operation_claim_completeness_cutover",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read completeness before");
+
+    // Snapshot public transport tables
+    let outbox_before: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, conversation_id, status FROM public.federation_outbox ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read federation_outbox before");
+
+    let queue_before: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, target_ds_did, convo_id, status FROM public.outbound_queue ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read outbound_queue before");
+
+    let sync_state_before: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT convo_id, sequencer_ds_did, status FROM public.federation_sync_state ORDER BY convo_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read federation_sync_state before");
+
+    // Execute preflight through one acquired connection in an explicit PostgreSQL READ ONLY transaction
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("acquire connection for read-only preflight execution");
+
+    sqlx::raw_sql("BEGIN TRANSACTION READ ONLY;")
+        .execute(&mut *conn)
+        .await
+        .expect("begin read-only transaction");
+
+    sqlx::raw_sql(PREFLIGHT_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("execute preflight in read-only transaction");
+
+    sqlx::raw_sql("COMMIT;")
+        .execute(&mut *conn)
+        .await
+        .expect("commit read-only transaction");
+
+    drop(conn);
 
     // Verify migration ledger unchanged
     let ledger_after: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
@@ -254,16 +313,87 @@ async fn test_preflight_is_strictly_read_only_and_preserves_database_state() {
         "migration ledger must be byte-for-byte unchanged"
     );
 
-    // Verify tables unchanged
-    let tables_after: Vec<String> = sqlx::query_scalar(
-        "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'chat' ORDER BY tablename",
+    // Verify chat relations unchanged
+    let tables_after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.relname, c.relkind::text
+         FROM pg_catalog.pg_class c
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'chat' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+         ORDER BY c.relname",
     )
     .fetch_all(&pool)
     .await
     .expect("read tables after");
     assert_eq!(
         tables_before, tables_after,
-        "tables in chat schema must be unchanged"
+        "relations in chat schema must be unchanged"
+    );
+
+    // Verify infrastructure unchanged
+    let proto_after: Vec<(bool, String, Uuid, String)> = sqlx::query_as(
+        "SELECT singleton, protocol_version, protocol_instance_id, cursor_key_id FROM chat.protocol_instances",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read protocol instances after");
+    assert_eq!(
+        proto_before, proto_after,
+        "protocol_instances must be unchanged"
+    );
+
+    let retention_after: Vec<(Uuid, i64)> =
+        sqlx::query_as("SELECT protocol_instance_id, retained_floor FROM chat.event_retention")
+            .fetch_all(&pool)
+            .await
+            .expect("read event retention after");
+    assert_eq!(
+        retention_before, retention_after,
+        "event_retention must be unchanged"
+    );
+
+    let completeness_after: Vec<(bool, i64)> = sqlx::query_as(
+        "SELECT singleton, legacy_receipt_count FROM chat.operation_claim_completeness_cutover",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read completeness after");
+    assert_eq!(
+        completeness_before, completeness_after,
+        "operation_claim_completeness_cutover must be unchanged"
+    );
+
+    // Verify public transport rows unchanged
+    let outbox_after: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, conversation_id, status FROM public.federation_outbox ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read federation_outbox after");
+    assert_eq!(
+        outbox_before, outbox_after,
+        "federation_outbox rows must be unchanged"
+    );
+
+    let queue_after: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, target_ds_did, convo_id, status FROM public.outbound_queue ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read outbound_queue after");
+    assert_eq!(
+        queue_before, queue_after,
+        "outbound_queue rows must be unchanged"
+    );
+
+    let sync_state_after: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT convo_id, sequencer_ds_did, status FROM public.federation_sync_state ORDER BY convo_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read federation_sync_state after");
+    assert_eq!(
+        sync_state_before, sync_state_after,
+        "federation_sync_state rows must be unchanged"
     );
 }
 
@@ -273,9 +403,9 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
 
     // Seed non-UUID legacy rows
     sqlx::query(
-        "INSERT INTO public.federation_outbox (id, conversation_id, status)
-         VALUES ('outbox-1', 'legacy-convo-id-12345', 'pending'),
-                ('outbox-2', 'not_a_uuid_at_all', 'done')
+        "INSERT INTO public.federation_outbox (id, conversation_id, target_service_did, payload, status)
+         VALUES ('outbox-1', 'legacy-convo-id-12345', 'did:web:target.example.com', decode('', 'hex'), 'pending'),
+                ('outbox-2', 'not_a_uuid_at_all', 'did:web:target.example.com', decode('', 'hex'), 'done')
          ON CONFLICT (id) DO NOTHING;",
     )
     .execute(&pool)
@@ -283,9 +413,9 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
     .expect("insert legacy federation_outbox rows");
 
     sqlx::query(
-        "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, convo_id, status)
-         VALUES ('queue-1', 'did:web:ds.example.com', 'https://ds.example.com', 'legacy-convo-999', 'delivered'),
-                ('queue-2', 'did:web:ds.example.com', 'https://ds.example.com', 'convo_legacy_group', 'dead')
+        "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
+         VALUES ('queue-1', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'legacy-convo-999', 'delivered'),
+                ('queue-2', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), 'convo_legacy_group', 'dead')
          ON CONFLICT (id) DO NOTHING;",
     )
     .execute(&pool)
@@ -295,12 +425,11 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
     sqlx::query(
         "INSERT INTO public.federation_sync_state (convo_id, sequencer_ds_did, status)
          VALUES ('legacy-convo-sync-1', 'did:web:example.com', 'healthy')
-         ON CONFLICT (convo_id) DO NOTHING;",
+         ON CONFLICT (convo_id, sequencer_ds_did) DO NOTHING;",
     )
     .execute(&pool)
     .await
     .expect("insert legacy federation_sync_state rows");
-
     let result = run_preflight(&pool).await;
     assert!(
         result.is_ok(),
@@ -310,7 +439,7 @@ async fn test_preflight_allows_legacy_non_uuid_rows_in_public_transport_tables()
 }
 
 // =============================================================================
-// Negative / RED Tests: Infrastructure Anomalies
+// Negative / RED Tests: Infrastructure Anomalies and NULL Drift
 // =============================================================================
 
 #[tokio::test]
@@ -375,6 +504,36 @@ async fn test_preflight_fails_when_protocol_version_is_not_v1() {
 }
 
 #[tokio::test]
+async fn test_preflight_fails_when_protocol_version_is_null() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query(
+        "ALTER TABLE chat.protocol_instances DISABLE TRIGGER protocol_instances_immutable;",
+    )
+    .execute(&pool)
+    .await
+    .expect("disable trigger");
+    sqlx::query("ALTER TABLE chat.protocol_instances DROP CONSTRAINT IF EXISTS protocol_instances_protocol_version_check;")
+        .execute(&pool)
+        .await
+        .expect("drop check");
+    sqlx::query("ALTER TABLE chat.protocol_instances ALTER COLUMN protocol_version DROP NOT NULL;")
+        .execute(&pool)
+        .await
+        .expect("drop not null");
+    sqlx::query("UPDATE chat.protocol_instances SET protocol_version = NULL;")
+        .execute(&pool)
+        .await
+        .expect("update version to null");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail when protocol_version is NULL");
+    assert!(
+        err.to_string().contains("protocol_version must be '1'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_preflight_fails_when_event_retention_floor_is_nonzero() {
     let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
@@ -396,6 +555,38 @@ async fn test_preflight_fails_when_event_retention_floor_is_nonzero() {
 
     let result = run_preflight(&pool).await;
     let err = result.expect_err("preflight must fail when retained_floor is nonzero");
+    assert!(
+        err.to_string().contains("retained_floor must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_fails_when_event_retention_floor_is_null() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query(
+        "ALTER TABLE chat.event_retention DISABLE TRIGGER event_retention_identity_immutable;",
+    )
+    .execute(&pool)
+    .await
+    .expect("disable trigger");
+    sqlx::query(
+        "ALTER TABLE chat.event_retention DISABLE TRIGGER event_retention_lifecycle_monotonic;",
+    )
+    .execute(&pool)
+    .await
+    .expect("disable monotonic trigger");
+    sqlx::query("ALTER TABLE chat.event_retention ALTER COLUMN retained_floor DROP NOT NULL;")
+        .execute(&pool)
+        .await
+        .expect("drop not null");
+    sqlx::query("UPDATE chat.event_retention SET retained_floor = NULL;")
+        .execute(&pool)
+        .await
+        .expect("update floor to null");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail when retained_floor is NULL");
     assert!(
         err.to_string().contains("retained_floor must be 0"),
         "unexpected error: {err}"
@@ -432,6 +623,44 @@ async fn test_preflight_fails_when_event_retention_is_unlinked() {
 }
 
 #[tokio::test]
+async fn test_preflight_fails_when_event_retention_instance_id_is_null() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("ALTER TABLE chat.event_retention DISABLE TRIGGER ALL;")
+        .execute(&pool)
+        .await
+        .expect("disable trigger");
+    sqlx::query(
+        "ALTER TABLE chat.event_retention DROP CONSTRAINT IF EXISTS event_retention_pkey CASCADE;",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop pkey");
+    sqlx::query("ALTER TABLE chat.event_retention DROP CONSTRAINT IF EXISTS event_retention_instance_fk CASCADE;")
+        .execute(&pool)
+        .await
+        .expect("drop fk");
+    sqlx::query(
+        "ALTER TABLE chat.event_retention ALTER COLUMN protocol_instance_id DROP NOT NULL;",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop not null");
+    sqlx::query("UPDATE chat.event_retention SET protocol_instance_id = NULL;")
+        .execute(&pool)
+        .await
+        .expect("update instance id to null");
+
+    let result = run_preflight(&pool).await;
+    let err =
+        result.expect_err("preflight must fail when event_retention protocol_instance_id is NULL");
+    assert!(
+        err.to_string()
+            .contains("does not match chat.protocol_instances singleton"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_preflight_fails_when_completeness_cutover_has_nonzero_receipts() {
     let (pool, _db) = setup_post_migration_db().await;
     sqlx::query("ALTER TABLE chat.operation_claim_completeness_cutover DISABLE TRIGGER operation_claim_completeness_cutover_immutable;")
@@ -451,6 +680,32 @@ async fn test_preflight_fails_when_completeness_cutover_has_nonzero_receipts() {
     );
 }
 
+#[tokio::test]
+async fn test_preflight_fails_when_completeness_cutover_legacy_receipt_count_is_null() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("ALTER TABLE chat.operation_claim_completeness_cutover DISABLE TRIGGER operation_claim_completeness_cutover_immutable;")
+        .execute(&pool)
+        .await
+        .expect("disable trigger");
+    sqlx::query("ALTER TABLE chat.operation_claim_completeness_cutover ALTER COLUMN legacy_receipt_count DROP NOT NULL;")
+        .execute(&pool)
+        .await
+        .expect("drop not null");
+    sqlx::query(
+        "UPDATE chat.operation_claim_completeness_cutover SET legacy_receipt_count = NULL;",
+    )
+    .execute(&pool)
+    .await
+    .expect("update legacy count to null");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail when legacy_receipt_count is NULL");
+    assert!(
+        err.to_string().contains("legacy_receipt_count must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
 // =============================================================================
 // Negative / RED Tests: Dirty Semantic Tables (Explicit Step 1 Set)
 // =============================================================================
@@ -458,38 +713,16 @@ async fn test_preflight_fails_when_completeness_cutover_has_nonzero_receipts() {
 #[tokio::test]
 async fn test_preflight_fails_when_devices_table_is_dirty() {
     let (pool, _db) = setup_post_migration_db().await;
-    let did = "did:web:alice.example.com";
     let dev_id = Uuid::new_v4();
 
-    sqlx::query(
-        "INSERT INTO chat.principals (user_did, created_at) VALUES ($1, clock_timestamp());",
-    )
-    .bind(did)
-    .execute(&pool)
-    .await
-    .expect("insert principal");
-
-    sqlx::query(
+    // Insert ONLY into chat.devices without any principal row (unbinding constraints/triggers)
+    let insert_sql = format!(
         "INSERT INTO chat.devices (user_did, device_id, device_name, status, dpop_jkt, auth_generation, capabilities, created_at, updated_at)
-         VALUES ($1, $2, 'phone', 'active', $3, 1, chat.protocol_capabilities(), clock_timestamp(), clock_timestamp());",
-    )
-    .bind(did)
-    .bind(dev_id)
-    .bind(CURSOR_KEY_ID)
-    .execute(&pool)
-    .await
-    .expect("insert device");
-
-    let result = run_preflight(&pool).await;
-    let err = result.expect_err("preflight must fail on dirty devices table");
-    assert!(
-        err.to_string()
-            .contains("semantic table chat.devices is dirty")
-            || err
-                .to_string()
-                .contains("semantic table chat.principals is dirty"),
-        "unexpected error: {err}"
+         VALUES ('did:web:alice.example.com', '{dev_id}', 'phone', 'active', '{cursor_key}', 1, chat.protocol_capabilities(), clock_timestamp(), clock_timestamp());",
+        cursor_key = CURSOR_KEY_ID
     );
+
+    assert_dirty_semantic_table_rejected(&pool, "devices", &insert_sql).await;
 }
 
 #[tokio::test]
@@ -847,7 +1080,24 @@ async fn test_preflight_fails_on_unexpected_extra_table_in_chat_schema() {
     let err = result.expect_err("preflight must fail on unexpected table");
     assert!(
         err.to_string()
-            .contains("unexpected table chat.unauthorized_extra_table"),
+            .contains("unexpected relation chat.unauthorized_extra_table"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_fails_on_unexpected_view_in_chat_schema() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("CREATE VIEW chat.unauthorized_view AS SELECT 1 AS id;")
+        .execute(&pool)
+        .await
+        .expect("create unauthorized view");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail on unexpected view in chat schema");
+    assert!(
+        err.to_string()
+            .contains("unexpected relation chat.unauthorized_view (relkind=v)"),
         "unexpected error: {err}"
     );
 }
@@ -881,14 +1131,15 @@ async fn test_pre_cutover_fails_if_post_table_federation_delivery_receipts_exist
     let err = result
         .expect_err("preflight must fail when post-migration table exists in pre-cutover mode");
     assert!(
-        err.to_string()
-            .contains("unexpected table chat.federation_delivery_receipts in pre-cutover mode"),
+        err.to_string().contains(
+            "unexpected relation chat.federation_delivery_receipts (relkind=r) in pre-cutover mode"
+        ),
         "unexpected error: {err}"
     );
 }
 
 // =============================================================================
-// Negative / RED Tests: Public Transport UUIDv4 Row Traps
+// Negative / RED Tests: Public Transport UUIDv4 Row Traps (Post-Migration & Pre-Cutover)
 // =============================================================================
 
 #[tokio::test]
@@ -897,8 +1148,8 @@ async fn test_preflight_fails_on_clean_chat_uuid_in_federation_outbox_for_all_st
         let (pool, _db) = setup_post_migration_db().await;
         let clean_convo_uuid = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO public.federation_outbox (id, conversation_id, status)
-             VALUES ($1, $2, $3);",
+            "INSERT INTO public.federation_outbox (id, conversation_id, target_service_did, payload, status)
+             VALUES ($1, $2, 'did:web:target.example.com', decode('', 'hex'), $3);",
         )
         .bind(format!("outbox-{status}"))
         .bind(&clean_convo_uuid)
@@ -925,8 +1176,8 @@ async fn test_preflight_fails_on_clean_chat_uuid_in_outbound_queue_for_all_statu
         let (pool, _db) = setup_post_migration_db().await;
         let clean_convo_uuid = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, convo_id, status)
-             VALUES ($1, 'did:web:ds.example.com', 'https://ds.example.com', $2, $3);",
+            "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
+             VALUES ($1, 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), $2, $3);",
         )
         .bind(format!("queue-{status}"))
         .bind(&clean_convo_uuid)
@@ -984,4 +1235,153 @@ async fn test_preflight_fails_on_clean_chat_uuid_in_federation_sync_state_for_al
             "unexpected error for status {status}: {err}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_pre_cutover_fails_on_clean_chat_uuid_in_public_transport_tables() {
+    // 1. federation_outbox in pre-cutover mode
+    {
+        let (pool, _db) = setup_pre_cutover_db().await;
+        let clean_convo_uuid = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO public.conversations (id, group_id, creator_did)
+             VALUES ('legacy-convo-pre', decode('0000000000000000000000000000000000000000000000000000000000000000', 'hex'), 'did:web:creator')
+             ON CONFLICT (id) DO NOTHING;",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy conversation");
+
+        sqlx::query(
+            "INSERT INTO public.delivery_events (id, conversation_id, seq, event_type, payload)
+             VALUES ('legacy-event-pre', 'legacy-convo-pre', 1, 'message', decode('', 'hex'))
+             ON CONFLICT (id) DO NOTHING;",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy delivery event");
+
+        sqlx::query(
+            "INSERT INTO public.federation_outbox (id, conversation_id, delivery_event_id, target_service_did, payload, status)
+             VALUES ('outbox-pre-1', $1, 'legacy-event-pre', 'did:web:target.example.com', decode('', 'hex'), 'pending');",
+        )
+        .bind(&clean_convo_uuid)
+        .execute(&pool)
+        .await
+        .expect("insert clean convo into federation_outbox");
+
+        let result = run_preflight(&pool).await;
+        let err = result
+            .expect_err("preflight must fail on UUIDv4 in federation_outbox in pre-cutover mode");
+        assert!(
+            err.to_string()
+                .contains("public.federation_outbox contains"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // 2. outbound_queue in pre-cutover mode
+    {
+        let (pool, _db) = setup_pre_cutover_db().await;
+        let clean_convo_uuid = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO public.outbound_queue (id, target_ds_did, target_endpoint, method, payload, convo_id, status)
+             VALUES ('queue-pre-1', 'did:web:ds.example.com', 'https://ds.example.com', 'deliverMessage', decode('', 'hex'), $1, 'pending');",
+        )
+        .bind(&clean_convo_uuid)
+        .execute(&pool)
+        .await
+        .expect("insert clean convo into outbound_queue");
+
+        let result = run_preflight(&pool).await;
+        let err = result
+            .expect_err("preflight must fail on UUIDv4 in outbound_queue in pre-cutover mode");
+        assert!(
+            err.to_string().contains("public.outbound_queue contains"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // 3. federation_sync_state in pre-cutover mode
+    {
+        let (pool, _db) = setup_pre_cutover_db().await;
+        let clean_convo_uuid = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO public.federation_sync_state (convo_id, sequencer_ds_did)
+             VALUES ($1, 'did:web:example.com');",
+        )
+        .bind(&clean_convo_uuid)
+        .execute(&pool)
+        .await
+        .expect("insert clean convo into federation_sync_state");
+
+        let result = run_preflight(&pool).await;
+        let err = result.expect_err(
+            "preflight must fail on UUIDv4 in federation_sync_state in pre-cutover mode",
+        );
+        assert!(
+            err.to_string()
+                .contains("public.federation_sync_state contains"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+// =============================================================================
+// Negative / RED Tests: Public Transport Table / Column / Type Drift
+// =============================================================================
+
+#[tokio::test]
+async fn test_preflight_fails_when_public_transport_table_is_missing() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("DROP TABLE public.federation_outbox CASCADE;")
+        .execute(&pool)
+        .await
+        .expect("drop federation_outbox table");
+
+    let result = run_preflight(&pool).await;
+    let err =
+        result.expect_err("preflight must fail when required public transport table is missing");
+    assert!(
+        err.to_string()
+            .contains("required public transport table public.federation_outbox is missing"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_fails_when_public_transport_identifier_column_is_missing() {
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query("ALTER TABLE public.outbound_queue DROP COLUMN convo_id CASCADE;")
+        .execute(&pool)
+        .await
+        .expect("drop convo_id column from outbound_queue");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail when identifier column is missing");
+    assert!(
+        err.to_string()
+            .contains("required identifier column outbound_queue.convo_id is missing"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_preflight_fails_when_public_transport_identifier_column_type_is_not_text_compatible()
+{
+    let (pool, _db) = setup_post_migration_db().await;
+    sqlx::query(
+        "ALTER TABLE public.federation_sync_state ALTER COLUMN convo_id TYPE integer USING 1;",
+    )
+    .execute(&pool)
+    .await
+    .expect("alter convo_id to integer");
+
+    let result = run_preflight(&pool).await;
+    let err = result.expect_err("preflight must fail when identifier column is non-text");
+    assert!(
+        err.to_string()
+            .contains("column federation_sync_state.convo_id in public.federation_sync_state is not text-compatible (type=int4)"),
+        "unexpected error: {err}"
+    );
 }
