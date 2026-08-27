@@ -247,7 +247,27 @@ fn coordinate(
     )
 }
 
+fn encode_schema2_snapshot(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(b"CBPGSNAP");
+    encoded.extend_from_slice(&2u16.to_be_bytes());
+    encoded.extend_from_slice(&(b"0.9.0-rc.3".len() as u16).to_be_bytes());
+    encoded.extend_from_slice(b"0.9.0-rc.3");
+    encoded.extend_from_slice(&(b"0.6.0-rc.3".len() as u16).to_be_bytes());
+    encoded.extend_from_slice(b"0.6.0-rc.3");
+    encoded.extend_from_slice(&(records.len() as u32).to_be_bytes());
+    for (key, value) in records {
+        encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(key);
+        encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(value);
+    }
+    encoded
+}
+
 fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> ActivePublicState {
+    let raw = parse_snapshot(&snapshot);
+    let schema2_snapshot = encode_schema2_snapshot(&raw.records);
     let binding = PublicGroupSnapshotBinding::new(
         *coordinate.conversation_id(),
         coordinate.generation(),
@@ -257,13 +277,13 @@ fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> Acti
         *coordinate.group_context_hash(),
         *coordinate.confirmation_tag(),
         coordinate.lifecycle(),
-        public_group_snapshot_sha256(&snapshot),
+        public_group_snapshot_sha256(&schema2_snapshot),
         tree_summary(&snapshot),
     );
     let encoded_summary =
         encode_public_tree_summary(binding.tree_summary()).expect("encode frozen tree summary");
     load_persisted_active_snapshot_from_parts_for_test(
-        &snapshot,
+        &schema2_snapshot,
         &binding,
         encoded_summary.bytes(),
         encoded_summary.sha256(),

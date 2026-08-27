@@ -1,4 +1,4 @@
-//! Shared error for the clean-chat cryptographic primitive layer.
+// Shared error for the clean-chat cryptographic primitive layer.
 
 use thiserror::Error;
 

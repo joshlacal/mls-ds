@@ -1,9 +1,9 @@
-//! Repository facade for the clean-chat leave/close mutation family.
-//!
-//! The facade owns the complete transaction: operation arbitration, canonical
-//! identity locking, state-machine planning, durable execution, and replay
-//! post-state validation.  It deliberately keeps the HTTP layer unaware of
-//! planners, SQL rows, and operation-completion capabilities.
+// Repository facade for the clean-chat leave/close mutation family.
+//
+// The facade owns the complete transaction: operation arbitration, canonical
+// identity locking, state-machine planning, durable execution, and replay
+// post-state validation.  It deliberately keeps the HTTP layer unaware of
+// planners, SQL rows, and operation-completion capabilities.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{SecondsFormat, TimeZone, Utc};

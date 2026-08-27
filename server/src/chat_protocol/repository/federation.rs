@@ -1,7 +1,7 @@
-//! PostgreSQL repository primitives for clean-chat federation operations.
-//!
-//! Implements delivery ID deduplication, preprovisioned Welcome verification (Choice C),
-//! exact message replication, and sequencer commit execution.
+// PostgreSQL repository primitives for clean-chat federation operations.
+//
+// Implements delivery ID deduplication, preprovisioned Welcome verification (Choice C),
+// exact message replication, and sequencer commit execution.
 
 use std::str::FromStr;
 

@@ -1,4 +1,4 @@
-//! Repository-owned `getEntries` read composition.
+// Repository-owned `getEntries` read composition.
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
@@ -133,17 +133,17 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     object.insert("seq".into(), Value::Number(row.seq.into()));
     object.insert("signedRequest".into(), signed_request);
     if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
-        return crate::chat_protocol::transcript::persisted_control_entry_response_json(
-            &row.entry_kind,
+        let bytes = crate::chat_protocol::transcript::persisted_control_entry_response_json(
             &row.entry_id.hyphenated().to_string(),
+            &row.entry_kind,
             &row.conversation_id.hyphenated().to_string(),
             u64::try_from(row.seq).map_err(|_| EntryReadFacadeError::Invariant)?,
             &row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             &row.signed_request_bytes,
             &row.server_fields_bytes,
         )
-        .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant))
         .map_err(|_| EntryReadFacadeError::Invariant)?;
+        return serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant);
     }
     Ok(Value::Object(object))
 }

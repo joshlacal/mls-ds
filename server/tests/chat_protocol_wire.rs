@@ -1028,9 +1028,9 @@ struct GenesisGroupInfoFixture {
 #[derive(Clone, Copy)]
 enum StatefulCommitVariant {
     EmptySelfUpdate,
-    EmptyWithDefaultPathCapabilities,
+    EmptyWithExtraPathCapabilities,
     EmptyWithChangedPathCredential,
-    AddWithDefaultPathCapabilities,
+    AddWithExtraPathCapabilities,
     AddWithChangedPathCredential,
 }
 
@@ -1087,7 +1087,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
             .commit()
             .tls_serialize_detached()
             .expect("serialize empty self-update"),
-        StatefulCommitVariant::EmptyWithDefaultPathCapabilities => group
+        StatefulCommitVariant::EmptyWithExtraPathCapabilities => group
             .self_update(
                 &provider,
                 &signer,
@@ -1095,10 +1095,10 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                     .with_capabilities(capabilities_with_extra_suite())
                     .build(),
             )
-            .expect("create default-capabilities self-update")
+            .expect("create extra-capabilities self-update")
             .commit()
             .tls_serialize_detached()
-            .expect("serialize default-capabilities self-update"),
+            .expect("serialize extra-capabilities self-update"),
         StatefulCommitVariant::EmptyWithChangedPathCredential => group
             .self_update(
                 &provider,
@@ -1115,7 +1115,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
             .commit()
             .tls_serialize_detached()
             .expect("serialize changed-credential self-update"),
-        StatefulCommitVariant::AddWithDefaultPathCapabilities
+        StatefulCommitVariant::AddWithExtraPathCapabilities
         | StatefulCommitVariant::AddWithChangedPathCredential => {
             let bob_signer =
                 SignatureKeyPair::new(XWING_CIPHERSUITE.signature_algorithm()).expect("Bob signer");
@@ -1141,7 +1141,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                 .key_package()
                 .clone();
             let leaf_parameters = match variant {
-                StatefulCommitVariant::AddWithDefaultPathCapabilities => {
+                StatefulCommitVariant::AddWithExtraPathCapabilities => {
                     LeafNodeParameters::builder()
                         .with_capabilities(capabilities_with_extra_suite())
                         .build()
@@ -1156,7 +1156,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                         .build()
                 }
                 StatefulCommitVariant::EmptySelfUpdate
-                | StatefulCommitVariant::EmptyWithDefaultPathCapabilities
+                | StatefulCommitVariant::EmptyWithExtraPathCapabilities
                 | StatefulCommitVariant::EmptyWithChangedPathCredential => unreachable!(),
             };
             group
@@ -2565,7 +2565,7 @@ fn stateful_commit_accepts_a_clean_sender_refresh_and_rejects_sender_path_mutati
 
     for (variant, reason) in [
         (
-            StatefulCommitVariant::EmptyWithDefaultPathCapabilities,
+            StatefulCommitVariant::EmptyWithExtraPathCapabilities,
             "proposal-free refresh path capabilities outside the exact singleton profile",
         ),
         (
@@ -2573,7 +2573,7 @@ fn stateful_commit_accepts_a_clean_sender_refresh_and_rejects_sender_path_mutati
             "proposal-free refresh path changes the sender identity",
         ),
         (
-            StatefulCommitVariant::AddWithDefaultPathCapabilities,
+            StatefulCommitVariant::AddWithExtraPathCapabilities,
             "path capabilities outside the exact singleton profile",
         ),
         (
@@ -3482,6 +3482,63 @@ fn public_commit_and_private_application_reject_wrong_content_types() {
 }
 
 #[test]
+#[test]
+fn public_commit_rejects_out_of_range_member_sender_index() {
+    let fixture = coherent_wire_fixture();
+    let prior = validate_group_info(&fixture.genesis_group_info, group_info_policy(&fixture))
+        .expect("valid GroupInfo");
+    let prior_binding = binding_for_validated_group(&prior, 0, 0);
+    let expected_add_coordinate = successor_coordinate(
+        &prior_binding,
+        fixture.add_group_context_hash,
+        fixture.add_confirmation_tag,
+    );
+    let prior_state = prior.public_state();
+    let member_count = prior_state.public_group().members().count();
+    assert_eq!(member_count, 1);
+
+    let member_0_bytes = [0x01_u8, 0x00, 0x00, 0x00, 0x00];
+    let offset = fixture
+        .public_add_commit
+        .windows(5)
+        .position(|w| w == member_0_bytes)
+        .expect("find sender offset");
+
+    for bad_index in [member_count as u32, u32::MAX] {
+        let mut mutated_commit_bytes = fixture.public_add_commit.clone();
+        mutated_commit_bytes[offset + 1..offset + 5].copy_from_slice(&bad_index.to_be_bytes());
+
+        let commit = validate_public_commit(&mutated_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+            .expect("canonical wrapping and Sender::Member structure are preserved");
+        assert_eq!(
+            commit.sender(),
+            &Sender::Member(openmls::prelude::LeafNodeIndex::new(bad_index))
+        );
+
+        let res = process_public_commit(
+            prior_state,
+            commit,
+            commit_policy(
+                b"commit-aad",
+                &prior_binding,
+                &expected_add_coordinate,
+                fixture.now_unix_seconds,
+                100,
+            ),
+        );
+        assert_eq!(
+            res.expect_err("out of range sender index must be rejected"),
+            WireValidationError::NonMemberCommitSender
+        );
+        assert_eq!(prior_state.public_group().members().count(), member_count);
+        assert_eq!(
+            prior_state.public_group().group_context().epoch().as_u64(),
+            0
+        );
+    }
+}
+
+#[test]
 fn public_commit_rejects_real_new_member_external_commit_sender() {
     let external_commit = external_commit_wire();
     let parsed = MlsMessageIn::tls_deserialize_exact(&external_commit)
@@ -3559,10 +3616,247 @@ fn test_server_timestamp_millisecond_floor_vectors() {
     );
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+#[error("injected storage write failure")]
+struct MockStorageError;
+
+struct RecordingStorage {
+    values: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
+    write_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_writes: bool,
+}
+
+impl RecordingStorage {
+    fn new(fail_writes: bool) -> Self {
+        Self {
+            values: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            write_attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_writes,
+        }
+    }
+}
+
+impl openmls_traits::public_storage::PublicStorageProvider<1> for RecordingStorage {
+    type PublicError = MockStorageError;
+
+    fn write_tree<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        TreeSync: openmls_traits::storage::traits::TreeSync<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+        tree: &TreeSync,
+    ) -> Result<(), Self::PublicError> {
+        self.write_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_writes {
+            return Err(MockStorageError);
+        }
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let value = serde_json::to_vec(&tree).unwrap();
+        self.values.write().insert(key, value);
+        Ok(())
+    }
+
+    fn write_interim_transcript_hash<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        InterimTranscriptHash: openmls_traits::storage::traits::InterimTranscriptHash<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+        hash: &InterimTranscriptHash,
+    ) -> Result<(), Self::PublicError> {
+        self.write_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_writes {
+            return Err(MockStorageError);
+        }
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let value = serde_json::to_vec(&hash).unwrap();
+        self.values.write().insert(key, value);
+        Ok(())
+    }
+
+    fn write_context<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        GroupContext: openmls_traits::storage::traits::GroupContext<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+        context: &GroupContext,
+    ) -> Result<(), Self::PublicError> {
+        self.write_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_writes {
+            return Err(MockStorageError);
+        }
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let value = serde_json::to_vec(&context).unwrap();
+        self.values.write().insert(key, value);
+        Ok(())
+    }
+
+    fn write_confirmation_tag<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ConfirmationTag: openmls_traits::storage::traits::ConfirmationTag<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+        tag: &ConfirmationTag,
+    ) -> Result<(), Self::PublicError> {
+        self.write_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_writes {
+            return Err(MockStorageError);
+        }
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let value = serde_json::to_vec(&tag).unwrap();
+        self.values.write().insert(key, value);
+        Ok(())
+    }
+
+    fn queue_proposal<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<1>,
+        QueuedProposal: openmls_traits::storage::traits::QueuedProposal<1>,
+    >(
+        &self,
+        _group_id: &GroupId,
+        _proposal_ref: &ProposalRef,
+        _proposal: &QueuedProposal,
+    ) -> Result<(), Self::PublicError> {
+        self.write_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_writes {
+            return Err(MockStorageError);
+        }
+        Ok(())
+    }
+
+    fn queued_proposals<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<1>,
+        QueuedProposal: openmls_traits::storage::traits::QueuedProposal<1>,
+    >(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<Vec<(ProposalRef, QueuedProposal)>, Self::PublicError> {
+        Ok(Vec::new())
+    }
+
+    fn tree<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        TreeSync: openmls_traits::storage::traits::TreeSync<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<TreeSync>, Self::PublicError> {
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let values = self.values.read();
+        Ok(values
+            .get(&key)
+            .and_then(|v| serde_json::from_slice(v).ok()))
+    }
+
+    fn group_context<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        GroupContext: openmls_traits::storage::traits::GroupContext<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupContext>, Self::PublicError> {
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let values = self.values.read();
+        Ok(values
+            .get(&key)
+            .and_then(|v| serde_json::from_slice(v).ok()))
+    }
+
+    fn interim_transcript_hash<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        InterimTranscriptHash: openmls_traits::storage::traits::InterimTranscriptHash<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<InterimTranscriptHash>, Self::PublicError> {
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let values = self.values.read();
+        Ok(values
+            .get(&key)
+            .and_then(|v| serde_json::from_slice(v).ok()))
+    }
+
+    fn confirmation_tag<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ConfirmationTag: openmls_traits::storage::traits::ConfirmationTag<1>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ConfirmationTag>, Self::PublicError> {
+        let key = serde_json::to_vec(&group_id).unwrap();
+        let values = self.values.read();
+        Ok(values
+            .get(&key)
+            .and_then(|v| serde_json::from_slice(v).ok()))
+    }
+
+    fn delete_tree<GroupId: openmls_traits::storage::traits::GroupId<1>>(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+
+    fn delete_confirmation_tag<GroupId: openmls_traits::storage::traits::GroupId<1>>(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+
+    fn delete_context<GroupId: openmls_traits::storage::traits::GroupId<1>>(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+
+    fn delete_interim_transcript_hash<GroupId: openmls_traits::storage::traits::GroupId<1>>(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+
+    fn remove_proposal<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<1>,
+    >(
+        &self,
+        _group_id: &GroupId,
+        _proposal_ref: &ProposalRef,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+
+    fn clear_proposal_queue<
+        GroupId: openmls_traits::storage::traits::GroupId<1>,
+        ProposalRef: openmls_traits::storage::traits::ProposalRef<1>,
+    >(
+        &self,
+        _group_id: &GroupId,
+    ) -> Result<(), Self::PublicError> {
+        Ok(())
+    }
+}
+
 #[test]
 fn test_current_at_identical_injected_storage_failure_no_write() {
-    let fixture =
-        genesis_group_info_fixture(Some(exact_capabilities()), Some(Lifetime::init(100, 1000)));
+    let now = frozen_now();
+    let fixture = genesis_group_info_fixture(
+        Some(exact_capabilities()),
+        Some(Lifetime::init(now - 60, now + 3600)),
+    );
     let parsed = MlsMessageIn::tls_deserialize_exact(&fixture.bytes).expect("parse GroupInfo");
     let MlsMessageBodyIn::GroupInfo(group_info) = parsed.extract() else {
         panic!("expected GroupInfo");
@@ -3570,54 +3864,144 @@ fn test_current_at_identical_injected_storage_failure_no_write() {
 
     let provider_current = openmls_libcrux_crypto::Provider::new().expect("provider");
     let provider_at = openmls_libcrux_crypto::Provider::new().expect("provider");
-
-    // Pass invalid empty ratchet tree to both
-    let empty_tree =
-        openmls::treesync::RatchetTreeIn::tls_deserialize_exact(&[0x00]).expect("empty tree");
+    let storage_current = RecordingStorage::new(true);
+    let storage_at = RecordingStorage::new(true);
+    let tree = group_info
+        .extensions()
+        .ratchet_tree()
+        .expect("ratchet tree extension")
+        .ratchet_tree()
+        .clone();
     let res_current = PublicGroup::from_external(
         provider_current.crypto(),
-        provider_current.storage(),
-        empty_tree.clone(),
+        &storage_current,
+        tree.clone(),
         group_info.clone(),
         ProposalStore::new(),
     );
     let res_at = PublicGroup::from_external_at(
         provider_at.crypto(),
-        provider_at.storage(),
+        &storage_at,
+        tree,
+        group_info.clone(),
+        ProposalStore::new(),
+        openmls::prelude::UnixSeconds::new(now + 10),
+    );
+
+    assert_eq!(
+        res_current.as_ref().unwrap_err(),
+        &CreationFromExternalError::WriteToStorageError(MockStorageError)
+    );
+    assert_eq!(
+        res_at.as_ref().unwrap_err(),
+        &CreationFromExternalError::WriteToStorageError(MockStorageError)
+    );
+    assert_eq!(res_current.unwrap_err(), res_at.unwrap_err());
+    assert!(
+        storage_current.values.read().is_empty(),
+        "zero retained records after injected storage failure"
+    );
+    assert!(
+        storage_at.values.read().is_empty(),
+        "zero retained records after injected storage failure"
+    );
+
+    // Separately verify that tree validation errors make ZERO storage write attempts and retain zero records
+    let val_current_storage = RecordingStorage::new(false);
+    let val_at_storage = RecordingStorage::new(false);
+    let empty_tree =
+        openmls::treesync::RatchetTreeIn::tls_deserialize_exact(&[0x00]).expect("empty tree");
+    let val_res_current = PublicGroup::from_external(
+        provider_current.crypto(),
+        &val_current_storage,
+        empty_tree.clone(),
+        group_info.clone(),
+        ProposalStore::new(),
+    );
+    let val_res_at = PublicGroup::from_external_at(
+        provider_at.crypto(),
+        &val_at_storage,
         empty_tree,
         group_info,
         ProposalStore::new(),
         openmls::prelude::UnixSeconds::new(150),
     );
-
-    assert!(res_current.is_err());
-    assert!(res_at.is_err());
+    assert!(val_res_current.is_err());
+    assert!(val_res_at.is_err());
+    assert_eq!(
+        val_current_storage
+            .write_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "validation errors must make zero storage write attempts"
+    );
+    assert_eq!(
+        val_at_storage
+            .write_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "validation errors must make zero storage write attempts"
+    );
+    assert!(val_current_storage.values.read().is_empty());
+    assert!(val_at_storage.values.read().is_empty());
 }
 
 #[test]
 fn test_absence_of_catbird_skip_callsites() {
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
-    fn visit_dirs(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    visit_dirs(&path, files);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    files.push(path);
-                }
+    fn visit_dirs(
+        dir: &std::path::Path,
+        files: &mut Vec<std::path::PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit_dirs(&path, files)?;
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
             }
         }
+        Ok(())
     }
-    visit_dirs(&src_dir, &mut files);
+    visit_dirs(&src_dir, &mut files).expect("traverse src dir");
+    assert!(!files.is_empty(), "expected production files in src");
+    assert!(
+        files.len() >= 30,
+        "expected at least 30 rust source files scanned, got {}",
+        files.len()
+    );
     for file in files {
         let content = std::fs::read_to_string(&file).expect("read source file");
         assert!(
-            !content.contains("LifetimeValidation::Skip")
-                && !content.contains("LeafNodeLifetimePolicy::Skip"),
+            !content.contains("LeafNodeLifetimeValidation::Skip")
+                && !content.contains("LifetimeValidation::Skip")
+                && !content.contains("skip_lifetime_validation"),
             "Catbird production source {} must not contain Skip lifetime callsites",
             file.display()
         );
+        for (line_no, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            assert!(
+                !(trimmed.contains("use ")
+                    && trimmed.contains("LeafNodeLifetimeValidation")
+                    && trimmed.contains("Skip")),
+                "Catbird production source {}:{} must not import Skip: {}",
+                file.display(),
+                line_no + 1,
+                line
+            );
+            assert!(
+                !trimmed.contains("skip_lifetime_validation"),
+                "Catbird production source {}:{} must not call skip_lifetime_validation: {}",
+                file.display(),
+                line_no + 1,
+                line
+            );
+        }
     }
 }

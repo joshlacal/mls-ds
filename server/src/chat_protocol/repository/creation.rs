@@ -1,8 +1,8 @@
-//! Transaction-bound createConversation repository composition.
-//!
-//! This module deliberately owns the Creation planner, generated-DTO response,
-//! execution capsule, and endpoint-specific replay proof.  Handlers only pass
-//! the caller-owned transaction and the already-arbitrated operation.
+// Transaction-bound createConversation repository composition.
+//
+// This module deliberately owns the Creation planner, generated-DTO response,
+// execution capsule, and endpoint-specific replay proof.  Handlers only pass
+// the caller-owned transaction and the already-arbitrated operation.
 
 use base64::Engine as _;
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;

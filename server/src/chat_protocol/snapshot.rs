@@ -1,10 +1,10 @@
-//! Canonical persistence for an OpenMLS [`PublicGroup`].
-//!
-//! The format is deliberately narrow: it contains exactly the four public
-//! records written by OpenMLS' `PublicGroup`, never member secrets, private
-//! keys, proposals, or provider randomness. Both dependency versions are part
-//! of the envelope because the memory-storage JSON representation is not a
-//! stable protocol format on its own.
+// Canonical persistence for an OpenMLS [`PublicGroup`].
+//
+// The format is deliberately narrow: it contains exactly the four public
+// records written by OpenMLS' `PublicGroup`, never member secrets, private
+// keys, proposals, or provider randomness. Both dependency versions are part
+// of the envelope because the memory-storage JSON representation is not a
+// stable protocol format on its own.
 
 use std::{
     collections::{HashMap, HashSet},

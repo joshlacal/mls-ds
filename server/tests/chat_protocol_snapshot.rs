@@ -873,6 +873,41 @@ fn snapshot_binding_rejects_digest_coordinate_stale_blob_and_record_splicing() {
             PublicGroupSnapshotError::SnapshotDigestMismatch,
             "record {record_index} splice escaped the exact snapshot binding"
         );
+
+        let candidate_digest = public_group_snapshot_sha256(&spliced);
+        let candidate_binding_genesis_tree = PublicGroupSnapshotBinding::new(
+            *genesis_binding.conversation_id(),
+            genesis_binding.generation(),
+            genesis_binding.state_version(),
+            *genesis_binding.group_id(),
+            genesis_binding.epoch(),
+            *genesis_binding.group_context_hash(),
+            *genesis_binding.confirmation_tag(),
+            genesis_binding.lifecycle(),
+            candidate_digest,
+            genesis_binding.tree_summary().clone(),
+        );
+        assert!(
+            decode_public_group_snapshot(&spliced, &candidate_binding_genesis_tree).is_err(),
+            "record {record_index} splice escaped semantic coherence validation under recomputed candidate digest and genesis tree summary"
+        );
+
+        let candidate_binding_committed_tree = PublicGroupSnapshotBinding::new(
+            *genesis_binding.conversation_id(),
+            genesis_binding.generation(),
+            genesis_binding.state_version(),
+            *genesis_binding.group_id(),
+            genesis_binding.epoch(),
+            *genesis_binding.group_context_hash(),
+            *genesis_binding.confirmation_tag(),
+            genesis_binding.lifecycle(),
+            candidate_digest,
+            committed_binding.tree_summary().clone(),
+        );
+        assert!(
+            decode_public_group_snapshot(&spliced, &candidate_binding_committed_tree).is_err(),
+            "record {record_index} splice escaped semantic coherence validation under recomputed candidate digest and committed tree summary"
+        );
     }
 }
 

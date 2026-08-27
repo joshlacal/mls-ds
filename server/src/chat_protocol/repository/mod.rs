@@ -1,4 +1,4 @@
-//! PostgreSQL boundaries for clean-chat protocol authority.
+// PostgreSQL boundaries for clean-chat protocol authority.
 
 pub(crate) mod acceptance;
 pub(crate) mod auth;

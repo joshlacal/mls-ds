@@ -2099,6 +2099,7 @@ pub async fn private_genuine_terminal_close_graph() -> PrivateGenuineTerminalClo
                 format!("conversation-closed-{conversation_id}").into_bytes(),
             ),
             welcome_disposition_event_payloads: Vec::new(),
+            ..Default::default()
         },
     )
     .await
@@ -4431,6 +4432,10 @@ pub(crate) mod genuine_terminal_fixture {
                     outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
                 },
             }],
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
         };
         let mut write = pool.begin().await.expect("begin genuine dynamic reset");
         let applied =
@@ -6505,6 +6510,10 @@ pub async fn build_creation_with_invitee(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     CreationApply {
@@ -6722,6 +6731,10 @@ pub async fn acceptance_ctx(
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     }
 }
 
@@ -7099,6 +7112,10 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
         welcome_expiry: None,
         welcome_response: None,
         welcome_dispositions: vec![],
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     BuiltFulfillment {

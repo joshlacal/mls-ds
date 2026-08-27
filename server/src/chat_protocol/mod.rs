@@ -1,4 +1,4 @@
-//! Clean-cutover chat protocol primitives.
+// Clean-cutover chat protocol primitives.
 
 use std::panic::AssertUnwindSafe;
 

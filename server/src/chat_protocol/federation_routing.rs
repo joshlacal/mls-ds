@@ -1,15 +1,15 @@
-//! Clean-chat federation routing intent and participant DS resolution.
-//!
-//! This module resolves participant routing intent after signed operation admission
-//! but strictly BEFORE opening business database transactions or taking row locks.
-//! Resolved intent carries immutable routing classifications into the persistence
-//! plan and rechecks exact manifest bindings under lock.
-//!
-//! Routing convention:
-//! - Local DS: participant `ds_did` is NULL (`None`).
-//! - Remote DS: participant `ds_did` is the canonical base DID string (`Some(ds_did)`).
-//! - Remote conversation: `is_remote` is true, `sequencer_ds` is non-NULL.
-//! - Local conversation: `is_remote` is false, `sequencer_ds` is NULL (`None`), `sequencer_term` is 0.
+// Clean-chat federation routing intent and participant DS resolution.
+//
+// This module resolves participant routing intent after signed operation admission
+// but strictly BEFORE opening business database transactions or taking row locks.
+// Resolved intent carries immutable routing classifications into the persistence
+// plan and rechecks exact manifest bindings under lock.
+//
+// Routing convention:
+// - Local DS: participant `ds_did` is NULL (`None`).
+// - Remote DS: participant `ds_did` is the canonical base DID string (`Some(ds_did)`).
+// - Remote conversation: `is_remote` is true, `sequencer_ds` is non-NULL.
+// - Local conversation: `is_remote` is false, `sequencer_ds` is NULL (`None`), `sequencer_term` is 0.
 
 use sqlx::PgPool;
 use std::collections::BTreeMap;

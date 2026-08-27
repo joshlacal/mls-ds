@@ -1,53 +1,53 @@
-//! C1 canonical-JCS v1 encoder for generated clean-chat DTOs.
-//!
-//! Owns the versioned canonical-JSON entry point
-//! [`encode_canonical_generated_chat_json_v1`] that C1 projections (and the
-//! G-send materialization path) use to byte-check their generated closed
-//! DTOs exactly once. The contract is frozen by Checkpoint C1 of the
-//! G7 downstream-readiness amendment:
-//!
-//! * UTF-8 only; no BOM, insignificant whitespace, trailing bytes, or Unicode
-//!   normalization. Strings pass through byte-for-byte (a composed `é`
-//!   (U+00E9) is never decomposed and a decomposed `e` + combining acute is
-//!   never composed).
-//! * Object member names are sorted by UTF-16 code-unit order (RFC 8785/JCS).
-//! * Strings escape quotation mark and reverse solidus, use `\b`, `\t`, `\n`,
-//!   `\f`, and `\r` for those controls, lowercase `\u00xx` for all other
-//!   U+0000 through U+001F controls, never escape solidus, and otherwise emit
-//!   the original Unicode scalar values.
-//! * Only integers are accepted; shortest base-10, no leading zero or plus,
-//!   zero exactly `0`, absolute value at most `9007199254740991`; every
-//!   floating-point form rejects.
-//! * `true`, `false`, and schema-declared `null` use those lowercase
-//!   spellings; arrays preserve generated DTO order.
-//! * The generated DTO serializer's `Option::None` omission rule is followed
-//!   (it already emitted the object); `null` is accepted only where the
-//!   selected definition explicitly permits it (no `nullable` field exists in
-//!   `blue.catbird.chat.defs`, so every null rejects).
-//! * Union definitions require their exact full `$type` string; `$type` is
-//!   sorted as an ordinary key and never invented or repaired.
-//! * A schema-aware normalization against the exact `definition_id` rejects
-//!   unknown/missing fields, unknown union tags, duplicate keys, invalid
-//!   nulls, and any non-empty `extra_data` before any canonical byte is
-//!   written. Bytes normalize to `{"$bytes": <standard padded base64>}`
-//!   objects (canonical spelling required) and datetimes must already be the
-//!   checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`).
-//! * Stored-byte validation re-parses the canonical bytes with a
-//!   duplicate-detecting parser, re-normalizes them against the exact
-//!   definition, re-encodes with this encoder, and requires byte-for-byte
-//!   equality.
-//!
-//! The generated chat DTO surface accepts byte fields in two input shapes
-//! (`{"$bytes": <padded base64>}` for `serde_bytes_helper` fields and plain
-//! byte arrays for the bare `bytes::Bytes` aliases such as `ArtifactHash` and
-//! `IdentifierBytes`). The normalizer also accepts bare base64 strings when
-//! validating compatibility input trees, but a v2 server must not be mixed with
-//! pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
-//! instances, wait the full 15-minute session TTL, and only then resume v2
-//! protocol availability. All accepted forms normalize to the one lexicon wire shape
-//! `{"$bytes": <padded base64>}`. The encoder is not left to an unspecified
-//! `serde_json::to_vec` ordering: it serializes the DTO once with the generated
-//! serializer and performs its own local canonical write.
+// C1 canonical-JCS v1 encoder for generated clean-chat DTOs.
+//
+// Owns the versioned canonical-JSON entry point
+// [`encode_canonical_generated_chat_json_v1`] that C1 projections (and the
+// G-send materialization path) use to byte-check their generated closed
+// DTOs exactly once. The contract is frozen by Checkpoint C1 of the
+// G7 downstream-readiness amendment:
+//
+// * UTF-8 only; no BOM, insignificant whitespace, trailing bytes, or Unicode
+//   normalization. Strings pass through byte-for-byte (a composed `é`
+//   (U+00E9) is never decomposed and a decomposed `e` + combining acute is
+//   never composed).
+// * Object member names are sorted by UTF-16 code-unit order (RFC 8785/JCS).
+// * Strings escape quotation mark and reverse solidus, use `\b`, `\t`, `\n`,
+//   `\f`, and `\r` for those controls, lowercase `\u00xx` for all other
+//   U+0000 through U+001F controls, never escape solidus, and otherwise emit
+//   the original Unicode scalar values.
+// * Only integers are accepted; shortest base-10, no leading zero or plus,
+//   zero exactly `0`, absolute value at most `9007199254740991`; every
+//   floating-point form rejects.
+// * `true`, `false`, and schema-declared `null` use those lowercase
+//   spellings; arrays preserve generated DTO order.
+// * The generated DTO serializer's `Option::None` omission rule is followed
+//   (it already emitted the object); `null` is accepted only where the
+//   selected definition explicitly permits it (no `nullable` field exists in
+//   `blue.catbird.chat.defs`, so every null rejects).
+// * Union definitions require their exact full `$type` string; `$type` is
+//   sorted as an ordinary key and never invented or repaired.
+// * A schema-aware normalization against the exact `definition_id` rejects
+//   unknown/missing fields, unknown union tags, duplicate keys, invalid
+//   nulls, and any non-empty `extra_data` before any canonical byte is
+//   written. Bytes normalize to `{"$bytes": <standard padded base64>}`
+//   objects (canonical spelling required) and datetimes must already be the
+//   checked canonical UTC text (`YYYY-MM-DDTHH:MM:SS.sssZ`).
+// * Stored-byte validation re-parses the canonical bytes with a
+//   duplicate-detecting parser, re-normalizes them against the exact
+//   definition, re-encodes with this encoder, and requires byte-for-byte
+//   equality.
+//
+// The generated chat DTO surface accepts byte fields in two input shapes
+// (`{"$bytes": <padded base64>}` for `serde_bytes_helper` fields and plain
+// byte arrays for the bare `bytes::Bytes` aliases such as `ArtifactHash` and
+// `IdentifierBytes`). The normalizer also accepts bare base64 strings when
+// validating compatibility input trees, but a v2 server must not be mixed with
+// pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
+// instances, wait the full 15-minute session TTL, and only then resume v2
+// protocol availability. All accepted forms normalize to the one lexicon wire shape
+// `{"$bytes": <padded base64>}`. The encoder is not left to an unspecified
+// `serde_json::to_vec` ordering: it serializes the DTO once with the generated
+// serializer and performs its own local canonical write.
 
 use std::{cmp::Ordering, collections::HashSet, fmt, sync::OnceLock};
 

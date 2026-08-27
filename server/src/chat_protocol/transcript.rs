@@ -1,9 +1,9 @@
-//! Closed clean-chat signing and outer-control transcript authority.
-//!
-//! The public API never accepts a caller-defined schema, domain, or type ID.
-//! Raw JSON is decoded with duplicate/null/float rejection and projected only
-//! through the embedded canonical `blue.catbird.chat.defs` contract before any
-//! generated DTO or cryptographic authority can exist.
+// Closed clean-chat signing and outer-control transcript authority.
+//
+// The public API never accepts a caller-defined schema, domain, or type ID.
+// Raw JSON is decoded with duplicate/null/float rejection and projected only
+// through the embedded canonical `blue.catbird.chat.defs` contract before any
+// generated DTO or cryptographic authority can exist.
 
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 

@@ -1,20 +1,3 @@
-//! Live-PostgreSQL verification of the T4-H2-pre conversation-substrate
-//! production hydrators (`chat_protocol::repository::core`).
-//!
-//! These exercise the REAL, production `#[cfg(not(test))]` guard-hydration path,
-//! which no other suite compiles: the lib build gates `repository::core` behind
-//! `#[cfg(not(test))]`, and the state-machine/executor harnesses use the
-//! `for_test` guard constructors instead. So — like the executor harness — this
-//! test `include!`s the whole `chat_protocol` module tree (so `core.rs`'s
-//! `super::super::{snapshot,state_machine,validation}` paths resolve) and adds
-//! `repository::core` on top.
-//!
-//! Live cases are `#[ignore]`d and run explicitly against the dedicated,
-//! freshly-migrated gate database:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_conversation_substrate -- --ignored --test-threads=1
-
 #![allow(dead_code)]
 
 mod common;
@@ -22,6 +5,17 @@ mod common;
 mod executor_seed;
 #[path = "common/frozen_public_state.rs"]
 mod frozen_public_state;
+
+pub use catbird_server::{auth, federation, identity, sqlx_jacquard, util};
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
+
+#[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
 
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/cursor.rs"]
@@ -32,17 +26,6 @@ mod model;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
-// `cursor.rs` remains path-included at this integration crate root. The actual
-// production `dpop.rs` is included only at `crate::chat_protocol::dpop`; this
-// root non-DPoP shim re-exports physically nested repository modules without
-// moving their private visibility boundary out of `crate::chat_protocol::repository`.
-mod repository {
-    pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
-}
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -51,17 +34,22 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
+    pub(crate) use crate::cursor::*;
+    pub(crate) use crate::model::*;
+    pub(crate) use crate::transcript::*;
+    pub(crate) use crate::validation::*;
+
     pub mod cursor {
         pub use crate::cursor::*;
     }
     pub mod model {
         pub use crate::model::*;
     }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
     pub mod transcript {
         pub use crate::transcript::*;
+    }
+    pub mod validation {
+        pub use crate::validation::*;
     }
     pub mod dpop {
         #![allow(dead_code)]
@@ -86,6 +74,28 @@ mod chat_protocol {
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
     }
+    pub mod federation_routing {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/federation_routing.rs"
+        ));
+    }
+    pub mod read_authority {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_authority.rs"
+        ));
+    }
+    pub mod read_projection {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_projection.rs"
+        ));
+    }
+
     pub mod repository {
         pub mod auth {
             #![allow(dead_code)]
@@ -99,6 +109,48 @@ mod chat_protocol {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/blobs.rs"
+            ));
+        }
+        pub mod coordinate {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/coordinate.rs"
+            ));
+        }
+        pub mod conversation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/conversation.rs"
+            ));
+        }
+        pub mod entry_read {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/entry_read.rs"
+            ));
+        }
+        pub mod message_delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/message_delivery.rs"
+            ));
+        }
+        pub mod subscription {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/subscription.rs"
+            ));
+        }
+        pub mod ticket {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/ticket.rs"
             ));
         }
         pub mod key_packages {
@@ -127,6 +179,13 @@ mod chat_protocol {
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/recovery.rs"
+            ));
+        }
+        pub mod relationship {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/relationship.rs"
             ));
         }
         pub mod core {
@@ -178,14 +237,111 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/expiry_sweep.rs"
             ));
         }
-        pub mod relationship {
+        pub mod device_directory {
             #![allow(dead_code)]
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
+                "/src/chat_protocol/repository/device_directory.rs"
+            ));
+        }
+        pub mod federation {
+            use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+            use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+            use jacquard_common::DefaultStr;
+            use uuid::Uuid;
+
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) async fn enqueue_federated_welcome_job(
+                _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _target_ds_did: &str,
+                _recipient_did_str: &str,
+                _recipient_device_id: Uuid,
+                _welcome_id: Uuid,
+                _recovery_request_id: Uuid,
+                _reserved_ref: &[u8; 32],
+                _opaque_welcome: &[u8],
+                _sha256: &[u8; 32],
+                _append: &super::delivery::AppendEntry,
+                _seq: u64,
+                _coordinates: ConversationCoordinates,
+                _pub_snap_sha: &[u8; 32],
+                _tree_sum_sha: &[u8; 32],
+                _sequencer_term: u64,
+            ) -> Result<Uuid, super::super::state_machine::ExecutorError> {
+                Ok(Uuid::nil())
+            }
+
+            pub(crate) async fn enqueue_clean_federation_message_jobs(
+                _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _entry: &super::delivery::AppendEntry,
+                _seq: u64,
+                _sequencer_term: u64,
+            ) -> Result<usize, catbird_server::federation::errors::FederationError> {
+                Ok(0)
+            }
+
+            pub(crate) fn build_federated_commit_envelope(
+                _conversation_id: Uuid,
+                _transition_id: Uuid,
+                _sequencer_ds_did: &str,
+                _signed_request_bytes: &[u8],
+                _sequencer_term: u64,
+                _received_at: &crate::validation::CanonicalTimestamp,
+            ) -> Result<SubmitCommit<DefaultStr>, catbird_server::federation::errors::FederationError>
+            {
+                Err(
+                    catbird_server::federation::errors::FederationError::InvalidEnvelope {
+                        reason: "test stub".to_string(),
+                    },
+                )
+            }
+        }
+        pub mod acceptance {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/acceptance.rs"
+            ));
+        }
+        pub mod creation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/creation.rs"
+            ));
+        }
+        pub mod leave {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/leave.rs"
+            ));
+        }
+        pub mod reset {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/reset.rs"
+            ));
+        }
+        pub mod revocation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/revocation.rs"
+            ));
+        }
+        pub mod submit_transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/submit_transition.rs"
             ));
         }
     }
+
     pub mod state_machine {
         #![allow(dead_code)]
         include!(concat!(
@@ -4425,6 +4581,10 @@ mod historical_control_loader {
                 genesis_group_info_bytes: None,
                 primary_event_payload: Some(format!("conversation-closed-{cid}").into_bytes()),
                 welcome_disposition_event_payloads: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             },
         )
         .await;
@@ -4440,6 +4600,10 @@ mod historical_control_loader {
                 genesis_group_info_bytes: None,
                 primary_event_payload: Some(format!("conversation-closed-{cid}").into_bytes()),
                 welcome_disposition_event_payloads: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             },
         )
         .await
@@ -7476,6 +7640,10 @@ mod historical_control_loader {
                 welcome_expiry: None,
                 welcome_response: None,
                 welcome_dispositions: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             };
             let target_cas = RevocationTargetCasBinding::for_test(target.clone(), 1, accepted);
             let target_did = graph.invitee.did.clone();
@@ -7729,6 +7897,10 @@ mod historical_control_loader {
                 welcome_expiry: None,
                 welcome_response: None,
                 welcome_dispositions: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             };
             (plan, context)
         }
@@ -7941,6 +8113,10 @@ mod historical_control_loader {
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
                         welcome_disposition_event_payloads: Vec::new(),
+                        is_remote: false,
+                        sequencer_ds: None,
+                        sequencer_term: 0,
+                        participant_ds_dids: std::collections::HashMap::new(),
                     },
                 ),
                 ConversationExecutionArtifacts::new(
@@ -7950,6 +8126,10 @@ mod historical_control_loader {
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
                         welcome_disposition_event_payloads: Vec::new(),
+                        is_remote: false,
+                        sequencer_ds: None,
+                        sequencer_term: 0,
+                        participant_ds_dids: std::collections::HashMap::new(),
                     },
                 ),
             ];
@@ -8063,6 +8243,10 @@ mod historical_control_loader {
                             genesis_group_info_bytes: None,
                             primary_event_payload: None,
                             welcome_disposition_event_payloads: Vec::new(),
+                            is_remote: false,
+                            sequencer_ds: None,
+                            sequencer_term: 0,
+                            participant_ds_dids: std::collections::HashMap::new(),
                         },
                     )
                     .await
@@ -8392,6 +8576,10 @@ mod historical_control_loader {
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
                         welcome_disposition_event_payloads: Vec::new(),
+                        is_remote: false,
+                        sequencer_ds: None,
+                        sequencer_term: 0,
+                        participant_ds_dids: std::collections::HashMap::new(),
                     },
                 ),
                 ConversationExecutionArtifacts::new(
@@ -8401,6 +8589,10 @@ mod historical_control_loader {
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
                         welcome_disposition_event_payloads: Vec::new(),
+                        is_remote: false,
+                        sequencer_ds: None,
+                        sequencer_term: 0,
+                        participant_ds_dids: std::collections::HashMap::new(),
                     },
                 ),
             ];
@@ -8748,6 +8940,10 @@ mod historical_control_loader {
                 genesis_group_info_bytes: None,
                 primary_event_payload: None,
                 welcome_disposition_event_payloads: Vec::new(),
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             }
         }
 
@@ -8971,6 +9167,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: None,
                     primary_event_payload: Some(b"caller-owned-welcome-expiry".to_vec()),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -12393,6 +12593,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
                     primary_event_payload: Some(b"{\"kind\":\"g6CreatorOnly\"}".to_vec()),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -12708,6 +12912,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: Some(wrong_group_info),
                     primary_event_payload: Some(creation_event_payload.clone()),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -12738,6 +12946,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
                     primary_event_payload: Some(creation_event_payload.clone()),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -12754,6 +12966,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: Some(fixture.genesis_group_info.clone()),
                     primary_event_payload: Some(creation_event_payload),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -12940,6 +13156,10 @@ mod historical_control_loader {
                         .expect("serialize conversation-scoped Policy event payload"),
                     ),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -14649,6 +14869,10 @@ mod historical_control_loader {
                         format!("g6-lifecycle-creation-{conversation_id}").into_bytes(),
                     ),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -14718,6 +14942,10 @@ mod historical_control_loader {
                         format!("g6-lifecycle-policy-{conversation_id}").into_bytes(),
                     ),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -14870,6 +15098,10 @@ mod historical_control_loader {
                         format!("g6-lifecycle-acceptance-{conversation_id}").into_bytes(),
                     ),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -15460,6 +15692,10 @@ mod historical_control_loader {
                         format!("g6-lifecycle-fulfillment-{conversation_id}").into_bytes(),
                     ),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -16619,6 +16855,10 @@ mod historical_control_loader {
                             genesis_group_info_bytes: None,
                             primary_event_payload: None,
                             welcome_disposition_event_payloads: Vec::new(),
+                            is_remote: false,
+                            sequencer_ds: None,
+                            sequencer_term: 0,
+                            participant_ds_dids: std::collections::HashMap::new(),
                         },
                     )
                     .await
@@ -16695,6 +16935,10 @@ mod historical_control_loader {
                                 genesis_group_info_bytes: None,
                                 primary_event_payload: None,
                                 welcome_disposition_event_payloads: Vec::new(),
+                                is_remote: false,
+                                sequencer_ds: None,
+                                sequencer_term: 0,
+                                participant_ds_dids: std::collections::HashMap::new(),
                             },
                         )
                         .await;
@@ -17036,6 +17280,10 @@ mod historical_control_loader {
                                 genesis_group_info_bytes: None,
                                 primary_event_payload: Some(b"caller-supplied-payload".to_vec()),
                                 welcome_disposition_event_payloads: Vec::new(),
+                                is_remote: false,
+                                sequencer_ds: None,
+                                sequencer_term: 0,
+                                participant_ds_dids: std::collections::HashMap::new(),
                             },
                         )
                         .await;
@@ -17069,6 +17317,10 @@ mod historical_control_loader {
                                     fulfillment.welcome_id,
                                     b"caller-disposition".to_vec(),
                                 )],
+                                is_remote: false,
+                                sequencer_ds: None,
+                                sequencer_term: 0,
+                                participant_ds_dids: std::collections::HashMap::new(),
                             },
                         )
                         .await;
@@ -17222,6 +17474,10 @@ mod historical_control_loader {
                                 genesis_group_info_bytes: None,
                                 primary_event_payload: None,
                                 welcome_disposition_event_payloads: Vec::new(),
+                                is_remote: false,
+                                sequencer_ds: None,
+                                sequencer_term: 0,
+                                participant_ds_dids: std::collections::HashMap::new(),
                             },
                         )
                         .await;
@@ -17371,6 +17627,10 @@ mod historical_control_loader {
                         genesis_group_info_bytes: None,
                         primary_event_payload: None,
                         welcome_disposition_event_payloads: Vec::new(),
+                        is_remote: false,
+                        sequencer_ds: None,
+                        sequencer_term: 0,
+                        participant_ds_dids: std::collections::HashMap::new(),
                     },
                 )
                 .await
@@ -18301,7 +18561,11 @@ mod historical_control_loader {
                             format!("g6-prior-bound-recovery-{conversation_id}").into_bytes(),
                         ),
                         welcome_disposition_event_payloads: Vec::new(),
-                    },
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
+        },
                 )
                 .await
                 .expect("hydrate prior-bound recovery request context");
@@ -18386,7 +18650,11 @@ mod historical_control_loader {
                             format!("g6-reset-request-{conversation_id}").into_bytes(),
                         ),
                         welcome_disposition_event_payloads: Vec::new(),
-                    },
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
+        },
                 )
                 .await
                 .expect("hydrate lifecycle ResetRequest context");
@@ -18834,7 +19102,11 @@ mod historical_control_loader {
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
                         welcome_disposition_event_payloads: Vec::new(),
-                    },
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
+        },
                 )
                 .await
                 .expect_err("caller-swapped GroupInfo must fail context hydration");
@@ -18859,7 +19131,11 @@ mod historical_control_loader {
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
                         welcome_disposition_event_payloads: Vec::new(),
-                    },
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
+        },
                 )
                 .await
                 .expect_err("second transaction cannot hydrate a sealed Reset plan");
@@ -18884,7 +19160,11 @@ mod historical_control_loader {
                             format!("g6-reset-activation-{conversation_id}").into_bytes(),
                         ),
                         welcome_disposition_event_payloads: Vec::new(),
-                    },
+            is_remote: false,
+            sequencer_ds: None,
+            sequencer_term: 0,
+            participant_ds_dids: std::collections::HashMap::new(),
+        },
                 )
                 .await
                 .expect("hydrate lifecycle ResetActivation context");
@@ -24031,6 +24311,10 @@ mod historical_control_loader {
                     genesis_group_info_bytes: None,
                     primary_event_payload: Some(format!("role-change-{seq}").into_bytes()),
                     welcome_disposition_event_payloads: Vec::new(),
+                    is_remote: false,
+                    sequencer_ds: None,
+                    sequencer_term: 0,
+                    participant_ds_dids: std::collections::HashMap::new(),
                 },
             )
             .await
@@ -30300,6 +30584,10 @@ mod historical_control_loader {
                         outbox: vec![(Uuid::new_v4(), OutboxWorkKind::Stream)],
                     },
                 }],
+                is_remote: false,
+                sequencer_ds: None,
+                sequencer_term: 0,
+                participant_ds_dids: std::collections::HashMap::new(),
             };
 
             let mut transaction = pool.begin().await.expect("begin genuine reset");

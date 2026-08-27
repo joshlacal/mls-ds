@@ -1,37 +1,27 @@
-//! Live-PostgreSQL end-to-end verification of the E2b-2/E2b-3 transition
-//! executor `apply_conversation_persistence_plan_unscoped_for_test` and the spine/seq-seam writers
-//! it composes.
-//!
-//! Two kinds of coverage:
-//!  * The NEW dumb-SQL writers (conversation-head insert/CAS/close, generation
-//!    insert/state-version-CAS/supersede, `append_entry_at`) — column fidelity +
-//!    CAS advance/conflict, inside one transaction with read-back + ROLLBACK.
-//!  * The executor driven end-to-end: a REAL creation plan built through the
-//!    production `plan_creation` path (with the E2b-3 `#[cfg(test)]`
-//!    metadata-bearing evidence + head-CAS synthesis), applied and COMMITTED,
-//!    then the full committed graph SELECT-verified past every DEFERRED trigger;
-//!    plus re-apply -> conflict with zero residue, and mid-transaction failure
-//!    injection -> whole-graph rollback.
-//!
-//! Run:
-//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
-//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
-//!   cargo test --test chat_protocol_executor -- --test-threads=1
-
 #![allow(dead_code)]
 
 mod common;
 
+pub use catbird_server::{auth, federation, identity, sqlx_jacquard, util};
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
+
+#[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
+
+#[allow(dead_code)]
+#[path = "../src/chat_protocol/cursor.rs"]
+mod cursor;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/relationship_policy.rs"]
 mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/transcript.rs"]
 mod transcript;
@@ -40,14 +30,29 @@ mod transcript;
 mod validation;
 
 mod chat_protocol {
-    pub mod validation {
-        pub use crate::validation::*;
+    pub(crate) use crate::cursor::*;
+    pub(crate) use crate::model::*;
+    pub(crate) use crate::transcript::*;
+    pub(crate) use crate::validation::*;
+
+    pub mod cursor {
+        pub use crate::cursor::*;
     }
     pub mod model {
-        pub(crate) use crate::model::*;
+        pub use crate::model::*;
     }
     pub mod transcript {
         pub use crate::transcript::*;
+    }
+    pub mod validation {
+        pub use crate::validation::*;
+    }
+    pub mod dpop {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/dpop.rs"
+        ));
     }
     pub mod snapshot {
         pub use catbird_server::chat_protocol::snapshot::*;
@@ -62,70 +67,109 @@ mod chat_protocol {
             "/src/chat_protocol/public_state.rs"
         ));
     }
-    #[allow(dead_code)]
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
     }
+    pub mod federation_routing {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/federation_routing.rs"
+        ));
+    }
+    pub mod read_authority {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_authority.rs"
+        ));
+    }
+    pub mod read_projection {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_projection.rs"
+        ));
+    }
+
     pub mod repository {
-        // Every module the executor's dependency closure names — `auth`,
-        // `blobs`, `core`, `delivery`, `execution_context`, `prelude`,
-        // `recovery`, `relationship`, `transition` — is the REAL production
-        // source, path-included the way the sibling harnesses do it (see
-        // `tests/chat_protocol_conversation_substrate.rs`). Several are
-        // `#[cfg(not(test))]` in the lib (`core`, `execution_context`,
-        // `relationship`), so a `#[path]`-including harness must include the
-        // real module itself rather than link it.
-        #[allow(dead_code)]
-        pub mod execution_context {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        // Unconditionally compiled in the lib for exactly this reason (see the
-        // comments on `repository::blobs` / `key_packages` in repository/mod.rs).
-        #[allow(dead_code)]
-        pub mod blobs {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        #[allow(dead_code)]
-        pub mod key_packages {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        #[allow(dead_code)]
         pub mod auth {
+            #![allow(dead_code)]
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/auth.rs"
             ));
         }
-        #[allow(dead_code)]
+        pub mod blobs {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/blobs.rs"
+            ));
+        }
+        pub mod coordinate {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/coordinate.rs"
+            ));
+        }
+        pub mod conversation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/conversation.rs"
+            ));
+        }
+        pub mod entry_read {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/entry_read.rs"
+            ));
+        }
+        pub mod message_delivery {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/message_delivery.rs"
+            ));
+        }
+        pub mod subscription {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/subscription.rs"
+            ));
+        }
+        pub mod ticket {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/ticket.rs"
+            ));
+        }
+        pub mod key_packages {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/key_packages.rs"
+            ));
+        }
         pub mod prelude {
+            #![allow(dead_code)]
             include!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/prelude.rs"
             ));
         }
-        // `recovery` is `#[allow(dead_code)] pub(crate)` (unconditional) in the
-        // lib, and supplies the REAL `RecoveryPersistenceWitness`,
-        // `RecoveryExecutorWriteAuthority`, `PreparedRecoveryExecutionGraph`, and
-        // `RecoverySqlAuthoritySeal` that `execution_context` and the executor
-        // name in their signatures. Path-included here — exactly as
-        // `tests/chat_protocol_conversation_substrate.rs` does — so this harness
-        // exercises the production Recovery persistence boundary rather than
-        // opaque stand-ins.
+        pub mod inventory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/inventory.rs"
+            ));
+        }
         pub mod recovery {
             #![allow(dead_code)]
             include!(concat!(
@@ -161,7 +205,139 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/delivery.rs"
             ));
         }
+        pub mod execution_context {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/execution_context.rs"
+            ));
+        }
+        pub mod welcome {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome.rs"
+            ));
+        }
+        pub mod welcome_terminal {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome_terminal.rs"
+            ));
+        }
+        pub mod expiry_sweep {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/expiry_sweep.rs"
+            ));
+        }
+        pub mod device_directory {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/device_directory.rs"
+            ));
+        }
+        pub mod federation {
+            use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+            use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+            use jacquard_common::DefaultStr;
+            use uuid::Uuid;
+
+            #[allow(clippy::too_many_arguments)]
+            pub(crate) async fn enqueue_federated_welcome_job(
+                _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _target_ds_did: &str,
+                _recipient_did_str: &str,
+                _recipient_device_id: Uuid,
+                _welcome_id: Uuid,
+                _recovery_request_id: Uuid,
+                _reserved_ref: &[u8; 32],
+                _opaque_welcome: &[u8],
+                _sha256: &[u8; 32],
+                _append: &super::delivery::AppendEntry,
+                _seq: u64,
+                _coordinates: ConversationCoordinates,
+                _pub_snap_sha: &[u8; 32],
+                _tree_sum_sha: &[u8; 32],
+                _sequencer_term: u64,
+            ) -> Result<Uuid, super::super::state_machine::ExecutorError> {
+                Ok(Uuid::nil())
+            }
+
+            pub(crate) async fn enqueue_clean_federation_message_jobs(
+                _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _entry: &super::delivery::AppendEntry,
+                _seq: u64,
+                _sequencer_term: u64,
+            ) -> Result<usize, catbird_server::federation::errors::FederationError> {
+                Ok(0)
+            }
+
+            pub(crate) fn build_federated_commit_envelope(
+                _conversation_id: Uuid,
+                _transition_id: Uuid,
+                _sequencer_ds_did: &str,
+                _signed_request_bytes: &[u8],
+                _sequencer_term: u64,
+                _received_at: &crate::validation::CanonicalTimestamp,
+            ) -> Result<SubmitCommit<DefaultStr>, catbird_server::federation::errors::FederationError>
+            {
+                Err(
+                    catbird_server::federation::errors::FederationError::InvalidEnvelope {
+                        reason: "test stub".to_string(),
+                    },
+                )
+            }
+        }
+        pub mod acceptance {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/acceptance.rs"
+            ));
+        }
+        pub mod creation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/creation.rs"
+            ));
+        }
+        pub mod leave {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/leave.rs"
+            ));
+        }
+        pub mod reset {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/reset.rs"
+            ));
+        }
+        pub mod revocation {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/revocation.rs"
+            ));
+        }
+        pub mod submit_transition {
+            #![allow(dead_code)]
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/submit_transition.rs"
+            ));
+        }
     }
+
     pub mod state_machine {
         #![allow(dead_code)]
         include!(concat!(
@@ -1171,6 +1347,10 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     // 5. Apply + COMMIT the policy edge.
@@ -1829,6 +2009,10 @@ async fn build_signed_policy_apply(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     PolicyApplyFixture {
         plan,
@@ -2334,6 +2518,10 @@ fn close_ctx(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     }
 }
 
@@ -2597,6 +2785,10 @@ async fn reset_request_commits_without_changing_the_coordinate() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin reset");
@@ -2753,6 +2945,10 @@ async fn commit_reset_request(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     let mut tx = pool.begin().await.expect("begin reset request");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -2959,6 +3155,10 @@ async fn reset_activation_commits_two_generation_graph_and_conflicts_on_replay()
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin activation");
@@ -3224,6 +3424,10 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -3424,6 +3628,10 @@ async fn reset_activation_supersedes_prior_pending_welcome() {
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
@@ -3770,6 +3978,10 @@ async fn reset_activation_over_overdue_leave_and_welcome_expires_them_instead_of
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -3974,6 +4186,10 @@ async fn reset_activation_over_overdue_leave_and_welcome_expires_them_instead_of
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
@@ -4285,6 +4501,10 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -4407,6 +4627,10 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -4585,6 +4809,10 @@ async fn reset_activation_supersedes_prior_open_recovery_request() {
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin reset activation");
@@ -4938,6 +5166,10 @@ async fn acceptance_commits_recovery_open_and_promotes_participant() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -5190,6 +5422,10 @@ async fn acceptance_supersedes_prior_open_recovery_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -5419,6 +5655,10 @@ async fn acceptance_stales_prior_pending_reset_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin acceptance");
@@ -5584,6 +5824,10 @@ async fn leaf_recovery_replace_request_commits_without_advancing_coordinate() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -5808,6 +6052,10 @@ async fn build_replace_recovery_request(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     BuiltReplaceRequest {
         plan,
@@ -5979,6 +6227,10 @@ async fn leaf_recovery_cancellation_releases_reservation_and_reactivates_package
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     // Preparing and then abandoning the plan is write-free. This is the
@@ -6613,6 +6865,10 @@ async fn build_welcome_expiry(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx)
 }
@@ -6796,6 +7052,10 @@ async fn build_welcome_response(
         }),
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx, expires_at)
 }
@@ -7298,6 +7558,10 @@ async fn build_generic_commit_at(
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     BuiltGenericCommit {
@@ -8367,6 +8631,10 @@ async fn commit_leave_request_against(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     let mut tx = pool.begin().await.expect("begin leave request");
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -8657,6 +8925,10 @@ async fn leave_cancellation_terminalizes_pending_request_and_conflicts_on_replay
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     let mut tx = pool.begin().await.expect("begin leave cancellation");
     let applied = apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &plan, &ctx)
@@ -8830,6 +9102,10 @@ async fn zero_leaf_leave_commits_immediate_self_removal() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
@@ -9023,6 +9299,10 @@ async fn zero_leaf_leave_supersedes_prior_open_recovery_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin zero-leaf leave");
@@ -9296,6 +9576,10 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin leave fulfillment");
@@ -9560,6 +9844,10 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin replace request");
@@ -9778,6 +10066,10 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let bob_signature_key = hex::decode(&manifest.identity.bob.signature_public_key_hex).unwrap();
@@ -10266,6 +10558,10 @@ async fn build_bob_leave_fulfillment(
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx, post_leave)
 }
@@ -10469,6 +10765,10 @@ async fn close_after_leave_emits_proof_only_for_removed_device() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin close");
@@ -10698,6 +10998,10 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin request");
@@ -10869,6 +11173,10 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let mut tx = pool.begin().await.expect("begin generic commit");
@@ -11064,6 +11372,10 @@ async fn seed_reset_leave_then_build_commit(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin reset request");
@@ -11167,6 +11479,10 @@ async fn seed_reset_leave_then_build_commit(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin leave request");
@@ -11343,6 +11659,10 @@ async fn seed_reset_leave_then_build_commit(
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let _ = commit_request_digest;
@@ -11668,6 +11988,10 @@ async fn seed_three_member_bob_pending_leave_clocked(
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin policy add carol");
@@ -11793,6 +12117,10 @@ async fn seed_three_member_bob_pending_leave_clocked(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin bob leave request");
@@ -11943,6 +12271,10 @@ async fn build_carol_zero_leaf_leave_at(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx, transition_id)
 }
@@ -12364,6 +12696,10 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     {
         let mut tx = pool.begin().await.expect("begin leaf recovery request");
@@ -12456,6 +12792,10 @@ async fn setup_revoked_target(pool: &PgPool) -> RevocationSetup {
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     RevocationSetup {
@@ -12747,6 +13087,10 @@ async fn commit_bob_welcome_revocation(
             },
         }],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
 
     let response_bytes = b"revokeDevice-welcome-ok".to_vec();
@@ -14188,6 +14532,10 @@ async fn build_policy_edge(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx)
 }
@@ -14468,6 +14816,10 @@ async fn seed_alice_open_recovery(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     let mut tx = pool.begin().await.expect("begin recovery request");
     apply_conversation_persistence_plan_unscoped_for_test(&mut tx, &rec_plan, &rec_ctx)
@@ -14927,6 +15279,10 @@ async fn build_reset_activation_edge(
         welcome_response: None,
         welcome_dispositions: vec![],
         metadata_avatar: None,
+        is_remote: false,
+        sequencer_ds: None,
+        sequencer_term: 0,
+        participant_ds_dids: std::collections::HashMap::new(),
     };
     (plan, ctx, request_id)
 }
