@@ -10247,7 +10247,7 @@ mod historical_control_loader {
                 crate::frozen_public_state::schema2_snapshot(&corpus_file(
                     "committed-public-state.bin"
                 )),
-                "processed Add snapshot is byte-exact with the committed corpus artifact"
+                "processed Add snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
             );
             let added = add.into_next();
             let generic_commit = process(
@@ -10273,7 +10273,7 @@ mod historical_control_loader {
                 crate::frozen_public_state::schema2_snapshot(&corpus_file(
                     "committed-generic-public-state.bin"
                 )),
-                "processed generic snapshot is byte-exact with the committed corpus artifact"
+                "processed generic snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
             );
             let generic = generic_commit.into_next();
             let remove = process(
@@ -10301,7 +10301,7 @@ mod historical_control_loader {
                 crate::frozen_public_state::schema2_snapshot(&corpus_file(
                     "committed-remove-public-state.bin"
                 )),
-                "processed Remove snapshot is byte-exact with the committed corpus artifact"
+                "processed Remove snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
             );
             let removed = remove.into_next();
             let reinvited = rebind_active_snapshot(
@@ -10344,7 +10344,7 @@ mod historical_control_loader {
                 crate::frozen_public_state::schema2_snapshot(&corpus_file(
                     "committed-rejoin-public-state.bin"
                 )),
-                "processed rejoin snapshot is byte-exact with the committed corpus artifact"
+                "processed rejoin snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
             );
             let rejoined = rejoin.into_next();
             FixedCorpusCommitStates {
