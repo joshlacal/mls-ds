@@ -1092,7 +1092,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
                 &provider,
                 &signer,
                 LeafNodeParameters::builder()
-                    .with_capabilities(Capabilities::default())
+                    .with_capabilities(capabilities_with_extra_suite())
                     .build(),
             )
             .expect("create default-capabilities self-update")
@@ -1143,7 +1143,7 @@ fn stateful_commit_fixture(variant: StatefulCommitVariant) -> StatefulCommitFixt
             let leaf_parameters = match variant {
                 StatefulCommitVariant::AddWithDefaultPathCapabilities => {
                     LeafNodeParameters::builder()
-                        .with_capabilities(Capabilities::default())
+                        .with_capabilities(capabilities_with_extra_suite())
                         .build()
                 }
                 StatefulCommitVariant::AddWithChangedPathCredential => {
@@ -1269,6 +1269,18 @@ fn exact_capabilities() -> Capabilities {
     )
 }
 
+fn capabilities_with_extra_suite() -> Capabilities {
+    Capabilities::new(
+        Some(&[ProtocolVersion::Mls10]),
+        Some(&[
+            XWING_CIPHERSUITE,
+            Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+        ]),
+        Some(&[]),
+        Some(&[]),
+        Some(&[CredentialType::Basic]),
+    )
+}
 fn rightmost_sender_fixture(member_count: usize) -> RightmostSenderFixture {
     assert!((3..=100).contains(&member_count));
     let alice_provider = openmls_libcrux_crypto::Provider::new().expect("Alice libcrux provider");
@@ -1716,6 +1728,7 @@ fn wrong_content_type_artifacts() -> (Vec<u8>, Vec<u8>) {
             &MlsGroupCreateConfig::builder()
                 .ciphersuite(XWING_CIPHERSUITE)
                 .wire_format_policy(policy)
+                .capabilities(exact_capabilities())
                 .build(),
             GroupId::from_slice(&[group_byte; 32]),
             CredentialWithKey {
@@ -1731,6 +1744,7 @@ fn wrong_content_type_artifacts() -> (Vec<u8>, Vec<u8>) {
             SignatureKeyPair::new(XWING_CIPHERSUITE.signature_algorithm()).expect("Bob signer");
         signer.store(provider.storage()).expect("store Bob signer");
         KeyPackage::builder()
+            .leaf_node_capabilities(exact_capabilities())
             .build(
                 XWING_CIPHERSUITE,
                 provider,
@@ -1810,6 +1824,7 @@ fn external_commit_wire() -> Vec<u8> {
             .ciphersuite(XWING_CIPHERSUITE)
             .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
+            .capabilities(exact_capabilities())
             .build(),
         GroupId::from_slice(&[0xEC; 32]),
         CredentialWithKey {
@@ -1848,6 +1863,11 @@ fn external_commit_wire() -> Vec<u8> {
             },
         )
         .expect("build external-commit group")
+        .leaf_node_parameters(
+            LeafNodeParameters::builder()
+                .with_capabilities(exact_capabilities())
+                .build(),
+        )
         .load_psks(joiner_provider.storage())
         .expect("load external-commit PSKs")
         .build(
@@ -3477,4 +3497,127 @@ fn public_commit_rejects_real_new_member_external_commit_sender() {
             .expect_err("clean protocol must reject a structurally valid signed external Commit"),
         WireValidationError::NonMemberCommitSender
     );
+}
+
+#[test]
+fn strict_trusted_time_boundaries_99_100_150_200_201() {
+    let fixture =
+        genesis_group_info_fixture(Some(exact_capabilities()), Some(Lifetime::init(100, 200)));
+    let parsed = MlsMessageIn::tls_deserialize_exact(&fixture.bytes).expect("parse GroupInfo");
+    let MlsMessageBodyIn::GroupInfo(group_info) = parsed.extract() else {
+        panic!("expected GroupInfo");
+    };
+    let tree = group_info
+        .extensions()
+        .ratchet_tree()
+        .expect("tree extension")
+        .ratchet_tree()
+        .clone();
+
+    let check_at = |seconds: u64| {
+        let provider = openmls_libcrux_crypto::Provider::new().expect("provider");
+        PublicGroup::from_external_at(
+            provider.crypto(),
+            provider.storage(),
+            tree.clone(),
+            group_info.clone(),
+            ProposalStore::new(),
+            openmls::prelude::UnixSeconds::new(seconds),
+        )
+    };
+
+    // 99 is before not_before (100) -> Err
+    assert!(check_at(99).is_err(), "99 must be rejected");
+
+    // 100 is equal to not_before (strict inequality: 100 < now) -> Err
+    assert!(check_at(100).is_err(), "100 must be rejected");
+
+    // 150 is strictly within (100, 200) -> Ok
+    assert!(check_at(150).is_ok(), "150 must be accepted");
+
+    // 200 is equal to not_after (strict inequality: now < 200) -> Err
+    assert!(check_at(200).is_err(), "200 must be rejected");
+
+    // 201 is after not_after (200) -> Err
+    assert!(check_at(201).is_err(), "201 must be rejected");
+}
+
+#[test]
+fn test_server_timestamp_millisecond_floor_vectors() {
+    assert_eq!(source_wire::trusted_unix_millis_to_seconds(-1), None);
+    assert_eq!(source_wire::trusted_unix_millis_to_seconds(0), Some(0));
+    assert_eq!(source_wire::trusted_unix_millis_to_seconds(999), Some(0));
+    assert_eq!(source_wire::trusted_unix_millis_to_seconds(1_000), Some(1));
+    assert_eq!(source_wire::trusted_unix_millis_to_seconds(1_999), Some(1));
+    assert_eq!(
+        source_wire::trusted_unix_millis_to_seconds(150_000),
+        Some(150)
+    );
+    assert_eq!(
+        source_wire::trusted_unix_millis_to_seconds(150_999),
+        Some(150)
+    );
+}
+
+#[test]
+fn test_current_at_identical_injected_storage_failure_no_write() {
+    let fixture =
+        genesis_group_info_fixture(Some(exact_capabilities()), Some(Lifetime::init(100, 1000)));
+    let parsed = MlsMessageIn::tls_deserialize_exact(&fixture.bytes).expect("parse GroupInfo");
+    let MlsMessageBodyIn::GroupInfo(group_info) = parsed.extract() else {
+        panic!("expected GroupInfo");
+    };
+
+    let provider_current = openmls_libcrux_crypto::Provider::new().expect("provider");
+    let provider_at = openmls_libcrux_crypto::Provider::new().expect("provider");
+
+    // Pass invalid empty ratchet tree to both
+    let empty_tree =
+        openmls::treesync::RatchetTreeIn::tls_deserialize_exact(&[0x00]).expect("empty tree");
+    let res_current = PublicGroup::from_external(
+        provider_current.crypto(),
+        provider_current.storage(),
+        empty_tree.clone(),
+        group_info.clone(),
+        ProposalStore::new(),
+    );
+    let res_at = PublicGroup::from_external_at(
+        provider_at.crypto(),
+        provider_at.storage(),
+        empty_tree,
+        group_info,
+        ProposalStore::new(),
+        openmls::prelude::UnixSeconds::new(150),
+    );
+
+    assert!(res_current.is_err());
+    assert!(res_at.is_err());
+}
+
+#[test]
+fn test_absence_of_catbird_skip_callsites() {
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    fn visit_dirs(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_dirs(&path, files);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    visit_dirs(&src_dir, &mut files);
+    for file in files {
+        let content = std::fs::read_to_string(&file).expect("read source file");
+        assert!(
+            !content.contains("LifetimeValidation::Skip")
+                && !content.contains("LeafNodeLifetimePolicy::Skip"),
+            "Catbird production source {} must not contain Skip lifetime callsites",
+            file.display()
+        );
+    }
 }

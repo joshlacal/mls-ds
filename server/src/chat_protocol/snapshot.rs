@@ -27,9 +27,9 @@ use tls_codec::{
 use super::{xwing_public_key_is_valid, MAX_BASIC_CREDENTIAL_BYTES, MIN_BASIC_CREDENTIAL_BYTES};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"CBPGSNAP";
-const SNAPSHOT_SCHEMA: u16 = 1;
-const OPENMLS_VERSION: &[u8] = b"0.8.1";
-const STORAGE_VERSION: &[u8] = b"0.5.0";
+const SNAPSHOT_SCHEMA: u16 = 2;
+const OPENMLS_VERSION: &[u8] = b"0.9.0-rc.3";
+const STORAGE_VERSION: &[u8] = b"0.6.0-rc.3";
 const PUBLIC_RECORD_COUNT: usize = 4;
 const MAX_PUBLIC_GROUP_LEAVES: usize = 100;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
@@ -675,7 +675,7 @@ pub fn decode_public_group_snapshot(
         *values = records.iter().cloned().collect::<HashMap<_, _>>();
     }
 
-    // MemoryStorage 0.5.0 has infallible-looking public reads that internally
+    // MemoryStorage 0.6.0-rc.3 has infallible-looking public reads that internally
     // unwrap serde failures. Keep an attacker-controlled snapshot from turning
     // dependency behavior into a process abort. The exact version is also
     // pinned in the envelope and Cargo manifest.

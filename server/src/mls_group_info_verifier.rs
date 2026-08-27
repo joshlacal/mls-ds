@@ -555,6 +555,7 @@ pub fn verify_group_info_for_transition(
 ) -> Result<VerifiedGroupInfo, GroupInfoVerificationError> {
     if registry_authority.user_did != device.user_did()
         || registry_authority.device_id != device.device_id()
+        || registry_authority.dpop_jkt != device.dpop_jkt()
         || registry_authority.auth_generation != device.auth_generation()
     {
         return Err(GroupInfoVerificationError::RegistryAuthorityMismatch);
@@ -619,7 +620,7 @@ pub(crate) mod context_binding_tests {
         let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).expect("signer");
         signer.store(provider.storage()).expect("store signer");
         let credential_with_key = CredentialWithKey {
-            credential: BasicCredential::new(b"did:plc:alice".to_vec()).into(),
+            credential: BasicCredential::new(b"did:plc:alice#device-a".to_vec()).into(),
             signature_key: signer.to_public_vec().into(),
         };
         let config = MlsGroupCreateConfig::builder()
@@ -631,11 +632,17 @@ pub(crate) mod context_binding_tests {
             &signer,
             &config,
             GroupId::from_slice(GROUP_ID),
-            credential_with_key,
+            credential_with_key.clone(),
         )
         .expect("create group");
         group
-            .self_update(&provider, &signer, LeafNodeParameters::default())
+            .self_update(
+                &provider,
+                &signer,
+                LeafNodeParameters::builder()
+                    .with_credential_with_key(credential_with_key)
+                    .build(),
+            )
             .expect("self update");
         group
             .merge_pending_commit(&provider)
@@ -708,7 +715,7 @@ pub(crate) mod context_binding_tests {
         assert_eq!(verified.signer_signature_key(), fixture.signer_key);
         assert_eq!(
             verified.signer_credential().clone(),
-            Credential::from(BasicCredential::new(b"did:plc:alice".to_vec()))
+            Credential::from(BasicCredential::new(b"did:plc:alice#device-a".to_vec()))
         );
     }
 

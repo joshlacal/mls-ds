@@ -33,13 +33,13 @@ serde_bytes = "0.11"
 sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "uuid", "chrono", "migrate"] }
 
 # MLS
-openmls = { version = "=0.8.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-openmls_traits = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-openmls_basic_credential = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-openmls_rust_crypto = { version = "=0.5.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-openmls_libcrux_crypto = { version = "=0.3.1", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-openmls_memory_storage = { version = "=0.5.0", git = "https://github.com/joshlacal/openmls", rev = "105027de96cad9835c81272651a93eeaf253b054" }
-libcrux-kem = "=0.0.7"
+openmls = { version = "=0.9.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b" }
+openmls_traits = { version = "=0.6.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { version = "=0.6.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites", "clonable"] }
+openmls_rust_crypto = { version = "=0.6.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_libcrux_crypto = { version = "=0.4.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = { version = "=0.6.0-rc.3", default-features = false, git = "https://github.com/joshlacal/openmls", rev = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b", features = ["draft-ietf-mls-pq-ciphersuites"] }
+libcrux-kem = "=0.0.9"
 x25519-dalek = "=2.0.1"
 
 # Crypto
@@ -114,7 +114,7 @@ prometheus = "0.14"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 serde_ipld_dagcbor = "0.6"
 hex = "0.4.3"
-tls_codec = "=0.4.2"
+tls_codec = "=0.5.0"
 lazy_static = "1.4"
 
 [dev-dependencies]
