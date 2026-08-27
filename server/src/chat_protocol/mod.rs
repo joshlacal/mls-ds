@@ -140,9 +140,6 @@ pub mod state_machine;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-#[cfg(not(any(test, feature = "test-support")))]
-pub(crate) mod transcript;
-#[cfg(any(test, feature = "test-support"))]
 pub mod transcript;
 
 #[cfg(not(any(test, feature = "test-support")))]

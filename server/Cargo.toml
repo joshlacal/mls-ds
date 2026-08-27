@@ -144,7 +144,6 @@ required-features = ["chat-protocol-production-proof"]
 [[test]]
 name = "chat_protocol_create_conversation_regression"
 path = "tests/chat_protocol_create_conversation_regression.rs"
-
 [[test]]
 name = "chat_protocol_create_conversation_handlers"
 path = "tests/chat_protocol_create_conversation_handlers.rs"

@@ -4123,16 +4123,285 @@ fn sealed_crypto_wire_v09_corpus_consumer_validation() {
     let _ = validate_welcome(&rejoin_welcome_bytes, MAX_WELCOME_WIRE_BYTES)
         .expect("validate rejoin welcome failed");
 
-    // 9. State-only metadata and policy transitions validation
-    for (filename, expected_kind) in [
-        ("creation-signed-request.cbor", "creationBody"),
-        ("transition-metadata-sv1.cbor", "metadataTransitionBody"),
-        ("transition-policy-sv2.cbor", "policyTransitionBody"),
-        ("transition-metadata-sv6.cbor", "metadataTransitionBody"),
-        ("transition-policy-sv7.cbor", "policyTransitionBody"),
-    ] {
-        let transition_bytes = fs::read(fixture_dir.join(filename)).unwrap();
-        assert!(transition_bytes.len() > 50, "{filename} too short");
-        assert_eq!(transition_bytes[0], 0xa2, "{filename} not DAG-CBOR map");
+    // 9. State-only metadata and policy transitions decoding, verification, and state-version progression
+    use base64::Engine as _;
+    use catbird_server::chat_protocol::transcript::{
+        decode_and_verify_signed_mutation, CanonicalValueRef, SignedMutationKind,
+        VerifiedMutationProjection,
+    };
+
+    fn decode_json_from_cbor_bytes(cbor_bytes: &[u8]) -> Vec<u8> {
+        #[derive(Debug, serde::Deserialize)]
+        enum CborNode {
+            Text(String),
+            Bytes(Vec<u8>),
+            Integer(u64),
+            Bool(bool),
+            Array(Vec<CborNode>),
+            Map(std::collections::BTreeMap<String, CborNode>),
+        }
+        impl<'de> serde::Deserialize<'de> for CborNodeVisitor {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(CborNodeVisitorHelper)
+            }
+        }
+        struct CborNodeVisitor(CborNode);
+        struct CborNodeVisitorHelper;
+        impl<'de> serde::de::Visitor<'de> for CborNodeVisitorHelper {
+            type Value = CborNodeVisitor;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("any CBOR value")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Bool(v)))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Integer(v)))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u64::try_from(v)
+                    .map(|u| CborNodeVisitor(CborNode::Integer(u)))
+                    .map_err(|_| E::custom("negative integer"))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Text(v.to_owned())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Text(v)))
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Bytes(v.to_vec())))
+            }
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(CborNodeVisitor(CborNode::Bytes(v)))
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(CborNodeVisitor(elem)) = seq.next_element()? {
+                    values.push(elem);
+                }
+                Ok(CborNodeVisitor(CborNode::Array(values)))
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = std::collections::BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let CborNodeVisitor(val) = map.next_value()?;
+                    values.insert(key, val);
+                }
+                Ok(CborNodeVisitor(CborNode::Map(values)))
+            }
+        }
+
+        const UUID_KEYS: &[&str] = &[
+            "conversationId",
+            "transitionId",
+            "actorDeviceId",
+            "authorDeviceId",
+            "deviceId",
+            "messageId",
+            "typingId",
+            "blobId",
+            "idempotencyKey",
+            "originTransitionId",
+        ];
+
+        fn node_to_json(
+            node: &CborNode,
+            parent: Option<&str>,
+            key: Option<&str>,
+        ) -> serde_json::Value {
+            match node {
+                CborNode::Text(s) => serde_json::Value::String(s.clone()),
+                CborNode::Integer(i) => serde_json::json!(i),
+                CborNode::Bool(b) => serde_json::Value::Bool(*b),
+                CborNode::Bytes(b) => {
+                    let is_id_bytes = parent == Some("coordinate") && key == Some("conversationId");
+                    if b.len() == 16 && !is_id_bytes && key.is_some_and(|k| UUID_KEYS.contains(&k))
+                    {
+                        if let Ok(u) = uuid::Uuid::from_slice(b) {
+                            serde_json::Value::String(u.to_string())
+                        } else {
+                            serde_json::Value::String(
+                                base64::engine::general_purpose::STANDARD.encode(b),
+                            )
+                        }
+                    } else {
+                        serde_json::Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(b),
+                        )
+                    }
+                }
+                CborNode::Array(arr) => serde_json::Value::Array(
+                    arr.iter()
+                        .map(|item| node_to_json(item, key, None))
+                        .collect(),
+                ),
+                CborNode::Map(m) => {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in m {
+                        map.insert(k.clone(), node_to_json(v, key, Some(k)));
+                    }
+                    serde_json::Value::Object(map)
+                }
+            }
+        }
+
+        let CborNodeVisitor(root) =
+            serde_ipld_dagcbor::from_slice(cbor_bytes).expect("deserialize DAG-CBOR");
+        let json_val = node_to_json(&root, None, None);
+        serde_json::to_vec(&json_val).expect("serialize JSON bytes")
     }
+
+    // Creation
+    let creation_raw_json = decode_json_from_cbor_bytes(
+        &fs::read(fixture_dir.join("creation-signed-request.cbor")).unwrap(),
+    );
+    let verified_creation =
+        decode_and_verify_signed_mutation(&creation_raw_json, &alice_pub).expect("verify creation");
+    assert_eq!(verified_creation.kind(), SignedMutationKind::Creation);
+    let VerifiedMutationProjection::Creation(creation_proj) = verified_creation.projection() else {
+        panic!("expected Creation projection");
+    };
+    let creation_next = creation_proj.next();
+    let CanonicalValueRef::Integer(creation_sv) = creation_next.get("stateVersion").unwrap() else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(creation_epoch) = creation_next.get("epoch").unwrap() else {
+        panic!("epoch");
+    };
+    assert_eq!(creation_sv, 0);
+    assert_eq!(creation_epoch, 0);
+
+    // Metadata transition sv1: 0 -> 1
+    let sv1_raw_json = decode_json_from_cbor_bytes(
+        &fs::read(fixture_dir.join("transition-metadata-sv1.cbor")).unwrap(),
+    );
+    let verified_sv1 =
+        decode_and_verify_signed_mutation(&sv1_raw_json, &alice_pub).expect("verify sv1");
+    assert_eq!(verified_sv1.kind(), SignedMutationKind::MetadataTransition);
+    let VerifiedMutationProjection::MetadataTransition(sv1_proj) = verified_sv1.projection() else {
+        panic!("expected MetadataTransition projection");
+    };
+    let CanonicalValueRef::Integer(sv1_prior_sv) = sv1_proj.prior().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv1_next_sv) = sv1_proj.next().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv1_epoch) = sv1_proj.next().get("epoch").unwrap() else {
+        panic!("epoch");
+    };
+    assert_eq!(sv1_prior_sv, 0);
+    assert_eq!(sv1_next_sv, 1);
+    assert_eq!(sv1_epoch, 0);
+
+    // Policy transition sv2: 1 -> 2
+    let sv2_raw_json = decode_json_from_cbor_bytes(
+        &fs::read(fixture_dir.join("transition-policy-sv2.cbor")).unwrap(),
+    );
+    let verified_sv2 =
+        decode_and_verify_signed_mutation(&sv2_raw_json, &alice_pub).expect("verify sv2");
+    assert_eq!(verified_sv2.kind(), SignedMutationKind::PolicyTransition);
+    let VerifiedMutationProjection::PolicyTransition(sv2_proj) = verified_sv2.projection() else {
+        panic!("expected PolicyTransition projection");
+    };
+    let CanonicalValueRef::Integer(sv2_prior_sv) = sv2_proj.prior().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv2_next_sv) = sv2_proj.next().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv2_epoch) = sv2_proj.next().get("epoch").unwrap() else {
+        panic!("epoch");
+    };
+    assert_eq!(sv2_prior_sv, 1);
+    assert_eq!(sv2_next_sv, 2);
+    assert_eq!(sv2_epoch, 0);
+
+    // Metadata transition sv6: 5 -> 6
+    let sv6_raw_json = decode_json_from_cbor_bytes(
+        &fs::read(fixture_dir.join("transition-metadata-sv6.cbor")).unwrap(),
+    );
+    let verified_sv6 =
+        decode_and_verify_signed_mutation(&sv6_raw_json, &alice_pub).expect("verify sv6");
+    assert_eq!(verified_sv6.kind(), SignedMutationKind::MetadataTransition);
+    let VerifiedMutationProjection::MetadataTransition(sv6_proj) = verified_sv6.projection() else {
+        panic!("expected MetadataTransition projection");
+    };
+    let CanonicalValueRef::Integer(sv6_prior_sv) = sv6_proj.prior().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv6_next_sv) = sv6_proj.next().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv6_epoch) = sv6_proj.next().get("epoch").unwrap() else {
+        panic!("epoch");
+    };
+    assert_eq!(sv6_prior_sv, 5);
+    assert_eq!(sv6_next_sv, 6);
+    assert_eq!(sv6_epoch, 3);
+
+    // Policy transition sv7: 6 -> 7
+    let sv7_raw_json = decode_json_from_cbor_bytes(
+        &fs::read(fixture_dir.join("transition-policy-sv7.cbor")).unwrap(),
+    );
+    let verified_sv7 =
+        decode_and_verify_signed_mutation(&sv7_raw_json, &alice_pub).expect("verify sv7");
+    assert_eq!(verified_sv7.kind(), SignedMutationKind::PolicyTransition);
+    let VerifiedMutationProjection::PolicyTransition(sv7_proj) = verified_sv7.projection() else {
+        panic!("expected PolicyTransition projection");
+    };
+    let CanonicalValueRef::Integer(sv7_prior_sv) = sv7_proj.prior().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv7_next_sv) = sv7_proj.next().get("stateVersion").unwrap()
+    else {
+        panic!("stateVersion");
+    };
+    let CanonicalValueRef::Integer(sv7_epoch) = sv7_proj.next().get("epoch").unwrap() else {
+        panic!("epoch");
+    };
+    assert_eq!(sv7_prior_sv, 6);
+    assert_eq!(sv7_next_sv, 7);
+    let mut corrupted_json: serde_json::Value = serde_json::from_slice(&sv1_raw_json).unwrap();
+    let sig_b64 = corrupted_json["signature"].as_str().unwrap();
+    let mut sig_bytes = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .unwrap();
+    sig_bytes[0] ^= 0xff;
+    corrupted_json["signature"] =
+        serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&sig_bytes));
+    let corrupted_raw = serde_json::to_vec(&corrupted_json).unwrap();
+    let corrupt_err = decode_and_verify_signed_mutation(&corrupted_raw, &alice_pub)
+        .expect_err("corrupted signature must fail verification");
+    assert_eq!(
+        corrupt_err.to_string(),
+        "invalid clean-chat authentication input: invalid Ed25519 signature"
+    );
+    // Verifying with wrong public key (Bob's key) must fail keyId thumbprint validation
+    let wrong_key_err = decode_and_verify_signed_mutation(&sv1_raw_json, &bob_pub)
+        .expect_err("Bob public key must not verify Alice's transition");
+    assert_eq!(
+        wrong_key_err.to_string(),
+        "invalid clean-chat authentication input: signed body key ID mismatch"
+    );
 }

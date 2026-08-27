@@ -35,13 +35,7 @@ STACK_ROOT = MLS_DS_ROOT.parent
 CANONICAL_ROOT = STACK_ROOT / "PetrelCatbird/lexicons/blue/catbird/chat"
 MIRROR_ROOT = MLS_DS_ROOT / "lexicon/blue/catbird/chat"
 VECTOR_PATH = Path(__file__).with_name("fixtures") / "mls_chat_contract_vectors.json"
-# Deliberately still the GENERATION home, not the in-repo snapshot. The Rust
-# suites now read a frozen copy committed at server/tests/fixtures/crypto-wire so
-# they never traverse out of the repository; this contract test is cross-stack by
-# nature (see CANONICAL_ROOT in PetrelCatbird above) and checks the artifacts
-# where the generator writes them. Keeping the two paths distinct is what lets a
-# regeneration that has not been re-snapshotted into the repo be noticed here.
-CRYPTO_WIRE_ROOT = STACK_ROOT / "docs/generated-artifacts/mls-chat-v1/crypto-wire"
+CRYPTO_WIRE_ROOT = Path(__file__).with_name("fixtures") / "crypto-wire"
 CRYPTO_WIRE_V09_ROOT = STACK_ROOT / "docs/generated-artifacts/mls-chat-v1/crypto-wire-v09"
 PROTOCOL_PATH = STACK_ROOT / "docs/mls-v2/CHAT_PROTOCOL.md"
 STANDARD_APPVIEW_ADR_PATH = STACK_ROOT / "docs/design-docs/adr-001-mls-standard-appview-auth.md"
@@ -1570,8 +1564,6 @@ def validate_normative_prose() -> None:
         "malicious sole admin",
         "three-DID poison → victim-signed `replace`",
         "all-peers-poisoned active-admin reset and direct-close flows",
-        "Catbird Chat Application Content Protocol v1",
-        "docs/generated-artifacts/chat-application-v1/manifest.json",
         "applicationEntry = {entryId,conversationId,seq,signedRequest,receivedAt}",
         "no duplicated unsigned actor, device, coordinate, message-ID, application-artifact, or blob-binding fields",
         "`entry.conversationId` MUST equal `signedRequest.body.prior.conversationId`",
@@ -3554,6 +3546,21 @@ def validate_crypto_wire_v09_corpus() -> None:
     assert chain["stateOnlyMetadataTransitionStateVersion"] == 6 and chain["stateOnlyPolicyTransitionStateVersion"] == 7
     assert chain["rejoinPriorStateVersion"] == 7
     assert chain["rejoinNextEpoch"] == 4 and chain["rejoinNextStateVersion"] == 8
+    files = manifest["files"]
+    assert files["commit-public.mls"]["epoch"] == chain["addPriorEpoch"]
+    assert files["commit-generic-public.mls"]["epoch"] == chain["genericCommitPriorEpoch"]
+    assert files["commit-metadata-appdata-public.mls"]["epoch"] == chain["metadataAppDataCommitPriorEpoch"]
+    assert files["commit-metadata-appdata-public.mls"]["epoch"] == chain["metadataAppDataCommitNextEpoch"]
+    assert files["commit-remove-public.mls"]["epoch"] == chain["removeCommitPriorEpoch"]
+    assert files["commit-rejoin-public.mls"]["epoch"] == chain["rejoinPriorEpoch"]
+    assert files["own-pending-commit.mls"]["epoch"] == chain["genericCommitNextEpoch"]
+    assert files["genesis-public-state.bin"]["epoch"] == chain["genesisEpoch"]
+    assert files["committed-public-state.bin"]["epoch"] == chain["addNextEpoch"]
+    assert files["committed-generic-public-state.bin"]["epoch"] == chain["genericCommitNextEpoch"]
+    assert files["committed-remove-public-state.bin"]["epoch"] == chain["removeCommitNextEpoch"]
+    assert files["committed-rejoin-public-state.bin"]["epoch"] == chain["rejoinNextEpoch"]
+    assert files["application-frame.cbor"]["epoch"] == chain["applicationEpoch"]
+    assert files["application-private.mls"]["epoch"] == chain["applicationEpoch"]
     public_snapshot_profile = manifest["publicSnapshots"]
     assert set(public_snapshot_profile) == {
         "schema", "openmlsVersion", "storageVersion", "recordCount", "recordLabels",
