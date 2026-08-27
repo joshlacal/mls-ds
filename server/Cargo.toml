@@ -132,6 +132,10 @@ name = "deadletter_recover"
 path = "src/bin/deadletter_recover.rs"
 required-features = ["server-bin"]
 
+[[example]]
+name = "seal_mls_chat_crypto_wire_v09"
+path = "examples/seal_mls_chat_crypto_wire_v09.rs"
+
 [[test]]
 name = "chat_protocol_production_cfg"
 path = "tests/chat_protocol_production_cfg.rs"
