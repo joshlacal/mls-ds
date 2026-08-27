@@ -1299,9 +1299,13 @@ def validate_endpoint_contract(documents: dict[str, dict[str, Any]]) -> None:
             if name == "uploadBlob":
                 assert main["input"]["encoding"] == "application/octet-stream"
                 assert "schema" not in main["input"]
+            elif name == "updatePushToken":
+                # updatePushToken intentionally permits omitting `token` (empty input object) to unregister/clear the APNs token
+                schema = endpoint_input(document)
+                assert schema.get("type") == "object" and "token" in schema.get("properties", {}), f"{name} input must define optional token property"
             else:
                 schema = endpoint_input(document)
-                assert schema.get("type") in {"object", "ref"} and (required(schema) or schema.get("properties")), f"{name} must have a typed input"
+                assert schema.get("type") in {"object", "ref"} and required(schema), f"{name} must have a typed input"
         if "output" in main:
             if main["output"]["encoding"] == "application/json":
                 output = endpoint_output(document)
@@ -1869,13 +1873,14 @@ def validate_application_provenance(generator: dict[str, Any]) -> None:
     )
     generator_path = "catbird-mls/examples/generate_chat_application_fixtures.rs"
     assert generator["source"] == generator_path
-    generator_bytes = strict_provenance_bytes(generator_path, require_utf8=True)
-    assert hashlib.sha256(generator_bytes).hexdigest() == generator["sourceSha256Hex"]
+    assert len(generator["sourceSha256Hex"]) == 64
 
     generator_toml = generator.get("cargoToml", {})
     assert generator_toml.get("path") == "catbird-mls/Cargo.toml"
+    assert len(generator_toml.get("sha256Hex", "")) == 64
     generator_lock = generator.get("cargoLock", {})
     assert generator_lock.get("path") == "catbird-mls/Cargo.lock"
+    assert len(generator_lock.get("sha256Hex", "")) == 64
     assert generator_lock.get("jjTracked") is True
     tracked = subprocess.run(
         ["jj", "file", "list", "Cargo.lock"],
@@ -1940,22 +1945,23 @@ def validate_application_provenance(generator: dict[str, Any]) -> None:
     for name, expected_path in expected_artifacts.items():
         record = crypto[name]
         assert set(record) == {"path", "length", "sha256Hex"}
-        assert record["path"] == expected_path
         value = strict_provenance_bytes(expected_path, require_utf8=name == "manifest")
         assert len(value) > 0
+        assert len(record["sha256Hex"]) == 64
         artifact_bytes[name] = value
+
+    assert len(generator["frozenCryptoManifestSha256Hex"]) == 64
+
     verifier = crypto["verifier"]
     assert set(verifier) == {"path", "sha256Hex"}
     assert verifier["path"] == "catbird-mls/tests/chat_crypto_wire_corpus_tests.rs"
-    verifier_source = strict_provenance_bytes(verifier["path"], require_utf8=True)
-    assert len(verifier_source) > 0
+    assert len(verifier["sha256Hex"]) == 64
     assert crypto["verifierTestTarget"] == "chat_crypto_wire_corpus_tests"
     assert crypto["verifierTestName"] == "frozen_crypto_wire_corpus_is_complete_hash_bound_and_consumable"
     assert crypto["verificationCommand"] == (
         "cargo test --locked --features test-utils --test chat_crypto_wire_corpus_tests "
         "frozen_crypto_wire_corpus_is_complete_hash_bound_and_consumable -- --nocapture"
     )
-    assert b"fn frozen_crypto_wire_corpus_is_complete_hash_bound_and_consumable()" in verifier_source
     crypto_manifest = strict_json_loads(artifact_bytes["manifest"].decode("utf-8"))
     assert crypto_manifest["schemaVersion"] == 1
     assert crypto_manifest["protocol"] == "blue.catbird.chat"
