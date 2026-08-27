@@ -5,22 +5,21 @@
 //! authoritative schema 2 `PublicGroupSnapshot` files, and finalizes the sealed
 //! `manifest.json`.
 
-use std::error::Error;
-use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
 use catbird_server::chat_protocol::snapshot::{
     decode_public_group_snapshot, encode_public_group_snapshot, public_group_snapshot_binding,
-    PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+    PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle, PublicGroupState,
 };
 use catbird_server::chat_protocol::wire::{
-    process_public_commit, validate_group_info, validate_public_commit,
-    GroupInfoValidationPolicy, PublicCommitValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES,
-    MAX_PUBLIC_MESSAGE_WIRE_BYTES,
+    process_public_commit, validate_group_info, validate_public_commit, GroupInfoValidationPolicy,
+    PublicCommitValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES, MAX_PUBLIC_MESSAGE_WIRE_BYTES,
 };
 use openmls::prelude::*;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 struct SealerError(String);
@@ -97,6 +96,118 @@ fn expected_public_snapshot_keys(group_id: &[u8; 32]) -> Result<Vec<String>> {
     }
     Ok(keys)
 }
+/// One sealed link of the public commit chain: the reconstructed state, its
+/// authoritative schema-2 snapshot bytes, and the coordinate material a
+/// successor commit must be bound against.
+struct SealedLink {
+    state: PublicGroupState,
+    snapshot_bytes: Vec<u8>,
+    epoch: u64,
+    group_context_hash: [u8; 32],
+    confirmation_tag: [u8; 32],
+}
+
+/// Per-link constants: which candidate file to seal, which manifest `chain`
+/// fields carry its expected coordinates, and the state versions the prior and
+/// successor snapshots are bound at.
+struct CommitLinkSpec<'a> {
+    label: &'a str,
+    commit_file: &'a str,
+    aad_field: &'a str,
+    group_context_hash_field: &'a str,
+    confirmation_tag_field: &'a str,
+    prior_state_version: u64,
+    next_state_version: u64,
+    next_epoch: u64,
+    snapshot_file: &'a str,
+}
+
+/// Validate one public commit against `prior`, process it through the production
+/// server commit path, then encode, bind, verify, and write its authoritative
+/// schema-2 successor snapshot.
+fn seal_commit_link(
+    target_dir: &Path,
+    manifest: &Value,
+    conversation_id: [u8; 16],
+    group_id: [u8; 32],
+    evaluation_unix_seconds: u64,
+    prior: &SealedLink,
+    spec: &CommitLinkSpec<'_>,
+) -> Result<SealedLink> {
+    let label = spec.label;
+    let commit_bytes = fs::read(target_dir.join(spec.commit_file))?;
+    let validated = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+        .map_err(|e| fail(format!("validate {label} failed: {e}")))?;
+
+    let group_context_hash = decode_hex_32(
+        manifest["chain"][spec.group_context_hash_field]
+            .as_str()
+            .ok_or_else(|| fail(format!("missing {}", spec.group_context_hash_field)))?,
+        spec.group_context_hash_field,
+    )?;
+    let confirmation_tag = decode_hex_32(
+        manifest["chain"][spec.confirmation_tag_field]
+            .as_str()
+            .ok_or_else(|| fail(format!("missing {}", spec.confirmation_tag_field)))?,
+        spec.confirmation_tag_field,
+    )?;
+
+    let next_coordinate = PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        0,
+        spec.next_state_version,
+        group_id,
+        spec.next_epoch,
+        group_context_hash,
+        confirmation_tag,
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let prior_coordinate = PublicGroupSnapshotCoordinate::new(
+        conversation_id,
+        0,
+        spec.prior_state_version,
+        group_id,
+        prior.epoch,
+        prior.group_context_hash,
+        prior.confirmation_tag,
+        PublicGroupSnapshotLifecycle::Active,
+    );
+    let prior_binding =
+        public_group_snapshot_binding(&prior.state, &prior.snapshot_bytes, &prior_coordinate)
+            .map_err(|e| fail(format!("bind {label} prior snapshot failed: {e}")))?;
+
+    let aad = validated_commit_aad(&validated, manifest, spec.aad_field)?;
+    let processed = process_public_commit(
+        &prior.state,
+        validated,
+        PublicCommitValidationPolicy {
+            expected_aad: &aad,
+            trusted_prior_binding: &prior_binding,
+            expected_next_coordinate: &next_coordinate,
+            now_unix_seconds: evaluation_unix_seconds,
+            max_members: 10,
+        },
+    )
+    .map_err(|e| fail(format!("process {label} failed: {e}")))?;
+
+    let state = processed.into_next_state();
+    let snapshot_bytes = encode_public_group_snapshot(&state)
+        .map_err(|e| fail(format!("encode {label} snapshot failed: {e}")))?;
+    let binding = public_group_snapshot_binding(&state, &snapshot_bytes, &next_coordinate)
+        .map_err(|e| fail(format!("bind {label} snapshot failed: {e}")))?;
+    decode_public_group_snapshot(&snapshot_bytes, &binding)
+        .map_err(|e| fail(format!("decode {label} snapshot failed: {e}")))?;
+
+    write_atomic(&target_dir.join(spec.snapshot_file), &snapshot_bytes)?;
+
+    Ok(SealedLink {
+        state,
+        snapshot_bytes,
+        epoch: spec.next_epoch,
+        group_context_hash,
+        confirmation_tag,
+    })
+}
 
 fn main() -> Result<()> {
     let target_dir = match std::env::args().nth(1) {
@@ -123,7 +234,10 @@ fn main() -> Result<()> {
     let candidate_manifest_path = target_dir.join("candidate-manifest.json");
     ensure(
         candidate_manifest_path.is_file(),
-        format!("missing candidate-manifest.json at {}", candidate_manifest_path.display()),
+        format!(
+            "missing candidate-manifest.json at {}",
+            candidate_manifest_path.display()
+        ),
     )?;
     let mut manifest: Value = serde_json::from_slice(&fs::read(&candidate_manifest_path)?)?;
 
@@ -183,12 +297,9 @@ fn main() -> Result<()> {
         genesis_confirmation_tag,
         PublicGroupSnapshotLifecycle::Active,
     );
-    let genesis_binding = public_group_snapshot_binding(
-        &genesis_state,
-        &genesis_snapshot_bytes,
-        &genesis_coordinate,
-    )
-    .map_err(|e| fail(format!("bind genesis snapshot failed: {e}")))?;
+    let genesis_binding =
+        public_group_snapshot_binding(&genesis_state, &genesis_snapshot_bytes, &genesis_coordinate)
+            .map_err(|e| fail(format!("bind genesis snapshot failed: {e}")))?;
 
     decode_public_group_snapshot(&genesis_snapshot_bytes, &genesis_binding)
         .map_err(|e| fail(format!("decode genesis snapshot failed: {e}")))?;
@@ -198,285 +309,71 @@ fn main() -> Result<()> {
         &genesis_snapshot_bytes,
     )?;
 
-    // ── 2. Validate Add Commit and write committed snapshot ─────────────────────
-    let commit_bytes = fs::read(target_dir.join("commit-public.mls"))?;
-    let validated_commit = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-        .map_err(|e| fail(format!("validate Add commit failed: {e}")))?;
-
-    let committed_group_context_hash = decode_hex_32(
-        manifest["chain"]["committedGroupContextHashHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing committedGroupContextHashHex"))?,
-        "committedGroupContextHash",
-    )?;
-    let committed_confirmation_tag = decode_hex_32(
-        manifest["chain"]["committedConfirmationTagHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing committedConfirmationTagHex"))?,
-        "committedConfirmationTag",
-    )?;
-
-    let add_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        3,
-        group_id,
-        1,
-        committed_group_context_hash,
-        committed_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-
-    let add_prior_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        2,
-        group_id,
-        0,
-        genesis_group_context_hash,
-        genesis_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-    let add_prior_binding = public_group_snapshot_binding(
-        &genesis_state,
-        &genesis_snapshot_bytes,
-        &add_prior_coord,
-    )
-    .map_err(|e| fail(format!("bind add prior snapshot failed: {e}")))?;
-
-    let commit_aad = validated_commit_aad(&validated_commit, &manifest, "commitAadSha256Hex")?;
-    let processed_commit = process_public_commit(
-        &genesis_state,
-        validated_commit,
-        PublicCommitValidationPolicy {
-            expected_aad: &commit_aad,
-            trusted_prior_binding: &add_prior_binding,
-            expected_next_coordinate: &add_coord,
-            now_unix_seconds: evaluation_unix_seconds,
-            max_members: 10,
+    // ── 2-5. Seal the public commit chain through the production commit path ────
+    let mut link = SealedLink {
+        state: genesis_state,
+        snapshot_bytes: genesis_snapshot_bytes,
+        epoch: 0,
+        group_context_hash: genesis_group_context_hash,
+        confirmation_tag: genesis_confirmation_tag,
+    };
+    let chain = [
+        CommitLinkSpec {
+            label: "Add commit",
+            commit_file: "commit-public.mls",
+            aad_field: "commitAadSha256Hex",
+            group_context_hash_field: "committedGroupContextHashHex",
+            confirmation_tag_field: "committedConfirmationTagHex",
+            prior_state_version: 2,
+            next_state_version: 3,
+            next_epoch: 1,
+            snapshot_file: "committed-public-state.bin",
         },
-    )
-    .map_err(|e| fail(format!("process Add commit failed: {e}")))?;
-
-    let committed_state = processed_commit.into_next_state();
-    let committed_snapshot_bytes = encode_public_group_snapshot(&committed_state)
-        .map_err(|e| fail(format!("encode committed snapshot failed: {e}")))?;
-    let committed_binding = public_group_snapshot_binding(
-        &committed_state,
-        &committed_snapshot_bytes,
-        &add_coord,
-    )
-    .map_err(|e| fail(format!("bind committed snapshot failed: {e}")))?;
-
-    decode_public_group_snapshot(&committed_snapshot_bytes, &committed_binding)
-        .map_err(|e| fail(format!("decode committed snapshot failed: {e}")))?;
-
-    write_atomic(
-        &target_dir.join("committed-public-state.bin"),
-        &committed_snapshot_bytes,
-    )?;
-
-    // ── 3. Validate Generic Commit and write generic snapshot ───────────────────
-    let generic_commit_bytes = fs::read(target_dir.join("commit-generic-public.mls"))?;
-    let validated_generic_commit =
-        validate_public_commit(&generic_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-            .map_err(|e| fail(format!("validate generic commit failed: {e}")))?;
-
-    let generic_committed_group_context_hash = decode_hex_32(
-        manifest["chain"]["genericCommittedGroupContextHashHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing genericCommittedGroupContextHashHex"))?,
-        "genericCommittedGroupContextHash",
-    )?;
-    let generic_committed_confirmation_tag = decode_hex_32(
-        manifest["chain"]["genericCommittedConfirmationTagHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing genericCommittedConfirmationTagHex"))?,
-        "genericCommittedConfirmationTag",
-    )?;
-
-    let generic_next_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        4,
-        group_id,
-        2,
-        generic_committed_group_context_hash,
-        generic_committed_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-
-    let generic_commit_aad = validated_commit_aad(&validated_generic_commit, &manifest, "genericCommitAadSha256Hex")?;
-    let processed_generic = process_public_commit(
-        &committed_state,
-        validated_generic_commit,
-        PublicCommitValidationPolicy {
-            expected_aad: &generic_commit_aad,
-            trusted_prior_binding: &committed_binding,
-            expected_next_coordinate: &generic_next_coord,
-            now_unix_seconds: evaluation_unix_seconds,
-            max_members: 10,
+        CommitLinkSpec {
+            label: "generic commit",
+            commit_file: "commit-generic-public.mls",
+            aad_field: "genericCommitAadSha256Hex",
+            group_context_hash_field: "genericCommittedGroupContextHashHex",
+            confirmation_tag_field: "genericCommittedConfirmationTagHex",
+            prior_state_version: 3,
+            next_state_version: 4,
+            next_epoch: 2,
+            snapshot_file: "committed-generic-public-state.bin",
         },
-    )
-    .map_err(|e| fail(format!("process generic commit failed: {e}")))?;
-    let generic_committed_state = processed_generic.into_next_state();
-    let generic_snapshot_bytes = encode_public_group_snapshot(&generic_committed_state)
-        .map_err(|e| fail(format!("encode generic committed snapshot failed: {e}")))?;
-    let generic_binding = public_group_snapshot_binding(
-        &generic_committed_state,
-        &generic_snapshot_bytes,
-        &generic_next_coord,
-    )
-    .map_err(|e| fail(format!("bind generic committed snapshot failed: {e}")))?;
-
-    decode_public_group_snapshot(&generic_snapshot_bytes, &generic_binding)
-        .map_err(|e| fail(format!("decode generic committed snapshot failed: {e}")))?;
-
-    write_atomic(
-        &target_dir.join("committed-generic-public-state.bin"),
-        &generic_snapshot_bytes,
-    )?;
-
-    // ── 4. Validate Remove Commit and write remove snapshot ────────────────────
-    let remove_commit_bytes = fs::read(target_dir.join("commit-remove-public.mls"))?;
-    let validated_remove_commit =
-        validate_public_commit(&remove_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-            .map_err(|e| fail(format!("validate remove commit failed: {e}")))?;
-
-    let remove_committed_group_context_hash = decode_hex_32(
-        manifest["chain"]["removeCommittedGroupContextHashHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing removeCommittedGroupContextHashHex"))?,
-        "removeCommittedGroupContextHash",
-    )?;
-    let remove_committed_confirmation_tag = decode_hex_32(
-        manifest["chain"]["removeCommittedConfirmationTagHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing removeCommittedConfirmationTagHex"))?,
-        "removeCommittedConfirmationTag",
-    )?;
-
-    let remove_next_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        5,
-        group_id,
-        3,
-        remove_committed_group_context_hash,
-        remove_committed_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-
-    let remove_commit_aad = validated_commit_aad(&validated_remove_commit, &manifest, "removeCommitAadSha256Hex")?;
-    let processed_remove = process_public_commit(
-        &generic_committed_state,
-        validated_remove_commit,
-        PublicCommitValidationPolicy {
-            expected_aad: &remove_commit_aad,
-            trusted_prior_binding: &generic_binding,
-            expected_next_coordinate: &remove_next_coord,
-            now_unix_seconds: evaluation_unix_seconds,
-            max_members: 10,
+        CommitLinkSpec {
+            label: "remove commit",
+            commit_file: "commit-remove-public.mls",
+            aad_field: "removeCommitAadSha256Hex",
+            group_context_hash_field: "removeCommittedGroupContextHashHex",
+            confirmation_tag_field: "removeCommittedConfirmationTagHex",
+            prior_state_version: 4,
+            next_state_version: 5,
+            next_epoch: 3,
+            snapshot_file: "committed-remove-public-state.bin",
         },
-    )
-    .map_err(|e| fail(format!("process remove commit failed: {e}")))?;
-
-    let remove_committed_state = processed_remove.into_next_state();
-    let remove_snapshot_bytes = encode_public_group_snapshot(&remove_committed_state)
-        .map_err(|e| fail(format!("encode remove committed snapshot failed: {e}")))?;
-    let remove_binding = public_group_snapshot_binding(
-        &remove_committed_state,
-        &remove_snapshot_bytes,
-        &remove_next_coord,
-    )
-    .map_err(|e| fail(format!("bind remove committed snapshot failed: {e}")))?;
-
-    decode_public_group_snapshot(&remove_snapshot_bytes, &remove_binding)
-        .map_err(|e| fail(format!("decode remove committed snapshot failed: {e}")))?;
-
-    write_atomic(
-        &target_dir.join("committed-remove-public-state.bin"),
-        &remove_snapshot_bytes,
-    )?;
-
-    // ── 5. Validate Rejoin Commit and write rejoin snapshot ────────────────────
-    let rejoin_commit_bytes = fs::read(target_dir.join("commit-rejoin-public.mls"))?;
-    let validated_rejoin_commit =
-        validate_public_commit(&rejoin_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
-            .map_err(|e| fail(format!("validate rejoin commit failed: {e}")))?;
-
-    let rejoin_committed_group_context_hash = decode_hex_32(
-        manifest["chain"]["rejoinGroupContextHashHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing rejoinGroupContextHashHex"))?,
-        "rejoinGroupContextHash",
-    )?;
-    let rejoin_committed_confirmation_tag = decode_hex_32(
-        manifest["chain"]["rejoinConfirmationTagHex"]
-            .as_str()
-            .ok_or_else(|| fail("missing rejoinConfirmationTagHex"))?,
-        "rejoinConfirmationTag",
-    )?;
-
-    let rejoin_next_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        8,
-        group_id,
-        4,
-        rejoin_committed_group_context_hash,
-        rejoin_committed_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-
-    let rejoin_prior_coord = PublicGroupSnapshotCoordinate::new(
-        conversation_id,
-        0,
-        7,
-        group_id,
-        3,
-        remove_committed_group_context_hash,
-        remove_committed_confirmation_tag,
-        PublicGroupSnapshotLifecycle::Active,
-    );
-    let rejoin_prior_binding = public_group_snapshot_binding(
-        &remove_committed_state,
-        &remove_snapshot_bytes,
-        &rejoin_prior_coord,
-    )
-    .map_err(|e| fail(format!("bind rejoin prior snapshot failed: {e}")))?;
-
-    let rejoin_commit_aad = validated_commit_aad(&validated_rejoin_commit, &manifest, "rejoinCommitAadSha256Hex")?;
-    let processed_rejoin = process_public_commit(
-        &remove_committed_state,
-        validated_rejoin_commit,
-        PublicCommitValidationPolicy {
-            expected_aad: &rejoin_commit_aad,
-            trusted_prior_binding: &rejoin_prior_binding,
-            expected_next_coordinate: &rejoin_next_coord,
-            now_unix_seconds: evaluation_unix_seconds,
-            max_members: 10,
+        CommitLinkSpec {
+            label: "rejoin commit",
+            commit_file: "commit-rejoin-public.mls",
+            aad_field: "rejoinCommitAadSha256Hex",
+            group_context_hash_field: "rejoinGroupContextHashHex",
+            confirmation_tag_field: "rejoinConfirmationTagHex",
+            prior_state_version: 7,
+            next_state_version: 8,
+            next_epoch: 4,
+            snapshot_file: "committed-rejoin-public-state.bin",
         },
-    )
-    .map_err(|e| fail(format!("process rejoin commit failed: {e}")))?;
-
-    let rejoin_committed_state = processed_rejoin.into_next_state();
-    let rejoin_snapshot_bytes = encode_public_group_snapshot(&rejoin_committed_state)
-        .map_err(|e| fail(format!("encode rejoin committed snapshot failed: {e}")))?;
-    let rejoin_binding = public_group_snapshot_binding(
-        &rejoin_committed_state,
-        &rejoin_snapshot_bytes,
-        &rejoin_next_coord,
-    )
-    .map_err(|e| fail(format!("bind rejoin committed snapshot failed: {e}")))?;
-
-    decode_public_group_snapshot(&rejoin_snapshot_bytes, &rejoin_binding)
-        .map_err(|e| fail(format!("decode rejoin committed snapshot failed: {e}")))?;
-
-    write_atomic(
-        &target_dir.join("committed-rejoin-public-state.bin"),
-        &rejoin_snapshot_bytes,
-    )?;
+    ];
+    for spec in &chain {
+        link = seal_commit_link(
+            &target_dir,
+            &manifest,
+            conversation_id,
+            group_id,
+            evaluation_unix_seconds,
+            &link,
+            spec,
+        )?;
+    }
 
     // ── 6. Assemble complete file inventory and manifest ────────────────────────
     let expected_keys = expected_public_snapshot_keys(&group_id)?;
@@ -499,23 +396,98 @@ fn main() -> Result<()> {
         ("key-package-inner.tls", "innerKeyPackageTls", None, None),
         ("key-package-ref.bin", "rfc9420KeyPackageRef", None, None),
         ("group-info.mls", "mlsMessageGroupInfo", Some(4), Some(0)),
-        ("commit-public.mls", "mlsMessagePublicCommit", Some(1), Some(0)),
+        (
+            "commit-public.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
+            Some(0),
+        ),
         ("welcome.mls", "mlsMessageWelcome", Some(3), Some(1)),
-        ("application-frame.cbor", "canonicalDagCborApplicationFrame", None, Some(1)),
-        ("application-private.mls", "mlsMessagePrivateApplication", Some(2), Some(1)),
-        ("genesis-public-state.bin", "publicGroupSnapshot", None, Some(0)),
-        ("committed-public-state.bin", "publicGroupSnapshot", None, Some(1)),
-        ("commit-generic-public.mls", "mlsMessagePublicCommit", Some(1), Some(1)),
-        ("committed-generic-public-state.bin", "publicGroupSnapshot", None, Some(2)),
-        ("commit-remove-public.mls", "mlsMessagePublicCommit", Some(1), Some(2)),
-        ("committed-remove-public-state.bin", "publicGroupSnapshot", None, Some(3)),
-        ("rejoin-key-package.mls", "mlsMessageKeyPackage", Some(5), None),
-        ("rejoin-key-package-inner.tls", "innerKeyPackageTls", None, None),
-        ("rejoin-key-package-ref.bin", "rfc9420KeyPackageRef", None, None),
-        ("commit-rejoin-public.mls", "mlsMessagePublicCommit", Some(1), Some(3)),
+        (
+            "application-frame.cbor",
+            "canonicalDagCborApplicationFrame",
+            None,
+            Some(1),
+        ),
+        (
+            "application-private.mls",
+            "mlsMessagePrivateApplication",
+            Some(2),
+            Some(1),
+        ),
+        (
+            "genesis-public-state.bin",
+            "publicGroupSnapshot",
+            None,
+            Some(0),
+        ),
+        (
+            "committed-public-state.bin",
+            "publicGroupSnapshot",
+            None,
+            Some(1),
+        ),
+        (
+            "commit-generic-public.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
+            Some(1),
+        ),
+        (
+            "committed-generic-public-state.bin",
+            "publicGroupSnapshot",
+            None,
+            Some(2),
+        ),
+        (
+            "commit-remove-public.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
+            Some(2),
+        ),
+        (
+            "committed-remove-public-state.bin",
+            "publicGroupSnapshot",
+            None,
+            Some(3),
+        ),
+        (
+            "rejoin-key-package.mls",
+            "mlsMessageKeyPackage",
+            Some(5),
+            None,
+        ),
+        (
+            "rejoin-key-package-inner.tls",
+            "innerKeyPackageTls",
+            None,
+            None,
+        ),
+        (
+            "rejoin-key-package-ref.bin",
+            "rfc9420KeyPackageRef",
+            None,
+            None,
+        ),
+        (
+            "commit-rejoin-public.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
+            Some(3),
+        ),
         ("rejoin-welcome.mls", "mlsMessageWelcome", Some(3), Some(4)),
-        ("committed-rejoin-public-state.bin", "publicGroupSnapshot", None, Some(4)),
-        ("creation-signed-request.cbor", "canonicalDagCborSignedCreation", None, Some(0)),
+        (
+            "committed-rejoin-public-state.bin",
+            "publicGroupSnapshot",
+            None,
+            Some(4),
+        ),
+        (
+            "creation-signed-request.cbor",
+            "canonicalDagCborSignedCreation",
+            None,
+            Some(0),
+        ),
     ];
 
     let mut file_manifest = Map::new();
@@ -542,10 +514,8 @@ fn main() -> Result<()> {
     manifest["publicSnapshots"] = public_snapshots_profile;
     manifest["files"] = Value::Object(file_manifest);
 
-    // Remove candidate-manifest.json if present
-    if candidate_manifest_path.exists() {
-        let _ = fs::remove_file(&candidate_manifest_path);
-    }
+    // Consumed: the sealed manifest.json replaces the candidate.
+    let _ = fs::remove_file(&candidate_manifest_path);
 
     let mut final_manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     final_manifest_bytes.push(b'\n');
