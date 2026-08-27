@@ -14,12 +14,15 @@ use catbird_server::chat_protocol::wire::{
     PublicCommitValidationPolicy, MAX_GROUP_INFO_WIRE_BYTES, MAX_PUBLIC_MESSAGE_WIRE_BYTES,
 };
 use openmls::prelude::*;
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const EXPECTED_FORK_REVISION: &str = "3ea192fc346663fba5db63aa8c90ccc3ae49f12b";
 
 #[derive(Debug)]
 struct SealerError(String);
@@ -96,9 +99,120 @@ fn expected_public_snapshot_keys(group_id: &[u8; 32]) -> Result<Vec<String>> {
     }
     Ok(keys)
 }
-/// One sealed link of the public commit chain: the reconstructed state, its
-/// authoritative schema-2 snapshot bytes, and the coordinate material a
-/// successor commit must be bound against.
+
+fn lock_string_field(block: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field} = \"");
+    block.lines().find_map(|line| {
+        let rest = line.strip_prefix(&prefix)?;
+        Some(rest.strip_suffix('"')?.to_owned())
+    })
+}
+
+fn verify_server_fork_lock(lock_path: &Path) -> Result<(String, String)> {
+    let lock_text = fs::read_to_string(lock_path)?;
+    for block in lock_text.split("[[package]]").skip(1) {
+        if lock_string_field(block, "name").as_deref() == Some("openmls") {
+            let source = lock_string_field(block, "source")
+                .ok_or_else(|| fail("server Cargo.lock openmls package has no source"))?;
+            let version = lock_string_field(block, "version")
+                .ok_or_else(|| fail("server Cargo.lock openmls package has no version"))?;
+            ensure(
+                source.starts_with("git+https://github.com/joshlacal/openmls")
+                    || source.starts_with("git+https://github.com/openmls/openmls"),
+                format!("openmls source must be git, got {source}"),
+            )?;
+            ensure(
+                source.contains(EXPECTED_FORK_REVISION),
+                format!("openmls fork revision in server Cargo.lock must match {EXPECTED_FORK_REVISION}, got {source}"),
+            )?;
+            ensure(
+                lock_string_field(block, "checksum").is_none(),
+                "openmls git package must not have a checksum",
+            )?;
+            return Ok((source, version));
+        }
+    }
+    Err(fail("openmls package not found in server Cargo.lock"))
+}
+
+macro_rules! creation_fixed_bytes {
+    ($module:ident, $length:expr) => {
+        mod $module {
+            use serde::Serializer;
+            pub fn serialize<S>(bytes: &[u8; $length], serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_bytes(bytes)
+            }
+        }
+    };
+}
+creation_fixed_bytes!(cbytes16, 16);
+creation_fixed_bytes!(cbytes32, 32);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PriorConversationContext<'a> {
+    #[serde(with = "cbytes16")]
+    conversation_id: [u8; 16],
+    generation: u64,
+    state_version: u64,
+    #[serde(with = "cbytes32")]
+    group_id: [u8; 32],
+    epoch: u64,
+    #[serde(with = "cbytes32")]
+    group_context_hash: [u8; 32],
+    #[serde(with = "cbytes32")]
+    confirmation_tag: [u8; 32],
+    lifecycle: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitAad<'a> {
+    protocol_version: &'static str,
+    #[serde(with = "cbytes16")]
+    conversation_id: [u8; 16],
+    generation: u64,
+    #[serde(with = "cbytes16")]
+    transition_id: [u8; 16],
+    prior: PriorConversationContext<'a>,
+}
+#[allow(clippy::too_many_arguments)]
+fn derive_expected_commit_aad(
+    conversation_id: [u8; 16],
+    generation: u64,
+    transition_id: [u8; 16],
+    prior_state_version: u64,
+    group_id: [u8; 32],
+    prior_epoch: u64,
+    prior_group_context_hash: [u8; 32],
+    prior_confirmation_tag: [u8; 32],
+) -> Result<Vec<u8>> {
+    let aad_body = CommitAad {
+        protocol_version: "1",
+        conversation_id,
+        generation,
+        transition_id,
+        prior: PriorConversationContext {
+            conversation_id,
+            generation,
+            state_version: prior_state_version,
+            group_id,
+            epoch: prior_epoch,
+            group_context_hash: prior_group_context_hash,
+            confirmation_tag: prior_confirmation_tag,
+            lifecycle: "active",
+        },
+    };
+    let cbor = serde_ipld_dagcbor::to_vec(&aad_body)?;
+    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".len() + cbor.len());
+    out.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0");
+    out.extend_from_slice(&cbor);
+    Ok(out)
+}
+
 struct SealedLink {
     state: PublicGroupState,
     snapshot_bytes: Vec<u8>,
@@ -107,13 +221,10 @@ struct SealedLink {
     confirmation_tag: [u8; 32],
 }
 
-/// Per-link constants: which candidate file to seal, which manifest `chain`
-/// fields carry its expected coordinates, and the state versions the prior and
-/// successor snapshots are bound at.
 struct CommitLinkSpec<'a> {
     label: &'a str,
     commit_file: &'a str,
-    aad_field: &'a str,
+    transition_id_field: &'a str,
     group_context_hash_field: &'a str,
     confirmation_tag_field: &'a str,
     prior_state_version: u64,
@@ -122,9 +233,6 @@ struct CommitLinkSpec<'a> {
     snapshot_file: &'a str,
 }
 
-/// Validate one public commit against `prior`, process it through the production
-/// server commit path, then encode, bind, verify, and write its authoritative
-/// schema-2 successor snapshot.
 fn seal_commit_link(
     target_dir: &Path,
     manifest: &Value,
@@ -138,6 +246,29 @@ fn seal_commit_link(
     let commit_bytes = fs::read(target_dir.join(spec.commit_file))?;
     let validated = validate_public_commit(&commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
         .map_err(|e| fail(format!("validate {label} failed: {e}")))?;
+
+    let transition_id = decode_hex_16(
+        manifest["identifiers"][spec.transition_id_field]
+            .as_str()
+            .ok_or_else(|| fail(format!("missing {}", spec.transition_id_field)))?,
+        spec.transition_id_field,
+    )?;
+
+    // Independently derive expected AAD from authoritative fields
+    let expected_aad = derive_expected_commit_aad(
+        conversation_id,
+        0,
+        transition_id,
+        spec.prior_state_version,
+        group_id,
+        prior.epoch,
+        prior.group_context_hash,
+        prior.confirmation_tag,
+    )?;
+    ensure(
+        validated.aad() == expected_aad.as_slice(),
+        format!("commit AAD mismatch for {label}"),
+    )?;
 
     let group_context_hash = decode_hex_32(
         manifest["chain"][spec.group_context_hash_field]
@@ -176,12 +307,11 @@ fn seal_commit_link(
         public_group_snapshot_binding(&prior.state, &prior.snapshot_bytes, &prior_coordinate)
             .map_err(|e| fail(format!("bind {label} prior snapshot failed: {e}")))?;
 
-    let aad = validated_commit_aad(&validated, manifest, spec.aad_field)?;
     let processed = process_public_commit(
         &prior.state,
         validated,
         PublicCommitValidationPolicy {
-            expected_aad: &aad,
+            expected_aad: &expected_aad,
             trusted_prior_binding: &prior_binding,
             expected_next_coordinate: &next_coordinate,
             now_unix_seconds: evaluation_unix_seconds,
@@ -241,6 +371,11 @@ fn main() -> Result<()> {
     )?;
     let mut manifest: Value = serde_json::from_slice(&fs::read(&candidate_manifest_path)?)?;
 
+    let server_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mls_ds_root = server_manifest_dir
+        .parent()
+        .ok_or_else(|| fail("server has no parent"))?;
+    let (fork_source, fork_version) = verify_server_fork_lock(&mls_ds_root.join("Cargo.lock"))?;
     let evaluation_unix_seconds = manifest["evaluationUnixSeconds"]
         .as_u64()
         .ok_or_else(|| fail("invalid evaluationUnixSeconds"))?;
@@ -317,63 +452,104 @@ fn main() -> Result<()> {
         group_context_hash: genesis_group_context_hash,
         confirmation_tag: genesis_confirmation_tag,
     };
-    let chain = [
-        CommitLinkSpec {
-            label: "Add commit",
-            commit_file: "commit-public.mls",
-            aad_field: "commitAadSha256Hex",
-            group_context_hash_field: "committedGroupContextHashHex",
-            confirmation_tag_field: "committedConfirmationTagHex",
-            prior_state_version: 2,
-            next_state_version: 3,
-            next_epoch: 1,
-            snapshot_file: "committed-public-state.bin",
-        },
-        CommitLinkSpec {
-            label: "generic commit",
-            commit_file: "commit-generic-public.mls",
-            aad_field: "genericCommitAadSha256Hex",
-            group_context_hash_field: "genericCommittedGroupContextHashHex",
-            confirmation_tag_field: "genericCommittedConfirmationTagHex",
-            prior_state_version: 3,
-            next_state_version: 4,
-            next_epoch: 2,
-            snapshot_file: "committed-generic-public-state.bin",
-        },
-        CommitLinkSpec {
-            label: "remove commit",
-            commit_file: "commit-remove-public.mls",
-            aad_field: "removeCommitAadSha256Hex",
-            group_context_hash_field: "removeCommittedGroupContextHashHex",
-            confirmation_tag_field: "removeCommittedConfirmationTagHex",
-            prior_state_version: 4,
-            next_state_version: 5,
-            next_epoch: 3,
-            snapshot_file: "committed-remove-public-state.bin",
-        },
-        CommitLinkSpec {
-            label: "rejoin commit",
-            commit_file: "commit-rejoin-public.mls",
-            aad_field: "rejoinCommitAadSha256Hex",
-            group_context_hash_field: "rejoinGroupContextHashHex",
-            confirmation_tag_field: "rejoinConfirmationTagHex",
-            prior_state_version: 7,
-            next_state_version: 8,
-            next_epoch: 4,
-            snapshot_file: "committed-rejoin-public-state.bin",
-        },
-    ];
-    for spec in &chain {
-        link = seal_commit_link(
-            &target_dir,
-            &manifest,
-            conversation_id,
-            group_id,
-            evaluation_unix_seconds,
-            &link,
-            spec,
-        )?;
-    }
+
+    // Add commit: 2 -> 3 (epoch 0 -> 1)
+    let add_spec = CommitLinkSpec {
+        label: "Add commit",
+        commit_file: "commit-public.mls",
+        transition_id_field: "transitionIdHex",
+        group_context_hash_field: "committedGroupContextHashHex",
+        confirmation_tag_field: "committedConfirmationTagHex",
+        prior_state_version: 2,
+        next_state_version: 3,
+        next_epoch: 1,
+        snapshot_file: "committed-public-state.bin",
+    };
+    link = seal_commit_link(
+        &target_dir,
+        &manifest,
+        conversation_id,
+        group_id,
+        evaluation_unix_seconds,
+        &link,
+        &add_spec,
+    )?;
+
+    // Generic commit: 3 -> 4 (epoch 1 -> 2)
+    let generic_spec = CommitLinkSpec {
+        label: "generic commit",
+        commit_file: "commit-generic-public.mls",
+        transition_id_field: "genericTransitionIdHex",
+        group_context_hash_field: "genericCommittedGroupContextHashHex",
+        confirmation_tag_field: "genericCommittedConfirmationTagHex",
+        prior_state_version: 3,
+        next_state_version: 4,
+        next_epoch: 2,
+        snapshot_file: "committed-generic-public-state.bin",
+    };
+    link = seal_commit_link(
+        &target_dir,
+        &manifest,
+        conversation_id,
+        group_id,
+        evaluation_unix_seconds,
+        &link,
+        &generic_spec,
+    )?;
+
+    // Prove server rejection expectation for metadata AppData commit
+    let appdata_commit_bytes = fs::read(target_dir.join("commit-metadata-appdata-public.mls"))?;
+    let appdata_validation_res =
+        validate_public_commit(&appdata_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES);
+    ensure(
+        appdata_validation_res.is_err(),
+        "server must reject metadata AppData commit under Add/Remove-only constraint",
+    )?;
+
+    // Remove commit: 4 -> 5 (epoch 2 -> 3)
+    let remove_spec = CommitLinkSpec {
+        label: "remove commit",
+        commit_file: "commit-remove-public.mls",
+        transition_id_field: "leaveFulfillmentTransitionIdHex",
+        group_context_hash_field: "removeCommittedGroupContextHashHex",
+        confirmation_tag_field: "removeCommittedConfirmationTagHex",
+        prior_state_version: 4,
+        next_state_version: 5,
+        next_epoch: 3,
+        snapshot_file: "committed-remove-public-state.bin",
+    };
+    link = seal_commit_link(
+        &target_dir,
+        &manifest,
+        conversation_id,
+        group_id,
+        evaluation_unix_seconds,
+        &link,
+        &remove_spec,
+    )?;
+
+    // Rejoin commit: prior state version 7 -> next state version 8 (epoch 3 -> 4)
+    // Bind prior at stateVersion 7 (preserving epoch 3 public state)
+    let rejoin_spec = CommitLinkSpec {
+        label: "rejoin commit",
+        commit_file: "commit-rejoin-public.mls",
+        transition_id_field: "rejoinTransitionIdHex",
+        group_context_hash_field: "rejoinGroupContextHashHex",
+        confirmation_tag_field: "rejoinConfirmationTagHex",
+        prior_state_version: 7,
+        next_state_version: 8,
+        next_epoch: 4,
+        snapshot_file: "committed-rejoin-public-state.bin",
+    };
+    let _rejoin_link = seal_commit_link(
+        &target_dir,
+        &manifest,
+        conversation_id,
+        group_id,
+        evaluation_unix_seconds,
+        &link,
+        &rejoin_spec,
+    )?;
 
     // ── 6. Assemble complete file inventory and manifest ────────────────────────
     let expected_keys = expected_public_snapshot_keys(&group_id)?;
@@ -391,7 +567,7 @@ fn main() -> Result<()> {
         "containsSecrets": false
     });
 
-    let payload_files: [(&str, &'static str, Option<u16>, Option<u64>); 21] = [
+    let payload_files: [(&str, &'static str, Option<u16>, Option<u64>); 23] = [
         ("key-package.mls", "mlsMessageKeyPackage", Some(5), None),
         ("key-package-inner.tls", "innerKeyPackageTls", None, None),
         ("key-package-ref.bin", "rfc9420KeyPackageRef", None, None),
@@ -437,6 +613,18 @@ fn main() -> Result<()> {
             "committed-generic-public-state.bin",
             "publicGroupSnapshot",
             None,
+            Some(2),
+        ),
+        (
+            "commit-metadata-appdata-public.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
+            Some(2),
+        ),
+        (
+            "own-pending-commit.mls",
+            "mlsMessagePublicCommit",
+            Some(1),
             Some(2),
         ),
         (
@@ -502,6 +690,10 @@ fn main() -> Result<()> {
         record.insert("length".into(), json!(bytes.len()));
         record.insert("sha256Hex".into(), json!(sha256_hex(&bytes)));
         record.insert("kind".into(), json!(kind));
+        if filename == "commit-metadata-appdata-public.mls" {
+            record.insert("serverRejectionExpected".into(), json!(true));
+            record.insert("serverRejectionReason".into(), json!("ProposalNotAllowed"));
+        }
         if let Some(wf) = wire_format {
             record.insert("wireFormat".into(), json!(wf));
         }
@@ -511,32 +703,48 @@ fn main() -> Result<()> {
         file_manifest.insert(filename.to_owned(), Value::Object(record));
     }
 
+    // Sealer and server provenance
+    let sealer_source = server_manifest_dir.join("examples/seal_mls_chat_crypto_wire_v09.rs");
+    let sealer_source_sha256 = sha256_hex(&fs::read(&sealer_source)?);
+    let server_cargo_manifest_sha256 =
+        sha256_hex(&fs::read(server_manifest_dir.join("Cargo.toml"))?);
+    let server_cargo_lock_sha256 = sha256_hex(&fs::read(mls_ds_root.join("Cargo.lock"))?);
+    let mut server_snapshot_wire_hasher = Sha256::new();
+    for rel_path in ["src/chat_protocol/snapshot.rs", "src/chat_protocol/wire.rs"] {
+        let path = server_manifest_dir.join(rel_path);
+        let bytes = fs::read(&path)?;
+        server_snapshot_wire_hasher.update(rel_path.as_bytes());
+        server_snapshot_wire_hasher.update([0u8]);
+        server_snapshot_wire_hasher.update((bytes.len() as u64).to_be_bytes());
+        server_snapshot_wire_hasher.update(&bytes);
+    }
+    let server_snapshot_wire_source_sha256 = hex::encode(server_snapshot_wire_hasher.finalize());
+
+    manifest["sealer"] = json!({
+        "source": "mls-ds/server/examples/seal_mls_chat_crypto_wire_v09.rs",
+        "sourceSha256Hex": sealer_source_sha256,
+        "serverCargoManifestSha256Hex": server_cargo_manifest_sha256,
+        "serverCargoLockSha256Hex": server_cargo_lock_sha256,
+        "serverSnapshotWireSourceSha256Hex": server_snapshot_wire_source_sha256,
+        "openmlsForkSource": fork_source,
+        "openmlsForkVersion": fork_version,
+        "openmlsForkRevision": EXPECTED_FORK_REVISION,
+    });
+
     manifest["publicSnapshots"] = public_snapshots_profile;
     manifest["files"] = Value::Object(file_manifest);
 
-    // Consumed: the sealed manifest.json replaces the candidate.
-    let _ = fs::remove_file(&candidate_manifest_path);
+    // Fail-closed remove candidate manifest
+    fs::remove_file(&candidate_manifest_path)?;
+    ensure(
+        !candidate_manifest_path.exists(),
+        "candidate-manifest.json must not remain after sealing",
+    )?;
 
     let mut final_manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     final_manifest_bytes.push(b'\n');
     write_atomic(&target_dir.join("manifest.json"), &final_manifest_bytes)?;
 
-    println!("Sealed 21 payload files + manifest.json successfully!");
+    println!("Sealed 23 payload files + manifest.json successfully!");
     Ok(())
-}
-
-fn validated_commit_aad(
-    commit: &catbird_server::chat_protocol::wire::ValidatedPublicCommit,
-    manifest: &Value,
-    sha_field: &str,
-) -> Result<Vec<u8>> {
-    let expected_sha = manifest["chain"][sha_field]
-        .as_str()
-        .ok_or_else(|| fail(format!("missing {sha_field}")))?;
-    let actual_sha = sha256_hex(commit.aad());
-    ensure(
-        actual_sha == expected_sha,
-        format!("AAD sha256 mismatch for {sha_field}: {actual_sha} != {expected_sha}"),
-    )?;
-    Ok(commit.aad().to_vec())
 }

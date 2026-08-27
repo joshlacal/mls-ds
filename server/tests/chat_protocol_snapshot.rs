@@ -2,10 +2,10 @@ use std::{fs, path::PathBuf};
 
 use catbird_server::chat_protocol::snapshot::{
     decode_public_group_snapshot, encode_public_group_snapshot, public_group_snapshot_binding,
-    public_group_snapshot_sha256, PublicGroupSnapshotBinding, PublicGroupSnapshotError,
-    PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle, PublicGroupSnapshotTreeSummary,
-    MAX_PROTOCOL_INTEGER, MAX_PUBLIC_GROUP_SNAPSHOT_BYTES, MAX_SNAPSHOT_KEY_BYTES,
-    MAX_SNAPSHOT_VALUE_BYTES,
+    public_group_snapshot_sha256, PublicGroupSnapshotBinding, PublicGroupSnapshotCoordinate,
+    PublicGroupSnapshotError, PublicGroupSnapshotLeaf, PublicGroupSnapshotLifecycle,
+    PublicGroupSnapshotTreeSummary, MAX_PROTOCOL_INTEGER, MAX_PUBLIC_GROUP_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_KEY_BYTES, MAX_SNAPSHOT_VALUE_BYTES,
 };
 use openmls::prelude::{
     tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, Ciphersuite,
@@ -448,7 +448,13 @@ fn frozen_public_group_snapshots_load_and_round_trip_canonically() {
     }
 
     // Historical schema-1 / OpenMLS 0.8.1 snapshots must be strictly rejected
-    for legacy_filename in ["genesis-public-state.bin", "committed-public-state.bin"] {
+    for legacy_filename in [
+        "genesis-public-state.bin",
+        "committed-public-state.bin",
+        "committed-generic-public-state.bin",
+        "committed-remove-public-state.bin",
+        "committed-rejoin-public-state.bin",
+    ] {
         let legacy_bytes = corpus_file(legacy_filename);
         let dummy_binding = PublicGroupSnapshotBinding::new(
             trusted_conversation_id(),
@@ -468,6 +474,85 @@ fn frozen_public_group_snapshots_load_and_round_trip_canonically() {
             err,
             PublicGroupSnapshotError::UnsupportedSchema { actual: 1 }
         );
+    }
+}
+
+#[test]
+fn schema2_crypto_wire_v09_snapshots_decode_and_validate() {
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/crypto-wire-v09/manifest.json");
+    assert!(
+        manifest_path.is_file(),
+        "missing v09 manifest: {}",
+        manifest_path.display()
+    );
+    let manifest_bytes = fs::read(&manifest_path).expect("read v09 manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("parse v09 manifest");
+    let conversation_id = hex_array::<16>(
+        manifest["identifiers"]["conversationIdHex"]
+            .as_str()
+            .unwrap(),
+    );
+    let group_id = hex_array::<32>(manifest["chain"]["groupIdHex"].as_str().unwrap());
+
+    for (filename, sv, ep, gch_key, tag_key) in [
+        (
+            "genesis-public-state.bin",
+            0u64,
+            0u64,
+            "genesisGroupContextHashHex",
+            "genesisConfirmationTagHex",
+        ),
+        (
+            "committed-public-state.bin",
+            3u64,
+            1u64,
+            "committedGroupContextHashHex",
+            "committedConfirmationTagHex",
+        ),
+        (
+            "committed-generic-public-state.bin",
+            4u64,
+            2u64,
+            "genericCommittedGroupContextHashHex",
+            "genericCommittedConfirmationTagHex",
+        ),
+        (
+            "committed-remove-public-state.bin",
+            5u64,
+            3u64,
+            "removeCommittedGroupContextHashHex",
+            "removeCommittedConfirmationTagHex",
+        ),
+        (
+            "committed-rejoin-public-state.bin",
+            8u64,
+            4u64,
+            "rejoinGroupContextHashHex",
+            "rejoinConfirmationTagHex",
+        ),
+    ] {
+        let snapshot_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/crypto-wire-v09")
+            .join(filename);
+        let snapshot_bytes = fs::read(&snapshot_path).expect("read snapshot");
+        let gch = hex_array::<32>(manifest["chain"][gch_key].as_str().unwrap());
+        let tag = hex_array::<32>(manifest["chain"][tag_key].as_str().unwrap());
+        let _coordinate = PublicGroupSnapshotCoordinate::new(
+            conversation_id,
+            0,
+            sv,
+            group_id,
+            ep,
+            gch,
+            tag,
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let raw = parse_valid_snapshot(&snapshot_bytes);
+        assert_eq!(raw.schema, 2);
+        assert_eq!(raw.openmls_version, OPENMLS_VERSION);
+        assert_eq!(raw.storage_version, STORAGE_VERSION);
     }
 }
 

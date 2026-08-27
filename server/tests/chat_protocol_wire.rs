@@ -3482,7 +3482,6 @@ fn public_commit_and_private_application_reject_wrong_content_types() {
 }
 
 #[test]
-#[test]
 fn public_commit_rejects_out_of_range_member_sender_index() {
     let fixture = coherent_wire_fixture();
     let prior = validate_group_info(&fixture.genesis_group_info, group_info_policy(&fixture))
@@ -4004,4 +4003,123 @@ fn test_absence_of_catbird_skip_callsites() {
             );
         }
     }
+}
+
+#[test]
+fn sealed_crypto_wire_v09_corpus_consumer_validation() {
+    use std::fs;
+    let fixture_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09");
+    assert!(
+        fixture_dir.is_dir(),
+        "missing v09 fixture dir: {}",
+        fixture_dir.display()
+    );
+    let manifest_bytes = fs::read(fixture_dir.join("manifest.json")).expect("read v09 manifest");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("parse manifest");
+
+    let eval_seconds = manifest["evaluationUnixSeconds"].as_u64().unwrap();
+    let alice_cred = manifest["identity"]["alice"]["credentialIdentity"]
+        .as_str()
+        .unwrap()
+        .as_bytes();
+    let alice_pub = hex::decode(
+        manifest["identity"]["alice"]["signaturePublicKeyHex"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let bob_cred = manifest["identity"]["bob"]["credentialIdentity"]
+        .as_str()
+        .unwrap()
+        .as_bytes();
+    let bob_pub = hex::decode(
+        manifest["identity"]["bob"]["signaturePublicKeyHex"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+
+    // 1. KeyPackage validation
+    let kp_bytes = fs::read(fixture_dir.join("key-package.mls")).unwrap();
+    let _ = validate_key_package(
+        &kp_bytes,
+        KeyPackageValidationPolicy {
+            expected_basic_credential: bob_cred,
+            expected_signature_key: &bob_pub,
+            now_unix_seconds: eval_seconds,
+            max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+        },
+    )
+    .expect("validate_key_package failed");
+
+    // 2. GroupInfo validation
+    let gi_bytes = fs::read(fixture_dir.join("group-info.mls")).unwrap();
+    let _ = validate_group_info(
+        &gi_bytes,
+        GroupInfoValidationPolicy {
+            expected_basic_credential: alice_cred,
+            expected_signature_key: &alice_pub,
+            now_unix_seconds: eval_seconds,
+            max_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+            max_ratchet_tree_bytes: 786_432,
+            max_members: 1,
+        },
+    )
+    .expect("validate_group_info failed");
+
+    // 3. Welcome validation
+    let welcome_bytes = fs::read(fixture_dir.join("welcome.mls")).unwrap();
+    let validated_welcome =
+        validate_welcome(&welcome_bytes, MAX_WELCOME_WIRE_BYTES).expect("validate_welcome failed");
+    assert_eq!(validated_welcome.key_package_refs().len(), 1);
+
+    // 4. Private application validation
+    let app_bytes = fs::read(fixture_dir.join("application-private.mls")).unwrap();
+    let validated_app = validate_private_application(&app_bytes, MAX_PRIVATE_MESSAGE_WIRE_BYTES)
+        .expect("validate_private_application failed");
+    assert_eq!(validated_app.epoch(), 1);
+
+    // 5. Public Add commit validation
+    let add_commit_bytes = fs::read(fixture_dir.join("commit-public.mls")).unwrap();
+    let validated_add = validate_public_commit(&add_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+        .expect("validate_public_commit Add failed");
+    assert_eq!(validated_add.epoch(), 0);
+
+    // 6. Server rejection of metadata AppData commit
+    let appdata_commit_bytes =
+        fs::read(fixture_dir.join("commit-metadata-appdata-public.mls")).unwrap();
+    let appdata_err = validate_public_commit(&appdata_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+        .expect_err("metadata AppData commit must be rejected by server");
+    assert!(matches!(
+        appdata_err,
+        WireValidationError::Truncated
+            | WireValidationError::Malformed
+            | WireValidationError::UnsupportedCommitProposal
+    ));
+
+    // 7. Remove commit validation
+    let remove_commit_bytes = fs::read(fixture_dir.join("commit-remove-public.mls")).unwrap();
+    let validated_remove =
+        validate_public_commit(&remove_commit_bytes, MAX_PUBLIC_MESSAGE_WIRE_BYTES)
+            .expect("validate_public_commit Remove failed");
+    assert_eq!(validated_remove.epoch(), 2);
+
+    // 8. Rejoin KeyPackage and Welcome validation
+    let rejoin_kp_bytes = fs::read(fixture_dir.join("rejoin-key-package.mls")).unwrap();
+    let _ = validate_key_package(
+        &rejoin_kp_bytes,
+        KeyPackageValidationPolicy {
+            expected_basic_credential: bob_cred,
+            expected_signature_key: &bob_pub,
+            now_unix_seconds: eval_seconds,
+            max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+        },
+    )
+    .expect("validate rejoin key package failed");
+
+    let rejoin_welcome_bytes = fs::read(fixture_dir.join("rejoin-welcome.mls")).unwrap();
+    let _ = validate_welcome(&rejoin_welcome_bytes, MAX_WELCOME_WIRE_BYTES)
+        .expect("validate rejoin welcome failed");
 }
