@@ -77,15 +77,11 @@ fn active_handlers_arbitrate_deferred_admission_and_never_render_unvalidated_byt
 
     for file in [
         "../src/handlers/chat/enroll_device.rs",
-        "../src/handlers/chat/rebind_device_authentication.rs",
         "../src/handlers/chat/replenish_key_packages.rs",
     ] {
         let handler = match file {
             "../src/handlers/chat/enroll_device.rs" => {
                 include_str!("../src/handlers/chat/enroll_device.rs")
-            }
-            "../src/handlers/chat/rebind_device_authentication.rs" => {
-                include_str!("../src/handlers/chat/rebind_device_authentication.rs")
             }
             _ => include_str!("../src/handlers/chat/replenish_key_packages.rs"),
         };
@@ -135,7 +131,6 @@ fn endpoint_preparation_never_exposes_raw_verified_or_replay_authority_to_handle
 
     for handler in [
         include_str!("../src/handlers/chat/enroll_device.rs"),
-        include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
         include_str!("../src/handlers/chat/replenish_key_packages.rs"),
     ] {
         assert!(!handler.contains("VerifiedChatDeviceRequest"));

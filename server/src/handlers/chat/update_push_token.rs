@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::device_directory::{
@@ -65,8 +66,13 @@ async fn update_push_token(
             ));
         }
     }
+    let target_device_id = headers
+        .get("x-catbird-chat-device-id")
+        .or_else(|| headers.get("x-catbird-device-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok());
 
-    let view = update_device_push_token(pool, principal.did(), parsed.token.as_deref())
+    let view = update_device_push_token(pool, principal.did(), parsed.token.as_deref(), target_device_id)
         .await
         .map_err(|err| match err {
             UpdatePushTokenRepositoryError::DeviceNotRegistered => {

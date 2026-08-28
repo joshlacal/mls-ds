@@ -298,12 +298,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             "complete_enrollment_bootstrap_operation",
         ),
         (
-            include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
-            "admit_rebind_operation_only",
-            "prepare_rebind_operation",
-            "complete_rebind_bootstrap_operation",
-        ),
-        (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
             "admit_replenishment_operation_only",
             "prepare_replenishment_operation",

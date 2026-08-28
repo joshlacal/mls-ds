@@ -364,11 +364,6 @@ fn completeness_activation_drains_writers_and_preserves_only_bounded_legacy_orph
             "prelude::complete_enrollment_bootstrap_operation",
         ),
         (
-            "rebind_device_authentication.rs",
-            "prelude::prepare_rebind_operation",
-            "prelude::complete_rebind_bootstrap_operation",
-        ),
-        (
             "replenish_key_packages.rs",
             "prelude::prepare_replenishment_operation",
             "prelude::complete_replenishment_operation",

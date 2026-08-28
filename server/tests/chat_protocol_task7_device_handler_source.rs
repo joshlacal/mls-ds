@@ -14,13 +14,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             "complete_enrollment_bootstrap_operation",
         ),
         (
-            include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
-            "admit_rebind_operation_only",
-            "prepare_rebind_operation",
-            "persist_rebind_bootstrap_effects",
-            "complete_rebind_bootstrap_operation",
-        ),
-        (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
             "admit_replenishment_operation_only",
             "prepare_replenishment_operation",
@@ -71,7 +64,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
 #[test]
 fn active_device_handlers_complete_only_after_their_mutation_effects_and_response() {
     let enroll = include_str!("../src/handlers/chat/enroll_device.rs");
-    let rebind = include_str!("../src/handlers/chat/rebind_device_authentication.rs");
     let replenish = include_str!("../src/handlers/chat/replenish_key_packages.rs");
 
     assert_in_handler_order(
@@ -80,15 +72,6 @@ fn active_device_handlers_complete_only_after_their_mutation_effects_and_respons
             "persist_enrollment_bootstrap_effects",
             "publish_enrollment_key_packages",
             "complete_enrollment_bootstrap_operation",
-            ".commit()",
-        ],
-    );
-    assert_in_handler_order(
-        rebind,
-        &[
-            "persist_rebind_bootstrap_effects",
-            "read_device_view(&mut transaction",
-            "complete_rebind_bootstrap_operation",
             ".commit()",
         ],
     );
