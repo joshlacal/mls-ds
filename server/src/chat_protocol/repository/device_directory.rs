@@ -227,22 +227,39 @@ pub(crate) async fn update_device_push_token(
     pool: &PgPool,
     user_did: &str,
     push_token: Option<&str>,
+    target_device_id: Option<Uuid>,
 ) -> Result<DeviceDirectoryView, UpdatePushTokenRepositoryError> {
     let mut tx = pool.begin().await?;
 
-    let active_device: Option<(Uuid, String)> = sqlx::query_as(
-        r#"
-        SELECT device_id, status
-          FROM chat.devices
-         WHERE user_did = $1
-         ORDER BY (status = 'active') DESC, updated_at DESC, created_at DESC
-         LIMIT 1
-         FOR UPDATE
-        "#,
-    )
-    .bind(user_did)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let active_device: Option<(Uuid, String)> = if let Some(target_id) = target_device_id {
+        sqlx::query_as(
+            r#"
+            SELECT device_id, status
+              FROM chat.devices
+             WHERE user_did = $1 AND device_id = $2
+             LIMIT 1
+             FOR UPDATE
+            "#,
+        )
+        .bind(user_did)
+        .bind(target_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT device_id, status
+              FROM chat.devices
+             WHERE user_did = $1
+             ORDER BY (status = 'active') DESC, updated_at DESC, created_at DESC
+             LIMIT 1
+             FOR UPDATE
+            "#,
+        )
+        .bind(user_did)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
 
     let (device_id, status) = match active_device {
         Some((device_id, status)) => (device_id, status),
