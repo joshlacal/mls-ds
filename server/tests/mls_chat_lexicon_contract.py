@@ -4015,10 +4015,14 @@ class ChatLexiconContractTests(unittest.TestCase):
     def test_server_mirror_has_exact_manifest_and_bytes(self) -> None:
         chat_canonical = {path.name: path.read_bytes() for path in CANONICAL_ROOT.glob("*.json")}
         chat_mirror = {path.name: path.read_bytes() for path in MIRROR_ROOT.glob("*.json")}
+        self.assertTrue(chat_canonical, "chat canonical manifest must not be empty")
+        self.assertTrue(chat_mirror, "chat mirror manifest must not be empty")
         self.assertEqual(chat_canonical, chat_mirror)
 
         mls_ds_canonical = {path.name: path.read_bytes() for path in CANONICAL_MLSDS_ROOT.glob("*.json")}
         mls_ds_mirror = {path.name: path.read_bytes() for path in MIRROR_MLSDS_ROOT.glob("*.json")}
+        self.assertTrue(mls_ds_canonical, "mlsDS canonical manifest must not be empty")
+        self.assertTrue(mls_ds_mirror, "mlsDS mirror manifest must not be empty")
         self.assertEqual(mls_ds_canonical, mls_ds_mirror)
 
     def test_negative_schema_mutations_are_rejected(self) -> None:
