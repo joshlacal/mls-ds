@@ -358,9 +358,48 @@ fn copy_and_normalize_lexicons(
 
 fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
     let mut value: Value = serde_json::from_str(content)?;
-    let normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
+    let mut normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
+    normalized_count += normalize_unsupported_string_formats(&mut value);
     let normalized_content = serde_json::to_string_pretty(&value)?;
     Ok((normalized_content, normalized_count))
+}
+
+fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
+    let mut normalized = 0usize;
+    match value {
+        Value::Object(map) => {
+            if let Some(format_val) = map.get("format").and_then(Value::as_str) {
+                let is_supported = matches!(
+                    format_val,
+                    "datetime"
+                        | "uri"
+                        | "at-uri"
+                        | "did"
+                        | "handle"
+                        | "at-identifier"
+                        | "nsid"
+                        | "cid"
+                        | "language"
+                        | "tid"
+                        | "record-key"
+                );
+                if !is_supported {
+                    map.remove("format");
+                    normalized += 1;
+                }
+            }
+            for child in map.values_mut() {
+                normalized += normalize_unsupported_string_formats(child);
+            }
+        }
+        Value::Array(list) => {
+            for child in list {
+                normalized += normalize_unsupported_string_formats(child);
+            }
+        }
+        _ => {}
+    }
+    normalized
 }
 
 fn normalize_raw_byte_xrpc_bodies(value: &mut Value) -> usize {

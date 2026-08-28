@@ -44,7 +44,7 @@
               "type": "array",
               "items": {
                 "type": "ref",
-                "ref": "blue.catbird.chat.defs#welcomeDeliveryView"
+                "ref": "blue.catbird.chat.defs#welcomeView"
               },
               "minLength": 0,
               "maxLength": 100
