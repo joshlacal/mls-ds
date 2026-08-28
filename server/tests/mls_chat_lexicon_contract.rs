@@ -1,4 +1,4 @@
-//! Executable guard for the clean `blue.catbird.chat` Lexicon corpus.
+//! Executable guard for the clean `blue.catbird.chat` and `blue.catbird.mlsDS` Lexicon corpora.
 //!
 //! The Python companion freezes semantic shapes and runs negative mutations.
 //! This test additionally parses every document with the same Jacquard parser
@@ -122,14 +122,9 @@ fn canonical_and_server_corpora_parse_and_match_exactly() {
         14,
         "canonical mlsDS: fourteen files required"
     );
-    let mirror_mls_ds = corpus(&mirror_mls_ds_root());
     assert_eq!(
-        mirror_mls_ds.len(),
-        14,
-        "mirror mlsDS: fourteen files required"
-    );
-    assert_eq!(
-        canonical_mls_ds, mirror_mls_ds,
+        canonical_mls_ds,
+        corpus(&mirror_mls_ds_root()),
         "server mlsDS corpus must be an exact byte mirror"
     );
 }

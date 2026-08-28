@@ -1,6 +1,7 @@
 use clap::Parser;
 use jacquard_lexicon::codegen::CodeGenerator;
 use jacquard_lexicon::corpus::LexiconCorpus;
+use jacquard_lexicon::lexicon::LexStringFormat;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -52,7 +53,7 @@ fn normalize_lexicon_dirs(
     }
 
     if normalized > 0 {
-        println!("  Normalized {normalized} raw-byte XRPC body schema(s) for Jacquard");
+        println!("  Normalized {normalized} lexicon schema(s) for Jacquard");
     }
 
     Ok(tempdir)
@@ -364,29 +365,19 @@ fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::
     Ok((normalized_content, normalized_count))
 }
 
+/// Jacquard hard-fails on any `format` outside its own `LexStringFormat` enum (today
+/// `space-ref`, used by the `com.atproto.space*` lexicons), so ask Jacquard what it accepts
+/// instead of restating the supported set here and drifting from it.
 fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
     let mut normalized = 0usize;
     match value {
         Value::Object(map) => {
-            if let Some(format_val) = map.get("format").and_then(Value::as_str) {
-                let is_supported = matches!(
-                    format_val,
-                    "datetime"
-                        | "uri"
-                        | "at-uri"
-                        | "did"
-                        | "handle"
-                        | "at-identifier"
-                        | "nsid"
-                        | "cid"
-                        | "language"
-                        | "tid"
-                        | "record-key"
-                );
-                if !is_supported {
-                    map.remove("format");
-                    normalized += 1;
-                }
+            let unsupported = map.get("format").is_some_and(|format| {
+                serde_json::from_value::<LexStringFormat>(format.clone()).is_err()
+            });
+            if unsupported {
+                map.remove("format");
+                normalized += 1;
             }
             for child in map.values_mut() {
                 normalized += normalize_unsupported_string_formats(child);

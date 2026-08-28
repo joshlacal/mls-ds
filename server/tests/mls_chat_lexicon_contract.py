@@ -3428,12 +3428,9 @@ def validate_crypto_wire_v09_corpus() -> None:
     generator_source = STACK_ROOT / generator["source"]
     cargo_manifest_path = STACK_ROOT / "catbird-mls/Cargo.toml"
     source_root = STACK_ROOT / "catbird-mls/src/chat_v2"
-    if (
-        lock_path.is_file()
-        and generator_source.is_file()
-        and cargo_manifest_path.is_file()
-        and source_root.is_dir()
-    ):
+    # catbird-mls is absent from partial checkouts of this stack; whenever it is present its
+    # generator provenance must match the manifest exactly, missing files included.
+    if (STACK_ROOT / "catbird-mls").is_dir():
         lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
         lock_packages = lock["package"]
         for package, profile in manifest["dependencies"].items():
@@ -3466,6 +3463,7 @@ def validate_crypto_wire_v09_corpus() -> None:
             source_hasher.update(len(source_bytes).to_bytes(8, "big"))
             source_hasher.update(source_bytes)
         assert source_hasher.hexdigest() == generator["chatProtocolSourceTreeSha256Hex"]
+
     identity = manifest["identity"]
     for principal in ("alice", "bob"):
         entry = identity[principal]
@@ -4025,6 +4023,7 @@ class ChatLexiconContractTests(unittest.TestCase):
         mls_ds_canonical = {path.name: path.read_bytes() for path in CANONICAL_MLSDS_ROOT.glob("*.json")}
         mls_ds_mirror = {path.name: path.read_bytes() for path in MIRROR_MLSDS_ROOT.glob("*.json")}
         self.assertEqual(mls_ds_canonical, mls_ds_mirror)
+
     def test_negative_schema_mutations_are_rejected(self) -> None:
         try:
             validate_non_crypto_contract(self.canonical, self.vectors)
