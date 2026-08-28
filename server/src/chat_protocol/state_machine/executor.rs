@@ -94,6 +94,8 @@ pub(crate) enum ExecutorError {
     },
     /// Symbolic revocation event schedule or predecessor-chain drift.
     EventChain(EventChainCursorError),
+    /// Execution context hydration encountered a database error.
+    HydrationDatabase(sqlx::Error),
 }
 
 impl From<TransitionRepositoryError> for ExecutorError {
@@ -189,6 +191,59 @@ impl ExecutionAuthority {
             Self::ControlEntry(entry) => entry.entry_id,
             Self::Entryless { operation_id } => *operation_id,
         }
+    }
+}
+
+pub(crate) use crate::chat_protocol::repository::remote_prefix::HistoricalWriteWitness;
+
+/// Sealed authority for historical remote prefix execution.
+///
+/// An execution capsule carrying this authority suppresses event emission,
+/// event recipients, and outbox/queue work for deterministic replay.
+#[derive(Debug)]
+pub(crate) struct HistoricalExecutionWriteAuthority {
+    admission_digest: [u8; 32],
+    source_entry_id: Uuid,
+    source_entry_kind: &'static str,
+    source_entry_sha256: [u8; 32],
+    outer_fingerprint: [u8; 32],
+}
+
+impl HistoricalExecutionWriteAuthority {
+    pub(crate) fn new(
+        _witness: HistoricalWriteWitness,
+        admission_digest: [u8; 32],
+        source_entry_id: Uuid,
+        source_entry_kind: &'static str,
+        source_entry_sha256: [u8; 32],
+        outer_fingerprint: [u8; 32],
+    ) -> Self {
+        Self {
+            admission_digest,
+            source_entry_id,
+            source_entry_kind,
+            source_entry_sha256,
+            outer_fingerprint,
+        }
+    }
+
+    pub(crate) fn source_entry_id(&self) -> Uuid {
+        self.source_entry_id
+    }
+
+    /// Fail closed unless the executing entry is exactly the admitted source entry.
+    pub(crate) fn matches_context(
+        &self,
+        entry_id: Uuid,
+        entry_kind: &str,
+        accepted_payload_sha256: &[u8],
+        outer_fingerprint: &[u8],
+    ) -> bool {
+        self.admission_digest != [0; 32]
+            && self.source_entry_id == entry_id
+            && self.source_entry_kind == entry_kind
+            && self.source_entry_sha256.as_slice() == accepted_payload_sha256
+            && self.outer_fingerprint.as_slice() == outer_fingerprint
     }
 }
 
@@ -779,8 +834,9 @@ pub(crate) struct PreparedConversationExecution<'borrow, 'connection, 'plan> {
     context: ExecutionContext,
     expected_transaction_id: Box<str>,
     recovery_write_authority:
-        Option<crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'plan>>,
-    _proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
+        Option<super::super::repository::recovery::RecoveryExecutorWriteAuthority<'plan>>,
+    historical_write_authority: Option<HistoricalExecutionWriteAuthority>,
+    _proof: super::super::repository::execution_context::ExecutionContextHydrationProof,
     #[cfg(any(
         test,
         all(
@@ -797,7 +853,7 @@ impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connec
         plan: &'plan ConversationPersistencePlan,
         context: ExecutionContext,
         expected_transaction_id: Box<str>,
-        proof: crate::chat_protocol::repository::execution_context::ExecutionContextHydrationProof,
+        proof: super::super::repository::execution_context::ExecutionContextHydrationProof,
     ) -> Self {
         Self {
             transaction,
@@ -805,6 +861,7 @@ impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connec
             context,
             expected_transaction_id,
             recovery_write_authority: None,
+            historical_write_authority: None,
             _proof: proof,
             #[cfg(any(
                 test,
@@ -842,11 +899,17 @@ impl<'borrow, 'connection, 'plan> PreparedConversationExecution<'borrow, 'connec
 
     pub(in crate::chat_protocol) fn with_recovery_write_authority(
         mut self,
-        authority: crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<
-            'plan,
-        >,
+        authority: super::super::repository::recovery::RecoveryExecutorWriteAuthority<'plan>,
     ) -> Self {
         self.recovery_write_authority = Some(authority);
+        self
+    }
+
+    pub(in crate::chat_protocol) fn with_historical_write_authority(
+        mut self,
+        authority: HistoricalExecutionWriteAuthority,
+    ) -> Self {
+        self.historical_write_authority = Some(authority);
         self
     }
 }
@@ -3476,8 +3539,9 @@ async fn apply_conversation_persistence_plan_inner(
     plan: &ConversationPersistencePlan,
     ctx: &ExecutionContext,
     recovery_write_authority: Option<
-        &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
+        &super::super::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
     >,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
     require_execution_authority(effects.kind(), &ctx.authority)?;
@@ -3616,6 +3680,7 @@ async fn apply_conversation_persistence_plan_inner(
                 generation,
                 state_version,
                 epoch,
+                historical_write_authority,
             )
             .await
         }
@@ -3631,6 +3696,7 @@ async fn apply_conversation_persistence_plan_inner(
                 generation,
                 state_version,
                 epoch,
+                historical_write_authority,
             )
             .await
         }
@@ -3652,6 +3718,7 @@ async fn apply_conversation_persistence_plan_inner(
                 generation,
                 state_version,
                 epoch,
+                historical_write_authority,
             )
             .await
         }
@@ -3739,6 +3806,7 @@ async fn apply_conversation_persistence_plan_inner(
                     state_version,
                     epoch,
                     recovery_write_authority,
+                    historical_write_authority,
                 )
                 .await
             } else {
@@ -3878,6 +3946,7 @@ pub(crate) async fn apply_conversation_persistence_plan(
         context,
         expected_transaction_id,
         recovery_write_authority,
+        historical_write_authority,
         _proof,
         #[cfg(any(
             test,
@@ -3906,6 +3975,7 @@ pub(crate) async fn apply_conversation_persistence_plan(
                 plan,
                 &context,
                 recovery_write_authority.as_ref(),
+                historical_write_authority.as_ref(),
             )
             .await
         }
@@ -3949,7 +4019,7 @@ pub(crate) async fn apply_conversation_persistence_plan_unscoped_for_test(
     plan: &ConversationPersistencePlan,
     context: &ExecutionContext,
 ) -> Result<AppliedTransition, ExecutorError> {
-    apply_conversation_persistence_plan_inner(transaction, plan, context, None).await
+    apply_conversation_persistence_plan_inner(transaction, plan, context, None, None).await
 }
 
 /// Apply an entry-less `leafRecoveryRequest` internal op. The coordinate and
@@ -3967,7 +4037,7 @@ async fn apply_leaf_recovery_request(
     state_version: i64,
     _epoch: i64,
     recovery_write_authority: Option<
-        &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
+        &super::super::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
     >,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
@@ -4086,7 +4156,7 @@ async fn apply_leaf_recovery_request(
     }
 
     // 3. No control entry (internal op) -> no entry recipients; only events.
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     Ok(AppliedTransition {
         // No control entry / seq was allocated; echo the unchanged counter.
@@ -4799,7 +4869,7 @@ async fn apply_device_revocation(
 
     // 5. No control entry (internal op) -> no entry recipients; only events.
     let event_positions =
-        write_events_with_cursor(transaction, ctx, event_cursor.as_deref_mut()).await?;
+        write_events_with_cursor(transaction, ctx, event_cursor.as_deref_mut(), None).await?;
 
     Ok(AppliedTransition {
         // No control entry / seq was allocated; echo the unchanged counter.
@@ -5039,7 +5109,7 @@ pub(crate) fn prepare_device_revocation_batch_members<'plan>(
     prelude_digest: [u8; 32],
     devices: Vec<DeviceIdentity>,
     initial_tails: Vec<Option<i64>>,
-    _proof: crate::chat_protocol::repository::execution_context::RevocationBatchHydrationProof,
+    _proof: super::super::repository::execution_context::RevocationBatchHydrationProof,
 ) -> Result<PreparedDeviceRevocationBatchMembers<'plan>, ExecutorError> {
     if plan.conversations().len() != contexts.len() {
         return Err(ExecutorError::InconsistentPlan(
@@ -5189,7 +5259,7 @@ async fn apply_prepared_device_revocation_member(
         .await?;
     }
     let event_positions =
-        write_events_with_cursor(transaction, &member.context, Some(event_cursor)).await?;
+        write_events_with_cursor(transaction, &member.context, Some(event_cursor), None).await?;
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(member.next_entry_seq)
             .expect("prepared next entry sequence is nonnegative"),
@@ -5712,7 +5782,7 @@ async fn apply_leaf_recovery_cancellation(
     state_version: i64,
     _epoch: i64,
     recovery_write_authority: Option<
-        &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
+        &super::super::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
     >,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
@@ -5872,7 +5942,7 @@ async fn apply_leaf_recovery_cancellation(
     }
 
     // 5. No control entry (internal op); only events.
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
@@ -5895,7 +5965,7 @@ async fn apply_leaf_recovery_expiry(
     state_version: i64,
     _epoch: i64,
     recovery_write_authority: Option<
-        &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
+        &super::super::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
     >,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
@@ -6087,7 +6157,7 @@ async fn apply_leaf_recovery_expiry(
         )
         .await?;
     }
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(successor_next_entry_seq).unwrap(),
         entry_id: operation_id,
@@ -6126,8 +6196,9 @@ async fn apply_leaf_recovery_fulfillment(
     state_version: i64,
     epoch: i64,
     recovery_write_authority: Option<
-        &crate::chat_protocol::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
+        &super::super::repository::recovery::RecoveryExecutorWriteAuthority<'_>,
     >,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
     let hydration = plan.state();
@@ -6552,19 +6623,20 @@ async fn apply_leaf_recovery_fulfillment(
     //    transition insert because the fulfilled rows reference it, while
     //    the prewrite reread already rejected all triple drift before the
     //    savepoint's first mutation.
-    #[cfg(not(test))]
-    recovery_write_authority
-        .ok_or(ExecutorError::MissingContext(
-            "missing validated Recovery executor write authority",
-        ))?
-        .apply_terminal(transaction)
-        .await?;
-    #[cfg(test)]
     if let Some(authority) = recovery_write_authority {
         authority.apply_terminal(transaction).await?;
-    }
-    #[cfg(test)]
-    if recovery_write_authority.is_none() {
+    } else {
+        // No live Recovery write authority exists for a reconstructed historical
+        // prefix, so replay terminalizes the triple directly; test builds share
+        // that path, and production without either authority fails closed.
+        #[cfg(not(test))]
+        {
+            if historical_write_authority.is_none() {
+                return Err(ExecutorError::MissingContext(
+                    "missing validated Recovery executor write authority",
+                ));
+            }
+        }
         transition::terminalize_leaf_recovery_request(
             transaction,
             recovery_request_id,
@@ -6663,11 +6735,11 @@ async fn apply_leaf_recovery_fulfillment(
         }
     };
 
-    if is_local {
+    if is_local || historical_write_authority.is_some() {
         tracing::debug!(
             %conversation_id,
             recipient_did = %recipient_did_str,
-            "welcome emission: recipient is local participant (NULL or self ds_did), skipping remote federation enqueue"
+            "welcome emission: recipient is local participant or historical reconstruction, skipping remote federation enqueue"
         );
     } else {
         let target_ds_did = ds_did_opt.unwrap();
@@ -6738,14 +6810,16 @@ async fn apply_leaf_recovery_fulfillment(
 
     // 11. Audience + events.
     let recipients = build_entry_recipients(&ctx.entry_recipients)?;
-    delivery::insert_entry_recipients(
-        transaction,
-        conversation_id,
-        u64::try_from(seq_i64).unwrap(),
-        &recipients,
-    )
-    .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    if !recipients.is_empty() {
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+    }
+    let event_positions = write_events(transaction, ctx, historical_write_authority).await?;
     // Prior-coordinate open-work supersession (a legal interleaving): the corpus
     // fulfillment carries none, but the path composes it for the general case.
     let receipt =
@@ -7172,7 +7246,7 @@ async fn apply_generic_commit(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
     // Supersede prior-coordinate open work (requests/reservations/packages) +
     // any prior pending Welcome the epoch change retired.
     let receipt =
@@ -7654,7 +7728,7 @@ async fn apply_leave_fulfillment(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     // 12. Shared prior-bound supersession + welcome supersession + reset/leave
     //     STALING + the silent-drop reconciliation (own recovery/reservation/
@@ -7720,6 +7794,7 @@ async fn apply_creation(
     generation: i64,
     state_version: i64,
     epoch: i64,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
     let hydration = plan.state();
@@ -7758,13 +7833,16 @@ async fn apply_creation(
     // `into_persistence_plan` requires EVERY Creation/Policy plan to carry
     // this binding (else `InvalidHydrationAuthority`); a missing binding here
     // is an `InconsistentPlan`, so this family is consumed — never silently
-    // dropped — exactly as the exhaustive-dispatch contract demands.
-    let _invitation_quota_witness =
-        effects
-            .invitation_quota_cas()
-            .ok_or(ExecutorError::InconsistentPlan(
-                "creation plan missing invitation quota CAS binding",
-            ))?;
+    // dropped — exactly as the exhaustive-dispatch contract demands. A
+    // reconstructed historical prefix carries no live quota binding at all.
+    if historical_write_authority.is_none() {
+        let _invitation_quota_witness =
+            effects
+                .invitation_quota_cas()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "creation plan missing invitation quota CAS binding",
+                ))?;
+    }
     // effects.authority() is likewise deliberately unread: it is the sealed
     // control/request/revocation authority that JUSTIFIED the plan
     // (provenance/witness), not a persistable row family. The signed bytes it
@@ -7941,16 +8019,18 @@ async fn apply_creation(
 
     // 8. Frozen control-entry audience.
     let recipients = build_entry_recipients(&ctx.entry_recipients)?;
-    delivery::insert_entry_recipients(
-        transaction,
-        conversation_id,
-        u64::try_from(seq_i64).unwrap(),
-        &recipients,
-    )
-    .await?;
+    if !recipients.is_empty() {
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+    }
 
     // 9. Events + audience + outbox.
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, historical_write_authority).await?;
 
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -7977,6 +8057,7 @@ async fn apply_policy(
     generation: i64,
     state_version: i64,
     epoch: i64,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
     let hydration = plan.state();
@@ -8034,12 +8115,15 @@ async fn apply_policy(
     // group policy addParticipant edge is the other kind production requires
     // to carry it. The quota itself is enforced by the deferred
     // `enforce_invitation_quota` trigger; a missing binding is InconsistentPlan.
-    let _invitation_quota_witness =
-        effects
-            .invitation_quota_cas()
-            .ok_or(ExecutorError::InconsistentPlan(
-                "policy plan missing invitation quota CAS binding",
-            ))?;
+    // A reconstructed historical prefix carries no live quota binding at all.
+    if historical_write_authority.is_none() {
+        let _invitation_quota_witness =
+            effects
+                .invitation_quota_cas()
+                .ok_or(ExecutorError::InconsistentPlan(
+                    "policy plan missing invitation quota CAS binding",
+                ))?;
+    }
 
     // 1. Head CAS advances the coordinate + counter (single seq authority).
     transition::cas_conversation_head(
@@ -8160,14 +8244,16 @@ async fn apply_policy(
 
     // 7. Audience + events.
     let recipients = build_entry_recipients(&ctx.entry_recipients)?;
-    delivery::insert_entry_recipients(
-        transaction,
-        conversation_id,
-        u64::try_from(seq_i64).unwrap(),
-        &recipients,
-    )
-    .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    if !recipients.is_empty() {
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+    }
+    let event_positions = write_events(transaction, ctx, historical_write_authority).await?;
 
     // 8. Supersede prior-coordinate open work the policy edge retired (an open
     //    recovery request / active reservation / reserved package + a prior pending
@@ -8372,7 +8458,7 @@ async fn apply_metadata_transition(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     // 8. Terminalize every prior-coordinate work item retired by this
     // coordinate change, then prove no family was silently skipped.
@@ -8689,7 +8775,7 @@ async fn apply_zero_leaf_leave(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     // Supersede prior-coordinate open work the leave retired (an open recovery
     // request / active reservation / reserved package + a prior pending Welcome)
@@ -9001,7 +9087,7 @@ async fn apply_close(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     // 10. Supersede prior-coordinate open work the close retired: an open
     //     leaf-recovery request (Open->Superseded) + its reservation
@@ -9183,7 +9269,7 @@ async fn apply_reset_request(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -9376,7 +9462,7 @@ async fn apply_leave_request(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -9518,7 +9604,7 @@ async fn apply_leave_cancellation(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     Ok(AppliedTransition {
         allocated_seq: u64::try_from(seq_i64).unwrap(),
@@ -9931,7 +10017,7 @@ async fn apply_reset_activation(
         &recipients,
     )
     .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    let event_positions = write_events(transaction, ctx, None).await?;
 
     // 13. Supersede prior-coordinate open work the reset retired: the retired
     //     generation's pending welcome(s) + any open recovery request / active
@@ -10001,6 +10087,7 @@ async fn apply_acceptance(
     generation: i64,
     state_version: i64,
     epoch: i64,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<AppliedTransition, ExecutorError> {
     let effects = plan.effects();
     let hydration = plan.state();
@@ -10257,14 +10344,16 @@ async fn apply_acceptance(
 
     // 10. Audience + events.
     let recipients = build_entry_recipients(&ctx.entry_recipients)?;
-    delivery::insert_entry_recipients(
-        transaction,
-        conversation_id,
-        u64::try_from(seq_i64).unwrap(),
-        &recipients,
-    )
-    .await?;
-    let event_positions = write_events(transaction, ctx).await?;
+    if !recipients.is_empty() {
+        delivery::insert_entry_recipients(
+            transaction,
+            conversation_id,
+            u64::try_from(seq_i64).unwrap(),
+            &recipients,
+        )
+        .await?;
+    }
+    let event_positions = write_events(transaction, ctx, historical_write_authority).await?;
 
     // 11. Supersede any prior-coordinate open work a DIFFERENT member left bound
     //     to the retired coordinate (Open->Superseded recovery / Active->Released
@@ -11535,15 +11624,32 @@ async fn append_one_event_at_with_cursor(
 async fn write_events(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ctx: &ExecutionContext,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<Vec<i64>, ExecutorError> {
-    write_events_with_cursor(transaction, ctx, None).await
+    write_events_with_cursor(transaction, ctx, None, historical_write_authority).await
 }
 
 async fn write_events_with_cursor(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ctx: &ExecutionContext,
     mut event_cursor: Option<&mut EventChainCursor>,
+    historical_write_authority: Option<&HistoricalExecutionWriteAuthority>,
 ) -> Result<Vec<i64>, ExecutorError> {
+    if let Some(historical) = historical_write_authority {
+        let entry = ctx.entry();
+        if !historical.matches_context(
+            entry.entry_id,
+            entry.entry_kind.as_str(),
+            &entry.accepted_payload_sha256,
+            &entry.outer_entry_fingerprint,
+        ) {
+            return Err(ExecutorError::MissingContext(
+                "historical write authority entry context mismatch",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+
     let mut positions = Vec::with_capacity(ctx.events.len());
     for event in &ctx.events {
         let position =

@@ -5,7 +5,7 @@ use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
 };
 use jacquard_common::DefaultStr;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{Postgres, Transaction};
 
 use super::envelope::{verify_receipt, SUBMIT_COMMIT_NSID};
 use super::errors::FederationError;
@@ -18,7 +18,6 @@ use crate::auth::AuthMiddleware;
 use crate::identity::dids_equivalent;
 
 pub struct RemoteCommitSubmitter {
-    pool: PgPool,
     resolver: Arc<DsResolver>,
     outbound: Arc<OutboundClient>,
     service_auth: Arc<ServiceAuthClient>,
@@ -29,18 +28,17 @@ pub struct RemoteCommitSubmitter {
 pub struct VerifiedSubmitCommit {
     pub output: SubmitCommitOutput,
     pub submit_transition_response_bytes: Vec<u8>,
+    pub federation_response_bytes: Vec<u8>,
 }
 
 impl RemoteCommitSubmitter {
     pub fn new(
-        pool: PgPool,
         resolver: Arc<DsResolver>,
         outbound: Arc<OutboundClient>,
         service_auth: Arc<ServiceAuthClient>,
         auth_middleware: AuthMiddleware,
     ) -> Self {
         Self {
-            pool,
             resolver,
             outbound,
             service_auth,
@@ -50,6 +48,7 @@ impl RemoteCommitSubmitter {
 
     pub async fn submit(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
         sequencer_ds_did: &str,
         sequencer_term: u64,
         envelope: &SubmitCommit<DefaultStr>,
@@ -60,10 +59,10 @@ impl RemoteCommitSubmitter {
     ) -> Result<VerifiedSubmitCommit, FederationError> {
         let destination = self
             .resolver
-            .resolve_ds_destination(sequencer_ds_did)
+            .resolve_ds_destination_uncached(sequencer_ds_did)
             .await?;
 
-        peer_policy::enforce_outbound_peer_policy(&self.pool, sequencer_ds_did).await?;
+        peer_policy::enforce_outbound_peer_policy_tx(transaction, sequencer_ds_did).await?;
 
         let auth_token = self
             .service_auth
@@ -106,7 +105,7 @@ impl RemoteCommitSubmitter {
                     reason: format!("failed to parse submitCommit response: {e}"),
                 }
             })?;
-        let receipt = output.receipt.clone();
+        let receipt = &output.receipt;
 
         let did_doc = self
             .auth_middleware
@@ -119,43 +118,16 @@ impl RemoteCommitSubmitter {
                 ),
             })?;
 
-        let matching_vm = did_doc
-            .verification_method
-            .iter()
-            .find(|vm| vm.id == super::RECEIPT_VERIFICATION_METHOD)
-            .ok_or_else(|| FederationError::AuthFailed {
+        let verifying_key = crate::auth::select_verification_method(&did_doc, Some("#atproto"))
+            .and_then(crate::auth::extract_p256_key_from_vm)
+            .map_err(|error| FederationError::AuthFailed {
                 reason: format!(
-                    "no verification method matching {} in DID document for {}",
-                    super::RECEIPT_VERIFICATION_METHOD,
+                    "invalid service-auth verification method for {}: {error}",
                     receipt.receiver_ds_did.as_str()
                 ),
             })?;
 
-        let method_owner = super::RECEIPT_VERIFICATION_METHOD
-            .split_once('#')
-            .map(|(did, _)| did)
-            .unwrap_or(super::RECEIPT_VERIFICATION_METHOD);
-        if !dids_equivalent(&matching_vm.controller, method_owner)
-            || !dids_equivalent(&matching_vm.controller, receipt.receiver_ds_did.as_str())
-        {
-            return Err(FederationError::AuthFailed {
-                reason: format!(
-                    "receipt verification method controller mismatch: expected {}, got {}",
-                    receipt.receiver_ds_did.as_str(),
-                    matching_vm.controller
-                ),
-            });
-        }
-
-        let verifying_key = crate::auth::extract_p256_key_from_vm(matching_vm).map_err(|e| {
-            FederationError::AuthFailed {
-                reason: format!(
-                    "failed to extract P-256 key from receipt verification method: {e}"
-                ),
-            }
-        })?;
-
-        match verify_receipt(&receipt, &verifying_key) {
+        match verify_receipt(receipt, &verifying_key) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(FederationError::InvalidEnvelope {
@@ -243,8 +215,9 @@ impl RemoteCommitSubmitter {
                 reason: "receipt result_sha256 mismatch".to_string(),
             });
         }
-        if receipt.source_locator.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
-            || output.commit_entry.entry_id.as_str() != expected_entry_id.hyphenated().to_string()
+        let expected_entry_id_text = expected_entry_id.hyphenated().to_string();
+        if receipt.source_locator.entry_id.as_str() != expected_entry_id_text
+            || output.commit_entry.entry_id.as_str() != expected_entry_id_text
         {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt/output entry_id mismatch with local expected entry_id".to_string(),
@@ -274,6 +247,7 @@ impl RemoteCommitSubmitter {
         Ok(VerifiedSubmitCommit {
             output,
             submit_transition_response_bytes,
+            federation_response_bytes: resp.response_bytes,
         })
     }
 }

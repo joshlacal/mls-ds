@@ -139,9 +139,10 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
     match error {
         E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
-        // The only semantic terminal outcomes are represented by the facade's
-        // canonical completed responses above.  A lock/hydration/seal/executor
-        // failure is never reclassified as a client-visible Welcome outcome.
+        // A quarantined aggregate fails the exact read-set check before the
+        // facade can classify its Welcome. Preserve the two declared conflict
+        // codes; every other lock, hydration, seal, or executor failure remains
+        // storage or invariant failure.
         E::WelcomeLock(crate::chat_protocol::repository::core::WelcomeLockError::Database(_))
         | E::ExecutionHydration(
             crate::chat_protocol::repository::execution_context::ExecutionContextHydrationError::Database(_),

@@ -1019,7 +1019,7 @@ async fn group_policy_add_participant_commits_state_version_plus_one() {
         is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
-        participant_ds_dids: std::collections::HashMap::new(),
+        participant_ds_dids: std::collections::HashMap::from([(bob2_did.clone(), None)]),
     };
 
     // 5. Apply + COMMIT the policy edge.
@@ -1574,6 +1574,13 @@ async fn build_signed_policy_apply(
     received_millis: Option<i64>,
     transaction_id: Option<String>,
 ) -> PolicyApplyFixture {
+    let participant_ds_dids = changes
+        .iter()
+        .filter_map(|change| match change {
+            SignedPolicyChange::Add(user_did) => Some((user_did.clone(), None)),
+            SignedPolicyChange::ChangeRole { .. } => None,
+        })
+        .collect();
     let add_count = changes
         .iter()
         .filter(|change| matches!(change, SignedPolicyChange::Add(_)))
@@ -1681,7 +1688,7 @@ async fn build_signed_policy_apply(
         is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
-        participant_ds_dids: std::collections::HashMap::new(),
+        participant_ds_dids,
     };
     PolicyApplyFixture {
         plan,
@@ -7059,7 +7066,7 @@ async fn build_generic_commit_at(
         .expect("frozen generic Commit parses as a valid public commit");
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         prior.coordinate().state_version() + 1,
         *prior.coordinate().group_id(),
         prior.coordinate().epoch() + 1,
@@ -7386,8 +7393,16 @@ fn signed_policy_control(
     .unwrap();
     let outer_fingerprint = *verified_entry.outer_control_fingerprint();
     let server_fields = verified_entry.server_fields_dag_cbor().unwrap();
-    let authority =
-        HydrationAuthority::new(*fixture.conversation_id.as_bytes()).expect("policy authority");
+    let received_at = ServerTimestamp::from_canonical_stored(&received_at_text).unwrap();
+    let authority = HydrationAuthority::for_test_with_locked(
+        *fixture.conversation_id.as_bytes(),
+        "tx-test".into(),
+        Some(*prior.coordinate()),
+        seq,
+        received_at,
+        [0x11; 32],
+    )
+    .expect("policy authority");
     let transition = authority
         .control_transition(verified_entry)
         .expect("genuine signed policy transition");
@@ -7407,7 +7422,7 @@ fn signed_policy_control(
             outer_entry_fingerprint: outer_fingerprint.to_vec(),
         },
         transition_id,
-        received_at: ServerTimestamp::from_canonical_stored(&received_at_text).unwrap(),
+        received_at,
     }
 }
 
@@ -7578,7 +7593,16 @@ async fn build_signed_generic_remove_commit(
     let server_fields = verified_entry
         .server_fields_dag_cbor()
         .expect("empty server fields");
-    let authority = HydrationAuthority::new(*conversation_id.as_bytes()).unwrap();
+    let received = ServerTimestamp::from_canonical_stored(received_at).unwrap();
+    let authority = HydrationAuthority::for_test_with_locked(
+        *conversation_id.as_bytes(),
+        "tx-test".into(),
+        Some(*prior.coordinate()),
+        4,
+        received,
+        [0x11; 32],
+    )
+    .unwrap();
     let transition = authority
         .control_transition(verified_entry)
         .expect("production transition authority");
@@ -7600,7 +7624,6 @@ async fn build_signed_generic_remove_commit(
         },
     )
     .expect("signed generic Remove plan");
-    let received = ServerTimestamp::from_canonical_stored(received_at).unwrap();
     let head_cas = ConversationHeadCasBinding::for_test_edge(
         *conversation_id.as_bytes(),
         *entry_id.as_bytes(),
@@ -9084,7 +9107,7 @@ async fn leave_fulfillment_commits_remove_and_supersedes_pending_welcome() {
     let bob_leaf_index = pending_state.leaf(&bob_id).expect("bob leaf").leaf_index();
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         pending_state.coordinate().state_version() + 1,
         *pending_state.coordinate().group_id(),
         pending_state.coordinate().epoch() + 1,
@@ -9540,7 +9563,7 @@ async fn build_replace_fulfillment(pool: &PgPool) -> BuiltReplaceFulfillment {
         .leaf_index();
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         requested_state.coordinate().state_version() + 1,
         *requested_state.coordinate().group_id(),
         requested_state.coordinate().epoch() + 1,
@@ -10074,7 +10097,7 @@ async fn build_bob_leave_fulfillment(
     let bob_leaf_index = pending_state.leaf(&bob_id).expect("bob leaf").leaf_index();
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         pending_state.coordinate().state_version() + 1,
         *pending_state.coordinate().group_id(),
         pending_state.coordinate().epoch() + 1,
@@ -10700,7 +10723,7 @@ async fn generic_commit_supersedes_prior_open_recovery_request() {
     .expect("generic commit parses");
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         request_state.coordinate().state_version() + 1,
         *request_state.coordinate().group_id(),
         request_state.coordinate().epoch() + 1,
@@ -11185,7 +11208,7 @@ async fn seed_reset_leave_then_build_commit(
     .expect("generic commit parses");
     let successor_coord = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         leave_state.coordinate().state_version() + 1,
         *leave_state.coordinate().group_id(),
         leave_state.coordinate().epoch() + 1,
@@ -11660,7 +11683,7 @@ async fn seed_three_member_bob_pending_leave_clocked(
         is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
-        participant_ds_dids: std::collections::HashMap::new(),
+        participant_ds_dids: std::collections::HashMap::from([(carol_did.clone(), None)]),
     };
     {
         let mut tx = pool.begin().await.expect("begin policy add carol");
@@ -13067,6 +13090,22 @@ async fn fresh_pre_v4_upgrade_db() -> (PgPool, FreshDbGuard) {
             .await
             .unwrap_or_else(|error| panic!("commit {filename}: {error}"));
     }
+    // These tests freeze the Welcome-provenance boundary, not later unrelated
+    // routing columns. Current writers still need their additive routing shape
+    // to create the historical rows that the frozen upgrade exercises.
+    sqlx::query(
+        "ALTER TABLE chat.conversations \
+         ADD COLUMN is_remote BOOLEAN NOT NULL DEFAULT FALSE, \
+         ADD COLUMN sequencer_ds TEXT, \
+         ADD COLUMN sequencer_term BIGINT NOT NULL DEFAULT 0",
+    )
+    .execute(&pool)
+    .await
+    .expect("add current conversation routing writer columns");
+    sqlx::query("ALTER TABLE chat.participants ADD COLUMN ds_did TEXT")
+        .execute(&pool)
+        .await
+        .expect("add current participant routing writer column");
     (pool, guard)
 }
 
@@ -14204,7 +14243,7 @@ async fn build_policy_edge(
         is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
-        participant_ds_dids: std::collections::HashMap::new(),
+        participant_ds_dids: std::collections::HashMap::from([(bob2_did.clone(), None)]),
     };
     (plan, ctx)
 }

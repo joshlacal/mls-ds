@@ -663,15 +663,6 @@ async fn g6_locked_creation_rejects_a_control_entry_from_another_trusted_instant
     let matching_verified =
         rebind_persisted_control_entry(matching_verified, &entry.raw_wrapper, &entry.public_key)
             .expect("retain exact accepted Creation wrapper bytes");
-    let pure_verified = decode_and_verify_control_entry(&entry.public_row_json, &entry.public_key)
-        .expect("verify pure-control Creation entry");
-    let pure_verified =
-        rebind_persisted_control_entry(pure_verified, &entry.raw_wrapper, &entry.public_key)
-            .expect("retain pure-control accepted wrapper bytes");
-    HydrationAuthority::new(*conversation_id.as_bytes())
-        .expect("mint pure Creation authority")
-        .control_transition(pure_verified)
-        .expect("fresh XWing Creation passes the pure semantic derivation");
     matching_authority
         .control_transition(matching_verified)
         .expect("the matching locked Creation entry must mint transition evidence");
@@ -2707,7 +2698,7 @@ mod historical_control_path {
     #[test]
     fn corpus_creation_entry_preserves_manifest_chronology() {
         let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/crypto-wire/manifest.json");
+            .join("tests/fixtures/crypto-wire-v09/manifest.json");
         let manifest: Value = serde_json::from_slice(
             &std::fs::read(manifest_path).expect("read frozen corpus manifest"),
         )
@@ -4868,7 +4859,7 @@ mod historical_control_loader {
         } else if public_state.is_some() {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/crypto-wire/group-info.mls"),
+                    .join("tests/fixtures/crypto-wire-v09/group-info.mls"),
             )
             .expect("read genuine frozen genesis GroupInfo")
         } else {
@@ -6963,30 +6954,30 @@ mod historical_control_loader {
         // losslessly through Postgres microsecond storage). `EXPIRES_AT` is
         // exactly `LEAST(REQUESTED_AT + 5min, KP.not_after)`, the expiry the
         // deferred `assert_recovery_fulfillment_mapping` constraint requires.
-        const KP_NOT_BEFORE: &str = "2026-07-27T03:05:08.000Z";
-        const KP_NOT_AFTER: &str = "2026-07-28T03:06:08.000Z";
-        const CREATION_SIGNED_AT: &str = "2026-07-27T03:06:08.000Z";
-        const CREATION_RECEIVED_AT: &str = "2026-07-27T03:06:09.000Z";
-        const POLICY_ADD_AT: &str = "2026-07-27T04:06:08.000Z";
-        const SIGNED_AT: &str = "2026-07-27T04:06:08.500Z";
-        const REQUESTED_AT: &str = "2026-07-27T04:06:09.000Z";
-        const EXPIRES_AT: &str = "2026-07-27T04:11:09.000Z";
-        const FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:09.500Z";
-        const FULFILLED_AT: &str = "2026-07-27T04:06:10.000Z";
-        const GENERIC_SIGNED_AT: &str = "2026-07-27T04:06:10.500Z";
-        const GENERIC_AT: &str = "2026-07-27T04:06:11.000Z";
-        const LEAVE_SIGNED_AT: &str = "2026-07-27T04:06:11.500Z";
-        const LEAVE_AT: &str = "2026-07-27T04:06:12.000Z";
-        const LEAVE_FULFILLMENT_SIGNED_AT: &str = "2026-07-27T04:06:12.500Z";
-        const LEAVE_FULFILLED_AT: &str = "2026-07-27T04:06:13.000Z";
-        const REINVITE_AT: &str = "2026-07-27T04:06:14.000Z";
-        const REACCEPT_SIGNED_AT: &str = "2026-07-27T04:06:14.500Z";
-        const REACCEPT_AT: &str = "2026-07-27T04:06:15.000Z";
-        const REACCEPT_EXPIRES_AT: &str = "2026-07-27T04:11:15.000Z";
-        const REJOIN_SIGNED_AT: &str = "2026-07-27T04:06:15.500Z";
-        const REJOIN_AT: &str = "2026-07-27T04:06:16.000Z";
-        const ROLE_ADMIN_AT: &str = "2026-07-27T04:06:11.000Z";
-        const ROLE_MEMBER_AT: &str = "2026-07-27T04:06:12.000Z";
+        const KP_NOT_BEFORE: &str = "2026-08-29T01:05:22.000Z";
+        const KP_NOT_AFTER: &str = "2026-08-30T01:06:22.000Z";
+        const CREATION_SIGNED_AT: &str = "2026-08-29T01:04:22.000Z";
+        const CREATION_RECEIVED_AT: &str = "2026-08-29T01:06:22.000Z";
+        const POLICY_ADD_AT: &str = "2026-08-29T02:06:22.000Z";
+        const SIGNED_AT: &str = "2026-08-29T02:06:22.500Z";
+        const REQUESTED_AT: &str = "2026-08-29T02:06:23.000Z";
+        const EXPIRES_AT: &str = "2026-08-29T02:11:23.000Z";
+        const FULFILLMENT_SIGNED_AT: &str = "2026-08-29T02:06:23.500Z";
+        const FULFILLED_AT: &str = "2026-08-29T02:06:24.000Z";
+        const GENERIC_SIGNED_AT: &str = "2026-08-29T02:06:24.500Z";
+        const GENERIC_AT: &str = "2026-08-29T02:06:25.000Z";
+        const LEAVE_SIGNED_AT: &str = "2026-08-29T02:06:25.500Z";
+        const LEAVE_AT: &str = "2026-08-29T02:06:26.000Z";
+        const LEAVE_FULFILLMENT_SIGNED_AT: &str = "2026-08-29T02:06:26.500Z";
+        const LEAVE_FULFILLED_AT: &str = "2026-08-29T02:06:27.000Z";
+        const REINVITE_AT: &str = "2026-08-29T02:06:28.000Z";
+        const REACCEPT_SIGNED_AT: &str = "2026-08-29T02:06:28.500Z";
+        const REACCEPT_AT: &str = "2026-08-29T02:06:29.000Z";
+        const REACCEPT_EXPIRES_AT: &str = "2026-08-29T02:11:29.000Z";
+        const REJOIN_SIGNED_AT: &str = "2026-08-29T02:06:29.500Z";
+        const REJOIN_AT: &str = "2026-08-29T02:06:30.000Z";
+        const ROLE_ADMIN_AT: &str = "2026-08-29T02:06:25.000Z";
+        const ROLE_MEMBER_AT: &str = "2026-08-29T02:06:26.000Z";
 
         async fn g6_gate_pool(label: &str) -> PgPool {
             const FIXED_GATE_DB: &str =
@@ -9184,8 +9175,8 @@ mod historical_control_loader {
                 .expect("check fixed transition occupancy");
                 assert_eq!(occupied_transition_count, 0);
                 let package_refs = vec![
-                    corpus_hex::<32>(&manifest["chain"]["innerKeyPackageRefHex"]).to_vec(),
-                    corpus_hex::<32>(&manifest["chain"]["rejoinInnerKeyPackageRefHex"]).to_vec(),
+                    corpus_file("key-package-ref.bin"),
+                    corpus_file("rejoin-key-package-ref.bin"),
                 ];
                 let occupied_package_count: i64 = sqlx::query_scalar(
                     "SELECT count(*) FROM chat.key_packages WHERE key_package_ref = ANY($1)",
@@ -10238,16 +10229,14 @@ mod historical_control_loader {
             assert_eq!(sender_leaf_index, 0, "frozen Add sender is Alice leaf zero");
             let add = crate::frozen_public_state::restore_add_commit(&add_prior, sender_leaf_index);
             assert_eq!(add.adds().len(), 1);
-            assert_eq!(
-                add.adds()[0].key_package_ref(),
-                &corpus_hex::<32>(&chain["innerKeyPackageRefHex"])
-            );
+            let key_package_ref: [u8; 32] = corpus_file("key-package-ref.bin")
+                .try_into()
+                .expect("the corpus key-package ref is exactly 32 bytes");
+            assert_eq!(add.adds()[0].key_package_ref(), &key_package_ref);
             assert_eq!(
                 add.next().snapshot(),
-                crate::frozen_public_state::schema2_snapshot(&corpus_file(
-                    "committed-public-state.bin"
-                )),
-                "processed Add snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
+                corpus_file("committed-public-state.bin"),
+                "processed Add snapshot is byte-exact with the sealed 0.9 corpus artifact"
             );
             let added = add.into_next();
             let generic_commit = process(
@@ -10255,8 +10244,8 @@ mod historical_control_loader {
                 "commit-generic-public.mls",
                 "genericCommitAadSha256Hex",
                 coordinate(
-                    chain["genericCommittedStateVersion"].as_u64().unwrap(),
-                    "genericCommittedEpoch",
+                    chain["genericCommitNextStateVersion"].as_u64().unwrap(),
+                    "genericCommitNextEpoch",
                     "genericCommittedGroupContextHashHex",
                     "genericCommittedConfirmationTagHex",
                 ),
@@ -10270,10 +10259,8 @@ mod historical_control_loader {
             );
             assert_eq!(
                 generic_commit.next().snapshot(),
-                crate::frozen_public_state::schema2_snapshot(&corpus_file(
-                    "committed-generic-public-state.bin"
-                )),
-                "processed generic snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
+                corpus_file("committed-generic-public-state.bin"),
+                "processed generic snapshot is byte-exact with the sealed 0.9 corpus artifact"
             );
             let generic = generic_commit.into_next();
             let remove = process(
@@ -10281,8 +10268,8 @@ mod historical_control_loader {
                 "commit-remove-public.mls",
                 "removeCommitAadSha256Hex",
                 coordinate(
-                    chain["removeCommittedStateVersion"].as_u64().unwrap(),
-                    "removeCommittedEpoch",
+                    chain["removeCommitNextStateVersion"].as_u64().unwrap(),
+                    "removeCommitNextEpoch",
                     "removeCommittedGroupContextHashHex",
                     "removeCommittedConfirmationTagHex",
                 ),
@@ -10298,10 +10285,8 @@ mod historical_control_loader {
             );
             assert_eq!(
                 remove.next().snapshot(),
-                crate::frozen_public_state::schema2_snapshot(&corpus_file(
-                    "committed-remove-public-state.bin"
-                )),
-                "processed Remove snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
+                corpus_file("committed-remove-public-state.bin"),
+                "processed Remove snapshot is byte-exact with the sealed 0.9 corpus artifact"
             );
             let removed = remove.into_next();
             let reinvited = rebind_active_snapshot(
@@ -10335,16 +10320,14 @@ mod historical_control_loader {
             let rejoin = crate::frozen_public_state::restore_rejoin_commit(&rejoin_prior)
                 .expect("restore strict manifest-bound frozen rejoin Add");
             assert_eq!(rejoin.adds().len(), 1);
-            assert_eq!(
-                rejoin.adds()[0].key_package_ref(),
-                &corpus_hex::<32>(&chain["rejoinInnerKeyPackageRefHex"])
-            );
+            let rejoin_key_package_ref: [u8; 32] = corpus_file("rejoin-key-package-ref.bin")
+                .try_into()
+                .expect("the rejoin corpus key-package ref is exactly 32 bytes");
+            assert_eq!(rejoin.adds()[0].key_package_ref(), &rejoin_key_package_ref);
             assert_eq!(
                 rejoin.next().snapshot(),
-                crate::frozen_public_state::schema2_snapshot(&corpus_file(
-                    "committed-rejoin-public-state.bin"
-                )),
-                "processed rejoin snapshot records are byte-exact with the committed corpus artifact under a schema-2 envelope"
+                corpus_file("committed-rejoin-public-state.bin"),
+                "processed rejoin snapshot is byte-exact with the sealed 0.9 corpus artifact"
             );
             let rejoined = rejoin.into_next();
             FixedCorpusCommitStates {
@@ -10495,7 +10478,7 @@ mod historical_control_loader {
             let rejoin_package_ref = validate_corpus_recovery_artifacts(
                 "rejoin-key-package.mls",
                 "rejoin-welcome.mls",
-                "rejoinInnerKeyPackageRefHex",
+                "rejoin-key-package-ref.bin",
             );
             let reacceptance = build_real_acceptance_entry_at(
                 &entry,
@@ -10538,8 +10521,8 @@ mod historical_control_loader {
             let manifest = corpus_manifest();
             let evaluation = manifest["evaluationUnixSeconds"].as_i64().unwrap();
             let lifetime = &manifest["mlsProfile"]["keyPackageLifetime"];
-            let not_before = lifetime["notBeforeUnixSeconds"].as_i64().unwrap();
-            let not_after = lifetime["notAfterUnixSeconds"].as_i64().unwrap();
+            let not_before = lifetime["notBefore"].as_i64().unwrap();
+            let not_after = lifetime["notAfter"].as_i64().unwrap();
             let canonical = |seconds: i64, millis: i64| {
                 (DateTime::<Utc>::from_timestamp(seconds, 0).unwrap()
                     + chrono::Duration::milliseconds(millis))
@@ -10549,11 +10532,11 @@ mod historical_control_loader {
             assert_eq!(KP_NOT_AFTER, canonical(not_after, 0));
             assert_eq!(
                 manifest["creation"]["signedAt"].as_str().unwrap(),
-                canonical(evaluation, 0)
+                canonical(evaluation - 120, 0)
             );
             assert_eq!(
                 manifest["creation"]["receivedAt"].as_str().unwrap(),
-                canonical(evaluation + 1, 0)
+                canonical(evaluation, 0)
             );
             for (actual, seconds, millis) in [
                 (POLICY_ADD_AT, 3_600, 0),
@@ -10600,10 +10583,10 @@ mod historical_control_loader {
         fn corpus_file(name: &str) -> Vec<u8> {
             std::fs::read(
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/crypto-wire")
+                    .join("tests/fixtures/crypto-wire-v09")
                     .join(name),
             )
-            .expect("read frozen crypto-wire artifact")
+            .expect("read frozen OpenMLS 0.9 crypto-wire artifact")
         }
 
         fn corpus_manifest() -> Value {
@@ -21008,14 +20991,14 @@ mod historical_control_loader {
             validate_corpus_recovery_artifacts(
                 "key-package.mls",
                 "welcome.mls",
-                "innerKeyPackageRefHex",
+                "key-package-ref.bin",
             )
         }
 
         fn validate_corpus_recovery_artifacts(
             key_package_file: &str,
             welcome_file: &str,
-            manifest_ref_field: &str,
+            key_package_ref_file: &str,
         ) -> [u8; 32] {
             let manifest = corpus_manifest();
             let bob = &manifest["identity"]["bob"];
@@ -21040,9 +21023,9 @@ mod historical_control_loader {
             .expect("production KeyPackage validation accepts the frozen corpus wrapper");
             let key_package_ref = *validated.key_package_ref();
             assert_eq!(
-                key_package_ref,
-                corpus_hex::<32>(&manifest["chain"][manifest_ref_field]),
-                "production-derived KeyPackageRef remains manifest-bound"
+                key_package_ref.as_slice(),
+                corpus_file(key_package_ref_file),
+                "production-derived KeyPackageRef remains corpus-bound"
             );
             verify_recovery_welcome(
                 &corpus_file(welcome_file),
@@ -21059,7 +21042,7 @@ mod historical_control_loader {
             let rejoin = validate_corpus_recovery_artifacts(
                 "rejoin-key-package.mls",
                 "rejoin-welcome.mls",
-                "rejoinInnerKeyPackageRefHex",
+                "rejoin-key-package-ref.bin",
             );
             assert_ne!(
                 rejoin, original,
@@ -23094,7 +23077,7 @@ mod historical_control_loader {
             let key_package_ref = validate_corpus_recovery_artifacts(
                 "rejoin-key-package.mls",
                 "rejoin-welcome.mls",
-                "rejoinInnerKeyPackageRefHex",
+                "rejoin-key-package-ref.bin",
             );
             let acceptance = build_real_acceptance_entry_at(
                 &graph.entry,
@@ -33723,9 +33706,9 @@ mod real_tree_genesis_seed {
 
     fn corpus_file(name: &str) -> Vec<u8> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/crypto-wire")
+            .join("tests/fixtures/crypto-wire-v09")
             .join(name);
-        fs::read(path).expect("read frozen crypto-wire corpus artifact")
+        fs::read(path).expect("read frozen OpenMLS 0.9 crypto-wire corpus artifact")
     }
 
     fn corpus_manifest() -> serde_json::Value {

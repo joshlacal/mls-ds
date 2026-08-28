@@ -28,7 +28,7 @@
 #![allow(dead_code)]
 
 mod common;
-pub use catbird_server::{auth, identity, util};
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -48,6 +48,13 @@ mod relationship_policy_source;
 // populated materialization tests, and so the B-read admission seam
 // (`dpop`/`read_authority`/`repository::auth`) is drivable for real.
 mod chat_protocol {
+    pub mod federation_routing {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/federation_routing.rs"
+        ));
+    }
     pub mod cursor {
         pub use crate::cursor::*;
     }
@@ -88,6 +95,13 @@ mod chat_protocol {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/read_authority.rs"
+        ));
+    }
+    pub mod read_projection {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/read_projection.rs"
         ));
     }
     pub mod relationship_policy {
@@ -177,6 +191,203 @@ mod chat_protocol {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/chat_protocol/repository/transition.rs"
             ));
+        }
+        #[allow(dead_code)]
+        pub mod acceptance {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/acceptance.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod creation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/creation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod leave {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/leave.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod reset {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/reset.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod revocation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/revocation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod submit_transition {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/submit_transition.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod welcome_terminal {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome_terminal.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod welcome {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod subscription {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/subscription.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod message_delivery {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/message_delivery.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod entry_read {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/entry_read.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod coordinate {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/coordinate.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod remote_prefix {
+            use uuid::Uuid;
+            #[derive(Debug)]
+            pub struct HistoricalWriteWitness {
+                pub(crate) _sealed: (),
+            }
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub enum BootstrapLocalIdLabel {
+                ParticipantPeriod,
+                LeafPeriod,
+                MetadataSnapshot,
+            }
+            impl BootstrapLocalIdLabel {
+                pub fn as_str(&self) -> &'static str {
+                    match self {
+                        Self::ParticipantPeriod => "participant-period",
+                        Self::LeafPeriod => "leaf-period",
+                        Self::MetadataSnapshot => "metadata-snapshot",
+                    }
+                }
+            }
+
+            pub fn derive_bootstrap_local_id(
+                conversation_id: Uuid,
+                source_entry_id: Uuid,
+                label: BootstrapLocalIdLabel,
+                entity_key: &[u8],
+            ) -> Uuid {
+                catbird_server::chat_protocol::derive_bootstrap_local_id_for_test(
+                    conversation_id,
+                    source_entry_id,
+                    label.as_str(),
+                    entity_key,
+                )
+            }
+        }
+        #[allow(dead_code)]
+        pub mod conversation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/conversation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod expiry_sweep {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/expiry_sweep.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod device_directory {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/device_directory.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod federation {
+            use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+            use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+            use jacquard_common::DefaultStr;
+            use uuid::Uuid;
+
+            #[allow(clippy::too_many_arguments)]
+            pub async fn enqueue_federated_welcome_job(
+                _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _target_ds_did: &str,
+                _recipient_did_str: &str,
+                _recipient_device_id: Uuid,
+                _welcome_id: Uuid,
+                _recovery_request_id: Uuid,
+                _reserved_ref: &[u8; 32],
+                _opaque_welcome: &[u8],
+                _sha256: &[u8; 32],
+                _append: &super::delivery::AppendEntry,
+                _seq: u64,
+                _coordinates: ConversationCoordinates,
+                _pub_snap_sha: &[u8; 32],
+                _tree_sum_sha: &[u8; 32],
+                _sequencer_term: u64,
+            ) -> Result<Uuid, super::super::state_machine::ExecutorError> {
+                Ok(Uuid::nil())
+            }
+
+            pub async fn enqueue_clean_federation_message_jobs(
+                _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _entry: &super::delivery::AppendEntry,
+                _seq: u64,
+                _sequencer_term: u64,
+            ) -> Result<usize, catbird_server::federation::errors::FederationError> {
+                Ok(0)
+            }
+
+            pub fn build_federated_commit_envelope(
+                _conversation_id: Uuid,
+                _transition_id: Uuid,
+                _sequencer_ds_did: &str,
+                _signed_request_bytes: &[u8],
+                _sequencer_term: u64,
+                _received_at: &crate::chat_protocol::validation::CanonicalTimestamp,
+            ) -> Result<SubmitCommit<DefaultStr>, catbird_server::federation::errors::FederationError>
+            {
+                Err(
+                    catbird_server::federation::errors::FederationError::InvalidEnvelope {
+                        reason: "test stub".to_string(),
+                    },
+                )
+            }
         }
     }
     pub mod state_machine {
@@ -4470,8 +4681,8 @@ async fn gc_reclaim_of_the_expired_session_permits_a_new_session_under_the_same_
         "the identity-immutable trigger forbids a plain DELETE outside the GC"
     );
 
-    // The sealed GC reclaims the expired row (children before parents; the
-    // GC's session_replication_role switch skips the immutable triggers).
+    // The sealed GC reclaims the expired row children-first while its exact,
+    // transaction-local table scope authorizes each otherwise-immutable delete.
     let removed: i64 = sqlx::query_scalar("SELECT chat.gc_expired_inventory_sessions($1)")
         .bind(100_i32)
         .fetch_one(&pool)
@@ -4559,6 +4770,182 @@ async fn gc_reclaim_of_the_expired_session_permits_a_new_session_under_the_same_
         replayed.sha256, stored,
         "the new session's first page serves and replays byte-identically"
     );
+}
+
+#[tokio::test]
+async fn targeted_inventory_gc_does_not_sweep_cross_device_orphans() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    seed_fixed_admission_device(&pool).await;
+    let device = fixed_admission_device();
+    let now = whole_second(clock_now(&pool).await);
+    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
+    let mut random = DeterministicRandom::new(0xD3F4);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let mut transaction = pool.begin().await.expect("begin receipt fixture");
+    serve_page_receipt_seed(
+        &mut transaction,
+        &fence,
+        &session,
+        "conversations",
+        "blue.catbird.chat.getConversations",
+        &conversations_request(100),
+        None,
+        None,
+        &[],
+        false,
+        &mut random,
+    )
+    .await;
+    transaction.commit().await.expect("commit receipt fixture");
+
+    let mut orphan = pool.begin().await.expect("begin legacy orphan fixture");
+    sqlx::query("SET LOCAL session_replication_role = 'replica'")
+        .execute(&mut *orphan)
+        .await
+        .expect("disable triggers for the isolated legacy fixture");
+    sqlx::query("DELETE FROM chat.inventory_sessions WHERE inventory_session_id = $1")
+        .bind(session_id)
+        .execute(&mut *orphan)
+        .await
+        .expect("remove the legacy fixture parent");
+    orphan.commit().await.expect("commit legacy orphan fixture");
+
+    let count_receipts_sql = "SELECT count(*) FROM chat.inventory_page_receipts \
+                              WHERE inventory_session_id = $1";
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts");
+    assert_eq!(orphan_receipts, 1);
+
+    let mut targeted = pool.begin().await.expect("begin targeted GC");
+    sqlx::query("SELECT set_config('chat.inventory_gc_target_user_did',$1,true)")
+        .bind(&device.did)
+        .execute(&mut *targeted)
+        .await
+        .expect("set targeted GC user");
+    sqlx::query("SELECT set_config('chat.inventory_gc_target_device_id',$1,true)")
+        .bind(device.device_id.to_string())
+        .execute(&mut *targeted)
+        .await
+        .expect("set targeted GC device");
+    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(100)")
+        .fetch_one(&mut *targeted)
+        .await
+        .expect("run targeted GC");
+    targeted.commit().await.expect("commit targeted GC");
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts after targeted GC");
+    assert_eq!(
+        orphan_receipts, 1,
+        "request-path targeted GC must not sweep legacy orphans"
+    );
+
+    sqlx::query_scalar::<_, i64>("SELECT chat.gc_expired_inventory_sessions(1)")
+        .fetch_one(&pool)
+        .await
+        .expect("run bounded background GC");
+    let orphan_receipts: i64 = sqlx::query_scalar(count_receipts_sql)
+        .bind(session_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count orphan receipts after background GC");
+    assert_eq!(
+        orphan_receipts, 0,
+        "untargeted background GC drains the orphan"
+    );
+}
+
+#[tokio::test]
+async fn exact_inventory_session_delete_reclaims_live_snapshot_children() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    seed_fixed_admission_device(&pool).await;
+    let device = fixed_admission_device();
+    let now = whole_second(clock_now(&pool).await);
+    let session_id = derive_inventory_session_uuid(&device.did, device.device_id, &device.jkt, 1);
+    let mut random = DeterministicRandom::new(0xD3F5);
+    let session = seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let mut transaction = pool.begin().await.expect("begin receipt fixture");
+    serve_page_receipt_seed(
+        &mut transaction,
+        &fence,
+        &session,
+        "conversations",
+        "blue.catbird.chat.getConversations",
+        &conversations_request(100),
+        None,
+        None,
+        &[],
+        false,
+        &mut random,
+    )
+    .await;
+    transaction.commit().await.expect("commit receipt fixture");
+
+    let wrong_identity: bool =
+        sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+            .bind(session_id)
+            .bind(&device.did)
+            .bind(Uuid::new_v4())
+            .fetch_one(&pool)
+            .await
+            .expect("run mismatched exact delete");
+    assert!(
+        !wrong_identity,
+        "a mismatched device cannot delete the session"
+    );
+
+    let deleted: bool = sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+        .bind(session_id)
+        .bind(&device.did)
+        .bind(device.device_id)
+        .fetch_one(&pool)
+        .await
+        .expect("run exact session delete");
+    assert!(deleted, "the exact live session is deleted");
+
+    let (sessions, receipts): (i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM chat.inventory_sessions WHERE inventory_session_id=$1), \
+         (SELECT count(*) FROM chat.inventory_page_receipts WHERE inventory_session_id=$1)",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count exact-delete residue");
+    assert_eq!((sessions, receipts), (0, 0));
 }
 
 // ===========================================================================

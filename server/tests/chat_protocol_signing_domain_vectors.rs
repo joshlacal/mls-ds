@@ -1,7 +1,7 @@
 //! Known-answer vectors for the ten active signing domains that no control-entry
 //! case covers.
 //!
-//! `mls_chat_contract_vectors.json` pins fourteen of the twenty-five signing
+//! `mls_chat_contract_vectors.json` pins fourteen of the twenty-four signing
 //! domains: the thirteen control entries, plus `CATBIRD-CHAT-BLOB-DELETE` from
 //! its one `signedMutator` case. The other ten — `CATBIRD-CHAT-MESSAGE`, the
 //! application-send domain, above all — had no server vector anywhere, so every
@@ -73,10 +73,10 @@ const CANONICAL_LEXICON: &[u8] =
 const CANONICAL_LEXICON_PATH: &str = "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json";
 const CANONICAL_SOURCE_LEXICON_PATH: &str =
     "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json";
-const CANONICAL_SOURCE_LEXICON_REVISION: &str = "8ec8acaa1137b68b57b78ebfaea9404d5923305b";
+const CANONICAL_SOURCE_LEXICON_REVISION: &str = "34e5cc3b23cc30b4a3ea837719614c436898d321";
 const CANONICAL_SOURCE_CORPUS_REVISION: &str = "a063ed8f995031fa0cf122bca3f4f82c89f08c90";
 const CANONICAL_SOURCE_LEXICON_SHA256: &str =
-    "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf";
+    "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639";
 
 /// A fixed, test-only Ed25519 seed. It is not the RFC 8032 seed the existing
 /// `signedMutator` vector uses, so a case cross-wired between the two fixtures
@@ -133,9 +133,7 @@ fn unpinned_body_names() -> Vec<&'static str> {
     SignedMutationKind::ALL
         .into_iter()
         .filter(|kind| {
-            *kind != SignedMutationKind::BlobDeletion
-                && *kind != SignedMutationKind::DeviceAuthenticationRebind
-                && !control.contains(kind.body_name())
+            *kind != SignedMutationKind::BlobDeletion && !control.contains(kind.body_name())
         })
         .map(SignedMutationKind::body_name)
         .collect()
@@ -402,7 +400,6 @@ fn every_signing_domain_now_has_a_server_vector() {
     ]);
     let enum_kinds: BTreeSet<&'static str> = SignedMutationKind::ALL
         .into_iter()
-        .filter(|kind| *kind != SignedMutationKind::DeviceAuthenticationRebind)
         .map(SignedMutationKind::body_name)
         .collect();
     assert_eq!(enum_kinds, expected, "the enum operation set drifted");
@@ -416,7 +413,7 @@ fn every_signing_domain_now_has_a_server_vector() {
     assert_eq!(unpinned.len(), 10);
     assert_eq!(
         control.len() + 1 + unpinned.len(),
-        SignedMutationKind::ALL.len() - 1
+        SignedMutationKind::ALL.len()
     );
     assert_eq!(
         unpinned,
@@ -734,22 +731,4 @@ fn participant_acceptance_server_fields_accepts_bytes_envelope() {
     )
     .expect("must decode serverFields with bytes envelopes");
     assert!(!sf.canonical_dag_cbor().is_empty());
-}
-
-#[test]
-fn live_submit_transition_fulfillment_decodes_and_verifies() {
-    let raw_file: serde_json::Value = serde_json::from_slice(
-        &std::fs::read("/tmp/last_blue.catbird.chat.submitTransition_body.json")
-            .expect("read last body"),
-    )
-    .unwrap();
-    let signed_req_bytes = serde_json::to_vec(&raw_file["signedRequest"]).unwrap();
-    let public_key =
-        hex::decode("e39325e78052440a7b49e33c39c9a228309678e2cf0f69f67d734d245c7d416d").unwrap();
-    let res = decode_and_verify_signed_mutation(&signed_req_bytes, &public_key);
-    println!(
-        "decode_and_verify_signed_mutation fulfillment result: {:?}",
-        res
-    );
-    assert!(res.is_ok());
 }

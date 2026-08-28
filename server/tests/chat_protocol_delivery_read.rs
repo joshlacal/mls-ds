@@ -27,13 +27,13 @@
 
 mod common;
 
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
 mod repository {
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use base64::{

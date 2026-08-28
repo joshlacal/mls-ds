@@ -27,7 +27,7 @@ pub struct CleanProtocol13ManifestEntry {
     pub migration: Migration,
 }
 
-pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 23]> = LazyLock::new(
+pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 28]> = LazyLock::new(
     || {
         [
             CleanProtocol13ManifestEntry {
@@ -252,12 +252,62 @@ pub static CLEAN_PROTOCOL_13_MANIFEST: LazyLock<[CleanProtocol13ManifestEntry; 2
             },
             CleanProtocol13ManifestEntry {
                 filename: "20260824000005_chat_federation_outbox_retry.sql",
-                reviewed_sha384: "b8b925e08f1da6b2f2932afa11e2434cc96d0f8a8f79c51b2f37e7e5da1dd59b188d6e96c98358f398578ba95935a2f9",
+                reviewed_sha384: "6d20fd054646d7da6de338b9ae27fea7c81a19569dfebc6231de5bc23bc79ca9aa22ab790cead55d82b06846f81dd799",
                 migration: Migration::new(
                     20260824000005,
                     Cow::Borrowed("chat federation outbox retry"),
                     MigrationType::Simple,
                     Cow::Borrowed(include_str!("../../migrations/20260824000005_chat_federation_outbox_retry.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260828000001_chat_historical_bootstrap_quota.sql",
+                reviewed_sha384: "c063fd2991cb28ce6947c587f11e2316bb5e02587873d86e89ff74476f880796c63ca1a90064f70c10fe7ed7cc0eb293",
+                migration: Migration::new(
+                    20260828000001,
+                    Cow::Borrowed("chat historical bootstrap quota"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260828000001_chat_historical_bootstrap_quota.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260828000002_chat_historical_bootstrap_application.sql",
+                reviewed_sha384: "7095f7c32b74c6660fcf8c03610ee88c8db5330639088a907fc996a20d7f47f948ca43ff64cef014a1107bf9626c0013",
+                migration: Migration::new(
+                    20260828000002,
+                    Cow::Borrowed("chat historical bootstrap application"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260828000002_chat_historical_bootstrap_application.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260828000003_chat_historical_bootstrap_cutoff_validate.sql",
+                reviewed_sha384: "4e2387ebf31369278e1504a8e00e548a0fd80eafc2adb5a461c01ceab30be2bd84e841eba12a366f51f5a1b1617a3917",
+                migration: Migration::new(
+                    20260828000003,
+                    Cow::Borrowed("chat historical bootstrap cutoff validate"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260828000003_chat_historical_bootstrap_cutoff_validate.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260828000004_chat_device_push_tokens.sql",
+                reviewed_sha384: "f8f4da493f6a3bf6261d2e09d6706ec6b4a395511a1eed6c5a557b5bb119b6f04aeabd9d3514db984e5e695894fe2fb1",
+                migration: Migration::new(
+                    20260828000004,
+                    Cow::Borrowed("chat device push tokens"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260828000004_chat_device_push_tokens.sql")),
+                ),
+            },
+            CleanProtocol13ManifestEntry {
+                filename: "20260828000005_fix_inventory_session_gc_scoping.sql",
+                reviewed_sha384: "cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2",
+                migration: Migration::new(
+                    20260828000005,
+                    Cow::Borrowed("fix inventory session gc scoping"),
+                    MigrationType::Simple,
+                    Cow::Borrowed(include_str!("../../migrations/20260828000005_fix_inventory_session_gc_scoping.sql")),
                 ),
             },
         ]
@@ -279,9 +329,6 @@ impl MigrationSource<'static> for CleanProtocol13MigrationSource {
 }
 
 pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
-    if CLEAN_PROTOCOL_13_MANIFEST.len() != 23 {
-        return Err("reviewed clean-protocol manifest must contain exactly 23 migrations".into());
-    }
     for (index, entry) in CLEAN_PROTOCOL_13_MANIFEST.iter().enumerate() {
         let filename_version = entry
             .filename
@@ -311,7 +358,10 @@ pub async fn reviewed_clean_protocol_migrator() -> Result<Migrator, String> {
         .map_err(|error| format!("resolve reviewed clean-protocol migrator: {error}"))?;
     migrator.set_ignore_missing(false);
     migrator.set_locking(true);
-    if migrator.ignore_missing || !migrator.locking || migrator.iter().count() != 23 {
+    if migrator.ignore_missing
+        || !migrator.locking
+        || migrator.iter().count() != CLEAN_PROTOCOL_13_MANIFEST.len()
+    {
         return Err("reviewed clean-protocol migrator policy mismatch".into());
     }
     for (entry, migration) in CLEAN_PROTOCOL_13_MANIFEST.iter().zip(migrator.iter()) {
@@ -1042,12 +1092,22 @@ async fn validate_exact_reviewed_ledger(
         .collect::<Vec<_>>();
     if actual != expected {
         return Err(
-            "clean-chat fixed target is not the exact reviewed 21-row installation; \
+            "clean-chat fixed target is not the exact reviewed migration installation; \
              validation-only setup refuses migration or repair"
                 .into(),
         );
     }
     Ok(actual)
+}
+
+/// Serializes tests that exercise the intentionally global outbox claim scan.
+pub async fn acquire_outbox_test_lock(pool: &PgPool) -> sqlx::Transaction<'_, sqlx::Postgres> {
+    let mut transaction = pool.begin().await.expect("begin outbox test lock");
+    sqlx::query("SELECT pg_advisory_xact_lock(1128354882, 1330992194)")
+        .execute(&mut *transaction)
+        .await
+        .expect("acquire outbox test lock");
+    transaction
 }
 
 #[allow(dead_code)]
@@ -1106,6 +1166,7 @@ pub async fn setup_chat_protocol_db(max_connections: u32) -> PgPool {
         .await
         .expect("fixed-target setup is validation-only");
 
+    let _migration_guard = crate::common::fresh_db::acquire_migration_lock().await;
     let mut migration_connection = pool
         .acquire()
         .await
@@ -1135,4 +1196,68 @@ pub async fn setup_chat_protocol_db(max_connections: u32) -> PgPool {
         "fixed-target setup attempted to mutate the exact reviewed ledger"
     );
     pool
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DbContentSnapshot {
+    pub table_rows: std::collections::BTreeMap<&'static str, Vec<String>>,
+}
+
+pub async fn snapshot_db_content(pool: &PgPool) -> DbContentSnapshot {
+    let tables = [
+        "chat.conversations",
+        "chat.generations",
+        "chat.participants",
+        "chat.entries",
+        "chat.transitions",
+        "chat.generation_states",
+        "chat.metadata_snapshots",
+        "chat.entry_recipients",
+        "chat.events",
+        "chat.event_recipients",
+        "chat.member_devices",
+        "chat.application_intervals",
+        "chat.operation_claims",
+        "chat.idempotency_records",
+        "chat.federation_delivery_receipts",
+        "chat.recovery_work_items",
+        "chat.welcome_bundles",
+        "chat.welcome_deliveries",
+        "chat.welcome_dispositions",
+        "chat.reset_requests",
+        "chat.leave_requests",
+        "chat.leaf_recovery_requests",
+        "chat.outbox",
+        "chat.message_sends",
+        "federation_sync_state",
+        "federation_outbox",
+        "outbound_queue",
+        "chat.key_package_reservations",
+        "chat.key_packages",
+        "ds_endpoints",
+        "did_ds_mappings",
+    ];
+    let mut table_rows = std::collections::BTreeMap::new();
+    for table in tables {
+        let query = format!("SELECT to_jsonb(row_data)::text FROM {table} AS row_data ORDER BY 1");
+        let rows = sqlx::query_scalar(&query)
+            .fetch_all(pool)
+            .await
+            .expect("snapshot table content");
+        table_rows.insert(table, rows);
+    }
+
+    DbContentSnapshot { table_rows }
+}
+
+pub async fn assert_zero_db_writes(
+    pool: &PgPool,
+    before_snapshot: &DbContentSnapshot,
+    context: &str,
+) {
+    let after_snapshot = snapshot_db_content(pool).await;
+    assert_eq!(
+        before_snapshot, &after_snapshot,
+        "{context}: expected zero database writes across all protected tables"
+    );
 }

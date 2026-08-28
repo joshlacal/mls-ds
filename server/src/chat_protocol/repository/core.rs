@@ -10351,6 +10351,60 @@ pub(crate) async fn is_conversation_quarantined(
     .await
 }
 
+pub(crate) async fn record_conversation_quarantine(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    sequencer_ds_did: &str,
+    sequencer_term: i64,
+    last_seq: i64,
+    last_epoch: i64,
+    last_digest_sha256: &[u8; 32],
+    quarantine_reason: &str,
+    first_mismatch_seq: i64,
+) -> Result<(), sqlx::Error> {
+    if first_mismatch_seq <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "first_mismatch_seq must be positive".into(),
+        ));
+    }
+    let convo_id_str = conversation_id.to_string();
+    let canonical_seq = crate::identity::canonical_did(sequencer_ds_did);
+    let rows_affected = sqlx::query(
+        r#"
+        INSERT INTO federation_sync_state
+            (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status, quarantined_at, quarantine_reason, first_mismatch_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, NOW(), 'quarantined', NOW(), $7, $8)
+         ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
+            quarantined_at = COALESCE(federation_sync_state.quarantined_at, EXCLUDED.quarantined_at),
+            quarantine_reason = COALESCE(federation_sync_state.quarantine_reason, EXCLUDED.quarantine_reason),
+            first_mismatch_seq = COALESCE(federation_sync_state.first_mismatch_seq, EXCLUDED.first_mismatch_seq),
+            last_seq = CASE WHEN federation_sync_state.status = 'quarantined' THEN federation_sync_state.last_seq ELSE EXCLUDED.last_seq END,
+            last_epoch = CASE WHEN federation_sync_state.status = 'quarantined' THEN federation_sync_state.last_epoch ELSE EXCLUDED.last_epoch END,
+            last_digest = CASE WHEN federation_sync_state.status = 'quarantined' THEN federation_sync_state.last_digest ELSE EXCLUDED.last_digest END,
+            status = 'quarantined',
+            drift_count = federation_sync_state.drift_count + 1,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&convo_id_str)
+    .bind(canonical_seq)
+    .bind(sequencer_term)
+    .bind(last_seq)
+    .bind(last_epoch)
+    .bind(hex::encode(last_digest_sha256))
+    .bind(quarantine_reason)
+    .bind(first_mismatch_seq)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    Ok(())
+}
+
 /// Hydrate, validate, and seal one active or terminal conversation graph under
 /// the caller's transaction-local conversation-row lock.
 ///

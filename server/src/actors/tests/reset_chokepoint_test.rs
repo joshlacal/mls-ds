@@ -208,21 +208,8 @@ mod outbox_db_tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    async fn setup_test_db() -> PgPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-
-        let config = DbConfig {
-            database_url,
-            max_connections: 4,
-            min_connections: 1,
-            acquire_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(600),
-        };
-
-        init_db(config)
-            .await
-            .expect("Failed to initialize test database")
+    async fn setup_test_db() -> (PgPool, super::super::fresh_db::DisposableDatabase) {
+        super::super::fresh_db::fresh_legacy_pool("actor_choke_", 4, 1).await
     }
 
     async fn wipe(pool: &PgPool, convo_id: &str) {
@@ -331,7 +318,7 @@ mod outbox_db_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL (and migration 20260429000003 applied)"]
     async fn chokepoint_request_writes_outbox_rows_same_tx() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = format!("convo-chokepoint-outbox-{}", Uuid::new_v4());
         wipe(&pool, &convo_id).await;
         seed(&pool, &convo_id).await;
@@ -437,21 +424,8 @@ mod self_heal_db_tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    async fn setup_test_db() -> PgPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-
-        let config = DbConfig {
-            database_url,
-            max_connections: 4,
-            min_connections: 1,
-            acquire_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(600),
-        };
-
-        init_db(config)
-            .await
-            .expect("Failed to initialize test database")
+    async fn setup_test_db() -> (PgPool, super::super::fresh_db::DisposableDatabase) {
+        super::super::fresh_db::fresh_legacy_pool("actor_choke_", 4, 1).await
     }
 
     async fn wipe(pool: &PgPool, convo_id: &str) {
@@ -571,7 +545,7 @@ mod self_heal_db_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn self_heal_chokepoint_updates_orphan_row_in_place() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = format!("convo-self-heal-{}", Uuid::new_v4());
         wipe(&pool, &convo_id).await;
         let (orphan_id, orphan_mls_group_id) = seed_orphan(&pool, &convo_id).await;
@@ -776,7 +750,7 @@ mod self_heal_db_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn self_heal_chokepoint_idempotent_replay() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = format!("convo-self-heal-replay-{}", Uuid::new_v4());
         wipe(&pool, &convo_id).await;
         let (orphan_id, _) = seed_orphan(&pool, &convo_id).await;
@@ -866,7 +840,7 @@ mod self_heal_db_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL"]
     async fn self_heal_clears_stale_pending_welcomes() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = format!("convo-self-heal-stale-pw-{}", Uuid::new_v4());
         wipe(&pool, &convo_id).await;
         let (orphan_id, _) = seed_orphan(&pool, &convo_id).await;

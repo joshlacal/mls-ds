@@ -3508,3 +3508,328 @@ fn digest_optional_time(digest: &mut Sha256, value: Option<DateTime<Utc>>) {
         }
     }
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PendingSealKindForTest {
+    Request,
+    Activation,
+}
+
+#[cfg(test)]
+pub(crate) async fn seal_pending_for_test(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &ScopeBoundBusinessAuthority,
+    conversation_id: Uuid,
+    preparation_kind: PendingSealKindForTest,
+    operation_id: Uuid,
+    dispose_lapsed: bool,
+) -> Result<Option<LockedPendingResetRequestGuard>, ResetRepositoryError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    if transaction_id != scope.transaction_id() {
+        return Err(ResetRepositoryError::ForeignTransaction);
+    }
+    let trusted_instant = scope.trusted_instant();
+    let aggregate = super::core::hydrate_locked_conversation_state(
+        transaction,
+        conversation_id,
+        trusted_instant,
+    )
+    .await
+    .map_err(map_aggregate_error)?;
+    let head = aggregate.head();
+    let head_coordinate = head
+        .prior_coordinate()
+        .ok_or(ResetRepositoryError::ConversationMissing)?;
+    let head_digest = *head.durable_row_digest();
+    let Some(row) = load_locked_pending_row(transaction, conversation_id).await? else {
+        return Ok(None);
+    };
+    let kind = match preparation_kind {
+        PendingSealKindForTest::Request => ResetPreparationKind::Request,
+        PendingSealKindForTest::Activation => ResetPreparationKind::Activation,
+    };
+    let binding = if dispose_lapsed
+        && matches!(kind, ResetPreparationKind::Request)
+        && trusted_instant >= row.expires_at
+    {
+        ResetAuthorityBinding::RecordedForDisposal
+    } else {
+        ResetAuthorityBinding::Live
+    };
+    seal_pending_reset(
+        row,
+        &transaction_id,
+        trusted_instant,
+        scope,
+        head_coordinate,
+        head_digest,
+        kind,
+        operation_id,
+        binding,
+    )
+    .map(Some)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PendingResetCasExpectationMutation {
+    ResetRequestId,
+    ConversationId,
+    RequesterDid,
+    RequesterDeviceId,
+    RequesterKeyId,
+    RequesterAuthGeneration,
+    PriorGeneration,
+    PriorStateVersion,
+    PriorGroupId,
+    PriorEpoch,
+    PriorGroupContextHash,
+    PriorConfirmationTag,
+    Reason,
+    SignedRequestBytes,
+    SigningTranscriptBytes,
+    RequestDigest,
+    Signature,
+    ReceivedAt,
+    ExpiresAt,
+}
+
+#[cfg(test)]
+pub(crate) const ALL_PENDING_RESET_CAS_EXPECTATION_MUTATIONS: [PendingResetCasExpectationMutation;
+    19] = [
+    PendingResetCasExpectationMutation::ResetRequestId,
+    PendingResetCasExpectationMutation::ConversationId,
+    PendingResetCasExpectationMutation::RequesterDid,
+    PendingResetCasExpectationMutation::RequesterDeviceId,
+    PendingResetCasExpectationMutation::RequesterKeyId,
+    PendingResetCasExpectationMutation::RequesterAuthGeneration,
+    PendingResetCasExpectationMutation::PriorGeneration,
+    PendingResetCasExpectationMutation::PriorStateVersion,
+    PendingResetCasExpectationMutation::PriorGroupId,
+    PendingResetCasExpectationMutation::PriorEpoch,
+    PendingResetCasExpectationMutation::PriorGroupContextHash,
+    PendingResetCasExpectationMutation::PriorConfirmationTag,
+    PendingResetCasExpectationMutation::Reason,
+    PendingResetCasExpectationMutation::SignedRequestBytes,
+    PendingResetCasExpectationMutation::SigningTranscriptBytes,
+    PendingResetCasExpectationMutation::RequestDigest,
+    PendingResetCasExpectationMutation::Signature,
+    PendingResetCasExpectationMutation::ReceivedAt,
+    PendingResetCasExpectationMutation::ExpiresAt,
+];
+
+#[cfg(test)]
+pub(crate) fn scope_rows_for_test(
+    prelude: &PreparedBusinessPrelude,
+) -> Vec<(String, Uuid, Option<String>)> {
+    let scope = prelude.scope_authority();
+    let mut rows = scope
+        .keys()
+        .iter()
+        .map(|key| {
+            (
+                key.user_did().to_owned(),
+                key.device_id(),
+                Some(key.key_id().to_owned()),
+            )
+        })
+        .collect::<Vec<_>>();
+    for device in scope.devices() {
+        if !rows
+            .iter()
+            .any(|row| row.0 == device.user_did() && row.1 == device.device_id())
+        {
+            rows.push((device.user_did().to_owned(), device.device_id(), None));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+#[cfg(test)]
+pub(crate) fn activation_request_for_test(
+    authority: LockedResetActivationAuthority,
+) -> LockedPendingResetRequestGuard {
+    authority.request
+}
+
+#[cfg(test)]
+pub(crate) fn authority_prior_for_test(
+    authority: &LockedResetRequestAuthority,
+) -> Option<PublicGroupSnapshotCoordinate> {
+    authority.aggregate.head().prior_coordinate().cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn corrupt_guard_trusted_instant_for_test(
+    mut guard: LockedPendingResetRequestGuard,
+) -> LockedPendingResetRequestGuard {
+    guard.trusted_instant += chrono::Duration::milliseconds(1);
+    guard
+}
+
+#[cfg(test)]
+pub(crate) fn mutate_pending_reset_cas_expectation_for_test(
+    mut guard: LockedPendingResetRequestGuard,
+    mutation: PendingResetCasExpectationMutation,
+) -> LockedPendingResetRequestGuard {
+    match mutation {
+        PendingResetCasExpectationMutation::ResetRequestId => {
+            guard.reset_request_id = Uuid::new_v4()
+        }
+        PendingResetCasExpectationMutation::ConversationId => {
+            guard.conversation_id = Uuid::new_v4()
+        }
+        PendingResetCasExpectationMutation::RequesterDid => {
+            guard.requester_did = "did:plc:casdriftfixtureaaaaaaaa"
+                .to_owned()
+                .into_boxed_str()
+        }
+        PendingResetCasExpectationMutation::RequesterDeviceId => {
+            guard.requester_device_id = Uuid::new_v4()
+        }
+        PendingResetCasExpectationMutation::RequesterKeyId => {
+            guard.requester_key_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                .to_owned()
+                .into_boxed_str()
+        }
+        PendingResetCasExpectationMutation::RequesterAuthGeneration => {
+            guard.requester_auth_generation += 1
+        }
+        PendingResetCasExpectationMutation::PriorGeneration => {
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation() + 1,
+                guard.prior.state_version(),
+                *guard.prior.group_id(),
+                guard.prior.epoch(),
+                *guard.prior.group_context_hash(),
+                *guard.prior.confirmation_tag(),
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::PriorStateVersion => {
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation(),
+                guard.prior.state_version() + 1,
+                *guard.prior.group_id(),
+                guard.prior.epoch(),
+                *guard.prior.group_context_hash(),
+                *guard.prior.confirmation_tag(),
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::PriorGroupId => {
+            let mut value = *guard.prior.group_id();
+            value[0] ^= 1;
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation(),
+                guard.prior.state_version(),
+                value,
+                guard.prior.epoch(),
+                *guard.prior.group_context_hash(),
+                *guard.prior.confirmation_tag(),
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::PriorEpoch => {
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation(),
+                guard.prior.state_version(),
+                *guard.prior.group_id(),
+                guard.prior.epoch() + 1,
+                *guard.prior.group_context_hash(),
+                *guard.prior.confirmation_tag(),
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::PriorGroupContextHash => {
+            let mut value = *guard.prior.group_context_hash();
+            value[0] ^= 1;
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation(),
+                guard.prior.state_version(),
+                *guard.prior.group_id(),
+                guard.prior.epoch(),
+                value,
+                *guard.prior.confirmation_tag(),
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::PriorConfirmationTag => {
+            let mut value = *guard.prior.confirmation_tag();
+            value[0] ^= 1;
+            guard.prior = PublicGroupSnapshotCoordinate::new(
+                *guard.prior.conversation_id(),
+                guard.prior.generation(),
+                guard.prior.state_version(),
+                *guard.prior.group_id(),
+                guard.prior.epoch(),
+                *guard.prior.group_context_hash(),
+                value,
+                guard.prior.lifecycle(),
+            )
+        }
+        PendingResetCasExpectationMutation::Reason => {
+            guard.reason = "poisonedState".to_owned().into_boxed_str()
+        }
+        PendingResetCasExpectationMutation::SignedRequestBytes => {
+            guard.signed_request_bytes[0] ^= 1
+        }
+        PendingResetCasExpectationMutation::SigningTranscriptBytes => {
+            guard.signing_transcript_bytes[0] ^= 1
+        }
+        PendingResetCasExpectationMutation::RequestDigest => guard.request_digest[0] ^= 1,
+        PendingResetCasExpectationMutation::Signature => guard.signature[0] ^= 1,
+        PendingResetCasExpectationMutation::ReceivedAt => {
+            guard.received_at += chrono::Duration::milliseconds(1)
+        }
+        PendingResetCasExpectationMutation::ExpiresAt => {
+            guard.expires_at += chrono::Duration::milliseconds(1)
+        }
+    }
+
+    let row = PendingResetRow {
+        reset_request_id: guard.reset_request_id,
+        conversation_id: guard.conversation_id,
+        requester_did: guard.requester_did.to_string(),
+        requester_device_id: guard.requester_device_id,
+        requester_key_id: guard.requester_key_id.to_string(),
+        requester_auth_generation: guard.requester_auth_generation,
+        prior_generation: i64::try_from(guard.prior.generation()).unwrap(),
+        prior_state_version: i64::try_from(guard.prior.state_version()).unwrap(),
+        prior_group_id: guard.prior.group_id().to_vec(),
+        prior_epoch: i64::try_from(guard.prior.epoch()).unwrap(),
+        prior_group_context_hash: guard.prior.group_context_hash().to_vec(),
+        prior_confirmation_tag: guard.prior.confirmation_tag().to_vec(),
+        reason: guard.reason.to_string(),
+        status: "pending".to_owned(),
+        signed_request_bytes: guard.signed_request_bytes.to_vec(),
+        signing_transcript_bytes: guard.signing_transcript_bytes.to_vec(),
+        request_digest: guard.request_digest.to_vec(),
+        signature: guard.signature.to_vec(),
+        received_at: guard.received_at,
+        expires_at: guard.expires_at,
+        terminal_transition_id: None,
+        terminal_at: None,
+    };
+    guard.immutable_row_digest = reset_immutable_row_digest(&row, &guard.prior);
+    guard.guard_digest = locked_pending_reset_digest(
+        &guard.transaction_id,
+        guard.trusted_instant,
+        &guard.scope_digest,
+        &guard.head_digest,
+        &guard.immutable_row_digest,
+        &guard.requester_device_digest,
+        &guard.requester_key_digest,
+        guard.authorized_terminal,
+    );
+    guard
+}

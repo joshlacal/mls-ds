@@ -1,3 +1,10 @@
+//! Live regression tests for createConversation.
+//!
+//! Run with:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_create_conversation_regression -- --test-threads=1
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_server::chat_protocol::wire::{
     validate_group_info, GroupInfoValidationPolicy, WireValidationError,

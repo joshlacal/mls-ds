@@ -1,5 +1,4 @@
-//! Source-level composition checks for the three active device handlers.
-//!
+//! Source-level composition checks for the active device handlers.
 //! This independent target builds the real production library without the
 //! legacy `#[path]` fixture topology used by the ignored live-DB handler suite.
 
@@ -12,13 +11,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             "prepare_enrollment_operation",
             "persist_enrollment_bootstrap_effects",
             "complete_enrollment_bootstrap_operation",
-        ),
-        (
-            include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
-            "admit_rebind_operation_only",
-            "prepare_rebind_operation",
-            "persist_rebind_bootstrap_effects",
-            "complete_rebind_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
@@ -71,7 +63,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
 #[test]
 fn active_device_handlers_complete_only_after_their_mutation_effects_and_response() {
     let enroll = include_str!("../src/handlers/chat/enroll_device.rs");
-    let rebind = include_str!("../src/handlers/chat/rebind_device_authentication.rs");
     let replenish = include_str!("../src/handlers/chat/replenish_key_packages.rs");
 
     assert_in_handler_order(
@@ -80,15 +71,6 @@ fn active_device_handlers_complete_only_after_their_mutation_effects_and_respons
             "persist_enrollment_bootstrap_effects",
             "publish_enrollment_key_packages",
             "complete_enrollment_bootstrap_operation",
-            ".commit()",
-        ],
-    );
-    assert_in_handler_order(
-        rebind,
-        &[
-            "persist_rebind_bootstrap_effects",
-            "read_device_view(&mut transaction",
-            "complete_rebind_bootstrap_operation",
             ".commit()",
         ],
     );
@@ -122,10 +104,7 @@ fn bootstrap_completion_and_effect_adapters_keep_verified_authority_internal() {
     let auth = include_str!("../src/chat_protocol/repository/auth.rs");
     let prelude = include_str!("../src/chat_protocol/repository/prelude.rs");
 
-    for admission in [
-        "impl EnrollmentOperationAdmission",
-        "impl RebindOperationAdmission",
-    ] {
+    for admission in ["impl EnrollmentOperationAdmission"] {
         let block = auth
             .split_once(admission)
             .expect("admission implementation exists")
@@ -136,7 +115,6 @@ fn bootstrap_completion_and_effect_adapters_keep_verified_authority_internal() {
     }
     for wrapper in [
         "prepare_enrollment_operation",
-        "prepare_rebind_operation",
         "prepare_replenishment_operation",
     ] {
         assert!(
@@ -144,11 +122,7 @@ fn bootstrap_completion_and_effect_adapters_keep_verified_authority_internal() {
             "missing endpoint wrapper: {wrapper}"
         );
     }
-    for completion in [
-        "EnrollmentBootstrapCompletion",
-        "RebindBootstrapCompletion",
-        "ReplenishmentCompletion",
-    ] {
+    for completion in ["EnrollmentBootstrapCompletion", "ReplenishmentCompletion"] {
         assert!(
             prelude.contains(completion),
             "missing owned completion: {completion}"
@@ -156,7 +130,6 @@ fn bootstrap_completion_and_effect_adapters_keep_verified_authority_internal() {
     }
     for writer in [
         "persist_enrollment_bootstrap_effects",
-        "persist_rebind_bootstrap_effects",
         "publish_enrollment_key_packages",
         "publish_replenishment_key_packages",
     ] {
@@ -188,14 +161,28 @@ fn task7_uses_narrow_effect_capabilities_and_the_existing_device_completion_fami
         }
     }
 
-    for forbidden in [
-        "pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest",
-        "pub(crate) fn request(&self) -> &VerifiedChatDeviceRequest",
+    for capability in [
+        "impl EnrollmentBootstrapEffectAuthority",
+        "impl ReplenishmentKeyPackageAuthority",
     ] {
-        assert!(
-            !prelude.contains(forbidden),
-            "effect/prelude authority escape remains public to handlers: {forbidden}"
-        );
+        let implementation = prelude
+            .split_once(capability)
+            .expect("narrow effect capability exists")
+            .1
+            .split_once("\nimpl ")
+            .map_or_else(
+                || panic!("missing implementation after {capability}"),
+                |(body, _)| body,
+            );
+        for forbidden in [
+            "pub(crate) fn authority(&self) -> &VerifiedChatDeviceRequest",
+            "pub(crate) fn request(&self) -> &VerifiedChatDeviceRequest",
+        ] {
+            assert!(
+                !implementation.contains(forbidden),
+                "effect capability exposes raw authority: {capability}: {forbidden}"
+            );
+        }
     }
     let replenishment_completion = prelude
         .split_once("pub(crate) struct ReplenishmentCompletion")
@@ -227,23 +214,19 @@ fn task7_uses_narrow_effect_capabilities_and_the_existing_device_completion_fami
 #[test]
 fn bootstrap_effect_writers_bind_the_live_transaction_to_the_locked_scope() {
     let auth = include_str!("../src/chat_protocol/repository/auth.rs");
-    for writer in [
-        "pub(super) async fn persist_enrollment_bootstrap_effects",
-        "pub(super) async fn persist_rebind_bootstrap_effects",
-    ] {
-        let implementation = auth
-            .split_once(writer)
-            .expect("Task 7 effects writer exists")
-            .1;
-        assert!(
-            implementation.contains("SELECT txid_current()::text"),
-            "{writer} must capture the executing SQL transaction"
-        );
-        assert!(
-            implementation.contains("transaction_id != scope.transaction_id()"),
-            "{writer} must reject a scope borrowed from another transaction"
-        );
-    }
+    let writer = "pub(super) async fn persist_enrollment_bootstrap_effects";
+    let implementation = auth
+        .split_once(writer)
+        .expect("Task 7 effects writer exists")
+        .1;
+    assert!(
+        implementation.contains("SELECT txid_current()::text"),
+        "{writer} must capture the executing SQL transaction"
+    );
+    assert!(
+        implementation.contains("transaction_id != scope.transaction_id()"),
+        "{writer} must reject a scope borrowed from another transaction"
+    );
 
     let prelude = include_str!("../src/chat_protocol/repository/prelude.rs");
     for adapter in [

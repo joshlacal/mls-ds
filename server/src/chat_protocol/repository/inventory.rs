@@ -2141,31 +2141,17 @@ async fn reap_prior_device_inventory_sessions(
     device_id: Uuid,
 ) -> Result<(), InventoryRepositoryError> {
     sqlx::query(
-        r#"
-        DELETE FROM chat.device_inventory_items
-         WHERE device_inventory_session_id IN (
-             SELECT device_inventory_session_id
-               FROM chat.device_inventory_sessions
-              WHERE user_did = $1 AND device_id = $2
-         )
-        "#,
+        "SELECT set_config('chat.inventory_gc_target_user_did', $1, true), \
+                set_config('chat.inventory_gc_target_device_id', $2, true)",
     )
     .bind(user_did)
-    .bind(device_id)
+    .bind(device_id.to_string())
     .execute(&mut **transaction)
     .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.device_inventory_sessions
-         WHERE user_did = $1 AND device_id = $2
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
+    let _: i64 = sqlx::query_scalar("SELECT chat.gc_expired_device_inventory_sessions($1)")
+        .bind(100_i32)
+        .fetch_one(&mut **transaction)
+        .await?;
     Ok(())
 }
 
@@ -2174,108 +2160,18 @@ async fn reap_expired_and_excess_inventory_sessions(
     user_did: &str,
     device_id: Uuid,
 ) -> Result<(), InventoryRepositoryError> {
-    // 1. Delete all expired sessions and receipts for this device
     sqlx::query(
-        r#"
-        DELETE FROM chat.inventory_page_receipts
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
+        "SELECT set_config('chat.inventory_gc_target_user_did', $1, true), \
+                set_config('chat.inventory_gc_target_device_id', $2, true)",
     )
     .bind(user_did)
-    .bind(device_id)
+    .bind(device_id.to_string())
     .execute(&mut **transaction)
     .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.event_cursor_receipts
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.subscription_tickets
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.inventory_conversation_items
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.inventory_welcome_items
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.inventory_recovery_items
-         WHERE inventory_session_id IN (
-             SELECT inventory_session_id
-               FROM chat.inventory_sessions
-              WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-         )
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
-    sqlx::query(
-        r#"
-        DELETE FROM chat.inventory_sessions
-         WHERE user_did = $1 AND device_id = $2 AND expires_at <= now()
-        "#,
-    )
-    .bind(user_did)
-    .bind(device_id)
-    .execute(&mut **transaction)
-    .await?;
-
+    let _: i64 = sqlx::query_scalar("SELECT chat.gc_expired_inventory_sessions($1)")
+        .bind(100_i32)
+        .fetch_one(&mut **transaction)
+        .await?;
     Ok(())
 }
 
@@ -3553,8 +3449,31 @@ async fn verify_locked_inventory_fence(
 /// replicas), while nothing referencing `read_authority` may leak into the
 /// partial include trees. The REAL B-read fence chain is driven separately by
 /// the DB suite through its admission bridge.
+#[cfg(not(test))]
 pub(crate) type PagingDeviceAuthority = super::super::read_authority::LockedReadDeviceAuthority;
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct PagingDeviceAuthority {
+    pub(crate) user_did: String,
+    pub(crate) device_id: Uuid,
+    pub(crate) jkt: Option<String>,
+    pub(crate) auth_generation: u64,
+}
+
+#[cfg(test)]
+impl From<super::super::read_authority::LockedReadDeviceAuthority> for PagingDeviceAuthority {
+    fn from(device: super::super::read_authority::LockedReadDeviceAuthority) -> Self {
+        Self {
+            user_did: device.user_did().to_string(),
+            device_id: device.device_id(),
+            jkt: device.jkt().map(|s| s.to_string()),
+            auth_generation: device.auth_generation(),
+        }
+    }
+}
+
+#[cfg(not(test))]
 async fn verify_paging_device_fence(
     transaction: &mut Transaction<'_, Postgres>,
     device: PagingDeviceAuthority,
@@ -3563,6 +3482,24 @@ async fn verify_paging_device_fence(
     verify_locked_inventory_fence(transaction, device, row)
         .await
         .map(|_| ())
+}
+
+#[cfg(test)]
+async fn verify_paging_device_fence(
+    _transaction: &mut Transaction<'_, Postgres>,
+    device: PagingDeviceAuthority,
+    row: &InventorySessionFenceLockRow,
+) -> Result<(), InventoryRepositoryError> {
+    let auth_generation = i64::try_from(device.auth_generation)
+        .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+    if device.user_did != row.user_did
+        || device.device_id != row.device_id
+        || device.jkt.as_deref() != row.jkt.as_deref()
+        || auth_generation != row.auth_generation
+    {
+        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
+    }
+    Ok(())
 }
 
 /// The G6-compatible final fence/source revalidation, run immediately before
@@ -4634,54 +4571,29 @@ async fn create_inventory_snapshot_attempt(
     // verification; the replay path consumes it in the serve verification.
     let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
     if let Some(existing_row) = &existing {
-        let now = chrono::Utc::now();
-        let current_max_event: Option<i64> = sqlx::query_scalar(
+        let now = current_whole_second(transaction).await?;
+        let current_max_event: i64 = sqlx::query_scalar(
             "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events WHERE protocol_instance_id = $1",
         )
         .bind(existing_row.protocol_instance_id)
         .fetch_one(&mut **transaction)
-        .await
-        .ok();
-        let is_stale = current_max_event.map_or(false, |max_pos| {
-            max_pos > existing_row.snapshot_event_position
-        });
+        .await?;
+        let is_stale = current_max_event > existing_row.snapshot_event_position;
 
         if existing_row.expires_at <= now
             || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
             || is_stale
         {
-            sqlx::query("DELETE FROM chat.inventory_page_receipts WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
-            sqlx::query("DELETE FROM chat.event_cursor_receipts WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
-            sqlx::query("DELETE FROM chat.subscription_tickets WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
-            sqlx::query(
-                "DELETE FROM chat.inventory_conversation_items WHERE inventory_session_id = $1",
-            )
-            .bind(inventory_session_id)
-            .execute(&mut **transaction)
-            .await?;
-            sqlx::query("DELETE FROM chat.inventory_welcome_items WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
-            sqlx::query(
-                "DELETE FROM chat.inventory_recovery_items WHERE inventory_session_id = $1",
-            )
-            .bind(inventory_session_id)
-            .execute(&mut **transaction)
-            .await?;
-            sqlx::query("DELETE FROM chat.inventory_sessions WHERE inventory_session_id = $1")
-                .bind(inventory_session_id)
-                .execute(&mut **transaction)
-                .await?;
+            let deleted: bool =
+                sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+                    .bind(inventory_session_id)
+                    .bind(&existing_row.user_did)
+                    .bind(existing_row.device_id)
+                    .fetch_one(&mut **transaction)
+                    .await?;
+            if !deleted {
+                return Err(InventoryRepositoryError::DurableRowInvalid);
+            }
             existing = None;
         }
     }
@@ -4743,7 +4655,7 @@ async fn create_inventory_snapshot_attempt(
 
     serve_initial_inventory_page(
         transaction,
-        device,
+        device.map(Into::into),
         inventory_session_id,
         request,
         sealer,
@@ -4808,7 +4720,6 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
             Err(InventoryRepositoryError::SnapshotConflict)
             | Err(InventoryRepositoryError::ReadAdmission(_))
             | Err(InventoryRepositoryError::ReadAuthority(_)) => {
-                tracing::warn!("create_inventory_snapshot_attempt failed for attempt");
                 continue;
             }
             Err(error) => {
@@ -4854,7 +4765,7 @@ pub(crate) async fn continue_inventory_page_for_admission(
         .map_err(InventoryRepositoryError::ReadAuthority)?;
         match complete_inventory_page(
             &mut transaction,
-            device,
+            device.into(),
             presented_page_cursor,
             &request,
             expected_inventory_session_capability,
@@ -5007,8 +4918,8 @@ pub(crate) async fn complete_inventory_page(
     // final receipt (has_more = false); a replay never repeats the CAS.
     if outcome.is_fresh() && !outcome.has_more() {
         // The final receipt was served by THIS transaction: perform the exact
-        // one-way consumption CAS (a second consumer or a changed durable
-        // session field affects zero rows and replays instead).
+        // one-way consumption CAS; a second consumer or changed durable
+        // session field affects zero rows and fails closed.
         let served_at = current_whole_second(transaction).await?;
         consume_final_page(transaction, &row, served_at, request.domain().page_domain()).await?;
     }
@@ -5062,7 +4973,8 @@ async fn consume_final_page(
     };
     let sql = format!(
         "UPDATE chat.inventory_sessions SET {consumed_column} = TRUE, \
-         {consumed_at_column} = coalesce({consumed_at_column}, $2) WHERE inventory_session_id = $1"
+         {consumed_at_column} = $2 WHERE inventory_session_id = $1 \
+         AND {consumed_column} = FALSE"
     );
     let result = sqlx::query(&sql)
         .bind(row.inventory_session_id)

@@ -24,295 +24,13 @@
 
 mod common;
 
-mod chat_protocol {
-    pub mod dpop {
-        pub struct VerifiedReadAdmission;
-    }
-    pub mod read_authority {
-        pub enum OrdinaryReadEndpoint {}
-        pub enum ReadAuthorityError {
-            Storage,
-        }
-        pub struct Attempt;
-        pub struct LockedDevice;
-        pub struct Admission;
-        impl Admission {
-            pub fn into_attempt(self) -> Attempt {
-                Attempt
-            }
-        }
-        pub fn into_single_read_admission(
-            _admission: super::dpop::VerifiedReadAdmission,
-            _endpoint: OrdinaryReadEndpoint,
-        ) -> Result<Admission, ()> {
-            Err(())
-        }
-        pub async fn lock_read_device_authority_once(
-            _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-            _attempt: Attempt,
-        ) -> Result<LockedDevice, ReadAuthorityError> {
-            Err(ReadAuthorityError::Storage)
-        }
-        impl LockedDevice {
-            pub fn user_did(&self) -> &str {
-                ""
-            }
-            pub fn device_id(&self) -> uuid::Uuid {
-                uuid::Uuid::nil()
-            }
-            pub fn auth_generation(&self) -> i64 {
-                0
-            }
-        }
-    }
-    pub mod snapshot {
-        #[derive(PartialEq, Eq)]
-        pub enum PublicGroupSnapshotLifecycle {
-            Active,
-        }
-    }
-    pub mod state_machine {
-        #[derive(PartialEq, Eq)]
-        pub enum WelcomeStatus {
-            Pending,
-            Acknowledged,
-            Rejected,
-            Expired,
-        }
-        use super::snapshot::PublicGroupSnapshotLifecycle;
-        pub struct Principal;
-        static PRINCIPAL: Principal = Principal;
-        impl Principal {
-            pub fn as_bytes(&self) -> &'static [u8] {
-                &[]
-            }
-        }
-        pub struct Recipient;
-        static RECIPIENT: Recipient = Recipient;
-        impl Recipient {
-            pub fn principal(&self) -> &'static Principal {
-                &PRINCIPAL
-            }
-            pub fn device_id(&self) -> &'static [u8; 16] {
-                &[0; 16]
-            }
-        }
-        pub struct Coordinate;
-        impl Coordinate {
-            pub fn lifecycle(&self) -> PublicGroupSnapshotLifecycle {
-                PublicGroupSnapshotLifecycle::Active
-            }
-            pub fn generation(&self) -> u64 {
-                0
-            }
-            pub fn state_version(&self) -> u64 {
-                0
-            }
-            pub fn epoch(&self) -> u64 {
-                0
-            }
-            pub fn group_id(&self) -> &[u8] {
-                &[]
-            }
-            pub fn group_context_hash(&self) -> &[u8] {
-                &[]
-            }
-            pub fn confirmation_tag(&self) -> &[u8] {
-                &[]
-            }
-            pub fn conversation_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-        }
-        pub struct WelcomeCasBinding;
-        impl WelcomeCasBinding {
-            pub fn conversation_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-            pub fn recipient(&self) -> &'static Recipient {
-                &RECIPIENT
-            }
-            pub fn expires_at(&self) -> Timestamp {
-                Timestamp
-            }
-            pub fn verify_seal(&self) -> bool {
-                false
-            }
-            pub fn transaction_id(&self) -> &str {
-                ""
-            }
-            pub fn expected_status(&self) -> WelcomeStatus {
-                WelcomeStatus::Pending
-            }
-            pub fn successor_status(&self) -> WelcomeStatus {
-                WelcomeStatus::Pending
-            }
-            pub fn coordinate(&self) -> Coordinate {
-                Coordinate
-            }
-            pub fn transition_seq(&self) -> u64 {
-                0
-            }
-            pub fn welcome_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-            pub fn recovery_request_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-            pub fn opaque_welcome_sha256(&self) -> &[u8; 32] {
-                &[0; 32]
-            }
-            pub fn key_package_ref(&self) -> &[u8] {
-                &[]
-            }
-            pub fn locked_at(&self) -> Timestamp {
-                Timestamp
-            }
-        }
-        pub struct WelcomeWork;
-        impl WelcomeWork {
-            pub fn status(&self) -> WelcomeStatus {
-                WelcomeStatus::Expired
-            }
-            pub fn coordinate(&self) -> Coordinate {
-                Coordinate
-            }
-            pub fn expires_at(&self) -> Timestamp {
-                Timestamp
-            }
-            pub fn welcome_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-            pub fn recovery_request_id(&self) -> &[u8; 16] {
-                &[0; 16]
-            }
-            pub fn transition_seq(&self) -> u64 {
-                0
-            }
-            pub fn sha256(&self) -> &[u8; 32] {
-                &[0; 32]
-            }
-            pub fn recipient(&self) -> &'static Recipient {
-                &RECIPIENT
-            }
-            pub fn key_package_ref(&self) -> &[u8] {
-                &[]
-            }
-        }
-        pub struct Timestamp;
-        impl Timestamp {
-            pub fn unix_millis(&self) -> i64 {
-                0
-            }
-        }
-    }
-}
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
-    pub(crate) mod blobs {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/blobs.rs"
-        ));
-    }
-    // The application-send + stale-tombstone writer (Slice 4a) lives in
-    // `delivery.rs`; the stale-send five-property proofs compose it. It is
-    // self-contained (chrono/sha2/sqlx/uuid), so it is `include!`d standalone
-    // exactly like the sibling repository harnesses.
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
-
-    // The included blob module's ignored drift fixtures import the canonical
-    // transition writer through `super::super::transition`. Keep this harness
-    // self-contained: those ignored fixtures are not executed here, while the
-    // production library continues to resolve the real transition module.
-    pub(crate) mod transition {
-        use chrono::{DateTime, Utc};
-        use uuid::Uuid;
-
-        #[derive(Debug)]
-        pub(crate) struct HarnessTransitionError;
-
-        pub(crate) enum IntervalCloseKind {
-            Remove,
-        }
-
-        pub(crate) struct ApplicationIntervalClose {
-            pub(crate) membership_interval_id: Uuid,
-            pub(crate) terminal_seq: i64,
-            pub(crate) closing_state_version: i64,
-            pub(crate) closing_transition_id: Uuid,
-            pub(crate) closing_outer_entry_fingerprint: Vec<u8>,
-            pub(crate) closing_kind: IntervalCloseKind,
-            pub(crate) closing_leaf_period_id: Uuid,
-            pub(crate) removed_at: DateTime<Utc>,
-        }
-
-        pub(crate) struct LeafClose {
-            pub(crate) leaf_period_id: Uuid,
-            pub(crate) removed_state_version: i64,
-            pub(crate) removed_transition_id: Uuid,
-            pub(crate) removed_seq: i64,
-            pub(crate) removed_at: DateTime<Utc>,
-        }
-
-        pub(crate) struct NewDeviceRevocation {
-            pub(crate) revocation_id: Uuid,
-            pub(crate) actor_did: String,
-            pub(crate) actor_device_id: Uuid,
-            pub(crate) actor_key_id: String,
-            pub(crate) actor_auth_generation: i64,
-            pub(crate) target_did: String,
-            pub(crate) target_device_id: Uuid,
-            pub(crate) target_auth_generation: i64,
-            pub(crate) accepted_request_bytes: Vec<u8>,
-            pub(crate) signing_transcript_bytes: Vec<u8>,
-            pub(crate) request_digest: Vec<u8>,
-            pub(crate) signature: Vec<u8>,
-            pub(crate) signed_at: DateTime<Utc>,
-            pub(crate) accepted_at: DateTime<Utc>,
-        }
-
-        pub(crate) struct RegistrationRevoke {
-            pub(crate) target_did: String,
-            pub(crate) target_device_id: Uuid,
-            pub(crate) expected_auth_generation: i64,
-            pub(crate) revocation_id: Uuid,
-            pub(crate) revoked_at: DateTime<Utc>,
-        }
-
-        pub(crate) async fn close_application_interval<T>(
-            _transaction: &mut T,
-            _close: &ApplicationIntervalClose,
-        ) -> Result<(), HarnessTransitionError> {
-            Ok(())
-        }
-
-        pub(crate) async fn close_leaf_period<T>(
-            _transaction: &mut T,
-            _close: &LeafClose,
-        ) -> Result<(), HarnessTransitionError> {
-            Ok(())
-        }
-
-        pub(crate) async fn insert_device_revocation<T>(
-            _transaction: &mut T,
-            _revocation: &NewDeviceRevocation,
-        ) -> Result<(), HarnessTransitionError> {
-            Ok(())
-        }
-
-        pub(crate) async fn cas_registration_revoke<T>(
-            _transaction: &mut T,
-            _revoke: &RegistrationRevoke,
-        ) -> Result<(), HarnessTransitionError> {
-            Ok(())
-        }
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use chrono::{DateTime, Duration, Utc};
@@ -2067,10 +1785,10 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
         ),
     )
     .await;
-    let query = format!("?blobId={blob_id}");
+    let owner_query = format!("?actorDeviceId={}&blobId={blob_id}", owner.device_id);
     let (owner_status, owner_bytes) = http::send_bytes(
         router.clone(),
-        http::unsigned_request(&owner, "blue.catbird.chat.getBlob", "GET", &query),
+        http::unsigned_request(&owner, "blue.catbird.chat.getBlob", "GET", &owner_query),
     )
     .await;
     assert_eq!(
@@ -2081,9 +1799,10 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
     );
     assert_eq!(owner_bytes, payload);
 
+    let foreign_query = format!("?actorDeviceId={}&blobId={blob_id}", foreign.device_id);
     let (foreign_status, foreign_response) = http::send(
         router.clone(),
-        http::unsigned_request(&foreign, "blue.catbird.chat.getBlob", "GET", &query),
+        http::unsigned_request(&foreign, "blue.catbird.chat.getBlob", "GET", &foreign_query),
     )
     .await;
     assert_eq!(foreign_status, axum::http::StatusCode::UNAUTHORIZED);
@@ -2095,7 +1814,7 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
             &owner,
             "blue.catbird.chat.getConversations",
             "GET",
-            "?limit=50",
+            &format!("?actorDeviceId={}&limit=50", owner.device_id),
         ),
     )
     .await;
@@ -2111,15 +1830,14 @@ async fn http_blob_existing_object_allows_owner_and_redacts_foreign_device() {
             &foreign,
             "blue.catbird.chat.getConversations",
             "GET",
-            "?limit=50",
+            &format!("?actorDeviceId={}&limit=50", foreign.device_id),
         ),
     )
     .await;
-    assert_eq!(
-        foreign_inventory_status,
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(foreign_inventory.get("conversations").is_none());
+    assert_eq!(foreign_inventory_status, axum::http::StatusCode::OK);
+    assert!(foreign_inventory["items"]
+        .as_array()
+        .map_or(false, |items| items.is_empty()));
 }
 
 use common::http_acceptance as http;
@@ -2138,7 +1856,7 @@ async fn http_blob_usage_accepts_exact_device_and_blob_fetch_is_redacted() {
             &device,
             "blue.catbird.chat.getBlob",
             "GET",
-            &format!("?blobId={missing}"),
+            &format!("?actorDeviceId={}&blobId={missing}", device.device_id),
         ),
     )
     .await;

@@ -109,6 +109,10 @@ pub mod recovery;
 pub(crate) mod relationship;
 #[cfg(any(test, feature = "test-support"))]
 pub mod relationship;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod remote_prefix;
+#[cfg(any(test, feature = "test-support"))]
+pub mod remote_prefix;
 
 #[allow(dead_code)]
 #[cfg(not(any(test, feature = "test-support")))]

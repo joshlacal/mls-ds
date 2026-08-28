@@ -1,4 +1,8 @@
 pub mod ack;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) mod bootstrap;
+#[cfg(any(test, feature = "test-support"))]
+pub mod bootstrap;
 pub mod commit_submitter;
 pub mod declaration_client;
 pub mod envelope;
@@ -16,6 +20,18 @@ pub mod transfer;
 pub mod upstream;
 
 pub use ack::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use bootstrap::{
+    bootstrap_remote_mailbox_from_selector, compute_bootstrap_advisory_lock_key,
+    fetch_remote_prefix_admission, QuarantineReason, RemotePrefixApplyOutcome,
+    RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
+};
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use bootstrap::{
+    bootstrap_remote_mailbox_from_selector, compute_bootstrap_advisory_lock_key,
+    fetch_remote_prefix_admission, QuarantineReason, RemotePrefixApplyOutcome,
+    RemotePrefixBootstrapError, RemotePrefixBootstrapSelector, VerifiedRemotePrefixAdmission,
+};
 pub use commit_submitter::*;
 pub use declaration_client::{DeviceRecord, DeviceRecordClient, DeviceRecordValue, MLSChatPolicy};
 pub use envelope::*;

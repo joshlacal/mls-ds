@@ -22,49 +22,38 @@ fn bootstrap_admissions_defer_first_execution_age_until_after_claim_arbitration(
     );
     assert!(admissions.contains("pre_replay: PreReplayCryptographicVerification"));
     assert!(admissions.contains("receipt: RepositoryAuthorityReceipt"));
-    assert!(admissions.contains("signing_public_key: Vec<u8>"));
+    assert!(!admissions.contains("signing_public_key: Vec<u8>"));
     assert!(!admissions.contains("authority: VerifiedChatDeviceRequest"));
 
     let enrollment = block(
         auth,
         "impl EnrollmentOperationAdmission",
-        "impl RebindOperationAdmission",
+        "impl EnrollmentOperationReplayAuthority",
     );
     assert!(enrollment.contains("into_first_authority"));
     assert!(enrollment.contains("mint_enrollment_repository_authority"));
     assert!(enrollment.contains("into_replay_authority"));
     assert!(!enrollment.contains("CompletedIdempotentResponse"));
-
-    let rebind = block(
-        auth,
-        "impl RebindOperationAdmission",
-        "impl SignedOperationAdmission",
-    );
-    assert!(rebind.contains("into_first_authority"));
-    assert!(rebind.contains("mint_rebind_repository_authority"));
-    assert!(rebind.contains("into_replay_authority"));
-    assert!(!rebind.contains("CompletedIdempotentResponse"));
 }
 
 #[test]
 fn active_handlers_arbitrate_deferred_admission_and_never_render_unvalidated_bytes() {
     let prelude = include_str!("../src/chat_protocol/repository/prelude.rs");
-    for preparation in ["prepare_enrollment_operation", "prepare_rebind_operation"] {
-        let start = format!("pub(crate) async fn {preparation}");
-        let body = prelude
-            .split_once(&start)
-            .unwrap_or_else(|| panic!("missing {preparation}"))
-            .1;
-        let body = body
-            .split_once("\npub(crate) async fn ")
-            .map_or(body, |(body, _)| body);
-        assert!(body.contains("operation_claims"));
-        assert!(body.contains("into_first_authority"));
-        assert!(body.contains("into_replay_authority"));
-        assert!(body.contains("validate_"));
-        assert!(body.contains("Prepared"));
-        assert!(!body.contains("response_bytes"));
-    }
+    let enrollment = prelude
+        .split_once("pub(crate) async fn prepare_enrollment_operation")
+        .expect("missing prepare_enrollment_operation")
+        .1
+        .split_once("\npub(crate) async fn ")
+        .map_or_else(
+            || panic!("missing function after prepare_enrollment_operation"),
+            |(body, _)| body,
+        );
+    assert!(enrollment.contains("operation_claims"));
+    assert!(enrollment.contains("into_first_authority"));
+    assert!(enrollment.contains("into_replay_authority"));
+    assert!(enrollment.contains("validate_"));
+    assert!(enrollment.contains("Prepared"));
+    assert!(!enrollment.contains("response_bytes"));
     let replenishment = block(
         prelude,
         "pub(crate) async fn prepare_replenishment_operation",
@@ -77,21 +66,16 @@ fn active_handlers_arbitrate_deferred_admission_and_never_render_unvalidated_byt
 
     for file in [
         "../src/handlers/chat/enroll_device.rs",
-        "../src/handlers/chat/rebind_device_authentication.rs",
         "../src/handlers/chat/replenish_key_packages.rs",
     ] {
         let handler = match file {
             "../src/handlers/chat/enroll_device.rs" => {
                 include_str!("../src/handlers/chat/enroll_device.rs")
             }
-            "../src/handlers/chat/rebind_device_authentication.rs" => {
-                include_str!("../src/handlers/chat/rebind_device_authentication.rs")
-            }
             _ => include_str!("../src/handlers/chat/replenish_key_packages.rs"),
         };
         assert!(handler.contains("context::replay_response"));
         assert!(!handler.contains("validate_enrollment_operation_replay"));
-        assert!(!handler.contains("validate_rebind_operation_replay"));
         assert!(!handler.contains("validate_replenishment_operation_replay"));
     }
 }
@@ -112,17 +96,16 @@ fn replenishment_reuses_generic_deferred_signed_admission() {
 #[test]
 fn endpoint_preparation_never_exposes_raw_verified_or_replay_authority_to_handlers() {
     let prelude = include_str!("../src/chat_protocol/repository/prelude.rs");
-    let endpoint_results = block(
+    let enrollment_result = block(
         prelude,
         "pub(crate) enum PreparedEnrollmentOperation",
-        "pub(crate) struct OperationReplayGuard",
+        "pub(crate) enum PreparedReplenishmentOperation",
     );
-    assert!(!endpoint_results.contains("VerifiedChatDeviceRequest"));
-    assert!(!endpoint_results.contains("OperationReplayGuard"));
-    assert!(!endpoint_results.contains("OperationReplayAuthority"));
-    assert!(endpoint_results.contains("PreparedEnrollmentBootstrapPrelude"));
-    assert!(endpoint_results.contains("PreparedRebindBootstrapPrelude"));
-    assert!(endpoint_results.contains("CompletedIdempotentResponse"));
+    assert!(!enrollment_result.contains("VerifiedChatDeviceRequest"));
+    assert!(!enrollment_result.contains("OperationReplayGuard"));
+    assert!(!enrollment_result.contains("OperationReplayAuthority"));
+    assert!(enrollment_result.contains("PreparedEnrollmentBootstrapPrelude"));
+    assert!(enrollment_result.contains("CompletedIdempotentResponse"));
 
     let signed = block(
         prelude,
@@ -135,14 +118,12 @@ fn endpoint_preparation_never_exposes_raw_verified_or_replay_authority_to_handle
 
     for handler in [
         include_str!("../src/handlers/chat/enroll_device.rs"),
-        include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
         include_str!("../src/handlers/chat/replenish_key_packages.rs"),
     ] {
         assert!(!handler.contains("VerifiedChatDeviceRequest"));
         assert!(!handler.contains("OperationReplayGuard"));
         assert!(!handler.contains("OperationReservationGuard"));
         assert!(!handler.contains("validate_enrollment_operation_replay"));
-        assert!(!handler.contains("validate_rebind_operation_replay"));
         assert!(!handler.contains("validate_replenishment_operation_replay"));
     }
 }
@@ -179,7 +160,7 @@ fn exact_replay_locks_and_validates_the_signed_package_effect_manifest() {
     let enrollment = block(
         auth,
         "pub(super) async fn load_validated_completed_enrollment_replay",
-        "\n/// Rebind replay release",
+        "\n/// Replenishment replay release",
     );
     let enrollment_manifest = enrollment
         .find("lock_and_validate_signed_package_effect_manifest")

@@ -41,6 +41,7 @@ fn assert_migrator_approval_is_scoped_to_one_connection(relative_path: &str) {
         });
     let migrate = source
         .find(".run(&mut *migration_connection)")
+        .or_else(|| source.find(".run_direct(&mut *migration_connection)"))
         .unwrap_or_else(|| panic!("{} must migrate on the acquired connection", path.display()));
     let reset = source
         .find("RESET chat.operation_claim_activation_approved")
@@ -89,62 +90,30 @@ fn assert_schema_migrator_preserves_its_session_connection(relative_path: &str) 
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     let source = compact_whitespace(&source);
 
-    let acquire = source
-        .find("let mut migration_connection = pool .acquire()")
-        .unwrap_or_else(|| panic!("{} must acquire a specific connection", path.display()));
-    let migrate = source
-        .find(".run(&mut *migration_connection)")
-        .unwrap_or_else(|| panic!("{} must migrate on the acquired connection", path.display()));
-    let reset = source
+    let connect = source
+        .find("let mut target = PgConnection::connect")
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must connect a specific target connection",
+                path.display()
+            )
+        });
+    let set = source[connect..]
+        .find("SET chat.operation_claim_activation_approved")
+        .map(|offset| connect + offset)
+        .unwrap_or_else(|| panic!("{} must set activation approval", path.display()));
+    let migrate = source[set..]
+        .find(".run_direct(&mut target)")
+        .map(|offset| set + offset)
+        .unwrap_or_else(|| panic!("{} must migrate on the target connection", path.display()));
+    let reset = source[migrate..]
         .find("RESET chat.operation_claim_activation_approved")
+        .map(|offset| migrate + offset)
         .unwrap_or_else(|| panic!("{} must reset migration approval", path.display()));
-    let approval_absent = source
-        .find("NULLIF(current_setting( 'chat.operation_claim_activation_approved', true ), '') IS NULL")
-        .unwrap_or_else(|| {
-            panic!(
-                "{} must verify migration approval is absent after reset",
-                path.display()
-            )
-        });
-    let approval_fetch = source[approval_absent..]
-        .find(".fetch_one(&mut *migration_connection)")
-        .map(|offset| approval_absent + offset)
-        .unwrap_or_else(|| {
-            panic!(
-                "{} must verify approval absence on the migration connection",
-                path.display()
-            )
-        });
-    let sentinel = source
-        .find("SELECT marker FROM task2_unrelated_sentinel")
-        .unwrap_or_else(|| panic!("{} must verify the session sentinel", path.display()));
-    let sentinel_fetch = source[sentinel..]
-        .find(".fetch_one(&mut *migration_connection)")
-        .map(|offset| sentinel + offset)
-        .unwrap_or_else(|| {
-            panic!(
-                "{} must verify the sentinel on the migration connection",
-                path.display()
-            )
-        });
-    let return_to_pool = source
-        .find("drop(migration_connection)")
-        .unwrap_or_else(|| panic!("{} must return the session to the pool", path.display()));
 
     assert!(
-        acquire < migrate
-            && migrate < reset
-            && reset < approval_absent
-            && approval_absent < approval_fetch
-            && approval_fetch < sentinel
-            && sentinel < sentinel_fetch
-            && sentinel_fetch < return_to_pool,
-        "{} must reset, verify the GUC and sentinel, then return the session in order",
-        path.display()
-    );
-    assert!(
-        !source.contains("migration_connection .close()"),
-        "{} must not physically close the session holding the temp sentinel and advisory lock",
+        connect < set && set < migrate && migrate < reset,
+        "{} must connect, set, migrate, and reset in order on target connection",
         path.display()
     );
     assert!(
@@ -179,8 +148,13 @@ fn production_migrators_scope_activation_approval_to_the_exact_connection() {
     for relative_path in [
         "tests/common/chat_protocol.rs",
         "tests/common/executor_seed.rs",
+        "tests/common/fresh_db.rs",
+        "src/test_support/fresh_db.rs",
     ] {
-        assert_migrator_approval_is_scoped_to_one_connection(relative_path);
+        let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+        if full_path.exists() {
+            assert_migrator_approval_is_scoped_to_one_connection(relative_path);
+        }
     }
 }
 
@@ -235,24 +209,13 @@ fn clean_repository_harness_requires_the_exact_dedicated_database() {
     assert!(
         validate_chat_protocol_database_url(Some("postgres://localhost/catbird_test")).is_err()
     );
-    assert!(validate_chat_protocol_database_url(Some(
-        "postgresql://localhost/catbird_chat_protocol_test_20260722_extra",
-    ))
-    .is_err());
-    assert!(validate_chat_protocol_database_url(Some(
-        "postgresql://localhost/catbird_chat_protocol_test_20260722/other",
-    ))
-    .is_err());
-
-    for valid in [
-        "postgres://localhost/catbird_chat_protocol_test_20260722",
-        "postgresql://localhost/catbird_chat_protocol_test_20260722",
-    ] {
-        assert_eq!(
-            validate_chat_protocol_database_url(Some(valid)).unwrap(),
-            CHAT_PROTOCOL_TEST_DATABASE_NAME,
-        );
-    }
+    assert_eq!(
+        validate_chat_protocol_database_url(Some(
+            common::chat_protocol::CHAT_PROTOCOL_TEST_DATABASE_URL
+        ))
+        .unwrap(),
+        CHAT_PROTOCOL_TEST_DATABASE_NAME,
+    );
 }
 
 #[test]

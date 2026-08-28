@@ -6,7 +6,11 @@
 //! 3. Authenticated happy path with DID-typed participants (DB-gated)
 //! 4. Verbatim idempotent replay (DB-gated)
 //! 5. Negative validation cases returning declared 4xx codes rather than 500 (DB-gated)
-
+//!
+//! Run with:
+//!   CHAT_OPERATION_CLAIM_ACTIVATION_APPROVED=handlers-and-legacy-apis-sealed \
+//!   TEST_DATABASE_URL=postgres://localhost/catbird_chat_protocol_test_20260722 \
+//!   cargo test --test chat_protocol_create_conversation_handlers -- --test-threads=1
 mod common;
 pub use catbird_server::{auth, crypto};
 
@@ -187,17 +191,22 @@ async fn ensure_verifier_env(pool: &DbPool) {
     catbird_server::auth::cache_test_did_document(doc).await;
 }
 
+static RUNTIME_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 async fn runtime(pool: &DbPool, cutover_enabled: bool) -> Arc<ChatRuntime> {
     ensure_verifier_env(pool).await;
+    let _guard = RUNTIME_ENV_LOCK.lock();
     if cutover_enabled {
         std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
     } else {
         std::env::remove_var("CHAT_CUTOVER_ENABLED");
     }
-    Arc::new(
+    let rt = Arc::new(
         ChatRuntime::from_env(Arc::new(catbird_server::realtime::SseState::new(8)))
             .expect("build clean-chat runtime"),
-    )
+    );
+    std::env::set_var("CHAT_CUTOVER_ENABLED", "1");
+    rt
 }
 
 async fn router_with(pool: DbPool, cutover_enabled: bool) -> Router {
@@ -762,8 +771,8 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
 
     assert_eq!(
         ledger_rows.len(),
-        21,
-        "fresh database ledger must contain exactly 21 migrations"
+        common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len(),
+        "fresh database ledger must contain exact reviewed migration manifest"
     );
     for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
         .iter()
@@ -949,8 +958,8 @@ async fn submit_transition_policy_add_against_production_router_replays_byte_ide
 
     assert_eq!(
         ledger_rows.len(),
-        21,
-        "fresh database ledger must contain exactly 21 migrations"
+        common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len(),
+        "fresh database ledger must contain exact reviewed migration manifest"
     );
     for (entry, row) in common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
         .iter()

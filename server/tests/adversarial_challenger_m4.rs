@@ -6,65 +6,15 @@
 //! 3. Rebind Ed25519 signature checks vs new DPoP JKTs
 //! 4. 32 `blue.catbird.chat.*` endpoints cutover rejection (`CHAT_CUTOVER_ENABLED=false`)
 
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
+
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
-
-mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use std::{
@@ -96,14 +46,13 @@ use sha2::{Digest, Sha256};
 use tower_util::ServiceExt;
 
 use chat_protocol::dpop::{
-    verify_enrollment_request_auth, verify_ordinary_request_auth, verify_rebind_request_auth,
-    TrustedNestVerifier,
+    verify_enrollment_request_auth, verify_ordinary_request_auth, TrustedNestVerifier,
 };
-use transcript::{
-    decode_and_verify_enrollment_body, decode_canonical_signed_mutation, decode_rebind_bootstrap,
+use chat_protocol::transcript::{
+    decode_and_verify_enrollment_body, decode_canonical_signed_mutation,
 };
-use validation::{
-    ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
+use chat_protocol::validation::{
+    self, ed25519_key_id, enrollment_grant_expiry, CanonicalHttpMethod, CanonicalTimestamp,
     CanonicalUuidV4, NumericDate, TrustedExternalBase, TrustedRequestInstant, ValidatedChatNsid,
 };
 
@@ -184,7 +133,7 @@ fn sign_chat_body(body: Value, key: &Ed25519SigningKey) -> Vec<u8> {
     serde_json::to_vec(&wrapper).unwrap()
 }
 
-fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs: &[u8]) -> Value {
+fn enrollment_body(_dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs: &[u8]) -> Value {
     let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
     let key_packages: Vec<_> = package_refs
         .iter()
@@ -207,7 +156,6 @@ fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs
         "deviceName": "Alice's iPhone",
         "keyId": key_id.as_str(),
         "signaturePublicKey": STANDARD.encode(signing_key.verifying_key().as_bytes()),
-        "dpopJkt": dpop_jkt,
         "expectedAuthGeneration": 0,
         "capability": {
             "protocolVersion": "1",
@@ -228,26 +176,6 @@ fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs
         "keyPackages": key_packages,
         "idempotencyKey": CHAT_INSTANCE,
         "signedAt": "2023-11-14T22:18:15.000Z"
-    })
-}
-
-fn rebind_body(
-    current_dpop_jkt: &str,
-    new_dpop_jkt: &str,
-    signing_key: &Ed25519SigningKey,
-) -> Value {
-    let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
-    json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0}",
-        "actorDid": DID,
-        "actorDeviceId": DEVICE_ID,
-        "keyId": key_id.as_str(),
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": current_dpop_jkt,
-        "newDpopJkt": new_dpop_jkt,
-        "idempotencyKey": CHAT_INSTANCE,
-        "signedAt": "2023-11-14T22:14:20.000Z"
     })
 }
 
@@ -1130,131 +1058,6 @@ fn challenge_2_enrollment_claims_auth_time_window_validation() {
 }
 
 // ---------------------------------------------------------------------------
-// Challenge 3: Rebind Ed25519 Signature Checks vs New DPoP JKTs
-// ---------------------------------------------------------------------------
-
-#[test]
-fn challenge_3_rebind_ed25519_signature_and_jkt_binding_invariants() {
-    let nest_signing = signing_key_p256(27);
-    let current_proof_signing = signing_key_p256(29);
-    let new_proof_signing = signing_key_p256(31);
-    let legitimate_device_signing = Ed25519SigningKey::from_bytes(&[33_u8; 32]);
-    let attacker_device_signing = Ed25519SigningKey::from_bytes(&[99_u8; 32]);
-
-    let current_jwk = public_jwk(&current_proof_signing);
-    let current_jkt = jwk_thumbprint(&current_jwk);
-    let new_jwk = public_jwk(&new_proof_signing);
-    let new_jkt = jwk_thumbprint(&new_jwk);
-
-    let origin = TrustedExternalBase::parse("https://chat.example.net", &BTreeSet::new()).unwrap();
-    let endpoint =
-        ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication").unwrap();
-    let now = TrustedRequestInstant::from_canonical_for_test(
-        CanonicalTimestamp::parse("2023-11-14T22:14:20.000Z").unwrap(),
-    );
-    let trust = TrustedNestVerifier::new(
-        ISSUER,
-        AUDIENCE,
-        CanonicalUuidV4::parse(CHAT_INSTANCE).unwrap(),
-        "nest-key-1",
-        nest_signing.verifying_key().to_owned(),
-        origin.clone(),
-    )
-    .unwrap();
-
-    // 1. Legitimate rebind signed by device's stored Ed25519 key
-    let raw = sign_chat_body(
-        rebind_body(&current_jkt, &new_jkt, &legitimate_device_signing),
-        &legitimate_device_signing,
-    );
-    let bootstrap = decode_rebind_bootstrap(&raw).unwrap();
-    let token = sign_jwt(
-        json!({"alg":"ES256","typ":"JWT","kid":"nest-key-1"}),
-        json!({
-            "iss": ISSUER,
-            "sub": DID,
-            "aud": AUDIENCE,
-            "lxm": endpoint.as_str(),
-            "iat": 1_700_000_000_i64,
-            "exp": 1_700_000_120_i64,
-            "jti": TOKEN_JTI,
-            "cnf": {"jkt": new_jkt},
-            "device_id": DEVICE_ID,
-            "chat_instance": CHAT_INSTANCE
-        }),
-        &nest_signing,
-    );
-    let proof = dpop_proof(
-        &new_proof_signing,
-        &new_jwk,
-        "POST",
-        &origin.htu(&endpoint),
-        &token,
-        1_700_000_060,
-        &[17; 12],
-    );
-
-    let pre_replay =
-        verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, bootstrap, &now)
-            .unwrap();
-
-    // Stored key verification against legitimate public key passes
-    assert!(pre_replay
-        .verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes())
-        .is_ok());
-
-    // Stored key verification against attacker/wrong public key FAILS
-    assert!(
-        pre_replay
-            .verify_rebind_stored_signing_key(attacker_device_signing.verifying_key().as_bytes())
-            .is_err(),
-        "Rebind signature MUST fail verification against wrong stored public key"
-    );
-
-    // 2. Attacker generates their own signature with wrong Ed25519 key
-    let attacker_raw = sign_chat_body(
-        rebind_body(&current_jkt, &new_jkt, &attacker_device_signing),
-        &attacker_device_signing,
-    );
-    let attacker_bootstrap = decode_rebind_bootstrap(&attacker_raw).unwrap();
-    let attacker_pre_replay = verify_rebind_request_auth(
-        &trust,
-        &format!("DPoP {token}"),
-        &proof,
-        attacker_bootstrap,
-        &now,
-    )
-    .unwrap();
-    assert!(
-        attacker_pre_replay
-            .verify_rebind_stored_signing_key(legitimate_device_signing.verifying_key().as_bytes())
-            .is_err(),
-        "Attacker rebind signed with foreign key MUST be rejected by stored device key"
-    );
-
-    // 3. Rebind body has new_jkt mismatched from token's cnf.jkt
-    let other_key = signing_key_p256(77);
-    let other_jwk = public_jwk(&other_key);
-    let other_jkt = jwk_thumbprint(&other_jwk);
-    let mismatched_raw = sign_chat_body(
-        rebind_body(&current_jkt, &other_jkt, &legitimate_device_signing),
-        &legitimate_device_signing,
-    );
-    let mismatched_bootstrap = decode_rebind_bootstrap(&mismatched_raw).unwrap();
-    assert!(
-        verify_rebind_request_auth(
-            &trust,
-            &format!("DPoP {token}"),
-            &proof,
-            mismatched_bootstrap,
-            &now
-        )
-        .is_err(),
-        "Must reject rebind when body new_dpop_jkt does not match token cnf.jkt"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Challenge 4: 32 `blue.catbird.chat.*` Endpoints Cutover Rejection
 // ---------------------------------------------------------------------------
 
@@ -1396,11 +1199,7 @@ async fn challenge_4_all_32_endpoints_cutover_disabled_rejection() {
         let body: Value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|err| panic!("Non-JSON body from {}: {err}", endpoint.nsid()));
 
-        let expected_error = if *endpoint == ChatEndpoint::UploadBlob {
-            "InvalidRequest"
-        } else {
-            "CutoverRequired"
-        };
+        let expected_error = "CutoverRequired";
         assert_eq!(
             body["error"],
             expected_error,

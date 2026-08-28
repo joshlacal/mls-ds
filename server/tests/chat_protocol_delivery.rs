@@ -20,13 +20,13 @@
 
 mod common;
 
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
 mod repository {
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use std::collections::HashSet;
@@ -41,11 +41,11 @@ use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use repository::delivery::{
-    append_entry, append_event, claim_outbox_batch, enqueue_outbox, insert_entry_recipients,
-    insert_event_recipients, mark_outbox_delivered, resolve_application_send, AppendEntry,
-    ApplicationSend, ApplicationSendDisposition, ApplicationSendOutcome, DeliveryRepositoryError,
-    EntryEntitlementKind, EntryRecipient, EventEntitlementKind, EventKind, EventRecipient,
-    NewEvent, OutboxWorkKind,
+    append_entry, append_event, append_message_available_event, claim_outbox_batch, enqueue_outbox,
+    insert_entry_recipients, insert_event_recipients, mark_outbox_delivered,
+    resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
+    ApplicationSendOutcome, DeliveryRepositoryError, EntryEntitlementKind, EntryRecipient,
+    EventEntitlementKind, EventKind, EventRecipient, NewEvent, OutboxWorkKind,
 };
 
 const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicationEntry";
@@ -564,6 +564,74 @@ async fn application_send_accepts_appends_entry_and_is_idempotent() {
     assert_eq!(next_entry_seq(&pool, fixture.conversation_id).await, 3);
 }
 
+#[tokio::test]
+async fn accepted_application_send_appends_message_available_event() {
+    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let fixture = seed_fixture(&pool).await;
+    let protocol_instance_id = ensure_protocol_instance(&pool).await;
+    let received_at = clock_now(&pool).await;
+    let send = to_application_send(coherent_application_send(&fixture, received_at, 0x22));
+
+    let mut tx = pool.begin().await.expect("begin accepted message event");
+    let outcome = resolve_application_send(&mut tx, &send, ApplicationSendDisposition::Accept)
+        .await
+        .expect("append accepted application entry");
+    let ApplicationSendOutcome::Accepted { seq } = outcome else {
+        panic!("accepted send returned stale");
+    };
+    let event_position =
+        append_message_available_event(&mut tx, fixture.conversation_id, 0, seq, received_at)
+            .await
+            .expect("append messageAvailable event");
+    tx.commit()
+        .await
+        .expect("commit accepted message and event atomically");
+
+    let (kind, payload, instance): (String, Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT event_kind,payload_bytes,protocol_instance_id FROM chat.events \
+         WHERE event_position=$1",
+    )
+    .bind(event_position)
+    .fetch_one(&pool)
+    .await
+    .expect("read messageAvailable event");
+    assert_eq!(kind, "messageAvailable");
+    assert_eq!(instance, protocol_instance_id);
+    assert_eq!(
+        payload,
+        format!(
+            r#"{{"$type":"blue.catbird.chat.defs#messageAvailableEvent","conversationId":"{}","seq":{seq}}}"#,
+            fixture.conversation_id.hyphenated()
+        )
+        .into_bytes()
+    );
+
+    let recipients: Vec<(String, Uuid, String, Option<i64>)> = sqlx::query_as(
+        "SELECT user_did,device_id,entitlement_kind,audience_predecessor_position \
+         FROM chat.event_recipients WHERE event_position=$1",
+    )
+    .bind(event_position)
+    .fetch_all(&pool)
+    .await
+    .expect("read frozen message audience");
+    assert_eq!(
+        recipients,
+        vec![(
+            fixture.actor_did,
+            fixture.actor_device_id,
+            "leaf".to_owned(),
+            None,
+        )]
+    );
+    let work_kinds: Vec<String> =
+        sqlx::query_scalar("SELECT work_kind FROM chat.outbox WHERE event_position=$1")
+            .bind(event_position)
+            .fetch_all(&pool)
+            .await
+            .expect("read message event outbox");
+    assert_eq!(work_kinds, vec!["stream"]);
+}
+
 /// Arm 6 (message send — stale tombstone): `resolve_application_send(Stale)` records
 /// a durable `stale` `message_sends` row with NO entry / NO seq (the explicitly-
 /// committed rejection path — it COMMITS even though the business is a refusal), and
@@ -955,51 +1023,7 @@ async fn outbox_row(
         .expect("read outbox work row")
 }
 
-/// Neutralise every pre-existing `chat.outbox` row before a test that asserts
-/// over a *global*, unscoped `claim_outbox_batch` scan, by parking it under a
-/// sentinel lease that expires far in the future (so it is not claimable during
-/// this test).
-///
-/// `claim_outbox_batch` claims in global `event_position` order with no per-test
-/// scoping — this is by design and its production code is review-approved. The
-/// clean-chat test database is never truncated between runs, so this suite's own
-/// committed work accumulates as claimable residue: the enqueue-uniqueness test
-/// commits two `pending` rows, and every claim test commits `leased` rows whose
-/// lease then expires relative to a later run's clock, becoming reclaimable.
-/// Because residue carries *lower* `event_position` values than a fresh run's
-/// rows, `ORDER BY event_position LIMIT n` claims the residue first and inflates
-/// (or entirely displaces) the current test's expected result — e.g.
-/// `reclaims_only_expired` observed `first.len() == 10` (its `LIMIT 10`) instead
-/// of `1` on the second run.
-///
-/// Outbox rows are immutable (a `BEFORE DELETE` trigger forbids removing them),
-/// so residue is *parked*, not deleted. The `pending -> leased` and
-/// `leased -> leased` transitions this UPDATE performs are exactly the ones the
-/// reviewed `claim_outbox_batch` / reclaim path performs and that the
-/// `outbox_lifecycle_monotonic` trigger permits; only the mutable
-/// `status`/`lease_owner`/`lease_expires_at` columns are touched (`lease_owner`
-/// is a fresh v4 UUID, as the `outbox_lease_owner_check` requires). Every
-/// non-terminal residue row lands under a lease dated years ahead, so the test's
-/// subsequent claim (sampled at `now`) sees only its own freshly enqueued work.
-/// Terminal (`delivered`/`failed`) rows are already non-claimable and left as-is.
-async fn drain_outbox(pool: &PgPool) {
-    let now = clock_now(pool).await;
-    let parked_until = now + chrono::Duration::days(3650);
-    sqlx::query(
-        r#"
-        UPDATE chat.outbox
-           SET status = 'leased',
-               lease_owner = $1,
-               lease_expires_at = $2
-         WHERE status IN ('pending', 'leased')
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(parked_until)
-    .execute(pool)
-    .await
-    .expect("park residual claimable outbox work before a global-claim test");
-}
+const GLOBAL_CLAIM_TEST_LIMIT: i64 = 10_000;
 
 // ---------------------------------------------------------------------------
 // entry_recipients
@@ -1691,9 +1715,7 @@ async fn enqueue_outbox_enforces_event_work_uniqueness() {
 #[tokio::test]
 async fn claim_outbox_batch_two_claimers_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(6).await;
-    // Remove prior-run residue so the two claimers partition exactly this test's
-    // freshly enqueued rows (the assertions below are exact over that set).
-    drain_outbox(&pool).await;
+    let _outbox_test_lock = common::chat_protocol::acquire_outbox_test_lock(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
@@ -1730,10 +1752,15 @@ async fn claim_outbox_batch_two_claimers_never_double_claim() {
         tokio::spawn(async move {
             let mut tx = pool.begin().await.expect("begin claimer tx");
             barrier.wait().await;
-            let claimed =
-                claim_outbox_batch(&mut tx, owner, base, lease_expires_at, WORK_COUNT as i64)
-                    .await
-                    .expect("claim outbox batch");
+            let claimed = claim_outbox_batch(
+                &mut tx,
+                owner,
+                base,
+                lease_expires_at,
+                GLOBAL_CLAIM_TEST_LIMIT,
+            )
+            .await
+            .expect("claim outbox batch");
             tx.commit().await.expect("commit claimer tx");
             claimed
                 .into_iter()
@@ -1763,17 +1790,15 @@ async fn claim_outbox_batch_two_claimers_never_double_claim() {
         set_a.is_disjoint(&set_b),
         "no outbox row is claimed by both workers"
     );
+    let expected = outbox_ids.iter().copied().collect::<HashSet<_>>();
+    let claimed_targets = set_a
+        .union(&set_b)
+        .filter(|outbox_id| expected.contains(outbox_id))
+        .copied()
+        .collect::<HashSet<_>>();
     assert_eq!(
-        claimed_a.len() + claimed_b.len(),
-        WORK_COUNT,
-        "the two workers together claim every pending row exactly once"
-    );
-    let mut union = set_a;
-    union.extend(set_b);
-    assert_eq!(
-        union,
-        outbox_ids.iter().copied().collect::<HashSet<Uuid>>(),
-        "the claimed union is exactly the enqueued set"
+        claimed_targets, expected,
+        "the two workers claim every row enqueued by this test exactly once"
     );
 }
 
@@ -1782,9 +1807,7 @@ async fn claim_outbox_batch_two_claimers_never_double_claim() {
 #[tokio::test]
 async fn claim_outbox_batch_reclaims_only_expired_leases() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
-    // Remove prior-run residue so the global claim scans only this test's row
-    // (asserted `first.len() == 1`, and the reclaim counts, are exact).
-    drain_outbox(&pool).await;
+    let _outbox_test_lock = common::chat_protocol::acquire_outbox_test_lock(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
@@ -1809,26 +1832,36 @@ async fn claim_outbox_batch_reclaims_only_expired_leases() {
         owner_a,
         base,
         base + chrono::Duration::seconds(100),
-        10,
+        GLOBAL_CLAIM_TEST_LIMIT,
     )
     .await
     .expect("first claim");
     tx.commit().await.expect("commit first claim");
-    assert_eq!(first.len(), 1, "the pending row is claimed once");
+    assert_eq!(
+        first
+            .iter()
+            .filter(|work| work.outbox_id == outbox_id)
+            .count(),
+        1,
+        "the pending target row is claimed once"
+    );
 
-    // A second worker before the lease expires reclaims nothing.
+    // A second worker before the target lease expires cannot reclaim it.
     let mut tx = pool.begin().await.expect("begin early reclaim");
     let early = claim_outbox_batch(
         &mut tx,
         Uuid::new_v4(),
         base + chrono::Duration::seconds(50),
         base + chrono::Duration::seconds(400),
-        10,
+        GLOBAL_CLAIM_TEST_LIMIT,
     )
     .await
     .expect("early reclaim attempt");
     tx.commit().await.expect("commit early reclaim");
-    assert!(early.is_empty(), "a still-valid lease is not reclaimable");
+    assert!(
+        early.iter().all(|work| work.outbox_id != outbox_id),
+        "a still-valid target lease is not reclaimable"
+    );
 
     // After the lease expires the row is reclaimed by a new owner.
     let owner_b = Uuid::new_v4();
@@ -1838,12 +1871,19 @@ async fn claim_outbox_batch_reclaims_only_expired_leases() {
         owner_b,
         base + chrono::Duration::seconds(200),
         base + chrono::Duration::seconds(600),
-        10,
+        GLOBAL_CLAIM_TEST_LIMIT,
     )
     .await
     .expect("expired reclaim");
     tx.commit().await.expect("commit expired reclaim");
-    assert_eq!(reclaimed.len(), 1, "the expired lease is reclaimed");
+    assert_eq!(
+        reclaimed
+            .iter()
+            .filter(|work| work.outbox_id == outbox_id)
+            .count(),
+        1,
+        "the expired target lease is reclaimed"
+    );
 
     let (status, lease_owner, _) = outbox_row(&pool, outbox_id).await;
     assert_eq!(status, "leased", "the reclaimed row remains leased");
@@ -1860,9 +1900,7 @@ async fn claim_outbox_batch_reclaims_only_expired_leases() {
 #[tokio::test]
 async fn mark_outbox_delivered_requires_exact_lease_owner() {
     let pool = common::chat_protocol::setup_chat_protocol_db(3).await;
-    // Remove prior-run residue so the claim (LIMIT 10) leases this test's single
-    // row rather than displacing it with older claimable residue.
-    drain_outbox(&pool).await;
+    let _outbox_test_lock = common::chat_protocol::acquire_outbox_test_lock(&pool).await;
     let instance = ensure_protocol_instance(&pool).await;
     let base = clock_now(&pool).await;
 
@@ -1881,15 +1919,23 @@ async fn mark_outbox_delivered_requires_exact_lease_owner() {
 
     let owner = Uuid::new_v4();
     let mut tx = pool.begin().await.expect("begin claim");
-    claim_outbox_batch(
+    let claimed = claim_outbox_batch(
         &mut tx,
         owner,
         base,
         base + chrono::Duration::seconds(100),
-        10,
+        GLOBAL_CLAIM_TEST_LIMIT,
     )
     .await
     .expect("claim the row");
+    assert_eq!(
+        claimed
+            .iter()
+            .filter(|work| work.outbox_id == outbox_id)
+            .count(),
+        1,
+        "the target row is claimed once"
+    );
     tx.commit().await.expect("commit claim");
 
     // A non-owner cannot terminalize the lease.

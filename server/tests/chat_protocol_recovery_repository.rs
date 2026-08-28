@@ -6,106 +6,19 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
 
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
+#[allow(dead_code)]
 mod snapshot {
     pub use catbird_server::chat_protocol::snapshot::*;
-}
-
-mod chat_protocol {
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod model {
-        pub use crate::model::*;
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod repository {
-        pub mod auth {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod core {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod relationship {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod transition {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-        pub mod execution_context {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod recovery {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
 }
 
 use chat_protocol::repository::delivery::{
@@ -691,7 +604,7 @@ fn recovery_prewrite_reloads_full_aggregate_custom_head_and_every_exact_row_befo
 #[test]
 fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy_fallbacks_to_tests(
 ) {
-    let source = include_str!("../src/chat_protocol/state_machine.rs");
+    let source = include_str!("../src/chat_protocol/state_machine/executor.rs");
     assert!(
         source
             .matches("missing validated Recovery executor write authority")
@@ -699,15 +612,20 @@ fn production_executor_requires_exact_recovery_write_authority_and_fences_legacy
             >= 4,
         "request, cancellation, expiry, and fulfillment must each reject missing write authority"
     );
+    let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
     assert_eq!(
-        source
-            .matches("#[cfg(test)]\n        if recovery_write_authority.is_none()")
+        compact
+            .matches("#[cfg(test)] if recovery_write_authority.is_none()")
             .count(),
-        4,
-        "every status-only Recovery fallback must be a genuine cfg(test) seam"
+        3,
+        "open, cancellation, and expiry status-only fallbacks must be genuine cfg(test) seams"
     );
     assert!(
-        !source.contains("#[cfg(not(test))]\n        if recovery_write_authority.is_none()"),
+        compact.contains("#[cfg(not(test))] { if historical_write_authority.is_none()"),
+        "historical fulfillment must fail closed without Recovery or historical write authority"
+    );
+    assert!(
+        !compact.contains("#[cfg(not(test))] if recovery_write_authority.is_none()"),
         "production must reject, never execute a witnessless fallback"
     );
 }

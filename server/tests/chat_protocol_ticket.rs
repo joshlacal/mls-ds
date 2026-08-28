@@ -14,52 +14,21 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
 
-use cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
-use zeroize::Zeroizing;
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
-    pub(crate) mod inventory {
-        use crate::cursor::{
-            EventCursor, InventoryPageDomain, InventorySessionBinding, InventorySessionToken,
-        };
-
-        #[allow(dead_code)]
-        pub(crate) struct LockedInventoryCursorEvidence;
-
-        impl LockedInventoryCursorEvidence {
-            #[allow(dead_code)]
-            #[allow(clippy::type_complexity)]
-            pub(crate) fn into_cursor_parts(
-                self,
-            ) -> (
-                InventorySessionBinding,
-                InventorySessionToken,
-                EventCursor,
-                InventoryPageDomain,
-                Vec<u8>,
-                u64,
-                u64,
-                u64,
-            ) {
-                unreachable!("ticket acceptance does not exercise inventory page cursors")
-            }
-        }
-    }
-    pub(crate) mod ticket {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/ticket.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
-mod common;
+mod cursor {
+    pub(crate) use crate::chat_protocol::cursor::*;
+}
+use chat_protocol::cursor::{CursorSealer, SealerBinding, SecureRandom, SecureRandomError};
+use zeroize::Zeroizing;
 
 #[test]
 fn ticket_repository_uses_only_g7_hash_and_sealed_columns() {

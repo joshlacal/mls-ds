@@ -1,9 +1,9 @@
-//! Transaction-bound composition for the non-Recovery `submitTransition` union.
-//!
-//! The public handler is deliberately kept outside this module. It may choose
-//! this facade after global signed-operation arbitration, serialize the exact
-//! returned bytes, and commit the caller-owned outer transaction. It may not
-//! assemble planner inputs, executor artifacts, or replay bytes.
+// Transaction-bound composition for the non-Recovery `submitTransition` union.
+//
+// The public handler is deliberately kept outside this module. It may choose
+// this facade after global signed-operation arbitration, serialize the exact
+// returned bytes, and commit the caller-owned outer transaction. It may not
+// assemble planner inputs, executor artifacts, or replay bytes.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
@@ -534,6 +534,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         // pending state only if measured federation latency makes this a throughput bottleneck.
         let verified = submitter
             .submit(
+                transaction,
                 &sequencer_ds,
                 sequencer_term as u64,
                 &envelope,
@@ -559,9 +560,15 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         {
             return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
         }
+        crate::federation::queue::store_federation_receipt_conn(
+            &mut **transaction,
+            &verified.output.receipt,
+            &verified.federation_response_bytes,
+        )
+        .await?;
     }
-    let (plan, response, accepted_control_entry_bytes) =
-        (plan, local_response, products.durable_json().to_vec());
+    let response = local_response;
+    let accepted_control_entry_bytes = products.durable_json().to_vec();
     let expected_coordinate = plan.successor_coordinate().copied();
     let response_sha256 = *response.sha256();
     let (scope_authority, completion) = prelude.into_execution_parts();

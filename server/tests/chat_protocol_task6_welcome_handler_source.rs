@@ -72,9 +72,12 @@ fn welcome_failure_mapper_exposes_only_declared_semantic_input_errors() {
     assert!(mapper.contains("E::ExecutionHydration"));
     assert!(mapper.contains("ChatFailure::storage(endpoint)"));
     assert!(mapper.contains("ChatFailure::invariant(endpoint)"));
+    assert!(mapper.contains(
+        "E::Aggregate(crate::chat_protocol::repository::core::ConversationStateHydrationError::ReadSetMismatch)"
+    ));
+    assert!(mapper.contains("C::AcknowledgementConflict"));
+    assert!(mapper.contains("C::RejectionConflict"));
     for forbidden in [
-        "C::AcknowledgementConflict",
-        "C::RejectionConflict",
         "C::WelcomeExpired",
         "C::WelcomeNotFound",
         "C::WelcomeSuperseded",

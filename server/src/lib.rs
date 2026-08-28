@@ -84,7 +84,6 @@ pub mod repositories;
 pub mod storage;
 pub mod util;
 pub mod workers;
-
 // Re-export shared generated types and common validated types.
 pub use catbird_atproto::generated;
 pub use catbird_atproto::types;

@@ -461,7 +461,6 @@ mod tests {
         for endpoint in [
             "/xrpc/blue.catbird.chat.sendMessage",
             "/xrpc/blue.catbird.chat.enrollDevice",
-            "/xrpc/blue.catbird.chat.rebindDeviceAuthentication",
             "/xrpc/blue.catbird.chat.createConversation",
         ] {
             assert!(!should_apply(endpoint, &Method::POST));

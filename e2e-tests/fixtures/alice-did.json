@@ -1,0 +1,15 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/did/v1",
+    "https://w3id.org/security/suites/jws-2020/v1"
+  ],
+  "id": "did:web:alice.catbird.blue",
+  "verificationMethod": [
+    {
+      "id": "did:web:alice.catbird.blue#atproto",
+      "type": "Multikey",
+      "controller": "did:web:alice.catbird.blue",
+      "publicKeyMultibase": "zDnaeWp1hEZZ97SCZmeqok6kPDWfzHWcvaE5zredZ6Qj1mzzX"
+    }
+  ]
+}

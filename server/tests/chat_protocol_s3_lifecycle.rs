@@ -1057,7 +1057,7 @@ async fn route_fetch_bytes(
             device,
             "blue.catbird.chat.getBlob",
             "GET",
-            &format!("?blobId={blob_id}"),
+            &format!("?actorDeviceId={}&blobId={blob_id}", device.device_id),
         ),
     )
     .await
@@ -2501,6 +2501,7 @@ async fn s3_denies_lost_membership_after_committed_removal() {
         jwk: bob_jwk,
         jkt: bob_jkt,
     };
+    http::cache_device_did(&bob).await;
     let bob_leaf = Uuid::new_v4();
     let bob_participant = Uuid::new_v4();
     let bob_key_package_ref = Sha256::digest(Uuid::new_v4().as_bytes()).to_vec();

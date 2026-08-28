@@ -139,6 +139,14 @@ fn random_p256() -> P256SigningKey {
     }
 }
 
+fn corpus_alice_p256() -> P256SigningKey {
+    P256SigningKey::from_slice(&[0x42; 32]).expect("fixed corpus auth key")
+}
+
+fn local_ds_p256() -> P256SigningKey {
+    P256SigningKey::from_slice(&[0x43; 32]).expect("fixed local service auth key")
+}
+
 fn sign_jwt(header: Value, claims: Value, key: &P256SigningKey) -> String {
     let h_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
     let c_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -517,10 +525,17 @@ fn make_tree_summary_bytes(
 
 fn corpus_file(name: &str) -> Vec<u8> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/crypto-wire")
+        .join("tests/fixtures/crypto-wire-v09")
         .join(name);
-    std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("failed to read corpus file {name} at {path:?}: {e}"))
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!("failed to read OpenMLS 0.9 corpus file {name} at {path:?}: {e}")
+    })
+}
+
+fn corpus_key_package_ref() -> [u8; 32] {
+    corpus_file("key-package-ref.bin")
+        .try_into()
+        .expect("the corpus key-package ref is exactly 32 bytes")
 }
 
 fn hex_array<const N: usize>(value: &str) -> [u8; N] {
@@ -639,28 +654,15 @@ async fn seed_corpus_conversation_at_added(
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
 
     // Verify manifest artifact checksums and lengths before use
-    for (file_name, expected_sha, expected_len) in [
-        (
-            "genesis-public-state.bin",
-            "121f07a1fad006427587a544509ce0948775870023a1ca9bdf4d94ace5804c74",
-            6849,
-        ),
-        (
-            "committed-public-state.bin",
-            "dff1863e208b53d428e97e57fb35b8367c5a43d911f2aeb0ddd67f9564c5a4c5",
-            16731,
-        ),
-        (
-            "commit-generic-public.mls",
-            "c7dfa6ffe408d0b7f3443726e98ee874267ffd55dcee60b898c933f5a6dbd36f",
-            4369,
-        ),
-        (
-            "group-info.mls",
-            "5aa545909adf7a81ab77f48094590a38b92edaf2a2eac74fd08236e703e17395",
-            2838,
-        ),
+    for file_name in [
+        "genesis-public-state.bin",
+        "committed-public-state.bin",
+        "commit-generic-public.mls",
+        "group-info.mls",
     ] {
+        let file_meta = &manifest["files"][file_name];
+        let expected_len = file_meta["length"].as_u64().expect("manifest length") as usize;
+        let expected_sha = file_meta["sha256Hex"].as_str().expect("manifest sha256Hex");
         let bytes = corpus_file(file_name);
         assert_eq!(
             bytes.len(),
@@ -704,7 +706,7 @@ async fn seed_corpus_conversation_at_added(
             .as_str()
             .unwrap(),
     );
-    let key_package_ref: [u8; 32] = hex_array(chain["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let key_package_wrapper = vec![0x77u8; 32];
     let creation_transition_id =
         Uuid::parse_str(manifest["creation"]["transitionId"].as_str().unwrap()).unwrap();
@@ -3383,7 +3385,7 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let manifest_bytes = corpus_file("manifest.json");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
-    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let public_snapshot_bytes = vec![0x88u8; 16];
     let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
@@ -4869,7 +4871,7 @@ async fn test_deliver_welcome_router_concurrency_revocation_fails_closed() {
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let manifest_bytes = corpus_file("manifest.json");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
-    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let public_snapshot_bytes = vec![0x88u8; 16];
     let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
@@ -5427,7 +5429,7 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let manifest_bytes = corpus_file("manifest.json");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
-    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let public_snapshot_bytes = vec![0x88u8; 16];
     let public_snapshot_sha256: [u8; 32] = Sha256::digest(&public_snapshot_bytes).into();
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
@@ -6413,7 +6415,6 @@ async fn test_remote_commit_rejected_order_leaves_mailbox_state_byte_for_byte_un
     let outbound = Arc::new(OutboundClient::new(2, 2));
     let auth_mw = AuthMiddleware::new();
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -6457,7 +6458,7 @@ async fn test_remote_commit_rejected_order_leaves_mailbox_state_byte_for_byte_un
     );
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt = sign_jwt(
@@ -6585,7 +6586,6 @@ async fn test_remote_commit_rejected_403_returns_not_authorized_and_leaves_mailb
     let outbound = Arc::new(OutboundClient::new(2, 2));
     let auth_mw = AuthMiddleware::new();
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -6629,7 +6629,7 @@ async fn test_remote_commit_rejected_403_returns_not_authorized_and_leaves_mailb
     );
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt = sign_jwt(
@@ -6717,7 +6717,7 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
     );
 
     use p256::pkcs8::EncodePrivateKey;
-    let local_ds_key = random_p256();
+    let local_ds_key = local_ds_p256();
     cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
     let pem_str = local_ds_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -6914,7 +6914,6 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
     auth_mw.cache_did_document(seq_did_doc).await;
 
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -6939,7 +6938,7 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
     let before = capture_mailbox_snapshot(&harness.pool).await;
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt = sign_jwt(
@@ -7027,7 +7026,7 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
     );
 
     use p256::pkcs8::EncodePrivateKey;
-    let local_ds_key = random_p256();
+    let local_ds_key = local_ds_p256();
     cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
     let pem_str = local_ds_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -7216,7 +7215,6 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
     auth_mw.cache_did_document(seq_did_doc).await;
 
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -7241,7 +7239,7 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
     let before = capture_mailbox_snapshot(&harness.pool).await;
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt = sign_jwt(
@@ -7329,7 +7327,7 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
     );
 
     use p256::pkcs8::EncodePrivateKey;
-    let local_ds_key = random_p256();
+    let local_ds_key = local_ds_p256();
     cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
     let pem_str = local_ds_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -7518,7 +7516,6 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
     auth_mw.cache_did_document(seq_did_doc).await;
 
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -7543,7 +7540,7 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
     let before = capture_mailbox_snapshot(&harness.pool).await;
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt = sign_jwt(
@@ -7632,7 +7629,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     );
 
     use p256::pkcs8::EncodePrivateKey;
-    let local_ds_key = random_p256();
+    let local_ds_key = local_ds_p256();
     cache_did_key(LOCAL_DS_DID, &local_ds_key).await;
     let pem_str = local_ds_key
         .to_pkcs8_pem(p256::pkcs8::LineEnding::LF)
@@ -7842,7 +7839,6 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     auth_mw.cache_did_document(seq_did_doc).await;
 
     let commit_submitter = Arc::new(RemoteCommitSubmitter::new(
-        harness.pool.clone(),
         resolver.clone(),
         outbound,
         service_auth,
@@ -7867,7 +7863,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
     let before = capture_mailbox_snapshot(&harness.pool).await;
 
     let client_body = json!({ "signedRequest": wrapper });
-    let alice_p256 = random_p256();
+    let alice_p256 = corpus_alice_p256();
     cache_did_key(&alice.did, &alice_p256).await;
     let now_ts = Utc::now().timestamp();
     let jwt1 = sign_jwt(
@@ -8068,130 +8064,105 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     let harness = TestHarness::new("recon-suffix").await;
     let now = Utc::now();
 
-    let convo_id = Uuid::new_v4();
-    let group_id = vec![0x42u8; 32];
-    let alice = TestActor::generate();
-    alice.seed(&harness.pool, now).await;
-    seed_conversation_structure(
-        &harness.pool,
+    let (
         convo_id,
-        &group_id,
-        true,
+        _creation_transition_id,
+        _generic_transition_id,
+        alice,
+        _bob,
+        group_id,
+        committed_group_context_hash,
+        committed_confirmation_tag,
+        _generic_group_context_hash,
+        _generic_confirmation_tag,
+    ) = seed_corpus_conversation_at_added(
+        &harness.pool,
+        &harness.sender_ds_did,
         Some(&harness.sequencer_ds_did),
-        0,
-        &alice,
-        Some(&harness.sender_ds_did),
         now,
     )
     .await;
 
-    let msg_id_2 = Uuid::new_v4();
-    let msg_entry_id_2 = Uuid::new_v4();
-    let (_msg_val, signed_req_bytes_2) =
-        make_message_body(convo_id, msg_id_2, &alice, &group_id, vec![], now);
-    let mutation_2 =
-        decode_and_verify_signed_mutation(&signed_req_bytes_2, &alice.public_key).unwrap();
-    let received_at_2 = TrustedRequestInstant::from_canonical_for_test(
+    let msg_id_5 = Uuid::new_v4();
+    let msg_entry_id_5 = Uuid::new_v4();
+    let (_msg_val, signed_req_bytes_5) = make_message_body_with_coordinates(
+        convo_id,
+        msg_id_5,
+        &alice,
+        &group_id,
+        3,
+        1,
+        &committed_group_context_hash,
+        &committed_confirmation_tag,
+        vec![],
+        now,
+    );
+    let mutation_5 =
+        decode_and_verify_signed_mutation(&signed_req_bytes_5, &alice.public_key).unwrap();
+    let received_at_5 = TrustedRequestInstant::from_canonical_for_test(
         CanonicalTimestamp::parse(&now.to_rfc3339_opts(SecondsFormat::Millis, true)).unwrap(),
     );
-    let built_2 = build_verified_application_entry(
-        mutation_2,
-        CanonicalUuidV4::parse(&msg_entry_id_2.to_string()).unwrap(),
+    let built_5 = build_verified_application_entry(
+        mutation_5,
+        CanonicalUuidV4::parse(&msg_entry_id_5.to_string()).unwrap(),
         CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
-        2,
-        &received_at_2,
+        5,
+        &received_at_5,
     )
     .unwrap();
-    let ciphertext_2 = built_2.canonical_entry_bytes().to_vec();
-    let payload_sha256_2 = built_2.accepted_payload_sha256().to_vec();
-    let outer_fp_2 = built_2.outer_application_fingerprint().to_vec();
+    let ciphertext_5 = built_5.canonical_entry_bytes().to_vec();
+    let payload_sha256_5 = built_5.accepted_payload_sha256().to_vec();
+    let outer_fp_5 = built_5.outer_application_fingerprint().to_vec();
 
-    let local_row_1: CleanDigestRow = sqlx::query_as(
+    let mut remote_rows: Vec<CleanDigestRow> = sqlx::query_as(
         "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
                 entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
                 signed_request_bytes, outer_entry_fingerprint, received_at \
-         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+         FROM chat.entries WHERE conversation_id = $1 ORDER BY seq",
     )
     .bind(convo_id)
-    .fetch_one(&harness.pool)
+    .fetch_all(&harness.pool)
     .await
     .unwrap();
+    assert_eq!(remote_rows.len(), 4);
 
-    let remote_row_2 = CleanDigestRow {
-        seq: 2,
+    let remote_row_5 = CleanDigestRow {
+        seq: 5,
         epoch: 0,
-        entry_id: msg_entry_id_2,
+        entry_id: msg_entry_id_5,
         entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
-        accepted_payload_bytes: ciphertext_2.clone(),
-        accepted_payload_sha256: payload_sha256_2.clone(),
-        signed_request_bytes: signed_req_bytes_2.clone(),
-        outer_entry_fingerprint: outer_fp_2.clone(),
+        accepted_payload_bytes: ciphertext_5.clone(),
+        accepted_payload_sha256: payload_sha256_5.clone(),
+        signed_request_bytes: signed_req_bytes_5.clone(),
+        outer_entry_fingerprint: outer_fp_5.clone(),
         received_at: now,
     };
-
-    let remote_rows = vec![
-        CleanDigestRow {
-            seq: local_row_1.seq,
-            epoch: local_row_1.epoch,
-            entry_id: local_row_1.entry_id,
-            entry_kind: local_row_1.entry_kind.clone(),
-            accepted_payload_bytes: local_row_1.accepted_payload_bytes.clone(),
-            accepted_payload_sha256: local_row_1.accepted_payload_sha256.clone(),
-            signed_request_bytes: local_row_1.signed_request_bytes.clone(),
-            outer_entry_fingerprint: local_row_1.outer_entry_fingerprint.clone(),
-            received_at: local_row_1.received_at,
-        },
-        remote_row_2,
-    ];
+    let mut remote_events: Vec<Value> = remote_rows
+        .iter()
+        .map(|row| clean_event_json(row, row.entry_id))
+        .collect();
+    remote_events.push(clean_event_json(&remote_row_5, msg_id_5));
+    remote_rows.push(remote_row_5);
     let remote_digest_sha256 = compute_clean_convo_digest(&remote_rows);
 
     let convo_id_str = convo_id.to_string();
     let seq_did_clone = harness.sequencer_ds_did.clone();
     let digest_output = GetConvoDigestOutput {
         convo_id: convo_id_str.clone(),
-        sequencer_ds_did: seq_did_clone.clone(),
-        sequencer_term: 0,
+        sequencer_ds_did: seq_did_clone,
+        sequencer_term: 1,
         epoch: 0,
-        last_seq: 2,
-        event_count: 2,
-        digest_sha256: remote_digest_sha256.clone(),
+        last_seq: 5,
+        event_count: 5,
+        digest_sha256: remote_digest_sha256,
         generated_at: now,
     };
 
     let events_output = serde_json::json!({
         "convoId": convo_id_str,
         "fromSeqExclusive": 0,
-        "toSeqInclusive": 2,
-        "events": [
-            {
-                "seq": 1,
-                "epoch": local_row_1.epoch,
-                "msgId": local_row_1.entry_id.to_string(),
-                "messageType": local_row_1.entry_kind,
-                "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-                "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-                "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": local_row_1.entry_id.to_string(),
-                "entryKind": local_row_1.entry_kind,
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-                "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-            },
-            {
-                "seq": 2,
-                "epoch": 0,
-                "msgId": msg_id_2.to_string(),
-                "messageType": "blue.catbird.chat.defs#applicationEntry",
-                "ciphertext": {"$bytes": STANDARD.encode(&ciphertext_2)},
-                "paddedSize": ciphertext_2.len() as i64,
-                "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                "entryId": msg_entry_id_2.to_string(),
-                "entryKind": "blue.catbird.chat.defs#applicationEntry",
-                "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256_2)},
-                "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes_2)},
-                "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp_2)}
-            }
-        ]
+        "toSeqInclusive": 5,
+        "events": remote_events,
     });
 
     let app = axum::Router::new()
@@ -8292,22 +8263,22 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
             .fetch_one(&harness.pool)
             .await
             .unwrap();
-    assert_eq!(entry_count, 2, "suffix entry must be applied to DS2");
+    assert_eq!(entry_count, 5, "suffix entry must be applied to DS2");
 
     assert_applied_suffix_entry_and_message_send_exact_fields(
         &harness.pool,
         convo_id,
-        2,
-        msg_entry_id_2,
-        msg_id_2,
+        5,
+        msg_entry_id_5,
+        msg_id_5,
         &alice,
-        &ciphertext_2,
-        &payload_sha256_2,
-        &signed_req_bytes_2,
-        &outer_fp_2,
-        built_2.mutation().transcript_bytes(),
-        built_2.mutation().request_digest().as_slice(),
-        built_2.mutation().signature().as_slice(),
+        &ciphertext_5,
+        &payload_sha256_5,
+        &signed_req_bytes_5,
+        &outer_fp_5,
+        built_5.mutation().transcript_bytes(),
+        built_5.mutation().request_digest().as_slice(),
+        built_5.mutation().signature().as_slice(),
         now,
     )
     .await;
@@ -8319,7 +8290,7 @@ async fn test_reconciliation_local_prefix_matches_and_suffix_applies_and_converg
     .await
     .unwrap();
     assert_eq!(sync_state.0, "healthy");
-    assert_eq!(sync_state.1, 2);
+    assert_eq!(sync_state.1, 5);
     assert_eq!(sync_state.2, None);
 }
 
@@ -9455,33 +9426,36 @@ async fn test_reconciliation_two_event_suffix_with_second_event_malformed_rolls_
 async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     let harness = TestHarness::new("recon-multipage").await;
     let now = Utc::now();
-    let convo_id = Uuid::new_v4();
-    let group_id = vec![0x55u8; 32];
-    let alice = TestActor::generate();
-    alice.seed(&harness.pool, now).await;
-    seed_conversation_structure(
-        &harness.pool,
+    let (
         convo_id,
-        &group_id,
-        true,
+        _creation_transition_id,
+        _generic_transition_id,
+        alice,
+        _bob,
+        group_id,
+        committed_group_context_hash,
+        committed_confirmation_tag,
+        _generic_group_context_hash,
+        _generic_confirmation_tag,
+    ) = seed_corpus_conversation_at_added(
+        &harness.pool,
+        &harness.sender_ds_did,
         Some(&harness.sequencer_ds_did),
-        0,
-        &alice,
-        Some(&harness.sender_ds_did),
         now,
     )
     .await;
 
-    let local_row_1: CleanDigestRow = sqlx::query_as(
+    let local_rows: Vec<CleanDigestRow> = sqlx::query_as(
         "SELECT CAST(seq AS BIGINT) AS seq, CAST(COALESCE(generation, 0) AS BIGINT) AS epoch, \
                 entry_id, entry_kind, accepted_payload_bytes, accepted_payload_sha256, \
                 signed_request_bytes, outer_entry_fingerprint, received_at \
-         FROM chat.entries WHERE conversation_id = $1 AND seq = 1",
+         FROM chat.entries WHERE conversation_id = $1 ORDER BY seq",
     )
     .bind(convo_id)
-    .fetch_one(&harness.pool)
+    .fetch_all(&harness.pool)
     .await
     .unwrap();
+    assert_eq!(local_rows.len(), 4);
 
     struct GeneratedSuffix {
         seq: i64,
@@ -9496,33 +9470,31 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
         signature: [u8; 64],
     }
 
-    // Generate 505 suffix events (seq 2..=506)
-    let mut all_events = Vec::with_capacity(506);
-    all_events.push(serde_json::json!({
-        "seq": 1,
-        "epoch": local_row_1.epoch,
-        "msgId": local_row_1.entry_id.to_string(),
-        "messageType": local_row_1.entry_kind,
-        "ciphertext": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_bytes)},
-        "paddedSize": local_row_1.accepted_payload_bytes.len() as i64,
-        "createdAt": local_row_1.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-        "entryId": local_row_1.entry_id.to_string(),
-        "entryKind": local_row_1.entry_kind,
-        "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&local_row_1.accepted_payload_sha256)},
-        "signedRequest": {"$bytes": STANDARD.encode(&local_row_1.signed_request_bytes)},
-        "outerFingerprint": {"$bytes": STANDARD.encode(&local_row_1.outer_entry_fingerprint)}
-    }));
-
-    let mut all_digest_rows = Vec::with_capacity(506);
-    all_digest_rows.push(local_row_1);
-
+    // Generate 505 suffix events (seq 5..=509) after a genuine four-entry prefix.
+    let mut all_events: Vec<Value> = local_rows
+        .iter()
+        .map(|row| clean_event_json(row, row.entry_id))
+        .collect();
+    let mut all_digest_rows = local_rows;
+    all_events.reserve(505);
+    all_digest_rows.reserve(505);
     let mut generated_suffix = Vec::with_capacity(505);
 
-    for seq in 2..=506 {
+    for seq in 5_i64..=509 {
         let msg_id = Uuid::new_v4();
         let msg_entry_id = Uuid::new_v4();
-        let (_, signed_req_bytes) =
-            make_message_body(convo_id, msg_id, &alice, &group_id, vec![], now);
+        let (_, signed_req_bytes) = make_message_body_with_coordinates(
+            convo_id,
+            msg_id,
+            &alice,
+            &group_id,
+            3,
+            1,
+            &committed_group_context_hash,
+            &committed_confirmation_tag,
+            vec![],
+            now,
+        );
         let mutation =
             decode_and_verify_signed_mutation(&signed_req_bytes, &alice.public_key).unwrap();
         let transcript_bytes = mutation.transcript_bytes().to_vec();
@@ -9535,16 +9507,15 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             mutation,
             CanonicalUuidV4::parse(&msg_entry_id.to_string()).unwrap(),
             CanonicalUuidV4::parse(&convo_id.to_string()).unwrap(),
-            seq as u64,
+            u64::try_from(seq).unwrap(),
             &received_at,
         )
         .unwrap();
         let ciphertext = built.canonical_entry_bytes().to_vec();
         let payload_sha256 = *built.accepted_payload_sha256();
         let outer_fp = *built.outer_application_fingerprint();
-
-        all_digest_rows.push(CleanDigestRow {
-            seq: seq as i64,
+        let row = CleanDigestRow {
+            seq,
             epoch: 0,
             entry_id: msg_entry_id,
             entry_kind: "blue.catbird.chat.defs#applicationEntry".to_string(),
@@ -9553,24 +9524,12 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             signed_request_bytes: signed_req_bytes.clone(),
             outer_entry_fingerprint: outer_fp.to_vec(),
             received_at: now,
-        });
+        };
 
-        all_events.push(serde_json::json!({
-            "seq": seq,
-            "epoch": 0,
-            "msgId": msg_id.to_string(),
-            "messageType": "blue.catbird.chat.defs#applicationEntry",
-            "ciphertext": {"$bytes": STANDARD.encode(&ciphertext)},
-            "paddedSize": ciphertext.len() as i64,
-            "createdAt": now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            "entryId": msg_entry_id.to_string(),
-            "entryKind": "blue.catbird.chat.defs#applicationEntry",
-            "acceptedPayloadSha256": {"$bytes": STANDARD.encode(&payload_sha256)},
-            "signedRequest": {"$bytes": STANDARD.encode(&signed_req_bytes)},
-            "outerFingerprint": {"$bytes": STANDARD.encode(&outer_fp)}
-        }));
+        all_events.push(clean_event_json(&row, msg_id));
+        all_digest_rows.push(row);
         generated_suffix.push(GeneratedSuffix {
-            seq: seq as i64,
+            seq,
             msg_entry_id,
             msg_id,
             ciphertext,
@@ -9590,19 +9549,19 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     let digest_output = GetConvoDigestOutput {
         convo_id: convo_id_str.clone(),
         sequencer_ds_did: seq_did_clone.clone(),
-        sequencer_term: 0,
+        sequencer_term: 1,
         epoch: 0,
-        last_seq: 506,
-        event_count: 506,
+        last_seq: 509,
+        event_count: 509,
         digest_sha256: total_digest_sha256.clone(),
         generated_at: now,
     };
 
-    // 4 pages: 0..130, 130..260, 260..390, 390..506
+    // Four bounded pages cover the genuine prefix plus 505 application events.
     let page1_events = all_events[0..130].to_vec();
     let page2_events = all_events[130..260].to_vec();
     let page3_events = all_events[260..390].to_vec();
-    let page4_events = all_events[390..506].to_vec();
+    let page4_events = all_events[390..509].to_vec();
 
     let pagination_requests: Arc<tokio::sync::Mutex<Vec<(i64, i64)>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -9703,7 +9662,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
                         } else if from_seq == 260 {
                             (p3_c, 390)
                         } else if from_seq == 390 {
-                            (p4_c, 506)
+                            (p4_c, 509)
                         } else {
                             return axum::response::Response::builder()
                                 .status(StatusCode::BAD_REQUEST)
@@ -9796,7 +9755,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
         .unwrap();
 
         assert_eq!(current_sync.0, "healthy");
-        if current_sync.1 == 506 {
+        if current_sync.1 == 509 {
             break;
         }
         assert!(
@@ -9806,7 +9765,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     }
     assert!(
         passes > 1,
-        "reconciliation of 506 events must take multiple bounded passes, took {}",
+        "reconciliation of 509 events must take multiple bounded passes, took {}",
         passes
     );
 
@@ -9833,7 +9792,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
     .fetch_one(&harness.pool)
     .await
     .unwrap();
-    assert_eq!(final_next_seq, 507, "next_entry_seq must advance to 507");
+    assert_eq!(final_next_seq, 510, "next_entry_seq must advance to 510");
 
     // Suffix fidelity: verify all 505 suffix rows match full immutable fields in chat.entries and chat.message_sends
     let entry_count: i64 =
@@ -9842,7 +9801,7 @@ async fn test_reconciliation_multi_page_bounded_pagination_and_progress() {
             .fetch_one(&harness.pool)
             .await
             .unwrap();
-    assert_eq!(entry_count, 506);
+    assert_eq!(entry_count, 509);
 
     for item in &generated_suffix {
         assert_applied_suffix_entry_and_message_send_exact_fields(
@@ -11007,7 +10966,7 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let manifest_bytes = corpus_file("manifest.json");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
-    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let public_snapshot_bytes = vec![0x88u8; 16];
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
     let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();
@@ -11930,7 +11889,7 @@ async fn test_ds_delivery_replay_cannot_bypass_quarantine() {
     let welcome_sha256: [u8; 32] = Sha256::digest(&welcome_bytes).into();
     let manifest_bytes = corpus_file("manifest.json");
     let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("parse manifest.json");
-    let key_package_ref = hex_array(manifest["chain"]["innerKeyPackageRefHex"].as_str().unwrap());
+    let key_package_ref = corpus_key_package_ref();
     let public_snapshot_bytes = vec![0x88u8; 16];
     let creator_credential = format!("{}#{}", creator.did, creator.device_id).into_bytes();
     let recipient_credential = format!("{}#{}", recipient.did, recipient.device_id).into_bytes();

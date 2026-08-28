@@ -7,9 +7,13 @@
 #[path = "../../../server/src/chat_protocol/cursor.rs"]
 pub mod cursor;
 
+#[allow(unused_imports)]
 pub(crate) use cursor::{
-    mint_capability_token, CursorCodecError, CursorSealer, OsSecureRandom, SealedCapability,
-    SealerBinding, SecureRandom,
+    decode_capability_token, mint_capability_token, CapabilityToken, CursorCodec, CursorCodecError,
+    CursorSealer, DeviceCursorBinding, EventCursor, InventoryPageBinding, InventoryPageDomain,
+    InventoryPageLocator, InventorySessionBinding, InventorySessionToken,
+    LockedInventoryPageVerification, OsSecureRandom, OwnDeviceCursorBinding, SealedCapability,
+    SealerBinding, SealerError, SecureRandom, SecureRandomError, VerifiedInventoryPageCursor,
 };
 
 #[allow(dead_code)]
@@ -95,6 +99,50 @@ pub mod repository {
     pub mod recovery;
     #[path = "../../../server/src/chat_protocol/repository/relationship.rs"]
     pub mod relationship;
+    pub mod remote_prefix {
+        use sha2::{Digest, Sha256};
+        use uuid::Uuid;
+        #[derive(Debug)]
+        pub struct HistoricalWriteWitness {
+            _sealed: (),
+        }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum BootstrapLocalIdLabel {
+            ParticipantPeriod,
+            LeafPeriod,
+            MetadataSnapshot,
+        }
+        impl BootstrapLocalIdLabel {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    Self::ParticipantPeriod => "participant-period",
+                    Self::LeafPeriod => "leaf-period",
+                    Self::MetadataSnapshot => "metadata-snapshot",
+                }
+            }
+        }
+
+        pub fn derive_bootstrap_local_id(
+            conversation_id: Uuid,
+            source_entry_id: Uuid,
+            label: BootstrapLocalIdLabel,
+            entity_key: &[u8],
+        ) -> Uuid {
+            let mut hasher = Sha256::new();
+            hasher.update(b"CATBIRD-CLEAN-REMOTE-BOOTSTRAP-LOCAL-ID-V1\0");
+            hasher.update(conversation_id.as_bytes());
+            hasher.update(source_entry_id.as_bytes());
+            let label = label.as_str().as_bytes();
+            hasher.update((label.len() as u16).to_be_bytes());
+            hasher.update(label);
+            hasher.update((entity_key.len() as u32).to_be_bytes());
+            hasher.update(entity_key);
+            let mut bytes: [u8; 16] = hasher.finalize()[..16].try_into().expect("fixed length");
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            Uuid::from_bytes(bytes)
+        }
+    }
     #[path = "../../../server/src/chat_protocol/repository/reset.rs"]
     pub mod reset;
     #[path = "../../../server/src/chat_protocol/repository/revocation.rs"]
@@ -170,3 +218,26 @@ pub mod repository {
 #[allow(dead_code)]
 #[path = "../../../server/src/chat_protocol/state_machine.rs"]
 pub mod state_machine;
+
+#[allow(dead_code)]
+pub(crate) fn mint_signed_repository_authority(
+    pre_replay: dpop::PreReplayCryptographicVerification,
+    canonical: transcript::CanonicalSignedMutation,
+    stored_public_key: &[u8],
+    repository_receipt: repository::auth::RepositoryAuthorityReceipt,
+) -> Result<dpop::VerifiedChatDeviceRequest, model::AuthPrimitiveError> {
+    dpop::mint_signed_repository_authority(
+        pre_replay,
+        canonical,
+        stored_public_key,
+        repository_receipt,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn mint_unsigned_repository_authority(
+    pre_replay: dpop::PreReplayCryptographicVerification,
+    repository_receipt: repository::auth::RepositoryAuthorityReceipt,
+) -> dpop::VerifiedChatDeviceRequest {
+    dpop::mint_unsigned_repository_authority(pre_replay, repository_receipt)
+}

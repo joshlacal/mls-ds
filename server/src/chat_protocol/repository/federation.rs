@@ -19,7 +19,8 @@ use uuid::Uuid;
 
 use super::blobs::{self, BindingKind, BlobPurpose, NewBlobBinding};
 use super::delivery::{
-    append_exact_application_entry, compare_exact_application_entry, AppendEntry, ApplicationSend,
+    append_exact_application_entry, append_message_available_event,
+    compare_exact_application_entry, AppendEntry, ApplicationSend, DeliveryRepositoryError,
 };
 use super::execution_context::{
     apply_prepared_submit_transition_execution, prepare_submit_transition_execution,
@@ -932,37 +933,18 @@ pub(crate) async fn claim_federated_operation(
         return Err(PreludeError::ForeignTransaction);
     }
     let binding = reservation.binding;
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO chat.operation_claims (
-            operation_id,principal_did,endpoint_nsid,mutation_kind,
-            request_digest,accepted_request_sha256,signature,claimed_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        "#,
+    prelude::insert_operation_claim_record(
+        transaction,
+        binding.operation_id,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        &binding.mutation_kind,
+        &binding.request_digest,
+        &binding.accepted_request_sha256,
+        &binding.signature,
+        binding.claimed_at,
     )
-    .bind(binding.operation_id)
-    .bind(&binding.principal_did)
-    .bind(&binding.endpoint_nsid)
-    .bind(&binding.mutation_kind)
-    .bind(binding.request_digest.as_slice())
-    .bind(binding.accepted_request_sha256.as_slice())
-    .bind(binding.signature.as_slice())
-    .bind(binding.claimed_at)
-    .execute(&mut **transaction)
-    .await;
-    match inserted {
-        Ok(_) => Ok(()),
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|db| db.code())
-                .as_deref()
-                == Some("23505") =>
-        {
-            Err(PreludeError::OperationIdConflict)
-        }
-        Err(error) => Err(PreludeError::Database(error)),
-    }
+    .await
 }
 
 /// Complete a federated first operation by writing the immutable idempotency
@@ -976,47 +958,23 @@ pub(crate) async fn complete_federated_operation(
     response_bytes: &[u8],
     event_position: Option<i64>,
 ) -> Result<(), PreludeError> {
-    if !(200..=599).contains(&completed_status) || response_bytes.is_empty() {
-        return Err(PreludeError::ClaimIntegrity);
-    }
-    let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO chat.idempotency_records(
-            principal_did,endpoint_nsid,operation_id,request_digest,
-            accepted_request_bytes,signing_transcript_bytes,signature,
-            completed_status,response_bytes,response_sha256,event_position,
-            historical_jkt,current_jkt,completed_at
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,$12)
-        "#,
+    prelude::insert_operation_completion_record(
+        transaction,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        binding.operation_id,
+        &binding.request_digest,
+        accepted_request_bytes,
+        signing_transcript_bytes,
+        &binding.signature,
+        completed_status,
+        response_bytes,
+        event_position,
+        None,
+        None,
+        binding.claimed_at,
     )
-    .bind(&binding.principal_did)
-    .bind(&binding.endpoint_nsid)
-    .bind(binding.operation_id)
-    .bind(binding.request_digest.as_slice())
-    .bind(accepted_request_bytes)
-    .bind(signing_transcript_bytes)
-    .bind(binding.signature.as_slice())
-    .bind(completed_status)
-    .bind(response_bytes)
-    .bind(response_sha256.as_slice())
-    .bind(event_position)
-    .bind(binding.claimed_at)
-    .execute(&mut **transaction)
-    .await;
-    match inserted {
-        Ok(_) => Ok(()),
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|database| database.code())
-                .as_deref()
-                == Some("23505") =>
-        {
-            Err(PreludeError::OperationIdConflict)
-        }
-        Err(error) => Err(PreludeError::Database(error)),
-    }
+    .await
 }
 
 /// Replicate an inbound MLS application message to a destination DS.
@@ -1586,6 +1544,7 @@ pub async fn deliver_message_replication(
     .fetch_one(&mut **tx)
     .await
     .map_err(FederationError::Database)?;
+    let mut event_position = None;
 
     if seq_exists {
         let is_exact =
@@ -1603,28 +1562,22 @@ pub async fn deliver_message_replication(
             });
         }
     } else {
-        // Shared operation claim in chat.operation_claims using blue.catbird.chat.sendMessage
-        let claim_res = sqlx::query(
-            r#"
-            INSERT INTO chat.operation_claims (
-                operation_id, principal_did, endpoint_nsid, mutation_kind,
-                request_digest, accepted_request_sha256, signature, claimed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            "#,
+        // The shared prelude remains the only operation-claim writer.
+        let claim_res = prelude::insert_operation_claim_record(
+            tx,
+            message_id,
+            actor_did,
+            "blue.catbird.chat.sendMessage",
+            "blue.catbird.chat.defs#applicationSendBody",
+            &send.entry.request_digest,
+            &signed_req_sha256,
+            &send.entry.signature,
+            send.entry.received_at,
         )
-        .bind(message_id)
-        .bind(actor_did)
-        .bind("blue.catbird.chat.sendMessage")
-        .bind("blue.catbird.chat.defs#applicationSendBody")
-        .bind(&send.entry.request_digest)
-        .bind(&signed_req_sha256[..])
-        .bind(&send.entry.signature)
-        .bind(send.entry.received_at)
-        .execute(&mut **tx)
         .await;
 
-        if let Err(e) = claim_res {
-            if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") {
+        if let Err(error) = claim_res {
+            if matches!(&error, PreludeError::OperationIdConflict) {
                 // New delivery ID for same operation returns canonical outcome + new receipt
                 let existing_idem: Option<(Vec<u8>, Vec<u8>, String)> = sqlx::query_as(
                     r#"
@@ -1680,7 +1633,12 @@ pub async fn deliver_message_replication(
                     reason: "operation claim already exists".to_string(),
                 });
             }
-            return Err(FederationError::Database(e));
+            return match error {
+                PreludeError::Database(error) => Err(FederationError::Database(error)),
+                _ => Err(FederationError::DeliveryConflict {
+                    reason: "operation claim rejected".to_string(),
+                }),
+            };
         }
 
         append_exact_application_entry(tx, &send, locator.seq)
@@ -1696,6 +1654,22 @@ pub async fn deliver_message_replication(
                     reason: format!("blob binding failed: {e:?}"),
                 })?;
         }
+        event_position = Some(
+            append_message_available_event(
+                tx,
+                header.conversation_id,
+                current_generation,
+                locator.seq,
+                send.entry.received_at,
+            )
+            .await
+            .map_err(|error| match error {
+                DeliveryRepositoryError::Database(error) => FederationError::Database(error),
+                _ => FederationError::DeliveryConflict {
+                    reason: format!("messageAvailable event append failed: {error:?}"),
+                },
+            })?,
+        );
     }
 
     // 5. Sign and insert receipt and shared idempotency record.
@@ -1723,41 +1697,40 @@ pub async fn deliver_message_replication(
     };
 
     let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
-    let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
 
     if !seq_exists {
-        let idem_res = sqlx::query(
-            r#"
-            INSERT INTO chat.idempotency_records (
-                principal_did, endpoint_nsid, operation_id, request_digest,
-                accepted_request_bytes, signing_transcript_bytes, signature,
-                completed_status, response_bytes, response_sha256, event_position,
-                historical_jkt, current_jkt, completed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL, $12)
-            "#,
+        match prelude::insert_operation_completion_record(
+            tx,
+            actor_did,
+            "blue.catbird.chat.sendMessage",
+            message_id,
+            &send.entry.request_digest,
+            &signed_request_bytes,
+            rebound_entry.mutation().transcript_bytes(),
+            &send.entry.signature,
+            200,
+            &response_bytes,
+            event_position,
+            None,
+            None,
+            send.entry.received_at,
         )
-        .bind(actor_did)
-        .bind("blue.catbird.chat.sendMessage")
-        .bind(message_id)
-        .bind(&send.entry.request_digest)
-        .bind(&signed_request_bytes)
-        .bind(rebound_entry.mutation().transcript_bytes())
-        .bind(&send.entry.signature)
-        .bind(200i32)
-        .bind(&response_bytes)
-        .bind(&response_sha256[..])
-        .bind(Option::<i64>::None)
-        .bind(send.entry.received_at)
-        .execute(&mut **tx)
-        .await;
-
-        if let Err(e) = idem_res {
-            if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") {
+        .await
+        {
+            Ok(()) => {}
+            Err(PreludeError::OperationIdConflict) => {
                 return Err(FederationError::DeliveryConflict {
                     reason: "idempotency record already exists".to_string(),
                 });
             }
-            return Err(FederationError::Database(e));
+            Err(PreludeError::Database(error)) => {
+                return Err(FederationError::Database(error));
+            }
+            Err(_) => {
+                return Err(FederationError::DeliveryConflict {
+                    reason: "operation completion rejected".to_string(),
+                });
+            }
         }
     }
 

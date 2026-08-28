@@ -1,15 +1,26 @@
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
+
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
+use chat_protocol::relationship_policy::*;
+use chat_protocol::validation::*;
+mod relationship_policy {
+    pub(crate) use crate::chat_protocol::relationship_policy::*;
+}
+mod validation {
+    pub(crate) use crate::chat_protocol::validation::*;
+}
 
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeDelta, TimeZone, Utc};
-use relationship_policy::*;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -21,7 +32,6 @@ use std::sync::{
 use std::time::Duration;
 use tokio::time::Instant;
 use url::Url;
-use validation::TrustedRequestInstant;
 
 fn did(index: usize) -> String {
     const DIGITS: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -1577,14 +1587,14 @@ async fn persisted_traffic_fallback_round_trip_rejects_duplicate_revisions() {
         actor: expected_scope.members[1].clone(),
         members: expected_scope.members.clone(),
     };
-    assert!(hydrate_persisted_fallback_traffic_projection(
+    assert!(hydrate_persisted_fallback_traffic_projection_for_test(
         values.clone(),
         TrafficProjectionLoadGuard::for_test(wrong_scope.clone()),
         &source,
         &traffic_decision_at(wrong_scope, live.completed_at()),
     )
     .is_err());
-    let hydrated = hydrate_persisted_fallback_traffic_projection(
+    let hydrated = hydrate_persisted_fallback_traffic_projection_for_test(
         values.clone(),
         TrafficProjectionLoadGuard::for_test(expected_scope.clone()),
         &source,
@@ -1614,7 +1624,7 @@ async fn persisted_traffic_fallback_round_trip_rejects_duplicate_revisions() {
         .collect::<BTreeSet<_>>();
     assert!(!collision_revisions.contains(&colliding_revision.projection_revision));
     assert_eq!(collision_revisions.len(), live.graph_batch_count());
-    hydrate_persisted_fallback_traffic_projection(
+    hydrate_persisted_fallback_traffic_projection_for_test(
         colliding_revision,
         TrafficProjectionLoadGuard::for_test(expected_scope.clone()),
         &source,
@@ -1874,7 +1884,7 @@ async fn operation_scope_cannot_be_relabelled_before_or_after_restart() {
         Err(PolicyDenial::RelationshipPolicyUnavailable)
     );
 
-    assert!(hydrate_persisted_fallback_relationship_projection(
+    assert!(hydrate_persisted_fallback_relationship_projection_for_test(
         persisted.clone(),
         RelationshipProjectionLoadGuard::for_test(
             ProjectionOperationScope::PendingAdd,
@@ -1889,7 +1899,7 @@ async fn operation_scope_cannot_be_relabelled_before_or_after_restart() {
     )
     .is_err());
 
-    let restarted = hydrate_persisted_fallback_relationship_projection(
+    let restarted = hydrate_persisted_fallback_relationship_projection_for_test(
         persisted,
         RelationshipProjectionLoadGuard::for_test(
             ProjectionOperationScope::Creation,
@@ -1973,7 +1983,7 @@ async fn fallback_identity_remaps_fetch_revisions_when_the_new_revision_collides
         fallback.declarations.len() + live.graph_batch_count()
     );
     let load_guard = relationship_load_guard(&fallback);
-    hydrate_persisted_fallback_relationship_projection(
+    hydrate_persisted_fallback_relationship_projection_for_test(
         fallback,
         load_guard,
         &source,
@@ -2041,7 +2051,7 @@ async fn hydration_requires_exact_evidence_kind_and_trusted_decision_time() {
         .unwrap();
 
     let fallback_as_live_load_guard = relationship_load_guard(&persisted_live);
-    assert!(hydrate_persisted_fallback_relationship_projection(
+    assert!(hydrate_persisted_fallback_relationship_projection_for_test(
         persisted_live.clone(),
         fallback_as_live_load_guard,
         &source,
@@ -2085,7 +2095,7 @@ async fn hydration_requires_exact_evidence_kind_and_trusted_decision_time() {
     )
     .is_err());
     let fallback_load_guard = relationship_load_guard(&persisted_fallback);
-    hydrate_persisted_fallback_relationship_projection(
+    hydrate_persisted_fallback_relationship_projection_for_test(
         persisted_fallback,
         fallback_load_guard,
         &source,

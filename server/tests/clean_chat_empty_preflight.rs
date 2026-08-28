@@ -1,7 +1,7 @@
 //! Integration tests for Clean Chat zero-state preflight gate.
 //!
 //! Tests both pre-cutover (74 migrations, max 20260821000001) and
-//! post-migration (79 migrations, max 20260824000005) modes against disposable
+//! post-migration (82 migrations, max 20260828000003) modes against disposable
 //! PostgreSQL databases.
 //!
 //! Verifies:
@@ -32,6 +32,7 @@ const CURSOR_KEY_ID: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 /// Apply `migrator` to a fresh disposable database, then initialize the infrastructure rows
 /// the preflight requires: the protocol singleton and its bound zero-floor retention row.
 async fn setup_db(migrator: Migrator) -> (PgPool, DisposableDatabase) {
+    let _migration_guard = common::fresh_db::acquire_migration_lock().await;
     let database = DisposableDatabase::mint(SHARED_LEGACY_DB_PREFIX).await;
     let pool = database.connect(5).await;
     let mut conn = pool
@@ -107,13 +108,13 @@ async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
     setup_db(migrator).await
 }
 
-/// Set up a disposable database with post-migration migrations (all 79 migrations).
+/// Set up a disposable database with post-migration migrations (all 82 migrations).
 async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
     let migrator = sqlx::migrate!("./migrations");
     assert_eq!(
         migrator.migrations.len(),
-        79,
-        "post-migration catalog must contain exactly 79 migrations"
+        82,
+        "post-migration catalog must contain exactly 82 migrations"
     );
     setup_db(migrator).await
 }
@@ -985,7 +986,7 @@ async fn test_preflight_fails_when_federation_delivery_receipts_is_dirty() {
 async fn test_preflight_fails_on_dirty_unsuccessful_migration() {
     let (pool, _db) = setup_post_migration_db().await;
     sqlx::query(
-        "UPDATE public._sqlx_migrations SET success = FALSE WHERE version = 20260824000005;",
+        "UPDATE public._sqlx_migrations SET success = FALSE WHERE version = 20260828000001;",
     )
     .execute(&pool)
     .await
@@ -1002,7 +1003,7 @@ async fn test_preflight_fails_on_dirty_unsuccessful_migration() {
 #[tokio::test]
 async fn test_preflight_fails_on_checksum_mismatch() {
     let (pool, _db) = setup_post_migration_db().await;
-    sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex') WHERE version = 20260824000005;")
+    sqlx::query("UPDATE public._sqlx_migrations SET checksum = decode('000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 'hex') WHERE version = 20260828000001;")
         .execute(&pool)
         .await
         .expect("corrupt checksum");
@@ -1018,7 +1019,7 @@ async fn test_preflight_fails_on_checksum_mismatch() {
 #[tokio::test]
 async fn test_preflight_fails_on_description_mismatch() {
     let (pool, _db) = setup_post_migration_db().await;
-    sqlx::query("UPDATE public._sqlx_migrations SET description = 'tampered description' WHERE version = 20260824000005;")
+    sqlx::query("UPDATE public._sqlx_migrations SET description = 'tampered description' WHERE version = 20260828000001;")
         .execute(&pool)
         .await
         .expect("tamper description");
@@ -1054,7 +1055,7 @@ async fn test_preflight_fails_on_unexpected_extra_migration() {
 #[tokio::test]
 async fn test_preflight_fails_on_missing_migration() {
     let (pool, _db) = setup_post_migration_db().await;
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = 20260824000005;")
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = 20260828000001;")
         .execute(&pool)
         .await
         .expect("delete migration");

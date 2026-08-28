@@ -145,7 +145,7 @@ mod genuine_creation_fixture {
             0xad, 0x82, 0xe9, 0xb5,
         ];
         let manifest: Value =
-            serde_json::from_str(include_str!("../fixtures/crypto-wire/manifest.json"))
+            serde_json::from_str(include_str!("../fixtures/crypto-wire-v09/manifest.json"))
                 .expect("parse frozen crypto-wire manifest");
         let bob = &manifest["identity"]["bob"];
         let signing_key = SigningKey::from_bytes(&BOB_SIGNING_SEED);
@@ -833,7 +833,7 @@ mod genuine_creation_fixture {
         let chain = &manifest["chain"];
         let corpus_coordinate = crate::chat_protocol::snapshot::PublicGroupSnapshotCoordinate::new(
             fresh_cid,
-            chain["generation"].as_u64().expect("corpus generation"),
+            0,
             chain["genesisStateVersion"]
                 .as_u64()
                 .expect("corpus genesis state version"),
@@ -1033,7 +1033,7 @@ async fn seed_genuine_creation_graph_inner(
     } else if public_state.is_some() {
         fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/crypto-wire/group-info.mls"),
+                .join("tests/fixtures/crypto-wire-v09/group-info.mls"),
         )
         .expect("read genuine frozen genesis GroupInfo")
     } else {
@@ -1434,7 +1434,7 @@ async fn seed_hydratable_genuine_creation_graph_inner(
 
     let coordinate = PublicGroupSnapshotCoordinate::new(
         *conversation_id.as_bytes(),
-        manifest.chain.generation,
+        0,
         manifest.chain.genesis_state_version,
         hex_array(&manifest.chain.group_id_hex),
         manifest.chain.genesis_epoch,
@@ -1841,6 +1841,7 @@ pub fn maintenance_url_from_env() -> String {
 }
 
 pub async fn fresh_executor_db() -> (PgPool, FreshDbGuard) {
+    let _migration_guard = crate::common::fresh_db::acquire_migration_lock().await;
     let maintenance_url = maintenance_url_from_env();
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -2215,6 +2216,61 @@ pub(crate) mod genuine_terminal_fixture {
             Some(&[CredentialType::Basic]),
         )
     }
+    pub(crate) fn build_genuine_invitee_key_package(
+        invitee: &AcceptanceInvitee,
+        package_evaluated_at: DateTime<Utc>,
+        package_not_before: DateTime<Utc>,
+        package_not_after: DateTime<Utc>,
+    ) -> ([u8; 32], Vec<u8>, DateTime<Utc>, DateTime<Utc>) {
+        let not_before =
+            DateTime::<Utc>::from_timestamp(package_not_before.timestamp(), 0).unwrap();
+        let not_after = DateTime::<Utc>::from_timestamp(package_not_after.timestamp(), 0).unwrap();
+        let lifetime = Lifetime::init(
+            u64::try_from(not_before.timestamp()).expect("package not-before fits u64"),
+            u64::try_from(not_after.timestamp()).expect("package not-after fits u64"),
+        );
+        let bob_provider = openmls_libcrux_crypto::Provider::new().expect("fresh Add Bob provider");
+        let bob_public_key = invitee.signing_key.verifying_key().to_bytes().to_vec();
+        let bob_signer = SignatureKeyPair::from_raw(
+            XWING_CIPHERSUITE.signature_algorithm(),
+            invitee.signing_key.to_bytes().to_vec(),
+            bob_public_key.clone(),
+        );
+        bob_signer
+            .store(bob_provider.storage())
+            .expect("store fresh Add Bob signer");
+        let bob_credential = format!("{}#{}", invitee.did, invitee.device_id).into_bytes();
+        let key_package = KeyPackage::builder()
+            .key_package_lifetime(lifetime)
+            .leaf_node_capabilities(exact_mls_capabilities())
+            .build(
+                XWING_CIPHERSUITE,
+                &bob_provider,
+                &bob_signer,
+                CredentialWithKey {
+                    credential: BasicCredential::new(bob_credential.clone()).into(),
+                    signature_key: bob_public_key.clone().into(),
+                },
+            )
+            .expect("build fresh Add Bob KeyPackage")
+            .key_package()
+            .clone();
+        let key_package_wrapper = MlsMessageOut::from(key_package.clone())
+            .tls_serialize_detached()
+            .expect("serialize fresh Add Bob KeyPackage");
+        let validated_package = validate_key_package(
+            &key_package_wrapper,
+            KeyPackageValidationPolicy {
+                expected_basic_credential: &bob_credential,
+                expected_signature_key: &bob_public_key,
+                now_unix_seconds: u64::try_from(package_evaluated_at.timestamp()).unwrap(),
+                max_bytes: MAX_KEY_PACKAGE_WIRE_BYTES,
+            },
+        )
+        .expect("production validates fresh Add Bob KeyPackage");
+        let key_package_ref = *validated_package.key_package_ref();
+        (key_package_ref, key_package_wrapper, not_before, not_after)
+    }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -2274,23 +2330,23 @@ pub(crate) mod genuine_terminal_fixture {
         aad
     }
 
-    struct DynamicTwoLeafCryptoFixture {
-        entry: RealCreationEntry,
-        invitee: AcceptanceInvitee,
-        genesis_group_info: Vec<u8>,
-        genesis: ActivePublicState,
-        committed: ActivePublicState,
-        key_package_ref: [u8; 32],
-        key_package_wrapper: Vec<u8>,
-        commit: Vec<u8>,
-        welcome: Vec<u8>,
-        remove_transition_id: Uuid,
-        remove_commit: Vec<u8>,
-        removed: ActivePublicState,
+    pub(crate) struct DynamicTwoLeafCryptoFixture {
+        pub(crate) entry: RealCreationEntry,
+        pub(crate) invitee: AcceptanceInvitee,
+        pub(crate) genesis_group_info: Vec<u8>,
+        pub(crate) genesis: ActivePublicState,
+        pub(crate) committed: ActivePublicState,
+        pub(crate) key_package_ref: [u8; 32],
+        pub(crate) key_package_wrapper: Vec<u8>,
+        pub(crate) commit: Vec<u8>,
+        pub(crate) welcome: Vec<u8>,
+        pub(crate) remove_transition_id: Uuid,
+        pub(crate) remove_commit: Vec<u8>,
+        pub(crate) removed: ActivePublicState,
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_dynamic_two_leaf_crypto_fixture(
+    pub(crate) fn build_dynamic_two_leaf_crypto_fixture(
         cid: Uuid,
         add_transition_id: Uuid,
         invitee: AcceptanceInvitee,
@@ -3316,7 +3372,17 @@ pub(crate) mod genuine_terminal_fixture {
         let server_fields = verified
             .server_fields_dag_cbor()
             .expect("policy server fields");
-        let authority = HydrationAuthority::new(entry.cid).expect("policy authority");
+        let received_at =
+            ServerTimestamp::from_canonical_stored(at).expect("policy server timestamp");
+        let authority = HydrationAuthority::for_test_with_locked(
+            entry.cid,
+            "tx-test".into(),
+            Some(*prior),
+            seq,
+            received_at,
+            [0x11; 32],
+        )
+        .expect("policy authority");
         let transition = authority
             .control_transition(verified)
             .expect("policy transition authority");
@@ -3336,12 +3402,12 @@ pub(crate) mod genuine_terminal_fixture {
                 outer_entry_fingerprint: outer.to_vec(),
             },
             transition_id,
-            received_at: ServerTimestamp::from_canonical_stored(at)
-                .expect("policy server timestamp"),
+            received_at,
             received_at_db: instant(at),
         }
     }
 
+    #[derive(Clone)]
     pub(crate) struct AcceptanceInvitee {
         pub(crate) did: String,
         pub(crate) device_id: Uuid,
@@ -6175,22 +6241,20 @@ pub struct CorpusActor {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorpusChain {
-    pub generation: u64,
     pub genesis_state_version: u64,
     pub genesis_epoch: u64,
     pub genesis_group_context_hash_hex: String,
     pub genesis_confirmation_tag_hex: String,
     pub group_id_hex: String,
-    // Committed (post-ADD-commit) coordinate + the recovered inner key-package ref
-    // — used only by the fulfillment scenario.
+    // Committed (post-ADD-commit) coordinate used by fulfillment scenarios.
+    #[serde(rename = "addNextEpoch")]
     pub committed_epoch: u64,
     pub committed_group_context_hash_hex: String,
     pub committed_confirmation_tag_hex: String,
-    pub inner_key_package_ref_hex: String,
 }
 
 pub fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09")
 }
 pub fn corpus_file(name: &str) -> Vec<u8> {
     fs::read(corpus_dir().join(name)).expect("read frozen crypto-wire corpus")
@@ -6217,7 +6281,7 @@ pub fn uuid_v4_bytes(byte: u8) -> [u8; 16] {
 pub fn genesis_coordinate(manifest: &CorpusManifest) -> PublicGroupSnapshotCoordinate {
     PublicGroupSnapshotCoordinate::new(
         hex_array(&manifest.identifiers.conversation_id_hex),
-        manifest.chain.generation,
+        0,
         manifest.chain.genesis_state_version,
         hex_array(&manifest.chain.group_id_hex),
         manifest.chain.genesis_epoch,
@@ -6256,14 +6320,14 @@ pub fn verified_genesis(manifest: &CorpusManifest) -> ActivePublicState {
     state
 }
 
-/// Idempotently seed a principal + active device + device-key row (committed).
-pub async fn seed_actor(
+/// Idempotently seed a principal + active device + device-key row stamped at `created_at` (committed).
+pub async fn seed_actor_at(
     pool: &PgPool,
     user_did: &str,
     device_id: Uuid,
     signing_public_key: &[u8],
+    created_at: DateTime<Utc>,
 ) -> String {
-    let now = clock_now(pool).await;
     let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
         .bind(signing_public_key)
         .fetch_one(pool)
@@ -6273,7 +6337,7 @@ pub async fn seed_actor(
         "INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2) ON CONFLICT DO NOTHING",
     )
     .bind(user_did)
-    .bind(now)
+    .bind(created_at)
     .execute(pool)
     .await
     .expect("seed principal");
@@ -6284,7 +6348,7 @@ pub async fn seed_actor(
     .bind(user_did)
     .bind(device_id)
     .bind(&key_id)
-    .bind(now)
+    .bind(created_at)
     .execute(pool)
     .await
     .expect("seed device");
@@ -6296,11 +6360,22 @@ pub async fn seed_actor(
     .bind(device_id)
     .bind(&key_id)
     .bind(signing_public_key)
-    .bind(now)
+    .bind(created_at)
     .execute(pool)
     .await
     .expect("seed device key");
     key_id
+}
+
+/// Idempotently seed a principal + active device + device-key row (committed).
+pub async fn seed_actor(
+    pool: &PgPool,
+    user_did: &str,
+    device_id: Uuid,
+    signing_public_key: &[u8],
+) -> String {
+    let now = clock_now(pool).await;
+    seed_actor_at(pool, user_did, device_id, signing_public_key, now).await
 }
 
 pub async fn seed_protocol_instance(pool: &PgPool) -> Uuid {
@@ -6513,7 +6588,10 @@ pub async fn build_creation_with_invitee(
         is_remote: false,
         sequencer_ds: None,
         sequencer_term: 0,
-        participant_ds_dids: std::collections::HashMap::new(),
+        participant_ds_dids: std::collections::HashMap::from([
+            (alice_did.clone(), None),
+            (bob_did.clone(), None),
+        ]),
     };
 
     CreationApply {
@@ -6600,20 +6678,18 @@ pub fn seeded_key_package_wrapper() -> Vec<u8> {
 /// Seed one `available` key package owned by `(owner_did, owner_device)` and
 /// return its exact `not_after` (the value the reservation's
 /// `expires_at = LEAST(created_at + 5 min, not_after)` mapping check needs).
-pub async fn seed_key_package(
+pub async fn seed_key_package_at(
     pool: &PgPool,
     owner_did: &str,
     owner_device: Uuid,
     owner_key_id: &str,
     key_package_ref: &[u8],
+    created_at: DateTime<Utc>,
 ) -> DateTime<Utc> {
-    let now = clock_now(pool).await;
-    let not_before = now - Duration::hours(1);
-    // Align `not_after` to whole milliseconds: the Welcome delivery's `expires_at`
-    // (a `ServerTimestamp`, millisecond-precision) is FK-bound to this exact value,
-    // so a sub-millisecond `not_after` would never match the round-tripped instant.
+    let not_before = created_at - Duration::hours(1);
     let not_after =
-        DateTime::from_timestamp_millis((now + Duration::hours(24)).timestamp_millis()).unwrap();
+        DateTime::from_timestamp_millis((created_at + Duration::hours(24)).timestamp_millis())
+            .unwrap();
     let wrapper = seeded_key_package_wrapper();
     let init_key = {
         let mut key = vec![0u8; 32];
@@ -6634,11 +6710,97 @@ pub async fn seed_key_package(
     .bind(owner_key_id)
     .bind(not_before)
     .bind(not_after)
-    .bind(now)
+    .bind(created_at)
     .execute(pool)
     .await
     .expect("seed key package");
     not_after
+}
+
+/// Seed one `available` key package owned by `(owner_did, owner_device)` and
+/// return its exact `not_after` (the value the reservation's
+/// `expires_at = LEAST(created_at + 5 min, not_after)` mapping check needs).
+pub async fn seed_key_package(
+    pool: &PgPool,
+    owner_did: &str,
+    owner_device: Uuid,
+    owner_key_id: &str,
+    key_package_ref: &[u8],
+) -> DateTime<Utc> {
+    let now = clock_now(pool).await;
+    seed_key_package_at(
+        pool,
+        owner_did,
+        owner_device,
+        owner_key_id,
+        key_package_ref,
+        now,
+    )
+    .await
+}
+
+pub async fn seed_genuine_key_package_at(
+    pool: &PgPool,
+    owner_did: &str,
+    owner_device: Uuid,
+    owner_key_id: &str,
+    key_package_ref: &[u8],
+    wrapper_bytes: &[u8],
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+) {
+    seed_genuine_key_package_with_status_at(
+        pool,
+        owner_did,
+        owner_device,
+        owner_key_id,
+        key_package_ref,
+        wrapper_bytes,
+        not_before,
+        not_after,
+        "available",
+        created_at,
+    )
+    .await;
+}
+
+pub async fn seed_genuine_key_package_with_status_at(
+    pool: &PgPool,
+    owner_did: &str,
+    owner_device: Uuid,
+    owner_key_id: &str,
+    key_package_ref: &[u8],
+    wrapper_bytes: &[u8],
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    status: &str,
+    created_at: DateTime<Utc>,
+) {
+    let init_key = {
+        let mut key = vec![0u8; 32];
+        key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+        key
+    };
+    sqlx::query(
+        "INSERT INTO chat.key_packages(key_package_ref,wrapper_bytes,wrapper_sha256,init_key,owner_did,owner_device_id,owner_key_id,owner_auth_generation,not_before,not_after,status,created_at) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$9,$10,$11)",
+    )
+    .bind(key_package_ref)
+    .bind(wrapper_bytes)
+    .bind(Sha256::digest(wrapper_bytes).to_vec())
+    .bind(&init_key)
+    .bind(owner_did)
+    .bind(owner_device)
+    .bind(owner_key_id)
+    .bind(not_before)
+    .bind(not_after)
+    .bind(status)
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("seed genuine key package");
 }
 
 /// The acceptance `ExecutionContext` for an invitee accepting (used by the
@@ -6755,7 +6917,7 @@ pub fn committed_coordinate(
 ) -> PublicGroupSnapshotCoordinate {
     PublicGroupSnapshotCoordinate::new(
         conversation_id,
-        manifest.chain.generation,
+        0,
         state_version,
         hex_array(&manifest.chain.group_id_hex),
         manifest.chain.committed_epoch,
@@ -6848,7 +7010,9 @@ pub async fn build_fulfillment(pool: &PgPool) -> BuiltFulfillment {
 
     // 2. Acceptance (bob), opening the add-request bound to sv1 with the CORPUS
     //    key-package ref (so the ADD commit's added member matches the request).
-    let corpus_ref: [u8; 32] = hex_array(&manifest.chain.inner_key_package_ref_hex);
+    let corpus_ref: [u8; 32] = corpus_file("key-package-ref.bin")
+        .try_into()
+        .expect("the corpus key-package ref is exactly 32 bytes");
     let bob_period: Uuid = sqlx::query_scalar(
         "SELECT participant_period_id FROM chat.participants WHERE conversation_id=$1 AND user_did=$2 AND current_membership",
     )

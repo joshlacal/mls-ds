@@ -19,10 +19,10 @@ use crate::util::outbound_body::{
     decode_json_bounded, ResponseBodyBudget, ORDINARY_DS_CONTROL_MAX_BYTES,
 };
 
-const DIGEST_NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
-const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
-const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
-const EVENTS_PAGE_LIMIT: i64 = 500;
+pub(crate) const DIGEST_NSID: &str = "blue.catbird.mlsDS.getConvoDigest";
+pub(crate) const EVENTS_NSID: &str = "blue.catbird.mlsDS.getConvoEvents";
+pub(crate) const HEALTH_CHECK_NSID: &str = "blue.catbird.mlsDS.healthCheck";
+pub(crate) const EVENTS_PAGE_LIMIT: i64 = 500;
 
 /// Decoded `getConvoDigest` response from a peer DS.
 ///
@@ -34,15 +34,15 @@ const EVENTS_PAGE_LIMIT: i64 = 500;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-struct RemoteConvoDigest {
-    convo_id: String,
-    sequencer_ds_did: String,
-    sequencer_term: i64,
-    epoch: i64,
-    last_seq: i64,
-    event_count: i64,
-    digest_sha256: String,
-    generated_at: DateTime<Utc>,
+pub(crate) struct RemoteConvoDigest {
+    pub(crate) convo_id: String,
+    pub(crate) sequencer_ds_did: String,
+    pub(crate) sequencer_term: i64,
+    pub(crate) epoch: i64,
+    pub(crate) last_seq: i64,
+    pub(crate) event_count: i64,
+    pub(crate) digest_sha256: String,
+    pub(crate) generated_at: DateTime<Utc>,
 }
 
 /// Decoded `getConvoEvents` response from a peer DS.
@@ -54,15 +54,15 @@ struct RemoteConvoDigest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-struct RemoteConvoEvents {
-    convo_id: String,
-    from_seq_exclusive: i64,
-    to_seq_inclusive: i64,
-    events: Vec<RemoteEvent>,
+pub(crate) struct RemoteConvoEvents {
+    pub(crate) convo_id: String,
+    pub(crate) from_seq_exclusive: i64,
+    pub(crate) to_seq_inclusive: i64,
+    pub(crate) events: Vec<RemoteEvent>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum StrictCleanRemoteEventError {
+pub enum StrictCleanRemoteEventError {
     #[error("missing required clean event field: {0}")]
     MissingField(&'static str),
     #[error("invalid entry id: {0}")]
@@ -80,7 +80,7 @@ pub(crate) enum StrictCleanRemoteEventError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct StrictCleanRemoteEvent {
+pub struct StrictCleanRemoteEvent {
     seq: i64,
     generation: i64,
     entry_id: uuid::Uuid,
@@ -93,39 +93,39 @@ pub(crate) struct StrictCleanRemoteEvent {
 }
 
 impl StrictCleanRemoteEvent {
-    pub(crate) fn seq(&self) -> i64 {
+    pub fn seq(&self) -> i64 {
         self.seq
     }
 
-    pub(crate) fn generation(&self) -> i64 {
+    pub fn generation(&self) -> i64 {
         self.generation
     }
 
-    pub(crate) fn entry_id(&self) -> uuid::Uuid {
+    pub fn entry_id(&self) -> uuid::Uuid {
         self.entry_id
     }
 
-    pub(crate) fn entry_kind(&self) -> CleanEntryKind {
+    pub fn entry_kind(&self) -> CleanEntryKind {
         self.entry_kind
     }
 
-    pub(crate) fn accepted_payload_bytes(&self) -> &[u8] {
+    pub fn accepted_payload_bytes(&self) -> &[u8] {
         &self.accepted_payload_bytes
     }
 
-    pub(crate) fn accepted_payload_sha256(&self) -> &[u8; 32] {
+    pub fn accepted_payload_sha256(&self) -> &[u8; 32] {
         &self.accepted_payload_sha256
     }
 
-    pub(crate) fn signed_request(&self) -> &[u8] {
+    pub fn signed_request(&self) -> &[u8] {
         &self.signed_request
     }
 
-    pub(crate) fn outer_fingerprint(&self) -> &[u8; 32] {
+    pub fn outer_fingerprint(&self) -> &[u8; 32] {
         &self.outer_fingerprint
     }
 
-    pub(crate) fn received_at(&self) -> DateTime<Utc> {
+    pub fn received_at(&self) -> DateTime<Utc> {
         self.received_at
     }
 }
@@ -198,7 +198,7 @@ impl TryFrom<RemoteEvent> for StrictCleanRemoteEvent {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RemoteEvent {
+pub struct RemoteEvent {
     pub seq: i64,
     pub epoch: i64,
     pub msg_id: String,
@@ -219,11 +219,11 @@ pub(crate) struct RemoteEvent {
     pub outer_fingerprint: Option<Vec<u8>>,
 }
 #[derive(Debug)]
-struct LocalDigestState {
-    last_seq: i64,
-    last_epoch: i64,
-    event_count: i64,
-    digest_sha256: String,
+pub(crate) struct LocalDigestState {
+    pub(crate) last_seq: i64,
+    pub(crate) last_epoch: i64,
+    pub(crate) event_count: i64,
+    pub(crate) digest_sha256: String,
 }
 pub async fn run_reconciliation_worker(
     pool: PgPool,
@@ -415,7 +415,7 @@ pub async fn reconcile_conversation(
         .await
     }
 }
-async fn query_remote_digest(
+pub(crate) async fn query_remote_digest(
     outbound: &OutboundClient,
     destination: &ValidatedRemoteDestination,
     token: &str,
@@ -428,7 +428,7 @@ async fn query_remote_digest(
     serde_json::from_value(json).map_err(|e| format!("invalid digest response: {e}"))
 }
 
-async fn query_remote_events(
+pub(crate) async fn query_remote_events(
     outbound: &OutboundClient,
     destination: &ValidatedRemoteDestination,
     token: &str,
@@ -581,7 +581,7 @@ async fn reconcile_clean_conversation(
         .bind(remote_digest.sequencer_term)
         .bind(local_snapshot.last_seq)
         .bind(local_snapshot.last_epoch)
-        .bind(hex::decode(&local_snapshot.digest_sha256).unwrap_or_default())
+        .bind(&local_snapshot.digest_sha256)
         .execute(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
@@ -814,32 +814,24 @@ async fn reconcile_clean_conversation(
                 return Err(format!("concurrent local head movement during quarantine"));
             }
 
-            sqlx::query(
-                r#"
-                INSERT INTO federation_sync_state
-                    (convo_id, sequencer_ds_did, sequencer_term, last_seq, last_epoch, last_digest, last_reconciled_at, drift_count, updated_at, status, quarantined_at, quarantine_reason, first_mismatch_seq)
-                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), 1, NOW(), 'quarantined', NOW(), $7, $8)
-                 ON CONFLICT (convo_id, sequencer_ds_did) DO UPDATE SET
-                    quarantined_at = COALESCE(federation_sync_state.quarantined_at, EXCLUDED.quarantined_at),
-                    quarantine_reason = COALESCE(federation_sync_state.quarantine_reason, EXCLUDED.quarantine_reason),
-                    first_mismatch_seq = COALESCE(federation_sync_state.first_mismatch_seq, EXCLUDED.first_mismatch_seq),
-                    status = 'quarantined',
-                    drift_count = federation_sync_state.drift_count + 1,
-                    updated_at = NOW()
-                "#,
+            let digest_vec = hex::decode(&local_snapshot.digest_sha256)
+                .map_err(|e| format!("invalid local digest hex: {e}"))?;
+            let digest_bytes: [u8; 32] = digest_vec
+                .try_into()
+                .map_err(|_| "invalid local digest byte length".to_string())?;
+            crate::chat_protocol::repository::core::record_conversation_quarantine(
+                &mut tx,
+                convo_uuid,
+                &remote_digest.sequencer_ds_did,
+                remote_digest.sequencer_term,
+                local_snapshot.last_seq,
+                local_snapshot.last_epoch,
+                &digest_bytes,
+                reason,
+                first_mismatch_seq,
             )
-            .bind(&convo_id)
-            .bind(canonical_did(&remote_digest.sequencer_ds_did))
-            .bind(remote_digest.sequencer_term)
-            .bind(local_snapshot.last_seq)
-            .bind(local_snapshot.last_epoch)
-            .bind(hex::decode(&local_snapshot.digest_sha256).unwrap_or_default())
-            .bind(reason)
-            .bind(first_mismatch_seq)
-            .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
-
             tx.commit().await.map_err(|e| e.to_string())?;
             metrics::counter!("federation_reconciliation_quarantine_total", 1, "convo_id" => convo_id.clone(), "reason" => reason.to_string());
             Ok(())
@@ -887,17 +879,32 @@ async fn reconcile_clean_conversation(
                 ));
             }
 
-            apply_remote_clean_events(&mut tx, convo_uuid, &retained_suffix_chunk).await?;
+            apply_remote_clean_events(
+                &mut tx,
+                convo_uuid,
+                &retained_suffix_chunk,
+                ApplicationImportMode::OrdinaryReconciliation,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
 
             let new_last_seq = retained_suffix_chunk.last().map_or(after_seq, |e| e.seq());
-            sqlx::query(
-                "UPDATE chat.conversations SET next_entry_seq = GREATEST(next_entry_seq, $2 + 1) WHERE conversation_id = $1",
+            let updated = sqlx::query(
+                "UPDATE chat.conversations
+                    SET next_entry_seq = $2 + 1
+                  WHERE conversation_id = $1 AND next_entry_seq = $3 + 1",
             )
             .bind(convo_uuid)
             .bind(new_last_seq)
+            .bind(after_seq)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
+            if updated.rows_affected() != 1 {
+                return Err(format!(
+                    "conversation {convo_id} head moved during suffix apply"
+                ));
+            }
 
             let new_local = local_clean_digest_state_tx(&mut tx, convo_uuid)
                 .await
@@ -924,7 +931,7 @@ async fn reconcile_clean_conversation(
             .bind(remote_digest.sequencer_term)
             .bind(new_local.last_seq)
             .bind(new_local.last_epoch)
-            .bind(hex::decode(&new_local.digest_sha256).unwrap_or_default())
+            .bind(&new_local.digest_sha256)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
@@ -1079,7 +1086,7 @@ async fn reconcile_conversation_internal(
     Ok(())
 }
 
-async fn fetch_discovery_payload(
+pub(crate) async fn fetch_discovery_payload(
     destination: &ValidatedRemoteDestination,
 ) -> Option<serde_json::Value> {
     fetch_discovery_payload_with_timeout(destination, Duration::from_secs(10)).await
@@ -1160,21 +1167,84 @@ async fn apply_remote_events(
     }
     Ok(())
 }
-async fn apply_remote_clean_events(
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplicationImportMode {
+    HistoricalBootstrap,
+    OrdinaryReconciliation,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyRemoteCleanEventsError {
+    #[error("database error: {0}")]
+    Database(String),
+    #[error("invalid event: {0}")]
+    InvalidEvent(String),
+    #[error("authority error: {0}")]
+    Authority(String),
+}
+
+fn classify_application_hydration_error(
+    error: crate::chat_protocol::repository::core::ConversationStateHydrationError,
+) -> ApplyRemoteCleanEventsError {
+    use std::error::Error as _;
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = source {
+        if current.is::<sqlx::Error>() {
+            return ApplyRemoteCleanEventsError::Database(error.to_string());
+        }
+        source = current.source();
+    }
+    ApplyRemoteCleanEventsError::Authority(error.to_string())
+}
+
+pub(crate) async fn apply_remote_clean_events(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     convo_id: uuid::Uuid,
     events: &[StrictCleanRemoteEvent],
-) -> Result<(), String> {
+    mode: ApplicationImportMode,
+) -> Result<(), ApplyRemoteCleanEventsError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
     let convo_id_string = convo_id.to_string();
+
+    let locked_convo = crate::chat_protocol::repository::core::hydrate_locked_conversation_state(
+        tx,
+        convo_id,
+        events[0].received_at(),
+    )
+    .await
+    .map_err(classify_application_hydration_error)?;
+
+    let mut expected_head_seq = locked_convo.head().next_entry_seq();
+    let expected_coordinate = locked_convo.state().coordinate().clone();
+
     for event in events {
         let entry_id = event.entry_id();
         let entry_id_str = entry_id.to_string();
 
         if event.entry_kind() != CleanEntryKind::Application {
-            return Err(format!(
-                "unsupported clean event kind during reconciliation: {}",
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                "unsupported clean event kind during application import: {}",
                 event.entry_kind().type_id()
-            ));
+            )));
+        }
+
+        let event_seq = u64::try_from(event.seq()).map_err(|_| {
+            ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                "application entry seq {} is outside the protocol domain",
+                event.seq()
+            ))
+        })?;
+        if event_seq != expected_head_seq {
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                "application entry seq {} does not match expected next seq {}",
+                event.seq(),
+                expected_head_seq
+            )));
         }
 
         let signed_req = event.signed_request();
@@ -1182,7 +1252,12 @@ async fn apply_remote_clean_events(
 
         let mutation =
             crate::chat_protocol::transcript::decode_canonical_signed_mutation(signed_req)
-                .map_err(|e| format!("invalid signedRequest for seq {}: {e:?}", event.seq()))?;
+                .map_err(|e| {
+                    ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                        "invalid signedRequest for seq {}: {e:?}",
+                        event.seq()
+                    ))
+                })?;
 
         let actor_did = mutation.actor_did().as_str();
         let actor_device_id = uuid::Uuid::from_bytes(*mutation.actor_device_id().as_bytes());
@@ -1197,7 +1272,7 @@ async fn apply_remote_clean_events(
               JOIN chat.devices d ON d.user_did = dk.user_did AND d.device_id = dk.device_id
              WHERE dk.user_did = $1 AND dk.device_id = $2 AND dk.key_id = $3
                AND dk.revoked_at IS NULL AND d.status = 'active' AND d.revoked_at IS NULL
-             FOR UPDATE
+             FOR SHARE
             "#,
         )
         .bind(actor_did)
@@ -1205,20 +1280,20 @@ async fn apply_remote_clean_events(
         .bind(actor_key_id)
         .fetch_optional(&mut **tx)
         .await
-        .map_err(|e| format!("failed to fetch device key for seq {}: {e}", event.seq()))?;
+        .map_err(|error| ApplyRemoteCleanEventsError::Database(error.to_string()))?;
 
         let Some((actor_public_key, enrollment_auth_generation)) = key_row else {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::Authority(format!(
                 "actor device key {actor_key_id} not provisioned or revoked on destination DS for seq {}",
                 event.seq()
-            ));
+            )));
         };
 
         if actor_auth_gen != enrollment_auth_generation {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::Authority(format!(
                 "auth_generation mismatch for seq {}: expected {enrollment_auth_generation}, got {actor_auth_gen}",
                 event.seq()
-            ));
+            )));
         }
 
         let verified_entry = crate::chat_protocol::transcript::decode_and_verify_application_entry(
@@ -1226,10 +1301,10 @@ async fn apply_remote_clean_events(
             &actor_public_key,
         )
         .map_err(|e| {
-            format!(
+            ApplyRemoteCleanEventsError::Authority(format!(
                 "application entry verification failed for seq {}: {e:?}",
                 event.seq()
-            )
+            ))
         })?;
 
         let outer_fp_32 = *event.outer_fingerprint();
@@ -1247,79 +1322,115 @@ async fn apply_remote_clean_events(
             &actor_public_key,
         )
         .map_err(|e| {
-            format!(
+            ApplyRemoteCleanEventsError::Authority(format!(
                 "application entry rebind failed for seq {}: {e:?}",
                 event.seq()
-            )
+            ))
         })?;
 
         let projection = match rebound_entry.mutation().projection() {
             crate::chat_protocol::transcript::VerifiedMutationProjection::ApplicationSend(p) => p,
             _ => {
-                return Err(format!(
+                return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                     "not an application send mutation for seq {}",
                     event.seq()
-                ))
+                )))
             }
         };
         let message_id = uuid::Uuid::from_bytes(*projection.message_id().as_bytes());
 
+        // Validate prior coordinate against locked conversation head coordinate
+        let prior_coord = crate::chat_protocol::state_machine::closed_coordinate(
+            &projection.prior(),
+        )
+        .map_err(|e| {
+            ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                "invalid prior coordinate for seq {}: {e:?}",
+                event.seq()
+            ))
+        })?;
+
+        if prior_coord != expected_coordinate {
+            return Err(ApplyRemoteCleanEventsError::Authority(format!(
+                "application entry prior coordinate mismatch for seq {}",
+                event.seq()
+            )));
+        }
+
+        if event.generation()
+            != i64::try_from(expected_coordinate.generation()).map_err(|_| {
+                ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                    "application entry generation is outside the protocol domain for seq {}",
+                    event.seq()
+                ))
+            })?
+        {
+            return Err(ApplyRemoteCleanEventsError::Authority(format!(
+                "application entry generation mismatch for seq {}",
+                event.seq()
+            )));
+        }
+
         if rebound_entry.conversation_id().as_str() != convo_id_string {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry conversation_id {} does not match convo_id {} for seq {}",
                 rebound_entry.conversation_id().as_str(),
                 convo_id,
                 event.seq()
-            ));
+            )));
         }
 
         if rebound_entry.seq() != event.seq() as u64 {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry seq {} does not match event seq {} for seq {}",
                 rebound_entry.seq(),
                 event.seq(),
                 event.seq()
-            ));
+            )));
         }
 
         if rebound_entry.entry_id().as_str() != entry_id_str {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry entry_id {} does not match event entry_id {entry_id_str} for seq {}",
                 rebound_entry.entry_id().as_str(),
                 event.seq()
-            ));
+            )));
         }
 
         if rebound_entry.received_at().datetime().timestamp_millis()
             != event.received_at().timestamp_millis()
         {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry received_at {} does not match event created_at {} for seq {}",
                 rebound_entry.received_at().as_str(),
                 event
                     .received_at()
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 event.seq()
-            ));
+            )));
         }
 
         if rebound_entry.outer_application_fingerprint() != &outer_fp_32 {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry outer fingerprint mismatch for seq {}",
                 event.seq()
-            ));
+            )));
         }
 
         if rebound_entry.accepted_payload_sha256() != payload_sha256 {
-            return Err(format!(
+            return Err(ApplyRemoteCleanEventsError::InvalidEvent(format!(
                 "verified entry payload sha256 mismatch for seq {}",
                 event.seq()
-            ));
+            )));
         }
 
         let server_fields_bytes =
             serde_ipld_dagcbor::to_vec(&std::collections::BTreeMap::<String, String>::new())
-                .map_err(|e| format!("server fields serialization failed: {e}"))?;
+                .map_err(|e| {
+                    ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                        "server fields serialization failed: {e}"
+                    ))
+                })?;
 
         let append_entry = crate::chat_protocol::repository::delivery::AppendEntry {
             conversation_id: convo_id,
@@ -1351,46 +1462,67 @@ async fn apply_remote_clean_events(
             event.seq() as u64,
         )
         .await
-        .map_err(|e| format!("failed to append entry at seq {}: {e:?}", event.seq()))?;
-
-        let outcome_bytes = serde_json::to_vec(&serde_json::json!({
-            "entry": {
-                "entryId": rebound_entry.entry_id().as_str(),
-                "conversationId": convo_id_string.as_str(),
-                "seq": event.seq(),
-                "signedRequest": serde_json::from_slice::<serde_json::Value>(signed_req)
-                    .unwrap_or(serde_json::Value::Null),
-                "receivedAt": rebound_entry.received_at().as_str()
-            }
-        }))
-        .map_err(|e| format!("failed to serialize reconciled send outcome: {e}"))?;
-        let outcome_sha256 = Sha256::digest(&outcome_bytes).to_vec();
-
-        sqlx::query(
-            r#"
-            INSERT INTO chat.message_sends (
-                conversation_id, message_id, signed_request_bytes,
-                signing_transcript_bytes, request_digest, signature, status,
-                accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', $7, $8, $9, $10)
-            "#,
-        )
-        .bind(convo_id)
-        .bind(message_id)
-        .bind(signed_req)
-        .bind(mutation.transcript_bytes())
-        .bind(&append_entry.request_digest)
-        .bind(&append_entry.signature)
-        .bind(event.seq())
-        .bind(&outcome_bytes)
-        .bind(&outcome_sha256)
-        .bind(rebound_entry.received_at().datetime())
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to insert message_sends for seq {}: {e}",
+        .map_err(|error| match error {
+            crate::chat_protocol::repository::delivery::DeliveryRepositoryError::Database(
+                database,
+            ) => ApplyRemoteCleanEventsError::Database(database.to_string()),
+            other => ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                "failed to append entry at seq {}: {other:?}",
                 event.seq()
+            )),
+        })?;
+
+        if mode == ApplicationImportMode::OrdinaryReconciliation {
+            let signed_request_json = serde_json::from_slice::<serde_json::Value>(signed_req)
+                .map_err(|e| {
+                    ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                        "invalid signedRequest json for seq {}: {e}",
+                        event.seq()
+                    ))
+                })?;
+            let outcome_bytes = serde_json::to_vec(&serde_json::json!({
+                "entry": {
+                    "entryId": rebound_entry.entry_id().as_str(),
+                    "conversationId": convo_id_string.as_str(),
+                    "seq": event.seq(),
+                    "signedRequest": signed_request_json,
+                    "receivedAt": rebound_entry.received_at().as_str()
+                }
+            }))
+            .map_err(|e| {
+                ApplyRemoteCleanEventsError::InvalidEvent(format!(
+                    "failed to serialize reconciled send outcome: {e}"
+                ))
+            })?;
+            let outcome_sha256 = Sha256::digest(&outcome_bytes).to_vec();
+
+            sqlx::query(
+                r#"
+                INSERT INTO chat.message_sends (
+                    conversation_id, message_id, signed_request_bytes,
+                    signing_transcript_bytes, request_digest, signature, status,
+                    accepted_entry_seq, outcome_bytes, outcome_sha256, received_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, 'accepted', $7, $8, $9, $10)
+                "#,
+            )
+            .bind(convo_id)
+            .bind(message_id)
+            .bind(signed_req)
+            .bind(mutation.transcript_bytes())
+            .bind(&append_entry.request_digest)
+            .bind(&append_entry.signature)
+            .bind(event.seq())
+            .bind(&outcome_bytes)
+            .bind(&outcome_sha256)
+            .bind(rebound_entry.received_at().datetime())
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| ApplyRemoteCleanEventsError::Database(error.to_string()))?;
+        }
+
+        expected_head_seq = expected_head_seq.checked_add(1).ok_or_else(|| {
+            ApplyRemoteCleanEventsError::InvalidEvent(
+                "application sequence overflowed the protocol domain".to_string(),
             )
         })?;
     }
@@ -1441,7 +1573,7 @@ async fn local_clean_digest_state(
     })
 }
 
-async fn local_clean_digest_state_tx(
+pub(crate) async fn local_clean_digest_state_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     convo_id: uuid::Uuid,
 ) -> Result<LocalDigestState, sqlx::Error> {

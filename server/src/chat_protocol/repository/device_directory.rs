@@ -221,9 +221,8 @@ pub(crate) async fn read_device_view(
     Ok(view)
 }
 
-/// Atomically update or clear the APNs device token for the caller's active device.
-/// Selects the active device row for the authenticated user DID, updates `devices`,
-/// and returns the canonical `DeviceDirectoryView`.
+/// Atomically update or clear the APNs token on the caller's active Clean Chat device
+/// and return the canonical `DeviceDirectoryView`.
 pub(crate) async fn update_device_push_token(
     pool: &PgPool,
     user_did: &str,
@@ -254,42 +253,20 @@ pub(crate) async fn update_device_push_token(
         return Err(UpdatePushTokenRepositoryError::DeviceRevoked);
     }
 
-    let device_id_str = device_id.to_string();
-    if let Some(token) = push_token {
-        sqlx::query(
-            r#"
-            INSERT INTO devices (
-                id, user_did, device_id, credential_did, active, push_token, push_token_updated_at
-            ) VALUES (
-                gen_random_uuid()::text, $1, $2, $1 || '#' || $2, TRUE, $3, NOW()
-            )
-            ON CONFLICT (user_did, device_id)
-            DO UPDATE SET
-                push_token = EXCLUDED.push_token,
-                push_token_updated_at = NOW(),
-                active = TRUE
-            "#,
-        )
-        .bind(user_did)
-        .bind(&device_id_str)
-        .bind(token)
-        .execute(&mut *tx)
-        .await?;
-    } else {
-        sqlx::query(
-            r#"
-            UPDATE devices
-               SET push_token = NULL,
-                   push_token_updated_at = NOW()
-             WHERE user_did = $1
-               AND (device_id = $2 OR device_uuid = $2)
-            "#,
-        )
-        .bind(user_did)
-        .bind(&device_id_str)
-        .execute(&mut *tx)
-        .await?;
-    }
+    sqlx::query(
+        r#"
+        UPDATE chat.devices
+           SET push_token = $3,
+               push_token_updated_at = NOW()
+         WHERE user_did = $1
+           AND device_id = $2
+        "#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .bind(push_token)
+    .execute(&mut *tx)
+    .await?;
 
     let view = read_device_view(&mut tx, user_did, device_id)
         .await

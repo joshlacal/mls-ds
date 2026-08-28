@@ -498,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?device_auth_mode, "Device-auth rollout mode installed");
 
     // Load offline test DID document fixtures if configured (strictly gated to APP_ENV=test)
+    #[cfg(feature = "test-support")]
     if let Err(e) = auth::load_test_did_fixtures_from_env().await {
         panic!("Failed to load test DID document fixtures: {e}");
     }
@@ -716,14 +717,21 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .expect("Failed to build HTTP client");
 
-    let resolver = Arc::new(federation::DsResolver::new(
+    let resolver = federation::DsResolver::new(
         db_pool.clone(),
         http_client.clone(),
         fed_config.self_did.clone(),
         fed_config.self_endpoint.clone(),
         fed_config.default_ds.clone(),
         fed_config.endpoint_cache_ttl_secs,
-    ));
+    );
+    #[cfg(feature = "test-support")]
+    let resolver = catbird_server::chat_protocol::test_support::with_federation_test_user_routes(
+        resolver,
+        &fed_config,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let resolver = Arc::new(resolver);
 
     let service_auth = if let Some(key_pem) = &fed_config.signing_key_pem {
         match federation::ServiceAuthClient::from_es256_pem(
@@ -774,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
         fed_config.outbound_timeout_secs,
     ));
 
-    let auth_middleware = auth::AuthMiddleware::new();
+    let auth_middleware = auth::shared_auth_middleware();
 
     let outbound_queue = Arc::new(federation::queue::OutboundQueue::new(
         db_pool.clone(),
@@ -789,7 +797,6 @@ async fn main() -> anyhow::Result<()> {
         });
         Some(Arc::new(
             federation::commit_submitter::RemoteCommitSubmitter::new(
-                db_pool.clone(),
                 resolver.clone(),
                 outbound.clone(),
                 auth.clone(),
@@ -925,6 +932,20 @@ async fn main() -> anyhow::Result<()> {
     // unconditionally still performs zero chat access — unlike the device-auth
     // cleanup worker above, which is unconditional and is its own known problem.)
     if chat_runtime.cutover_enabled() {
+        #[cfg(feature = "test-support")]
+        {
+            let key_id = std::env::var("CHAT_CURSOR_KEY_ID").unwrap_or_else(|_| {
+                tracing::error!("CHAT_CURSOR_KEY_ID disappeared after runtime validation");
+                std::process::exit(1);
+            });
+            maybe_initialize_chat_fence_for_test(&db_pool, key_id.trim())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!("clean-chat test fence initialization failed: {error}");
+                    std::process::exit(1);
+                });
+        }
+
         chat_runtime
             .validate_protocol_fence(&db_pool)
             .await
@@ -1191,6 +1212,124 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
 
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+async fn maybe_initialize_chat_fence_for_test(
+    pool: &PgPool,
+    cursor_key_id: &str,
+) -> Result<(), String> {
+    let app_env = std::env::var("APP_ENV").unwrap_or_default();
+    let init_flag = std::env::var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE").unwrap_or_default();
+    if app_env != "test" || init_flag != "true" {
+        return Ok(());
+    }
+
+    if cursor_key_id.is_empty() {
+        return Err("cursor_key_id cannot be empty for chat fence initialization".to_string());
+    }
+
+    let existing: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
+        "SELECT protocol_instance_id, cursor_key_id, protocol_version \
+         FROM chat.protocol_instances WHERE singleton = TRUE",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("failed to query protocol_instances: {e}"))?;
+
+    let protocol_instance_id = match existing {
+        Some((id, existing_key, version)) => {
+            if version != "1" {
+                return Err(format!(
+                    "existing protocol_instances row has invalid version '{version}' (expected '1')"
+                ));
+            }
+            if existing_key != cursor_key_id {
+                return Err(format!(
+                    "existing protocol_instances cursor_key_id '{existing_key}' does not match expected '{cursor_key_id}'"
+                ));
+            }
+            id
+        }
+        None => {
+            let new_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO chat.protocol_instances (singleton, protocol_version, protocol_instance_id, cursor_key_id, created_at) \
+                 VALUES (TRUE, '1', $1, $2, clock_timestamp()) \
+                 ON CONFLICT (singleton) DO NOTHING",
+            )
+            .bind(new_id)
+            .bind(cursor_key_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("failed to insert protocol_instances: {e}"))?;
+
+            let (id, key, version): (uuid::Uuid, String, String) = sqlx::query_as(
+                "SELECT protocol_instance_id, cursor_key_id, protocol_version \
+                 FROM chat.protocol_instances WHERE singleton = TRUE",
+            )
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("failed to fetch protocol_instances after insert: {e}"))?;
+
+            if version != "1" || key != cursor_key_id {
+                return Err("protocol_instances insert/fetch invariant violation".to_string());
+            }
+            id
+        }
+    };
+
+    let existing_retention: Option<(uuid::Uuid, i64)> = sqlx::query_as(
+        "SELECT protocol_instance_id, retained_floor \
+         FROM chat.event_retention WHERE protocol_instance_id = $1",
+    )
+    .bind(protocol_instance_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("failed to query event_retention: {e}"))?;
+
+    match existing_retention {
+        Some((ret_id, floor)) => {
+            if ret_id != protocol_instance_id {
+                return Err("event_retention protocol_instance_id mismatch".to_string());
+            }
+            if floor != 0 {
+                return Err(format!(
+                    "event_retention retained_floor is {floor} (expected 0)"
+                ));
+            }
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at) \
+                 VALUES ($1, 0, clock_timestamp()) \
+                 ON CONFLICT (protocol_instance_id) DO NOTHING",
+            )
+            .bind(protocol_instance_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("failed to insert event_retention: {e}"))?;
+
+            let (ret_id, floor): (uuid::Uuid, i64) = sqlx::query_as(
+                "SELECT protocol_instance_id, retained_floor \
+                 FROM chat.event_retention WHERE protocol_instance_id = $1",
+            )
+            .bind(protocol_instance_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("failed to fetch event_retention after insert: {e}"))?;
+
+            if ret_id != protocol_instance_id || floor != 0 {
+                return Err("event_retention insert/fetch invariant violation".to_string());
+            }
+        }
+    }
+
+    tracing::info!(
+        protocol_instance_id = %protocol_instance_id,
+        "Clean-chat test infrastructure fence initialized/verified"
+    );
     Ok(())
 }
 

@@ -15,21 +15,8 @@ mod conversation_tests {
     use tokio::sync::oneshot;
 
     /// Test helper to set up a test database
-    async fn setup_test_db() -> PgPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-
-        let config = crate::db::DbConfig {
-            database_url,
-            max_connections: 10,
-            min_connections: 2,
-            acquire_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(600),
-        };
-
-        crate::db::init_db(config)
-            .await
-            .expect("Failed to initialize test database")
+    async fn setup_test_db() -> (PgPool, super::super::fresh_db::DisposableDatabase) {
+        super::super::fresh_db::fresh_legacy_pool("actor_convo_", 10, 2).await
     }
 
     /// Test helper to clean up test data
@@ -85,7 +72,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "fixture rot: AddMembers payload no longer satisfies actor's input contract"]
     async fn test_epoch_monotonicity() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-epoch-monotonicity";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -164,7 +151,7 @@ mod conversation_tests {
 
     #[tokio::test]
     async fn test_unread_count_updates() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-unread-count";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -240,7 +227,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "fixture rot: AddMembers payload no longer satisfies actor's input contract"]
     async fn test_state_persistence_on_shutdown() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-state-persistence";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -300,7 +287,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "fixture rot: AddMembers payload no longer satisfies actor's input contract"]
     async fn test_error_recovery() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-error-recovery";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -347,7 +334,7 @@ mod conversation_tests {
 
     #[tokio::test]
     async fn test_concurrent_messages_serialized() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-concurrent-serialization";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -554,7 +541,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_happy_path_3_member_2_votes() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-happy";
         wipe_a7(&pool, convo_id).await;
         let auth = "deadbeefc0de";
@@ -608,7 +595,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_stale_authenticator() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-stale";
         wipe_a7(&pool, convo_id).await;
         seed_a7_convo(
@@ -652,7 +639,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_rate_limited() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-rl";
         wipe_a7(&pool, convo_id).await;
         let auth = "beeff00d";
@@ -693,7 +680,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_circuit_breaker_trips() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-breaker";
         wipe_a7(&pool, convo_id).await;
         let auth = "facefeed";
@@ -757,7 +744,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_per_did_multi_device() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-multidev";
         wipe_a7(&pool, convo_id).await;
         let auth = "c0ffee42";
@@ -824,7 +811,7 @@ mod conversation_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres with A7 migration applied (TEST_DATABASE_URL)"]
     async fn test_record_reset_vote_partial_lockout_zero() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-a7-partial";
         wipe_a7(&pool, convo_id).await;
         let auth = "b00dcafe";

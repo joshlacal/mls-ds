@@ -747,8 +747,8 @@
     "sourceCorpusRevision": "a063ed8f995031fa0cf122bca3f4f82c89f08c90",
     "sourceLexicon": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
     "sourceLexiconMirror": "lexicon/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceLexiconRevision": "8ec8acaa1137b68b57b78ebfaea9404d5923305b",
-    "sourceLexiconSha256": "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf"
+    "sourceLexiconRevision": "34e5cc3b23cc30b4a3ea837719614c436898d321",
+    "sourceLexiconSha256": "3d5d867d9b651fc22e119cb6011262740e3308f127efbf87742850ecded6d639"
   },
   "publicKeyHex": "ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3",
   "purpose": "Known-answer vectors for the ten active signing domains carried by no control entry. Produced by the server's own transcript code; see tests/chat_protocol_signing_domain_vectors.rs.",

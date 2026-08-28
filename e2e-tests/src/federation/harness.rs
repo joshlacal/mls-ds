@@ -4,25 +4,69 @@
 //! testing. See `mls-ds/e2e-tests/docker-compose.federation.yml` for the
 //! container topology.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::TestClient;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::Utc;
-use p256::ecdsa::{signature::Signer, signature::Verifier, Signature as P256Signature, SigningKey, VerifyingKey};
+use p256::ecdsa::{
+    signature::Signer, signature::Verifier, Signature as P256Signature, SigningKey, VerifyingKey,
+};
 use p256::pkcs8::DecodePrivateKey;
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::json;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
-use crate::TestClient;
 
 pub const DS1_DEFAULT_SERVICE_DID: &str = "did:web:ds1.catbird.blue";
 pub const DS2_DEFAULT_SERVICE_DID: &str = "did:web:ds2.catbird.blue";
+pub const MLS_APPVIEW_SERVICE_REF: &str = "did:web:chat.catbird.blue#atproto_mls";
 
+pub const DIGEST_ALLOWED_TABLES: &[&str] = &[
+    "chat.conversations",
+    "chat.entries",
+    "chat.transitions",
+    "chat.generation_states",
+    "chat.participants",
+    "chat.message_sends",
+    "chat.generations",
+    "chat.member_devices",
+    "chat.application_intervals",
+    "chat.metadata_snapshots",
+    "chat.leaf_recovery_requests",
+    "chat.key_package_reservations",
+    "chat.welcome_bundles",
+    "chat.welcome_deliveries",
+    "chat.operation_claims",
+    "chat.idempotency_records",
+    "chat.federation_delivery_receipts",
+    "chat.recovery_work_items",
+    "chat.welcome_dispositions",
+    "chat.reset_requests",
+    "chat.leave_requests",
+    "chat.outbox",
+    "federation_sync_state",
+    "federation_outbox",
+    "outbound_queue",
+    "chat.principals",
+    "chat.key_packages",
+];
+
+/// Compact outcome output from the selector-only bootstrap fixture.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapOutcome {
+    pub outcome: String,
+    pub conversation_id: String,
+    pub sequencer_term: i64,
+    pub head_seq: i64,
+    pub digest_sha256: String,
+}
 /// Configuration for booting the cluster.
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
@@ -35,8 +79,8 @@ impl Default for HarnessConfig {
     fn default() -> Self {
         let project_name = std::env::var("FED_HARNESS_PROJECT_NAME")
             .unwrap_or_else(|_| format!("mls-fed-{}", Uuid::new_v4().simple()));
-        let compose_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("docker-compose.federation.yml");
+        let compose_file =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docker-compose.federation.yml");
         Self {
             project_name,
             boot_timeout: Duration::from_secs(90),
@@ -80,6 +124,9 @@ impl std::fmt::Debug for TwoNodeCluster {
 impl Drop for TwoNodeCluster {
     fn drop(&mut self) {
         if !self.cleaned_up {
+            if std::thread::panicking() {
+                self.capture_diagnostics();
+            }
             self.teardown_sync();
         }
     }
@@ -124,22 +171,35 @@ impl TwoNodeCluster {
 
     /// Mint an ES256 service JWT for DS1 as issuer.
     pub fn mint_ds1_jwt(&self, audience: &str, endpoint_nsid: &str) -> String {
-        self.mint_jwt(&self.ds1_service_did, &self.ds1_signing_key, audience, endpoint_nsid, None)
+        self.mint_jwt(
+            &self.ds1_service_did,
+            &self.ds1_signing_key,
+            audience,
+            endpoint_nsid,
+            None,
+        )
     }
 
     /// Mint an ES256 service JWT for DS2 as issuer.
     pub fn mint_ds2_jwt(&self, audience: &str, endpoint_nsid: &str) -> String {
-        self.mint_jwt(&self.ds2_service_did, &self.ds2_signing_key, audience, endpoint_nsid, None)
+        self.mint_jwt(
+            &self.ds2_service_did,
+            &self.ds2_signing_key,
+            audience,
+            endpoint_nsid,
+            None,
+        )
     }
 
-    /// Mint an ES256 service JWT with custom issuer, audience, and lxm.
-    pub fn mint_jwt(
+    /// Mint an ES256 service JWT with custom issuer, key, audience, endpoint_nsid, custom_jti, and lifetime.
+    pub fn mint_jwt_with_lifetime(
         &self,
         issuer: &str,
         key: &SigningKey,
         audience: &str,
         endpoint_nsid: &str,
         custom_jti: Option<&str>,
+        lifetime_secs: i64,
     ) -> String {
         let now = Utc::now().timestamp();
         let jti = custom_jti
@@ -156,7 +216,7 @@ impl TwoNodeCluster {
             "aud": audience,
             "lxm": endpoint_nsid,
             "iat": now,
-            "exp": now + 120,
+            "exp": now + lifetime_secs,
             "jti": jti
         });
 
@@ -167,6 +227,30 @@ impl TwoNodeCluster {
         let sig_bytes = signature.to_bytes();
         let s_b64 = URL_SAFE_NO_PAD.encode(sig_bytes);
         format!("{signing_input}.{s_b64}")
+    }
+
+    /// Mint an ES256 service JWT with default 120s lifetime.
+    pub fn mint_jwt(
+        &self,
+        issuer: &str,
+        key: &SigningKey,
+        audience: &str,
+        endpoint_nsid: &str,
+        custom_jti: Option<&str>,
+    ) -> String {
+        self.mint_jwt_with_lifetime(issuer, key, audience, endpoint_nsid, custom_jti, 120)
+    }
+
+    /// Mint a short-lived ES256 service JWT (<=60s) targeting the MLS AppView service.
+    pub fn mint_chat_jwt(&self, issuer: &str, key: &SigningKey, endpoint_nsid: &str) -> String {
+        self.mint_jwt_with_lifetime(
+            issuer,
+            key,
+            MLS_APPVIEW_SERVICE_REF,
+            endpoint_nsid,
+            None,
+            50,
+        )
     }
 
     /// Verify an ES256 signature against DS1 verifying key.
@@ -189,7 +273,10 @@ impl TwoNodeCluster {
 
     /// Capture diagnostic snapshots (ps, logs, and database tables) on failure.
     pub fn capture_diagnostics(&self) {
-        println!("=== FEDERATION TWO-NODE DIAGNOSTICS ({}) ===", self.compose_project);
+        println!(
+            "=== FEDERATION TWO-NODE DIAGNOSTICS ({}) ===",
+            self.compose_project
+        );
         let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
 
         // 1. docker compose ps
@@ -251,18 +338,337 @@ impl TwoNodeCluster {
             .output();
     }
 
-    /// Explicit asynchronous shutdown.
-    pub async fn shutdown(mut self) {
-        self.teardown_sync();
+    /// Pause a docker-compose service (e.g. "ds2").
+    pub fn pause_service(&self, service: &str) -> Result<()> {
+        let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
+        let status = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "pause",
+                service,
+            ])
+            .current_dir(repo_root)
+            .status()
+            .with_context(|| format!("pause service '{service}'"))?;
+        if !status.success() {
+            anyhow::bail!(
+                "docker compose pause {service} failed with status: {:?}",
+                status.code()
+            );
+        }
+        Ok(())
+    }
+
+    /// Unpause a docker-compose service (e.g. "ds2").
+    pub fn unpause_service(&self, service: &str) -> Result<()> {
+        let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
+        let status = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "unpause",
+                service,
+            ])
+            .current_dir(repo_root)
+            .status()
+            .with_context(|| format!("unpause service '{service}'"))?;
+        if !status.success() {
+            anyhow::bail!(
+                "docker compose unpause {service} failed with status: {:?}",
+                status.code()
+            );
+        }
+        Ok(())
+    }
+
+    /// Calculate deterministic content digest for a table using closed allowlist.
+    pub async fn table_digest(&self, pg: &tokio_postgres::Client, table: &str) -> Result<String> {
+        if !DIGEST_ALLOWED_TABLES.contains(&table) {
+            anyhow::bail!("table '{table}' is not in DIGEST_ALLOWED_TABLES allowlist");
+        }
+        let query = format!(
+            "SELECT encode(digest(COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY to_jsonb(row_data)::text)::text, '[]'), 'sha256'), 'hex') FROM (SELECT * FROM {table}) AS row_data"
+        );
+        let row = pg
+            .query_one(&query, &[])
+            .await
+            .with_context(|| format!("table_digest for {table}"))?;
+        let digest: String = row.get(0);
+        Ok(digest)
+    }
+
+    /// Snapshot table content digests for multiple tables.
+    pub async fn table_digests(
+        &self,
+        pg: &tokio_postgres::Client,
+        tables: &[&str],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut digests = BTreeMap::new();
+        for &table in tables {
+            let digest = self.table_digest(pg, table).await?;
+            digests.insert(table.to_string(), digest);
+        }
+        Ok(digests)
+    }
+
+    /// Invoke the selector-only federation fixture in DS2 via strict argv.
+    pub async fn bootstrap_ds2_from_selector(
+        &self,
+        conversation_id: Uuid,
+        configured_sequencer_did: &str,
+        configured_sequencer_term: i64,
+    ) -> Result<BootstrapOutcome> {
+        let file_uuid = Uuid::new_v4();
+        let host_temp_path = std::env::temp_dir().join(format!("selector-{file_uuid}.json"));
+        let container_temp_path = format!("/tmp/selector-{file_uuid}.json");
+
+        let input_json = json!({
+            "conversationId": conversation_id.to_string(),
+            "configuredSequencerDid": configured_sequencer_did,
+            "configuredSequencerTerm": configured_sequencer_term,
+        });
+        let json_bytes = serde_json::to_vec(&input_json)?;
+
+        // The selector contains peer routing input; make permissions atomic with creation.
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&host_temp_path)
+                .with_context(|| format!("create temp file {:?}", host_temp_path))?;
+            file.write_all(&json_bytes)?;
+            file.flush()?;
+        }
+
+        let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
+
+        // Ensure host and container files are removed in all exit paths
+        let cleanup = || {
+            let _ = std::fs::remove_file(&host_temp_path);
+            let _ = Command::new("docker")
+                .args([
+                    "compose",
+                    "-p",
+                    &self.compose_project,
+                    "-f",
+                    self.compose_file.to_str().unwrap(),
+                    "exec",
+                    "-T",
+                    "ds2",
+                    "rm",
+                    "-f",
+                    &container_temp_path,
+                ])
+                .current_dir(repo_root)
+                .output();
+        };
+
+        // 1. docker compose cp host_temp_path ds2:container_temp_path
+        let cp_output = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "cp",
+                host_temp_path.to_str().unwrap(),
+                &format!("ds2:{container_temp_path}"),
+            ])
+            .current_dir(repo_root)
+            .output();
+
+        let cp_res = match cp_output {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(anyhow::anyhow!(
+                "docker compose cp failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )),
+            Err(e) => Err(anyhow::anyhow!("failed to run docker compose cp: {e}")),
+        };
+
+        if let Err(e) = cp_res {
+            cleanup();
+            return Err(e);
+        }
+        let chown_output = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "exec",
+                "-T",
+                "-u",
+                "root",
+                "ds2",
+                "chown",
+                "catbird:catbird",
+                &container_temp_path,
+            ])
+            .current_dir(repo_root)
+            .output();
+        let chown_res = match chown_output {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(anyhow::anyhow!(
+                "failed to set federation selector ownership: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to run federation selector chown: {error}"
+            )),
+        };
+        if let Err(error) = chown_res {
+            cleanup();
+            return Err(error);
+        }
+
+
+        // 2. docker compose exec -T ds2 /usr/local/bin/federation_fixture <container-path>
+        let exec_output = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "exec",
+                "-T",
+                "ds2",
+                "/usr/local/bin/federation_fixture",
+                &container_temp_path,
+            ])
+            .current_dir(repo_root)
+            .output();
+
+        cleanup();
+
+        let out = exec_output.context("execute federation_fixture")?;
+        if out.stdout.len() > 4096 {
+            anyhow::bail!(
+                "federation_fixture stdout exceeded 4096-byte protocol limit: {} bytes",
+                out.stdout.len()
+            );
+        }
+        let stdout = std::str::from_utf8(&out.stdout).context("federation_fixture stdout UTF-8")?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        if !out.status.success() {
+            anyhow::bail!(
+                "federation_fixture failed (exit {:?}): stdout: {}, stderr: {}",
+                out.status.code(),
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+
+        let lines = stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        if lines.len() != 1 {
+            anyhow::bail!(
+                "federation_fixture must emit exactly one non-empty JSON line, got {}",
+                lines.len()
+            );
+        }
+        let outcome: BootstrapOutcome = serde_json::from_str(lines[0])
+            .with_context(|| format!("parse federation_fixture output: '{}'", lines[0]))?;
+
+        Ok(outcome)
+    }
+
+    /// Explicit asynchronous shutdown with post-teardown container and volume verification.
+    pub async fn shutdown(mut self) -> Result<()> {
+        let repo_root = self.compose_file.parent().unwrap().parent().unwrap();
+        let down_output = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "down",
+                "--volumes",
+                "--remove-orphans",
+            ])
+            .current_dir(repo_root)
+            .output()
+            .context("docker compose down")?;
+        if !down_output.status.success() {
+            let stderr = String::from_utf8_lossy(&down_output.stderr);
+            anyhow::bail!("docker compose down failed: {stderr}");
+        }
+
+        // Verify no leftover containers for this project
+        let ps_output = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                &self.compose_project,
+                "-f",
+                self.compose_file.to_str().unwrap(),
+                "ps",
+                "-a",
+                "-q",
+            ])
+            .current_dir(repo_root)
+            .output()
+            .context("docker compose ps -a -q")?;
+        let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
+        if !ps_stdout.trim().is_empty() {
+            anyhow::bail!(
+                "leftover containers found after teardown for project {}: {}",
+                self.compose_project,
+                ps_stdout.trim()
+            );
+        }
+
+        // Verify no leftover volumes for this project
+        let vol_output = Command::new("docker")
+            .args([
+                "volume",
+                "ls",
+                "--filter",
+                &format!("label=com.docker.compose.project={}", self.compose_project),
+                "-q",
+            ])
+            .output()
+            .context("docker volume ls")?;
+        let vol_stdout = String::from_utf8_lossy(&vol_output.stdout);
+        if !vol_stdout.trim().is_empty() {
+            anyhow::bail!(
+                "leftover volumes found after teardown for project {}: {}",
+                self.compose_project,
+                vol_stdout.trim()
+            );
+        }
+        self.cleaned_up = true;
+        Ok(())
     }
 }
 
 /// Verify that Docker is available, or fail loudly.
 pub fn ensure_docker_available() -> Result<()> {
-    let output = Command::new("docker")
-        .arg("info")
-        .output()
-        .map_err(|e| anyhow::anyhow!("Failed to execute `docker info`: {e}. Please ensure Docker or Colima is installed."))?;
+    let output = Command::new("docker").arg("info").output().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to execute `docker info`: {e}. Please ensure Docker or Colima is installed."
+        )
+    })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -356,9 +762,9 @@ pub async fn boot_two_node_cluster_with(config: HarnessConfig) -> Result<TwoNode
             .rsplit(':')
             .next()
             .context("parse host port from docker compose port output")?;
-        let port: u16 = host_port_str
-            .parse()
-            .with_context(|| format!("parse port integer from '{host_port_str}' (raw='{trimmed}')"))?;
+        let port: u16 = host_port_str.parse().with_context(|| {
+            format!("parse port integer from '{host_port_str}' (raw='{trimmed}')")
+        })?;
         Ok(port)
     };
 
@@ -400,7 +806,10 @@ pub async fn boot_two_node_cluster_with(config: HarnessConfig) -> Result<TwoNode
 
     while start.elapsed() < config.boot_timeout {
         if !ds1_ready {
-            let ready_res = http_client.get(format!("{ds1_url}/health/ready")).send().await;
+            let ready_res = http_client
+                .get(format!("{ds1_url}/health/ready"))
+                .send()
+                .await;
             let health_res = http_client
                 .get(format!("{ds1_url}/xrpc/blue.catbird.mlsDS.healthCheck"))
                 .send()
@@ -413,7 +822,10 @@ pub async fn boot_two_node_cluster_with(config: HarnessConfig) -> Result<TwoNode
         }
 
         if !ds2_ready {
-            let ready_res = http_client.get(format!("{ds2_url}/health/ready")).send().await;
+            let ready_res = http_client
+                .get(format!("{ds2_url}/health/ready"))
+                .send()
+                .await;
             let health_res = http_client
                 .get(format!("{ds2_url}/xrpc/blue.catbird.mlsDS.healthCheck"))
                 .send()

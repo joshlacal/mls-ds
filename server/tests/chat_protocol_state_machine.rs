@@ -114,21 +114,27 @@ struct CorpusActor {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CorpusChain {
+    #[serde(default)]
     generation: u64,
     genesis_state_version: u64,
     genesis_epoch: u64,
     genesis_group_context_hash_hex: String,
     genesis_confirmation_tag_hex: String,
     group_id_hex: String,
-    inner_key_package_ref_hex: String,
 }
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09")
 }
 
 fn corpus_file(name: &str) -> Vec<u8> {
     fs::read(corpus_dir().join(name)).expect("read frozen crypto-wire corpus")
+}
+
+fn corpus_key_package_ref() -> [u8; 32] {
+    corpus_file("key-package-ref.bin")
+        .try_into()
+        .expect("the corpus key-package ref is exactly 32 bytes")
 }
 
 fn corpus_manifest() -> CorpusManifest {
@@ -796,7 +802,7 @@ fn accepted_direct() -> chat_protocol::state_machine::ConversationState {
             actor: bob(&manifest),
             transition: evidence(ACCEPT_SEQ, 0x22),
             recovery_request_id: uuid_v4_bytes(0x23),
-            key_package_ref: hex_array(&manifest.chain.inner_key_package_ref_hex),
+            key_package_ref: corpus_key_package_ref(),
             package_not_after: fixture_package_not_after(),
         },
     )
@@ -812,7 +818,7 @@ fn accepted_group() -> chat_protocol::state_machine::ConversationState {
             actor: bob(&manifest),
             transition: evidence(ACCEPT_SEQ, 0x22),
             recovery_request_id: uuid_v4_bytes(0x23),
-            key_package_ref: hex_array(&manifest.chain.inner_key_package_ref_hex),
+            key_package_ref: corpus_key_package_ref(),
             package_not_after: fixture_package_not_after(),
         },
     )
@@ -835,7 +841,7 @@ fn added_direct() -> chat_protocol::state_machine::ConversationState {
     let manifest = corpus_manifest();
     let state = accepted_direct();
     let commit = verified_add_commit(&state);
-    let package_ref = hex_array(&manifest.chain.inner_key_package_ref_hex);
+    let package_ref = corpus_key_package_ref();
     let welcome = verify_recovery_welcome(&corpus_file("welcome.mls"), package_ref, 1_048_576)
         .expect("one-recipient Welcome is request-bound");
     plan_leaf_recovery_fulfillment(
@@ -858,7 +864,7 @@ fn added_group() -> chat_protocol::state_machine::ConversationState {
     let manifest = corpus_manifest();
     let state = accepted_group();
     let commit = verified_add_commit(&state);
-    let package_ref = hex_array(&manifest.chain.inner_key_package_ref_hex);
+    let package_ref = corpus_key_package_ref();
     let welcome = verify_recovery_welcome(&corpus_file("welcome.mls"), package_ref, 1_048_576)
         .expect("one-recipient Welcome is request-bound");
     plan_leaf_recovery_fulfillment(
@@ -1211,7 +1217,7 @@ fn acceptance_recovery_package_comparison_rejects_wrapper_and_hash_drift() {
         bob(&manifest),
         uuid_v4_bytes(0x11),
         alice(&manifest),
-        hex_array(&manifest.chain.inner_key_package_ref_hex),
+        corpus_key_package_ref(),
         wrapper.clone(),
         [0x44; 32],
         1,
@@ -1249,7 +1255,7 @@ fn stale_commit_is_rejected_without_partial_state_mutation() {
     let commit = verified_add_commit(&accepted);
     let welcome = verify_recovery_welcome(
         &corpus_file("welcome.mls"),
-        hex_array(&manifest.chain.inner_key_package_ref_hex),
+        corpus_key_package_ref(),
         1_048_576,
     )
     .unwrap();
@@ -1319,7 +1325,7 @@ fn recovery_is_bound_to_exact_target_device_request_package_and_welcome() {
     let commit = verified_add_commit(&state);
     let welcome = verify_recovery_welcome(
         &corpus_file("welcome.mls"),
-        hex_array(&manifest.chain.inner_key_package_ref_hex),
+        corpus_key_package_ref(),
         1_048_576,
     )
     .unwrap();
@@ -2022,7 +2028,7 @@ fn request_and_reservation_lifetimes_use_server_received_at_and_expire_closed() 
     assert_eq!(reservation.expires_at(), request.expires_at());
 
     let commit = verified_add_commit(&accepted);
-    let package_ref = hex_array(&manifest.chain.inner_key_package_ref_hex);
+    let package_ref = corpus_key_package_ref();
     let welcome =
         verify_recovery_welcome(&corpus_file("welcome.mls"), package_ref, 1_048_576).unwrap();
     let before = accepted.clone();

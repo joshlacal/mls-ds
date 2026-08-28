@@ -334,12 +334,6 @@ pub struct AuthMiddleware {
         Arc<moka::sync::Cache<String, Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>>,
     http_client: reqwest::Client,
     did_resolution_timeout: Duration,
-    /// Stored TTL value used to construct `did_cache` (moka's `time_to_live`).
-    /// Not read after construction today, but useful for diagnostics endpoints
-    /// and future on-demand TTL reconfiguration without rebuilding the cache.
-    /// TODO(phase-2.5-cleanup): expose via diagnostics or drop the field.
-    #[allow(dead_code)]
-    cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
     #[cfg(test)]
@@ -398,7 +392,6 @@ impl AuthMiddleware {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             did_resolution_timeout: Duration::from_secs(did_resolution_timeout_seconds),
-            cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
             #[cfg(test)]
@@ -896,7 +889,12 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
 });
 
 static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
+#[doc(hidden)]
+pub fn shared_auth_middleware() -> AuthMiddleware {
+    AUTH_MIDDLEWARE.clone()
+}
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn cache_test_did_document(doc: DidDocument) {
     AUTH_MIDDLEWARE.cache_did_document(doc).await;
 }
@@ -906,6 +904,7 @@ pub async fn cache_test_did_document(doc: DidDocument) {
 /// # Security
 /// This is strictly forbidden outside `APP_ENV=test`. If any fixture configuration is present
 /// while `APP_ENV` is not `"test"`, this function aborts startup immediately.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn load_test_did_fixtures_from_env() -> Result<usize, AuthError> {
     let paths_var = std::env::var("TEST_DID_DOCUMENT_PATHS")
         .or_else(|_| std::env::var("TEST_DID_DOC_PATHS"))
@@ -1050,7 +1049,7 @@ fn kid_matches(vm_id: &str, kid: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn select_verification_method<'a>(
+pub(crate) fn select_verification_method<'a>(
     did_doc: &'a DidDocument,
     kid: Option<&str>,
 ) -> Result<&'a VerificationMethod, AuthError> {
@@ -2499,7 +2498,8 @@ mod federation_fixture_tests {
         assert_eq!(doc1.id, "did:web:ds1.catbird.blue");
         let key1 = extract_p256_key(&doc1).expect("extract p256 key for ds1");
 
-        let doc2 = AUTH_MIDDLEWARE
+        let shared_middleware = shared_auth_middleware();
+        let doc2 = shared_middleware
             .resolve_did("did:web:ds2.catbird.blue")
             .await
             .expect("resolve ds2 did from cache");

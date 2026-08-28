@@ -11,28 +11,22 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
+
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
-    pub(crate) mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
-
 mod cursor {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/chat_protocol/cursor.rs"
-    ));
+    pub(crate) use crate::chat_protocol::cursor::*;
 }
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chat_protocol::validation::{ed25519_key_id, KeyThumbprint};
 use chrono::{TimeZone, Utc};
 use cursor::{
     mint_capability_token, CapabilityToken, CursorCodec, CursorSealer, InventoryPageDomain,
@@ -46,7 +40,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex};
 use uuid::Uuid;
-use validation::{ed25519_key_id, KeyThumbprint};
 use zeroize::Zeroizing;
 
 const DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
@@ -1821,6 +1814,18 @@ fn d2_receipt_retry_and_continuation_paths_are_source_pinned() {
     assert!(facade.contains("transaction.rollback().await"));
     assert!(facade.contains("InventoryRepositoryError::RetryCeiling"));
 
+    let create_attempt = body("async fn create_inventory_snapshot_attempt(");
+    assert!(
+        create_attempt.contains("SELECT chat.delete_inventory_session_exact($1,$2,$3)"),
+        "stale snapshot replacement must use the sealed exact-delete function"
+    );
+    assert!(
+        !create_attempt.contains("DELETE FROM chat.inventory_")
+            && !create_attempt.contains("DELETE FROM chat.event_cursor_receipts")
+            && !create_attempt.contains("DELETE FROM chat.subscription_tickets"),
+        "the request path must not bypass sealed inventory deletion"
+    );
+
     let serve = body("async fn serve_page_receipt(");
     for needle in [
         "insert_page_receipt_unserved",
@@ -1902,7 +1907,6 @@ fn d2_receipt_retry_and_continuation_paths_are_source_pinned() {
             "the serve loser path must keep its savepoint discipline: {needle}"
         );
     }
-    let create_attempt = body("async fn create_inventory_snapshot_attempt(");
     for needle in [
         "SAVEPOINT create_inventory_session_arm",
         "RELEASE SAVEPOINT create_inventory_session_arm",

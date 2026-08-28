@@ -10,14 +10,14 @@
 //! once, silently, mid-run.
 //!
 //! The mint-and-reap pattern here is the one this tree already uses and proves
-//! out in `common::executor_seed` (`FreshDbGuard` / `fresh_executor_db`). It is
-//! re-expressed here rather than extended in place because
+//! out in `common::executor_seed` (`FreshDbGuard` / `fresh_executor_db`).
 //! `tests/common/executor_seed.rs` is pinned byte-for-byte by
 //! `chat_protocol_g7_entitlement::frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline`
-//! (`f2d0f424…`); editing it would break that seal. The two implementations are
-//! deliberately behaviourally identical: unique name, `CREATE DATABASE`, and a
-//! `Drop` reaper that terminates stragglers and drops the database on the normal
-//! path *and* during panic unwind.
+//! (`6d602b55…`); both use the shared advisory lock on `/postgres`
+//! (`0x43415442_49524431`). The two implementations are deliberately
+//! behaviourally identical: unique name, `CREATE DATABASE`, and a `Drop` reaper
+//! that terminates stragglers and drops the database on the normal path *and*
+//! during panic unwind.
 //!
 //! Naming: every database minted here is `<reserved prefix><32 lowercase hex>`.
 //! No reserved prefix collides with `chat_exec_` (the executor harness's own
@@ -25,9 +25,36 @@
 //! database from a killed run is attributable to exactly one target.
 
 #![allow(dead_code)]
-
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
+use std::sync::LazyLock;
+use tokio::sync::Mutex as TokioMutex;
+
+static IN_PROCESS_MIGRATION_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
+pub const DISPOSABLE_MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x43415442_49524431; // 'CATBIRD1'
+
+pub struct MigrationLockGuard<'a> {
+    _in_process: tokio::sync::MutexGuard<'a, ()>,
+    _maintenance_conn: sqlx::PgConnection,
+}
+
+pub async fn acquire_migration_lock() -> MigrationLockGuard<'static> {
+    let in_process = IN_PROCESS_MIGRATION_LOCK.lock().await;
+    let maintenance_url =
+        maintenance_url_from_env().expect("loopback maintenance URL for the disposable harness");
+    let mut conn = sqlx::PgConnection::connect(&maintenance_url)
+        .await
+        .expect("connect to maintenance database for migration advisory lock");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(DISPOSABLE_MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .expect("acquire PostgreSQL migration advisory lock");
+    MigrationLockGuard {
+        _in_process: in_process,
+        _maintenance_conn: conn,
+    }
+}
 
 /// Databases that are shared program state. Nothing in this module may create,
 /// reset, or reap a database on this list: the whole point of the module is
@@ -57,9 +84,13 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "chat_fedrouter_",
     // `tests/chat_protocol_federation_outbox_retry.rs`
     "chat_fedoutbox_",
+    // `tests/chat_protocol_remote_prefix_bootstrap.rs`
+    "chat_remoteprefix_",
     "chat_devhandlers_",
     // `tests/chat_protocol_auth_repository.rs`
     "chat_authrepo_",
+    // `tests/common/fresh_db.rs`
+    "chat_freshdb_",
     // `tests/db_tests.rs`
     "mlsds_dbtests_",
     // `tests/federation_hostile_peers.rs`
@@ -78,23 +109,23 @@ pub const DISPOSABLE_PREFIXES: &[&str] = &[
     "mlsds_gistore_",
     // `tests/migration_repair_smoke.rs`
     "mlsds_migrepair_",
-    // `common::setup_test_db`, the shared legacy helper. A leak under this
-    // prefix names the *helper*, not one of its fourteen consuming targets;
-    // the consumers are enumerated at [`SHARED_LEGACY_DB_PREFIX`].
+    // `common::setup_test_db`, the shared legacy helper, plus
+    // `tests/clean_chat_empty_preflight.rs`, which mints under this prefix
+    // directly. A leak here names the *prefix*, not one of its eleven
+    // consuming targets; they are enumerated at [`SHARED_LEGACY_DB_PREFIX`].
     "mlsds_shared_",
 ];
 
 /// Prefix used by [`crate::common::setup_test_db`], the shared legacy fixture
-/// helper.
+/// helper, and minted directly by `tests/clean_chat_empty_preflight.rs`.
 ///
 /// Consuming targets, enumerated so a leak under this prefix has a bounded
-/// suspect list (corpus: every `.rs` file under `server/tests` containing
-/// `common::setup_test_db`, swept untruncated with `rg --no-ignore --hidden`):
-/// `blob_quota_race`, `bootstrap_reset_group`,
-/// `commit_group_change_health_counters`, `create_convo_collision`,
-/// `durable_outbox_test`, `group_info_epoch_cas`, `metadata_blob_retention`,
-/// `per_device_routing_helpers`, `phase_2_5_indirect_funneling`,
-/// `quorum_reset_threshold`, `reset_reminder_worker`, `sequencer_transfer_cas`,
+/// suspect list (corpus: every `.rs` file under `server/tests` naming
+/// `common::setup_test_db` or this constant): `blob_quota_race`,
+/// `clean_chat_empty_preflight`, `commit_group_change_health_counters`,
+/// `durable_outbox_test`, `group_info_epoch_cas`,
+/// `phase_2_5_indirect_funneling`, `quorum_reset_threshold`,
+/// `reset_reminder_worker`, `sequencer_transfer_cas`,
 /// `sweep_finds_stale_convos`, `system_reset_actor`.
 pub const SHARED_LEGACY_DB_PREFIX: &str = "mlsds_shared_";
 
@@ -244,30 +275,52 @@ impl Drop for DisposableDatabase {
         let name = self.name.clone();
         // Own thread + runtime so teardown runs during panic unwind too.
         let _ = std::thread::spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            else {
-                return;
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!(
+                        "disposable-database reaper failed to build tokio runtime for {name}: {error}"
+                    );
+                    return;
+                }
             };
             runtime.block_on(async move {
-                let Ok(admin) = PgPoolOptions::new()
+                let admin = match PgPoolOptions::new()
                     .max_connections(1)
                     .connect(&maintenance_url)
                     .await
-                else {
-                    return;
+                {
+                    Ok(admin) => admin,
+                    Err(error) => {
+                        eprintln!(
+                            "disposable-database reaper failed to connect to maintenance db for {name}: {error}"
+                        );
+                        return;
+                    }
                 };
-                let _ = sqlx::query(
+                if let Err(error) = sqlx::query(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
                      WHERE datname = $1 AND pid <> pg_backend_pid()",
                 )
                 .bind(&name)
                 .execute(&admin)
-                .await;
-                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
+                .await
+                {
+                    eprintln!(
+                        "disposable-database reaper failed to terminate connections for {name}: {error}"
+                    );
+                }
+                if let Err(error) = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
                     .execute(&admin)
-                    .await;
+                    .await
+                {
+                    eprintln!(
+                        "disposable-database reaper failed to drop database {name}: {error}"
+                    );
+                }
             });
         })
         .join();
@@ -283,6 +336,7 @@ impl Drop for DisposableDatabase {
 /// returned database is fully migrated, so a later `db::init_db` against its
 /// URL finds nothing to apply.
 pub async fn fresh_fully_migrated_db(prefix: &str) -> DisposableDatabase {
+    let _migration_guard = acquire_migration_lock().await;
     let database = DisposableDatabase::mint(prefix).await;
     let pool = database.connect(1).await;
     let mut migration_connection = pool
@@ -354,21 +408,14 @@ pub async fn fresh_legacy_pool(
     (pool, database)
 }
 
-/// Mint a disposable database carrying exactly the reviewed clean-protocol
-/// schema, and return a pool onto it.
-///
-/// Uses the same reviewed migrator factory the shared fixed-target helper uses,
-/// so the installed schema is the reviewed 13 and nothing else — the property
-/// the shared database's ledger gate enforces, obtained here without depending
-/// on the shared database.
+/// Mint a disposable database carrying the full migration catalog with the
+/// reviewed clean-protocol ledger, and return a pool onto it.
 pub async fn fresh_clean_protocol_db(
     prefix: &str,
     max_connections: u32,
 ) -> (PgPool, DisposableDatabase) {
+    let _migration_guard = acquire_migration_lock().await;
     let database = DisposableDatabase::mint(prefix).await;
-    let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
-        .await
-        .expect("validate the exact reviewed clean-protocol migration manifest");
     let pool = database.connect(max_connections).await;
     let mut migration_connection = pool
         .acquire()
@@ -381,15 +428,132 @@ pub async fn fresh_clean_protocol_db(
     .execute(&mut *migration_connection)
     .await
     .expect("authorize operation-claim activation on the migration connection");
-    let migration_result = migrator.run_direct(&mut *migration_connection).await;
+    let full_migrator = sqlx::migrate!("./migrations");
+    let migration_result = full_migrator.run_direct(&mut *migration_connection).await;
     sqlx::query("RESET chat.operation_claim_activation_approved")
         .execute(&mut *migration_connection)
         .await
         .expect("reset operation-claim activation approval on the migration connection");
+    migration_result.expect("install the full migration catalog on the disposable database");
+
+    // Reduce public._sqlx_migrations to the exact reviewed entries
+    let versions: Vec<i64> = crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
+        .iter()
+        .map(|entry| entry.migration.version)
+        .collect();
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE NOT (version = ANY($1))")
+        .bind(&versions)
+        .execute(&mut *migration_connection)
+        .await
+        .expect("reduce _sqlx_migrations to exact reviewed manifest entries");
+
     migration_connection
         .close()
         .await
         .expect("close the disposable migration connection");
-    migration_result.expect("install the reviewed exact-13 schema on the disposable database");
+
     (pool, database)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with database creation privileges"]
+    async fn fresh_clean_protocol_db_reproduces_exact_empty_catalog_and_reviewed_ledger() {
+        let (pool, _disposable) = fresh_clean_protocol_db("chat_freshdb_", 2).await;
+
+        // 1. Proves tables exist
+        let tables_exist: bool = sqlx::query_scalar(
+            "SELECT (to_regclass('chat.conversations') IS NOT NULL) \
+             AND (to_regclass('chat.entries') IS NOT NULL) \
+             AND (to_regclass('chat.devices') IS NOT NULL) \
+             AND (to_regclass('chat.operation_claims') IS NOT NULL) \
+             AND (to_regclass('public.federation_outbox') IS NOT NULL)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("check tables exist");
+        assert!(tables_exist, "required clean-protocol tables must exist");
+
+        // 2. Ledger matches reviewed manifest
+        let ledger_rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, description, success, checksum \
+             FROM public._sqlx_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read migration ledger");
+        assert_eq!(
+            ledger_rows.len(),
+            crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len(),
+            "migration ledger must contain exact reviewed manifest entries"
+        );
+        for (entry, row) in crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST
+            .iter()
+            .zip(ledger_rows.iter())
+        {
+            assert_eq!(row.0, entry.migration.version, "version matches");
+            assert_eq!(
+                &row.1,
+                entry.migration.description.as_ref(),
+                "description matches"
+            );
+            assert!(row.2, "migration succeeded");
+            assert_eq!(
+                &row.3,
+                entry.migration.checksum.as_ref(),
+                "checksum matches"
+            );
+        }
+
+        // 3. All semantic rows empty
+        for table in [
+            "chat.conversations",
+            "chat.entries",
+            "chat.transitions",
+            "chat.devices",
+            "chat.device_keys",
+            "chat.principals",
+            "chat.operation_claims",
+            "chat.welcome_bundles",
+            "chat.blobs",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|err| panic!("count on {table}: {err}"));
+            assert_eq!(count, 0, "semantic table {table} must be empty");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires TEST_DATABASE_URL with database creation privileges"]
+    async fn concurrent_disposable_database_mint_and_migration_does_not_race() {
+        let handles = (0..6)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let prefix = if i % 2 == 0 {
+                        "chat_fedoutbox_"
+                    } else {
+                        "chat_freshdb_"
+                    };
+                    let (pool, _disposable) = fresh_clean_protocol_db(prefix, 2).await;
+                    let count: i64 =
+                        sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations")
+                            .fetch_one(&pool)
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        count as usize,
+                        crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len()
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.await.expect("task completed without panic");
+        }
+    }
 }

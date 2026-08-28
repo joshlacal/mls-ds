@@ -209,6 +209,12 @@ pub struct FetchKeyPackageParams {
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use crate::db::{init_db, DbConfig};
     use chrono::{Duration, Utc};
@@ -224,18 +230,8 @@ mod tests {
 
     const CIPHER_SUITE: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
 
-    async fn setup_test_db() -> DbPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-        init_db(DbConfig {
-            database_url,
-            max_connections: 8,
-            min_connections: 2,
-            acquire_timeout: std::time::Duration::from_secs(10),
-            idle_timeout: std::time::Duration::from_secs(60),
-        })
-        .await
-        .expect("initialize test database")
+    async fn setup_test_db() -> (DbPool, fresh_db::DisposableDatabase) {
+        fresh_db::fresh_legacy_pool("ds_fetchkp_", 8, 2).await
     }
 
     fn generate_key_package(identity: &str) -> (Vec<u8>, Vec<u8>) {
@@ -337,7 +333,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn federation_fetch_skips_and_quarantines_legacy_or_stale_regular_row() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2regular{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
 
@@ -373,7 +369,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn production_fetch_loop_reresolves_authority_after_quarantining_candidate() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2resolveagain{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
 
@@ -409,7 +405,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn incomplete_authority_does_not_quarantine_candidate() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2incomplete{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
 
@@ -454,7 +450,7 @@ mod tests {
     async fn assert_candidate_expiring_during_device_validation_is_never_returned(
         last_resort: bool,
     ) {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let kind = if last_resort { "lastresort" } else { "regular" };
         let did = format!("did:plc:w2nearexpiry{kind}{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
@@ -560,7 +556,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn federation_fetch_revalidates_reusable_last_resort_rows() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2lastresort{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
 
@@ -590,7 +586,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn concurrent_authorized_regular_fetch_has_exactly_one_winner() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2race{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
         let (bytes, key) = generate_key_package(&did);
@@ -636,7 +632,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn concurrent_regular_fetches_quarantine_invalid_rows_and_keep_one_winner() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2invalidrace{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
         for device_id in ["legacy-a", "legacy-b"] {
@@ -690,7 +686,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn concurrent_authorized_last_resort_fetches_both_reuse_the_row() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2lrrace{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
         let (bytes, key) = generate_key_package(&did);
@@ -731,7 +727,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn last_resort_fetch_waits_for_concurrent_reuse_instead_of_skipping() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2lrlock{}", Uuid::new_v4().simple());
         seed_user(&pool, &did).await;
         let (bytes, key) = generate_key_package(&did);

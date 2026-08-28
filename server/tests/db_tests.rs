@@ -162,6 +162,40 @@ fn integration_test_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+fn src_rust_sources() -> Vec<(String, String)> {
+    fn walk(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(path).expect("read src source directory") {
+            let path = entry.expect("read src source entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(
+        files.len() > 30,
+        "src sweep found only {} files — the corpus is not being walked",
+        files.len()
+    );
+    files
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&root)
+                .expect("source under src/")
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", relative));
+            (relative, source)
+        })
+        .collect()
+}
+
 /// True for a line that is entirely a `//`, `///` or `//!` comment.
 ///
 /// Deliberately does not model block comments: there are none carrying a
@@ -198,6 +232,7 @@ fn init_db_is_only_reachable_from_targets_that_mint_their_own_database() {
     const APPROVED_INIT_DB_CALLERS: &[&str] = &[
         "common/fresh_db.rs",
         "db_tests.rs",
+        "chat_protocol_remote_prefix_bootstrap.rs",
         "federation_hostile_peers.rs",
         "migration_repair_smoke.rs",
     ];
@@ -321,6 +356,207 @@ fn disposable_prefixes_are_disjoint_and_exclude_the_executor_namespace() {
         );
         assert_ne!(
             *outer, "chat_exec_",
+            "the executor harness namespace must never be reservable here"
+        );
+        for (j, inner) in prefixes.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            assert!(
+                !outer.starts_with(inner),
+                "{outer:?} starts with {inner:?}: a leaked database would be \
+                 attributable to two different targets"
+            );
+        }
+    }
+}
+
+#[test]
+fn inline_src_tests_do_not_run_unisolated_migrations_from_test_database_url() {
+    let src_sources = src_rust_sources();
+    let mut offenders: Vec<String> = Vec::new();
+
+    let migrate_run = ["migrate", "!", "(", ")", ".run"].concat();
+    let migrate_run_explicit = ["migrate", "!", "(\"./migrations\").run"].concat();
+    let init_db_call = ["init_db", "("].concat();
+    let fresh_db_needle = ["fresh_db", "::"].concat();
+
+    for (relative, source) in &src_sources {
+        if relative.starts_with("test_support") {
+            continue;
+        }
+
+        let lines: Vec<&str> = source.lines().collect();
+        let mut in_test_module = false;
+
+        for (index, line) in lines.iter().enumerate() {
+            if is_line_comment(line) {
+                continue;
+            }
+            if line.contains("#[cfg(test)]")
+                || line.contains("mod tests")
+                || line.contains("mod outbox_db_tests")
+                || line.contains("mod self_heal_db_tests")
+                || line.contains("mod transition_repository_tests")
+            {
+                in_test_module = true;
+            }
+
+            if in_test_module {
+                if line.contains(&migrate_run) || line.contains(&migrate_run_explicit) {
+                    offenders.push(format!(
+                        "{relative}:{} runs inline migration without isolation harness",
+                        index + 1
+                    ));
+                }
+                if line.contains(&init_db_call) && !source.contains(&fresh_db_needle) {
+                    offenders.push(format!(
+                        "{relative}:{} calls init_db in tests without minting a disposable database",
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "inline src test sources run unisolated migrations: {offenders:?}. Use crate::test_support::fresh_db instead."
+    );
+}
+
+#[test]
+fn no_src_test_source_defaults_a_database_connection_to_a_hardcoded_name() {
+    let schemes = [["postgres", "://"].concat(), ["postgresql", "://"].concat()];
+    let fallback = ["unwrap_or", ""].concat();
+
+    let sources = src_rust_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    for (relative, source) in &sources {
+        if relative == "db.rs" {
+            let lines: Vec<&str> = source.lines().collect();
+            let mut in_tests = false;
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains("#[cfg(test)]") {
+                    in_tests = true;
+                }
+                if in_tests
+                    && !is_line_comment(line)
+                    && schemes.iter().any(|scheme| line.contains(scheme))
+                {
+                    let window = lines[index.saturating_sub(2)..=index].join("\n");
+                    if window.contains(&fallback) {
+                        offenders.push(format!("{relative}:{}", index + 1));
+                    }
+                }
+            }
+            continue;
+        }
+
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if is_line_comment(line) || !schemes.iter().any(|scheme| line.contains(scheme)) {
+                continue;
+            }
+            let window = lines[index.saturating_sub(2)..=index].join("\n");
+            if window.contains(&fallback) {
+                offenders.push(format!("{relative}:{}", index + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "src test sources default a database connection to a hardcoded name: \
+         {offenders:?}. A test must never adopt a database it did not create — \
+         mint one via crate::test_support::fresh_db instead."
+    );
+}
+
+#[test]
+fn no_src_test_adopts_connection_directly_from_test_database_url() {
+    let src_sources = src_rust_sources();
+    let mut offenders: Vec<String> = Vec::new();
+    let test_db_env = ["TEST_DATABASE", "_URL"].concat();
+
+    for (relative, source) in &src_sources {
+        if relative.starts_with("test_support") {
+            continue;
+        }
+
+        let lines: Vec<&str> = source.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if is_line_comment(line) || !line.contains(&test_db_env) {
+                continue;
+            }
+
+            // Exclude harmless S3 bucket naming suffix reads in blob_store.rs
+            if relative == "blob_store.rs"
+                && (line.contains(".rsplit('/')") || line.contains(".ok()"))
+            {
+                continue;
+            }
+
+            // Also exclude comment doc lines or ignore reasons like `#[ignore = "..."]`
+            if line.contains("#[ignore") {
+                continue;
+            }
+
+            // Check if this is a connection/migration adoption
+            let window = lines[index..=index.saturating_add(5).min(lines.len() - 1)].join("\n");
+            if window.contains("connect")
+                || window.contains("PgPool")
+                || window.contains("migrate")
+                || window.contains("init_db")
+            {
+                offenders.push(format!("{relative}:{}", index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "src tests adopt connections directly from TEST_DATABASE_URL: {offenders:?}. Use crate::test_support::fresh_db instead."
+    );
+}
+
+#[test]
+fn src_disposable_prefixes_are_disjoint() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let content = std::fs::read_to_string(manifest_dir.join("src/test_support/fresh_db.rs"))
+        .expect("read fresh_db.rs");
+    let mut prefixes = Vec::new();
+    let mut in_prefixes = false;
+    for line in content.lines() {
+        if line.contains("pub const DISPOSABLE_PREFIXES") {
+            in_prefixes = true;
+            continue;
+        }
+        if in_prefixes {
+            if line.contains("];") {
+                break;
+            }
+            let trimmed = line
+                .trim()
+                .trim_matches('"')
+                .trim_matches(',')
+                .trim_matches('"');
+            if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                prefixes.push(trimmed.to_string());
+            }
+        }
+    }
+    assert!(
+        !prefixes.is_empty(),
+        "no disposable prefixes found in src fresh_db.rs"
+    );
+    for (i, outer) in prefixes.iter().enumerate() {
+        assert!(
+            outer.ends_with('_'),
+            "{outer:?} must end with '_' so a prefix cannot run into a hex suffix"
+        );
+        assert_ne!(
+            outer.as_str(),
+            "chat_exec_",
             "the executor harness namespace must never be reservable here"
         );
         for (j, inner) in prefixes.iter().enumerate() {

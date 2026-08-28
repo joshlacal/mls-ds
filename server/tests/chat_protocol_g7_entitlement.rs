@@ -23,6 +23,7 @@
 
 #[allow(dead_code)]
 mod common;
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
 
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/cursor.rs"]
@@ -35,7 +36,9 @@ mod model;
 mod relationship_policy_source;
 #[allow(unused_imports)]
 mod repository {
-    pub use crate::chat_protocol::repository::{auth, blobs, inventory, key_packages, prelude};
+    pub use crate::chat_protocol::repository::{
+        auth, blobs, core, inventory, key_packages, prelude, relationship,
+    };
 }
 #[allow(dead_code)]
 mod snapshot {
@@ -55,6 +58,13 @@ mod chat_protocol {
     pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
     pub mod cursor {
         pub use crate::cursor::*;
+    }
+    pub mod federation_routing {
+        #![allow(dead_code)]
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/federation_routing.rs"
+        ));
     }
     pub mod model {
         pub use crate::model::*;
@@ -289,7 +299,7 @@ mod chat_protocol {
                 row_did.into_boxed_str(),
                 row_device,
                 status.into_boxed_str(),
-                jkt.into_boxed_str(),
+                Some(jkt.into_boxed_str()),
                 generation,
                 key_id.into_boxed_str(),
                 signing_sha,
@@ -324,7 +334,7 @@ mod chat_protocol {
                 did.to_owned().into_boxed_str(),
                 device_id,
                 device_status.to_owned().into_boxed_str(),
-                textual_jkt.to_owned().into_boxed_str(),
+                Some(textual_jkt.to_owned().into_boxed_str()),
                 auth_generation,
                 key_id.to_owned().into_boxed_str(),
                 signing_public_key_sha256,
@@ -1656,6 +1666,196 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/relationship.rs"
             ));
         }
+        #[allow(dead_code)]
+        pub mod acceptance {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/acceptance.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod creation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/creation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod leave {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/leave.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod reset {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/reset.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod revocation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/revocation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod submit_transition {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/submit_transition.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod subscription {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/subscription.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod message_delivery {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/message_delivery.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod entry_read {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/entry_read.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod coordinate {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/coordinate.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod remote_prefix {
+            use uuid::Uuid;
+            #[derive(Debug)]
+            pub struct HistoricalWriteWitness {
+                pub(crate) _sealed: (),
+            }
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            pub enum BootstrapLocalIdLabel {
+                ParticipantPeriod,
+                LeafPeriod,
+                MetadataSnapshot,
+            }
+            impl BootstrapLocalIdLabel {
+                pub fn as_str(&self) -> &'static str {
+                    match self {
+                        Self::ParticipantPeriod => "participant-period",
+                        Self::LeafPeriod => "leaf-period",
+                        Self::MetadataSnapshot => "metadata-snapshot",
+                    }
+                }
+            }
+
+            pub fn derive_bootstrap_local_id(
+                conversation_id: Uuid,
+                source_entry_id: Uuid,
+                label: BootstrapLocalIdLabel,
+                entity_key: &[u8],
+            ) -> Uuid {
+                catbird_server::chat_protocol::derive_bootstrap_local_id_for_test(
+                    conversation_id,
+                    source_entry_id,
+                    label.as_str(),
+                    entity_key,
+                )
+            }
+        }
+        #[allow(dead_code)]
+        pub mod conversation {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/conversation.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod expiry_sweep {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/expiry_sweep.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod device_directory {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/device_directory.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod welcome {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/chat_protocol/repository/welcome.rs"
+            ));
+        }
+        #[allow(dead_code)]
+        pub mod federation {
+            use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+            use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+            use jacquard_common::DefaultStr;
+            use uuid::Uuid;
+
+            #[allow(clippy::too_many_arguments)]
+            pub async fn enqueue_federated_welcome_job(
+                _transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _target_ds_did: &str,
+                _recipient_did_str: &str,
+                _recipient_device_id: Uuid,
+                _welcome_id: Uuid,
+                _recovery_request_id: Uuid,
+                _reserved_ref: &[u8; 32],
+                _opaque_welcome: &[u8],
+                _sha256: &[u8; 32],
+                _append: &super::delivery::AppendEntry,
+                _seq: u64,
+                _coordinates: ConversationCoordinates,
+                _pub_snap_sha: &[u8; 32],
+                _tree_sum_sha: &[u8; 32],
+                _sequencer_term: u64,
+            ) -> Result<Uuid, super::super::state_machine::ExecutorError> {
+                Ok(Uuid::nil())
+            }
+
+            pub async fn enqueue_clean_federation_message_jobs(
+                _tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+                _conversation_id: Uuid,
+                _entry: &super::delivery::AppendEntry,
+                _seq: u64,
+                _sequencer_term: u64,
+            ) -> Result<usize, catbird_server::federation::errors::FederationError> {
+                Ok(0)
+            }
+
+            pub fn build_federated_commit_envelope(
+                _conversation_id: Uuid,
+                _transition_id: Uuid,
+                _sequencer_ds_did: &str,
+                _signed_request_bytes: &[u8],
+                _sequencer_term: u64,
+                _received_at: &crate::chat_protocol::validation::CanonicalTimestamp,
+            ) -> Result<SubmitCommit<DefaultStr>, catbird_server::federation::errors::FederationError>
+            {
+                Err(
+                    catbird_server::federation::errors::FederationError::InvalidEnvelope {
+                        reason: "test stub".to_string(),
+                    },
+                )
+            }
+        }
     }
     pub mod state_machine {
         #![allow(dead_code)]
@@ -1836,18 +2036,22 @@ async fn production_hydrated_genuine_creation_round_trips_locked_aggregate() {
 // consumed the row through activation without re-parsing the request. The
 // fixture now signs `idempotencyKey: request_id`, which is what production
 // requires; every suite that consumes the seed is unchanged by it.
+// Re-pinned for the OpenMLS 0.9 clean cutover: the helper now consumes the
+// sealed v0.9 corpus and mints only routing- and lock-bound authority.
 // Re-pin only alongside a reviewed change to `tests/common/executor_seed.rs`;
 // an unexplained mismatch here still means the seed drifted.
 const FROZEN_EXECUTOR_SEED_SHA256: &str =
-    "6428038d04be0ab28bd9743cd146690dbfe8d708293739cff738ed1aa3d1b1f1";
+    "375d5ab957f5754d0f325c8999d83310ed64702782f5a29c5f7b5083e8179544";
 // Re-pinned 2026-08-15 for finding 3 fix (b): `load_reset_request_hydration_rows`
 // admits the ratified `revoked` status and selects `terminal_revocation_id`,
 // `select_reset_terminal` gained the revocation arm (and now checks the
 // revocation column on every arm, mirroring the DB shape check), and
 // `graph_digest_reset` encodes the fifth status. Taken from POST-rustfmt bytes.
+// Re-pinned for the clean cutover's fail-closed routing and locked-hydration
+// repository changes.
 // An unexplained mismatch here still means core.rs drifted.
 const SEALED_REPOSITORY_CORE_SHA256: &str =
-    "f118cc9c303cb013e20b8752a6f36edb250ec744cac39215fe52212fc5b74258";
+    "420ad7d9c040bb33be7a411de14a1eeed47b8f26b8de3cc9e32be0122edb24a5";
 
 #[test]
 fn frozen_executor_seed_helper_is_byte_identical_to_the_sealed_baseline() {
@@ -2258,7 +2462,12 @@ async fn production_subscription_ticket_mint_decodes_and_consumes_once() {
             .await
             .expect("sample database clock");
     let expires_at = now + chrono::Duration::minutes(10);
-    let session_id = Uuid::new_v4();
+    let session_id = chat_protocol::repository::inventory::derive_inventory_session_uuid(
+        B_AUTH_DID,
+        Uuid::parse_str(B_AUTH_DEVICE).unwrap(),
+        Some(B_AUTH_JKT),
+        1,
+    );
     let (protocol_instance_id, cursor_key_id, retained_floor, event_position): (
         Uuid,
         String,
@@ -2304,7 +2513,7 @@ async fn production_subscription_ticket_mint_decodes_and_consumes_once() {
     )
     .expect("bind sealed snapshot cursor");
     let sealed = sealer
-        .seal_successor(capability.as_bytes(), &binding, &mut TicketSealRandom(0x33))
+        .seal_successor(&capability_bytes, &binding, &mut TicketSealRandom(0x33))
         .expect("seal snapshot cursor");
     let empty_hash: [u8; 32] = Sha256::digest([]).into();
     sqlx::query(
@@ -2344,7 +2553,7 @@ async fn production_subscription_ticket_mint_decodes_and_consumes_once() {
         chat_protocol::repository::ticket::mint_subscription_ticket_for_admission(
             &pool,
             admission,
-            session_id,
+            &capability,
             &capability,
             &sealer,
         )
@@ -2534,10 +2743,8 @@ fn declaration_with_attributes<'a>(source: &'a str, item: &str) -> &'a str {
 const B_AUTH_SEAL_ORDERED_REJECTIONS: &[&str] = &[
     "if request.mutation().is_some()",
     "ReadAdmissionBindingError::OperationShape",
-    "pre_replay.enrollment.is_some()",
-    "pre_replay.enrollment_body.is_some()",
-    "pre_replay.rebind.is_some()",
-    "pre_replay.auth_transaction_replay.is_some()",
+    "pre_replay.enrollment_body().is_some()",
+    "pre_replay.auth_transaction_replay().is_some()",
     "ReadAdmissionBindingError::OperationShape",
     "receipt.class() != RepositoryAuthorityClass::ExistingDevice",
     "ReadAdmissionBindingError::AuthorityClass",
@@ -2551,9 +2758,10 @@ const B_AUTH_SEAL_ORDERED_REJECTIONS: &[&str] = &[
     "coordinates.did != pre_replay.subject().as_str()",
     "coordinates.device_id.as_bytes() != pre_replay.device_id().as_bytes()",
     "ReadAdmissionBindingError::RequesterCoordinates",
-    "coordinates.textual_jkt != pre_replay.dpop_jkt().as_str()",
+    "let locked_jkt_digest = if let Some(jkt) = pre_replay.dpop_jkt()",
+    "coordinates.textual_jkt != Some(jkt.as_str())",
     "ReadAdmissionBindingError::Thumbprint",
-    "decode_canonical_thumbprint_digest(coordinates.textual_jkt)",
+    "decode_canonical_thumbprint_digest(jkt.as_str())",
     "coordinates.auth_generation <= 0",
     "ReadAdmissionBindingError::Generation",
 ];
@@ -2572,7 +2780,9 @@ const B_AUTH_VERIFIER_ORDERED_REJECTIONS: &[&str] = &[
     "ReadAdmissionBindingError::KeyRevoked",
     "if &*row.did != binding.locked_did.as_str() || row.device_id != binding.locked_device_id",
     "ReadAdmissionBindingError::RequesterCoordinates",
-    "if decode_canonical_thumbprint_digest(&row.textual_jkt)? != binding.locked_jkt_digest",
+    "if let Some(expected_digest) = binding.locked_jkt_digest",
+    ".ok_or(ReadAdmissionBindingError::Thumbprint)?",
+    "if decode_canonical_thumbprint_digest(textual)? != expected_digest",
     "ReadAdmissionBindingError::Thumbprint",
     "if row.auth_generation <= 0 || row.auth_generation != binding.locked_auth_generation",
     "ReadAdmissionBindingError::Generation",
@@ -3355,12 +3565,12 @@ fn b_auth_get_own_devices_budget_mints_fixed_three_attempts() {
 const B_AUTH_G7_SELF_SOURCE: &str = include_str!("chat_protocol_g7_entitlement.rs");
 
 // ---------------------------------------------------------------------------
-// 8. Nonignored source/compile: privacy, call graph, and the exact thirteen.
+// 8. Nonignored source/compile: privacy, call graph, and the exact nine.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn b_auth_read_authority_privacy_and_call_graph_guards() {
-    // === THE EXACT THIRTEEN MUTATION-GETTER CALLSITES =====================
+    // === THE EXACT NINE MUTATION-GETTER CALLSITES =========================
     //
     // PREDICATE: occurrences of the 24-byte fixed string
     // `locked_auth_generation()` — the identifier followed by an EMPTY argument
@@ -3373,8 +3583,8 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     }
     let total: usize = per_file.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 13,
-        "exactly thirteen pre-existing mutation-only callsites; found {per_file:?}"
+        total, 9,
+        "exactly nine mutation-only callsites remain after legacy teardown; found {per_file:?}"
     );
     assert_eq!(
         per_file
@@ -3382,8 +3592,8 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
             .find(|(name, _)| *name == "repository/auth.rs")
             .expect("auth.rs is in the search set")
             .1,
-        11,
-        "eleven successor containing functions in auth.rs"
+        7,
+        "seven clean mutation functions in auth.rs"
     );
     assert_eq!(
         per_file
@@ -4355,12 +4565,12 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     assert_eq!(
         hex::encode(Sha256::digest(B_AUTH_DEVICE_DIRECTORY_SOURCE.as_bytes())),
         B_AUTH_DEVICE_DIRECTORY_SHA256,
-        "device_directory.rs is read-only through Stage B"
+        "device_directory.rs matches the reviewed clean-cutover surface"
     );
     assert_eq!(
         hex::encode(Sha256::digest(B_AUTH_DEVICE_VIEWS_SOURCE.as_bytes())),
         B_AUTH_DEVICE_VIEWS_SHA256,
-        "device_views.rs is read-only through Stage B"
+        "device_views.rs matches the reviewed clean-cutover surface"
     );
     assert_eq!(
         hex::encode(Sha256::digest(include_bytes!("common/executor_seed.rs"))),
@@ -4369,11 +4579,11 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
     );
 }
 
-/// Lane-P pins for the paths that stay byte-identical through Stage B.
+/// Clean-cutover pins after removing the legacy device-directory and view APIs.
 const B_AUTH_DEVICE_DIRECTORY_SHA256: &str =
-    "0e0933e7a20bc5abf5744b2e322fde0d7ac55677ce6bddb87c350665cb35be36";
+    "e7118078b3490d4483f37bf7b7506914ec6dfd7595a2d8974c0798b0d2231ec7";
 const B_AUTH_DEVICE_VIEWS_SHA256: &str =
-    "aa154f2dd7043cb15b05a6293228ae866929cde78ace6ced468984e6777959a0";
+    "12a2bbe6eb78dd459880b8e314b648b353ce0ea4c64101a5bc9fe992c6af708d";
 
 // ---------------------------------------------------------------------------
 // 4-7. Ignored Tokio database cases, class `commit-write`. Task B6 runs these.
@@ -8126,6 +8336,8 @@ fn c1_2_active_conversation_state_projects_complete_dto() {
         vec![c1_2_leaf_a()],
         c1_2_metadata_snapshot(),
         vec![c1_2_participant_a()],
+        C1_2_DID_A,
+        0,
         42,
     )
     .expect("active checked state source");
@@ -8225,6 +8437,8 @@ fn c1_2_group_pending_and_zero_leaf_states_project_complete_dtos() {
         vec![c1_2_leaf_a()],
         c1_2_metadata_snapshot(),
         vec![c1_2_participant_a(), c1_2_participant_b_pending()],
+        C1_2_DID_A,
+        0,
         5,
     )
     .expect("group-pending checked state source");
@@ -8259,6 +8473,8 @@ fn c1_2_group_pending_and_zero_leaf_states_project_complete_dtos() {
             CheckedParticipantView::new(C1_2_DID_A, "admin", "active", 0, None)
                 .expect("active zero-leaf participant is checked"),
         ],
+        C1_2_DID_A,
+        0,
         0,
     )
     .expect("zero-leaf checked state source");
@@ -8716,6 +8932,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![],
         c1_2_metadata_snapshot(),
         vec![],
+        C1_2_DID_A,
+        0,
         0,
     )
     .err()
@@ -8728,6 +8946,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![],
         c1_2_metadata_snapshot(),
         vec![],
+        C1_2_DID_A,
+        0,
         0,
     )
     .err()
@@ -8762,6 +8982,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![],
         c1_2_metadata_snapshot(),
         vec![],
+        C1_2_DID_A,
+        0,
         -1,
     )
     .err()
@@ -8830,6 +9052,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![c1_2_leaf_a()],
         c1_2_metadata_snapshot(),
         vec![c1_2_participant_b_pending(), c1_2_participant_a()],
+        C1_2_DID_A,
+        0,
         1,
     )
     .err()
@@ -8842,6 +9066,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![c1_2_leaf_a(), c1_2_leaf_a()],
         c1_2_metadata_snapshot(),
         vec![c1_2_participant_a()],
+        C1_2_DID_A,
+        0,
         1,
     )
     .err()
@@ -8854,6 +9080,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         vec![c1_2_leaf_b(), c1_2_leaf_a()],
         c1_2_metadata_snapshot(),
         vec![c1_2_participant_a()],
+        C1_2_DID_A,
+        0,
         1,
     )
     .err()
@@ -9009,6 +9237,8 @@ fn c1_2_projected_dtos_encode_canonically_without_extra_data() {
             vec![c1_2_leaf_a()],
             c1_2_metadata_snapshot(),
             vec![c1_2_participant_a()],
+            C1_2_DID_A,
+            0,
             42,
         )
         .expect("active checked state source"),

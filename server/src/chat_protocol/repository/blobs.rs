@@ -1829,14 +1829,215 @@ pub(crate) async fn expire_due_blobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::delivery::{
-        close_application_interval, ApplicationIntervalClose, IntervalCloseKind,
-    };
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::super::transition::{
-        cas_registration_revoke, close_leaf_period, insert_device_revocation, LeafClose,
-        NewDeviceRevocation, RegistrationRevoke,
+        cas_registration_revoke, insert_device_revocation, NewDeviceRevocation, RegistrationRevoke,
     };
     use super::*;
+
+    /// Read one required `TEST_BLOB_*` identifier for the ignored fixtures.
+    fn required_env(variable: &str) -> String {
+        std::env::var(variable)
+            .unwrap_or_else(|_| panic!("{variable} is required for this ignored integration test"))
+    }
+
+    struct BlobFixtureArgs {
+        blob_id: Uuid,
+        caller_did: String,
+        caller_device_id: Uuid,
+        auth_generation: i64,
+        revocation_actor_device_id: Option<Uuid>,
+    }
+
+    /// Build the smallest commit-coherent application graph used by the ignored
+    /// authorization tests.
+    async fn seed_blob_fixture(pool: &PgPool, args: &BlobFixtureArgs) {
+        let mut tx = pool.begin().await.expect("begin blob fixture");
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("fixture clock");
+        let public_key = vec![0x11_u8; 32];
+        let key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+            .bind(&public_key)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("fixture key id");
+        sqlx::query("INSERT INTO chat.principals(user_did,created_at) VALUES($1,$2)")
+            .bind(&args.caller_did)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .expect("fixture principal");
+        sqlx::query(
+            "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'fixture','active',$3,$4,chat.protocol_capabilities(),$5,$5)",
+        ).bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id)
+            .bind(args.auth_generation).bind(now).execute(&mut *tx).await
+            .expect("fixture device");
+        sqlx::query(
+            "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,$5,$6)",
+        ).bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id)
+            .bind(&public_key).bind(args.auth_generation).bind(now)
+            .execute(&mut *tx).await.expect("fixture device key");
+
+        // Only the revocation-drift fixture needs a second, distinct active
+        // sibling device to act as the revoking actor.
+        if let Some(actor_device_id) = args
+            .revocation_actor_device_id
+            .filter(|device_id| *device_id != args.caller_device_id)
+        {
+            let actor_public_key = vec![0x12_u8; 32];
+            let actor_key_id: String = sqlx::query_scalar("SELECT chat.ed25519_key_id($1)")
+                .bind(&actor_public_key)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("fixture actor key id");
+            sqlx::query(
+                "INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'fixture-sibling','active',$3,$4,chat.protocol_capabilities(),$5,$5)",
+            ).bind(&args.caller_did).bind(actor_device_id).bind(&actor_key_id)
+                .bind(args.auth_generation).bind(now).execute(&mut *tx).await
+                .expect("fixture sibling device");
+            sqlx::query(
+                "INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,$5,$6)",
+            ).bind(&args.caller_did).bind(actor_device_id).bind(&actor_key_id)
+                .bind(&actor_public_key).bind(args.auth_generation).bind(now)
+                .execute(&mut *tx).await.expect("fixture sibling key");
+        }
+
+        let conversation_id = Uuid::new_v4();
+        let transition_id = Uuid::new_v4();
+        let metadata_snapshot_id = Uuid::new_v4();
+        let entry_id = Uuid::new_v4();
+        let leaf_id = Uuid::new_v4();
+        let opening_fingerprint = vec![0x21_u8; 32];
+        let group_id = vec![0x22_u8; 32];
+        let context_hash = vec![0x23_u8; 32];
+        let confirmation = vec![0x24_u8; 32];
+        let payload = vec![0x25_u8; 16];
+        let transcript = vec![0x26_u8; 8];
+        let digest = Sha256::digest(&transcript).to_vec();
+        let signature = vec![0x27_u8; 64];
+        sqlx::query("INSERT INTO chat.conversations(conversation_id,kind,lifecycle,current_generation,current_state_version,next_entry_seq,created_at) VALUES($1,'group','active',0,0,2,$2)")
+            .bind(conversation_id).bind(now).execute(&mut *tx).await.expect("fixture conversation");
+        sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,0,$2,'active',$3,$4,0,1,$5)")
+            .bind(conversation_id).bind(&group_id).bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(now)
+            .execute(&mut *tx).await.expect("fixture generation");
+        sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,next_generation,next_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'creation',$3,$4,$5,$6,'admin','active',$7,$8,$9,$10,$11,0,0,$12,1,$13)")
+            .bind(transition_id).bind(conversation_id).bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id).bind(args.auth_generation)
+            .bind(&payload).bind(&payload).bind(&transcript).bind(&digest).bind(&signature).bind(metadata_snapshot_id).bind(now)
+            .execute(&mut *tx).await.expect("fixture transition");
+        sqlx::query("INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,0,0,$2,0,$3,$4,'active','creation',$5,$6,$7,$8,$9,1,$10)")
+            .bind(conversation_id).bind(&group_id).bind(&context_hash).bind(&confirmation).bind(transition_id)
+            .bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(now)
+            .execute(&mut *tx).await.expect("fixture state");
+        sqlx::query("INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,0,0,$3,0,$4,$5,$6,$6,1,$7,$8,$9,16,$10,$11,$12,$13,$14,1,'admin','active',$15)")
+            .bind(metadata_snapshot_id).bind(conversation_id).bind(&group_id).bind(&context_hash).bind(&confirmation)
+            .bind(transition_id).bind(vec![0x28_u8; 12]).bind(&payload).bind(Sha256::digest(&payload).to_vec())
+            .bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id).bind(&public_key).bind(args.auth_generation).bind(now)
+            .execute(&mut *tx).await.expect("fixture metadata");
+        let participant_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO chat.participants(participant_period_id,conversation_id,user_did,status,role,role_transition_id,role_changed_at,created_by_did,created_by_device_id,current_membership,created_at) VALUES($1,$2,$3,'active','admin',$4,$5,$3,$6,true,$5)")
+            .bind(participant_id).bind(conversation_id).bind(&args.caller_did).bind(transition_id).bind(now).bind(args.caller_device_id)
+            .execute(&mut *tx).await.expect("fixture participant");
+        sqlx::query("INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,0,$4,$5,0,$6,$7,$8,$9,'genesis',0,$10,1,true,$11)")
+            .bind(leaf_id).bind(participant_id).bind(conversation_id).bind(&args.caller_did).bind(args.caller_device_id)
+            .bind(format!("{}#{}", args.caller_did, args.caller_device_id).into_bytes()).bind(&public_key).bind(&key_id).bind(args.auth_generation).bind(transition_id).bind(now)
+            .execute(&mut *tx).await.expect("fixture member device");
+        sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at) VALUES($1,1,$2,'blue.catbird.chat.defs#creationEntry',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,0,0,$14,$15)")
+            .bind(conversation_id).bind(entry_id).bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(&payload).bind(&digest).bind(&signature).bind(vec![0_u8]).bind(&opening_fingerprint)
+            .bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id).bind(args.auth_generation).bind(transition_id).bind(now)
+            .execute(&mut *tx).await.expect("fixture entry");
+        sqlx::query("INSERT INTO chat.application_intervals(membership_interval_id,conversation_id,generation,recipient_did,recipient_device_id,start_seq,opening_kind,opening_transition_id,opening_outer_entry_fingerprint,opening_state_version,opening_group_id,opening_epoch,opening_group_context_hash,opening_confirmation_tag,opening_leaf_period_id,created_at) VALUES($1,$2,0,$3,$4,1,'creation',$5,$6,0,$7,0,$8,$9,$10,$11)")
+            .bind(transition_id).bind(conversation_id).bind(&args.caller_did).bind(args.caller_device_id).bind(transition_id).bind(&opening_fingerprint).bind(&group_id).bind(&context_hash).bind(&confirmation).bind(leaf_id).bind(now)
+            .execute(&mut *tx).await.expect("fixture interval");
+
+        let application_message_id = Uuid::new_v4();
+        let application_seq = 2_i64;
+        sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,message_id,transition_id,received_at) VALUES($1,$2,$3,'blue.catbird.chat.defs#applicationEntry',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,0,0,$15,NULL,$16)")
+            .bind(conversation_id).bind(application_seq).bind(application_message_id).bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(&payload).bind(&digest).bind(&signature).bind(vec![0_u8]).bind(vec![0x33_u8; 32])
+            .bind(&args.caller_did).bind(args.caller_device_id).bind(&key_id).bind(args.auth_generation).bind(application_message_id).bind(now)
+            .execute(&mut *tx).await.expect("fixture application entry");
+        sqlx::query("INSERT INTO chat.message_sends(conversation_id,message_id,signed_request_bytes,signing_transcript_bytes,request_digest,signature,status,accepted_entry_seq,outcome_bytes,outcome_sha256,received_at) VALUES($1,$2,$3,$4,$5,$6,'accepted',$7,$8,$9,$10)")
+            .bind(conversation_id).bind(application_message_id).bind(&payload).bind(&transcript).bind(&digest).bind(&signature)
+            .bind(application_seq).bind(&payload).bind(Sha256::digest(&payload).to_vec()).bind(now)
+            .execute(&mut *tx).await.expect("fixture message send");
+        let plaintext_size = 8_i64;
+        let ciphertext_size = plaintext_size + AEAD_TAG_BYTES;
+        let ciphertext_hash = Sha256::digest(b"fixture-ciphertext").to_vec();
+        let ticket_hash = Sha256::digest(b"fixture-ticket").to_vec();
+        let prepared_at = now;
+        prepare_blob(
+            &mut tx,
+            &PrepareBlobRequest {
+                blob_id: args.blob_id,
+                owner_did: args.caller_did.clone(),
+                owner_device_id: args.caller_device_id,
+                owner_key_id: key_id.clone(),
+                owner_auth_generation: args.auth_generation,
+                purpose: BlobPurpose::Attachment,
+                media_type: BlobMediaType::ImagePng,
+                plaintext_size,
+                ciphertext_size,
+                ciphertext_sha256: ciphertext_hash.clone(),
+                ticket_hash: ticket_hash.clone(),
+                prepared_at,
+            },
+        )
+        .await
+        .expect("fixture prepare");
+        let uploaded_at = prepared_at + chrono::Duration::seconds(1);
+        let object_key =
+            derive_blob_cid(args.blob_id, ciphertext_hash.as_slice().try_into().unwrap());
+        complete_upload(
+            &mut tx,
+            args.blob_id,
+            &args.caller_did,
+            args.caller_device_id,
+            ciphertext_size,
+            &ticket_hash,
+            uploaded_at,
+            &object_key,
+        )
+        .await
+        .expect("fixture complete");
+        let binding = NewBlobBinding {
+            blob_id: args.blob_id,
+            binding_kind: BindingKind::Application,
+            conversation_id,
+            entry_seq: Some(application_seq),
+            message_id: Some(application_message_id),
+            metadata_origin_transition_id: None,
+            metadata_version: None,
+            owner_did: args.caller_did.clone(),
+            owner_device_id: args.caller_device_id,
+            descriptor_bytes: vec![0x31],
+            descriptor_sha256: Sha256::digest([0x31]).to_vec(),
+            aad_bytes: vec![0x32],
+            aad_sha256: Sha256::digest([0x32]).to_vec(),
+            ciphertext_sha256: ciphertext_hash,
+            plaintext_size,
+            ciphertext_size,
+            purpose: BlobPurpose::Attachment,
+            bound_at: uploaded_at,
+            uploaded_at,
+            unbound_expires_at: uploaded_at + chrono::Duration::hours(1),
+        };
+        bind_application_blob(&mut tx, &binding)
+            .await
+            .expect("fixture bind");
+        sqlx::query("UPDATE chat.conversations SET next_entry_seq = $2 WHERE conversation_id = $1")
+            .bind(conversation_id)
+            .bind(application_seq + 1)
+            .execute(&mut *tx)
+            .await
+            .expect("fixture sequence");
+        tx.commit().await.expect("commit blob fixture");
+    }
 
     fn test_fetch() -> AuthorizedBlobFetch {
         let issued_at = Utc::now();
@@ -1916,10 +2117,7 @@ mod tests {
             let fetch = Arc::clone(&fetch);
             std::thread::spawn(move || fetch.claim_once().is_ok())
         };
-        let second = {
-            let fetch = Arc::clone(&fetch);
-            std::thread::spawn(move || fetch.claim_once().is_ok())
-        };
+        let second = std::thread::spawn(move || fetch.claim_once().is_ok());
         assert_eq!(
             first.join().unwrap() as u8 + second.join().unwrap() as u8,
             1
@@ -1963,15 +2161,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL; run explicitly with cargo test -- --ignored"]
+    #[ignore = "requires local PostgreSQL; run explicitly with cargo test -- --ignored"]
     async fn top_level_authority_rolls_back_on_explicit_abort() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for this ignored integration test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+        let (pool, _db) = fresh_db::fresh_legacy_pool("chat_blobs_", 1, 1).await;
         let authority = BlobAuthorizationTransaction::begin(&pool)
             .await
             .expect("pool.begin must create the authority transaction");
@@ -1983,30 +2175,30 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL and TEST_BLOB_* seeded fixture; run explicitly with cargo test -- --ignored"]
+    #[ignore = "requires local PostgreSQL and TEST_BLOB_* identifiers; run explicitly with cargo test -- --ignored"]
     async fn authorize_commit_consume_is_one_fresh_repository_flow() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for this ignored integration test");
-        let blob_id = std::env::var("TEST_BLOB_ID")
-            .expect("TEST_BLOB_ID is required for this ignored integration test");
-        let caller_did = std::env::var("TEST_BLOB_CALLER_DID")
-            .expect("TEST_BLOB_CALLER_DID is required for this ignored integration test");
-        let caller_device_id = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
-            .expect("TEST_BLOB_CALLER_DEVICE_ID is required for this ignored integration test");
-        let auth_generation = std::env::var("TEST_BLOB_AUTH_GENERATION")
-            .expect("TEST_BLOB_AUTH_GENERATION is required for this ignored integration test");
-        let blob_id: Uuid = blob_id.parse().expect("TEST_BLOB_ID must be a UUID");
-        let caller_device_id: Uuid = caller_device_id
+        let blob_id: Uuid = required_env("TEST_BLOB_ID")
+            .parse()
+            .expect("TEST_BLOB_ID must be a UUID");
+        let caller_did = required_env("TEST_BLOB_CALLER_DID");
+        let caller_device_id: Uuid = required_env("TEST_BLOB_CALLER_DEVICE_ID")
             .parse()
             .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
-        let auth_generation: i64 = auth_generation
+        let auth_generation: i64 = required_env("TEST_BLOB_AUTH_GENERATION")
             .parse()
             .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+        let (pool, _db) = fresh_db::fresh_legacy_pool("chat_blobs_", 4, 1).await;
+        seed_blob_fixture(
+            &pool,
+            &BlobFixtureArgs {
+                blob_id,
+                caller_did: caller_did.clone(),
+                caller_device_id,
+                auth_generation,
+                revocation_actor_device_id: None,
+            },
+        )
+        .await;
         let authority = BlobAuthorizationTransaction::begin(&pool)
             .await
             .expect("begin top-level authority transaction");
@@ -2032,184 +2224,37 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL, TEST_BLOB_* seeded application fixture, and TEST_BLOB_CLOSE_* canonical interval proof; run explicitly with cargo test -- --ignored"]
-    async fn seeded_post_authorization_interval_closure_denies_consumption() {
-        for variable in [
-            "TEST_DATABASE_URL",
-            "TEST_BLOB_ID",
-            "TEST_BLOB_CALLER_DID",
-            "TEST_BLOB_CALLER_DEVICE_ID",
-            "TEST_BLOB_AUTH_GENERATION",
-            "TEST_BLOB_CLOSE_INTERVAL_ID",
-            "TEST_BLOB_CLOSE_TERMINAL_SEQ",
-            "TEST_BLOB_CLOSE_STATE_VERSION",
-            "TEST_BLOB_CLOSE_TRANSITION_ID",
-            "TEST_BLOB_CLOSE_FINGERPRINT_HEX",
-            "TEST_BLOB_CLOSE_LEAF_PERIOD_ID",
-        ] {
-            assert!(
-                std::env::var(variable).is_ok(),
-                "{variable} is required for this ignored seeded interval-drift test"
-            );
-        }
-        let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
-        let blob_id: Uuid = std::env::var("TEST_BLOB_ID")
-            .unwrap()
-            .parse()
-            .expect("TEST_BLOB_ID must be a UUID");
-        let caller_did = std::env::var("TEST_BLOB_CALLER_DID").unwrap();
-        let caller_device_id: Uuid = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
-            .unwrap()
-            .parse()
-            .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
-        let auth_generation: i64 = std::env::var("TEST_BLOB_AUTH_GENERATION")
-            .unwrap()
-            .parse()
-            .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
-
-        let authority = BlobAuthorizationTransaction::begin(&pool)
-            .await
-            .expect("begin top-level authority transaction");
-        let authorization = authorize_blob_read(
-            authority,
-            &AuthorizeBlobReadRequest {
-                blob_id,
-                caller_did,
-                caller_device_id,
-                auth_generation,
-            },
-        )
-        .await
-        .expect("seeded application fixture must authorize before drift")
-        .publicize()
-        .await
-        .expect("authorization must be minted only after commit");
-
-        // Close through the repository's canonical interval CAS, carrying the
-        // exact signed close proof from the seeded fixture. This is the real
-        // member-removal/application-interval lifecycle edge; direct UPDATEs
-        // are intentionally not accepted by the production schema triggers.
-        let mut transaction = pool.begin().await.expect("begin interval close");
-        let removed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()::timestamptz")
-            .fetch_one(&mut *transaction)
-            .await
-            .expect("database clock for canonical interval close");
-        close_application_interval(
-            &mut transaction,
-            &ApplicationIntervalClose {
-                membership_interval_id: std::env::var("TEST_BLOB_CLOSE_INTERVAL_ID")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_INTERVAL_ID must be a UUID"),
-                terminal_seq: std::env::var("TEST_BLOB_CLOSE_TERMINAL_SEQ")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_TERMINAL_SEQ must be an integer"),
-                closing_state_version: std::env::var("TEST_BLOB_CLOSE_STATE_VERSION")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_STATE_VERSION must be an integer"),
-                closing_transition_id: std::env::var("TEST_BLOB_CLOSE_TRANSITION_ID")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_TRANSITION_ID must be a UUID"),
-                closing_outer_entry_fingerprint: hex::decode(
-                    std::env::var("TEST_BLOB_CLOSE_FINGERPRINT_HEX").unwrap(),
-                )
-                .expect("TEST_BLOB_CLOSE_FINGERPRINT_HEX must be hex"),
-                closing_kind: IntervalCloseKind::Remove,
-                closing_leaf_period_id: std::env::var("TEST_BLOB_CLOSE_LEAF_PERIOD_ID")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_LEAF_PERIOD_ID must be a UUID"),
-                removed_at,
-            },
-        )
-        .await
-        .expect("seeded canonical interval close must commit");
-        close_leaf_period(
-            &mut transaction,
-            &LeafClose {
-                leaf_period_id: std::env::var("TEST_BLOB_CLOSE_LEAF_PERIOD_ID")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_LEAF_PERIOD_ID must be a UUID"),
-                removed_state_version: std::env::var("TEST_BLOB_CLOSE_STATE_VERSION")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_STATE_VERSION must be an integer"),
-                removed_transition_id: std::env::var("TEST_BLOB_CLOSE_TRANSITION_ID")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_TRANSITION_ID must be a UUID"),
-                removed_seq: std::env::var("TEST_BLOB_CLOSE_TERMINAL_SEQ")
-                    .unwrap()
-                    .parse()
-                    .expect("TEST_BLOB_CLOSE_TERMINAL_SEQ must be an integer"),
-                removed_at,
-            },
-        )
-        .await
-        .expect("seeded canonical member removal must apply");
-        transaction
-            .commit()
-            .await
-            .expect("interval closure must commit before consumption");
-
-        assert!(matches!(
-            authorization.consume_for_storage(&pool).await,
-            Err(BlobRepositoryError::NotAuthorized)
-        ));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires TEST_DATABASE_URL, TEST_BLOB_* seeded fixture, and TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID; run explicitly with cargo test -- --ignored"]
+    #[ignore = "requires local PostgreSQL, TEST_BLOB_* identifiers, and TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID; run explicitly with cargo test -- --ignored"]
     async fn seeded_post_authorization_device_revocation_denies_consumption() {
-        for variable in [
-            "TEST_DATABASE_URL",
-            "TEST_BLOB_ID",
-            "TEST_BLOB_CALLER_DID",
-            "TEST_BLOB_CALLER_DEVICE_ID",
-            "TEST_BLOB_AUTH_GENERATION",
-            "TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID",
-        ] {
-            assert!(
-                std::env::var(variable).is_ok(),
-                "{variable} is required for this ignored seeded revocation-drift test"
-            );
-        }
-        let database_url = std::env::var("TEST_DATABASE_URL").unwrap();
-        let blob_id: Uuid = std::env::var("TEST_BLOB_ID")
-            .unwrap()
+        let blob_id: Uuid = required_env("TEST_BLOB_ID")
             .parse()
             .expect("TEST_BLOB_ID must be a UUID");
-        let caller_did = std::env::var("TEST_BLOB_CALLER_DID").unwrap();
-        let caller_device_id: Uuid = std::env::var("TEST_BLOB_CALLER_DEVICE_ID")
-            .unwrap()
+        let caller_did = required_env("TEST_BLOB_CALLER_DID");
+        let caller_device_id: Uuid = required_env("TEST_BLOB_CALLER_DEVICE_ID")
             .parse()
             .expect("TEST_BLOB_CALLER_DEVICE_ID must be a UUID");
-        let auth_generation: i64 = std::env::var("TEST_BLOB_AUTH_GENERATION")
-            .unwrap()
+        let auth_generation: i64 = required_env("TEST_BLOB_AUTH_GENERATION")
             .parse()
             .expect("TEST_BLOB_AUTH_GENERATION must be an integer");
-        let actor_device_id: Uuid = std::env::var("TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID")
-            .unwrap()
+        let actor_device_id: Uuid = required_env("TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID")
             .parse()
             .expect("TEST_BLOB_REVOCATION_ACTOR_DEVICE_ID must be a UUID");
         assert_ne!(
             actor_device_id, caller_device_id,
             "revocation actor must be a distinct active sibling device"
         );
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("TEST_DATABASE_URL must name a reachable Postgres instance");
+        let (pool, _db) = fresh_db::fresh_legacy_pool("chat_blobs_", 4, 1).await;
+        seed_blob_fixture(
+            &pool,
+            &BlobFixtureArgs {
+                blob_id,
+                caller_did: caller_did.clone(),
+                caller_device_id,
+                auth_generation,
+                revocation_actor_device_id: Some(actor_device_id),
+            },
+        )
+        .await;
 
         let authority = BlobAuthorizationTransaction::begin(&pool)
             .await
@@ -2248,9 +2293,12 @@ mod tests {
                 .await
                 .expect("database clock for revocation");
         let revocation_id = Uuid::new_v4();
-        let accepted_request_bytes = vec![0x01];
-        let signing_transcript_bytes = vec![0x02];
+        let accepted_request_bytes =
+            br#"{"body":{"$type":"blue.catbird.chat.defs#deviceRevocationBody"}}"#.to_vec();
+        let mut signing_transcript_bytes = b"CATBIRD-CHAT-DEVICE-REVOKE\0".to_vec();
+        signing_transcript_bytes.extend_from_slice(&[0x02_u8]);
         let request_digest: [u8; 32] = Sha256::digest(&signing_transcript_bytes).into();
+        let accepted_request_sha256: [u8; 32] = Sha256::digest(&accepted_request_bytes).into();
         let signature = vec![0x03; 64];
         let response_bytes = vec![0x04];
         let response_sha256: [u8; 32] = Sha256::digest(&response_bytes).into();
@@ -2288,6 +2336,24 @@ mod tests {
         )
         .await
         .expect("revoke device and key through canonical CAS");
+        sqlx::query(
+            "INSERT INTO chat.operation_claims(
+                operation_id, principal_did, endpoint_nsid, mutation_kind,
+                request_digest, accepted_request_sha256, signature, claimed_at
+             ) VALUES(
+                $1, $2, 'blue.catbird.chat.revokeDevice',
+                'blue.catbird.chat.defs#deviceRevocationBody', $3, $4, $5, $6
+             )",
+        )
+        .bind(revocation_id)
+        .bind(&caller_did)
+        .bind(request_digest.as_slice())
+        .bind(accepted_request_sha256.as_slice())
+        .bind(&signature)
+        .bind(accepted_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("canonical revocation operation claim");
         sqlx::query(
             "INSERT INTO chat.idempotency_records (
                 principal_did, endpoint_nsid, operation_id, request_digest,

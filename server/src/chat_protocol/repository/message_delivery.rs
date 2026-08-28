@@ -1,11 +1,11 @@
-//! Business admission for the clean application-send and typing procedures.
-//!
-//! This module is deliberately transaction-scoped: authentication and the
-//! operation prelude have already consumed replay evidence and locked the
-//! actor authority before either function is called.  Conversation state and
-//! the actor's concrete MLS interval are then read under the same transaction
-//! and all coordinate fields are compared, rather than comparing only a
-//! generation or state version.
+// Business admission for the clean application-send and typing procedures.
+//
+// This module is deliberately transaction-scoped: authentication and the
+// operation prelude have already consumed replay evidence and locked the
+// actor authority before either function is called.  Conversation state and
+// the actor's concrete MLS interval are then read under the same transaction
+// and all coordinate fields are compared, rather than comparing only a
+// generation or state version.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -615,10 +615,19 @@ pub(crate) async fn send<T: PublicTransport>(
             _ => MessageDeliveryError::Invariant,
         })?;
     }
-    Ok((
-        response_bytes,
-        Some(i64::try_from(seq).map_err(|_| MessageDeliveryError::Invariant)?),
-    ))
+    let event_position = delivery::append_message_available_event(
+        tx,
+        expected.conversation_id,
+        expected.generation,
+        seq,
+        scope.trusted_instant(),
+    )
+    .await
+    .map_err(|error| match error {
+        delivery::DeliveryRepositoryError::Database(error) => MessageDeliveryError::Database(error),
+        _ => MessageDeliveryError::Invariant,
+    })?;
+    Ok((response_bytes, Some(event_position)))
 }
 
 static TYPING_LAST: OnceLock<Mutex<HashMap<(Uuid, Uuid), (bool, DateTime<Utc>)>>> = OnceLock::new();

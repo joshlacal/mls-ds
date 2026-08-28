@@ -13,6 +13,7 @@ use sqlx::PgPool;
 
 pub mod chat_protocol;
 pub mod fresh_db;
+#[cfg(feature = "test-support")]
 pub mod http_acceptance;
 /// Mint a private, freshly migrated database for one test case.
 ///
@@ -20,7 +21,7 @@ pub mod http_acceptance;
 /// `postgres://localhost/catbird_test` when unset — and hand it straight to
 /// `db::init_db`, which runs `sqlx::migrate!("./migrations")`. That applied the
 /// whole ~56-migration legacy set to whatever database the ambient environment
-/// named. Fourteen targets call this helper, so with the program's standard
+/// named. Ten targets call this helper, so with the program's standard
 /// environment exported, any one of them silently took the shared clean-chat
 /// database's `_sqlx_migrations` ledger from the reviewed 13 to 69 and disabled
 /// `validate_exact_reviewed_ledger` for every clean-chat suite — while passing.

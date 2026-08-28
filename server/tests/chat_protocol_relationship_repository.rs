@@ -13,8 +13,6 @@
 
 #![allow(dead_code)]
 
-use catbird_server::{identity, util};
-
 mod common;
 
 #[path = "../src/identity.rs"]
@@ -216,7 +214,32 @@ mod state_machine {
 // surface; the production library still compiles against repository/core.rs.
 mod repository {
     pub(crate) mod core {
-        pub use catbird_server::chat_protocol::repository::core::*;
+        #[derive(Debug)]
+        pub(crate) struct AllocatedProjectionRevisionGuard {
+            allocation_id: uuid::Uuid,
+            projection_revision: u64,
+        }
+
+        impl AllocatedProjectionRevisionGuard {
+            pub(crate) fn from_database_allocation(
+                allocation_id: uuid::Uuid,
+                projection_revision: i64,
+            ) -> Option<Self> {
+                let projection_revision = u64::try_from(projection_revision).ok()?;
+                Some(Self {
+                    allocation_id,
+                    projection_revision,
+                })
+            }
+
+            pub(crate) fn projection_revision(&self) -> u64 {
+                self.projection_revision
+            }
+
+            pub(crate) fn into_allocation(self) -> (uuid::Uuid, u64) {
+                (self.allocation_id, self.projection_revision)
+            }
+        }
 
         #[derive(Debug)]
         pub(crate) struct LockedConversationHeadGuard {
@@ -394,13 +417,6 @@ mod repository {
     }
 
     pub(crate) mod relationship {
-        pub(crate) fn observe_relationship_persistence(
-        ) -> crate::relationship_policy::TrustedRelationshipPersistenceInstant {
-            crate::relationship_policy::TrustedRelationshipPersistenceInstant::for_test(
-                chrono::Utc::now(),
-            )
-        }
-
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/chat_protocol/repository/relationship.rs"
@@ -473,8 +489,11 @@ fn repository_source_seals_projection_and_scope_authority() {
         .split_once("pub(crate) struct SealedRelationshipProjection")
         .expect("sealed projection follows raw DTOs")
         .0;
-    assert!(raw_projection_region.contains("pub(super) projection_id"));
+    assert!(raw_projection_region.contains("$field_visibility projection_id"));
     assert!(!raw_projection_region.contains("pub(crate) projection_id"));
+    assert!(policy_source
+        .contains("#[cfg(not(test))]\ndefine_persisted_projection_types!(pub(super));"));
+    assert!(policy_source.contains("#[cfg(test)]\ndefine_persisted_projection_types!(pub(crate));"));
 
     let relationship_loader = source
         .split_once("pub(crate) async fn load_fallback_relationship_projection")

@@ -15,8 +15,10 @@ use std::fmt;
 use uuid::Uuid;
 
 use super::super::{
-    dpop::VerifiedReadAdmission, read_authority, repository::inventory, OsSecureRandom,
-    SecureRandom,
+    cursor::{CursorSealer, OsSecureRandom, SecureRandom},
+    dpop::VerifiedReadAdmission,
+    read_authority,
+    repository::inventory,
 };
 
 /// The exact subscription path a clean-chat ticket authorizes.
@@ -638,7 +640,7 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     admission: VerifiedReadAdmission,
     inventory_session_capability: &str,
     event_cursor: &str,
-    sealer: &crate::chat_protocol::CursorSealer,
+    sealer: &CursorSealer,
 ) -> Result<(String, DateTime<Utc>), TicketRepositoryError> {
     let attempt = admission
         .into_single_read_attempt("blue.catbird.chat.getSubscriptionTicket", "POST")

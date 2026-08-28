@@ -938,6 +938,12 @@ pub async fn cleanup_expired_auth_material(pool: &PgPool) -> Result<u64, sqlx::E
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use p256::ecdsa::SigningKey as P256SigningKey;
@@ -1538,9 +1544,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_challenge_is_single_use_rebinds_and_rolls_back_bad_signature() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
-        let pool = PgPool::connect(&url).await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let (pool, _db) = fresh_db::fresh_legacy_pool("auth_device_", 5, 1).await;
         let challenge_device_index: String = sqlx::query_scalar(
             "SELECT indexdef FROM pg_indexes
              WHERE schemaname=current_schema()
@@ -1966,9 +1970,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_begin_binding_serializes_registry_mutations_and_rolls_back() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
-        let pool = PgPool::connect(&url).await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let (pool, db) = fresh_db::fresh_legacy_pool("auth_device_", 5, 1).await;
         let now = Utc::now();
 
         async fn insert_device(
@@ -2077,7 +2079,7 @@ mod tests {
             .await
             .unwrap();
         let delete_application = format!("binding-delete-{delete_device}");
-        let delete_pool = named_pool(&url, &delete_application).await;
+        let delete_pool = named_pool(db.url(), &delete_application).await;
         let delete_task =
             tokio::spawn(async move { begin_binding(&delete_pool, &delete_enrollment, now).await });
         wait_for_lock(&pool, &delete_application, &delete_task).await;
@@ -2103,7 +2105,7 @@ mod tests {
             .await
             .unwrap();
         let inactive_application = format!("binding-inactive-{inactive_device}");
-        let inactive_pool = named_pool(&url, &inactive_application).await;
+        let inactive_pool = named_pool(db.url(), &inactive_application).await;
         let inactive_task =
             tokio::spawn(
                 async move { begin_binding(&inactive_pool, &inactive_enrollment, now).await },
@@ -2134,7 +2136,7 @@ mod tests {
         .await
         .unwrap();
         let rekey_application = format!("binding-rekey-{rekey_device}");
-        let rekey_pool = named_pool(&url, &rekey_application).await;
+        let rekey_pool = named_pool(db.url(), &rekey_application).await;
         let rekey_task =
             tokio::spawn(async move { begin_binding(&rekey_pool, &rekey_enrollment, now).await });
         wait_for_lock(&pool, &rekey_application, &rekey_task).await;
@@ -2177,9 +2179,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_stale_challenge_cannot_cross_rekey_or_device_lifecycle() {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
-        let pool = PgPool::connect(&url).await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let (pool, _db) = fresh_db::fresh_legacy_pool("auth_device_", 5, 1).await;
         let suffix = Uuid::new_v4().simple().to_string();
         let user = format!("did:plc:stale{suffix}");
         let device = format!("device-{suffix}");

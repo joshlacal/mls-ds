@@ -29,81 +29,21 @@
 
 mod common;
 
-// Full production-module prelude (mirrors `chat_protocol_executor.rs`) so the
-// shared `common::executor_seed` fulfillment-graph builders — which reference
-// `crate::chat_protocol::*` — compile in this crate and can seed a coherent
-// pending-Welcome / recovery graph for the populated live tests below.
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
 
-mod chat_protocol {
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod repository {
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
+#[allow(dead_code)]
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
 }
 
 #[path = "common/executor_seed.rs"]
 mod executor_seed;
-
-// `welcome` reads `super::delivery::RecoveryWorkSourceKind`, so BOTH production
-// modules are inlined here exactly as they are laid out under `repository/`.
-mod repository {
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
-    pub(crate) mod welcome {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/welcome.rs"
-        ));
-    }
-}
 
 use chrono::Utc;
 use sqlx::PgPool;

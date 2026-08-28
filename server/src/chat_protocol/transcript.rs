@@ -956,11 +956,6 @@ signed_mutation_kinds!(
         "CATBIRD-CHAT-DEVICE-REPLENISH\0"
     ),
     (
-        DeviceAuthenticationRebind,
-        "deviceAuthenticationRebindBody",
-        "CATBIRD-CHAT-DEVICE-REBIND\0"
-    ),
-    (
         DeviceRevocation,
         "deviceRevocationBody",
         "CATBIRD-CHAT-DEVICE-REVOKE\0"
@@ -1208,10 +1203,7 @@ impl CanonicalSignedMutation {
         body_thumbprint(&self.body, "keyId")
     }
     pub fn auth_generation(&self) -> u64 {
-        let field = if matches!(
-            self.kind,
-            SignedMutationKind::DeviceEnrollment | SignedMutationKind::DeviceAuthenticationRebind
-        ) {
+        let field = if self.kind == SignedMutationKind::DeviceEnrollment {
             "expectedAuthGeneration"
         } else {
             "authGeneration"
@@ -1282,6 +1274,28 @@ impl CanonicalSignedMutation {
             }
         }
         Ok(additions)
+    }
+
+    pub fn policy_change_kinds(&self) -> Result<Vec<String>, AuthPrimitiveError> {
+        let changes = match self.body.get("participantChanges") {
+            Some(DagValue::Array(array)) => array,
+            _ => return Ok(Vec::new()),
+        };
+        let mut kinds = Vec::new();
+        for item in changes {
+            if let DagValue::Map(map) = item {
+                if let Some(DagValue::Text(type_tag)) = map.get("$type") {
+                    kinds.push(type_tag.clone());
+                } else {
+                    return Err(AuthPrimitiveError::invalid(
+                        "participant change missing $type",
+                    ));
+                }
+            } else {
+                return Err(AuthPrimitiveError::invalid("participant change row"));
+            }
+        }
+        Ok(kinds)
     }
 }
 
@@ -1410,7 +1424,7 @@ pub fn decode_and_verify_signed_mutation(
 }
 
 impl VerifiedSignedMutation {
-    fn historical_public_key(&self) -> &[u8; 32] {
+    pub(crate) fn historical_public_key(&self) -> &[u8; 32] {
         &self.historical_public_key
     }
 
@@ -1575,10 +1589,6 @@ macro_rules! projection_types {
 projection_types!(
     (DeviceEnrollment, DeviceEnrollmentProjection),
     (KeyPackageReplenishment, KeyPackageReplenishmentProjection),
-    (
-        DeviceAuthenticationRebind,
-        DeviceAuthenticationRebindProjection
-    ),
     (DeviceRevocation, DeviceRevocationProjection),
     (BlobUploadPreparation, BlobUploadPreparationProjection),
     (BlobDeletion, BlobDeletionProjection),
@@ -1612,11 +1622,6 @@ fn projection_for(value: &VerifiedSignedMutation) -> VerifiedMutationProjection<
             VerifiedMutationProjection::KeyPackageReplenishment(KeyPackageReplenishmentProjection(
                 value,
             ))
-        }
-        SignedMutationKind::DeviceAuthenticationRebind => {
-            VerifiedMutationProjection::DeviceAuthenticationRebind(
-                DeviceAuthenticationRebindProjection(value),
-            )
         }
         SignedMutationKind::DeviceRevocation => {
             VerifiedMutationProjection::DeviceRevocation(DeviceRevocationProjection(value))
@@ -1707,7 +1712,6 @@ macro_rules! projection_body {
 projection_body!(
     DeviceEnrollmentProjection,
     KeyPackageReplenishmentProjection,
-    DeviceAuthenticationRebindProjection,
     DeviceRevocationProjection,
     BlobUploadPreparationProjection,
     BlobDeletionProjection,
@@ -2085,100 +2089,6 @@ impl VerifiedEnrollmentBody {
         self.verified
             .accepted_wrapper_bytes()
             .expect("enrollment evidence is decoded from an exact signed wrapper")
-    }
-}
-
-/// Strictly decoded rebind bootstrap. Its body signature is retained but not
-/// elevated to final authority: the repository must resolve the immutable
-/// stored Ed25519 key and current JKT/generation, verify, and CAS atomically.
-#[derive(Debug)]
-pub struct CanonicalRebindBootstrap {
-    canonical: CanonicalSignedMutation,
-}
-
-pub fn decode_rebind_bootstrap(
-    raw_json: &[u8],
-) -> Result<CanonicalRebindBootstrap, AuthPrimitiveError> {
-    let canonical = decode_canonical_signed_mutation(raw_json)?;
-    if canonical.kind() != SignedMutationKind::DeviceAuthenticationRebind {
-        return Err(AuthPrimitiveError::invalid("rebind body type"));
-    }
-    Ok(CanonicalRebindBootstrap { canonical })
-}
-
-impl CanonicalRebindBootstrap {
-    pub fn subject(&self) -> &BareDid {
-        self.canonical.actor_did()
-    }
-    pub fn device_id(&self) -> &CanonicalUuidV4 {
-        self.canonical.actor_device_id()
-    }
-    pub fn key_id(&self) -> &KeyThumbprint {
-        self.canonical.key_id()
-    }
-    pub fn expected_auth_generation(&self) -> u64 {
-        self.canonical.auth_generation()
-    }
-    pub fn current_dpop_jkt(&self) -> &KeyThumbprint {
-        body_thumbprint(&self.canonical.body, "currentDpopJkt")
-    }
-    pub fn new_dpop_jkt(&self) -> &KeyThumbprint {
-        body_thumbprint(&self.canonical.body, "newDpopJkt")
-    }
-    pub fn signed_at(&self) -> &CanonicalTimestamp {
-        self.canonical.signed_at()
-    }
-    pub fn idempotency_key(&self) -> &CanonicalUuidV4 {
-        body_uuid(&self.canonical.body, "idempotencyKey")
-    }
-    pub fn accepted_wrapper_bytes(&self) -> &[u8] {
-        self.canonical
-            .accepted_wrapper_bytes()
-            .expect("rebind bootstrap is decoded from an exact signed wrapper")
-    }
-    pub fn request_digest(&self) -> &[u8; 32] {
-        self.canonical.request_digest()
-    }
-    pub fn signature(&self) -> &[u8; 64] {
-        self.canonical.signature()
-    }
-    pub fn verify_signature_with_stored_key(
-        &self,
-        stored_public_key: &[u8],
-    ) -> Result<(), AuthPrimitiveError> {
-        if &ed25519_key_id(stored_public_key)? != self.canonical.key_id() {
-            return Err(AuthPrimitiveError::invalid("rebind key ID mismatch"));
-        }
-        verify_ed25519_strict(
-            stored_public_key,
-            self.canonical.transcript_bytes(),
-            self.canonical.signature(),
-        )
-    }
-    /// Verify this bootstrap's retained body signature against the stored
-    /// Ed25519 key and yield the elevated mutation **without consuming the
-    /// bootstrap**.
-    ///
-    /// This type is deliberately borrow-only: it must remain readable by the
-    /// repository stage, which still needs `current_dpop_jkt`, `new_dpop_jkt`,
-    /// `key_id`, `expected_auth_generation` and `idempotency_key` to bind the
-    /// locked device row. A by-value verifier previously existed here and was
-    /// the sole reason a caller moved the bootstrap out of
-    /// `PreReplayCryptographicVerification`, which left the repository stage
-    /// with `None` and made every first-execution rebind fail closed. Do not
-    /// reintroduce a `self`-by-value method on this type.
-    ///
-    /// Re-decoding the retained exact wrapper bytes is the same non-consuming
-    /// pattern already used by the rebind *replay* path.
-    pub fn verify_mutation_with_stored_key(
-        &self,
-        stored_public_key: &[u8],
-    ) -> Result<VerifiedSignedMutation, AuthPrimitiveError> {
-        let canonical = decode_canonical_signed_mutation(self.accepted_wrapper_bytes())?;
-        if canonical.kind() != SignedMutationKind::DeviceAuthenticationRebind {
-            return Err(AuthPrimitiveError::invalid("rebind body type"));
-        }
-        verify_signed_mutation(canonical, stored_public_key)
     }
 }
 

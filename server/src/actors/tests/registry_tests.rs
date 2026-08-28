@@ -15,21 +15,8 @@ mod registry_tests {
     use tokio::sync::Barrier;
 
     /// Test helper to set up a test database
-    async fn setup_test_db() -> PgPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://catbird:changeme@localhost:5433/catbird".to_string());
-
-        let config = crate::db::DbConfig {
-            database_url,
-            max_connections: 20, // Higher for concurrent tests
-            min_connections: 5,
-            acquire_timeout: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(600),
-        };
-
-        crate::db::init_db(config)
-            .await
-            .expect("Failed to initialize test database")
+    async fn setup_test_db() -> (PgPool, super::super::fresh_db::DisposableDatabase) {
+        super::super::fresh_db::fresh_legacy_pool("actor_reg_", 20, 5).await
     }
 
     /// Test helper to clean up test data
@@ -79,7 +66,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn test_actor_spawn_and_reuse() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-spawn-reuse";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -126,7 +113,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn test_concurrent_get_or_spawn_no_duplicates() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-concurrent-spawn";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -193,7 +180,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn test_cleanup_after_timeout() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-cleanup-timeout";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;
@@ -232,7 +219,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn test_actor_count() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let registry = ActorRegistry::new(pool.clone(), Arc::new(SseState::new(1000)), None);
 
         // Initially should be 0
@@ -276,7 +263,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn test_multiple_registries_same_pool() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let convo_id = "test-multi-registry";
         cleanup_test_data(&pool, convo_id).await;
         create_test_convo(&pool, convo_id, "did:plc:creator").await;

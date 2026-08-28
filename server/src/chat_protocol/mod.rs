@@ -191,3 +191,19 @@ pub mod production_proof {
         super::repository::execution_context::run_welcome_terminal_context_family_semantic_proof()
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn derive_bootstrap_local_id_for_test(
+    conversation_id: uuid::Uuid,
+    source_entry_id: uuid::Uuid,
+    label: &str,
+    entity_key: &[u8],
+) -> uuid::Uuid {
+    repository::remote_prefix::test_support::derive_bootstrap_local_id_for_test(
+        conversation_id,
+        source_entry_id,
+        label,
+        entity_key,
+    )
+}

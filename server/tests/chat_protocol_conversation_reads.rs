@@ -134,9 +134,9 @@ async fn conversation_read_routes_are_cutover_gated() {
 async fn conversation_read_routes_dispatch_real_dpop_admission() {
     let (status, body) = send(
         router(true),
-        "/xrpc/blue.catbird.chat.getConversationState?conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "/xrpc/blue.catbird.chat.getConversationState?actorDeviceId=018f3f6a-7b2c-4d91-8a5e-0f123456789b&conversationId=018f3f6a-7b2c-4d91-8a5e-0f123456789a",
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }

@@ -283,45 +283,8 @@ impl OperationClaimBinding {
         )
     }
 
-    fn from_rebind_admission(
-        admission: &auth::RebindOperationAdmission,
-    ) -> Result<Self, PreludeError> {
-        let canonical = admission.canonical()?;
-        let accepted_request_bytes = canonical
-            .accepted_wrapper_bytes()
-            .ok_or(PreludeError::NonCanonicalOperation)?;
-        let endpoint = admission.pre_replay().endpoint().as_str();
-        let operation_id = admission.operation_id();
-        if !endpoint_has_operation_claim(endpoint) || operation_id.get_version_num() != 4 {
-            return Err(PreludeError::NonCanonicalOperation);
-        }
-        Ok(Self {
-            operation_id,
-            principal_did: admission.pre_replay().subject().as_str().to_owned(),
-            endpoint_nsid: endpoint.to_owned(),
-            mutation_kind: canonical.type_id().to_owned(),
-            request_digest: *canonical.request_digest(),
-            accepted_request_sha256: Sha256::digest(accepted_request_bytes).into(),
-            signature: *canonical.signature(),
-            claimed_at: admission.pre_replay().trusted_instant().datetime(),
-        })
-    }
-
     fn from_enrollment_replay_authority(
         authority: &auth::EnrollmentOperationReplayAuthority,
-    ) -> Result<Self, PreludeError> {
-        Self::from_parts(
-            authority
-                .repository_receipt()
-                .operation_id()
-                .ok_or(PreludeError::NonCanonicalOperation)?,
-            authority.pre_replay(),
-            authority.mutation(),
-        )
-    }
-
-    fn from_rebind_replay_authority(
-        authority: &auth::RebindOperationReplayAuthority,
     ) -> Result<Self, PreludeError> {
         Self::from_parts(
             authority
@@ -400,7 +363,6 @@ pub(crate) fn endpoint_has_operation_claim(endpoint: &str) -> bool {
             | "blue.catbird.chat.deleteBlob"
             | "blue.catbird.chat.enrollDevice"
             | "blue.catbird.chat.prepareBlobUpload"
-            | "blue.catbird.chat.rebindDeviceAuthentication"
             | "blue.catbird.chat.rejectWelcome"
             | "blue.catbird.chat.replenishKeyPackages"
             | "blue.catbird.chat.requestLeafRecovery"
@@ -419,11 +381,6 @@ pub(crate) enum OperationArbitration {
 
 pub(crate) enum PreparedEnrollmentOperation {
     First(PreparedEnrollmentBootstrapPrelude),
-    Replay(CompletedIdempotentResponse),
-}
-
-pub(crate) enum PreparedRebindOperation {
-    First(PreparedRebindBootstrapPrelude),
     Replay(CompletedIdempotentResponse),
 }
 
@@ -460,7 +417,6 @@ macro_rules! redacted_endpoint_operation_debug {
 }
 
 redacted_endpoint_operation_debug!(PreparedEnrollmentOperation, "PreparedEnrollmentOperation");
-redacted_endpoint_operation_debug!(PreparedRebindOperation, "PreparedRebindOperation");
 redacted_endpoint_operation_debug!(
     PreparedReplenishmentOperation,
     "PreparedReplenishmentOperation"
@@ -933,13 +889,6 @@ pub(crate) struct PreparedEnrollmentBootstrapPrelude {
 }
 
 #[must_use]
-pub(crate) struct PreparedRebindBootstrapPrelude {
-    authority: VerifiedChatDeviceRequest,
-    scope: auth::RebindOldStateLockedBootstrapScope,
-    operation: OperationClaimGuard,
-}
-
-#[must_use]
 pub(crate) struct PreparedReplenishmentPrelude {
     inner: PreparedBusinessPrelude,
     authority: VerifiedChatDeviceRequest,
@@ -948,11 +897,6 @@ pub(crate) struct PreparedReplenishmentPrelude {
 pub(crate) struct EnrollmentBootstrapEffectAuthority<'a> {
     authority: &'a VerifiedChatDeviceRequest,
     scope: &'a auth::EnrollmentAbsenceLockedBootstrapScope,
-}
-
-pub(crate) struct RebindBootstrapEffectAuthority<'a> {
-    authority: &'a VerifiedChatDeviceRequest,
-    scope: &'a auth::RebindOldStateLockedBootstrapScope,
 }
 
 /// Borrowed endpoint capability that keeps a replenishment's verified request
@@ -1000,55 +944,6 @@ impl PreparedEnrollmentBootstrapPrelude {
                 authority_digest,
                 scope_digest: *scope.scope_digest(),
                 jkt_shape: BootstrapCompletionJktShape::Enrollment { current },
-            },
-            authority,
-        }
-    }
-}
-
-impl PreparedRebindBootstrapPrelude {
-    pub(crate) fn effect_authority(&self) -> RebindBootstrapEffectAuthority<'_> {
-        RebindBootstrapEffectAuthority {
-            authority: &self.authority,
-            scope: &self.scope,
-        }
-    }
-
-    pub(crate) fn into_completion_guard(self) -> RebindBootstrapCompletion {
-        let PreparedRebindBootstrapPrelude {
-            authority,
-            scope,
-            operation,
-        } = self;
-        let historical = scope.old_jkt().to_owned();
-        let current = scope.new_jkt().to_owned();
-        let key_id = scope.key_id().to_owned();
-        let auth_generation = scope.old_auth_generation();
-        let signing_key_sha256: [u8; 32] = Sha256::digest(scope.signing_public_key()).into();
-        let authority_digest = bootstrap_completion_digest(
-            &operation.transaction_id,
-            &operation.binding,
-            scope.receipt_id(),
-            scope.scope_digest(),
-            scope.trusted_instant(),
-            scope.subject(),
-            scope.device_id(),
-            &current,
-            Some(&historical),
-            Some(&key_id),
-            Some(auth_generation),
-            Some(&signing_key_sha256),
-        );
-        RebindBootstrapCompletion {
-            guard: BootstrapCompletionGuard {
-                operation,
-                scope_receipt_id: scope.receipt_id(),
-                authority_digest,
-                scope_digest: *scope.scope_digest(),
-                jkt_shape: BootstrapCompletionJktShape::Rebind {
-                    historical,
-                    current,
-                },
             },
             authority,
         }
@@ -1106,15 +1001,6 @@ impl EnrollmentBootstrapEffectAuthority<'_> {
             .ok_or(PreludeError::UnsupportedAuthority)?
             .key_id()
             .as_str())
-    }
-}
-
-impl RebindBootstrapEffectAuthority<'_> {
-    pub(crate) fn subject(&self) -> &str {
-        self.scope.subject()
-    }
-    pub(crate) fn device_id(&self) -> Uuid {
-        self.scope.device_id()
     }
 }
 
@@ -1506,9 +1392,9 @@ impl fmt::Debug for RecoveryPreludePrewriteWitness {
     }
 }
 
-/// Single-use opaque completion capability for enrollment and rebind bootstrap
-/// operations. The domain-separated digest binds the exact operation claim,
-/// locked scope receipt, and JKT shape.
+/// Single-use opaque completion capability for enrollment bootstrap. The
+/// domain-separated digest binds the exact operation claim, locked scope
+/// receipt, and JKT shape.
 #[must_use]
 pub(crate) struct BootstrapCompletionGuard {
     operation: OperationClaimGuard,
@@ -1523,14 +1409,6 @@ pub(crate) struct BootstrapCompletionGuard {
 /// pair a valid completion guard with a caller-selected request.
 #[must_use]
 pub(crate) struct EnrollmentBootstrapCompletion {
-    guard: BootstrapCompletionGuard,
-    authority: VerifiedChatDeviceRequest,
-}
-
-/// Endpoint-owned completion authority for rebind. The old-state JKT shape is
-/// sealed in `guard`; the verified request cannot escape separately.
-#[must_use]
-pub(crate) struct RebindBootstrapCompletion {
     guard: BootstrapCompletionGuard,
     authority: VerifiedChatDeviceRequest,
 }
@@ -1581,10 +1459,6 @@ impl BootstrapCompletionGuard {
             BootstrapCompletionJktShape::Enrollment { current } => {
                 historical_jkt.is_none() && current.as_deref().unwrap_or("") == current_jkt
             }
-            BootstrapCompletionJktShape::Rebind {
-                historical,
-                current,
-            } => historical_jkt == Some(historical.as_str()) && current == current_jkt,
         };
         shape_matches
             && bootstrap_completion_digest(
@@ -1607,7 +1481,6 @@ impl BootstrapCompletionGuard {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BootstrapCompletionJktShape {
     Enrollment { current: Option<String> },
-    Rebind { historical: String, current: String },
 }
 
 impl ScopeBoundBusinessAuthority {
@@ -1933,7 +1806,6 @@ impl RecoveryPreludePrewriteWitness {
         digest.update([match self.scope.actor_class() {
             RepositoryAuthorityClass::ExistingDevice => 1,
             RepositoryAuthorityClass::EnrollmentBootstrap => 2,
-            RepositoryAuthorityClass::RebindBootstrap => 3,
         }]);
         digest.update(self.scope.actor_device_id().as_bytes());
         digest.update(
@@ -2299,74 +2171,6 @@ pub(crate) async fn prepare_enrollment_operation(
     Ok(PreparedEnrollmentOperation::First(prepared))
 }
 
-/// Arbitrate a rebind's immutable claim before opening either first-execution
-/// age authority or completed-replay authority.
-pub(crate) async fn prepare_rebind_operation(
-    transaction: &mut Transaction<'_, Postgres>,
-    admission: auth::RebindOperationAdmission,
-) -> Result<PreparedRebindOperation, PreludeError> {
-    let mut binding = OperationClaimBinding::from_rebind_admission(&admission)?;
-    let operation_lock = auth::reserve_canonical_operation_id(
-        transaction,
-        binding.operation_id,
-        Some(admission.operation_id()),
-    )
-    .await?;
-    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
-        .fetch_one(&mut **transaction)
-        .await?;
-    if operation_lock.transaction_id() != transaction_id
-        || operation_lock.operation_id() != binding.operation_id
-    {
-        return Err(PreludeError::ForeignTransaction);
-    }
-    let existing: Option<OperationClaimRow> = sqlx::query_as(
-        r#"
-        SELECT operation_id,principal_did,endpoint_nsid,mutation_kind,
-               request_digest,accepted_request_sha256,signature,claimed_at
-          FROM chat.operation_claims
-         WHERE operation_id=$1
-        "#,
-    )
-    .bind(binding.operation_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if let Some(existing) = existing {
-        if !existing.matches(&binding) {
-            return Err(PreludeError::OperationIdConflict);
-        }
-        binding.claimed_at = existing.claimed_at;
-        let authority = admission.into_replay_authority()?;
-        if !binding.matches_rebind_replay_authority(&authority)? {
-            return Err(PreludeError::ClaimIntegrity);
-        }
-        let response = validate_rebind_operation_replay(
-            transaction,
-            authority,
-            OperationReplayGuard {
-                operation_lock,
-                binding,
-            },
-        )
-        .await?;
-        return Ok(PreparedRebindOperation::Replay(response));
-    }
-    let authority = admission.into_first_authority()?;
-    if !binding.matches_authority(&authority)? {
-        return Err(PreludeError::ClaimIntegrity);
-    }
-    let prepared = prepare_rebind_bootstrap_prelude(
-        transaction,
-        authority,
-        OperationReservationGuard {
-            operation_lock,
-            binding,
-        },
-    )
-    .await?;
-    Ok(PreparedRebindOperation::First(prepared))
-}
-
 pub(crate) async fn prepare_replenishment_operation(
     transaction: &mut Transaction<'_, Postgres>,
     admission: auth::SignedOperationAdmission,
@@ -2603,25 +2407,6 @@ async fn prepare_enrollment_bootstrap_prelude(
     })
 }
 
-async fn prepare_rebind_bootstrap_prelude(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: VerifiedChatDeviceRequest,
-    reservation: OperationReservationGuard,
-) -> Result<PreparedRebindBootstrapPrelude, PreludeError> {
-    let scope =
-        auth::lock_rebind_old_state_scope(transaction, &authority, &reservation.operation_lock)
-            .await?;
-    let operation = claim_operation(transaction, reservation).await?;
-    if !operation.binding.matches_authority(&authority)? {
-        return Err(PreludeError::ClaimIntegrity);
-    }
-    Ok(PreparedRebindBootstrapPrelude {
-        authority,
-        scope,
-        operation,
-    })
-}
-
 async fn prepare_replenishment_prelude(
     transaction: &mut Transaction<'_, Postgres>,
     authority: VerifiedChatDeviceRequest,
@@ -2639,18 +2424,6 @@ pub(crate) async fn persist_enrollment_bootstrap_effects(
     effect: &EnrollmentBootstrapEffectAuthority<'_>,
 ) -> Result<(), PreludeError> {
     auth::persist_enrollment_bootstrap_effects(transaction, effect.authority, effect.scope)
-        .await
-        .map_err(PreludeError::Authorization)
-}
-
-/// Persist only rebind's exact old-state CAS through the borrowed old-state
-/// authority. Receipt completion is deliberately a separate, later consuming
-/// step.
-pub(crate) async fn persist_rebind_bootstrap_effects(
-    transaction: &mut Transaction<'_, Postgres>,
-    effect: &RebindBootstrapEffectAuthority<'_>,
-) -> Result<(), PreludeError> {
-    auth::persist_rebind_bootstrap_effects(transaction, effect.authority, effect.scope)
         .await
         .map_err(PreludeError::Authorization)
 }
@@ -2862,20 +2635,6 @@ async fn validate_enrollment_operation_replay(
         .ok_or(PreludeError::ClaimIntegrity)
 }
 
-async fn validate_rebind_operation_replay(
-    transaction: &mut Transaction<'_, Postgres>,
-    authority: auth::RebindOperationReplayAuthority,
-    replay: OperationReplayGuard,
-) -> Result<CompletedIdempotentResponse, PreludeError> {
-    validate_operation_replay_claim(transaction, &replay).await?;
-    if !replay.binding.matches_rebind_replay_authority(&authority)? {
-        return Err(PreludeError::ClaimIntegrity);
-    }
-    auth::load_validated_completed_rebind_replay(transaction, &authority)
-        .await?
-        .ok_or(PreludeError::ClaimIntegrity)
-}
-
 async fn validate_replenishment_operation_replay(
     transaction: &mut Transaction<'_, Postgres>,
     authority: auth::SignedOperationReplayAuthority,
@@ -2996,20 +2755,6 @@ impl OperationClaimBinding {
             && self.accepted_request_sha256 == current.accepted_request_sha256
             && self.signature == current.signature)
     }
-
-    fn matches_rebind_replay_authority(
-        &self,
-        authority: &auth::RebindOperationReplayAuthority,
-    ) -> Result<bool, PreludeError> {
-        let current = Self::from_rebind_replay_authority(authority)?;
-        Ok(self.operation_id == current.operation_id
-            && self.principal_did == current.principal_did
-            && self.endpoint_nsid == current.endpoint_nsid
-            && self.mutation_kind == current.mutation_kind
-            && self.request_digest == current.request_digest
-            && self.accepted_request_sha256 == current.accepted_request_sha256
-            && self.signature == current.signature)
-    }
 }
 
 async fn claim_operation(
@@ -3023,7 +2768,52 @@ async fn claim_operation(
         return Err(PreludeError::ForeignTransaction);
     }
     let binding = reservation.binding;
-    let inserted = sqlx::query(
+    insert_operation_claim_record(
+        transaction,
+        binding.operation_id,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        &binding.mutation_kind,
+        &binding.request_digest,
+        &binding.accepted_request_sha256,
+        &binding.signature,
+        binding.claimed_at,
+    )
+    .await?;
+    Ok(OperationClaimGuard {
+        transaction_id,
+        binding,
+    })
+}
+
+/// Map an operation-row insert failure onto the prelude error surface: a unique
+/// violation is an attempt to rebind an operation ID that is already claimed,
+/// every other database failure propagates unchanged.
+fn operation_row_insert_error(error: sqlx::Error) -> PreludeError {
+    if error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .as_deref()
+        == Some("23505")
+    {
+        return PreludeError::OperationIdConflict;
+    }
+    PreludeError::Database(error)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn insert_operation_claim_record(
+    transaction: &mut Transaction<'_, Postgres>,
+    operation_id: Uuid,
+    principal_did: &str,
+    endpoint_nsid: &str,
+    mutation_kind: &str,
+    request_digest: &[u8],
+    accepted_request_sha256: &[u8],
+    signature: &[u8],
+    claimed_at: DateTime<Utc>,
+) -> Result<(), PreludeError> {
+    sqlx::query(
         r#"
         INSERT INTO chat.operation_claims (
             operation_id,principal_did,endpoint_nsid,mutation_kind,
@@ -3031,32 +2821,18 @@ async fn claim_operation(
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         "#,
     )
-    .bind(binding.operation_id)
-    .bind(&binding.principal_did)
-    .bind(&binding.endpoint_nsid)
-    .bind(&binding.mutation_kind)
-    .bind(binding.request_digest.as_slice())
-    .bind(binding.accepted_request_sha256.as_slice())
-    .bind(binding.signature.as_slice())
-    .bind(binding.claimed_at)
+    .bind(operation_id)
+    .bind(principal_did)
+    .bind(endpoint_nsid)
+    .bind(mutation_kind)
+    .bind(request_digest)
+    .bind(accepted_request_sha256)
+    .bind(signature)
+    .bind(claimed_at)
     .execute(&mut **transaction)
-    .await;
-    match inserted {
-        Ok(_) => Ok(OperationClaimGuard {
-            transaction_id,
-            binding,
-        }),
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|db| db.code())
-                .as_deref()
-                == Some("23505") =>
-        {
-            Err(PreludeError::OperationIdConflict)
-        }
-        Err(error) => Err(PreludeError::Database(error)),
-    }
+    .await
+    .map(|_| ())
+    .map_err(operation_row_insert_error)
 }
 
 pub(crate) async fn complete_operation(
@@ -3095,9 +2871,6 @@ pub(crate) async fn complete_operation(
     {
         return Err(PreludeError::ForeignTransaction);
     }
-    if !(200..=599).contains(&completed_status) || response_bytes.is_empty() {
-        return Err(PreludeError::ClaimIntegrity);
-    }
     let binding = claim.binding;
     let mutation = authority
         .mutation()
@@ -3105,49 +2878,26 @@ pub(crate) async fn complete_operation(
     let accepted_request_bytes = mutation
         .accepted_wrapper_bytes()
         .ok_or(PreludeError::NonCanonicalOperation)?;
-    let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
     let historical_jkt = (binding.endpoint_nsid == "blue.catbird.chat.revokeDevice")
-        .then(|| authority.dpop_jkt().map(|k| k.as_str()))
+        .then(|| authority.dpop_jkt().map(|key| key.as_str()))
         .flatten();
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO chat.idempotency_records(
-            principal_did,endpoint_nsid,operation_id,request_digest,
-            accepted_request_bytes,signing_transcript_bytes,signature,
-            completed_status,response_bytes,response_sha256,event_position,
-            historical_jkt,current_jkt,completed_at
-        ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,$13)
-        "#,
+    insert_operation_completion_record(
+        transaction,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        binding.operation_id,
+        &binding.request_digest,
+        accepted_request_bytes,
+        mutation.transcript_bytes(),
+        &binding.signature,
+        completed_status,
+        response_bytes,
+        event_position,
+        historical_jkt,
+        None,
+        authority.trusted_instant().datetime(),
     )
-    .bind(&binding.principal_did)
-    .bind(&binding.endpoint_nsid)
-    .bind(binding.operation_id)
-    .bind(binding.request_digest.as_slice())
-    .bind(accepted_request_bytes)
-    .bind(mutation.transcript_bytes())
-    .bind(binding.signature.as_slice())
-    .bind(completed_status)
-    .bind(response_bytes)
-    .bind(response_sha256.as_slice())
-    .bind(event_position)
-    .bind(historical_jkt)
-    .bind(authority.trusted_instant().datetime())
-    .execute(&mut **transaction)
-    .await;
-    match inserted {
-        Ok(_) => {}
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|database| database.code())
-                .as_deref()
-                == Some("23505") =>
-        {
-            return Err(PreludeError::OperationIdConflict);
-        }
-        Err(error) => return Err(PreludeError::Database(error)),
-    }
-    Ok(())
+    .await
 }
 
 pub(crate) async fn complete_enrollment_bootstrap_operation(
@@ -3159,10 +2909,8 @@ pub(crate) async fn complete_enrollment_bootstrap_operation(
 ) -> Result<(), PreludeError> {
     let EnrollmentBootstrapCompletion { guard, authority } = completion;
     validate_bootstrap_completion(transaction, &guard, &authority).await?;
-    let current = match &guard.jkt_shape {
-        BootstrapCompletionJktShape::Enrollment { current } => current.clone(),
-        _ => return Err(PreludeError::ClaimIntegrity),
-    };
+    let BootstrapCompletionJktShape::Enrollment { current } = &guard.jkt_shape;
+    let current = current.clone();
     insert_operation_completion(
         transaction,
         &authority,
@@ -3172,35 +2920,6 @@ pub(crate) async fn complete_enrollment_bootstrap_operation(
         event_position,
         None,
         current.as_deref(),
-    )
-    .await
-}
-
-pub(crate) async fn complete_rebind_bootstrap_operation(
-    transaction: &mut Transaction<'_, Postgres>,
-    completion: RebindBootstrapCompletion,
-    completed_status: i32,
-    response_bytes: &[u8],
-    event_position: Option<i64>,
-) -> Result<(), PreludeError> {
-    let RebindBootstrapCompletion { guard, authority } = completion;
-    validate_bootstrap_completion(transaction, &guard, &authority).await?;
-    let (historical, current) = match &guard.jkt_shape {
-        BootstrapCompletionJktShape::Rebind {
-            historical,
-            current,
-        } => (historical.clone(), current.clone()),
-        _ => return Err(PreludeError::ClaimIntegrity),
-    };
-    insert_operation_completion(
-        transaction,
-        &authority,
-        guard.operation.binding,
-        completed_status,
-        response_bytes,
-        event_position,
-        Some(&historical),
-        Some(&current),
     )
     .await
 }
@@ -3247,10 +2966,6 @@ async fn validate_bootstrap_completion(
         BootstrapCompletionJktShape::Enrollment { current } => {
             (None, current.as_deref().unwrap_or(""))
         }
-        BootstrapCompletionJktShape::Rebind {
-            historical,
-            current,
-        } => (Some(historical.as_str()), current.as_str()),
     };
     let subject = authority.subject().as_str();
     let device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
@@ -3334,9 +3049,6 @@ async fn insert_operation_completion(
     historical_jkt: Option<&str>,
     current_jkt: Option<&str>,
 ) -> Result<(), PreludeError> {
-    if !(200..=599).contains(&completed_status) || response_bytes.is_empty() {
-        return Err(PreludeError::ClaimIntegrity);
-    }
     let mutation = authority
         .mutation()
         .ok_or(PreludeError::UnsupportedAuthority)?;
@@ -3346,8 +3058,47 @@ async fn insert_operation_completion(
     if !binding.matches_authority(authority)? {
         return Err(PreludeError::ClaimIntegrity);
     }
+    insert_operation_completion_record(
+        transaction,
+        &binding.principal_did,
+        &binding.endpoint_nsid,
+        binding.operation_id,
+        &binding.request_digest,
+        accepted_request_bytes,
+        mutation.transcript_bytes(),
+        &binding.signature,
+        completed_status,
+        response_bytes,
+        event_position,
+        historical_jkt,
+        current_jkt,
+        authority.trusted_instant().datetime(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn insert_operation_completion_record(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal_did: &str,
+    endpoint_nsid: &str,
+    operation_id: Uuid,
+    request_digest: &[u8],
+    accepted_request_bytes: &[u8],
+    signing_transcript_bytes: &[u8],
+    signature: &[u8],
+    completed_status: i32,
+    response_bytes: &[u8],
+    event_position: Option<i64>,
+    historical_jkt: Option<&str>,
+    current_jkt: Option<&str>,
+    completed_at: DateTime<Utc>,
+) -> Result<(), PreludeError> {
+    if !(200..=599).contains(&completed_status) || response_bytes.is_empty() {
+        return Err(PreludeError::ClaimIntegrity);
+    }
     let response_sha256: [u8; 32] = Sha256::digest(response_bytes).into();
-    let inserted = sqlx::query(
+    sqlx::query(
         r#"
         INSERT INTO chat.idempotency_records(
             principal_did,endpoint_nsid,operation_id,request_digest,
@@ -3357,35 +3108,24 @@ async fn insert_operation_completion(
         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
         "#,
     )
-    .bind(&binding.principal_did)
-    .bind(&binding.endpoint_nsid)
-    .bind(binding.operation_id)
-    .bind(binding.request_digest.as_slice())
+    .bind(principal_did)
+    .bind(endpoint_nsid)
+    .bind(operation_id)
+    .bind(request_digest)
     .bind(accepted_request_bytes)
-    .bind(mutation.transcript_bytes())
-    .bind(binding.signature.as_slice())
+    .bind(signing_transcript_bytes)
+    .bind(signature)
     .bind(completed_status)
     .bind(response_bytes)
     .bind(response_sha256.as_slice())
     .bind(event_position)
     .bind(historical_jkt)
     .bind(current_jkt)
-    .bind(authority.trusted_instant().datetime())
+    .bind(completed_at)
     .execute(&mut **transaction)
-    .await;
-    match inserted {
-        Ok(_) => Ok(()),
-        Err(error)
-            if error
-                .as_database_error()
-                .and_then(|database| database.code())
-                .as_deref()
-                == Some("23505") =>
-        {
-            Err(PreludeError::OperationIdConflict)
-        }
-        Err(error) => Err(PreludeError::Database(error)),
-    }
+    .await
+    .map(|_| ())
+    .map_err(operation_row_insert_error)
 }
 
 fn completion_digest_from_scope_authority(
@@ -3476,7 +3216,6 @@ fn completion_authority_digest(
     digest.update([match class {
         RepositoryAuthorityClass::ExistingDevice => 1,
         RepositoryAuthorityClass::EnrollmentBootstrap => 2,
-        RepositoryAuthorityClass::RebindBootstrap => 3,
     }]);
     digest.update(scope_receipt_id.as_bytes());
     for value in [

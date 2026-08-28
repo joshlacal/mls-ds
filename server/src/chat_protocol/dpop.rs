@@ -21,8 +21,8 @@ use super::{
     model::AuthPrimitiveError,
     repository::auth::{ReplayAuditIds, RepositoryAuthorityClass, RepositoryAuthorityReceipt},
     transcript::{
-        verify_signed_mutation, CanonicalRebindBootstrap, CanonicalSignedMutation,
-        VerifiedEnrollmentBody, VerifiedSignedMutation,
+        verify_signed_mutation, CanonicalSignedMutation, VerifiedEnrollmentBody,
+        VerifiedSignedMutation,
     },
     validation::{
         decode_canonical_base64url, enrollment_grant_expiry, validate_first_execution_signed_at,
@@ -187,7 +187,6 @@ pub struct LegacyDpopEvidence {
     pub(crate) auth_transaction_replay: Option<AuthTransactionReplayIdentity>,
     pub(crate) enrollment: Option<EnrollmentGrantEvidence>,
     pub(crate) enrollment_body: Option<VerifiedEnrollmentBody>,
-    pub(crate) rebind: Option<CanonicalRebindBootstrap>,
     pub(crate) endpoint: ValidatedChatNsid,
     pub(crate) method: CanonicalHttpMethod,
     pub(crate) htu: String,
@@ -295,26 +294,6 @@ impl PreReplayCryptographicVerification {
             .enrollment_body()
             .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not enrollment"))?;
         validate_first_execution_signed_at(body.signed_at(), self.trusted_instant())
-    }
-    pub fn rebind_bootstrap(&self) -> Option<&CanonicalRebindBootstrap> {
-        match &self.evidence {
-            PreReplayAuthenticationEvidence::StandardService(_) => None,
-            PreReplayAuthenticationEvidence::LegacyDpop(e) => e.rebind.as_ref(),
-        }
-    }
-    pub fn validate_rebind_first_execution_signed_at(&self) -> Result<(), AuthPrimitiveError> {
-        let bootstrap = self
-            .rebind_bootstrap()
-            .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?;
-        validate_first_execution_signed_at(bootstrap.signed_at(), self.trusted_instant())
-    }
-    pub fn verify_rebind_stored_signing_key(
-        &self,
-        stored_public_key: &[u8],
-    ) -> Result<(), AuthPrimitiveError> {
-        self.rebind_bootstrap()
-            .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?
-            .verify_signature_with_stored_key(stored_public_key)
     }
     pub fn endpoint(&self) -> &ValidatedChatNsid {
         match &self.evidence {
@@ -523,34 +502,6 @@ pub(super) fn mint_enrollment_repository_authority(
     })
 }
 
-/// Mint first-execution rebind authority.
-///
-/// The rebind bootstrap must **survive** into the returned authority: the
-/// repository stage (`lock_rebind_old_state_scope`) reads it back off
-/// `pre_replay` to bind the locked device row. Read it by reference only —
-/// moving it out here is what previously made every first-execution rebind
-/// fail closed with `UnsupportedAuthorizationShape` → `InvalidRequest`.
-pub(super) fn mint_rebind_repository_authority(
-    pre_replay: PreReplayCryptographicVerification,
-    stored_public_key: &[u8],
-    repository_receipt: RepositoryAuthorityReceipt,
-) -> Result<VerifiedChatDeviceRequest, AuthPrimitiveError> {
-    pre_replay.validate_rebind_first_execution_signed_at()?;
-    let mutation = pre_replay
-        .rebind_bootstrap()
-        .ok_or_else(|| AuthPrimitiveError::invalid("authentication is not a rebind"))?
-        .verify_mutation_with_stored_key(stored_public_key)?;
-    debug_assert!(
-        pre_replay.rebind_bootstrap().is_some(),
-        "rebind bootstrap must survive minting: the repository stage reads it back"
-    );
-    Ok(VerifiedChatDeviceRequest {
-        pre_replay,
-        mutation: Some(mutation),
-        repository_receipt,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Opaque existing-device read admission (Stage B).
 //
@@ -733,10 +684,7 @@ pub(crate) fn seal_read_admission(
         return Err(ReadAdmissionBindingError::OperationShape);
     }
     let pre_replay = request.pre_replay();
-    if pre_replay.enrollment_body().is_some()
-        || pre_replay.rebind_bootstrap().is_some()
-        || pre_replay.auth_transaction_replay().is_some()
-    {
+    if pre_replay.enrollment_body().is_some() || pre_replay.auth_transaction_replay().is_some() {
         return Err(ReadAdmissionBindingError::OperationShape);
     }
 
@@ -1181,7 +1129,6 @@ struct TokenClaims {
 enum AuthClass<'a> {
     Ordinary,
     Enrollment(&'a VerifiedEnrollmentBody),
-    Rebind(&'a CanonicalRebindBootstrap),
 }
 
 pub(crate) fn verify_ordinary_request_auth(
@@ -1194,9 +1141,7 @@ pub(crate) fn verify_ordinary_request_auth(
 ) -> Result<PreReplayCryptographicVerification, AuthPrimitiveError> {
     if matches!(
         endpoint.as_str(),
-        "blue.catbird.chat.enrollDevice"
-            | "blue.catbird.chat.rebindDeviceAuthentication"
-            | "blue.catbird.chat.subscribeEvents"
+        "blue.catbird.chat.enrollDevice" | "blue.catbird.chat.subscribeEvents"
     ) {
         return Err(AuthPrimitiveError::invalid(
             "endpoint has a non-ordinary authentication class",
@@ -1242,30 +1187,6 @@ pub(crate) fn verify_enrollment_request_auth(
     Ok(verified)
 }
 
-pub(crate) fn verify_rebind_request_auth(
-    trust: &TrustedNestVerifier,
-    authorization: &str,
-    dpop_proof: &str,
-    body: CanonicalRebindBootstrap,
-    trusted_instant: &TrustedRequestInstant,
-) -> Result<PreReplayCryptographicVerification, AuthPrimitiveError> {
-    let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication")?;
-    let method = endpoint.dpop_method()?;
-    let mut verified = verify_for_class(
-        trust,
-        authorization,
-        dpop_proof,
-        &endpoint,
-        &method,
-        trusted_instant,
-        AuthClass::Rebind(&body),
-    )?;
-    if let PreReplayAuthenticationEvidence::LegacyDpop(legacy) = &mut verified.evidence {
-        legacy.rebind = Some(body);
-    }
-    Ok(verified)
-}
-
 fn verify_for_class(
     trust: &TrustedNestVerifier,
     authorization: &str,
@@ -1297,23 +1218,6 @@ fn verify_for_class(
             body,
             token_parts.decode_payload()?,
         )?,
-        AuthClass::Rebind(body) => {
-            let claims = validate_ordinary_claims(
-                trust,
-                endpoint,
-                trusted_instant,
-                token_parts.decode_payload()?,
-            )?;
-            if claims.common.subject != *body.subject()
-                || claims.common.device_id != *body.device_id()
-                || claims.common.dpop_jkt != *body.new_dpop_jkt()
-            {
-                return Err(AuthPrimitiveError::invalid(
-                    "rebind token/body bootstrap mismatch",
-                ));
-            }
-            claims
-        }
     };
 
     let proof_parts = CompactJws::parse(dpop_proof)?;
@@ -1363,7 +1267,6 @@ fn verify_for_class(
             auth_transaction_replay,
             enrollment: token_claims.enrollment,
             enrollment_body: None,
-            rebind: None,
             endpoint: endpoint.clone(),
             method: method.clone(),
             htu: trust.external_base.htu(endpoint),
@@ -1688,7 +1591,6 @@ pub(crate) mod repository_test_evidence {
                 auth_transaction_replay: None,
                 enrollment: None,
                 enrollment_body: None,
-                rebind: None,
                 endpoint,
                 method: CanonicalHttpMethod::parse("GET").expect("fixed method is canonical"),
                 htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.getDevices".to_owned(),
@@ -1746,7 +1648,6 @@ pub(crate) mod repository_test_evidence {
                 auth_transaction_replay: None,
                 enrollment: None,
                 enrollment_body: None,
-                rebind: None,
                 htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
                 endpoint,
                 method,
@@ -1805,7 +1706,6 @@ pub(crate) mod repository_test_evidence {
                 auth_transaction_replay: None,
                 enrollment: None,
                 enrollment_body: None,
-                rebind: None,
                 htu: format!("https://chat.catbird.blue/xrpc/{endpoint_name}"),
                 endpoint,
                 method,
@@ -1878,63 +1778,7 @@ pub(crate) mod repository_test_evidence {
                     auth_time: NumericDate::new(now - 20).expect("test auth time is valid"),
                 }),
                 enrollment_body: Some(body),
-                rebind: None,
                 htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.enrollDevice".to_owned(),
-                endpoint,
-                method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
-                trusted_instant,
-                chat_instance,
-                token_iat: NumericDate::new(now - 10).expect("test token iat is valid"),
-                token_exp: NumericDate::new(now + 110).expect("test token exp is valid"),
-                proof_iat: NumericDate::new(now).expect("test proof iat is valid"),
-                token_sha256: Sha256::digest(token_jti_value.as_bytes()).into(),
-                proof_sha256: Sha256::digest(proof_jti_bytes).into(),
-            }),
-        }
-    }
-
-    pub(crate) fn rebind_with_replay(
-        bootstrap: CanonicalRebindBootstrap,
-        token_jti_value: uuid::Uuid,
-        proof_jti_bytes: [u8; 12],
-        trusted_at: &str,
-    ) -> PreReplayCryptographicVerification {
-        let subject = BareDid::parse(bootstrap.subject().as_str()).expect("test DID is canonical");
-        let device_id = CanonicalUuidV4::parse(bootstrap.device_id().as_str())
-            .expect("test device is canonical");
-        let dpop_jkt = KeyThumbprint::parse(bootstrap.new_dpop_jkt().as_str())
-            .expect("test new DPoP JKT is canonical");
-        let trusted_instant = TrustedRequestInstant::from_canonical_for_test(
-            CanonicalTimestamp::parse(trusted_at).expect("trusted test timestamp is canonical"),
-        );
-        let now = trusted_instant.datetime().timestamp();
-        let token_jti = CanonicalUuidV4::parse(&token_jti_value.hyphenated().to_string())
-            .expect("test token JTI is canonical");
-        let chat_instance = CanonicalUuidV4::parse("018f3f6a-7b2c-4d91-8a5e-0f123456789a")
-            .expect("fixed test instance UUID is canonical");
-        let endpoint = ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication")
-            .expect("rebind endpoint is canonical");
-        PreReplayCryptographicVerification {
-            evidence: PreReplayAuthenticationEvidence::LegacyDpop(LegacyDpopEvidence {
-                subject,
-                audience: "did:web:chat.catbird.blue".to_owned(),
-                device_id,
-                dpop_jkt: dpop_jkt.clone(),
-                token_replay: TokenReplayIdentity {
-                    issuer: "did:web:api.catbird.blue".to_owned(),
-                    jti: token_jti,
-                },
-                proof_replay: ProofReplayIdentity {
-                    jkt: dpop_jkt,
-                    jti: ProofJti::parse(&URL_SAFE_NO_PAD.encode(proof_jti_bytes))
-                        .expect("test proof JTI is canonical"),
-                },
-                auth_transaction_replay: None,
-                enrollment: None,
-                enrollment_body: None,
-                rebind: Some(bootstrap),
-                htu: "https://chat.catbird.blue/xrpc/blue.catbird.chat.rebindDeviceAuthentication"
-                    .to_owned(),
                 endpoint,
                 method: CanonicalHttpMethod::parse("POST").expect("POST is canonical"),
                 trusted_instant,

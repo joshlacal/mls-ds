@@ -750,80 +750,6 @@ fn bootstrap_completion_guard_rejects_claim_and_completion_token_mismatch() {
 }
 
 #[test]
-fn rebind_completion_guard_rejects_old_jkt_generation_key_and_signature_drift() {
-    let op_id = Uuid::parse_str("67a08d9c-46a3-4cb2-aa4a-50f756748f3a").unwrap();
-    let scope_receipt = Uuid::from_u128(2);
-    let scope_digest = [3u8; 32];
-    let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
-    let binding = OperationClaimBinding::for_test(
-        op_id,
-        "did:plc:test",
-        "blue.catbird.chat.rebindDeviceAuthentication",
-        "deviceAuthenticationRebind",
-        [7u8; 32],
-        [8u8; 32],
-        [9u8; 64],
-        instant,
-    );
-    let guard = BootstrapCompletionGuard {
-        operation: OperationClaimGuard {
-            transaction_id: "rebind-test-tx".to_owned(),
-            binding: OperationClaimBinding::for_test(
-                op_id,
-                "did:plc:test",
-                "blue.catbird.chat.rebindDeviceAuthentication",
-                "deviceAuthenticationRebind",
-                [7u8; 32],
-                [8u8; 32],
-                [9u8; 64],
-                instant,
-            ),
-        },
-        scope_receipt_id: scope_receipt,
-        authority_digest: bootstrap_completion_digest(
-            "rebind-test-tx",
-            &binding,
-            scope_receipt,
-            &scope_digest,
-            instant,
-            "did:plc:test",
-            Uuid::from_u128(3),
-            "new-jkt",
-            Some("old-jkt"),
-            Some("key-id"),
-            Some(7),
-            Some(&[2u8; 32]),
-        ),
-        scope_digest,
-        jkt_shape: BootstrapCompletionJktShape::Rebind {
-            historical: "old-jkt".to_owned(),
-            current: "new-jkt".to_owned(),
-        },
-    };
-    for (old_jkt, generation, key_id, key_digest) in [
-        ("drifted-old-jkt", 7, "key-id", [2u8; 32]),
-        ("old-jkt", 8, "key-id", [2u8; 32]),
-        ("old-jkt", 7, "other-key", [2u8; 32]),
-        ("old-jkt", 7, "key-id", [4u8; 32]),
-    ] {
-        assert!(!guard.matches_test_material(
-            "rebind-test-tx",
-            &binding,
-            scope_receipt,
-            &scope_digest,
-            instant,
-            "did:plc:test",
-            Uuid::from_u128(3),
-            "new-jkt",
-            Some(old_jkt),
-            Some(key_id),
-            Some(generation),
-            Some(&key_digest),
-        ));
-    }
-}
-
-#[test]
 fn replenishment_operation_completion_digest_binds_existing_device_receipt_dimensions() {
     let instant = Utc.timestamp_millis_opt(1_785_252_309_123).unwrap();
     let binding = OperationClaimBinding::for_test(
@@ -1056,7 +982,7 @@ fn bootstrap_completion_digest_differs_per_jkt_shape() {
         [9u8; 64],
         instant,
     );
-    // Enrollment: (None, Some(new)), Rebind: (Some(old), Some(new)), Replenishment: (None, None)
+    // Enrollment: (None, Some(new)), Replenishment: (None, None)
     let enrollment = bootstrap_completion_digest(
         "test-tx",
         &binding,
@@ -1085,22 +1011,8 @@ fn bootstrap_completion_digest_differs_per_jkt_shape() {
         None,
         None,
     );
-    let rebind = bootstrap_completion_digest(
-        "test-tx",
-        &binding,
-        scope_receipt,
-        &scope_digest,
-        instant,
-        "did:plc:test",
-        Uuid::from_u128(1),
-        "new-jkt",
-        Some("old-jkt"),
-        Some("key-id"),
-        Some(7),
-        Some(&[2u8; 32]),
-    );
-    assert!(
-        enrollment != replenishment || enrollment != rebind || replenishment != rebind,
+    assert_ne!(
+        enrollment, replenishment,
         "each JKT shape must produce a distinct digest"
     );
 }
@@ -1264,7 +1176,6 @@ fn bootstrap_completion_resource_functions_never_commit() {
     let source = include_str!("../../src/chat_protocol/repository/prelude.rs");
     for function_name in [
         "complete_enrollment_bootstrap_operation",
-        "complete_rebind_bootstrap_operation",
         "complete_replenishment_operation",
     ] {
         assert!(source.contains(function_name), "missing {function_name}");

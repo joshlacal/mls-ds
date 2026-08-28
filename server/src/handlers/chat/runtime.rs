@@ -65,6 +65,28 @@ impl ChatRuntime {
         let cutover_enabled = env_flag("CHAT_CUTOVER_ENABLED");
         let cursor_sealer = build_cursor_sealer_from_env()?;
         let subscription_endpoint = parse_subscription_endpoint_from_env()?;
+        #[cfg(feature = "test-support")]
+        let relationship_authority = if std::env::var("FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS")
+            .as_deref()
+            == Ok("true")
+        {
+            if std::env::var("APP_ENV").as_deref() != Ok("test") {
+                return Err(
+                    "FEDERATION_TEST_ALLOW_ALL_RELATIONSHIPS requires APP_ENV=test".to_owned(),
+                );
+            }
+            Arc::new(
+                ProductionRelationshipAuthority::federation_allow_all_for_test().map_err(
+                    |error| format!("federation test relationship authority rejected: {error:?}"),
+                )?,
+            )
+        } else {
+            Arc::new(ProductionRelationshipAuthority::from_startup_guard(
+                load_fixed_relationship_authority_startup_guard()
+                    .map_err(|error| format!("fixed relationship authority rejected: {error:?}"))?,
+            ))
+        };
+        #[cfg(not(feature = "test-support"))]
         let relationship_authority = Arc::new(ProductionRelationshipAuthority::from_startup_guard(
             load_fixed_relationship_authority_startup_guard()
                 .map_err(|error| format!("fixed relationship authority rejected: {error:?}"))?,

@@ -1,26 +1,18 @@
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
 
-#[allow(dead_code)]
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
 mod repository {
-    pub(crate) mod inventory {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/inventory.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
-
-// The HMAC codec surface is retained byte-stable for the lane D-2 rewiring
-// and the own-device codec for lane F; this test crate exercises it only
-// through the kept own-device and hash tests.
-#[allow(dead_code)]
 mod cursor {
-    include!("../src/chat_protocol/cursor.rs");
+    pub(crate) use crate::chat_protocol::cursor::*;
+}
+mod validation {
+    pub(crate) use crate::chat_protocol::validation::*;
 }
 
 mod cursor_tests {
@@ -972,7 +964,6 @@ mod cursor_tests {
             ),
             ("nil device", Box::new(|s| s.device_id = Uuid::nil())),
             ("empty user did", Box::new(|s| s.user_did.clear())),
-            ("empty jkt", Box::new(|s| s.jkt.clear())),
             ("zero auth generation", Box::new(|s| s.auth_generation = 0)),
             (
                 "nil protocol instance",
@@ -1012,6 +1003,13 @@ mod cursor_tests {
                 "{name} must be rejected"
             );
         }
+
+        let mut standard_service_spec = PageSpec::default();
+        standard_service_spec.jkt.clear();
+        assert!(
+            standard_service_spec.try_to_binding().is_ok(),
+            "standard-service admissions without a DPoP thumbprint must remain representable"
+        );
 
         let mut event = DeterministicRandom::new(1);
         let bad_event = SealerBinding::for_event_cursor_receipt(

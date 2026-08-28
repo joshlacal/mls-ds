@@ -255,3 +255,226 @@ pub async fn seed_deterministic_pending_add_fallback(
         .map_err(|e| format!("commit fallback tx: {e}"))?;
     Ok(())
 }
+
+#[cfg(feature = "test-support")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FederationFixtureInput {
+    conversation_id: uuid::Uuid,
+    configured_sequencer_did: String,
+    configured_sequencer_term: i64,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactOutcomeOutput {
+    outcome: &'static str,
+    conversation_id: uuid::Uuid,
+    sequencer_term: i64,
+    head_seq: i64,
+    digest_sha256: String,
+}
+
+#[cfg(feature = "test-support")]
+pub fn with_federation_test_user_routes(
+    resolver: crate::federation::DsResolver,
+    config: &crate::federation::FederationConfig,
+) -> Result<crate::federation::DsResolver, String> {
+    if std::env::var("APP_ENV").as_deref() != Ok("test") {
+        return Err("test user routing requires APP_ENV=test".to_string());
+    }
+    let local_user_dids = std::env::var("FEDERATION_TEST_LOCAL_USER_DIDS")
+        .map_err(|_| "FEDERATION_TEST_LOCAL_USER_DIDS must be configured".to_string())?
+        .split(',')
+        .map(str::trim)
+        .filter(|did| !did.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if local_user_dids.is_empty() {
+        return Err("FEDERATION_TEST_LOCAL_USER_DIDS must not be empty".to_string());
+    }
+    let local_did = config.self_did.clone();
+    let local_endpoint = config.self_endpoint.clone();
+    let (peer_did, peer_endpoint) = config.default_ds.clone().ok_or_else(|| {
+        "test user routing requires DEFAULT_DS_DID and DEFAULT_DS_ENDPOINT".to_string()
+    })?;
+
+    Ok(
+        resolver.with_user_did_resolver_hook(std::sync::Arc::new(move |user_did| {
+            let (did, endpoint) = if local_user_dids.iter().any(|did| did == user_did) {
+                (local_did.clone(), local_endpoint.clone())
+            } else {
+                (peer_did.clone(), peer_endpoint.clone())
+            };
+            Some(Ok(crate::federation::DsEndpoint {
+                did,
+                endpoint,
+                supported_cipher_suites: None,
+                federation_capabilities: None,
+            }))
+        })),
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub async fn run_federation_fixture() -> Result<(), String> {
+    let app_env = std::env::var("APP_ENV")
+        .map_err(|_| "APP_ENV must be set to 'test' to run federation_fixture".to_string())?;
+    if app_env != "test" {
+        return Err(format!(
+            "refusing to run federation_fixture outside of APP_ENV=test (found APP_ENV={app_env})"
+        ));
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 2 {
+        return Err("usage: federation_fixture <path-to-selector-json>".to_string());
+    }
+    let file_path = &args[1];
+
+    use std::io::Read;
+    let mut file = std::fs::File::open(file_path)
+        .map_err(|e| format!("failed to open selector file '{file_path}': {e}"))?;
+    let mut buffer = Vec::new();
+    let bytes_read = (&mut file)
+        .take(4097)
+        .read_to_end(&mut buffer)
+        .map_err(|e| format!("failed to read selector file '{file_path}': {e}"))?;
+    if bytes_read > 4096 {
+        return Err(format!(
+            "selector file '{file_path}' exceeds maximum allowed size of 4096 bytes (read {bytes_read} bytes)"
+        ));
+    }
+
+    let input: FederationFixtureInput = serde_json::from_slice(&buffer)
+        .map_err(|e| format!("failed to parse selector JSON: {e}"))?;
+
+    let selector = crate::federation::RemotePrefixBootstrapSelector::new(
+        input.conversation_id,
+        input.configured_sequencer_did,
+        input.configured_sequencer_term,
+    )
+    .map_err(|e| format!("invalid bootstrap selector: {e}"))?;
+
+    crate::auth::load_test_did_fixtures_from_env()
+        .await
+        .map_err(|e| format!("failed to load test did fixtures: {e}"))?;
+
+    let pool = crate::db::init_db_default()
+        .await
+        .map_err(|e| format!("failed to initialize database pool: {e}"))?;
+
+    let fed_config = crate::federation::FederationConfig::from_env();
+
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            fed_config.outbound_connect_timeout_secs,
+        ))
+        .timeout(std::time::Duration::from_secs(
+            fed_config.outbound_timeout_secs,
+        ))
+        .user_agent("catbird-mls-ds/1.0")
+        .build()
+        .map_err(|e| format!("failed to build http client: {e}"))?;
+
+    let (peer_did, peer_endpoint) = fed_config.default_ds.clone().ok_or_else(|| {
+        "federation fixture requires DEFAULT_DS_DID and DEFAULT_DS_ENDPOINT".to_string()
+    })?;
+    if peer_did != selector.configured_sequencer_did() {
+        return Err("fixture sequencer DID must match DEFAULT_DS_DID".to_string());
+    }
+
+    let resolver_peer_did = peer_did.clone();
+    let resolver_peer_endpoint = peer_endpoint.clone();
+    let resolver = crate::federation::DsResolver::new(
+        pool.clone(),
+        http_client,
+        fed_config.self_did.clone(),
+        fed_config.self_endpoint.clone(),
+        fed_config.default_ds.clone(),
+        fed_config.endpoint_cache_ttl_secs,
+    )
+    .with_destination_resolver_hook(std::sync::Arc::new(move |target| {
+        if target != resolver_peer_did && target != resolver_peer_endpoint {
+            return None;
+        }
+
+        let endpoint = resolver_peer_endpoint.clone();
+        Some(Box::pin(async move {
+            crate::federation::resolver::validate_and_resolve_destination(&endpoint, None).await
+        }))
+    }));
+    let resolver = with_federation_test_user_routes(resolver, &fed_config)?;
+
+    let outbound = crate::federation::outbound::OutboundClient::new(
+        fed_config.outbound_connect_timeout_secs,
+        fed_config.outbound_timeout_secs,
+    );
+
+    let signing_pem = fed_config
+        .signing_key_pem
+        .as_ref()
+        .ok_or_else(|| "federation service auth signing key is not configured".to_string())?;
+
+    let service_auth = crate::federation::ServiceAuthClient::from_es256_pem(
+        fed_config.self_did.clone(),
+        signing_pem.as_bytes(),
+        None,
+    )
+    .map_err(|e| format!("failed to create service auth client: {e}"))?;
+
+    let auth_sign = move |target_did: &str, method: &str| -> Result<String, String> {
+        service_auth
+            .sign_request(target_did, method)
+            .map_err(|e| e.to_string())
+    };
+
+    let outcome = crate::federation::bootstrap::bootstrap_remote_mailbox_from_selector(
+        &pool, &resolver, &outbound, &auth_sign, selector,
+    )
+    .await
+    .map_err(|e| format!("bootstrap remote mailbox failed: {e}"))?;
+
+    let output = match outcome {
+        crate::federation::RemotePrefixApplyOutcome::Applied {
+            conversation_id,
+            sequencer_term,
+            last_seq,
+            digest_sha256,
+        } => CompactOutcomeOutput {
+            outcome: "applied",
+            conversation_id,
+            sequencer_term,
+            head_seq: last_seq,
+            digest_sha256: hex::encode(digest_sha256),
+        },
+        crate::federation::RemotePrefixApplyOutcome::ExactReplay {
+            conversation_id,
+            sequencer_term,
+            last_seq,
+            digest_sha256,
+        } => CompactOutcomeOutput {
+            outcome: "exactReplay",
+            conversation_id,
+            sequencer_term,
+            head_seq: last_seq,
+            digest_sha256: hex::encode(digest_sha256),
+        },
+        crate::federation::RemotePrefixApplyOutcome::Quarantined {
+            first_mismatch_seq,
+            reason,
+            ..
+        } => {
+            return Err(format!(
+                "bootstrap remote mailbox quarantined at seq {first_mismatch_seq}: {}",
+                reason.as_str()
+            ));
+        }
+    };
+
+    let json_bytes =
+        serde_json::to_string(&output).map_err(|e| format!("failed to serialize outcome: {e}"))?;
+    println!("{json_bytes}");
+    Ok(())
+}

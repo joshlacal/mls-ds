@@ -1,8 +1,11 @@
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::future::Future;
+#[cfg(any(test, feature = "test-support"))]
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -431,6 +434,7 @@ pub struct DsEndpoint {
     pub federation_capabilities: Option<Vec<String>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub type DestinationResolverFn = Arc<
     dyn Fn(
             &str,
@@ -458,6 +462,7 @@ pub struct DsResolver {
     default_ds_did: Option<String>,
     default_ds_endpoint: Option<String>,
     cache_ttl_secs: i64,
+    #[cfg(any(test, feature = "test-support"))]
     destination_resolver: Option<DestinationResolverFn>,
     #[cfg(any(test, feature = "test-support"))]
     user_did_resolver: Option<UserDidResolverFn>,
@@ -497,12 +502,14 @@ impl DsResolver {
             default_ds_did: resolved_default_did,
             default_ds_endpoint: resolved_default_endpoint,
             cache_ttl_secs: cache_ttl_secs as i64,
+            #[cfg(any(test, feature = "test-support"))]
             destination_resolver: None,
             #[cfg(any(test, feature = "test-support"))]
             user_did_resolver: None,
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_destination_resolver_hook(mut self, hook: DestinationResolverFn) -> Self {
         self.destination_resolver = Some(hook);
         self
@@ -587,6 +594,60 @@ impl DsResolver {
         );
         metrics::counter!("ds_resolve_outcome_total", 1, "outcome" => outcome);
         result
+    }
+
+    /// Resolve a user DID to its DS endpoint without writing to did_ds_mappings or ds_endpoints.
+    ///
+    /// Required for pre-admission participant routing verification where database mutations must not occur on failure.
+    pub async fn resolve_uncached(&self, user_did: &str) -> Result<DsEndpoint, FederationError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = &self.user_did_resolver {
+            if let Some(res) = hook(user_did) {
+                return res;
+            }
+        }
+
+        // Check if it's us
+        if canonical_did(user_did) == canonical_did(&self.self_did) {
+            return Ok(DsEndpoint {
+                did: self.self_did.clone(),
+                endpoint: self.self_endpoint.clone(),
+                supported_cipher_suites: None,
+                federation_capabilities: Some(super::local_federation_capabilities()),
+            });
+        }
+
+        // Fresh cache (TTL-bounded)
+        if let Ok(Some(cached)) = self.get_cached(user_did).await {
+            return Ok(cached);
+        }
+
+        // `#atproto_mls` service entry in the user's DID document
+        if let Ok(endpoint) = self.resolve_from_did_doc(user_did).await {
+            return Ok(endpoint);
+        }
+
+        // Declaration record (blue.catbird.chat.declaration/self)
+        if let Ok(endpoint) = self.resolve_from_declaration(user_did).await {
+            return Ok(endpoint);
+        }
+
+        // Profile record fallback (blue.catbird.chat.profile)
+        if let Ok(endpoint) = self.resolve_from_repo(user_did).await {
+            return Ok(endpoint);
+        }
+
+        // Degraded mode
+        if let Ok(Some(cached)) = self.get_cached_any(user_did).await {
+            return Ok(cached);
+        }
+
+        Err(FederationError::ResolutionFailed {
+            did: user_did.to_string(),
+            kind: ResolutionFailureKind::ServiceMissing(format!(
+                "Could not resolve delivery service for user {user_did}"
+            )),
+        })
     }
 
     async fn resolve_with_outcome(
@@ -769,12 +830,14 @@ impl DsResolver {
         &self,
         ds_did: &str,
     ) -> Result<ValidatedRemoteDestination, FederationError> {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.destination_resolver {
             if let Some(fut) = hook(ds_did) {
                 return fut.await;
             }
         }
         let endpoint = self.resolve_ds_did(ds_did).await?;
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.destination_resolver {
             if let Some(fut) = hook(&endpoint.endpoint) {
                 return fut.await;
@@ -782,12 +845,43 @@ impl DsResolver {
         }
         validate_and_resolve_destination(&endpoint.endpoint, None).await
     }
+    /// Resolve a DS DID to a validated remote destination without writing to ds_endpoints cache.
+    ///
+    /// Preserves test destination resolver hooks and performs live resolution with no database access.
+    pub async fn resolve_ds_destination_uncached(
+        &self,
+        ds_did: &str,
+    ) -> Result<ValidatedRemoteDestination, FederationError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = &self.destination_resolver {
+            if let Some(fut) = hook(ds_did) {
+                return fut.await;
+            }
+        }
+        let canonical = canonical_did(ds_did);
+        if canonical.is_empty() {
+            return Err(FederationError::ResolutionFailed {
+                did: ds_did.to_string(),
+                kind: ResolutionFailureKind::InvalidDid("Empty DS DID".to_string()),
+            });
+        }
+        let endpoint_url = self.resolve_ds_did_to_endpoint(canonical).await?;
+
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = &self.destination_resolver {
+            if let Some(fut) = hook(&endpoint_url) {
+                return fut.await;
+            }
+        }
+        validate_and_resolve_destination(&endpoint_url, None).await
+    }
 
     /// Resolve an endpoint URL directly to a validated remote destination with pinned socket addrs.
     pub async fn resolve_endpoint_destination(
         &self,
         endpoint_url: &str,
     ) -> Result<ValidatedRemoteDestination, FederationError> {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.destination_resolver {
             if let Some(fut) = hook(endpoint_url) {
                 return fut.await;
@@ -1068,6 +1162,14 @@ impl DsResolver {
                         )),
                     });
                 }
+            }
+        }
+        if let (Some(configured_did), Some(configured_endpoint)) =
+            (&self.default_ds_did, &self.default_ds_endpoint)
+        {
+            if configured_did == canonical_ds {
+                self.validate_remote_url(configured_endpoint).await?;
+                return Ok(configured_endpoint.clone());
             }
         }
 
@@ -2137,6 +2239,12 @@ pub(crate) async fn send_hardened_resolution_request(
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use base64::Engine as _;
 
@@ -3218,7 +3326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_fresh_cache_short_circuits() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool,
@@ -3254,7 +3362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_expired_cache_degraded_after_live_failure() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -3306,7 +3414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_default_fallback_when_no_cache() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool,
@@ -3331,7 +3439,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_hard_failure_without_default() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::with_defaults(
             pool,
@@ -3352,37 +3460,13 @@ mod tests {
         ));
     }
 
-    async fn setup_cache_test_pool() -> PgPool {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for database integration tests");
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .connect(&database_url)
-            .await
-            .expect("failed to connect to TEST_DATABASE_URL");
-
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migration run failed in setup_cache_test_pool");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
-
-        pool
+    async fn setup_cache_test_pool() -> (PgPool, fresh_db::DisposableDatabase) {
+        fresh_db::fresh_legacy_pool("fed_resolver_", 5, 1).await
     }
 
     #[tokio::test]
     async fn test_cache_refresh_and_invalidate() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -3447,7 +3531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_two_table_cache_actor_mapping_and_ds_queue_lookup() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         let resolver = DsResolver::new(
             pool.clone(),
@@ -3522,7 +3606,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_fallback_has_real_ds_identity() {
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
 
         // 1. Test HTTPS URL fallback derives did:web:<host>
         let resolver = DsResolver::with_defaults(
@@ -3784,7 +3868,10 @@ mod tests {
             reqwest::Client::new(),
             "did:web:self.example.com".to_string(),
             "https://self.example.com".to_string(),
-            None,
+            Some((
+                "did:web:8.8.4.4".to_string(),
+                "https://8.8.4.4/federation".to_string(),
+            )),
             3600,
         );
 
@@ -3801,6 +3888,14 @@ mod tests {
             .await
             .expect("public ip did:web resolves to https endpoint");
         assert_eq!(remote_endpoint, "https://8.8.8.8");
+
+        // The configured endpoint wins for its exact DS DID; direct did:web
+        // derivation would lose the deployment-specific path.
+        let configured_endpoint = resolver
+            .resolve_ds_did_to_endpoint("did:web:8.8.4.4")
+            .await
+            .expect("configured DS DID resolves to configured endpoint");
+        assert_eq!(configured_endpoint, "https://8.8.4.4/federation");
     }
 
     #[tokio::test]
@@ -3828,7 +3923,7 @@ mod tests {
             err_direct,
             FederationError::ResolutionFailed { .. }
         ));
-        let pool = setup_cache_test_pool().await;
+        let (pool, _db) = setup_cache_test_pool().await;
         let resolver = DsResolver::new(
             pool,
             reqwest::Client::new(),
@@ -4076,14 +4171,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migration_purges_legacy_actor_keyed_ds_endpoints_row() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for migration test");
-
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
+        let (pool, _db) = fresh_db::fresh_full_catalog_pool("fed_resolver_", 2).await;
         let mut conn = pool
             .acquire()
             .await

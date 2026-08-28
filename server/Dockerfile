@@ -26,6 +26,11 @@ COPY codegen codegen
 COPY lexicon lexicon
 RUN cargo build --release -p catbird-server
 
+# ---------- federation-builder (test-only builder) ----------
+FROM builder AS federation-builder
+
+RUN cargo build --release -p catbird-server --features test-support --bin federation_fixture --bin catbird-server
+
 # ---------- runtime-base ----------
 FROM debian:bookworm-slim AS runtime-base
 
@@ -50,8 +55,10 @@ CMD ["catbird-server"]
 FROM runtime-base AS federation-test
 
 USER root
+COPY --from=federation-builder /build/target/release/catbird-server /usr/local/bin/catbird-server
+COPY --from=federation-builder /build/target/release/federation_fixture /usr/local/bin/federation_fixture
 COPY e2e-tests/fixtures /app/fixtures
-RUN chown -R catbird:catbird /app/fixtures
+RUN chown -R catbird:catbird /app/fixtures /usr/local/bin/federation_fixture
 
 USER catbird
 

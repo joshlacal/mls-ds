@@ -1,9 +1,9 @@
-//! Transaction-bound acceptConversation repository composition.
-//!
-//! Acceptance owns the locked aggregate, exact successor KeyPackage
-//! reservation, recovery server-fields projection, canonical output, and its
-//! endpoint-specific replay post-state proof.  The handler never receives a
-//! raw planner or execution-artifact seam.
+// Transaction-bound acceptConversation repository composition.
+//
+// Acceptance owns the locked aggregate, exact successor KeyPackage
+// reservation, recovery server-fields projection, canonical output, and its
+// endpoint-specific replay post-state proof.  The handler never receives a
+// raw planner or execution-artifact seam.
 
 use base64::Engine as _;
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;

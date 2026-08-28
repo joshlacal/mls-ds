@@ -588,15 +588,10 @@ mod tests {
 
     #[test]
     fn device_auth_binding_has_dedicated_tight_quota() {
-        let (begin_limit, begin_window) =
-            get_endpoint_quota("/xrpc/blue.catbird.chat.enrollDevice");
-        let (complete_limit, complete_window) =
-            get_endpoint_quota("/xrpc/blue.catbird.chat.rebindDeviceAuthentication");
+        let (limit, window) = get_endpoint_quota("/xrpc/blue.catbird.chat.enrollDevice");
 
-        assert_eq!(begin_limit, 10);
-        assert_eq!(complete_limit, 10);
-        assert_eq!(begin_window, Duration::from_secs(60));
-        assert_eq!(complete_window, Duration::from_secs(60));
+        assert_eq!(limit, 10);
+        assert_eq!(window, Duration::from_secs(60));
     }
 
     #[test]

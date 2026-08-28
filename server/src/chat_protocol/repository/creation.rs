@@ -1,8 +1,8 @@
-//! Transaction-bound createConversation repository composition.
-//!
-//! This module deliberately owns the Creation planner, generated-DTO response,
-//! execution capsule, and endpoint-specific replay proof.  Handlers only pass
-//! the caller-owned transaction and the already-arbitrated operation.
+// Transaction-bound createConversation repository composition.
+//
+// This module deliberately owns the Creation planner, generated-DTO response,
+// execution capsule, and endpoint-specific replay proof.  Handlers only pass
+// the caller-owned transaction and the already-arbitrated operation.
 
 use base64::Engine as _;
 use catbird_atproto::generated::blue_catbird::chat as chat_dto;
@@ -643,6 +643,12 @@ fn bind(digest: &mut Sha256, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use crate::chat_protocol::dpop;
     use crate::chat_protocol::relationship_policy::ProductionRelationshipAuthority;
@@ -661,15 +667,8 @@ mod tests {
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
-    async fn test_pool() -> PgPool {
-        let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-            "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string()
-        });
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("PostgreSQL test database connection is required for behavioral creation tests")
+    async fn test_pool() -> (PgPool, fresh_db::DisposableDatabase) {
+        fresh_db::fresh_full_catalog_pool("chat_creation_", 2).await
     }
     fn random_test_did(prefix: &str) -> String {
         let bytes = Uuid::new_v4();
@@ -982,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn direct_dedup_member_caller_returns_existing_conversation_and_preserves_wire_contract()
     {
-        let pool = test_pool().await;
+        let (pool, _db) = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
         let trusted_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
@@ -1118,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn direct_dedup_non_member_caller_rejects_with_conversation_already_exists_and_no_mutation(
     ) {
-        let pool = test_pool().await;
+        let (pool, _db) = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
         let trusted_at: DateTime<Utc> =
             sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")

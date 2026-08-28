@@ -1,62 +1,12 @@
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
+
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
-    pub(crate) use crate::chat_protocol::repository::inventory;
-}
-
-mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use std::{
@@ -78,18 +28,16 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use chat_protocol::dpop::{
-    verify_enrollment_request_auth, verify_ordinary_request_auth, verify_rebind_request_auth,
-    TrustedNestVerifier, MAX_TRUSTED_NEST_AUDIENCE_BYTES, MAX_TRUSTED_NEST_ISSUER_BYTES,
-    MAX_TRUSTED_NEST_KEY_ID_BYTES,
+    verify_enrollment_request_auth, verify_ordinary_request_auth, TrustedNestVerifier,
+    MAX_TRUSTED_NEST_AUDIENCE_BYTES, MAX_TRUSTED_NEST_ISSUER_BYTES, MAX_TRUSTED_NEST_KEY_ID_BYTES,
 };
-use transcript::{
+use chat_protocol::transcript::{
     build_verified_control_entry, decode_and_verify_control_entry,
     decode_and_verify_enrollment_body, decode_and_verify_signed_mutation,
-    decode_canonical_signed_mutation, decode_control_fingerprint, decode_rebind_bootstrap,
-    verify_signed_mutation, CanonicalControlServerFields, ControlEntryKind, SignedMutationKind,
-    VerifiedMutationProjection,
+    decode_canonical_signed_mutation, decode_control_fingerprint, verify_signed_mutation,
+    CanonicalControlServerFields, ControlEntryKind, SignedMutationKind, VerifiedMutationProjection,
 };
-use validation::{
+use chat_protocol::validation::{
     basic_credential_identity, ed25519_key_id, enrollment_grant_expiry,
     validate_first_execution_signed_at, BareDid, CanonicalHttpMethod, CanonicalTimestamp,
     CanonicalUuidV4, DpopAuthorization, KeyThumbprint, NumericDate, ProofJti, TrustedExternalBase,
@@ -412,7 +360,6 @@ fn every_dpop_endpoint_owns_its_exact_http_method_profile() {
     for endpoint in [
         "blue.catbird.chat.enrollDevice",
         "blue.catbird.chat.replenishKeyPackages",
-        "blue.catbird.chat.rebindDeviceAuthentication",
         "blue.catbird.chat.revokeDevice",
         "blue.catbird.chat.createConversation",
         "blue.catbird.chat.acceptConversation",
@@ -562,11 +509,6 @@ fn all_frozen_signed_mutation_contracts_have_owned_type_and_domain() {
             SignedMutationKind::KeyPackageReplenishment,
             "keyPackageReplenishmentBody",
             "CATBIRD-CHAT-DEVICE-REPLENISH\0",
-        ),
-        (
-            SignedMutationKind::DeviceAuthenticationRebind,
-            "deviceAuthenticationRebindBody",
-            "CATBIRD-CHAT-DEVICE-REBIND\0",
         ),
         (
             SignedMutationKind::DeviceRevocation,
@@ -1291,11 +1233,11 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
 
     assert_eq!(verified.subject().as_str(), DID);
     assert_eq!(verified.device_id().as_str(), DEVICE_ID);
-    assert_eq!(verified.dpop_jkt().as_str(), proof_jkt);
-    assert_eq!(verified.token_replay().issuer(), ISSUER);
-    assert_eq!(verified.token_replay().jti().as_str(), TOKEN_JTI);
-    assert_eq!(verified.proof_replay().jkt().as_str(), proof_jkt);
-    assert_eq!(verified.proof_replay().jti_bytes(), &[1; 12]);
+    assert_eq!(verified.dpop_jkt().unwrap().as_str(), proof_jkt);
+    assert_eq!(verified.token_replay().unwrap().issuer(), ISSUER);
+    assert_eq!(verified.token_replay().unwrap().jti().as_str(), TOKEN_JTI);
+    assert_eq!(verified.proof_replay().unwrap().jkt().as_str(), proof_jkt);
+    assert_eq!(verified.proof_replay().unwrap().jti_bytes(), &[1; 12]);
     assert!(verified.auth_transaction_replay().is_none());
     assert_eq!(
         verified.token_sha256(),
@@ -1308,7 +1250,7 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
     assert_eq!(verified.endpoint().as_str(), "blue.catbird.chat.getEntries");
     assert_eq!(verified.method().as_str(), "GET");
     assert_eq!(verified.htu(), htu);
-    assert_eq!(verified.chat_instance().as_str(), CHAT_INSTANCE);
+    assert_eq!(verified.chat_instance().unwrap().as_str(), CHAT_INSTANCE);
     assert_eq!(verified.token_iat().get(), 1_700_000_000);
     assert_eq!(verified.token_exp().get(), 1_700_000_120);
     assert_eq!(verified.proof_iat().get(), 1_700_000_060);
@@ -1324,10 +1266,13 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
         &now,
     )
     .unwrap();
-    assert_eq!(repeated.token_replay().jti(), verified.token_replay().jti());
     assert_eq!(
-        repeated.proof_replay().jti_bytes(),
-        verified.proof_replay().jti_bytes()
+        repeated.token_replay().unwrap().jti(),
+        verified.token_replay().unwrap().jti()
+    );
+    assert_eq!(
+        repeated.proof_replay().unwrap().jti_bytes(),
+        verified.proof_replay().unwrap().jti_bytes()
     );
     assert!(repeated.requires_atomic_replay_consumption());
 
@@ -1611,10 +1556,7 @@ fn ordinary_nest_token_and_dpop_proof_verify_as_one_bound_request() {
     )
     .is_err());
 
-    for special in [
-        "blue.catbird.chat.enrollDevice",
-        "blue.catbird.chat.rebindDeviceAuthentication",
-    ] {
+    for special in ["blue.catbird.chat.enrollDevice"] {
         assert!(verify_ordinary_request_auth(
             &trust,
             &format!("DPoP {token}"),
@@ -1806,7 +1748,11 @@ fn enrollment_grant_has_exact_claims_formula_bindings_and_third_replay_identity(
     )
     .unwrap();
     assert_eq!(
-        stale_exact_pre_replay.token_replay().jti().as_str(),
+        stale_exact_pre_replay
+            .token_replay()
+            .unwrap()
+            .jti()
+            .as_str(),
         RETRY_TOKEN_JTI
     );
     assert_eq!(
@@ -1818,12 +1764,12 @@ fn enrollment_grant_has_exact_claims_formula_bindings_and_third_replay_identity(
         RETRY_AUTH_TXN
     );
     assert_ne!(
-        stale_exact_pre_replay.token_replay().jti(),
-        verified.token_replay().jti()
+        stale_exact_pre_replay.token_replay().unwrap().jti(),
+        verified.token_replay().unwrap().jti()
     );
     assert_ne!(
-        stale_exact_pre_replay.proof_replay().jti_bytes(),
-        verified.proof_replay().jti_bytes()
+        stale_exact_pre_replay.proof_replay().unwrap().jti_bytes(),
+        verified.proof_replay().unwrap().jti_bytes()
     );
     assert!(stale_exact_pre_replay
         .validate_enrollment_first_execution_signed_at()
@@ -1849,156 +1795,6 @@ fn maximum_key_package_batch_is_not_rejected_by_a_smaller_global_json_cap() {
     assert!(raw.len() > 8 * 1024 * 1024);
     assert!(raw.len() < 16 * 1024 * 1024);
     decode_and_verify_enrollment_body(&raw).unwrap();
-}
-
-#[test]
-fn rebind_bootstrap_uses_signed_new_jkt_but_remains_pre_repository_authority() {
-    let nest_signing = signing_key(27);
-    let current_proof_signing = signing_key(29);
-    let new_proof_signing = signing_key(31);
-    let body_signing = Ed25519SigningKey::from_bytes(&[33_u8; 32]);
-    let current_jwk = public_jwk(&current_proof_signing);
-    let current_jkt = jwk_thumbprint(&current_jwk);
-    let new_jwk = public_jwk(&new_proof_signing);
-    let new_jkt = jwk_thumbprint(&new_jwk);
-    let raw = sign_chat_body(
-        rebind_body(&current_jkt, &new_jkt, &body_signing),
-        &body_signing,
-    );
-    let bootstrap = decode_rebind_bootstrap(&raw).unwrap();
-    assert_eq!(bootstrap.new_dpop_jkt().as_str(), new_jkt);
-    assert_eq!(bootstrap.current_dpop_jkt().as_str(), current_jkt);
-    assert_eq!(bootstrap.expected_auth_generation(), 1);
-    assert_eq!(bootstrap.idempotency_key().as_str(), CHAT_INSTANCE);
-    assert_eq!(bootstrap.accepted_wrapper_bytes(), raw);
-
-    let verified_body = verify_signed_mutation(
-        decode_canonical_signed_mutation(&raw).unwrap(),
-        body_signing.verifying_key().as_bytes(),
-    )
-    .unwrap();
-    assert_eq!(
-        verified_body.kind(),
-        SignedMutationKind::DeviceAuthenticationRebind
-    );
-
-    let origin = TrustedExternalBase::parse("https://chat.example.net", &BTreeSet::new()).unwrap();
-    let endpoint =
-        ValidatedChatNsid::parse("blue.catbird.chat.rebindDeviceAuthentication").unwrap();
-    let now = TrustedRequestInstant::from_canonical_for_test(
-        CanonicalTimestamp::parse("2023-11-14T22:14:20.000Z").unwrap(),
-    );
-    let token = sign_jwt(
-        json!({"alg":"ES256","typ":"JWT","kid":"nest-key-1"}),
-        json!({
-            "iss": ISSUER,
-            "sub": DID,
-            "aud": AUDIENCE,
-            "lxm": endpoint.as_str(),
-            "iat": 1_700_000_000_i64,
-            "exp": 1_700_000_120_i64,
-            "jti": TOKEN_JTI,
-            "cnf": {"jkt": new_jkt},
-            "device_id": DEVICE_ID,
-            "chat_instance": CHAT_INSTANCE
-        }),
-        &nest_signing,
-    );
-    let proof = dpop_proof(
-        &new_proof_signing,
-        &new_jwk,
-        "POST",
-        &origin.htu(&endpoint),
-        &token,
-        1_700_000_060,
-        &[17; 12],
-    );
-    let trust = TrustedNestVerifier::new(
-        ISSUER,
-        AUDIENCE,
-        CanonicalUuidV4::parse(CHAT_INSTANCE).unwrap(),
-        "nest-key-1",
-        nest_signing.verifying_key().to_owned(),
-        origin,
-    )
-    .unwrap();
-    let pre_replay =
-        verify_rebind_request_auth(&trust, &format!("DPoP {token}"), &proof, bootstrap, &now)
-            .unwrap();
-    assert_eq!(pre_replay.dpop_jkt().as_str(), new_jkt);
-    assert!(pre_replay.requires_atomic_replay_consumption());
-    assert_eq!(pre_replay.trusted_instant().as_str(), now.as_str());
-    let carried_bootstrap = pre_replay.rebind_bootstrap().unwrap();
-    assert_eq!(carried_bootstrap.current_dpop_jkt().as_str(), current_jkt);
-    assert_eq!(carried_bootstrap.new_dpop_jkt().as_str(), new_jkt);
-    assert_eq!(carried_bootstrap.expected_auth_generation(), 1);
-    assert_eq!(
-        carried_bootstrap.request_digest(),
-        verified_body.request_digest()
-    );
-    assert_eq!(carried_bootstrap.signature(), verified_body.signature());
-    pre_replay
-        .validate_rebind_first_execution_signed_at()
-        .unwrap();
-    pre_replay
-        .verify_rebind_stored_signing_key(body_signing.verifying_key().as_bytes())
-        .unwrap();
-
-    let wrong_token = sign_jwt(
-        json!({"alg":"ES256","typ":"JWT","kid":"nest-key-1"}),
-        json!({
-            "iss": ISSUER,
-            "sub": DID,
-            "aud": AUDIENCE,
-            "lxm": endpoint.as_str(),
-            "iat": 1_700_000_000_i64,
-            "exp": 1_700_000_120_i64,
-            "jti": AUTH_TXN,
-            "cnf": {"jkt": current_jkt},
-            "device_id": DEVICE_ID,
-            "chat_instance": CHAT_INSTANCE
-        }),
-        &nest_signing,
-    );
-    let wrong_proof = dpop_proof(
-        &current_proof_signing,
-        &current_jwk,
-        "POST",
-        &trust.external_base().htu(&endpoint),
-        &wrong_token,
-        1_700_000_060,
-        &[18; 12],
-    );
-    assert!(verify_rebind_request_auth(
-        &trust,
-        &format!("DPoP {wrong_token}"),
-        &wrong_proof,
-        decode_rebind_bootstrap(&raw).unwrap(),
-        &now,
-    )
-    .is_err());
-
-    let mut stale_body = rebind_body(&current_jkt, &new_jkt, &body_signing);
-    stale_body["signedAt"] = json!("2020-01-01T00:00:00.000Z");
-    let stale_raw = sign_chat_body(stale_body, &body_signing);
-    let stale_pre_replay = verify_rebind_request_auth(
-        &trust,
-        &format!("DPoP {token}"),
-        &proof,
-        decode_rebind_bootstrap(&stale_raw).unwrap(),
-        &now,
-    )
-    .unwrap();
-    assert!(stale_pre_replay
-        .validate_rebind_first_execution_signed_at()
-        .is_err());
-    assert_ne!(
-        stale_pre_replay
-            .rebind_bootstrap()
-            .unwrap()
-            .request_digest(),
-        pre_replay.rebind_bootstrap().unwrap().request_digest()
-    );
 }
 
 fn unsigned_policy_request(participant_dids: &[&str]) -> Vec<u8> {
@@ -2210,7 +2006,7 @@ fn sign_chat_body(body: Value, key: &Ed25519SigningKey) -> Vec<u8> {
     serde_json::to_vec(&wrapper).unwrap()
 }
 
-fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs: &[u8]) -> Value {
+fn enrollment_body(_dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs: &[u8]) -> Value {
     let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
     let key_packages: Vec<_> = package_refs
         .iter()
@@ -2233,7 +2029,6 @@ fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs
         "deviceName": "Test device",
         "keyId": key_id.as_str(),
         "signaturePublicKey": STANDARD.encode(signing_key.verifying_key().as_bytes()),
-        "dpopJkt": dpop_jkt,
         "expectedAuthGeneration": 0,
         "capability": {
             "protocolVersion": "1",
@@ -2254,26 +2049,6 @@ fn enrollment_body(dpop_jkt: &str, signing_key: &Ed25519SigningKey, package_refs
         "keyPackages": key_packages,
         "idempotencyKey": CHAT_INSTANCE,
         "signedAt": "2023-11-14T22:18:15.000Z"
-    })
-}
-
-fn rebind_body(
-    current_dpop_jkt: &str,
-    new_dpop_jkt: &str,
-    signing_key: &Ed25519SigningKey,
-) -> Value {
-    let key_id = ed25519_key_id(signing_key.verifying_key().as_bytes()).unwrap();
-    json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0}",
-        "actorDid": DID,
-        "actorDeviceId": DEVICE_ID,
-        "keyId": key_id.as_str(),
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": current_dpop_jkt,
-        "newDpopJkt": new_dpop_jkt,
-        "idempotencyKey": CHAT_INSTANCE,
-        "signedAt": "2023-11-14T22:14:20.000Z"
     })
 }
 

@@ -1250,6 +1250,38 @@ pub(crate) struct HydrationAuthority {
     locked: Option<LockedHydrationBinding>,
 }
 
+/// Sealed witness proving that a historical plan is authorized for the exact source entry.
+///
+/// This witness is move-only and can only be minted by `HistoricalPrefixAuthority`
+/// in `crate::chat_protocol::repository::remote_prefix`. It prevents unauthenticated callers
+/// within the crate from bypassing live quota checks by calling `into_historical_persistence_plan`.
+#[derive(Debug)]
+pub(in crate::chat_protocol) struct HistoricalPlanWitness {
+    _witness: crate::chat_protocol::repository::remote_prefix::HistoricalWriteWitness,
+    source_entry_id: Uuid,
+}
+
+impl HistoricalPlanWitness {
+    pub(in crate::chat_protocol) fn new(
+        witness: crate::chat_protocol::repository::remote_prefix::HistoricalWriteWitness,
+        source_entry_id: Uuid,
+    ) -> Self {
+        Self {
+            _witness: witness,
+            source_entry_id,
+        }
+    }
+}
+
+/// The device the transition's sealed authority names as actor.
+fn historical_actor(transition: &TransitionEvidence) -> Result<DeviceIdentity, StateMachineError> {
+    transition
+        .authority
+        .as_ref()
+        .map(|authority| authority.actor.clone())
+        .ok_or(StateMachineError::InvalidHydrationAuthority)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::chat_protocol) enum RecoveryPlannedKind {
     Request {
@@ -1414,6 +1446,228 @@ impl HydrationAuthority {
         })
     }
 
+    pub(in crate::chat_protocol) fn plan_historical_creation(
+        &self,
+        witness: HistoricalPlanWitness,
+        entry: VerifiedControlEntry,
+        creation_head: &crate::chat_protocol::repository::core::LockedConversationHeadGuard,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        let group_info_bytes = match entry.mutation().projection() {
+            VerifiedMutationProjection::Creation(value) => {
+                checked_artifact_bytes(&value.genesis_group_info())?
+            }
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        let transition = self.transition_from_control(&entry)?;
+        let (kind, next, manifest) = match transition.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Creation {
+                kind,
+                next,
+                manifest,
+                ..
+            }) => (*kind, *next, manifest),
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if kind != ConversationKind::Group {
+            return Err(StateMachineError::InvalidCreation);
+        }
+        let creator_device = manifest.actor_leaf.clone();
+        let invitees = manifest
+            .participants
+            .iter()
+            .filter(|participant| participant.principal != *creator_device.principal())
+            .map(|participant| participant.principal.clone())
+            .collect::<Vec<_>>();
+        let public_state = verify_genesis_group_info(
+            &group_info_bytes,
+            GenesisGroupInfoExpectations {
+                coordinate: next,
+                expected_basic_credential: &creator_device.basic_credential(),
+                expected_signature_key: entry.mutation().historical_public_key(),
+                now_unix_seconds: trusted_unix_millis_to_seconds(
+                    transition.received_at.unix_millis(),
+                )
+                .ok_or(StateMachineError::InvalidServerTime)?,
+                max_wire_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_ratchet_tree_bytes: MAX_GROUP_INFO_WIRE_BYTES,
+                max_members: MAX_PARTICIPANTS,
+            },
+        )?;
+        let decision = plan_creation_inner(
+            None,
+            CreationCommand {
+                kind,
+                creator: creator_device,
+                invitees,
+                transition: transition.clone(),
+                public_state,
+            },
+        )?;
+        let CreationDecision::Create(planned_transition) = decision else {
+            return Err(StateMachineError::InvalidCreation);
+        };
+        planned_transition.bind_historical_transition_authority(
+            witness,
+            transition,
+            creation_head,
+            None,
+        )
+    }
+
+    pub(in crate::chat_protocol) fn plan_historical_policy_add(
+        &self,
+        witness: HistoricalPlanWitness,
+        locked_convo: &crate::chat_protocol::repository::core::LockedConversationStateGuard,
+        entry: VerifiedControlEntry,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        let transition = self.transition_from_control(&entry)?;
+        let changes = match transition.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Policy {
+                participant_changes,
+                ..
+            }) => participant_changes,
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        if changes.is_empty()
+            || changes
+                .iter()
+                .any(|change| !matches!(change, ManifestParticipantChange::Add(_)))
+        {
+            return Err(StateMachineError::InvalidPolicyAuthority);
+        }
+        let actor = historical_actor(&transition)?;
+        let planned_transition = plan_policy_transition(
+            locked_convo.state(),
+            PolicyCommand {
+                actor,
+                transition: transition.clone(),
+                relationship_evidence_digest: [0; 32],
+            },
+        )?;
+        planned_transition.bind_historical_transition_authority(
+            witness,
+            transition,
+            locked_convo.head(),
+            None,
+        )
+    }
+
+    pub(in crate::chat_protocol) fn plan_historical_acceptance(
+        &self,
+        witness: HistoricalPlanWitness,
+        locked_convo: &crate::chat_protocol::repository::core::LockedConversationStateGuard,
+        entry: VerifiedControlEntry,
+        package_guard: crate::chat_protocol::repository::core::LockedRecoveryPackageGuard,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        let transition = self.transition_from_control(&entry)?;
+        let recovery_request_id = match transition.body_binding.as_ref() {
+            Some(TransitionBodyBinding::Acceptance {
+                recovery_request_id,
+                ..
+            }) => *recovery_request_id,
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        let actor = historical_actor(&transition)?;
+        let key_package_ref = *package_guard.key_package_ref();
+        let package_not_after =
+            ServerTimestamp::from_unix_millis(package_guard.not_after().timestamp_millis())?;
+        let package_cas = historical_available_package_cas(
+            package_guard,
+            &transition,
+            locked_convo.head().transaction_id(),
+        )?;
+        let planned_transition = plan_accept_conversation_inner(
+            locked_convo.state(),
+            AcceptConversation {
+                actor,
+                transition: transition.clone(),
+                recovery_request_id,
+                key_package_ref,
+                package_not_after,
+            },
+        )?;
+        planned_transition.bind_historical_transition_authority(
+            witness,
+            transition,
+            locked_convo.head(),
+            Some(package_cas),
+        )
+    }
+
+    pub(in crate::chat_protocol) fn plan_historical_recovery_fulfillment(
+        &self,
+        witness: HistoricalPlanWitness,
+        locked_convo: &crate::chat_protocol::repository::core::LockedConversationStateGuard,
+        entry: VerifiedControlEntry,
+        reserved_package: crate::chat_protocol::repository::core::LockedRecoveryPackageGuard,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        let transition = self.transition_from_control(&entry)?;
+        let (request_id, commit_bytes, aad, next) = match entry.mutation().projection() {
+            VerifiedMutationProjection::LeafRecoveryFulfillment(value) => (
+                *value.recovery_request_id().as_bytes(),
+                checked_artifact_bytes(&value.commit())?,
+                commit_aad_bytes(&value.aad()),
+                closed_coordinate(&value.next())?,
+            ),
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        let request = locked_convo
+            .state()
+            .recovery_request(&request_id)
+            .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+        let reservation = locked_convo
+            .state()
+            .recovery_reservation(&request_id)
+            .ok_or(StateMachineError::LeafRecoveryNotFound)?;
+        let package_cas = reserved_package_cas_for_request(
+            reserved_package,
+            request,
+            reservation,
+            locked_convo.head().transaction_id(),
+            PackageStatus::Consumed,
+        )?;
+        let commit = process_commit(
+            locked_convo.state().public_state(),
+            &commit_bytes,
+            &aad,
+            next,
+            trusted_unix_millis_to_seconds(transition.received_at.unix_millis())
+                .ok_or(StateMachineError::InvalidServerTime)?,
+            MAX_PARTICIPANTS,
+        )?;
+        let signed_welcome = match transition.body_binding.as_ref() {
+            Some(TransitionBodyBinding::LeafRecoveryFulfillment { manifest, .. }) => manifest
+                .welcome
+                .as_ref()
+                .ok_or(StateMachineError::InvalidWelcomeMapping)?,
+            _ => return Err(StateMachineError::InvalidHydrationAuthority),
+        };
+        let welcome = verify_recovery_welcome(
+            &signed_welcome.opaque_welcome,
+            request.key_package_ref,
+            MAX_WELCOME_WIRE_BYTES,
+        )?;
+        let actor = historical_actor(&transition)?;
+        let planned_transition = plan_leaf_recovery_fulfillment_inner(
+            locked_convo.state(),
+            LeafRecoveryFulfillment {
+                actor,
+                target: request.target.clone(),
+                recovery_request_id: request_id,
+                welcome_id: signed_welcome.welcome_id,
+                transition: transition.clone(),
+                commit,
+                welcome,
+            },
+        )?;
+        planned_transition.bind_historical_transition_authority(
+            witness,
+            transition,
+            locked_convo.head(),
+            Some(package_cas),
+        )
+    }
+
     pub(crate) fn from_locked_conversation(
         locked: &LockedConversationStateGuard,
     ) -> Result<Self, StateMachineError> {
@@ -1531,7 +1785,7 @@ impl HydrationAuthority {
         Ok(())
     }
 
-    fn transition_from_control(
+    pub(crate) fn transition_from_control(
         &self,
         entry: &VerifiedControlEntry,
     ) -> Result<TransitionEvidence, StateMachineError> {
@@ -1547,23 +1801,16 @@ impl HydrationAuthority {
             return Err(StateMachineError::InvalidHydrationAuthority);
         }
         let (transition_id, body_binding) = match entry.mutation().projection() {
-            VerifiedMutationProjection::Creation(value) => {
-                let kind = parse_conversation_kind(value.conversation_kind())?;
-                let next = closed_coordinate(&value.next())?;
-                let manifest = parse_roster_manifest(&value.manifest())?;
-                let group_info_sha256 = checked_artifact_sha256(&value.genesis_group_info())?;
-                let metadata = parse_metadata_snapshot(&value.metadata_snapshot())?;
-                (
-                    *value.transition_id().as_bytes(),
-                    TransitionBodyBinding::Creation {
-                        kind,
-                        next,
-                        manifest,
-                        group_info_sha256,
-                        metadata,
-                    },
-                )
-            }
+            VerifiedMutationProjection::Creation(value) => (
+                *value.transition_id().as_bytes(),
+                TransitionBodyBinding::Creation {
+                    kind: parse_conversation_kind(value.conversation_kind())?,
+                    next: closed_coordinate(&value.next())?,
+                    manifest: parse_roster_manifest(&value.manifest())?,
+                    group_info_sha256: checked_artifact_sha256(&value.genesis_group_info())?,
+                    metadata: parse_metadata_snapshot(&value.metadata_snapshot())?,
+                },
+            ),
             VerifiedMutationProjection::CommitTransition(value) => (
                 *value.transition_id().as_bytes(),
                 TransitionBodyBinding::Commit {
@@ -5875,7 +6122,7 @@ fn sealed_object_digest(object: &super::transcript::ClosedObjectRef<'_>) -> [u8;
     Sha256::digest(object.canonical_dag_cbor()).into()
 }
 
-fn commit_aad_bytes(object: &super::transcript::ClosedObjectRef<'_>) -> Vec<u8> {
+pub(crate) fn commit_aad_bytes(object: &super::transcript::ClosedObjectRef<'_>) -> Vec<u8> {
     let encoded = object.canonical_dag_cbor();
     let mut aad = Vec::with_capacity(COMMIT_AAD_DOMAIN.len() + encoded.len());
     aad.extend_from_slice(COMMIT_AAD_DOMAIN);
@@ -5907,7 +6154,7 @@ fn checked_artifact_sha256(
     Ok(actual)
 }
 
-fn checked_artifact_bytes(
+pub(crate) fn checked_artifact_bytes(
     object: &super::transcript::ClosedObjectRef<'_>,
 ) -> Result<Vec<u8>, StateMachineError> {
     let bytes = match object.get("bytes") {
@@ -7206,7 +7453,77 @@ impl LockedRecoveryReservationProjection {
     }
 }
 
-fn reserved_package_cas_for_request(
+pub(crate) fn historical_available_package_cas(
+    guard: LockedRecoveryPackageGuard,
+    transition: &TransitionEvidence,
+    transaction_id: &str,
+) -> Result<RecoveryPackageCasBinding, StateMachineError> {
+    let Some(TransitionBodyBinding::Acceptance { recovery, .. }) = transition.body_binding.as_ref()
+    else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
+    let target_key_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(
+            KeyThumbprint::parse(guard.target_key_id())
+                .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+                .as_str(),
+        )
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?
+        .try_into()
+        .map_err(|_| StateMachineError::InvalidHydrationAuthority)?;
+    let target_auth_generation = u64::try_from(guard.target_auth_generation())
+        .ok()
+        .filter(|value| (1..=MAX_PROTOCOL_INTEGER).contains(value))
+        .ok_or(StateMachineError::InvalidHydrationAuthority)?;
+    let claimed_at = ServerTimestamp::from_unix_millis(guard.claimed_at().timestamp_millis())?;
+    let package_not_after =
+        ServerTimestamp::from_unix_millis(guard.not_after().timestamp_millis())?;
+    let expected_expiry = recovery_expiry(claimed_at, package_not_after)?;
+
+    if guard.transaction_id() != transaction_id
+        || guard.status() != LockedRecoveryPackageStatus::Available
+        || guard.use_kind() != LockedRecoveryPackageUse::AvailableSelection
+        || guard.durable_row_digest() == &[0; 32]
+        || transition.received_at != claimed_at
+        || recovery.request_id != *guard.request_id().as_bytes()
+        || recovery.conversation_id != *guard.conversation_id().as_bytes()
+        || recovery.target.principal().as_bytes() != guard.target_did().as_bytes()
+        || recovery.target.device_id() != guard.target_device_id().as_bytes()
+        || recovery.kind != LeafRecoveryKind::Add
+        || recovery.bound_coordinate != *guard.bound_coordinate()
+        || recovery.requester_key_id != target_key_id
+        || recovery.requester_auth_generation != target_auth_generation
+        || recovery.key_package_ref != *guard.key_package_ref()
+        || recovery.key_package_wrapper != guard.wrapper_bytes()
+        || recovery.key_package_wrapper_sha256 != *guard.wrapper_sha256()
+        || recovery.requested_at != claimed_at
+        || recovery.expires_at != expected_expiry
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+
+    let mut binding = RecoveryPackageCasBinding {
+        transaction_id: transaction_id.to_owned(),
+        conversation_id: *guard.conversation_id().as_bytes(),
+        request_id: *guard.request_id().as_bytes(),
+        target: recovery.target.clone(),
+        target_key_id,
+        target_auth_generation,
+        bound_coordinate: recovery.bound_coordinate,
+        key_package_ref: *guard.key_package_ref(),
+        key_package_wrapper_sha256: *guard.wrapper_sha256(),
+        package_not_after,
+        claimed_at: recovery.requested_at,
+        expected_status: PackageStatus::Available,
+        successor_status: PackageStatus::Reserved,
+        locked_row_digest: *guard.durable_row_digest(),
+        authority_digest: [0; 32],
+    };
+    binding.authority_digest = recovery_package_cas_authority_digest(&binding);
+    Ok(binding)
+}
+
+pub(crate) fn reserved_package_cas_for_request(
     guard: LockedRecoveryPackageGuard,
     request: &RecoveryRequest,
     reservation: &RecoveryReservation,
@@ -12128,7 +12445,6 @@ fn signed_mutation_kind_code(value: SignedMutationKind) -> u8 {
         SignedMutationKind::ApplicationSend => 19,
         SignedMutationKind::DeviceEnrollment => 20,
         SignedMutationKind::KeyPackageReplenishment => 21,
-        SignedMutationKind::DeviceAuthenticationRebind => 22,
         SignedMutationKind::BlobUploadPreparation => 23,
         SignedMutationKind::BlobDeletion => 24,
         SignedMutationKind::Typing => 25,
@@ -12779,7 +13095,7 @@ impl PlannedTransition {
         self.state
     }
 
-    fn bind_transition_authority(
+    pub(crate) fn bind_transition_authority(
         mut self,
         evidence: TransitionEvidence,
         head: &LockedConversationHeadGuard,
@@ -12828,6 +13144,87 @@ impl PlannedTransition {
             locked_head_digest: *head.durable_row_digest(),
         });
         Ok(self)
+    }
+
+    pub(in crate::chat_protocol) fn bind_historical_transition_authority(
+        self,
+        witness: HistoricalPlanWitness,
+        evidence: TransitionEvidence,
+        head: &LockedConversationHeadGuard,
+        package_cas: Option<RecoveryPackageCasBinding>,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        let locked_at = ServerTimestamp::from_unix_millis(head.locked_at().timestamp_millis())?;
+        let mut planned =
+            self.bind_transition_authority(evidence, head, head.transaction_id(), locked_at)?;
+        if let Some(cas) = package_cas {
+            planned = planned.bind_recovery_package_cas(cas)?;
+        }
+        planned.into_historical_persistence_plan(witness)
+    }
+
+    pub(in crate::chat_protocol) fn into_historical_persistence_plan(
+        self,
+        witness: HistoricalPlanWitness,
+    ) -> Result<ConversationPersistencePlan, StateMachineError> {
+        if self
+            .effects
+            .head_cas
+            .as_ref()
+            .and_then(|h| h.allocated_entry_id)
+            != Some(*witness.source_entry_id.as_bytes())
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        let welcome_authority_valid =
+            match self.effects.kind {
+                PlanKind::WelcomeAcknowledgement => {
+                    matches!(
+                        self.effects.authority.as_ref(),
+                        Some(PlanAuthority::Request(evidence))
+                            if evidence.kind == RequestEntryKind::WelcomeAcknowledgement
+                    ) && self.effects.welcome_cas.as_ref().is_some_and(|binding| {
+                        binding.successor_status == WelcomeStatus::Acknowledged
+                    })
+                }
+                PlanKind::WelcomeRejection => {
+                    matches!(
+                        self.effects.authority.as_ref(),
+                        Some(PlanAuthority::Request(evidence))
+                            if evidence.kind == RequestEntryKind::WelcomeRejection
+                    ) && self
+                        .effects
+                        .welcome_cas
+                        .as_ref()
+                        .is_some_and(|binding| binding.successor_status == WelcomeStatus::Rejected)
+                }
+                PlanKind::WelcomeExpiry => {
+                    matches!(
+                        self.effects.authority.as_ref(),
+                        Some(PlanAuthority::WelcomeExpiry(_))
+                    ) && self
+                        .effects
+                        .welcome_cas
+                        .as_ref()
+                        .is_some_and(|binding| binding.successor_status == WelcomeStatus::Expired)
+                }
+                _ => self.effects.welcome_cas.is_none(),
+            };
+        // Under the sealed historical path, Creation and Policy MUST NOT carry present-day invitation quota CAS.
+        if self.effects.authority.is_none()
+            || self.effects.head_cas.is_none()
+            || !welcome_authority_valid
+            || self.effects.invitation_quota_cas.is_some()
+            || !package_cas_bijection_valid(&self.effects)
+        {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
+        Ok(ConversationPersistencePlan {
+            expected_prior: self.expected_prior,
+            retired_coordinate: self.retired_coordinate,
+            successor_coordinate: self.successor_coordinate,
+            state: ConversationStateHydration::from_state(self.state),
+            effects: self.effects,
+        })
     }
 
     fn bind_control_request_authority(
@@ -13106,7 +13503,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    fn bind_invitation_quota_cas(
+    pub(crate) fn bind_invitation_quota_cas(
         mut self,
         binding: InvitationQuotaCasBinding,
     ) -> Result<Self, StateMachineError> {
@@ -13213,7 +13610,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-    fn bind_recovery_package_cas(
+    pub(crate) fn bind_recovery_package_cas(
         mut self,
         binding: RecoveryPackageCasBinding,
     ) -> Result<Self, StateMachineError> {
@@ -13373,7 +13770,7 @@ pub(crate) struct CreationCommand {
     pub(crate) public_state: ActivePublicState,
 }
 
-fn plan_creation_inner(
+pub(crate) fn plan_creation_inner(
     existing_direct: Option<&ConversationState>,
     command: CreationCommand,
 ) -> Result<CreationDecision, StateMachineError> {
@@ -13541,13 +13938,13 @@ fn singleton_genesis_leaf(
     })
 }
 
-struct PolicyCommand {
-    actor: DeviceIdentity,
-    transition: TransitionEvidence,
-    relationship_evidence_digest: [u8; 32],
+pub(crate) struct PolicyCommand {
+    pub(crate) actor: DeviceIdentity,
+    pub(crate) transition: TransitionEvidence,
+    pub(crate) relationship_evidence_digest: [u8; 32],
 }
 
-fn plan_policy_transition(
+pub(crate) fn plan_policy_transition(
     prior: &ConversationState,
     command: PolicyCommand,
 ) -> Result<PlannedTransition, StateMachineError> {
@@ -13667,7 +14064,7 @@ pub(crate) struct AcceptConversation {
     pub(crate) package_not_after: ServerTimestamp,
 }
 
-fn plan_accept_conversation_inner(
+pub(crate) fn plan_accept_conversation_inner(
     prior: &ConversationState,
     command: AcceptConversation,
 ) -> Result<PlannedTransition, StateMachineError> {
@@ -14498,7 +14895,7 @@ pub(crate) struct LeafRecoveryFulfillment {
     pub(crate) welcome: VerifiedRecoveryWelcome,
 }
 
-fn plan_leaf_recovery_fulfillment_inner(
+pub(crate) fn plan_leaf_recovery_fulfillment_inner(
     prior: &ConversationState,
     command: LeafRecoveryFulfillment,
 ) -> Result<PlannedTransition, StateMachineError> {
@@ -19860,10 +20257,10 @@ pub(crate) use executor::{
     apply_conversation_persistence_plan, apply_prepared_device_revocation_members,
     apply_prepared_device_revocation_prefix, prepare_device_revocation_batch_members,
     AppliedTransition, ControlEntryContent, EventChainCursorError, EventFanout, ExecutionActor,
-    ExecutionAuthority, ExecutorError, LeafPersistenceColumns, MetadataAuthorColumns,
-    MetadataAvatarPersistence, PreparedDeviceRevocationBatchMembers, RecoveryOpenContext,
-    ResetRequestRow, SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext,
-    WelcomeRejectionWork, WelcomeResponseContext,
+    ExecutionAuthority, ExecutorError, HistoricalExecutionWriteAuthority, LeafPersistenceColumns,
+    MetadataAuthorColumns, MetadataAvatarPersistence, PreparedDeviceRevocationBatchMembers,
+    RecoveryOpenContext, ResetRequestRow, SpineArtifacts, WelcomeDispositionInput,
+    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext,
 };
 #[cfg(test)]
 pub(crate) use executor::{

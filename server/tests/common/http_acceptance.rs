@@ -159,36 +159,34 @@ pub fn seed_device(pool: &DbPool) -> impl Future<Output = Device> + '_ {
         sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'http-test','active',$3,1,chat.protocol_capabilities(),$4,$4)").bind(&did).bind(device_id).bind(&jkt).bind(now).execute(pool).await.expect("device");
         sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)").bind(&did).bind(device_id).bind(&key_id).bind(&key).bind(now).execute(pool).await.expect("device key");
 
-        let point = signing.verifying_key().to_encoded_point(false);
-        let jwk_val = serde_json::json!({
-            "kty": "EC",
-            "crv": "P-256",
-            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
-            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
-        });
-        let jwk_parsed: catbird_server::auth::PublicKeyJwk =
-            serde_json::from_value(jwk_val).unwrap();
-        let doc = catbird_server::auth::DidDocument {
-            id: did.clone(),
-            verification_method: vec![catbird_server::auth::VerificationMethod {
-                id: format!("{did}#atproto"),
-                key_type: "JsonWebKey2020".to_string(),
-                controller: did.clone(),
-                public_key_jwk: Some(jwk_parsed),
-                public_key_multibase: None,
-            }],
-            service: None,
-        };
-        catbird_server::auth::cache_test_did_document(doc).await;
-
-        Device {
+        let device = Device {
             did,
             device_id,
             signing,
             jwk,
             jkt,
-        }
+        };
+        cache_device_did(&device).await;
+        device
     }
+}
+
+/// Cache the test DID document that lets `device`'s service-auth JWTs verify.
+pub async fn cache_device_did(device: &Device) {
+    let public_key_jwk: catbird_server::auth::PublicKeyJwk =
+        serde_json::from_value(device.jwk.clone()).expect("device auth JWK");
+    catbird_server::auth::cache_test_did_document(catbird_server::auth::DidDocument {
+        id: device.did.clone(),
+        verification_method: vec![catbird_server::auth::VerificationMethod {
+            id: format!("{}#atproto", device.did),
+            key_type: "JsonWebKey2020".to_string(),
+            controller: device.did.clone(),
+            public_key_jwk: Some(public_key_jwk),
+            public_key_multibase: None,
+        }],
+        service: None,
+    })
+    .await;
 }
 
 pub async fn ensure_fence(pool: &DbPool) {

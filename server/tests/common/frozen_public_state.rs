@@ -23,8 +23,8 @@ use crate::chat_protocol::{
 };
 
 const MANIFEST_SHA256: [u8; 32] = [
-    0x43, 0xb6, 0x3e, 0xe5, 0xc7, 0x94, 0x6a, 0xe1, 0xe0, 0x1f, 0xb1, 0x71, 0x5f, 0x1b, 0x98, 0x6a,
-    0x93, 0x84, 0x65, 0xaf, 0x33, 0xef, 0xad, 0xbd, 0xa9, 0x75, 0x4e, 0xb6, 0x7f, 0xeb, 0xc4, 0x63,
+    0xd1, 0xc4, 0x3d, 0xe1, 0xfe, 0x8c, 0xe5, 0x37, 0x3d, 0x41, 0x3f, 0xce, 0x1c, 0x34, 0x64, 0xd0,
+    0x7a, 0xb5, 0xa0, 0x3a, 0x4c, 0x77, 0xa1, 0x73, 0x61, 0xcc, 0x4f, 0xe2, 0xfe, 0xba, 0x1b, 0xeb,
 ];
 
 #[derive(Deserialize)]
@@ -58,26 +58,29 @@ struct ManifestActor {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManifestChain {
+    #[serde(default)]
     generation: u64,
     genesis_state_version: u64,
     genesis_epoch: u64,
     genesis_group_context_hash_hex: String,
     genesis_confirmation_tag_hex: String,
+    #[serde(rename = "addNextEpoch")]
     committed_epoch: u64,
     committed_group_context_hash_hex: String,
     committed_confirmation_tag_hex: String,
     group_id_hex: String,
-    inner_key_package_ref_hex: String,
     commit_aad_sha256_hex: String,
+    #[serde(rename = "removeCommitNextEpoch")]
     remove_committed_epoch: u64,
     remove_committed_group_context_hash_hex: String,
     remove_committed_confirmation_tag_hex: String,
     rejoin_prior_state_version: u64,
+    #[serde(rename = "rejoinNextStateVersion")]
     rejoin_state_version: u64,
+    #[serde(rename = "rejoinNextEpoch")]
     rejoin_epoch: u64,
     rejoin_group_context_hash_hex: String,
     rejoin_confirmation_tag_hex: String,
-    rejoin_inner_key_package_ref_hex: String,
     rejoin_commit_aad_sha256_hex: String,
 }
 
@@ -93,7 +96,7 @@ struct RawSnapshot {
 }
 
 fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crypto-wire-v09")
 }
 
 fn hex_array<const N: usize>(value: &str) -> [u8; N] {
@@ -128,6 +131,12 @@ fn artifact(manifest: &Manifest, name: &str) -> Vec<u8> {
     bytes
 }
 
+fn artifact_32(manifest: &Manifest, name: &str) -> [u8; 32] {
+    artifact(manifest, name)
+        .try_into()
+        .unwrap_or_else(|_| panic!("{name} must be exactly 32 bytes"))
+}
+
 fn take<'a>(bytes: &'a [u8], offset: &mut usize, length: usize) -> &'a [u8] {
     let end = offset.checked_add(length).expect("snapshot offset");
     let value = bytes.get(*offset..end).expect("valid frozen snapshot");
@@ -146,11 +155,11 @@ fn take_u32(bytes: &[u8], offset: &mut usize) -> u32 {
 fn parse_snapshot(bytes: &[u8]) -> RawSnapshot {
     let mut offset = 0;
     assert_eq!(take(bytes, &mut offset, 8), b"CBPGSNAP");
-    assert_eq!(take_u16(bytes, &mut offset), 1);
+    assert_eq!(take_u16(bytes, &mut offset), 2);
     let openmls_len = usize::from(take_u16(bytes, &mut offset));
-    assert_eq!(take(bytes, &mut offset, openmls_len), b"0.8.1");
+    assert_eq!(take(bytes, &mut offset, openmls_len), b"0.9.0-rc.3");
     let storage_len = usize::from(take_u16(bytes, &mut offset));
-    assert_eq!(take(bytes, &mut offset, storage_len), b"0.5.0");
+    assert_eq!(take(bytes, &mut offset, storage_len), b"0.6.0-rc.3");
     let count = usize::try_from(take_u32(bytes, &mut offset)).expect("snapshot record count");
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
@@ -247,30 +256,7 @@ fn coordinate(
     )
 }
 
-fn encode_schema2_snapshot(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(b"CBPGSNAP");
-    encoded.extend_from_slice(&2u16.to_be_bytes());
-    encoded.extend_from_slice(&(b"0.9.0-rc.3".len() as u16).to_be_bytes());
-    encoded.extend_from_slice(b"0.9.0-rc.3");
-    encoded.extend_from_slice(&(b"0.6.0-rc.3".len() as u16).to_be_bytes());
-    encoded.extend_from_slice(b"0.6.0-rc.3");
-    encoded.extend_from_slice(&(records.len() as u32).to_be_bytes());
-    for (key, value) in records {
-        encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(key);
-        encoded.extend_from_slice(&(value.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(value);
-    }
-    encoded
-}
-pub(crate) fn schema2_snapshot(snapshot: &[u8]) -> Vec<u8> {
-    let raw = parse_snapshot(snapshot);
-    encode_schema2_snapshot(&raw.records)
-}
-
 fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> ActivePublicState {
-    let schema2_snapshot = schema2_snapshot(&snapshot);
     let binding = PublicGroupSnapshotBinding::new(
         *coordinate.conversation_id(),
         coordinate.generation(),
@@ -280,13 +266,13 @@ fn restore(snapshot: Vec<u8>, coordinate: PublicGroupSnapshotCoordinate) -> Acti
         *coordinate.group_context_hash(),
         *coordinate.confirmation_tag(),
         coordinate.lifecycle(),
-        public_group_snapshot_sha256(&schema2_snapshot),
+        public_group_snapshot_sha256(&snapshot),
         tree_summary(&snapshot),
     );
     let encoded_summary =
         encode_public_tree_summary(binding.tree_summary()).expect("encode frozen tree summary");
     load_persisted_active_snapshot_from_parts_for_test(
-        &schema2_snapshot,
+        &snapshot,
         &binding,
         encoded_summary.bytes(),
         encoded_summary.sha256(),
@@ -374,7 +360,7 @@ pub fn restore_add_commit(
         &expected_next_sender_encryption_key,
         manifest.identity.bob.credential_identity.as_bytes(),
         &hex::decode(&manifest.identity.bob.signature_public_key_hex).expect("Bob signature key"),
-        hex_array(&manifest.chain.inner_key_package_ref_hex),
+        artifact_32(&manifest, "key-package-ref.bin"),
         commit_sha256,
         aad_sha256,
     )
@@ -425,23 +411,24 @@ pub fn restore_rejoin_commit(
     const BOB_SIGNATURE_KEY_HEX: &str =
         "2bf5a667aa32fc2e05db907f7ff503c3c276ab8adbde93df7c80e9306d704d60";
     const PRIOR_ALICE_ENCRYPTION_KEY_SHA256_HEX: &str =
-        "3a0aa71cc359bccef8a325ae32b5e16d95dcb9b8921cfa68c09d72952593ac29";
+        "99c0c52982128c7c9a8506e165aa26f2eb5f61adbf9bb53c696e0d2337fe0f7b";
     const NEXT_ALICE_ENCRYPTION_KEY_SHA256_HEX: &str =
-        "f29796db39bc81bad1c3feb782d5b2f243582480981019ae6c5faadb3316c639";
+        "69603de1cc196e6e437af00431305b58d6bce99e166c09ac4a5d01d071e12e71";
     const NEXT_BOB_ENCRYPTION_KEY_SHA256_HEX: &str =
-        "41e05313f91466928c50642eb0f0f3eb238f8e2fef00902115b21a7b57e51823";
+        "577a8705fc466722d993af46523a592d3dc6767066214a8a0d3b5a5c990e7662";
     const COMMIT_SHA256_HEX: &str =
-        "c29f43f3232e6204816a8f8901b24c6548eb339ab7a881b95d16348462e788e8";
-    const AAD_SHA256_HEX: &str = "ee8545719e50a4e07182224ae8a6ddb806b3020636e0856b4bbdae394a4d92d5";
+        "bbe9ba8a9ec658dd0ed597f6d23432825eec8494290904fc877600955115fe23";
+    const AAD_SHA256_HEX: &str = "726f97f842b38065822d5d92a1421198515ac4d4b2e3cf34b564890c6a6b457a";
     const KEY_PACKAGE_REF_HEX: &str =
-        "fae8ee21e794dd60ef65a7a47e736fe9d3426be85624c982824db2853433d078";
+        "1a208d32f60042fcd0b1d6e2547478ff84335a363e3b412a423e1683e6f97a16";
 
     let manifest = manifest();
+    let key_package_ref = artifact_32(&manifest, "rejoin-key-package-ref.bin");
     if manifest.identity.alice.credential_identity != ALICE_CREDENTIAL
         || manifest.identity.alice.signature_public_key_hex != ALICE_SIGNATURE_KEY_HEX
         || manifest.identity.bob.credential_identity != BOB_CREDENTIAL
         || manifest.identity.bob.signature_public_key_hex != BOB_SIGNATURE_KEY_HEX
-        || manifest.chain.rejoin_inner_key_package_ref_hex != KEY_PACKAGE_REF_HEX
+        || key_package_ref != hex_array(KEY_PACKAGE_REF_HEX)
         || manifest.chain.rejoin_commit_aad_sha256_hex != AAD_SHA256_HEX
     {
         return Err(PublicStateError::CoordinateMismatch);
@@ -514,7 +501,6 @@ pub fn restore_rejoin_commit(
         .map_err(|_| PublicStateError::CoordinateMismatch)?;
     let commit_sha256 = <[u8; 32]>::from(Sha256::digest(&commit_bytes));
     let aad_sha256 = <[u8; 32]>::from(Sha256::digest(parsed.aad()));
-    let key_package_ref = hex_array(&manifest.chain.rejoin_inner_key_package_ref_hex);
     if commit_sha256 != hex_array(COMMIT_SHA256_HEX)
         || aad_sha256 != hex_array(AAD_SHA256_HEX)
         || key_package_ref != hex_array(KEY_PACKAGE_REF_HEX)
@@ -599,7 +585,7 @@ mod tests {
                 manifest.identity.bob.credential_identity.as_bytes(),
                 &hex::decode(&manifest.identity.bob.signature_public_key_hex)
                     .expect("Bob signature key"),
-                hex_array(&manifest.chain.inner_key_package_ref_hex),
+                artifact_32(&manifest, "key-package-ref.bin"),
                 commit_sha256,
                 aad_sha256,
             ),
@@ -665,7 +651,7 @@ mod tests {
                 manifest.identity.bob.credential_identity.as_bytes(),
                 &hex::decode(&manifest.identity.bob.signature_public_key_hex)
                     .expect("Bob signature key"),
-                hex_array(&manifest.chain.inner_key_package_ref_hex),
+                artifact_32(&manifest, "key-package-ref.bin"),
                 commit_sha256,
                 aad_sha256,
             ),

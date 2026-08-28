@@ -59,6 +59,8 @@ const HARDENED_SOURCE_PROFILE_V1: &[u8] =
     b"reqwest-pinned-system-dns/no-proxy/no-redirect/public-only/credential-free/v1";
 #[cfg(test)]
 const UNTRUSTED_TEST_SOURCE_PROFILE: &[u8] = b"untrusted-test-source";
+#[cfg(feature = "test-support")]
+const FEDERATION_TEST_SOURCE_PROFILE: &[u8] = b"federation-test-allow-all/v1";
 
 const GRAPH_PATH: &str = "/xrpc/app.bsky.graph.getRelationships";
 const GET_RECORD_PATH: &str = "/xrpc/com.atproto.repo.getRecord";
@@ -1539,7 +1541,7 @@ pub enum ProjectionScope {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub struct RelationshipProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1560,7 +1562,7 @@ pub struct RelationshipProjection {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(test, derive(Clone, PartialEq))]
 pub struct TrafficProjection {
     projection_id: Uuid,
     operation_scope: ProjectionOperationScope,
@@ -1617,6 +1619,15 @@ impl Clone for ProjectionPersistenceAuthority {
     }
 }
 
+#[cfg(test)]
+impl PartialEq for ProjectionPersistenceAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        let left = self.0.lock().expect("test authority lock");
+        let right = other.0.lock().expect("test authority lock");
+        left.is_some() == right.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionPersistenceError {
     Invalid,
@@ -1645,96 +1656,107 @@ impl DeclarationRecordEvidenceKind {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct PersistedDeclarationEvidence {
-    pub(super) projection_id: String,
-    pub(super) recipient: String,
-    pub(super) incoming: IncomingPolicy,
-    pub(super) allow_group_invites: Option<IncomingPolicy>,
-    pub(super) resolved_group_policy: IncomingPolicy,
-    pub(super) record_evidence_kind: DeclarationRecordEvidenceKind,
-    pub(super) cid: Option<String>,
-    pub(super) service_id: String,
-    pub(super) resolved_pds_origin: String,
-    pub(super) did_request_digest: [u8; 32],
-    pub(super) did_document_digest: [u8; 32],
-    pub(super) record_request_digest: [u8; 32],
-    pub(super) record_response_digest: [u8; 32],
-    pub(super) fetch_revision: u64,
-    pub(super) fetched_at: DateTime<Utc>,
-    pub(super) evidence_kind: EvidenceKind,
+macro_rules! define_persisted_projection_types {
+    ($field_visibility:vis) => {
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        pub(crate) struct PersistedDeclarationEvidence {
+            $field_visibility projection_id: String,
+            $field_visibility recipient: String,
+            $field_visibility incoming: IncomingPolicy,
+            $field_visibility allow_group_invites: Option<IncomingPolicy>,
+            $field_visibility resolved_group_policy: IncomingPolicy,
+            $field_visibility record_evidence_kind: DeclarationRecordEvidenceKind,
+            $field_visibility cid: Option<String>,
+            $field_visibility service_id: String,
+            $field_visibility resolved_pds_origin: String,
+            $field_visibility did_request_digest: [u8; 32],
+            $field_visibility did_document_digest: [u8; 32],
+            $field_visibility record_request_digest: [u8; 32],
+            $field_visibility record_response_digest: [u8; 32],
+            $field_visibility fetch_revision: u64,
+            $field_visibility fetched_at: DateTime<Utc>,
+            $field_visibility evidence_kind: EvidenceKind,
+        }
+
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        pub(crate) struct PersistedGraphRelationshipEvidence {
+            $field_visibility projection_id: String,
+            $field_visibility actor: String,
+            $field_visibility target: String,
+            $field_visibility batch_ordinal: u16,
+            $field_visibility following: bool,
+            $field_visibility followed_by: bool,
+            $field_visibility blocking: bool,
+            $field_visibility blocked_by: bool,
+            $field_visibility blocking_by_list: bool,
+            $field_visibility blocked_by_list: bool,
+            $field_visibility request_digest: [u8; 32],
+            $field_visibility response_digest: [u8; 32],
+            $field_visibility fetch_revision: u64,
+            $field_visibility fetched_at: DateTime<Utc>,
+            $field_visibility evidence_kind: EvidenceKind,
+        }
+
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        pub(crate) struct PersistedRelationshipProjection {
+            $field_visibility projection_id: String,
+            $field_visibility operation_scope: ProjectionOperationScope,
+            $field_visibility scope: ProjectionScope,
+            $field_visibility scope_digest: [u8; 32],
+            $field_visibility canonical_did_set_bytes: Vec<u8>,
+            $field_visibility canonical_did_set_sha256: [u8; 32],
+            $field_visibility appview_base: String,
+            $field_visibility configuration_fingerprint: [u8; 32],
+            $field_visibility projection_revision: u64,
+            $field_visibility source_call_count: u64,
+            $field_visibility started_at: DateTime<Utc>,
+            $field_visibility completed_at: DateTime<Utc>,
+            $field_visibility evidence_kind: EvidenceKind,
+            $field_visibility declarations: Vec<PersistedDeclarationEvidence>,
+            $field_visibility relationships: Vec<PersistedGraphRelationshipEvidence>,
+            $field_visibility aggregate_evidence_bytes: Vec<u8>,
+            $field_visibility aggregate_evidence_sha256: [u8; 32],
+        }
+
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        pub(crate) struct PersistedTrafficProjection {
+            $field_visibility projection_id: String,
+            $field_visibility operation_scope: ProjectionOperationScope,
+            $field_visibility scope: TrafficGraphScope,
+            $field_visibility scope_digest: [u8; 32],
+            $field_visibility canonical_did_set_bytes: Vec<u8>,
+            $field_visibility canonical_did_set_sha256: [u8; 32],
+            $field_visibility appview_base: String,
+            $field_visibility configuration_fingerprint: [u8; 32],
+            $field_visibility projection_revision: u64,
+            $field_visibility source_call_count: u64,
+            $field_visibility started_at: DateTime<Utc>,
+            $field_visibility completed_at: DateTime<Utc>,
+            $field_visibility evidence_kind: EvidenceKind,
+            $field_visibility relationships: Vec<PersistedGraphRelationshipEvidence>,
+            $field_visibility aggregate_evidence_bytes: Vec<u8>,
+            $field_visibility aggregate_evidence_sha256: [u8; 32],
+        }
+    };
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct PersistedGraphRelationshipEvidence {
-    pub(super) projection_id: String,
-    pub(super) actor: String,
-    pub(super) target: String,
-    pub(super) batch_ordinal: u16,
-    pub(super) following: bool,
-    pub(super) followed_by: bool,
-    pub(super) blocking: bool,
-    pub(super) blocked_by: bool,
-    pub(super) blocking_by_list: bool,
-    pub(super) blocked_by_list: bool,
-    pub(super) request_digest: [u8; 32],
-    pub(super) response_digest: [u8; 32],
-    pub(super) fetch_revision: u64,
-    pub(super) fetched_at: DateTime<Utc>,
-    pub(super) evidence_kind: EvidenceKind,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct PersistedRelationshipProjection {
-    pub(super) projection_id: String,
-    pub(super) operation_scope: ProjectionOperationScope,
-    pub(super) scope: ProjectionScope,
-    pub(super) scope_digest: [u8; 32],
-    pub(super) canonical_did_set_bytes: Vec<u8>,
-    pub(super) canonical_did_set_sha256: [u8; 32],
-    pub(super) appview_base: String,
-    pub(super) configuration_fingerprint: [u8; 32],
-    pub(super) projection_revision: u64,
-    pub(super) source_call_count: u64,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) completed_at: DateTime<Utc>,
-    pub(super) evidence_kind: EvidenceKind,
-    pub(super) declarations: Vec<PersistedDeclarationEvidence>,
-    pub(super) relationships: Vec<PersistedGraphRelationshipEvidence>,
-    pub(super) aggregate_evidence_bytes: Vec<u8>,
-    pub(super) aggregate_evidence_sha256: [u8; 32],
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct PersistedTrafficProjection {
-    pub(super) projection_id: String,
-    pub(super) operation_scope: ProjectionOperationScope,
-    pub(super) scope: TrafficGraphScope,
-    pub(super) scope_digest: [u8; 32],
-    pub(super) canonical_did_set_bytes: Vec<u8>,
-    pub(super) canonical_did_set_sha256: [u8; 32],
-    pub(super) appview_base: String,
-    pub(super) configuration_fingerprint: [u8; 32],
-    pub(super) projection_revision: u64,
-    pub(super) source_call_count: u64,
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) completed_at: DateTime<Utc>,
-    pub(super) evidence_kind: EvidenceKind,
-    pub(super) relationships: Vec<PersistedGraphRelationshipEvidence>,
-    pub(super) aggregate_evidence_bytes: Vec<u8>,
-    pub(super) aggregate_evidence_sha256: [u8; 32],
-}
+#[cfg(not(test))]
+define_persisted_projection_types!(pub(super));
+#[cfg(test)]
+define_persisted_projection_types!(pub(crate));
 
 /// Only this non-Clone value can cross the repository's insert boundary. Its
 /// allocation identity is private and is paired with values derived from the
 /// exact projection that consumed the corresponding SQL allocation guard.
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct SealedRelationshipProjection {
     allocation_id: Uuid,
     values: PersistedRelationshipProjection,
 }
 
 #[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct SealedTrafficProjection {
     allocation_id: Uuid,
     values: PersistedTrafficProjection,
@@ -1755,70 +1777,37 @@ impl SealedTrafficProjection {
 // Corruption tests exercise the strict hydration and SQL-validation fences.
 // Production has no Clone or field access for either sealed projection.
 #[cfg(test)]
-impl Clone for SealedRelationshipProjection {
-    fn clone(&self) -> Self {
-        Self {
-            allocation_id: self.allocation_id,
-            values: self.values.clone(),
+macro_rules! impl_sealed_projection_test_access {
+    ($sealed:ident, $values:ident) => {
+        impl std::ops::Deref for $sealed {
+            type Target = $values;
+
+            fn deref(&self) -> &Self::Target {
+                &self.values
+            }
         }
-    }
-}
 
-#[cfg(test)]
-impl Clone for SealedTrafficProjection {
-    fn clone(&self) -> Self {
-        Self {
-            allocation_id: self.allocation_id,
-            values: self.values.clone(),
+        impl std::ops::DerefMut for $sealed {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.values
+            }
         }
-    }
+
+        impl From<$sealed> for $values {
+            fn from(sealed: $sealed) -> Self {
+                sealed.values
+            }
+        }
+    };
 }
 
 #[cfg(test)]
-impl std::ops::Deref for SealedRelationshipProjection {
-    type Target = PersistedRelationshipProjection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
-}
-
+impl_sealed_projection_test_access!(
+    SealedRelationshipProjection,
+    PersistedRelationshipProjection
+);
 #[cfg(test)]
-impl std::ops::DerefMut for SealedRelationshipProjection {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
-    }
-}
-
-#[cfg(test)]
-impl std::ops::Deref for SealedTrafficProjection {
-    type Target = PersistedTrafficProjection;
-
-    fn deref(&self) -> &Self::Target {
-        &self.values
-    }
-}
-
-#[cfg(test)]
-impl std::ops::DerefMut for SealedTrafficProjection {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
-    }
-}
-
-#[cfg(test)]
-impl From<SealedRelationshipProjection> for PersistedRelationshipProjection {
-    fn from(sealed: SealedRelationshipProjection) -> Self {
-        sealed.values
-    }
-}
-
-#[cfg(test)]
-impl From<SealedTrafficProjection> for PersistedTrafficProjection {
-    fn from(sealed: SealedTrafficProjection) -> Self {
-        sealed.values
-    }
-}
+impl_sealed_projection_test_access!(SealedTrafficProjection, PersistedTrafficProjection);
 
 impl ProjectionRefreshFailure {
     fn new(started_at: DateTime<Utc>, failure_count: usize) -> Self {
@@ -2621,6 +2610,19 @@ pub(super) fn hydrate_persisted_fallback_relationship_projection<
 }
 
 #[cfg(test)]
+pub(crate) fn hydrate_persisted_fallback_relationship_projection_for_test<
+    T: PublicTransport,
+    V: Into<PersistedRelationshipProjection>,
+>(
+    values: V,
+    load_guard: RelationshipProjectionLoadGuard,
+    authority: &RelationshipAuthority<T>,
+    decision: &TrustedRelationshipDecisionInstant,
+) -> Result<RelationshipProjection, ProjectionPersistenceError> {
+    hydrate_persisted_fallback_relationship_projection(values, load_guard, authority, decision)
+}
+
+#[cfg(test)]
 pub(crate) fn hydrate_persisted_relationship_projection<
     T: PublicTransport,
     V: Into<PersistedRelationshipProjection>,
@@ -2750,6 +2752,19 @@ pub(super) fn hydrate_persisted_fallback_traffic_projection<
 }
 
 #[cfg(test)]
+pub(crate) fn hydrate_persisted_fallback_traffic_projection_for_test<
+    T: PublicTransport,
+    V: Into<PersistedTrafficProjection>,
+>(
+    values: V,
+    load_guard: TrafficProjectionLoadGuard,
+    authority: &RelationshipAuthority<T>,
+    decision: &TrustedRelationshipDecisionInstant,
+) -> Result<TrafficProjection, ProjectionPersistenceError> {
+    hydrate_persisted_fallback_traffic_projection(values, load_guard, authority, decision)
+}
+
+#[cfg(test)]
 pub(crate) fn hydrate_persisted_traffic_projection<
     T: PublicTransport,
     V: Into<PersistedTrafficProjection>,
@@ -2791,11 +2806,101 @@ pub struct RelationshipAuthority<T: PublicTransport> {
     source_identity: [u8; 32],
 }
 
-/// The sole production relationship authority shape. Keeping the transport
-/// concrete here prevents runtime or handler code from substituting origins,
-/// DNS behavior, redirects, proxies, credentials, or an arbitrary HTTP client.
+/// The production build has exactly the audited pinned transport. The
+/// `test-support` build can instead select an explicit, synthetic federation
+/// transport for the container E2E suite.
+#[cfg(not(feature = "test-support"))]
 pub(crate) type ProductionRelationshipAuthority =
     RelationshipAuthority<ReqwestPinnedTransport<SystemDnsResolver>>;
+#[cfg(feature = "test-support")]
+pub(crate) type ProductionRelationshipAuthority =
+    RelationshipAuthority<TestSupportRelationshipTransport>;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub(crate) enum TestSupportRelationshipTransport {
+    Production(ReqwestPinnedTransport<SystemDnsResolver>),
+    FederationAllowAll,
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl PublicTransport for TestSupportRelationshipTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        match self {
+            Self::Production(transport) => transport.get(request).await,
+            Self::FederationAllowAll => federation_allow_all_response(&request),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, TransportError> {
+    let path = request.url.path();
+    if path == "/.well-known/did.json" {
+        let host = request
+            .url
+            .host_str()
+            .ok_or(TransportError::InvalidRequest)?;
+        let actor = format!("did:web:{host}");
+        return Ok(PublicResponse::json(
+            200,
+            serde_json::json!({
+                "id": actor,
+                "service": [{
+                    "id": format!("{actor}#atproto_pds"),
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "https://pds.example.net",
+                }],
+            }),
+        ));
+    }
+    if path == GET_RECORD_PATH {
+        let actor = request
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == "repo")
+            .map(|(_, value)| value.into_owned())
+            .ok_or(TransportError::InvalidRequest)?;
+        return Ok(PublicResponse::json(
+            200,
+            serde_json::json!({
+                "uri": format!("at://{actor}/{DECLARATION_COLLECTION}/{DECLARATION_RKEY}"),
+                "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+                "value": {
+                    "$type": DECLARATION_TYPE,
+                    "allowIncoming": "all",
+                    "allowGroupInvites": "all",
+                },
+            }),
+        ));
+    }
+    if path == GRAPH_PATH {
+        let actor = request
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == "actor")
+            .map(|(_, value)| value.into_owned())
+            .ok_or(TransportError::InvalidRequest)?;
+        let relationships = request
+            .url
+            .query_pairs()
+            .filter(|(name, _)| name == "others")
+            .map(|(_, did)| {
+                serde_json::json!({
+                    "$type": RELATIONSHIP_TYPE,
+                    "did": did,
+                    "following": format!("at://{actor}/app.bsky.graph.follow/federation-test"),
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(PublicResponse::json(
+            200,
+            serde_json::json!({"actor": actor, "relationships": relationships}),
+        ));
+    }
+    Err(TransportError::InvalidRequest)
+}
 
 #[cfg(test)]
 pub type HttpRelationshipSource<T> = RelationshipAuthority<T>;
@@ -3033,7 +3138,18 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 impl ProductionRelationshipAuthority {
     pub(crate) fn from_startup_guard(guard: RelationshipAuthorityStartupGuard) -> Self {
         let (config, transport) = guard.into_parts();
+        #[cfg(feature = "test-support")]
+        let transport = TestSupportRelationshipTransport::Production(transport);
         Self::from_parts(config, transport, HARDENED_SOURCE_PROFILE_V1)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn federation_allow_all_for_test() -> Result<Self, RelationshipPolicyConfigError> {
+        Ok(Self::from_parts(
+            fixed_production_relationship_policy_config()?,
+            TestSupportRelationshipTransport::FederationAllowAll,
+            FEDERATION_TEST_SOURCE_PROFILE,
+        ))
     }
 }
 

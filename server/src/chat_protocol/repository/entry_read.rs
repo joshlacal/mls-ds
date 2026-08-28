@@ -1,4 +1,4 @@
-//! Repository-owned `getEntries` read composition.
+// Repository-owned `getEntries` read composition.
 
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};

@@ -17,7 +17,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
-catbird_mls = { path = "../../catbird-mls" }
+catbird_mls = { path = "../../catbird-mls", features = ["e2e-aad"] }
 catbird-atproto = { path = "../../catbird-atproto" }
 hex = "0.4"
 ulid = "1.2.1"

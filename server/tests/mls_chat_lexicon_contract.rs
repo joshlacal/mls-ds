@@ -60,8 +60,8 @@ fn corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
 fn validate_corpus(corpus: &BTreeMap<String, Vec<u8>>, label: &str) {
     assert_eq!(
         corpus.len(),
-        33,
-        "{label}: defs plus thirty-two endpoints are required"
+        36,
+        "{label}: defs, authFull, thirty-two endpoints, and two records are required"
     );
     for (filename, bytes) in corpus {
         let source = std::str::from_utf8(bytes)

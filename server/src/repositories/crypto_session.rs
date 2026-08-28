@@ -778,15 +778,17 @@ async fn apply_transition_tx(
 
 #[cfg(test)]
 mod transition_repository_tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use crate::mls_transition::{TransitionKind, ValidatedMlsTransition};
 
-    async fn test_pool() -> PgPool {
-        let url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for ignored transition repository tests");
-        let pool = PgPool::connect(&url).await.expect("connect test postgres");
-        sqlx::migrate!().run(&pool).await.expect("run migrations");
-        pool
+    async fn test_pool() -> (PgPool, fresh_db::DisposableDatabase) {
+        fresh_db::fresh_legacy_pool("repo_crypto_", 5, 1).await
     }
 
     #[test]
@@ -814,7 +816,7 @@ mod transition_repository_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn verified_receipt_allows_epoch_reuse_after_reset_generation() {
-        let pool = test_pool().await;
+        let (pool, _db) = test_pool().await;
         let suffix = Uuid::new_v4().to_string();
         let conversation_id = format!("receipt-reset-repo-{suffix}");
         let group_id = format!("receipt-reset-group-{suffix}");
@@ -925,7 +927,7 @@ mod transition_repository_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn postgres_mls_transition_cas_and_projection_are_atomic() {
-        let pool = test_pool().await;
+        let (pool, _db) = test_pool().await;
         let suffix = Uuid::new_v4().to_string();
         let conversation_id = format!("transition-convo-{suffix}");
         let group_id = format!("transition-group-{suffix}");
@@ -1263,7 +1265,7 @@ mod transition_repository_tests {
     #[tokio::test]
     #[ignore = "requires TEST_DATABASE_URL with migration privileges"]
     async fn mls_transition_migration_is_idempotent() {
-        let pool = test_pool().await;
+        let (pool, _db) = test_pool().await;
         sqlx::migrate!()
             .run(&pool)
             .await

@@ -14,221 +14,323 @@ use catbird_mls::{EpochSecretStorage, KeychainAccess, MLSContext, MLSError};
 // ── In-memory keychain (no iOS Keychain in tests) ────────────────────────
 
 struct InMemoryKeychain {
-  store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl InMemoryKeychain {
-  fn new() -> Self {
-    Self {
-      store: Mutex::new(HashMap::new()),
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(HashMap::new()),
+        }
     }
-  }
 }
 
 #[async_trait::async_trait]
 impl KeychainAccess for InMemoryKeychain {
-  async fn read(&self, key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
-    Ok(self.store.lock().unwrap().get(&key).cloned())
-  }
+    async fn read(&self, key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
+        Ok(self.store.lock().unwrap().get(&key).cloned())
+    }
 
-  async fn write(&self, key: String, value: Vec<u8>) -> std::result::Result<(), MLSError> {
-    self.store.lock().unwrap().insert(key, value);
-    Ok(())
-  }
+    async fn write(&self, key: String, value: Vec<u8>) -> std::result::Result<(), MLSError> {
+        self.store.lock().unwrap().insert(key, value);
+        Ok(())
+    }
 
-  async fn delete(&self, key: String) -> std::result::Result<(), MLSError> {
-    self.store.lock().unwrap().remove(&key);
-    Ok(())
-  }
+    async fn delete(&self, key: String) -> std::result::Result<(), MLSError> {
+        self.store.lock().unwrap().remove(&key);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
 struct InMemoryEpochSecretStorage {
-  secrets: Mutex<HashMap<(String, u64), Vec<u8>>>,
+    secrets: Mutex<HashMap<(String, u64), Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
 impl EpochSecretStorage for InMemoryEpochSecretStorage {
-  async fn store_epoch_secret(
-    &self,
-    conversation_id: String,
-    epoch: u64,
-    secret_data: Vec<u8>,
-  ) -> bool {
-    self
-      .secrets
-      .lock()
-      .unwrap()
-      .insert((conversation_id, epoch), secret_data);
-    true
-  }
+    async fn store_epoch_secret(
+        &self,
+        conversation_id: String,
+        epoch: u64,
+        secret_data: Vec<u8>,
+    ) -> bool {
+        self.secrets
+            .lock()
+            .unwrap()
+            .insert((conversation_id, epoch), secret_data);
+        true
+    }
 
-  async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
-    self
-      .secrets
-      .lock()
-      .unwrap()
-      .get(&(conversation_id, epoch))
-      .cloned()
-  }
+    async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
+        self.secrets
+            .lock()
+            .unwrap()
+            .get(&(conversation_id, epoch))
+            .cloned()
+    }
 
-  async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
-    self
-      .secrets
-      .lock()
-      .unwrap()
-      .remove(&(conversation_id, epoch));
-    true
-  }
+    async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
+        self.secrets
+            .lock()
+            .unwrap()
+            .remove(&(conversation_id, epoch));
+        true
+    }
 
-  async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
-    let mut secrets = self.secrets.lock().unwrap();
-    let before = secrets.len();
-    secrets.retain(|(stored_conversation, epoch), _| {
-      stored_conversation != &conversation_id || *epoch >= cutoff_epoch
-    });
-    u32::try_from(before.saturating_sub(secrets.len())).unwrap_or(u32::MAX)
-  }
+    async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
+        let mut secrets = self.secrets.lock().unwrap();
+        let before = secrets.len();
+        secrets.retain(|(stored_conversation, epoch), _| {
+            stored_conversation != &conversation_id || *epoch >= cutoff_epoch
+        });
+        u32::try_from(before.saturating_sub(secrets.len())).unwrap_or(u32::MAX)
+    }
 }
 
 // ── MlsEngine ────────────────────────────────────────────────────────────
 
 /// Per-user MLS engine backed by a real `MLSContext`.
 pub struct MlsEngine {
-  ctx: Arc<MLSContext>,
-  _temp_dir: PathBuf,
+    ctx: Arc<MLSContext>,
+    _temp_dir: PathBuf,
 }
 
 impl Drop for MlsEngine {
-  fn drop(&mut self) {
-    let _ = self.ctx.flush_and_prepare_close();
-    let _ = std::fs::remove_dir_all(&self._temp_dir);
-  }
+    fn drop(&mut self) {
+        let _ = self.ctx.flush_and_prepare_close();
+        let _ = std::fs::remove_dir_all(&self._temp_dir);
+    }
 }
 
 impl MlsEngine {
-  /// Create a new engine with a temporary SQLite database.
-  pub fn new(user_label: &str) -> Result<Self> {
-    let temp_dir = std::env::temp_dir().join(format!(
-      "mls-e2e-{}-{}-{}",
-      user_label,
-      std::process::id(),
-      uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&temp_dir)
-      .with_context(|| format!("create temp dir {:?}", temp_dir))?;
+    /// Create a new engine with a temporary SQLite database.
+    pub fn new(user_label: &str) -> Result<Self> {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mls-e2e-{}-{}-{}",
+            user_label,
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir)
+            .with_context(|| format!("create temp dir {:?}", temp_dir))?;
 
-    let db_path = temp_dir.join("mls.db");
-    let keychain = Box::new(InMemoryKeychain::new());
-    let ctx = MLSContext::new(
-      db_path.to_string_lossy().to_string(),
-      format!("test-key-{}", user_label),
-      keychain,
-    )
-    .map_err(|e| anyhow::anyhow!("MLSContext::new failed: {e}"))?;
+        let db_path = temp_dir.join("mls.db");
+        let keychain = Box::new(InMemoryKeychain::new());
+        let ctx = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            format!("test-key-{}", user_label),
+            keychain,
+        )
+        .map_err(|e| anyhow::anyhow!("MLSContext::new failed: {e}"))?;
 
-    ctx
-      .set_epoch_secret_storage(Box::new(InMemoryEpochSecretStorage::default()))
-      .map_err(|e| anyhow::anyhow!("set_epoch_secret_storage failed: {e}"))?;
+        ctx.set_epoch_secret_storage(Box::new(InMemoryEpochSecretStorage::default()))
+            .map_err(|e| anyhow::anyhow!("set_epoch_secret_storage failed: {e}"))?;
 
-    Ok(Self {
-      ctx,
-      _temp_dir: temp_dir,
-    })
-  }
+        Ok(Self {
+            ctx,
+            _temp_dir: temp_dir,
+        })
+    }
 
-  /// Generate a real MLS key package for the given identity.
-  /// Returns `(key_package_bytes, hash_ref_bytes)`.
-  pub fn create_key_package(&self, identity: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    let result = self
-      .ctx
-      .create_key_package(identity.as_bytes().to_vec())
-      .map_err(|e| anyhow::anyhow!("create_key_package: {e}"))?;
-    Ok((result.key_package_data, result.hash_ref))
-  }
+    /// Generate a real MLS key package for the given identity.
+    /// Returns `(key_package_bytes, hash_ref_bytes)`.
+    pub fn create_key_package(&self, identity: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let result = self
+            .ctx
+            .create_key_package(identity.as_bytes().to_vec())
+            .map_err(|e| anyhow::anyhow!("create_key_package: {e}"))?;
+        Ok((result.key_package_data, result.hash_ref))
+    }
+    pub fn identity_public_key(&self, identity: &str) -> Result<Vec<u8>> {
+        self.ctx
+            .identity_public_key(identity.to_string())
+            .map_err(|e| anyhow::anyhow!("identity_public_key: {e}"))
+    }
 
-  /// Create a real MLS group. Returns binary group_id.
-  pub fn create_group(&self, identity: &str) -> Result<Vec<u8>> {
-    let result = self
-      .ctx
-      .create_group(identity.as_bytes().to_vec(), None)
-      .map_err(|e| anyhow::anyhow!("create_group: {e}"))?;
-    Ok(result.group_id)
-  }
+    pub fn sign_with_identity_key(&self, identity: &str, payload: &[u8]) -> Result<Vec<u8>> {
+        self.ctx
+            .sign_with_identity_key(identity.to_string(), payload.to_vec())
+            .map_err(|e| anyhow::anyhow!("sign_with_identity_key: {e}"))
+    }
 
-  /// Add members to a group. Returns `(commit_data, welcome_data)`.
-  pub fn add_members(
-    &self,
-    group_id: &[u8],
-    key_packages: Vec<Vec<u8>>,
-  ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let kps = key_packages
-      .into_iter()
-      .map(|data| catbird_mls::KeyPackageData { data })
-      .collect();
-    let result = self
-      .ctx
-      .add_members(group_id.to_vec(), kps)
-      .map_err(|e| anyhow::anyhow!("add_members: {e}"))?;
-    Ok((result.commit_data, result.welcome_data))
-  }
-  /// Merge pending commit locally to advance epoch after server ACK.
-  pub fn merge_pending_commit(&self, group_id: &[u8]) -> Result<u64> {
-    let result = self
-      .ctx
-      .merge_pending_commit(group_id.to_vec())
-      .map_err(|e| anyhow::anyhow!("merge_pending_commit: {e}"))?;
-    Ok(result.new_epoch)
-  }
 
-  /// Process a welcome message to join a group. Returns binary group_id.
-  pub fn process_welcome(&self, welcome_bytes: &[u8], identity: &str) -> Result<Vec<u8>> {
-    let result = self
-      .ctx
-      .process_welcome(welcome_bytes.to_vec(), identity.as_bytes().to_vec(), None)
-      .map_err(|e| anyhow::anyhow!("process_welcome: {e}"))?;
-    Ok(result.group_id)
-  }
+    /// Create a real MLS group. Returns binary group_id.
+    pub fn create_group(&self, identity: &str) -> Result<Vec<u8>> {
+        let result = self
+            .ctx
+            .create_group(identity.as_bytes().to_vec(), None)
+            .map_err(|e| anyhow::anyhow!("create_group: {e}"))?;
+        Ok(result.group_id)
+    }
 
-  /// Encrypt a plaintext message. Returns `(padded_ciphertext, padded_size)`.
-  pub fn encrypt(&self, group_id: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, u32)> {
-    let result = self
-      .ctx
-      .encrypt_message(group_id.to_vec(), plaintext.to_vec())
-      .map_err(|e| anyhow::anyhow!("encrypt_message: {e}"))?;
-    Ok((result.ciphertext, result.padded_size))
-  }
+    /// Export a real ratchet-tree GroupInfo for the current group state.
+    pub fn export_group_info(&self, group_id: &[u8], identity: &str) -> Result<Vec<u8>> {
+        self.ctx
+            .export_group_info(group_id.to_vec(), identity.as_bytes().to_vec())
+            .map_err(|e| anyhow::anyhow!("export_group_info: {e}"))
+    }
 
-  /// Decrypt a ciphertext. Returns plaintext bytes.
-  pub fn decrypt(&self, group_id: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    let result = self
-      .ctx
-      .decrypt_message(group_id.to_vec(), ciphertext.to_vec())
-      .map_err(|e| anyhow::anyhow!("decrypt_message: {e}"))?;
-    Ok(result.plaintext)
-  }
+    pub fn group_context_hash(&self, group_id: &[u8]) -> Result<Vec<u8>> {
+        self.ctx
+            .get_group_context_hash(group_id.to_vec())
+            .map_err(|e| anyhow::anyhow!("get_group_context_hash: {e}"))
+    }
 
-  /// Process an incoming MLS message (commit, proposal, application message).
-  pub fn process_message(
-    &self,
-    group_id: &[u8],
-    message_data: &[u8],
-  ) -> Result<catbird_mls::ProcessedContent> {
-    self
-      .ctx
-      .process_message(group_id.to_vec(), message_data.to_vec())
-      .map_err(|e| anyhow::anyhow!("process_message: {e}"))
-  }
+    pub fn confirmation_tag(&self, group_id: &[u8]) -> Result<Vec<u8>> {
+        self.ctx
+            .get_confirmation_tag(group_id.to_vec())
+            .map_err(|e| anyhow::anyhow!("get_confirmation_tag: {e}"))
+    }
 
-  /// Extract the identity (DID) from a key package.
-  pub fn extract_key_package_identity(kp_bytes: &[u8]) -> Result<String> {
-    catbird_mls::mls_extract_key_package_identity(kp_bytes.to_vec())
-      .map_err(|e| anyhow::anyhow!("extract_kp_identity: {e}"))
-  }
+    /// Stage a real MLS self-update commit.
+    pub fn self_update(&self, group_id: &[u8]) -> Result<Vec<u8>> {
+        self.ctx
+            .self_update(group_id.to_vec())
+            .map(|result| result.commit_data)
+            .map_err(|e| anyhow::anyhow!("self_update: {e}"))
+    }
+    pub fn self_update_with_aad(&self, group_id: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        self.ctx
+            .self_update_with_aad_for_test(group_id.to_vec(), aad.to_vec())
+            .map(|result| result.commit_data)
+            .map_err(|e| anyhow::anyhow!("self_update_with_aad: {e}"))
+    }
 
-  /// Extract the signature public key from a key package.
-  pub fn extract_key_package_sig_key(kp_bytes: &[u8]) -> Result<Vec<u8>> {
-    catbird_mls::mls_extract_key_package_signature_public_key(kp_bytes.to_vec())
-      .map_err(|e| anyhow::anyhow!("extract_kp_sig_key: {e}"))
-  }
+
+    /// Add members and return the staged commit, Welcome, and next public coordinate.
+    pub fn add_members(
+        &self,
+        group_id: &[u8],
+        key_packages: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let kps = key_packages
+            .into_iter()
+            .map(|data| catbird_mls::KeyPackageData { data })
+            .collect();
+        let result = self
+            .ctx
+            .add_members(group_id.to_vec(), kps)
+            .map_err(|e| anyhow::anyhow!("add_members: {e}"))?;
+        let next_group_context_hash = result
+            .next_group_context_hash
+            .context("add_members omitted next GroupContext hash")?;
+        let next_confirmation_tag = result
+            .next_confirmation_tag
+            .context("add_members omitted next confirmation tag")?;
+        Ok((
+            result.commit_data,
+            result.welcome_data,
+            next_group_context_hash,
+            next_confirmation_tag,
+        ))
+    }
+    pub fn add_members_with_aad(
+        &self,
+        group_id: &[u8],
+        key_packages: Vec<Vec<u8>>,
+        aad: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let key_packages = key_packages
+            .into_iter()
+            .map(|data| catbird_mls::KeyPackageData { data })
+            .collect();
+        let result = self
+            .ctx
+            .add_members_with_aad(group_id.to_vec(), key_packages, Some(aad.to_vec()))
+            .map_err(|e| anyhow::anyhow!("add_members_with_aad: {e}"))?;
+        Ok((
+            result.commit_data,
+            result.welcome_data,
+            result
+                .next_group_context_hash
+                .context("add_members_with_aad omitted next GroupContext hash")?,
+            result
+                .next_confirmation_tag
+                .context("add_members_with_aad omitted next confirmation tag")?,
+        ))
+    }
+
+    /// Merge pending commit locally to advance epoch after server ACK.
+    pub fn merge_pending_commit(&self, group_id: &[u8]) -> Result<u64> {
+        let result = self
+            .ctx
+            .merge_pending_commit(group_id.to_vec())
+            .map_err(|e| anyhow::anyhow!("merge_pending_commit: {e}"))?;
+        Ok(result.new_epoch)
+    }
+
+    /// Process a welcome message to join a group. Returns binary group_id.
+    pub fn process_welcome(&self, welcome_bytes: &[u8], identity: &str) -> Result<Vec<u8>> {
+        let result = self
+            .ctx
+            .process_welcome(welcome_bytes.to_vec(), identity.as_bytes().to_vec(), None)
+            .map_err(|e| anyhow::anyhow!("process_welcome: {e}"))?;
+        Ok(result.group_id)
+    }
+
+    /// Encrypt a plaintext message. Returns `(padded_ciphertext, padded_size)`.
+    pub fn encrypt(&self, group_id: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, u32)> {
+        let result = self
+            .ctx
+            .encrypt_message(group_id.to_vec(), plaintext.to_vec())
+            .map_err(|e| anyhow::anyhow!("encrypt_message: {e}"))?;
+        Ok((result.ciphertext, result.padded_size))
+    }
+    pub fn encrypt_with_aad(
+        &self,
+        group_id: &[u8],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<(Vec<u8>, u32)> {
+        let result = self
+            .ctx
+            .encrypt_message_with_aad_for_test(
+                group_id.to_vec(),
+                plaintext.to_vec(),
+                aad.to_vec(),
+            )
+            .map_err(|e| anyhow::anyhow!("encrypt_message_with_aad: {e}"))?;
+        Ok((result.ciphertext, result.padded_size))
+    }
+
+
+    /// Decrypt a ciphertext. Returns plaintext bytes.
+    pub fn decrypt(&self, group_id: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let result = self
+            .ctx
+            .decrypt_message(group_id.to_vec(), ciphertext.to_vec())
+            .map_err(|e| anyhow::anyhow!("decrypt_message: {e}"))?;
+        Ok(result.plaintext)
+    }
+
+    /// Process an incoming MLS message (commit, proposal, application message).
+    pub fn process_message(
+        &self,
+        group_id: &[u8],
+        message_data: &[u8],
+    ) -> Result<catbird_mls::ProcessedContent> {
+        self.ctx
+            .process_message(group_id.to_vec(), message_data.to_vec())
+            .map_err(|e| anyhow::anyhow!("process_message: {e}"))
+    }
+
+    /// Merge an incoming commit staged by [`Self::process_message`].
+    pub fn merge_incoming_commit(&self, group_id: &[u8], target_epoch: u64) -> Result<u64> {
+        self.ctx
+            .merge_incoming_commit(group_id.to_vec(), target_epoch)
+            .map_err(|e| anyhow::anyhow!("merge_incoming_commit: {e}"))
+    }
+
+    /// Extract the identity (DID) from a key package.
+    pub fn extract_key_package_identity(kp_bytes: &[u8]) -> Result<String> {
+        catbird_mls::mls_extract_key_package_identity(kp_bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("extract_kp_identity: {e}"))
+    }
+
+    /// Extract the signature public key from a key package.
+    pub fn extract_key_package_sig_key(kp_bytes: &[u8]) -> Result<Vec<u8>> {
+        catbird_mls::mls_extract_key_package_signature_public_key(kp_bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("extract_kp_sig_key: {e}"))
+    }
 }

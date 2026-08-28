@@ -574,14 +574,22 @@ impl OutboundQueue {
                         }
                     };
 
-                    let Some(verifying_key) = crate::auth::extract_p256_key(&did_doc) else {
-                        let error_msg = format!(
-                            "No P-256 key found in DID document for {}",
-                            receipt.receiver_ds_did.as_str()
-                        );
-                        warn!(queue_id = %item.id, error = %error_msg, "Missing P-256 key in DID doc");
-                        self.handle_failure(item, &error_msg, false).await;
-                        return;
+                    let verifying_key = match crate::auth::select_verification_method(
+                        &did_doc,
+                        Some("#atproto"),
+                    )
+                    .and_then(crate::auth::extract_p256_key_from_vm)
+                    {
+                        Ok(key) => key,
+                        Err(error) => {
+                            let error_msg = format!(
+                                "Invalid service-auth verification method for {}: {error}",
+                                receipt.receiver_ds_did.as_str()
+                            );
+                            warn!(queue_id = %item.id, error = %error_msg, "Invalid service-auth key in DID doc");
+                            self.handle_failure(item, &error_msg, false).await;
+                            return;
+                        }
                     };
 
                     // Verify cryptographic signature of receipt
@@ -1452,6 +1460,12 @@ fn backoff_delay(retry_count: i32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
 
     #[test]
@@ -1518,28 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_stops_delivery_when_peer_policy_revoked_after_enqueue() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for queue policy revocation test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
         let peer_did = format!(
             "did:web:revoked-{}.example.com",
             uuid::Uuid::new_v4().as_simple()
@@ -1618,28 +1611,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_retries_on_injected_dns_temporary_and_timeout() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for queue transient DNS test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
             "did:web:injected-dns-{}.example.com",
@@ -1740,28 +1712,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_fails_immediately_on_injected_dns_nxdomain_permanent() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for queue NXDOMAIN test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
             "did:web:nxdomain-{}.example.com",
@@ -1856,28 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_outbound_queue_distinguishes_injected_http_status_codes() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for queue HTTP status test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_queue_", 2, 1).await;
 
         let peer_did = format!(
             "did:web:status-{}.example.com",

@@ -18,7 +18,7 @@ fi
 export APP_ENV="${APP_ENV:-test}"
 export FEDERATION_MODE="${FEDERATION_MODE:-allowlist}"
 export FEDERATION_ENABLED="${FEDERATION_ENABLED:-true}"
-export FEDERATION_CAPABILITIES="${FEDERATION_CAPABILITIES:-baseline,reconciliation-v1}"
+export FEDERATION_CAPABILITIES="${FEDERATION_CAPABILITIES:-baseline,reconciliation-v1,canonical-prefix-bootstrap-v1}"
 
 # Default to 0 for ephemeral host port allocation; explicit overrides allowed for interactive reuse
 export DS1_PORT="${DS1_PORT:-0}"
@@ -173,9 +173,9 @@ check_federation_endpoint() {
     return 1
   fi
 
-  if [[ "$compact" != *"baseline"* ]] || [[ "$compact" != *"reconciliation-v1"* ]]; then
+  if [[ "$compact" != *"baseline"* ]] || [[ "$compact" != *"reconciliation-v1"* ]] || [[ "$compact" != *"canonical-prefix-bootstrap-v1"* ]]; then
     echo "✗ Federation health check capabilities mismatch for $node"
-    echo "  expected capabilities: baseline, reconciliation-v1"
+    echo "  expected capabilities: baseline, reconciliation-v1, canonical-prefix-bootstrap-v1"
     echo "  response: $payload"
     return 1
   fi

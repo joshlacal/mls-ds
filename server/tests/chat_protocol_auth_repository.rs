@@ -12,189 +12,49 @@
 
 mod common;
 
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/relationship_policy.rs"]
-mod relationship_policy_source;
-#[allow(dead_code)]
-mod snapshot {
-    pub use catbird_server::chat_protocol::snapshot::*;
-}
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
 mod repository {
     pub(crate) use crate::chat_protocol::repository::*;
 }
 #[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod snapshot {
+    pub use catbird_server::chat_protocol::snapshot::*;
+}
 
-// The production repository module now includes Welcome CAS writers that
-// consume the nested `crate::chat_protocol` authority types. Mirror the
-// production-shaped module graph used by the transition harness so this
-// repository-boundary target compiles without weakening production paths.
-#[allow(dead_code)]
-mod chat_protocol {
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-    pub mod snapshot {
-        pub use catbird_server::chat_protocol::snapshot::*;
-    }
-    pub mod wire {
-        pub use catbird_server::chat_protocol::wire::*;
-    }
-    pub mod public_state {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/public_state.rs"
-        ));
-    }
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-    pub mod relationship_policy {
-        pub use crate::relationship_policy_source::*;
-    }
-    pub mod repository {
-        pub mod blobs {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/blobs.rs"
-            ));
-        }
-        pub mod execution_context {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/execution_context.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod prelude {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-        pub mod key_packages {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
-        pub mod core {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/core.rs"
-            ));
-        }
-        pub mod relationship {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/relationship.rs"
-            ));
-        }
-        pub mod transition {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/transition.rs"
-            ));
-        }
-        pub mod delivery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/delivery.rs"
-            ));
-        }
-    }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
-
-    #[test]
-    fn final_authority_constructor_requires_the_concrete_repository_receipt() {
-        let constructor: fn(
-            dpop::PreReplayCryptographicVerification,
-            repository::auth::RepositoryAuthorityReceipt,
-        ) -> dpop::VerifiedChatDeviceRequest = dpop::mint_unsigned_repository_authority;
-        let _ = constructor;
-    }
+#[test]
+fn final_authority_constructor_requires_the_concrete_repository_receipt() {
+    let constructor: fn(
+        chat_protocol::dpop::PreReplayCryptographicVerification,
+        chat_protocol::repository::auth::RepositoryAuthorityReceipt,
+    ) -> chat_protocol::dpop::VerifiedChatDeviceRequest =
+        chat_protocol::mint_unsigned_repository_authority;
+    let _ = constructor;
 }
 
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use chat_protocol::transcript::{
+    decode_and_verify_enrollment_body, decode_canonical_signed_mutation,
+};
+use chat_protocol::validation;
 use ed25519_dalek::{Signer, SigningKey};
 use repository::auth::{
-    authorize_enrollment_operation_only, authorize_rebind_operation_only,
-    authorize_replenishment_operation_only, authorize_signed_request, authorize_unsigned_request,
-    test_arbitrate_business_idempotency, test_recheck_business_authority,
-    test_record_completed_idempotency, AuthRepositoryError, AuthorizationOutcome,
-    EnrollmentOperationAdmission, RebindOperationAdmission, SignedOperationAdmission,
+    authorize_enrollment_operation_only, authorize_replenishment_operation_only,
+    authorize_signed_request, authorize_unsigned_request, test_arbitrate_business_idempotency,
+    test_recheck_business_authority, test_record_completed_idempotency, AuthRepositoryError,
+    AuthorizationOutcome, EnrollmentOperationAdmission, SignedOperationAdmission,
     TestBusinessIdempotencyOutcome,
 };
 use repository::key_packages::NewKeyPackage;
 use repository::prelude::{self, PreludeError};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use transcript::{
-    decode_and_verify_enrollment_body, decode_canonical_signed_mutation, decode_rebind_bootstrap,
-};
 
 const REGISTERED_DID: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
 const REGISTERED_DEVICE: &str = "3b241101-e2bb-4255-8caf-4136c566a962";
@@ -709,43 +569,6 @@ fn enrollment_evidence(
     )
 }
 
-fn rebind_body(
-    fixture: &DeviceFixture,
-    operation_id: uuid::Uuid,
-    current_jkt: &str,
-    new_jkt: &str,
-    expected_auth_generation: u64,
-    signed_at: &str,
-) -> Vec<u8> {
-    let body = json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0000}",
-        "actorDid": REGISTERED_DID,
-        "actorDeviceId": fixture.device_id,
-        "keyId": fixture.key_id,
-        "expectedAuthGeneration": expected_auth_generation,
-        "currentDpopJkt": current_jkt,
-        "newDpopJkt": new_jkt,
-        "idempotencyKey": operation_id,
-        "signedAt": signed_at,
-    });
-    sign_exact_body_with_key(body, &fixture.signing_key)
-}
-
-fn rebind_evidence(
-    raw: &[u8],
-    token_jti: uuid::Uuid,
-    proof_jti: [u8; 12],
-    trusted_at: &str,
-) -> chat_protocol::dpop::PreReplayCryptographicVerification {
-    chat_protocol::dpop::repository_test_evidence::rebind_with_replay(
-        decode_rebind_bootstrap(raw).unwrap(),
-        token_jti,
-        proof_jti,
-        trusted_at,
-    )
-}
-
 fn first_authority(
     outcome: AuthorizationOutcome,
 ) -> chat_protocol::dpop::VerifiedChatDeviceRequest {
@@ -766,19 +589,6 @@ async fn prepare_enrollment_first(
         }
     }
 }
-
-async fn prepare_rebind_first(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    admission: RebindOperationAdmission,
-) -> Result<repository::prelude::PreparedRebindBootstrapPrelude, PreludeError> {
-    match prelude::prepare_rebind_operation(transaction, admission).await? {
-        prelude::PreparedRebindOperation::First(prepared) => Ok(prepared),
-        prelude::PreparedRebindOperation::Replay(_) => {
-            panic!("fresh rebind unexpectedly replayed")
-        }
-    }
-}
-
 async fn persist_and_complete_enrollment(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: EnrollmentOperationAdmission,
@@ -810,27 +620,6 @@ async fn persist_and_complete_enrollment(
     .await
 }
 
-async fn persist_and_complete_rebind(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    admission: RebindOperationAdmission,
-    status: i32,
-    response: &[u8],
-) -> Result<(), PreludeError> {
-    let prepared = prepare_rebind_first(transaction, admission).await?;
-    {
-        let effect = prepared.effect_authority();
-        prelude::persist_rebind_bootstrap_effects(transaction, &effect).await?;
-    }
-    prelude::complete_rebind_bootstrap_operation(
-        transaction,
-        prepared.into_completion_guard(),
-        status,
-        response,
-        None,
-    )
-    .await
-}
-
 async fn validate_enrollment_replay(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     admission: EnrollmentOperationAdmission,
@@ -842,19 +631,6 @@ async fn validate_enrollment_replay(
         }
     }
 }
-
-async fn validate_rebind_replay(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    admission: RebindOperationAdmission,
-) -> Result<repository::auth::CompletedIdempotentResponse, PreludeError> {
-    match prelude::prepare_rebind_operation(transaction, admission).await? {
-        prelude::PreparedRebindOperation::Replay(response) => Ok(response),
-        prelude::PreparedRebindOperation::First(_) => {
-            panic!("completed rebind unexpectedly executed")
-        }
-    }
-}
-
 async fn seed_registered_device(pool: &sqlx::PgPool) {
     let public_key = registered_signing_key().verifying_key().to_bytes();
     sqlx::query(
@@ -1519,145 +1295,6 @@ async fn enrollment_adapter_commits_generation_one_and_durable_exact_completion(
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn rebind_adapter_cas_updates_only_jkt_and_generation_and_replays_after_restart() {
-    let (pool, _database) = setup_auth_repository_db(3).await;
-    let fixture = DeviceFixture::fresh();
-    seed_device(&pool, &fixture).await;
-    let operation_id = uuid::Uuid::new_v4();
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let raw = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &new_jkt,
-        1,
-        FIRST_T,
-    );
-    let conflicting_new_jkt =
-        URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let conflicting_raw = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &conflicting_new_jkt,
-        1,
-        FIRST_T,
-    );
-    let admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-    )
-    .await
-    .unwrap();
-    // Both exact old-state requests are admitted before either one changes the
-    // row. Their immutable bodies differ under one operation ID, so arbitration
-    // (not post-CAS admission) must reject the second request.
-    let conflicting_admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(
-            &conflicting_raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            FIRST_T,
-        ),
-    )
-    .await
-    .unwrap();
-
-    let mut transaction = pool.begin().await.unwrap();
-    let response = br#"{"authGeneration":2}"#;
-    persist_and_complete_rebind(&mut transaction, admission, 200, response)
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
-
-    let mut conflict_transaction = pool.begin().await.unwrap();
-    let conflict =
-        prelude::prepare_rebind_operation(&mut conflict_transaction, conflicting_admission)
-            .await
-            .unwrap_err();
-    assert!(matches!(conflict, PreludeError::OperationIdConflict));
-    conflict_transaction.rollback().await.unwrap();
-
-    let device: (String, i64) = sqlx::query_as(
-        "SELECT dpop_jkt, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(fixture.device_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(device, (new_jkt.clone(), 2));
-    let key: (String, Vec<u8>, i64) = sqlx::query_as(
-        "SELECT key_id, signing_public_key, enrollment_auth_generation FROM chat.device_keys WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(fixture.device_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(key.0, fixture.key_id);
-    assert_eq!(
-        key.1,
-        fixture.signing_key.verifying_key().as_bytes().as_slice()
-    );
-    assert_eq!(key.2, 1, "rebind rewrote immutable enrollment provenance");
-    pool.close().await;
-
-    let restarted = _database.connect(2).await;
-    let replay_admission = authorize_rebind_operation_only(
-        &restarted,
-        rebind_evidence(
-            &raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            "2026-07-24T14:05:09.123Z",
-        ),
-    )
-    .await
-    .unwrap();
-    let mut replay_transaction = restarted.begin().await.unwrap();
-    let prelude::PreparedRebindOperation::Replay(replay) =
-        prelude::prepare_rebind_operation(&mut replay_transaction, replay_admission)
-            .await
-            .unwrap()
-    else {
-        panic!("completed rebind was not durable across a fresh pool");
-    };
-    replay_transaction.commit().await.unwrap();
-    assert_eq!(replay.response_bytes(), response);
-
-    let changed_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let changed = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &changed_jkt,
-        1,
-        FIRST_T,
-    );
-    let conflict = match authorize_rebind_operation_only(
-        &restarted,
-        rebind_evidence(
-            &changed,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            "2026-07-23T14:05:10.123Z",
-        ),
-    )
-    .await
-    {
-        Ok(_) => panic!("changed completed rebind unexpectedly admitted"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        conflict,
-        AuthRepositoryError::RequestBindingMismatch
-    ));
-}
-
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn replenishment_exact_replay_survives_next_day_but_stale_first_creates_no_claim() {
     let (pool, _database) = setup_auth_repository_db(3).await;
     seed_registered_device(&pool).await;
@@ -1888,7 +1525,7 @@ async fn replenishment_replay_rejects_missing_ref_hash_and_owner_manifest_drift(
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn stale_enrollment_and_rebind_first_execution_create_no_operation_claim() {
+async fn stale_enrollment_first_execution_creates_no_operation_claim() {
     let (pool, _database) = setup_auth_repository_db(3).await;
     let late = "2026-07-24T14:05:09.123Z";
 
@@ -1918,43 +1555,13 @@ async fn stale_enrollment_and_rebind_first_execution_create_no_operation_claim()
     ));
     enrollment_tx.rollback().await.unwrap();
 
-    let rebind_fixture = DeviceFixture::fresh();
-    seed_device(&pool, &rebind_fixture).await;
-    let rebind_id = uuid::Uuid::new_v4();
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let rebind_raw = rebind_body(
-        &rebind_fixture,
-        rebind_id,
-        &rebind_fixture.dpop_jkt,
-        &new_jkt,
-        1,
-        FIRST_T,
-    );
-    let rebind = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&rebind_raw, uuid::Uuid::new_v4(), random_proof_jti(), late),
-    )
-    .await
-    .unwrap();
-    let mut rebind_tx = pool.begin().await.unwrap();
-    let error = prelude::prepare_rebind_operation(&mut rebind_tx, rebind)
-        .await
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        PreludeError::Authorization(AuthRepositoryError::Primitive(_))
-    ));
-    rebind_tx.rollback().await.unwrap();
-
-    for operation_id in [enrollment_id, rebind_id] {
-        let claim_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
-                .bind(operation_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(claim_count, 0, "stale first execution created a claim");
-    }
+    let claim_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM chat.operation_claims WHERE operation_id=$1")
+            .bind(enrollment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(claim_count, 0, "stale first execution created a claim");
 }
 
 #[tokio::test]
@@ -2110,144 +1717,6 @@ async fn identical_enrollment_business_racers_converge_on_one_device_and_respons
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn rebind_adapter_rolls_back_cas_without_unburning_replay() {
-    let (pool, _database) = setup_auth_repository_db(3).await;
-    let fixture = DeviceFixture::fresh();
-    seed_device(&pool, &fixture).await;
-    let operation_id = uuid::Uuid::new_v4();
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let raw = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &new_jkt,
-        1,
-        FIRST_T,
-    );
-    let token_jti = uuid::Uuid::new_v4();
-    let proof_jti = random_proof_jti();
-    let admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&raw, token_jti, proof_jti, FIRST_T),
-    )
-    .await
-    .unwrap();
-    let mut transaction = pool.begin().await.unwrap();
-    persist_and_complete_rebind(&mut transaction, admission, 200, br#"{"rolledBack":true}"#)
-        .await
-        .unwrap();
-    transaction.rollback().await.unwrap();
-
-    let device: (String, i64) = sqlx::query_as(
-        "SELECT dpop_jkt, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(fixture.device_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let completion_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM chat.idempotency_records WHERE principal_did = $1 AND endpoint_nsid = 'blue.catbird.chat.rebindDeviceAuthentication' AND operation_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(operation_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let replay_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT count(*) FROM chat.dpop_replays
-         WHERE (replay_namespace = 'token' AND token_jti = $1)
-            OR (replay_namespace = 'proof' AND proof_jti_bytes = $2)
-        "#,
-    )
-    .bind(token_jti)
-    .bind(proof_jti.as_slice())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(device, (fixture.dpop_jkt.clone(), 1));
-    assert_eq!(completion_count, 0);
-    assert_eq!(replay_count, 2);
-}
-
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn identical_rebind_business_racers_converge_on_one_cas_and_response() {
-    let (pool, _database) = setup_auth_repository_db(4).await;
-    let fixture = DeviceFixture::fresh();
-    seed_device(&pool, &fixture).await;
-    let operation_id = uuid::Uuid::new_v4();
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let raw = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &new_jkt,
-        1,
-        FIRST_T,
-    );
-    let first = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-    )
-    .await
-    .unwrap();
-    let second = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-    )
-    .await
-    .unwrap();
-
-    let mut first_tx = pool.begin().await.unwrap();
-    let prepared = prepare_rebind_first(&mut first_tx, first).await.unwrap();
-    let second_pool = pool.clone();
-    let second_task = tokio::spawn(async move {
-        let mut second_tx = second_pool.begin().await.unwrap();
-        let result = prelude::prepare_rebind_operation(&mut second_tx, second)
-            .await
-            .unwrap();
-        let prelude::PreparedRebindOperation::Replay(response) = result else {
-            panic!("identical rebind loser executed twice");
-        };
-        let bytes = response.response_bytes().to_vec();
-        second_tx.rollback().await.unwrap();
-        bytes
-    });
-    tokio::task::yield_now().await;
-    let response = br#"{"winner":"rebind"}"#;
-    {
-        let effect = prepared.effect_authority();
-        prelude::persist_rebind_bootstrap_effects(&mut first_tx, &effect)
-            .await
-            .unwrap();
-    }
-    prelude::complete_rebind_bootstrap_operation(
-        &mut first_tx,
-        prepared.into_completion_guard(),
-        200,
-        response,
-        None,
-    )
-    .await
-    .unwrap();
-    first_tx.commit().await.unwrap();
-    assert_eq!(second_task.await.unwrap(), response);
-
-    let device: (String, i64) = sqlx::query_as(
-        "SELECT dpop_jkt, auth_generation FROM chat.devices WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(fixture.device_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(device, (new_jkt, 2));
-}
-
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_rows() {
     let (pool, _database) = setup_auth_repository_db(3).await;
 
@@ -2295,102 +1764,6 @@ async fn dedicated_bootstrap_conflicts_burn_replay_without_mutating_authority_ro
     .await
     .unwrap();
     assert_eq!(enrollment_replays, 3);
-
-    let rebind = DeviceFixture::fresh();
-    seed_device(&pool, &rebind).await;
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let stale_raw = rebind_body(
-        &rebind,
-        uuid::Uuid::new_v4(),
-        &rebind.dpop_jkt,
-        &new_jkt,
-        2,
-        FIRST_T,
-    );
-    let stale_token = uuid::Uuid::new_v4();
-    let stale_proof = random_proof_jti();
-    let error = match authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&stale_raw, stale_token, stale_proof, FIRST_T),
-    )
-    .await
-    {
-        Ok(_) => panic!("stale rebind unexpectedly admitted"),
-        Err(error) => error,
-    };
-    assert!(matches!(
-        error,
-        AuthRepositoryError::AuthenticationGenerationMismatch
-    ));
-    let stale_replays: i64 = sqlx::query_scalar(
-        r#"
-        SELECT count(*) FROM chat.dpop_replays
-         WHERE (replay_namespace = 'token' AND token_jti = $1)
-            OR (replay_namespace = 'proof' AND proof_jti_bytes = $2)
-        "#,
-    )
-    .bind(stale_token)
-    .bind(stale_proof.as_slice())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(stale_replays, 2);
-
-    let attacker_seed: [u8; 32] = Sha256::digest(uuid::Uuid::new_v4().as_bytes()).into();
-    let attacker_key = SigningKey::from_bytes(&attacker_seed);
-    let attacker_key_id = validation::ed25519_key_id(attacker_key.verifying_key().as_bytes())
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let attacker_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let attacker_body = json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0000}",
-        "actorDid": REGISTERED_DID,
-        "actorDeviceId": rebind.device_id,
-        "keyId": attacker_key_id,
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": rebind.dpop_jkt,
-        "newDpopJkt": attacker_jkt,
-        "idempotencyKey": uuid::Uuid::new_v4(),
-        "signedAt": FIRST_T,
-    });
-    let attacker_raw = sign_exact_body_with_key(attacker_body, &attacker_key);
-    let attacker_token = uuid::Uuid::new_v4();
-    let attacker_proof = random_proof_jti();
-    let error = match authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&attacker_raw, attacker_token, attacker_proof, FIRST_T),
-    )
-    .await
-    {
-        Ok(_) => panic!("forged rebind unexpectedly admitted"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, AuthRepositoryError::RequestBindingMismatch));
-    let attacker_replays: i64 = sqlx::query_scalar(
-        r#"
-        SELECT count(*) FROM chat.dpop_replays
-         WHERE (replay_namespace = 'token' AND token_jti = $1)
-            OR (replay_namespace = 'proof' AND proof_jti_bytes = $2)
-        "#,
-    )
-    .bind(attacker_token)
-    .bind(attacker_proof.as_slice())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(attacker_replays, 2);
-
-    let unchanged: (String, i64, String) = sqlx::query_as(
-        "SELECT dpop_jkt, auth_generation, status FROM chat.devices WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(REGISTERED_DID)
-    .bind(rebind.device_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(unchanged, (rebind.dpop_jkt, 1, "active".to_owned()));
 }
 
 #[tokio::test]
@@ -2530,120 +1903,6 @@ async fn completed_enrollment_replay_requires_exact_installed_generation_one_aut
 
 #[tokio::test]
 #[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn completed_rebind_replay_requires_exact_post_cas_authority_and_signature() {
-    let (pool, _database) = setup_auth_repository_db(3).await;
-
-    let orphan = DeviceFixture::fresh();
-    seed_device(&pool, &orphan).await;
-    let orphan_operation = uuid::Uuid::new_v4();
-    let orphan_new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let orphan_raw = rebind_body(
-        &orphan,
-        orphan_operation,
-        &orphan.dpop_jkt,
-        &orphan_new_jkt,
-        1,
-        FIRST_T,
-    );
-    insert_completed_bootstrap_fixture(
-        &pool,
-        "blue.catbird.chat.rebindDeviceAuthentication",
-        orphan_operation,
-        &orphan_raw,
-        Some(&orphan.dpop_jkt),
-        Some(&orphan_new_jkt),
-        br#"{"orphan":true}"#,
-    )
-    .await;
-    let admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(
-            &orphan_raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            "2026-07-23T14:05:09.123Z",
-        ),
-    )
-    .await
-    .unwrap();
-    let mut transaction = pool.begin().await.unwrap();
-    let error = validate_rebind_replay(&mut transaction, admission)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            PreludeError::Authorization(AuthRepositoryError::DpopBindingMismatch)
-        ),
-        "pre-CAS rebind completion was replayed: {error:?}"
-    );
-    transaction.rollback().await.unwrap();
-
-    let forged = DeviceFixture::fresh();
-    seed_device(&pool, &forged).await;
-    let forged_operation = uuid::Uuid::new_v4();
-    let forged_new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    sqlx::query(
-        r#"
-        UPDATE chat.devices
-           SET dpop_jkt = $3, auth_generation = 2, updated_at = $4::timestamptz
-         WHERE user_did = $1 AND device_id = $2
-        "#,
-    )
-    .bind(REGISTERED_DID)
-    .bind(forged.device_id)
-    .bind(&forged_new_jkt)
-    .bind("2026-07-22T14:06:09.123Z")
-    .execute(&pool)
-    .await
-    .unwrap();
-    let attacker_seed: [u8; 32] = Sha256::digest(uuid::Uuid::new_v4().as_bytes()).into();
-    let attacker_key = SigningKey::from_bytes(&attacker_seed);
-    let forged_body = json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0000}",
-        "actorDid": REGISTERED_DID,
-        "actorDeviceId": forged.device_id,
-        "keyId": forged.key_id,
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": forged.dpop_jkt,
-        "newDpopJkt": forged_new_jkt,
-        "idempotencyKey": forged_operation,
-        "signedAt": FIRST_T,
-    });
-    let forged_raw = sign_exact_body_with_key(forged_body, &attacker_key);
-    insert_completed_bootstrap_fixture(
-        &pool,
-        "blue.catbird.chat.rebindDeviceAuthentication",
-        forged_operation,
-        &forged_raw,
-        Some(&forged.dpop_jkt),
-        Some(&forged_new_jkt),
-        br#"{"forged":true}"#,
-    )
-    .await;
-    let error = match authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(
-            &forged_raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            "2026-07-23T14:05:10.123Z",
-        ),
-    )
-    .await
-    {
-        Ok(_) => panic!("forged completed rebind unexpectedly admitted"),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(error, AuthRepositoryError::Primitive(_)),
-        "rebind completion escaped immutable-key signature verification: {error:?}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
 async fn business_convergence_revalidates_completed_authority_and_post_state() {
     let (pool, _database) = setup_auth_repository_db(4).await;
 
@@ -2726,109 +1985,4 @@ async fn business_convergence_revalidates_completed_authority_and_post_state() {
         "business convergence replay ignored missing enrollment post-state: {error:?}"
     );
     enrollment_transaction.rollback().await.unwrap();
-
-    let rebind = DeviceFixture::fresh();
-    seed_device(&pool, &rebind).await;
-    let rebind_operation = uuid::Uuid::new_v4();
-    let rebind_new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let rebind_raw = rebind_body(
-        &rebind,
-        rebind_operation,
-        &rebind.dpop_jkt,
-        &rebind_new_jkt,
-        1,
-        FIRST_T,
-    );
-    let rebind_admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(
-            &rebind_raw,
-            uuid::Uuid::new_v4(),
-            random_proof_jti(),
-            FIRST_T,
-        ),
-    )
-    .await
-    .unwrap();
-    insert_completed_bootstrap_fixture(
-        &pool,
-        "blue.catbird.chat.rebindDeviceAuthentication",
-        rebind_operation,
-        &rebind_raw,
-        Some(&rebind.dpop_jkt),
-        Some(&rebind_new_jkt),
-        br#"{"alreadyCompleted":true}"#,
-    )
-    .await;
-    let mut rebind_transaction = pool.begin().await.unwrap();
-    let error = validate_rebind_replay(&mut rebind_transaction, rebind_admission)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            PreludeError::Authorization(AuthRepositoryError::DpopBindingMismatch)
-        ),
-        "business convergence replay ignored missing rebind CAS post-state: {error:?}"
-    );
-    rebind_transaction.rollback().await.unwrap();
-}
-
-/// Regression guard for the dead first-execution device-rebind path.
-///
-/// `dpop::mint_rebind_repository_authority` used to move the rebind bootstrap
-/// out of `PreReplayCryptographicVerification` (`pre_replay.rebind.take()`) to
-/// feed a by-value verifier. `auth::lock_rebind_old_state_scope` then reads
-/// that same bootstrap back off the minted authority — it needs
-/// `currentDpopJkt`, `newDpopJkt`, `keyId`, `expectedAuthGeneration` and
-/// `idempotencyKey` to bind the locked device row — found `None`, and returned
-/// `UnsupportedAuthorizationShape`. Every first-execution rebind failed closed
-/// as `InvalidRequest` (HTTP 400), so DPoP key rotation was unavailable.
-///
-/// Failing input for this assertion: reintroduce any move of
-/// `pre_replay.rebind` inside the mint (`.take()`, destructuring, or a
-/// `self`-by-value method on `CanonicalRebindBootstrap`). This test then fails
-/// with `Authorization(UnsupportedAuthorizationShape)` and the panic below
-/// names the cause. Verified by reverting the fix in an isolated copy.
-#[tokio::test]
-#[ignore = "requires the isolated clean-chat PostgreSQL database"]
-async fn first_execution_rebind_carries_its_bootstrap_into_the_old_state_lock() {
-    let (pool, _database) = setup_auth_repository_db(2).await;
-    let fixture = DeviceFixture::fresh();
-    seed_device(&pool, &fixture).await;
-    let operation_id = uuid::Uuid::new_v4();
-    let new_jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(uuid::Uuid::new_v4().as_bytes()));
-    let raw = rebind_body(
-        &fixture,
-        operation_id,
-        &fixture.dpop_jkt,
-        &new_jkt,
-        1,
-        FIRST_T,
-    );
-
-    let admission = authorize_rebind_operation_only(
-        &pool,
-        rebind_evidence(&raw, uuid::Uuid::new_v4(), random_proof_jti(), FIRST_T),
-    )
-    .await
-    .expect("an exact old-state rebind must be admitted");
-
-    // Admission has already matched every stored-vs-body binding. The only
-    // remaining step is the mint -> old-state-lock handoff, which is where the
-    // bootstrap must still be readable.
-    let mut transaction = pool.begin().await.unwrap();
-    match prelude::prepare_rebind_operation(&mut transaction, admission).await {
-        Ok(prelude::PreparedRebindOperation::First(_)) => {}
-        Ok(prelude::PreparedRebindOperation::Replay(_)) => {
-            panic!("a freshly minted rebind operation must not resolve as a replay")
-        }
-        Err(error) => panic!(
-            "REGRESSION: first-execution rebind was rejected at the repository stage with \
-             {error:?}. If this is Authorization(UnsupportedAuthorizationShape), the rebind \
-             bootstrap was consumed before lock_rebind_old_state_scope could read it back off \
-             pre_replay, which makes every device rebind return InvalidRequest (HTTP 400)."
-        ),
-    }
-    transaction.rollback().await.unwrap();
 }

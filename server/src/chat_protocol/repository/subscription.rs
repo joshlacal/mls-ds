@@ -1,8 +1,8 @@
-//! Durable clean-chat subscription reads.
-//!
-//! `chat.events` is the only durable source. `chat.event_recipients` freezes
-//! entitlement for an exact device, so this reader never rediscovers a current
-//! conversation membership and cannot accidentally broaden a historical event.
+// Durable clean-chat subscription reads.
+//
+// `chat.events` is the only durable source. `chat.event_recipients` freezes
+// entitlement for an exact device, so this reader never rediscovers a current
+// conversation membership and cannot accidentally broaden a historical event.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use catbird_atproto::generated::blue_catbird::chat::{
@@ -18,7 +18,7 @@ use super::ticket::{
     TicketRepositoryError,
 };
 use crate::{
-    chat_protocol::{
+    chat_protocol::cursor::{
         mint_capability_token, CursorSealer, OsSecureRandom, SealedCapability, SealerBinding,
     },
     sqlx_jacquard::chrono_to_datetime,
@@ -221,7 +221,7 @@ pub(crate) async fn materialize_envelope(
             .verify_successor(
                 &SealedCapability {
                     nonce,
-                    ciphertext: row.try_get("cursor_ciphertext")?,
+                    ciphertext: row.try_get::<Vec<u8>, _>("cursor_ciphertext")?,
                 },
                 &binding,
             )

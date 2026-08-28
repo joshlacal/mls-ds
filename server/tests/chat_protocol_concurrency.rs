@@ -36,19 +36,13 @@
 
 mod common;
 
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
 mod repository {
-    pub(crate) mod transition {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/transition.rs"
-        ));
-    }
-    pub(crate) mod delivery {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/repository/delivery.rs"
-        ));
-    }
+    pub(crate) use crate::chat_protocol::repository::*;
 }
 
 use std::collections::HashSet;
@@ -591,6 +585,7 @@ async fn concurrent_application_appends_get_unique_contiguous_seqs() {
 #[tokio::test]
 async fn two_outbox_workers_never_double_claim() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
+    let _outbox_test_lock = common::chat_protocol::acquire_outbox_test_lock(&pool).await;
     let protocol_instance_id = seed_protocol_instance(&pool).await;
     let now = clock_now(&pool).await;
 

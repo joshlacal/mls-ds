@@ -76,14 +76,14 @@ impl fmt::Display for CursorCodecError {
 
 impl Error for CursorCodecError {}
 
-pub(super) struct CursorCodec {
+pub(crate) struct CursorCodec {
     protocol_instance: Uuid,
     key_id: [u8; 32],
     secret: Zeroizing<[u8; 32]>,
 }
 
 impl CursorCodec {
-    pub(super) fn new(
+    pub(crate) fn new(
         protocol_instance: Uuid,
         key_id: &str,
         secret: Zeroizing<[u8; 32]>,
@@ -113,7 +113,7 @@ impl CursorCodec {
                 .is_ok_and(|decoded| decoded.as_slice() == self.key_id)
     }
 
-    pub(super) fn issue_event_cursor(
+    pub(crate) fn issue_event_cursor(
         &self,
         device: &DeviceCursorBinding,
         position: u64,
@@ -133,7 +133,7 @@ impl CursorCodec {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn hydrate_event_cursor(
+    pub(crate) fn hydrate_event_cursor(
         &self,
         persisted_bytes: &[u8],
         expected_sha256: [u8; 32],
@@ -161,7 +161,7 @@ impl CursorCodec {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn bind_inventory_session(
+    pub(crate) fn bind_inventory_session(
         &self,
         device: DeviceCursorBinding,
         session_id: Uuid,
@@ -213,7 +213,7 @@ impl CursorCodec {
         Ok(InventorySessionToken(encoded.to_owned()))
     }
 
-    pub(super) fn verify_event_cursor(
+    pub(crate) fn verify_event_cursor(
         &self,
         encoded: &str,
         expected_device: &DeviceCursorBinding,
@@ -275,7 +275,7 @@ impl CursorCodec {
         })
     }
 
-    pub(super) fn issue_inventory_session_id(
+    pub(crate) fn issue_inventory_session_id(
         &self,
         binding: &InventorySessionBinding,
         issued_at: u64,
@@ -377,7 +377,7 @@ impl CursorCodec {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn bind_inventory_page(
+    pub(crate) fn bind_inventory_page(
         &self,
         session_binding: &InventorySessionBinding,
         inventory_session: &InventorySessionToken,
@@ -652,7 +652,7 @@ impl CursorCodec {
         Ok(())
     }
 
-    pub(super) fn issue_own_device_cursor(
+    pub(crate) fn issue_own_device_cursor(
         &self,
         binding: &OwnDeviceCursorBinding,
         last_ordinal: u64,
@@ -666,7 +666,7 @@ impl CursorCodec {
         OwnDeviceCursor::from_body(self.authenticate(body)?)
     }
 
-    pub(super) fn verify_own_device_cursor(
+    pub(crate) fn verify_own_device_cursor(
         &self,
         encoded: &str,
         expected: &OwnDeviceCursorBinding,
@@ -848,7 +848,7 @@ impl CursorCodec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct DeviceCursorBinding {
+pub(crate) struct DeviceCursorBinding {
     did_hash: [u8; 32],
     device_id: Uuid,
     auth_generation: u64,
@@ -856,7 +856,7 @@ pub(super) struct DeviceCursorBinding {
 }
 
 impl DeviceCursorBinding {
-    pub(super) fn new(
+    pub(crate) fn new(
         did: &BareDid,
         device_id: Uuid,
         auth_generation: u64,
@@ -884,7 +884,7 @@ impl DeviceCursorBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct InventorySessionBinding {
+pub(crate) struct InventorySessionBinding {
     device: DeviceCursorBinding,
     session_id: Uuid,
     snapshot_event_position: u64,
@@ -914,17 +914,17 @@ impl InventorySessionBinding {
         })
     }
 
-    pub(super) const fn session_id(&self) -> Uuid {
+    pub(crate) const fn session_id(&self) -> Uuid {
         self.session_id
     }
 
-    pub(super) const fn snapshot_event_cursor_hash(&self) -> [u8; 32] {
+    pub(crate) const fn snapshot_event_cursor_hash(&self) -> [u8; 32] {
         self.snapshot_event_cursor_hash
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum InventoryPageDomain {
+pub(crate) enum InventoryPageDomain {
     Conversations,
     PendingWelcomes,
     LeafRecovery,
@@ -941,7 +941,7 @@ impl InventoryPageDomain {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct InventoryPageBinding {
+pub(crate) struct InventoryPageBinding {
     session_binding: InventorySessionBinding,
     inventory_session: InventorySessionToken,
     snapshot_event_cursor: EventCursor,
@@ -978,7 +978,7 @@ impl InventoryPageBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct OwnDeviceCursorBinding {
+pub(crate) struct OwnDeviceCursorBinding {
     device: DeviceCursorBinding,
     device_inventory_session_id: Uuid,
     fence_revision: u64,
@@ -987,7 +987,7 @@ pub(super) struct OwnDeviceCursorBinding {
 }
 
 impl OwnDeviceCursorBinding {
-    pub(super) fn new(
+    pub(crate) fn new(
         device: DeviceCursorBinding,
         device_inventory_session_id: Uuid,
         fence_revision: u64,
@@ -1006,13 +1006,13 @@ impl OwnDeviceCursorBinding {
         })
     }
 
-    pub(super) const fn session_id(&self) -> Uuid {
+    pub(crate) const fn session_id(&self) -> Uuid {
         self.device_inventory_session_id
     }
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct EventCursor(String);
+pub(crate) struct EventCursor(String);
 
 impl EventCursor {
     fn from_body(bytes: Vec<u8>) -> Result<Self, CursorCodecError> {
@@ -1023,11 +1023,11 @@ impl EventCursor {
         Ok(Self(encoded))
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub(super) fn binding_hash(&self) -> [u8; 32] {
+    pub(crate) fn binding_hash(&self) -> [u8; 32] {
         opaque_binding_hash(self.0.as_bytes()).expect("issued cursor is within the public bound")
     }
 }
@@ -1039,9 +1039,9 @@ impl fmt::Debug for EventCursor {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct InventorySessionToken(String);
+pub(crate) struct InventorySessionToken(String);
 
-pub(super) type InventorySessionId = InventorySessionToken;
+pub(crate) type InventorySessionId = InventorySessionToken;
 
 impl InventorySessionToken {
     fn from_body(bytes: Vec<u8>) -> Result<Self, CursorCodecError> {
@@ -1091,7 +1091,7 @@ impl fmt::Debug for InventoryPageCursor {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct OwnDeviceCursor(String);
+pub(crate) struct OwnDeviceCursor(String);
 
 impl OwnDeviceCursor {
     fn from_body(bytes: Vec<u8>) -> Result<Self, CursorCodecError> {
@@ -1102,7 +1102,7 @@ impl OwnDeviceCursor {
         Ok(Self(encoded))
     }
 
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -1165,7 +1165,7 @@ impl VerifiedInventorySession {
 /// or event-fence authority. The token hash selects one durable session row;
 /// authorization is completed only against that row's locked binding.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) struct InventoryPageLocator {
+pub(crate) struct InventoryPageLocator {
     domain: InventoryPageDomain,
     session_token_hash: [u8; 32],
     authenticated_cursor_hash: [u8; 32],
@@ -1173,17 +1173,17 @@ pub(super) struct InventoryPageLocator {
 }
 
 impl InventoryPageLocator {
-    pub(super) const fn session_token_hash(&self) -> [u8; 32] {
+    pub(crate) const fn session_token_hash(&self) -> [u8; 32] {
         self.session_token_hash
     }
 
-    pub(super) const fn authenticated_cursor_hash(&self) -> [u8; 32] {
+    pub(crate) const fn authenticated_cursor_hash(&self) -> [u8; 32] {
         self.authenticated_cursor_hash
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct VerifiedInventoryPageCursor {
+pub(crate) struct VerifiedInventoryPageCursor {
     domain: InventoryPageDomain,
     last_ordinal: u64,
     item_key_hash: [u8; 32],
@@ -1197,25 +1197,25 @@ pub(crate) struct LockedInventoryPageVerification {
 }
 
 impl VerifiedInventoryPageCursor {
-    pub(super) const fn domain(self) -> InventoryPageDomain {
+    pub(crate) const fn domain(self) -> InventoryPageDomain {
         self.domain
     }
 
-    pub(super) const fn last_ordinal(self) -> u64 {
+    pub(crate) const fn last_ordinal(self) -> u64 {
         self.last_ordinal
     }
 
-    pub(super) const fn item_key_hash(self) -> [u8; 32] {
+    pub(crate) const fn item_key_hash(self) -> [u8; 32] {
         self.item_key_hash
     }
 
-    pub(super) const fn expires_at(self) -> u64 {
+    pub(crate) const fn expires_at(self) -> u64 {
         self.expires_at
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct VerifiedOwnDeviceCursor {
+pub(crate) struct VerifiedOwnDeviceCursor {
     device_inventory_session_id: Uuid,
     fence_revision: u64,
     last_ordinal: u64,
@@ -1224,23 +1224,23 @@ pub(super) struct VerifiedOwnDeviceCursor {
 }
 
 impl VerifiedOwnDeviceCursor {
-    pub(super) const fn device_inventory_session_id(self) -> Uuid {
+    pub(crate) const fn device_inventory_session_id(self) -> Uuid {
         self.device_inventory_session_id
     }
 
-    pub(super) const fn fence_revision(self) -> u64 {
+    pub(crate) const fn fence_revision(self) -> u64 {
         self.fence_revision
     }
 
-    pub(super) const fn last_ordinal(self) -> u64 {
+    pub(crate) const fn last_ordinal(self) -> u64 {
         self.last_ordinal
     }
 
-    pub(super) const fn item_key_hash(self) -> [u8; 32] {
+    pub(crate) const fn item_key_hash(self) -> [u8; 32] {
         self.item_key_hash
     }
 
-    pub(super) const fn expires_at(self) -> u64 {
+    pub(crate) const fn expires_at(self) -> u64 {
         self.expires_at
     }
 }
@@ -1362,14 +1362,14 @@ fn persisted_encoded_with_digest(
     Ok(encoded)
 }
 
-pub(super) fn opaque_binding_hash(bytes: &[u8]) -> Result<[u8; 32], CursorCodecError> {
+pub(crate) fn opaque_binding_hash(bytes: &[u8]) -> Result<[u8; 32], CursorCodecError> {
     if bytes.is_empty() || bytes.len() > MAX_OPAQUE_CURSOR_ASCII_BYTES {
         return Err(CursorCodecError::InvalidField);
     }
     Ok(Sha256::digest(bytes).into())
 }
 
-pub(super) fn inventory_item_key_hash(
+pub(crate) fn inventory_item_key_hash(
     domain: InventoryPageDomain,
     item_key: &[u8],
 ) -> Result<[u8; 32], CursorCodecError> {
@@ -1417,7 +1417,7 @@ fn exact_identity_hash(label: &[u8], value: &[u8]) -> Result<[u8; 32], CursorCod
     Ok(digest.finalize().into())
 }
 
-pub(super) fn own_device_item_key_hash(item_key: &[u8]) -> Result<[u8; 32], CursorCodecError> {
+pub(crate) fn own_device_item_key_hash(item_key: &[u8]) -> Result<[u8; 32], CursorCodecError> {
     bounded_hash(b"CBCC-OWN-DEVICE-ITEM\0", item_key, 1, 512)
 }
 

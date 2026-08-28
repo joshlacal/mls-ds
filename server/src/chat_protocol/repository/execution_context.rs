@@ -23,6 +23,7 @@ use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
 };
 use super::recovery::PreparedRecoveryExecutionGraph;
+use super::remote_prefix::{derive_bootstrap_local_id, BootstrapLocalIdLabel};
 use super::transition::{MetadataAvatarBinding, ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
 #[cfg(test)]
@@ -34,12 +35,12 @@ use crate::chat_protocol::state_machine::{
     prepare_device_revocation_batch_members, AppliedTransition, ControlEntryContent,
     ConversationKind, ConversationPersistencePlan, DeviceIdentity,
     DeviceRevocationBatchPersistencePlan, EventChainCursorError, EventFanout, ExecutionActor,
-    ExecutionAuthority, ExecutorError, LeafPersistenceColumns, LeafRecoveryKind,
-    LeaveRequestStatus, MetadataAuthorColumns, MetadataAvatarPersistence, ParticipantRole,
-    PlanAuthority, PlanKind, PreparedConversationExecution, PreparedDeviceRevocationBatchMembers,
-    PrincipalId, RecoveryOpenContext, RecoverySource, ResetRequestRow, ServerTimestamp,
-    SpineArtifacts, WelcomeDispositionInput, WelcomeExpiryContext, WelcomeRejectionWork,
-    WelcomeResponseContext, WelcomeStatus,
+    ExecutionAuthority, ExecutorError, HistoricalExecutionWriteAuthority, LeafPersistenceColumns,
+    LeafRecoveryKind, LeaveRequestStatus, MetadataAuthorColumns, MetadataAvatarPersistence,
+    ParticipantRole, PlanAuthority, PlanKind, PreparedConversationExecution,
+    PreparedDeviceRevocationBatchMembers, PrincipalId, RecoveryOpenContext, RecoverySource,
+    ResetRequestRow, ServerTimestamp, SpineArtifacts, WelcomeDispositionInput,
+    WelcomeExpiryContext, WelcomeRejectionWork, WelcomeResponseContext, WelcomeStatus,
 };
 use crate::chat_protocol::transcript::{
     canonical_metadata_avatar_blob_aad, decode_and_verify_control_entry,
@@ -881,6 +882,7 @@ async fn closing_participant_periods(
 async fn participant_period_ids(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
+    historical_source_entry_id: Option<Uuid>,
 ) -> Result<Vec<Uuid>, ExecutionContextHydrationError> {
     let needs_full_mapping = matches!(
         plan.effects().kind(),
@@ -890,13 +892,29 @@ async fn participant_period_ids(
         if plan.effects().kind() != PlanKind::Policy {
             return Ok(Vec::new());
         }
-        return Ok(plan
+        let mut ids = Vec::new();
+        for after in plan
             .effects()
             .participant_changes()
             .iter()
-            .filter(|change| change.before().is_none() && change.after().is_some())
-            .map(|_| Uuid::new_v4())
-            .collect());
+            .filter(|change| change.before().is_none())
+            .filter_map(|change| change.after())
+        {
+            match historical_source_entry_id {
+                Some(source_entry_id) => {
+                    let did = String::from_utf8(after.principal().as_bytes().to_vec())
+                        .map_err(|_| ExecutionContextHydrationError::OutOfDomain)?;
+                    ids.push(derive_bootstrap_local_id(
+                        Uuid::from_bytes(*plan.state().coordinate.conversation_id()),
+                        source_entry_id,
+                        BootstrapLocalIdLabel::ParticipantPeriod,
+                        did.as_bytes(),
+                    ));
+                }
+                None => ids.push(Uuid::new_v4()),
+            }
+        }
+        return Ok(ids);
     }
     let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
     let mut ids = Vec::with_capacity(plan.state().participants.len());
@@ -907,15 +925,24 @@ async fn participant_period_ids(
             r#"
             SELECT participant_period_id
               FROM chat.participants
-             WHERE conversation_id=$1 AND user_did=$2 AND current_membership
+             WHERE conversation_id=$1 AND user_did=$2 AND (current_membership OR status = 'pending')
              FOR SHARE
             "#,
         )
         .bind(conversation_id)
-        .bind(did)
+        .bind(&did)
         .fetch_optional(&mut **transaction)
         .await?;
-        ids.push(existing.unwrap_or_else(Uuid::new_v4));
+        let id = existing.unwrap_or_else(|| match historical_source_entry_id {
+            Some(source_entry_id) => derive_bootstrap_local_id(
+                conversation_id,
+                source_entry_id,
+                BootstrapLocalIdLabel::ParticipantPeriod,
+                did.as_bytes(),
+            ),
+            None => Uuid::new_v4(),
+        });
+        ids.push(id);
     }
     Ok(ids)
 }
@@ -923,8 +950,10 @@ async fn participant_period_ids(
 async fn opened_leaf_columns(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
+    historical_source_entry_id: Option<Uuid>,
 ) -> Result<(Vec<LeafPersistenceColumns>, Vec<Uuid>), ExecutionContextHydrationError> {
     let mut columns = Vec::new();
+    let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
     for device in plan.effects().opened_intervals() {
         let _after = plan
             .effects()
@@ -961,7 +990,24 @@ async fn opened_leaf_columns(
             leaf_auth_generation: auth_generation,
         });
     }
-    let ids = (0..columns.len()).map(|_| Uuid::new_v4()).collect();
+    let ids = match historical_source_entry_id {
+        Some(source_entry_id) => {
+            let mut ids = Vec::with_capacity(columns.len());
+            for col in &columns {
+                let did = device_did(&col.device)?;
+                let leaf_key =
+                    [did.as_bytes(), &[0x00], device_uuid(&col.device).as_bytes()].concat();
+                ids.push(derive_bootstrap_local_id(
+                    conversation_id,
+                    source_entry_id,
+                    BootstrapLocalIdLabel::LeafPeriod,
+                    &leaf_key,
+                ));
+            }
+            ids
+        }
+        None => (0..columns.len()).map(|_| Uuid::new_v4()).collect(),
+    };
     Ok((columns, ids))
 }
 
@@ -970,6 +1016,7 @@ async fn metadata_author(
     plan: &ConversationPersistencePlan,
     facts: &AuthorityFacts,
     actor: &LockedActorRow,
+    historical_source_entry_id: Option<Uuid>,
 ) -> Result<Option<MetadataAuthorColumns>, ExecutionContextHydrationError> {
     let Some(metadata) = plan
         .effects()
@@ -1030,12 +1077,21 @@ async fn metadata_author(
     {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
+    let metadata_snapshot_id = match historical_source_entry_id {
+        Some(source_entry_id) => derive_bootstrap_local_id(
+            Uuid::from_bytes(*plan.state().coordinate.conversation_id()),
+            source_entry_id,
+            BootstrapLocalIdLabel::MetadataSnapshot,
+            &[],
+        ),
+        None => Uuid::new_v4(),
+    };
     Ok(Some(MetadataAuthorColumns {
         author_role: role,
         author_device_status: status,
         author_public_key: public_key,
         author_key_id: key_id,
-        metadata_snapshot_id: Uuid::new_v4(),
+        metadata_snapshot_id,
     }))
 }
 
@@ -1750,7 +1806,7 @@ async fn recovery_open(
                 r#"
                 SELECT participant_period_id
                   FROM chat.participants
-                 WHERE conversation_id=$1 AND user_did=$2 AND current_membership
+                 WHERE conversation_id=$1 AND user_did=$2 AND (current_membership OR status = 'pending')
                  FOR SHARE
                 "#,
             )
@@ -1813,6 +1869,7 @@ async fn hydrate_execution_context_inner_with_g6(
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
     g6_prelude: Option<&LockedG6Prelude>,
+    historical_source_entry_id: Option<Uuid>,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
     if g6_prelude.is_some() {
         // This SQL-free shape gate runs before the first transaction query.
@@ -1934,10 +1991,10 @@ async fn hydrate_execution_context_inner_with_g6(
             .collect()
     };
 
+    // Supersession disposition payloads are repository-owned canonical
+    // protocol projections. Accepting caller bytes here lets append-time
+    // and historical terminal-graph verification disagree.
     if !artifacts.welcome_disposition_event_payloads.is_empty() {
-        // Supersession disposition payloads are repository-owned canonical
-        // protocol projections. Accepting caller bytes here lets append-time
-        // and historical terminal-graph verification disagree.
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
     let prior_bound_dispositions = plan
@@ -2162,13 +2219,21 @@ async fn hydrate_execution_context_inner_with_g6(
             None,
         )
     } else {
-        let (opened_leaves, leaf_period_ids) = opened_leaf_columns(transaction, plan).await?;
+        let (opened_leaves, leaf_period_ids) =
+            opened_leaf_columns(transaction, plan, historical_source_entry_id).await?;
         (
             opened_leaves,
             leaf_period_ids,
-            participant_period_ids(transaction, plan).await?,
+            participant_period_ids(transaction, plan, historical_source_entry_id).await?,
             closing_participant_periods(transaction, plan).await?,
-            metadata_author(transaction, plan, &facts, &actor_row).await?,
+            metadata_author(
+                transaction,
+                plan,
+                &facts,
+                &actor_row,
+                historical_source_entry_id,
+            )
+            .await?,
             metadata_avatar(transaction, plan, facts.applied_at).await?,
             spine_artifacts(transaction, plan, &artifacts).await?,
             recovery_open(transaction, plan).await?,
@@ -2214,7 +2279,7 @@ async fn hydrate_execution_context_inner(
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
-    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, None).await
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, None, None).await
 }
 
 async fn hydrate_g6_execution_context_inner(
@@ -2223,7 +2288,7 @@ async fn hydrate_g6_execution_context_inner(
     artifacts: ExecutionContextArtifacts,
     prelude: &LockedG6Prelude,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
-    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, Some(prelude)).await
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, Some(prelude), None).await
 }
 
 /// Unforgeable proof that execution-context hydration completed inside the
@@ -2541,6 +2606,91 @@ pub(in crate::chat_protocol::repository) async fn apply_prepared_acceptance_exec
 ) -> Result<AppliedTransition, ExecutorError> {
     crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(prepared)
         .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::chat_protocol::repository) async fn hydrate_historical_execution_context<
+    'borrow,
+    'conn,
+    'plan,
+>(
+    transaction: &'borrow mut Transaction<'conn, Postgres>,
+    plan: &'plan ConversationPersistencePlan,
+    accepted_control_entry_bytes: Vec<u8>,
+    genesis_group_info_bytes: Option<Vec<u8>>,
+    is_remote: bool,
+    sequencer_ds: Option<String>,
+    sequencer_term: i64,
+    participant_ds_dids: std::collections::HashMap<String, Option<String>>,
+    historical_authority: HistoricalExecutionWriteAuthority,
+) -> Result<PreparedConversationExecution<'borrow, 'conn, 'plan>, ExecutionContextHydrationError> {
+    let expected_transaction_id = plan
+        .effects()
+        .head_cas()
+        .ok_or(ExecutionContextHydrationError::MissingAuthority)?
+        .transaction_id()
+        .to_owned();
+    if !plan_transaction_bindings_match(plan, &expected_transaction_id) {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let facts = authority_facts(plan)?;
+    let actor = lock_actor(transaction, &facts).await?;
+    let entry =
+        decode_and_verify_control_entry(&accepted_control_entry_bytes, &actor.signing_public_key)
+            .map_err(|_| ExecutionContextHydrationError::ControlEntryMismatch)?;
+    let entry_id = Uuid::from_bytes(*entry.entry_id().as_bytes());
+    let entry_kind = entry.kind().type_id();
+    let accepted_sha256 = Sha256::digest(&accepted_control_entry_bytes);
+    let outer_fingerprint = entry.outer_control_fingerprint();
+
+    if !historical_authority.matches_context(
+        entry_id,
+        entry_kind,
+        &accepted_sha256,
+        outer_fingerprint,
+    ) {
+        return Err(ExecutionContextHydrationError::AuthorityMismatch);
+    }
+    let primary_event_payload = canonical_historical_primary_event_payload(plan)?;
+    let context = hydrate_execution_context_inner_with_g6(
+        transaction,
+        plan,
+        ExecutionContextArtifacts {
+            accepted_control_entry_bytes: Some(accepted_control_entry_bytes),
+            genesis_group_info_bytes,
+            primary_event_payload,
+            welcome_disposition_event_payloads: Vec::new(),
+            is_remote,
+            sequencer_ds,
+            sequencer_term,
+            participant_ds_dids,
+        },
+        None,
+        Some(historical_authority.source_entry_id()),
+    )
+    .await?;
+    Ok(PreparedConversationExecution::from_hydrated_parts(
+        transaction,
+        plan,
+        context,
+        expected_transaction_id.into_boxed_str(),
+        ExecutionContextHydrationProof { _minted_here: () },
+    )
+    .with_historical_write_authority(historical_authority))
+}
+
+fn canonical_historical_primary_event_payload(
+    plan: &ConversationPersistencePlan,
+) -> Result<Option<Vec<u8>>, ExecutionContextHydrationError> {
+    match plan.effects().kind() {
+        PlanKind::Creation => Ok(Some(canonical_creation_primary_event_payload(plan)?)),
+        PlanKind::Policy => Ok(Some(canonical_submit_transition_primary_event_payload(
+            plan,
+        )?)),
+        PlanKind::Acceptance => Ok(Some(canonical_acceptance_primary_event_payload(plan)?)),
+        PlanKind::Commit => Ok(Some(canonical_recovery_primary_event_payload(plan)?)),
+        _ => Ok(None),
+    }
 }
 
 fn canonical_creation_primary_event_payload(

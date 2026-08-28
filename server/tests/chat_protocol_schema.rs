@@ -29,19 +29,19 @@ use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::panic::AssertUnwindSafe;
 
 const TEST_DATABASE_NAME: &str = "catbird_chat_protocol_test_20260722";
-static MIGRATION_VERSIONS: LazyLock<[i64; 23]> = LazyLock::new(|| {
+static MIGRATION_VERSIONS: LazyLock<[i64; 28]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
             .version
     })
 });
-static MIGRATION_FILES: LazyLock<[&'static str; 23]> = LazyLock::new(|| {
+static MIGRATION_FILES: LazyLock<[&'static str; 28]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index].filename
     })
 });
-static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 23]> = LazyLock::new(|| {
+static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 28]> = LazyLock::new(|| {
     std::array::from_fn(|index| {
         crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST[index]
             .migration
@@ -52,19 +52,18 @@ static MIGRATION_DESCRIPTIONS: LazyLock<[&'static str; 23]> = LazyLock::new(|| {
 // These are regenerated only from a reviewed, freshly applied migration
 // snapshot. They deliberately make unreviewed catalog drift loud.
 //
-// Refreshed from the dedicated local database after applying the complete
-// post-20260729000001 migration chain. The sequence catalog remained
-// structurally unchanged.
+// Refreshed from a dedicated local database after applying exactly the
+// 28 migrations in CLEAN_PROTOCOL_13_MANIFEST.
 const COLUMN_CATALOG_SHA256: &str =
-    "5ca78b4db4fe77899613930487ddfa2dbf71c250eca6780c4c255fe03d346b12";
+    "f4c50e97b3a528c33102688b37911d257473f8ce527734824937ef52d5aca1ec";
 const CONSTRAINT_CATALOG_SHA256: &str =
-    "54cc3605853acd7be5e4679eb785ba17bf8844b622d5b4e6c298ffdbd4e00530";
+    "012b568f1d48dafc2c36b03fcca6620e7c90bb72cf58539687564f546d55da57";
 const INDEX_CATALOG_SHA256: &str =
     "69e3094a66adb4ca52d6a2bcd1427e98dca8eb80e1b267ee71a37b2fb2d9e160";
 const FUNCTION_CATALOG_SHA256: &str =
-    "04e3c4f157b281751d9bd9ed58b0a376e8bddd1f64b3861bc977eeff0e7716e1";
+    "60a4d23f0c48d0edfc315e93ff9bc8c87f6bfd677c048c26ccd9628d3066b7bc";
 const TRIGGER_CATALOG_SHA256: &str =
-    "f368418845b99186be3f9fb53b41eb10dc1e93b7bf2171b77198d13a8d78e9dc";
+    "c952cbcfc26a2f8cebf0c18a575454610ac4999a840b1f620cc69069eba96e8f";
 const SEQUENCE_CATALOG_SHA256: &str =
     "0f5fdcab044481afeaca50ac88cff13edd4b583df914da2c798e4a4194464abe";
 // search_path dependency for CONSTRAINT_/FUNCTION_CATALOG_SHA256 above and
@@ -76,13 +75,6 @@ const SEQUENCE_CATALOG_SHA256: &str =
 // three at once. Verified at the time of writing: the post-clean path sets none
 // — the harness's only `SET LOCAL search_path TO pg_catalog` is confined to the
 // legacy-fingerprint transaction and does not reach these assertions.
-//
-// Why CONSTRAINT and FUNCTION moved while COLUMN/INDEX/TRIGGER/SEQUENCE did
-// not: they are the only two whose preimages embed rendered text that calls
-// chat-schema functions. Two candidate causes remain indistinguishable without
-// the superseded preimage — the server rendering differently than when the old
-// values were recorded, or the underlying CHECK/function text having changed
-// since. Both imply the same promoted values.
 const OPERATION_CLAIM_00004_PRE_REPAIR_SHA384: &str =
     "d7f92b96421a33f0385789f44c0fc2986321e8c7487e79e96c9c4880a1853e4c9d7d32f36bf3dfd22ff07a1cd6fb1674";
 const OPERATION_CLAIM_00004_REPAIRED_SHA384: &str =
@@ -1312,7 +1304,7 @@ fn a0_seal_legacy_forward_reconcile(
         && facts.catalog_sha256 == A0_LEGACY_CATALOG_SHA256
         && facts.catalog_sha384 == A0_LEGACY_CATALOG_SHA384
         && facts.exact13_overlap == 0
-        && facts.exact13_missing == 13
+        && facts.exact13_missing == MIGRATION_VERSIONS.len()
         && facts.intent_absent
         && facts.consumed_absent;
     if !exact {
@@ -1637,7 +1629,7 @@ fn a0_exact_legacy_fingerprint_facts() -> A0LegacyFingerprintFacts {
         catalog_sha256: A0_LEGACY_CATALOG_SHA256.to_owned(),
         catalog_sha384: A0_LEGACY_CATALOG_SHA384.to_owned(),
         exact13_overlap: 0,
-        exact13_missing: 13,
+        exact13_missing: MIGRATION_VERSIONS.len(),
         intent_absent: true,
         consumed_absent: true,
     }
@@ -1682,7 +1674,7 @@ fn a0_legacy_forward_reconcile_classifier_rejects_every_drift_dimension() {
     reject_mutation!(catalog_sha256, "00".repeat(32));
     reject_mutation!(catalog_sha384, "00".repeat(48));
     reject_mutation!(exact13_overlap, 1);
-    reject_mutation!(exact13_missing, 12);
+    reject_mutation!(exact13_missing, MIGRATION_VERSIONS.len() - 1);
     reject_mutation!(intent_absent, false);
     reject_mutation!(consumed_absent, false);
 }
@@ -2379,14 +2371,14 @@ fn clean_chat_migration_inventory_orders_g7_entitlement_last() {
         MIGRATION_VERSIONS.windows(2).all(|pair| pair[0] < pair[1]),
         "migration versions must remain strictly increasing"
     );
-    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260824000005));
+    assert_eq!(MIGRATION_VERSIONS.last(), Some(&20260828000005));
     assert_eq!(
         MIGRATION_FILES.last(),
-        Some(&"20260824000005_chat_federation_outbox_retry.sql")
+        Some(&"20260828000005_fix_inventory_session_gc_scoping.sql")
     );
     assert_eq!(
         MIGRATION_DESCRIPTIONS.last(),
-        Some(&"chat federation outbox retry")
+        Some(&"fix inventory session gc scoping")
     );
     for file in MIGRATION_FILES.iter().copied() {
         assert!(
@@ -2609,20 +2601,20 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
             );
         }
     }
-    // Re-derived after the Task-4 federation-route/delivery-receipt tests landed:
-    // the post-Task-4 tree has 259 setup calls. Four occurrences in this schema
+    // Re-derived after removing the obsolete unbound-hydration fixture: the
+    // post-cutover tree has 258 setup calls. Four occurrences in this schema
     // and three in the G7 schema are the authorized Amendment-3 calls, leaving
-    // 252 other fixed-target calls. This inventory catches unreviewed drift in
+    // 251 other fixed-target calls. This inventory catches unreviewed drift in
     // which tests depend on the shared database.
     assert_eq!(
-        caller_occurrences, 259,
+        caller_occurrences, 258,
         "fixed-target setup caller inventory changed"
     );
     assert_eq!(
         caller_occurrences
             .checked_sub(schema_amendment_3_occurrences.len() + 3)
             .expect("Amendment-3 setup delta cannot exceed the closed inventory"),
-        252,
+        251,
         "the seven authorized Amendment-3 occurrences must be the only inventory delta"
     );
     let expected_targets: BTreeSet<String> = [
@@ -2657,7 +2649,10 @@ async fn fixed_target_helper_uses_one_closed_exact13_migrator_and_unchanged_api(
     let migrator = crate::common::chat_protocol::reviewed_clean_protocol_migrator()
         .await
         .expect("construct reviewed exact-13 migrator");
-    assert_eq!(migrator.iter().count(), 23);
+    assert_eq!(
+        migrator.iter().count(),
+        crate::common::chat_protocol::CLEAN_PROTOCOL_13_MANIFEST.len()
+    );
     assert!(!migrator.ignore_missing);
     assert!(migrator.locking);
 }
@@ -4339,9 +4334,9 @@ fn validate_closed_complete_source_authority(
         .collect::<Vec<_>>();
     let top_level_function_digest =
         hex::encode(Sha256::digest(top_level_functions.join("\0").as_bytes()));
-    if top_level_functions.len() != 117
+    if top_level_functions.len() != 118
         || top_level_function_digest
-            != "bf8bdfaf798a3cb6c32b9ac9c677476c660427361db6eda37587ac68e73344e9"
+            != "c565c586b50089c5ae4baf5e67cd4c4a93e0a3a3161ea3a23e70ff0b6a63c6b4"
     {
         return Err(format!(
             "top-level callable item inventory changed: count={} sha256={} names={:?}",
@@ -4622,7 +4617,7 @@ fn validate_closed_complete_source_authority(
         ));
         macro_cursor = body_close + 1;
     }
-    let expected_macro_definitions = ["reject_mutation|delimiter={}|82830..83211|depth=1|\
+    let expected_macro_definitions = ["reject_mutation|delimiter={}|82334..82715|depth=1|\
          module=<root>|\
          scope=a0_legacy_forward_reconcile_classifier_rejects_every_drift_dimension|\
          arms=[\"()->{}:matcher=$ field : ident , $ value : expr:\
@@ -5608,7 +5603,7 @@ fn populated_upgrade_rollback_proof_is_transaction_bounded_and_source_pinned() {
     assert!(begin < boundary_peer_position && boundary_peer_position < drop_position);
 
     let expected_manifest = [
-        ("20260722000001_chat_protocol_core.sql", "dd48feea7beafae59fbc11516e8c1ae91382b356b80366056f71d2493c10923bd39ff0739fe08cb4b0452b0ec82132ff"),
+        ("20260722000001_chat_protocol_core.sql", "20ac0db9cd73859486bc4b08a8bd4d211def74a2ce203bfcc5608e4b6106e3540ea41be2bc3b141e5e8a734d4a2b8b93"),
         ("20260722000002_chat_protocol_delivery.sql", "86952763aaeb8f4cf8a8a18dd5d022a5357d450193e265a18da5a771513b9d4c7c8408bad27c4f4ba3b712b41b80e504"),
         ("20260722000003_chat_protocol_blobs.sql", "310101886f60d3a663ee5df829bbc86a96a45e23adee754220d3b06fd74acfd708d23a138124872a5177244d3e14e8eb"),
         ("20260725000001_prepare_welcome_provenance_backfill.sql", "3f3d1660193bc37aa8c9876e636a4918f59404f0e055f509b9a67158b6028d947adc299c4d776a693bf8b75e647d90a8"),
@@ -5841,10 +5836,14 @@ fn lane_a_rollback_write_manifest_is_complete_and_immediate() {
             "chat_protocol_g7_schema",
             "g7_live_catalog_has_closed_arms_receipts_and_trigger_guards",
         ),
+        (
+            "chat_protocol_schema",
+            "historical_bootstrap_populated_upgrade_is_atomic_and_rollback_only",
+        ),
     ]
     .into_iter()
     .collect();
-    assert_eq!(expected.len(), 10);
+    assert_eq!(expected.len(), 11);
 
     let helper_name = "force_constraints_and_rollback";
     let commit_method = [".com", "mit()"].concat();
@@ -7361,7 +7360,7 @@ async fn a0_assert_exact_ledger(connection: &mut PgConnection) -> String {
     let expected = a0_expected_ledger();
     assert_eq!(
         actual, expected,
-        "A0 ledger must equal exactly the reviewed 13-entry manifest"
+        "A0 ledger must equal exactly the reviewed manifest"
     );
     a0_ledger_fingerprint(&actual)
 }
@@ -9367,7 +9366,7 @@ mod populated_upgrade_rollback_only {
     const POPULATED_UPGRADE_PRE_00004_MANIFEST: [PopulatedUpgradeMigration; 11] = [
         PopulatedUpgradeMigration {
             filename: "20260722000001_chat_protocol_core.sql",
-            reviewed_sha384: "dd48feea7beafae59fbc11516e8c1ae91382b356b80366056f71d2493c10923bd39ff0739fe08cb4b0452b0ec82132ff",
+            reviewed_sha384: "20ac0db9cd73859486bc4b08a8bd4d211def74a2ce203bfcc5608e4b6106e3540ea41be2bc3b141e5e8a734d4a2b8b93",
             source: include_str!("../migrations/20260722000001_chat_protocol_core.sql"),
         },
         PopulatedUpgradeMigration {
@@ -9777,6 +9776,159 @@ mod populated_upgrade_rollback_only {
             .await
             .expect("close original populated-proof connection");
     }
+}
+
+#[tokio::test]
+#[ignore = "authorized A-final only: populated historical bootstrap migration proof is atomic and rollback-only"]
+async fn historical_bootstrap_populated_upgrade_is_atomic_and_rollback_only() {
+    let pool = fresh_pool().await;
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("acquire connection for historical bootstrap populated upgrade proof");
+    let mut transaction = connection.begin().await.expect("begin outer transaction");
+
+    let fixture_principal = "did:web:historical-populated.example.com";
+    let fixture_conversation_local = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1")
+        .expect("valid local conversation UUID");
+    let fixture_conversation_remote = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2")
+        .expect("valid remote conversation UUID");
+
+    sqlx::query(
+        "INSERT INTO chat.principals(user_did, created_at) \
+         VALUES($1, clock_timestamp() - interval '1 hour') \
+         ON CONFLICT (user_did) DO NOTHING",
+    )
+    .bind(fixture_principal)
+    .execute(&mut *transaction)
+    .await
+    .expect("seed fixture principal");
+
+    sqlx::query(
+        "INSERT INTO chat.conversations(\
+             conversation_id, created_by_did, is_remote, is_closed, \
+             created_at, updated_at, latest_entry_seq, latest_state_version, \
+             historical_bootstrap_last_seq\
+         ) VALUES \
+             ($1, $3, false, false, clock_timestamp() - interval '30 minutes', clock_timestamp() - interval '30 minutes', 0, 0, NULL), \
+             ($2, $3, true, false, clock_timestamp() - interval '30 minutes', clock_timestamp() - interval '30 minutes', 0, 0, NULL)",
+    )
+    .bind(fixture_conversation_local)
+    .bind(fixture_conversation_remote)
+    .bind(fixture_principal)
+    .execute(&mut *transaction)
+    .await
+    .expect("seed preexisting populated conversations with NULL cutoffs");
+
+    let pre_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.conversations WHERE conversation_id IN ($1, $2)",
+    )
+    .bind(fixture_conversation_local)
+    .bind(fixture_conversation_remote)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("count preexisting conversations");
+    assert_eq!(pre_count, 2, "preexisting conversations must exist");
+
+    // Simulate 000001 / 000002: constraint is NOT VALID
+    sqlx::query(
+        "ALTER TABLE chat.conversations DROP CONSTRAINT IF EXISTS conversations_historical_bootstrap_last_seq_check",
+    )
+    .execute(&mut *transaction)
+    .await
+    .expect("drop constraint to simulate 000001 state");
+
+    sqlx::query(
+        "ALTER TABLE chat.conversations ADD CONSTRAINT conversations_historical_bootstrap_last_seq_check \
+         CHECK (historical_bootstrap_last_seq IS NULL OR (is_remote AND chat.is_safe_integer(historical_bootstrap_last_seq) AND historical_bootstrap_last_seq >= 1)) NOT VALID",
+    )
+    .execute(&mut *transaction)
+    .await
+    .expect("add constraint NOT VALID as in 000001");
+
+    let convalidated_post_000001: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conrelid = 'chat.conversations'::regclass \
+           AND conname = 'conversations_historical_bootstrap_last_seq_check'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("query constraint convalidated status after 000001/000002");
+    assert!(
+        !convalidated_post_000001,
+        "constraint must remain NOT VALID after 000001/000002"
+    );
+
+    let non_null_cutoffs_post_000001: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.conversations \
+         WHERE conversation_id IN ($1, $2) AND historical_bootstrap_last_seq IS NOT NULL",
+    )
+    .bind(fixture_conversation_local)
+    .bind(fixture_conversation_remote)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("verify cutoffs remain NULL after 000001/000002");
+    assert_eq!(
+        non_null_cutoffs_post_000001, 0,
+        "preexisting cutoffs must remain NULL"
+    );
+
+    // Simulate 000003: validate constraint
+    sqlx::query(
+        "ALTER TABLE chat.conversations VALIDATE CONSTRAINT conversations_historical_bootstrap_last_seq_check",
+    )
+    .execute(&mut *transaction)
+    .await
+    .expect("validate constraint as in 000003");
+
+    let convalidated_post_000003: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conrelid = 'chat.conversations'::regclass \
+           AND conname = 'conversations_historical_bootstrap_last_seq_check'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("query constraint convalidated status after 000003");
+    assert!(
+        convalidated_post_000003,
+        "constraint must be validated after 000003"
+    );
+
+    let post_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.conversations WHERE conversation_id IN ($1, $2)",
+    )
+    .bind(fixture_conversation_local)
+    .bind(fixture_conversation_remote)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("count post-validate conversations");
+    assert_eq!(post_count, 2, "preexisting rows must remain unchanged");
+
+    let non_null_cutoffs_post_000003: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.conversations \
+         WHERE conversation_id IN ($1, $2) AND historical_bootstrap_last_seq IS NOT NULL",
+    )
+    .bind(fixture_conversation_local)
+    .bind(fixture_conversation_remote)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("verify cutoffs remain NULL after 000003");
+    assert_eq!(
+        non_null_cutoffs_post_000003, 0,
+        "preexisting cutoffs must remain NULL after 000003"
+    );
+
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *transaction)
+        .await
+        .expect("evaluate deferred constraints before rollback");
+
+    transaction
+        .rollback()
+        .await
+        .expect("roll back populated upgrade transaction");
+
+    pool.close().await;
 }
 
 #[test]

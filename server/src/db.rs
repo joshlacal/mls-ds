@@ -3783,27 +3783,22 @@ pub async fn get_sequencer_receipts(
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
 
-    async fn setup_test_db() -> DbPool {
-        let config = DbConfig {
-            database_url: std::env::var("TEST_DATABASE_URL")
-                .unwrap_or_else(|_| "postgres://localhost/catbird_test".to_string()),
-            max_connections: 5,
-            min_connections: 1,
-            acquire_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(60),
-        };
-
-        init_db(config)
-            .await
-            .expect("Failed to initialize test database")
+    async fn setup_test_db() -> (DbPool, fresh_db::DisposableDatabase) {
+        fresh_db::fresh_legacy_pool("db_mod_", 5, 1).await
     }
 
     #[tokio::test]
     #[ignore = "requires isolated TEST_DATABASE_URL with migration privileges"]
     async fn sequencer_receipt_store_is_generation_qualified_and_append_only() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let suffix = Uuid::new_v4().to_string();
         let receipt = SequencerReceipt {
             convo_id: format!("receipt-store-{suffix}"),
@@ -3842,11 +3837,7 @@ mod tests {
                 .unwrap();
         assert_eq!(rows, 2);
 
-        let restarted = PgPool::connect(
-            &std::env::var("TEST_DATABASE_URL").expect("isolated test database URL"),
-        )
-        .await
-        .unwrap();
+        let restarted = _db.connect(5).await;
         store_sequencer_receipt(&restarted, 0, &receipt)
             .await
             .expect("exact replay remains stable after reconnect");
@@ -3855,7 +3846,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated TEST_DATABASE_URL with migration privileges"]
     async fn sequencer_receipt_read_preserves_legacy_rows_after_first_v2_append() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let suffix = Uuid::new_v4().to_string();
         let convo_id = format!("receipt-visibility-{suffix}");
         let legacy_receipt_hash = Uuid::new_v4().as_bytes().repeat(2);
@@ -3954,7 +3945,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires isolated TEST_DATABASE_URL with migration privileges"]
     async fn sequencer_receipt_store_allows_epoch_reuse_after_reset() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let suffix = Uuid::new_v4().to_string();
         let convo_id = format!("receipt-reset-{suffix}");
         let legacy_receipt_hash = Uuid::new_v4().as_bytes().repeat(2);
@@ -4019,7 +4010,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_and_get_conversation() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let conversation = create_conversation(&pool, "did:plc:test123")
             .await
@@ -4038,7 +4029,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_member_operations() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let conversation = create_conversation(&pool, "did:plc:creator")
             .await
@@ -4063,7 +4054,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_operations() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let conversation = create_conversation(&pool, "did:plc:creator")
             .await
@@ -4337,7 +4328,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn rejected_regular_and_last_resort_packages_store_no_rows() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2nostore{}", Uuid::new_v4().simple());
         let expires_at = Utc::now() + chrono::Duration::hours(24);
 
@@ -4369,7 +4360,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn device_deactivation_race_prevents_key_package_storage() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
         let did = format!("did:plc:w2deactivate{}", Uuid::new_v4().simple());
         let device_id = "device-race";
         let (key_data, signature_key) = generate_key_package_bytes_and_signature_key(&did);
@@ -4447,7 +4438,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_key_package_operations() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let expires_at = Utc::now() + chrono::Duration::hours(24);
         let key_data = generate_key_package_bytes("did:plc:user");
@@ -4496,7 +4487,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_transaction() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let conversation = create_conversation_with_members(
             &pool,
@@ -4546,7 +4537,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (TEST_DATABASE_URL)"]
     async fn test_soft_remove_roster_ghost() {
-        let pool = setup_test_db().await;
+        let (pool, _db) = setup_test_db().await;
 
         let convo = create_conversation(&pool, "did:plc:ghostcreator")
             .await

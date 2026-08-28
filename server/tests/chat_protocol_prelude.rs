@@ -1,53 +1,11 @@
 #![allow(dead_code)]
 
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+mod common;
 
-mod chat_protocol {
-    pub mod model {
-        pub use crate::model::*;
-    }
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
 
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod repository {
-        pub mod auth {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod key_packages {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/key_packages.rs"
-            ));
-        }
-        pub mod prelude {
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/prelude.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-}
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
     pub(crate) use crate::chat_protocol::repository::*;

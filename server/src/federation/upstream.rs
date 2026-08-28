@@ -681,6 +681,12 @@ fn extract_cursor(event: &StreamEvent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
     use super::*;
     use axum::{
         body::Body,
@@ -1013,29 +1019,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upstream_subscribe_denies_untrusted_peer_before_resolution() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for upstream peer policy test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db must succeed when TEST_DATABASE_URL is set");
-
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_upstream_", 2, 1).await;
 
         let http_client = reqwest::Client::new();
         let resolver = Arc::new(DsResolver::new(
@@ -1081,29 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upstream_reconnect_stops_when_peer_policy_revoked() {
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for upstream revocation test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_upstream_", 2, 1).await;
         let peer_did = format!(
             "did:web:revoked-up-{}.example.com",
             uuid::Uuid::new_v4().as_simple()
@@ -1167,30 +1129,7 @@ mod tests {
     ) {
         std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
         std::env::set_var("APP_ENV", "test");
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for upstream revocation test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
-
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_upstream_", 4, 1).await;
         let peer_did = format!(
             "did:web:127.0.0.1%3Arevoked-during-res-{}",
             uuid::Uuid::new_v4().as_simple()
@@ -1314,30 +1253,7 @@ mod tests {
     async fn test_upstream_cancels_when_peer_policy_revoked_after_ticket_before_connect() {
         std::env::set_var("FEDERATION_ALLOW_INSECURE_HTTP", "true");
         std::env::set_var("APP_ENV", "test");
-        let database_url = std::env::var("TEST_DATABASE_URL")
-            .expect("TEST_DATABASE_URL is required for upstream revocation test");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&database_url)
-            .await
-            .expect("connect to test db");
-
-        let mut conn = pool.acquire().await.expect("acquire migration connection");
-        let _ = sqlx::query(
-            "SET chat.operation_claim_activation_approved = 'handlers-and-legacy-apis-sealed'",
-        )
-        .execute(&mut *conn)
-        .await;
-        let mut migrator = sqlx::migrate!("./migrations");
-        migrator.set_ignore_missing(true);
-        migrator
-            .run(&mut *conn)
-            .await
-            .expect("migrations must succeed");
-        let _ = sqlx::query("RESET chat.operation_claim_activation_approved")
-            .execute(&mut *conn)
-            .await;
-
+        let (pool, _db) = fresh_db::fresh_legacy_pool("fed_upstream_", 4, 1).await;
         let pool_clone = pool.clone();
         let peer_did = format!(
             "did:web:127.0.0.1%3Arevoked-after-{}",

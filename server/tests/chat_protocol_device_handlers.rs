@@ -3,18 +3,17 @@
 //! getDevices,getOwnDevices}`) plus the cutover-gated `revokeDevice` stub.
 //!
 //! These fire real HTTP requests at the real `chat_router` (through the shared
-//! admit spine + error mapper) so the handler wiring, cutover gate, DPoP
-//! extraction, and repository composition are all exercised end to end. The
-//! authenticated cases build the full Nest ES256 token + DPoP proof + canonical
-//! Ed25519-signed body + real MLS key-package fixtures (modelled on
-//! `chat_protocol_auth.rs`) and assert the RULED conformance conditions by reading
-//! the certified `device_directory` projection back after the call.
+//! admission spine + error mapper) so handler wiring, cutover gating, standard
+//! service authentication, and repository composition are exercised end to end.
+//! Authenticated cases build short-lived ES256 service tokens, canonical
+//! Ed25519-signed bodies, and real MLS key-package fixtures modelled on
+//! `chat_protocol_auth.rs`, then read the certified `device_directory`
+//! projection back after each call.
 //!
 //! Timestamps are wall-clock relative because the handler captures a real trusted
-//! instant; every token/proof/body is minted around `Utc::now()` so the captured
-//! instant lands inside the protocol bounds. Every authenticated case uses fresh
-//! random DID / device / jti / auth_txn values so the never-truncated clean-chat
-//! gate database accumulates no cross-run collisions.
+//! instant. Every token and body is minted around `Utc::now()`, and authenticated
+//! cases use fresh DID, device, jti, and auth transaction values so the
+//! never-truncated clean-chat gate database accumulates no cross-run collisions.
 //!
 //! The authenticated (database) cases are `#[ignore]`d like the other clean-chat
 //! live suites; run them explicitly against the dedicated database:
@@ -32,72 +31,10 @@
 
 mod common;
 
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/cursor.rs"]
-mod cursor;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/model.rs"]
-mod model;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/transcript.rs"]
-mod transcript;
-#[allow(dead_code)]
-#[path = "../src/chat_protocol/validation.rs"]
-mod validation;
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
 
-mod chat_protocol {
-    pub mod model {
-        pub use crate::model::*;
-    }
-
-    pub mod transcript {
-        pub use crate::transcript::*;
-    }
-
-    pub mod validation {
-        pub use crate::validation::*;
-    }
-
-    pub mod cursor {
-        pub use crate::cursor::*;
-    }
-
-    // Enumerated per-module rather than including `repository/mod.rs` wholesale:
-    // that file opens with an inner `//!` doc comment, which is not accepted in
-    // `include!` position, and it would additionally declare every sibling module
-    // whose own `super::super::*` references this shim does not carry.
-    pub mod repository {
-        pub mod device_directory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/device_directory.rs"
-            ));
-        }
-        pub mod auth {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/auth.rs"
-            ));
-        }
-        pub mod inventory {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/inventory.rs"
-            ));
-        }
-    }
-
-    pub mod dpop {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/dpop.rs"
-        ));
-    }
-}
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
 
 mod repository {
     pub(crate) use crate::chat_protocol::repository::*;
@@ -121,7 +58,7 @@ use catbird_server::handlers::chat::{chat_router, ChatRuntime};
 use catbird_server::storage::DbPool;
 
 const ISSUER: &str = "did:web:api.catbird.blue";
-const AUDIENCE: &str = "did:web:chat.catbird.blue";
+const AUDIENCE: &str = "did:web:chat.catbird.blue#atproto_mls";
 const NEST_KEY_ID: &str = "nest-key-1";
 const CHAT_INSTANCE: &str = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
 const EXTERNAL_BASE: &str = "https://chat.example.net";
@@ -272,7 +209,6 @@ fn post_empty(nsid: &str) -> Request<Body> {
 const DEVICE_POST_ENDPOINTS: &[&str] = &[
     "blue.catbird.chat.enrollDevice",
     "blue.catbird.chat.replenishKeyPackages",
-    "blue.catbird.chat.rebindDeviceAuthentication",
     "blue.catbird.chat.revokeDevice",
 ];
 const DEVICE_GET_ENDPOINTS: &[&str] = &[
@@ -296,12 +232,6 @@ fn active_device_handlers_use_consuming_operation_preludes_not_legacy_receipts()
             "admit_enrollment_operation_only",
             "prepare_enrollment_operation",
             "complete_enrollment_bootstrap_operation",
-        ),
-        (
-            include_str!("../src/handlers/chat/rebind_device_authentication.rs"),
-            "admit_rebind_operation_only",
-            "prepare_rebind_operation",
-            "complete_rebind_bootstrap_operation",
         ),
         (
             include_str!("../src/handlers/chat/replenish_key_packages.rs"),
@@ -392,31 +322,39 @@ async fn revoke_device_requires_dpop_after_cutover() {
     // library without `--test`), so the shared `not_implemented` stub is never registered
     // for it. Post-cutover the request therefore runs ordinary signed-operation admission —
     // the cutover gate opens, then DPoP header extraction rejects a request carrying none
-    // with the declared `InvalidDPoP`, exactly as for every other implemented endpoint.
+    // with the declared `NotAuthorized`, exactly as for every other implemented endpoint.
     let (status, body) = send(
         stateless_router(true),
         post_empty("blue.catbird.chat.revokeDevice"),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }
 
 #[tokio::test]
-async fn cutover_enabled_missing_dpop_headers_is_invalid_dpop() {
-    // Enrollment (POST) and getDevices (GET) both fail DPoP header extraction with
-    // the declared InvalidDPoP once the cutover gate is open.
+async fn cutover_enabled_missing_dpop_headers_is_not_authorized() {
+    // Enrollment (POST) and getDevices (GET) both reject missing DPoP headers with
+    // the declared NotAuthorized once the cutover gate is open.
     let (status, body) = send(
         stateless_router(true),
         post_empty("blue.catbird.chat.enrollDevice"),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 
-    let (status, body) = send(stateless_router(true), get("blue.catbird.chat.getDevices")).await;
+    let missing_headers = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "{}?actorDeviceId={CHAT_INSTANCE}&userDids=did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            xrpc("blue.catbird.chat.getDevices")
+        ))
+        .body(Body::empty())
+        .expect("build getDevices request");
+    let (status, body) = send(stateless_router(true), missing_headers).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"], "InvalidDPoP");
+    assert_eq!(body["error"], "NotAuthorized");
 }
 
 // =============================================================================
@@ -527,8 +465,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{signature::Signer as _, Signature as P256Signature};
 use sha2::{Digest, Sha256};
 
-use transcript::decode_and_verify_enrollment_body;
-use validation::{ed25519_key_id, TrustedExternalBase, ValidatedChatNsid};
+use chat_protocol::transcript::decode_and_verify_enrollment_body;
+use chat_protocol::validation::{ed25519_key_id, TrustedExternalBase, ValidatedChatNsid};
 
 /// A random, always-valid P-256 signing key (rejection-sampled from two UUIDs so
 /// no all-same-byte scalar can slip through and panic).
@@ -598,8 +536,8 @@ fn dpop_proof(
 /// Sign a `{ "$type": "…Body", … }` object into the `{ body, signature }` wrapper,
 /// signing the exact canonical transcript the decoders reconstruct.
 fn sign_chat_body(body: Value, key: &Ed25519SigningKey) -> Vec<u8> {
+    use chat_protocol::transcript::decode_canonical_signed_mutation;
     use ed25519_dalek::Signer as _;
-    use transcript::decode_canonical_signed_mutation;
     let mut wrapper = serde_json::json!({
         "body": body,
         "signature": STANDARD.encode([0_u8; 64]),
@@ -724,7 +662,6 @@ impl EnrollScenario {
             "deviceName": "Test device",
             "keyId": key_id,
             "signaturePublicKey": STANDARD.encode(device_signing.verifying_key().as_bytes()),
-            "dpopJkt": proof_jkt,
             "expectedAuthGeneration": 0,
             "capability": capability_profile(),
             "keyPackages": packages,
@@ -748,19 +685,37 @@ impl EnrollScenario {
         }
     }
 
-    /// Mint a fresh-grant HTTP request for the fixed enrollment body.
-    fn fresh_request(&self) -> Request<Body> {
+    async fn cache_service_auth_identity(&self) {
+        let jwk =
+            serde_json::from_value(self.proof_jwk.clone()).expect("service-auth test JWK is valid");
+        let document = catbird_server::auth::DidDocument {
+            id: self.did.clone(),
+            verification_method: vec![catbird_server::auth::VerificationMethod {
+                id: format!("{}#atproto", self.did),
+                key_type: "JsonWebKey2020".to_string(),
+                controller: self.did.clone(),
+                public_key_jwk: Some(jwk),
+                public_key_multibase: None,
+            }],
+            service: None,
+        };
+        catbird_server::auth::cache_test_did_document(document).await;
+    }
+
+    /// Mint a fresh service-auth request for the fixed enrollment body.
+    async fn fresh_request(&self) -> Request<Body> {
+        self.cache_service_auth_identity().await;
         let nsid = "blue.catbird.chat.enrollDevice";
         let now = chrono::Utc::now().timestamp();
         let token = sign_jwt(
-            serde_json::json!({"alg":"ES256","typ":"JWT","kid": NEST_KEY_ID}),
+            jwt_header(&self.did),
             serde_json::json!({
-                "iss": ISSUER,
+                "iss": self.did,
                 "sub": self.did,
                 "aud": AUDIENCE,
                 "lxm": nsid,
                 "iat": now,
-                "exp": now + 120,
+                "exp": now + 60,
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "cnf": {"jkt": self.proof_jkt},
                 "device_id": self.device_id.to_string(),
@@ -771,7 +726,7 @@ impl EnrollScenario {
                 "auth_time": now,
                 "auth_txn": uuid::Uuid::new_v4().to_string(),
             }),
-            &nest_signing_key(),
+            &self.proof_signing,
         );
         let proof = dpop_proof(
             &self.proof_signing,
@@ -789,7 +744,7 @@ impl EnrollScenario {
             .method("POST")
             .uri(xrpc(nsid))
             .header("content-type", "application/json")
-            .header("authorization", format!("DPoP {token}"))
+            .header("authorization", format!("Bearer {token}"))
             .header("dpop", proof)
             .body(Body::from(body_bytes))
             .expect("enroll request")
@@ -827,7 +782,11 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
     let device_id = scenario.device_id;
     let count = scenario.key_package_count as i64;
 
-    let (status, body) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        scenario.fresh_request().await,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "enroll failed: {body}");
     let device = &body["device"];
     assert_eq!(device["availablePackageCount"], count);
@@ -875,7 +834,7 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
     // device (Option A builds this view by hand, so this pins every hand-set field
     // to the certified projection).
     assert_eq!(view.key_id, device["keyId"].as_str().unwrap());
-    assert_eq!(view.dpop_jkt, device["dpopJkt"].as_str().unwrap());
+    assert_eq!(view.dpop_jkt.as_deref(), device["dpopJkt"].as_str());
     assert_eq!(view.status, device["status"].as_str().unwrap());
     assert_eq!(
         view.auth_generation,
@@ -901,11 +860,17 @@ async fn enroll_device_replay_returns_verbatim_stored_bytes() {
     let scenario = EnrollScenario::build(2);
     // Same enrollment body, fresh grant each time (response-loss retry). The second
     // call is an idempotent replay returning the exact stored response bytes.
-    let (status_1, bytes_1) =
-        send_raw(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    let (status_1, bytes_1) = send_raw(
+        router_with(pool.clone(), true),
+        scenario.fresh_request().await,
+    )
+    .await;
     assert_eq!(status_1, StatusCode::OK, "first enroll status");
-    let (status_2, bytes_2) =
-        send_raw(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    let (status_2, bytes_2) = send_raw(
+        router_with(pool.clone(), true),
+        scenario.fresh_request().await,
+    )
+    .await;
     assert_eq!(status_2, StatusCode::OK, "replay enroll status");
     // OQ-3 verbatim contract (M-1): assert byte-for-byte equality, not merely a
     // structural JSON compare (two different serializations parsing to the same
@@ -924,19 +889,23 @@ async fn enroll_device_replay_returns_verbatim_stored_bytes() {
 /// scenario so follow-on requests can authenticate as that device.
 async fn enroll_fresh_device(pool: &DbPool, package_count: usize) -> EnrollScenario {
     let scenario = EnrollScenario::build(package_count);
-    let (status, body) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
+    let (status, body) = send(
+        router_with(pool.clone(), true),
+        scenario.fresh_request().await,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "setup enroll failed: {body}");
     scenario
 }
 
 fn ordinary_claims(did: &str, device_id: uuid::Uuid, jkt: &str, nsid: &str, now: i64) -> Value {
     serde_json::json!({
-        "iss": ISSUER,
+        "iss": did,
         "sub": did,
         "aud": AUDIENCE,
         "lxm": nsid,
         "iat": now,
-        "exp": now + 120,
+        "exp": now + 60,
         "jti": uuid::Uuid::new_v4().to_string(),
         "cnf": {"jkt": jkt},
         "device_id": device_id.to_string(),
@@ -944,8 +913,8 @@ fn ordinary_claims(did: &str, device_id: uuid::Uuid, jkt: &str, nsid: &str, now:
     })
 }
 
-fn jwt_header() -> Value {
-    serde_json::json!({"alg":"ES256","typ":"JWT","kid": NEST_KEY_ID})
+fn jwt_header(did: &str) -> Value {
+    serde_json::json!({"alg":"ES256","typ":"JWT","kid": format!("{did}#atproto")})
 }
 
 /// A signed-body procedure request authenticated by the enrolled device's own
@@ -964,9 +933,9 @@ fn signed_request_with_token_jkt(
 ) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
-        jwt_header(),
+        jwt_header(&scenario.did),
         ordinary_claims(&scenario.did, scenario.device_id, token_jkt, nsid, now),
-        &nest_signing_key(),
+        &scenario.proof_signing,
     );
     let proof = dpop_proof(
         &scenario.proof_signing,
@@ -983,7 +952,7 @@ fn signed_request_with_token_jkt(
         .method("POST")
         .uri(xrpc(nsid))
         .header("content-type", "application/json")
-        .header("authorization", format!("DPoP {token}"))
+        .header("authorization", format!("Bearer {token}"))
         .header("dpop", proof)
         .body(Body::from(body_bytes))
         .expect("signed request")
@@ -1004,7 +973,7 @@ fn query_request_parts(
 ) -> (Request<Body>, String, String) {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
-        jwt_header(),
+        jwt_header(&scenario.did),
         ordinary_claims(
             &scenario.did,
             scenario.device_id,
@@ -1012,7 +981,7 @@ fn query_request_parts(
             nsid,
             now,
         ),
-        &nest_signing_key(),
+        &scenario.proof_signing,
     );
     let proof = dpop_proof(
         &scenario.proof_signing,
@@ -1023,10 +992,16 @@ fn query_request_parts(
         now,
         uuid::Uuid::new_v4().as_bytes(),
     );
+    let extra_query = query_suffix.strip_prefix('?').unwrap_or(query_suffix);
+    let query = if extra_query.is_empty() {
+        format!("?actorDeviceId={}", scenario.device_id)
+    } else {
+        format!("?actorDeviceId={}&{extra_query}", scenario.device_id)
+    };
     let request = Request::builder()
         .method("GET")
-        .uri(format!("{}{}", xrpc(nsid), query_suffix))
-        .header("authorization", format!("DPoP {token}"))
+        .uri(format!("{}{}", xrpc(nsid), query))
+        .header("authorization", format!("Bearer {token}"))
         .header("dpop", proof.clone())
         .body(Body::empty())
         .expect("query request");
@@ -1082,7 +1057,6 @@ fn replenishment_wrapper_keyed(
         "actorDid": scenario.did,
         "actorDeviceId": scenario.device_id.to_string(),
         "authGeneration": 1,
-        "dpopJkt": scenario.proof_jkt,
         "keyId": key_id,
         "keyPackages": packages,
         "signaturePublicKey": STANDARD.encode(scenario.device_signing.verifying_key().as_bytes()),
@@ -1092,62 +1066,11 @@ fn replenishment_wrapper_keyed(
     sign_chat_body(body, &scenario.device_signing)
 }
 
-/// Build a rebind body rotating to `new_proof`'s DPoP key, signed by the device's
-/// registered key.
-fn rebind_request(scenario: &EnrollScenario, new_proof: &SigningKey) -> Request<Body> {
-    let nsid = "blue.catbird.chat.rebindDeviceAuthentication";
-    let now = chrono::Utc::now().timestamp();
-    let new_jwk = public_jwk(new_proof);
-    let new_jkt = jwk_thumbprint(&new_jwk);
-    let key_id = ed25519_key_id(scenario.device_signing.verifying_key().as_bytes())
-        .unwrap()
-        .as_str()
-        .to_owned();
-    let body = serde_json::json!({
-        "$type": "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
-        "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0}",
-        "actorDid": scenario.did,
-        "actorDeviceId": scenario.device_id.to_string(),
-        "keyId": key_id,
-        "expectedAuthGeneration": 1,
-        "currentDpopJkt": scenario.proof_jkt,
-        "newDpopJkt": new_jkt,
-        "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-        "signedAt": canonical_timestamp(0),
-    });
-    let raw = sign_chat_body(body, &scenario.device_signing);
-    let token = sign_jwt(
-        jwt_header(),
-        ordinary_claims(&scenario.did, scenario.device_id, &new_jkt, nsid, now),
-        &nest_signing_key(),
-    );
-    let proof = dpop_proof(
-        new_proof,
-        &new_jwk,
-        "POST",
-        &htu_for(nsid),
-        &token,
-        now,
-        uuid::Uuid::new_v4().as_bytes(),
-    );
-    let wrapper: Value = serde_json::from_slice(&raw).unwrap();
-    let body_bytes = serde_json::to_vec(&serde_json::json!({ "signedRequest": wrapper })).unwrap();
-    Request::builder()
-        .method("POST")
-        .uri(xrpc(nsid))
-        .header("content-type", "application/json")
-        .header("authorization", format!("DPoP {token}"))
-        .header("dpop", proof)
-        .body(Body::from(body_bytes))
-        .expect("rebind request")
-}
-
 const DEVICE_VIEW_FIELDS: &[&str] = &[
     "authGeneration",
     "availablePackageCount",
     "createdAt",
     "deviceId",
-    "dpopJkt",
     "keyId",
     "reservedPackageCount",
     "signaturePublicKey",
@@ -1238,50 +1161,6 @@ async fn replenish_same_idempotency_key_different_body_is_invalid_request() {
         body["error"], "IdempotencyConflict",
         "mismatched-body replay error"
     );
-}
-
-#[tokio::test]
-#[ignore]
-async fn rebind_device_authentication_rotates_and_conforms_to_read_back() {
-    let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
-    let scenario = enroll_fresh_device(&pool, 2).await;
-    let new_proof = random_p256();
-    let new_jkt = jwk_thumbprint(&public_jwk(&new_proof));
-
-    let request = rebind_request(&scenario, &new_proof);
-    let (status, body) = send(router_with(pool.clone(), true), request).await;
-    assert_eq!(status, StatusCode::OK, "rebind failed: {body}");
-    let device = &body["device"];
-    assert_eq!(device["dpopJkt"], new_jkt, "rotated to the new thumbprint");
-    assert_eq!(device["authGeneration"], 2, "generation incremented");
-    assert_eq!(
-        device["availablePackageCount"], 2,
-        "counts unchanged by rebind"
-    );
-    assert_eq!(device["reservedPackageCount"], 0);
-
-    // RULED conformance: post-rebind read_device_view matches the response on
-    // counts + keyId + createdAt.
-    let mut tx = pool.begin().await.unwrap();
-    let view = read_device_view(&mut tx, &scenario.did, scenario.device_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        view.available_package_count,
-        device["availablePackageCount"].as_i64().unwrap()
-    );
-    assert_eq!(
-        view.reserved_package_count,
-        device["reservedPackageCount"].as_i64().unwrap()
-    );
-    assert_eq!(view.key_id, device["keyId"].as_str().unwrap());
-    assert_eq!(view.auth_generation, 2, "read-back reflects the rotation");
-    // createdAt is preserved by a rebind: the response createdAt equals the stored
-    // device's created_at.
-    let created_at = jacquard_created_at(&view);
-    assert_eq!(device["createdAt"], created_at, "createdAt preserved");
-    tx.rollback().await.ok();
 }
 
 #[tokio::test]
@@ -1377,70 +1256,20 @@ fn jacquard_created_at(view: &repository::device_directory::DeviceDirectoryView)
 // Task 7 — failure atomicity and replay-drift gate (dedicated database only)
 // =============================================================================
 
-/// The Task 7 handlers must reject replay when its authenticated device binding,
-/// Nest-token binding, or immutable operation claim no longer matches. Every
-/// branch uses a legal operation sequence; this fixture never hand-edits an
-/// immutable claim or device/key-package state.
+/// A reused operation ID is bound to its original immutable signed request.
 #[tokio::test]
 #[ignore = "requires the dedicated clean-chat gate database"]
-async fn task7_replay_rejects_registered_jkt_token_and_claim_mismatch() {
+async fn task7_replay_rejects_claim_mismatch() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
-
-    // A successful legal rebind changes the registered JKT and generation. An
-    // old replenishment retry signed by the prior DPoP key cannot release bytes.
-    let scenario = enroll_fresh_device(&pool, 2).await;
-    let idempotency_key = uuid::Uuid::new_v4().to_string();
-    let wrapper = replenishment_wrapper_keyed(&scenario, 1, &idempotency_key);
     let nsid = "blue.catbird.chat.replenishKeyPackages";
+    let scenario = enroll_fresh_device(&pool, 2).await;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let first = replenishment_wrapper_keyed(&scenario, 1, &operation_id);
+    let second = replenishment_wrapper_keyed(&scenario, 2, &operation_id);
+
     let (status, body) = send(
         router_with(pool.clone(), true),
-        signed_request(&scenario, nsid, &wrapper),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "initial replenish failed: {body}");
-    let new_proof = random_p256();
-    let (rebind_status, rebind_body) = send(
-        router_with(pool.clone(), true),
-        rebind_request(&scenario, &new_proof),
-    )
-    .await;
-    assert_eq!(
-        rebind_status,
-        StatusCode::OK,
-        "legal rebind failed: {rebind_body}"
-    );
-    let (status, _) = send(
-        router_with(pool.clone(), true),
-        signed_request(&scenario, nsid, &wrapper),
-    )
-    .await;
-    assert_ne!(status, StatusCode::OK, "drifted JKT must not replay");
-
-    // A fresh scenario isolates the Nest-token `cnf.jkt` mismatch from the
-    // registered-device drift above.
-    let token_scenario = enroll_fresh_device(&pool, 2).await;
-    let token_wrapper = replenishment_wrapper(&token_scenario, 1);
-    let (status, _) = send(
-        router_with(pool.clone(), true),
-        signed_request_with_token_jkt(
-            &token_scenario,
-            nsid,
-            &token_wrapper,
-            "task7-token-jkt-drift",
-        ),
-    )
-    .await;
-    assert_ne!(status, StatusCode::OK, "drifted token JKT must not replay");
-
-    // The immutable claim is exercised honestly: a distinct signed body with
-    // the same operation ID conflicts rather than being admitted as a replay.
-    let claim_scenario = enroll_fresh_device(&pool, 2).await;
-    let claim_key = uuid::Uuid::new_v4().to_string();
-    let first = replenishment_wrapper_keyed(&claim_scenario, 1, &claim_key);
-    let second = replenishment_wrapper_keyed(&claim_scenario, 2, &claim_key);
-    let (status, body) = send(
-        router_with(pool.clone(), true),
-        signed_request(&claim_scenario, nsid, &first),
+        signed_request(&scenario, nsid, &first),
     )
     .await;
     assert_eq!(
@@ -1448,9 +1277,10 @@ async fn task7_replay_rejects_registered_jkt_token_and_claim_mismatch() {
         StatusCode::OK,
         "claim fixture first write failed: {body}"
     );
+
     let (status, _) = send(
         router_with(pool.clone(), true),
-        signed_request(&claim_scenario, nsid, &second),
+        signed_request(&scenario, nsid, &second),
     )
     .await;
     assert_ne!(status, StatusCode::OK, "claim mismatch must not replay");
@@ -1487,7 +1317,11 @@ async fn task7_injected_claim_effect_and_completion_failures_rollback_the_whole_
     ] {
         let scenario = EnrollScenario::build(1);
         install_task7_failure_trigger(&pool, table, function, trigger).await;
-        let (status, body) = send(router_with(pool.clone(), true), scenario.fresh_request()).await;
+        let (status, body) = send(
+            router_with(pool.clone(), true),
+            scenario.fresh_request().await,
+        )
+        .await;
         assert_ne!(
             status,
             StatusCode::OK,
@@ -1756,26 +1590,6 @@ fn b4_jwt_claim(jwt: &str, claim: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("{claim} claim is absent from the request JWT"))
         .to_owned()
-}
-
-/// The same trusted-Nest verifier the router builds from the environment,
-/// constructed directly so a cryptographic negative can be driven as a pure
-/// function — no router, no pool, no admission, no database.
-fn b4_trusted_verifier() -> chat_protocol::dpop::TrustedNestVerifier {
-    ensure_verifier_env();
-    let chat_instance =
-        validation::CanonicalUuidV4::parse(CHAT_INSTANCE).expect("canonical chat instance");
-    let base = TrustedExternalBase::parse(EXTERNAL_BASE, &std::collections::BTreeSet::new())
-        .expect("trusted external base");
-    chat_protocol::dpop::TrustedNestVerifier::new(
-        ISSUER,
-        AUDIENCE,
-        chat_instance,
-        NEST_KEY_ID,
-        *nest_signing_key().verifying_key(),
-        base,
-    )
-    .expect("trusted Nest verifier")
 }
 
 const B4_GET_DEVICES_SOURCE: &str = include_str!("../src/handlers/chat/get_devices.rs");
@@ -2296,16 +2110,18 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
     }
 
     // -- RUNTIME REDACTION: nothing authority-bearing crosses the wire. --------
-    // A fully-formed Nest token and DPoP proof carrying this device's real DID,
-    // device UUID, JKT, and key id, rejected at DPoP binding — which happens
-    // BEFORE any database access, so this needs no database and no admission
-    // ever succeeds. The exact request material must appear nowhere in the
-    // response bytes.
+    // A complete service token and DPoP header carry the requester's DID, device
+    // UUID, JKT, and key id. The token is signed by an untrusted key, so service
+    // authentication rejects it before any database access. None of the exact
+    // request material may appear in the response.
     let scenario = EnrollScenario::build(1);
+    scenario.cache_service_auth_identity().await;
     let nsid = "blue.catbird.chat.getOwnDevices";
     let now = chrono::Utc::now().timestamp();
+    let foreign = random_p256();
+    let foreign_jwk = public_jwk(&foreign);
     let token = sign_jwt(
-        jwt_header(),
+        jwt_header(&scenario.did),
         ordinary_claims(
             &scenario.did,
             scenario.device_id,
@@ -2313,12 +2129,8 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
             nsid,
             now,
         ),
-        &nest_signing_key(),
+        &foreign,
     );
-    // A proof under a FOREIGN key: it parses completely, so the whole token and
-    // proof are in memory, and it then fails the confirmation binding.
-    let foreign = random_p256();
-    let foreign_jwk = public_jwk(&foreign);
     let proof = dpop_proof(
         &foreign,
         &foreign_jwk,
@@ -2330,8 +2142,12 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
     );
     let request = Request::builder()
         .method("GET")
-        .uri(xrpc(nsid))
-        .header("authorization", format!("DPoP {token}"))
+        .uri(format!(
+            "{}?actorDeviceId={}",
+            xrpc(nsid),
+            scenario.device_id
+        ))
+        .header("authorization", format!("Bearer {token}"))
         .header("dpop", proof.clone())
         .body(Body::empty())
         .expect("redaction probe request");
@@ -2346,8 +2162,8 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
         "empty response makes the redaction check vacuous"
     );
     assert!(
-        body.contains("InvalidDPoP"),
-        "expected the declared DPoP failure; got {body}"
+        body.contains("NotAuthorized"),
+        "expected the declared service-auth failure; got {body}"
     );
 
     // The replay identifiers are read back OUT of the exact bytes that were
@@ -2419,168 +2235,67 @@ async fn existing_device_read_handlers_expose_no_raw_admission_or_receipt_detail
     // ...and it must ACCEPT the exact two shapes `errors.rs` emits, or the
     // assertions above would be failing for the wrong reason.
     for shape in [
-        serde_json::json!({ "error": "InvalidDPoP", "message": "InvalidDPoP" }),
+        serde_json::json!({ "error": "NotAuthorized", "message": "NotAuthorized" }),
         serde_json::json!({ "error": "InternalServerError" }),
     ] {
         b4_assert_failure_body_is_closed("closure control", &shape);
     }
     std::panic::set_hook(previous_hook);
 
-    // -- CRYPTOGRAPHIC WRONG-METHOD, refused before the repository. -----------
-    //
-    // The amendment's phase manifest requires
-    // `get_own_devices_endpoint_or_method_substitution_fails_before_sql` to open
-    // with a "cryptographic wrong-method subcase [that] stops before
-    // repository". That test is database-marked and runs in Task B6; this is the
-    // same shape with no database at all, so the property is EXECUTED in the
-    // no-database gate too — and, unlike a status code on its own, it shows that
-    // the METHOD is what caused the refusal.
-    //
-    // Leg 1 is pure. `dpop::verify_ordinary_request_auth` is the exact function
-    // the admission spine calls (`context.rs:143`) BEFORE its first repository
-    // call (`context.rs:152`). Two proofs identical in every byte except `htm`
-    // are pushed through it against the endpoint-owned canonical method. Wrong
-    // `htm` must fail, right `htm` must succeed; without the second leg the
-    // first proves nothing about the method. No pool, no admission, no database.
-    //
-    // Leg 2 is the same wrong-`htm` proof at the real router, over real HTTP.
-    //
-    // WHAT MAKES "BEFORE THE REPOSITORY" A MEASUREMENT HERE — corrected, because
-    // the reason previously given was false. It was: "a failure raised inside
-    // `authorize_unsigned_request` or the facade is rendered code-less, so
-    // `InvalidDPoP` can only have come from the pre-repository verifier." That
-    // is wrong. `handlers/chat/context.rs:353` maps
-    // `AuthRepositoryError::ReplayDetected | DpopBindingMismatch` to
-    // `ChatProtocolErrorCode::InvalidDPoP`, and both are produced by
-    // `authorize_unsigned_request` AFTER it has called `pool.begin()` and
-    // INSERTed a `chat.dpop_replays` row (`repository/auth.rs:1108-1117`).
-    // `InvalidDPoP` is therefore a post-repository code too, and on a router
-    // with a live pool it discriminates nothing.
-    //
-    // The discriminator that actually holds is the ROUTER, and it is asserted
-    // rather than assumed. `stateless_router` carries a lazily-connected pool
-    // aimed at a database that does not exist, so ANY request that reaches
-    // `authorize_unsigned_request` fails at `pool.begin()` with
-    // `AuthRepositoryError::Database`, which `context.rs:349` turns into
-    // `ChatFailure::storage` — HTTP 500 `{"error":"InternalServerError"}`, with
-    // no protocol code at all. `401 InvalidDPoP` on THIS router therefore
-    // excludes the repository path. The positive control below sends the
-    // byte-identical fixture with the CORRECT `htm` through the same router and
-    // asserts exactly that 500, so the discriminator is executed, not argued.
-    let method_probe = EnrollScenario::build(1);
-    let method_now = chrono::Utc::now().timestamp();
-    let method_token = sign_jwt(
-        jwt_header(),
-        ordinary_claims(
-            &method_probe.did,
-            method_probe.device_id,
-            &method_probe.proof_jkt,
-            nsid,
-            method_now,
-        ),
-        &nest_signing_key(),
+    // -- SERVICE-AUTH SIGNATURE, refused before repository access. ------------
+    // The stateless router names a nonexistent database. A token signed by a key
+    // absent from the cached DID document must stop at service authentication
+    // with 401; the same claims signed by the cached key must proceed far enough
+    // to touch the unavailable replay store and render 500.
+    let auth_probe = EnrollScenario::build(1);
+    auth_probe.cache_service_auth_identity().await;
+    let auth_now = chrono::Utc::now().timestamp();
+    let claims = ordinary_claims(
+        &auth_probe.did,
+        auth_probe.device_id,
+        &auth_probe.proof_jkt,
+        nsid,
+        auth_now,
     );
-    let method_jti = uuid::Uuid::new_v4();
-    let wrong_htm_proof = dpop_proof(
-        &method_probe.proof_signing,
-        &method_probe.proof_jwk,
-        "POST",
-        &htu_for(nsid),
-        &method_token,
-        method_now,
-        method_jti.as_bytes(),
-    );
-    let right_htm_proof = dpop_proof(
-        &method_probe.proof_signing,
-        &method_probe.proof_jwk,
-        "GET",
-        &htu_for(nsid),
-        &method_token,
-        method_now,
-        method_jti.as_bytes(),
-    );
-
-    let trust = b4_trusted_verifier();
-    let read_endpoint = ValidatedChatNsid::parse(nsid).expect("read endpoint nsid");
-    let canonical_get = validation::CanonicalHttpMethod::parse("GET").expect("canonical GET");
-    let verification_instant =
-        validation::TrustedRequestInstant::capture().expect("trusted request instant");
-    let authorization = format!("DPoP {method_token}");
-    assert!(
-        chat_protocol::dpop::verify_ordinary_request_auth(
-            &trust,
-            &authorization,
-            &wrong_htm_proof,
-            &read_endpoint,
-            &canonical_get,
-            &verification_instant,
-        )
-        .is_err(),
-        "a DPoP proof bound to POST must not verify against the GET-only getOwnDevices profile"
-    );
-    assert!(
-        chat_protocol::dpop::verify_ordinary_request_auth(
-            &trust,
-            &authorization,
-            &right_htm_proof,
-            &read_endpoint,
-            &canonical_get,
-            &verification_instant,
-        )
-        .is_ok(),
-        "the identical fixture with the correct htm must verify — otherwise the negative above \
-         is not evidence about the METHOD"
-    );
-
-    let wrong_method_request = Request::builder()
+    let untrusted_token = sign_jwt(jwt_header(&auth_probe.did), claims.clone(), &random_p256());
+    let untrusted_request = Request::builder()
         .method("GET")
-        .uri(xrpc(nsid))
-        .header("authorization", authorization.as_str())
-        .header("dpop", wrong_htm_proof)
+        .uri(format!(
+            "{}?actorDeviceId={}",
+            xrpc(nsid),
+            auth_probe.device_id
+        ))
+        .header("authorization", format!("Bearer {untrusted_token}"))
         .body(Body::empty())
-        .expect("wrong-method probe request");
-    let (method_status, method_body) = send(stateless_router(true), wrong_method_request).await;
-    assert_eq!(
-        method_status,
-        StatusCode::UNAUTHORIZED,
-        "the cryptographic wrong-method probe must be refused: {method_body}"
-    );
-    assert_eq!(
-        method_body["error"], "InvalidDPoP",
-        "a wrong-method proof must be refused with the endpoint's declared DPoP \
-         code: {method_body}"
-    );
-    b4_assert_failure_body_is_closed("wrong-method probe", &method_body);
+        .expect("untrusted service-auth request");
+    let (untrusted_status, untrusted_body) = send(stateless_router(true), untrusted_request).await;
+    assert_eq!(untrusted_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(untrusted_body["error"], "NotAuthorized");
+    b4_assert_failure_body_is_closed("untrusted service-auth probe", &untrusted_body);
 
-    // POSITIVE CONTROL FOR THE DISCRIMINATOR. The identical fixture with the
-    // CORRECT `htm` passes `verify_ordinary_request_auth` and goes on to
-    // `authorize_unsigned_request`, whose `pool.begin()` cannot reach the
-    // nonexistent database this router names. It must therefore come back 500
-    // `InternalServerError` — a rendering the wrong-method probe above did NOT
-    // produce. Without this leg, "401 InvalidDPoP means it stopped before the
-    // repository" would be an argument about `context.rs`; with it, the two
-    // outcomes are observed to differ on the same router with the same
-    // credentials, differing only in `htm`.
+    let trusted_token = sign_jwt(
+        jwt_header(&auth_probe.did),
+        claims,
+        &auth_probe.proof_signing,
+    );
     let reached_repository_request = Request::builder()
         .method("GET")
-        .uri(xrpc(nsid))
-        .header("authorization", authorization.as_str())
-        .header("dpop", right_htm_proof)
+        .uri(format!(
+            "{}?actorDeviceId={}",
+            xrpc(nsid),
+            auth_probe.device_id
+        ))
+        .header("authorization", format!("Bearer {trusted_token}"))
         .body(Body::empty())
-        .expect("repository-reaching control request");
+        .expect("repository-reaching service-auth request");
     let (reached_status, reached_body) =
         send(stateless_router(true), reached_repository_request).await;
     assert_eq!(
         reached_status,
         StatusCode::INTERNAL_SERVER_ERROR,
-        "a request that PASSES the pre-repository verifier must reach the \
-         unreachable pool and render 500, or `401 InvalidDPoP` above \
-         discriminates nothing: {reached_body}"
+        "valid service auth must reach the unavailable replay store: {reached_body}"
     );
-    assert_eq!(
-        reached_body["error"], "InternalServerError",
-        "a repository-reaching failure carries no protocol code: {reached_body}"
-    );
+    assert_eq!(reached_body["error"], "InternalServerError");
     b4_assert_failure_body_is_closed("repository-reaching control", &reached_body);
 }
 
@@ -2641,27 +2356,15 @@ async fn b4_device_items(pool: &DbPool, session: uuid::Uuid) -> Vec<(i64, uuid::
     .expect("read device inventory items")
 }
 
-/// An unsigned query request whose Nest-token `lxm`, DPoP `htu`, DPoP `htm`,
-/// HTTP method, and request path can each be set independently, so
-/// endpoint/method substitution can be exercised honestly rather than simulated.
-///
-/// `proof_htm` is deliberately separate from `method`. Binding them together —
-/// as an earlier version did — makes a "method substitution" case send a real
-/// POST at a `get`-only route, which axum answers with a bodiless 405 before the
-/// handler, the admission spine, or any cryptography runs. That case would then
-/// assert nothing about the endpoint's method binding: it would assert that
-/// axum routes by method.
+/// A service-auth query with independently chosen token and path endpoints.
 fn b4_substituted_request(
     scenario: &EnrollScenario,
     token_lxm: &str,
-    proof_htu_nsid: &str,
-    proof_htm: &str,
-    method: &str,
     path_nsid: &str,
 ) -> Request<Body> {
     let now = chrono::Utc::now().timestamp();
     let token = sign_jwt(
-        jwt_header(),
+        jwt_header(&scenario.did),
         ordinary_claims(
             &scenario.did,
             scenario.device_id,
@@ -2669,22 +2372,20 @@ fn b4_substituted_request(
             token_lxm,
             now,
         ),
-        &nest_signing_key(),
-    );
-    let proof = dpop_proof(
         &scenario.proof_signing,
-        &scenario.proof_jwk,
-        proof_htm,
-        &htu_for(proof_htu_nsid),
-        &token,
-        now,
-        uuid::Uuid::new_v4().as_bytes(),
     );
+    let query = if path_nsid == "blue.catbird.chat.getDevices" {
+        format!(
+            "actorDeviceId={}&userDids={}",
+            scenario.device_id, scenario.did
+        )
+    } else {
+        format!("actorDeviceId={}", scenario.device_id)
+    };
     Request::builder()
-        .method(method)
-        .uri(xrpc(path_nsid))
-        .header("authorization", format!("DPoP {token}"))
-        .header("dpop", proof)
+        .method("GET")
+        .uri(format!("{}?{query}", xrpc(path_nsid)))
+        .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .expect("substituted request")
 }
@@ -2765,6 +2466,7 @@ async fn get_devices_projects_exact_addressable_fields_and_refuses_an_unregister
     // the audience read is never reached. `EnrollScenario::build` mints a fresh
     // identity WITHOUT enrolling it.
     let stranger = EnrollScenario::build(1);
+    stranger.cache_service_auth_identity().await;
     let (status, body) = send(
         router_with(pool.clone(), true),
         query_request(&stranger, "blue.catbird.chat.getDevices", &suffix),
@@ -2919,29 +2621,6 @@ async fn get_devices_revocation_jkt_generation_and_key_drift_fail_before_read() 
     // `lock_device_and_key:3729` — `device.status != "active"` is
     // `DeviceRevoked`, declared by `getDevices` and rendered at 401.
     assert_drift_is_terminal(&pool, &revoked, "revoked device", "DeviceRevoked").await;
-
-    // 2. JKT drift, produced by a LEGAL rebind: the registered JKT and the
-    //    authentication generation both move, and the stale credentials the
-    //    scenario still holds no longer match the locked row.
-    let rebound = enroll_fresh_device(&pool, 1).await;
-    let new_proof = random_p256();
-    let (rebind_status, rebind_body) = send(
-        router_with(pool.clone(), true),
-        rebind_request(&rebound, &new_proof),
-    )
-    .await;
-    assert_eq!(
-        rebind_status,
-        StatusCode::OK,
-        "legal rebind failed: {rebind_body}"
-    );
-    // `lock_existing_authority:3705` — the registered `dpop_jkt` no longer
-    // matches the stale proof, which is `DpopBindingMismatch` and maps to the
-    // declared `InvalidDPoP` (`context.rs:353`). The generation moved too, but
-    // the JKT check is reached first and the authority layer never inspects the
-    // generation at all, so this case cannot reach the facade's generation
-    // branch.
-    assert_drift_is_terminal(&pool, &rebound, "drifted JKT and generation", "InvalidDPoP").await;
 
     // 3. Non-positive authentication generation is UNREACHABLE from a durable
     //    row, and this case proves that rather than pretending otherwise.
@@ -3137,10 +2816,6 @@ async fn get_own_devices_materializes_from_locked_admission_without_handler_coor
         .find(|item| item["device"]["deviceId"] == scenario.device_id.to_string())
         .expect("own device present");
     assert!(
-        own["device"]["dpopJkt"].is_string(),
-        "dpopJkt is a legitimate directory-row field"
-    );
-    assert!(
         own["device"]["authGeneration"].is_number(),
         "authGeneration is a legitimate directory-row field"
     );
@@ -3241,150 +2916,88 @@ async fn get_own_devices_retry_uses_fresh_transaction_and_attempt() {
     );
     assert!(after_success[0].1, "the surviving session is complete");
 
-    // Each successful call is its own transaction and its own session; the
-    // earlier committed session is untouched by the later one.
+    // A later successful call uses a fresh session, then reaps the superseded
+    // session so steady-state polling remains bounded.
     let (status, _) = send(
         router_with(pool.clone(), true),
         query_request(&scenario, "blue.catbird.chat.getOwnDevices", ""),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let two = b4_device_sessions(&pool, &scenario.did).await;
-    assert_eq!(two.len(), 2, "a second call mints its own session");
+    let latest = b4_device_sessions(&pool, &scenario.did).await;
     assert_eq!(
-        two[0].0, after_success[0].0,
-        "the first committed session is not rewritten by the second call"
+        latest.len(),
+        1,
+        "only the newest complete session is retained"
     );
-    assert!(
-        two.iter().all(|session| session.1),
-        "both sessions complete"
+    assert_ne!(
+        latest[0].0, after_success[0].0,
+        "the second call must mint a fresh session before reaping the first"
     );
+    assert!(latest[0].1, "the retained session is complete");
 }
 
-/// Substituting the endpoint or the method fails before any SQL runs: no
-/// device-inventory session is created by a substituted request.
+/// Substituting the endpoint in either the service token or request path fails
+/// before device-inventory materialization starts.
 #[tokio::test]
 #[ignore = "requires the dedicated clean-chat gate database"]
-async fn get_own_devices_endpoint_or_method_substitution_fails_before_sql() {
+async fn get_own_devices_endpoint_substitution_fails_before_materialization() {
     let pool = common::chat_protocol::setup_chat_protocol_db(4).await;
     let scenario = enroll_fresh_device(&pool, 2).await;
     let own = "blue.catbird.chat.getOwnDevices";
     let other = "blue.catbird.chat.getDevices";
-
-    // WHAT THIS TEST PROVES, AND WHAT IT DOES NOT — stated exactly, because an
-    // earlier version of this comment deferred a required case to the
-    // entitlement suite, which does not carry it either. A deferral to a place
-    // that does not implement the case is worse than an admitted gap: it reads
-    // as covered.
-    //
-    // PROVEN HERE. Cases 1-3 substitute the ENDPOINT along each of its three
-    // independent carriers (Nest-token `lxm`, DPoP `htu`, request path). Case 4
-    // is the amendment's CRYPTOGRAPHIC WRONG-METHOD subcase: a real GET whose
-    // DPoP proof is bound to POST, so it reaches the real handler and is refused
-    // by `verify_ordinary_request_auth` (`context.rs:143`) before
-    // `authorize_unsigned_request` (`context.rs:152`) issues any SQL. It is a
-    // GET on purpose — sending an actual POST would be answered by axum's
-    // method router with a bodiless 405 and would never reach the endpoint's
-    // method binding at all.
-    //
-    // HOW "BEFORE SQL" IS MEASURED — corrected, because the previous instrument
-    // was not a discriminator. It was: "each case asserts the DECLARED
-    // `InvalidDPoP`; a refusal raised inside the repository or the facade is
-    // rendered code-less, so `InvalidDPoP` can only have come from the
-    // pre-repository cryptographic verifier." That premise is false.
-    // `context.rs:353` maps `AuthRepositoryError::ReplayDetected |
-    // DpopBindingMismatch` to `InvalidDPoP`, and `authorize_unsigned_request`
-    // (`repository/auth.rs:1108-1117`) calls `pool.begin()` and INSERTs replay
-    // rows before either can be produced. A 401 `InvalidDPoP` is therefore
-    // produced by two distinguishable paths, one of which has already written to
-    // the database, and the assertion cannot tell them apart. Concretely
-    // undetected: move the `lxm`/`htu`/`htm` binding checks out of
-    // `verify_ordinary_request_auth` and let the repository's
-    // `DpopBindingMismatch` catch them instead — every assertion still passed
-    // while every substituted request opened a transaction and committed rows.
-    //
-    // The instrument is now `chat.dpop_replays`, sampled around EACH
-    // substituted request. It is committed unconditionally on every semantic
-    // refusal and rolled back only on a `Database` fault, so it distinguishes
-    // "never issued SQL" from "issued SQL and rolled back" — which row-absence
-    // in `chat.device_inventory_sessions` structurally cannot. The unsubstituted
-    // control at the end must MOVE that same counter, so a zero delta is a
-    // measurement rather than a broken fixture. The declared `InvalidDPoP` is
-    // still asserted, as what it actually is: the endpoint's wire vocabulary.
-    //
-    // NOT PROVEN HERE, AND NOT PROVABLE OVER HTTP. The facade's own closed
-    // endpoint/budget binding — `into_get_devices_read_admission` and
-    // `into_get_own_devices_read_admission` refusing an admission sealed for the
-    // other endpoint. Each handler seals its admission with its OWN
-    // `ChatEndpoint` and hands it to its OWN facade, so no HTTP request can
-    // present a `getDevices` admission to the `getOwnDevices` budget; the
-    // mismatch arm is unreachable through the router by construction. Reaching
-    // it requires calling the conversions directly, which only the entitlement
-    // suite's test-crate bridge can do. That leg is OPEN and reported as open,
-    // not deferred.
+    // Make entry into materialization observable. A valid request must hit this
+    // trigger, while endpoint substitution must fail in service authentication.
+    install_task7_failure_trigger(
+        &pool,
+        "chat.device_inventory_sessions",
+        "b4_fail_substituted_device_inventory",
+        "b4_fail_substituted_device_inventory_trigger",
+    )
+    .await;
     for (case, request) in [
         (
             "token lxm names the other read endpoint",
-            b4_substituted_request(&scenario, other, own, "GET", "GET", own),
+            b4_substituted_request(&scenario, other, own),
         ),
         (
-            "proof htu names the other read endpoint",
-            b4_substituted_request(&scenario, own, other, "GET", "GET", own),
-        ),
-        (
-            "own-devices credentials replayed at the other endpoint",
-            b4_substituted_request(&scenario, own, own, "GET", "GET", other),
-        ),
-        (
-            "cryptographic wrong-method: the proof is bound to POST",
-            b4_substituted_request(&scenario, own, own, "POST", "GET", own),
+            "own-devices token replayed at the other endpoint",
+            b4_substituted_request(&scenario, own, other),
         ),
     ] {
-        let replays_before = b4_consumed_replay_rows(&pool).await;
         let (status, body) = send(router_with(pool.clone(), true), request).await;
-        // BEFORE SQL, MEASURED. `authorize_unsigned_request` commits its replay
-        // set on every semantic outcome, so reaching it is visible here whether
-        // or not its transaction rolled back. An unchanged count is the only
-        // available proof that no SQL was issued at all.
-        assert_eq!(
-            b4_consumed_replay_rows(&pool).await,
-            replays_before,
-            "{case}: the substituted request committed replay rows, so it \
-             reached `authorize_unsigned_request` and did NOT stop before SQL"
-        );
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
-            "{case}: substitution must be refused: {body}"
+            "{case}: substitution must be refused before the failure trigger: {body}"
         );
         assert_eq!(
-            body["error"], "InvalidDPoP",
-            "{case}: substitution must be refused with the endpoint's declared \
-             DPoP code: {body}"
+            body["error"], "NotAuthorized",
+            "{case}: substitution must use the endpoint's declared authorization code: {body}"
         );
-        // Strictly stronger than a `body.get("items").is_none()` check, which
-        // stood here and could not fail once the body was known closed: this
-        // pins the key set to a subset of {`error`, `message`}.
         b4_assert_failure_body_is_closed(case, &body);
     }
-
-    // Durable corroboration, from the other side: not one substituted request
-    // created a session. This is NOT a before-SQL proof on its own — a session
-    // written and rolled back is equally absent — but combined with the
-    // unchanged replay counter above it pins both "no SQL issued" and "nothing
-    // durable produced".
-    let sessions = b4_device_sessions(&pool, &scenario.did).await;
     assert!(
-        sessions.is_empty(),
-        "a substituted request reached the durable session write ({} row(s))",
-        sessions.len()
+        b4_device_sessions(&pool, &scenario.did).await.is_empty(),
+        "a substituted request reached device-inventory materialization"
     );
-
-    // POSITIVE CONTROL FOR BOTH INSTRUMENTS. The same scenario with NO
-    // substitution must move the replay counter AND commit exactly one session,
-    // so neither zero above can be the product of a dead fixture or a counter
-    // that never moves.
-    let replays_before_control = b4_consumed_replay_rows(&pool).await;
+    let (status, _) = send(
+        router_with(pool.clone(), true),
+        query_request(&scenario, own, ""),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the valid control did not reach the materialization failure trigger"
+    );
+    remove_task7_failure_trigger(
+        &pool,
+        "chat.device_inventory_sessions",
+        "b4_fail_substituted_device_inventory",
+        "b4_fail_substituted_device_inventory_trigger",
+    )
+    .await;
     let (status, body) = send(
         router_with(pool.clone(), true),
         query_request(&scenario, own, ""),
@@ -3393,16 +3006,11 @@ async fn get_own_devices_endpoint_or_method_substitution_fails_before_sql() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "unsubstituted control failed: {body}"
-    );
-    assert!(
-        b4_consumed_replay_rows(&pool).await > replays_before_control,
-        "the unsubstituted control committed no replay rows — the before-SQL \
-         instrument above cannot move and proves nothing"
+        "valid control failed after removing the trigger: {body}"
     );
     assert_eq!(
         b4_device_sessions(&pool, &scenario.did).await.len(),
         1,
-        "the unsubstituted control must commit exactly one session"
+        "the valid control must commit exactly one session"
     );
 }

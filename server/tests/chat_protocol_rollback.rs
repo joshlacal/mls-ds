@@ -50,15 +50,22 @@
 
 mod common;
 
-use catbird_server::chat_protocol::repository::{blobs, delivery};
+pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+
+#[path = "common/chat_protocol_harness.rs"]
+mod chat_protocol;
+
+mod repository {
+    pub(crate) use crate::chat_protocol::repository::*;
+}
 
 use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
-use delivery::{
+use repository::blobs::{prepare_blob, BlobMediaType, BlobPurpose, PrepareBlobRequest};
+use repository::delivery::{
     resolve_application_send, AppendEntry, ApplicationSend, ApplicationSendDisposition,
     ApplicationSendOutcome,
 };

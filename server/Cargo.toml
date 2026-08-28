@@ -57,10 +57,10 @@ jsonwebtoken = "9"
 
 # Jacquard (ATProto types)
 catbird-atproto = { path = "../../catbird-atproto" }
-jacquard-common = "=0.12.1"
-jacquard-axum = "=0.12.1"
-jacquard-derive = "=0.12.1"
-jacquard-lexicon = "=0.12.1"
+jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+jacquard-axum = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+jacquard-derive = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+jacquard-lexicon = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
 serde_html_form = "0.4"
 miette = "7"
 rustversion = "1"
@@ -132,6 +132,11 @@ name = "deadletter_recover"
 path = "src/bin/deadletter_recover.rs"
 required-features = ["server-bin"]
 
+[[bin]]
+name = "federation_fixture"
+path = "src/bin/federation_fixture.rs"
+required-features = ["test-support"]
+
 [[example]]
 name = "seal_mls_chat_crypto_wire_v09"
 path = "examples/seal_mls_chat_crypto_wire_v09.rs"
@@ -144,6 +149,48 @@ required-features = ["chat-protocol-production-proof"]
 [[test]]
 name = "chat_protocol_create_conversation_regression"
 path = "tests/chat_protocol_create_conversation_regression.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_blobs"
+path = "tests/chat_protocol_blobs.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_device_handlers"
+path = "tests/chat_protocol_device_handlers.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_g7_entitlement"
+path = "tests/chat_protocol_g7_entitlement.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_inventory"
+path = "tests/chat_protocol_inventory.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_s3_lifecycle"
+path = "tests/chat_protocol_s3_lifecycle.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_ticket"
+path = "tests/chat_protocol_ticket.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_wire"
+path = "tests/chat_protocol_wire.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "federation_hostile_peers"
+path = "tests/federation_hostile_peers.rs"
+required-features = ["test-support"]
+
 [[test]]
 name = "chat_protocol_create_conversation_handlers"
 path = "tests/chat_protocol_create_conversation_handlers.rs"
@@ -153,6 +200,27 @@ required-features = ["test-support"]
 name = "chat_protocol_federation_routing"
 path = "tests/chat_protocol_federation_routing.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_federation_router"
+path = "tests/chat_protocol_federation_router.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_federation_outbox_retry"
+path = "tests/chat_protocol_federation_outbox_retry.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "chat_protocol_remote_prefix_bootstrap"
+path = "tests/chat_protocol_remote_prefix_bootstrap.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "federation_fixture_cli"
+path = "tests/federation_fixture_cli.rs"
+required-features = ["test-support"]
+
 [features]
 default = ["namespace-bluecatbird", "server-bin"]
 namespace-bluecatbird = []

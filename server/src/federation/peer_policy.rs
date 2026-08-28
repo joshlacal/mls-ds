@@ -541,21 +541,10 @@ pub async fn enforce_inbound_peer_policy(
     }
 }
 
-pub async fn enforce_outbound_peer_policy(
-    pool: &PgPool,
+fn evaluate_peer_record_policy(
     ds_did: &str,
+    row: Option<(String, Option<i32>, i32, i64, i64)>,
 ) -> Result<PeerPolicy, FederationError> {
-    let ds_did = canonical_did(ds_did);
-    let row: Option<(String, Option<i32>, i32, i64, i64)> = sqlx::query_as(
-        "SELECT status, max_requests_per_minute, trust_score, \
-                 rejected_request_count, invalid_token_count \
-         FROM federation_peers WHERE ds_did = $1",
-    )
-    .bind(ds_did)
-    .fetch_optional(pool)
-    .await
-    .map_err(FederationError::Database)?;
-
     let Some((
         status,
         max_requests_per_minute,
@@ -589,6 +578,42 @@ pub async fn enforce_outbound_peer_policy(
             reason: format!("Peer DS '{}' is blocklisted", ds_did),
         }),
     }
+}
+
+pub async fn enforce_outbound_peer_policy(
+    pool: &PgPool,
+    ds_did: &str,
+) -> Result<PeerPolicy, FederationError> {
+    let ds_did = canonical_did(ds_did);
+    let row: Option<(String, Option<i32>, i32, i64, i64)> = sqlx::query_as(
+        "SELECT status, max_requests_per_minute, trust_score, \
+                 rejected_request_count, invalid_token_count \
+         FROM federation_peers WHERE ds_did = $1",
+    )
+    .bind(ds_did)
+    .fetch_optional(pool)
+    .await
+    .map_err(FederationError::Database)?;
+
+    evaluate_peer_record_policy(ds_did, row)
+}
+
+pub(crate) async fn enforce_outbound_peer_policy_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ds_did: &str,
+) -> Result<PeerPolicy, FederationError> {
+    let ds_did = canonical_did(ds_did);
+    let row: Option<(String, Option<i32>, i32, i64, i64)> = sqlx::query_as(
+        "SELECT status, max_requests_per_minute, trust_score, \
+                 rejected_request_count, invalid_token_count \
+         FROM federation_peers WHERE ds_did = $1 FOR SHARE",
+    )
+    .bind(ds_did)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(FederationError::Database)?;
+
+    evaluate_peer_record_policy(ds_did, row)
 }
 
 pub async fn record_success(pool: &PgPool, ds_did: &str) {
