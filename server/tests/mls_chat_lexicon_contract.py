@@ -3424,45 +3424,42 @@ def validate_crypto_wire_v09_corpus() -> None:
     }
     assert set(manifest["dependencies"]) == set(expected_dependency_versions)
     lock_path = STACK_ROOT / "catbird-mls/Cargo.lock"
+    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    lock_packages = lock["package"]
+    for package, profile in manifest["dependencies"].items():
+        assert package and "version" in profile and "source" in profile
+        assert profile["version"] == expected_dependency_versions[package]
+        matches = [
+            entry for entry in lock_packages
+            if entry["name"] == package and entry["version"] == profile["version"]
+        ]
+        assert len(matches) == 1, f"Cargo.lock package ambiguity for {package}"
+        assert matches[0].get("source") == profile["source"]
+        if "checksum" in profile:
+            assert matches[0].get("checksum") == profile["checksum"]
+
     generator = manifest["generator"]
     generator_source = STACK_ROOT / generator["source"]
     cargo_manifest_path = STACK_ROOT / "catbird-mls/Cargo.toml"
+    assert hashlib.sha256(generator_source.read_bytes()).hexdigest() == generator["sourceSha256Hex"]
+    assert hashlib.sha256(cargo_manifest_path.read_bytes()).hexdigest() == generator["cargoManifestSha256Hex"]
+    assert hashlib.sha256(lock_path.read_bytes()).hexdigest() == generator["cargoLockSha256Hex"]
+    assert generator["officialClientRevision"] == "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7"
+    assert generator["catbirdOpenMlsForkRev"] == "3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
+
     source_root = STACK_ROOT / "catbird-mls/src/chat_v2"
-    # catbird-mls is absent from partial checkouts of this stack; whenever it is present its
-    # generator provenance must match the manifest exactly, missing files included.
-    if (STACK_ROOT / "catbird-mls").is_dir():
-        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
-        lock_packages = lock["package"]
-        for package, profile in manifest["dependencies"].items():
-            assert package and "version" in profile and "source" in profile
-            assert profile["version"] == expected_dependency_versions[package]
-            matches = [
-                entry for entry in lock_packages
-                if entry["name"] == package and entry["version"] == profile["version"]
-            ]
-            assert len(matches) == 1, f"Cargo.lock package ambiguity for {package}"
-            assert matches[0].get("source") == profile["source"]
-            if "checksum" in profile:
-                assert matches[0].get("checksum") == profile["checksum"]
-
-        assert hashlib.sha256(generator_source.read_bytes()).hexdigest() == generator["sourceSha256Hex"]
-        assert hashlib.sha256(cargo_manifest_path.read_bytes()).hexdigest() == generator["cargoManifestSha256Hex"]
-        assert hashlib.sha256(lock_path.read_bytes()).hexdigest() == generator["cargoLockSha256Hex"]
-        assert generator["officialClientRevision"] == "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7"
-        assert generator["catbirdOpenMlsForkRev"] == "3ea192fc346663fba5db63aa8c90ccc3ae49f12b"
-
-        source_files = sorted(
-            (path.relative_to(source_root).as_posix(), path.read_bytes())
-            for path in source_root.rglob("*.rs")
-        )
-        assert source_files
-        source_hasher = hashlib.sha256()
-        for relative, source_bytes in source_files:
-            source_hasher.update(relative.encode("utf-8"))
-            source_hasher.update(b"\0")
-            source_hasher.update(len(source_bytes).to_bytes(8, "big"))
-            source_hasher.update(source_bytes)
-        assert source_hasher.hexdigest() == generator["chatProtocolSourceTreeSha256Hex"]
+    source_files = sorted(
+        (path.relative_to(source_root).as_posix(), path.read_bytes())
+        for path in source_root.rglob("*.rs")
+    )
+    assert source_files
+    source_hasher = hashlib.sha256()
+    for relative, source_bytes in source_files:
+        source_hasher.update(relative.encode("utf-8"))
+        source_hasher.update(b"\0")
+        source_hasher.update(len(source_bytes).to_bytes(8, "big"))
+        source_hasher.update(source_bytes)
+    assert source_hasher.hexdigest() == generator["chatProtocolSourceTreeSha256Hex"]
 
     identity = manifest["identity"]
     for principal in ("alice", "bob"):

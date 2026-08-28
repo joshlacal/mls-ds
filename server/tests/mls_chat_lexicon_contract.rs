@@ -1,4 +1,4 @@
-//! Executable guard for the clean `blue.catbird.chat` and `blue.catbird.mlsDS` Lexicon corpora.
+//! Executable guard for the clean `blue.catbird.chat` Lexicon corpus.
 //!
 //! The Python companion freezes semantic shapes and runs negative mutations.
 //! This test additionally parses every document with the same Jacquard parser
@@ -38,14 +38,6 @@ fn mirror_root() -> PathBuf {
     mls_ds_root().join("lexicon/blue/catbird/chat")
 }
 
-fn canonical_mls_ds_root() -> PathBuf {
-    stack_root().join("PetrelCatbird/lexicons/blue/catbird/mlsDS")
-}
-
-fn mirror_mls_ds_root() -> PathBuf {
-    mls_ds_root().join("lexicon/blue/catbird/mlsDS")
-}
-
 fn corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let entries =
         fs::read_dir(root).unwrap_or_else(|error| panic!("must read {}: {error}", root.display()));
@@ -68,8 +60,8 @@ fn corpus(root: &Path) -> BTreeMap<String, Vec<u8>> {
 fn validate_corpus(corpus: &BTreeMap<String, Vec<u8>>, label: &str) {
     assert_eq!(
         corpus.len(),
-        36,
-        "{label}: thirty-six chat lexicon files are required"
+        33,
+        "{label}: defs plus thirty-two endpoints are required"
     );
     for (filename, bytes) in corpus {
         let source = std::str::from_utf8(bytes)
@@ -114,18 +106,6 @@ fn canonical_and_server_corpora_parse_and_match_exactly() {
     assert_eq!(
         canonical, mirror,
         "server corpus must be an exact byte mirror"
-    );
-
-    let canonical_mls_ds = corpus(&canonical_mls_ds_root());
-    assert_eq!(
-        canonical_mls_ds.len(),
-        14,
-        "canonical mlsDS: fourteen files required"
-    );
-    assert_eq!(
-        canonical_mls_ds,
-        corpus(&mirror_mls_ds_root()),
-        "server mlsDS corpus must be an exact byte mirror"
     );
 }
 

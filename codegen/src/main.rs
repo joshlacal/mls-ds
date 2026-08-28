@@ -337,15 +337,7 @@ fn copy_and_normalize_lexicons(
 
         let content = fs::read_to_string(&source_path)?;
         let (normalized_content, normalized_count) =
-            normalize_lexicon_json(&content).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "failed to parse JSON file {}: {error}",
-                        source_path.display()
-                    ),
-                )
-            })?;
+            normalize_lexicon_json(&content, &source_path)?;
         normalized += normalized_count;
 
         if let Some(parent) = destination_path.parent() {
@@ -357,40 +349,100 @@ fn copy_and_normalize_lexicons(
     Ok(normalized)
 }
 
-fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
-    let mut value: Value = serde_json::from_str(content)?;
+fn normalize_lexicon_json(content: &str, source_path: &Path) -> Result<(String, usize), io::Error> {
+    let mut value: Value = serde_json::from_str(content).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse JSON file {}: {error}", source_path.display()),
+        )
+    })?;
+
+    if value.get("lexicon").is_none() {
+        let serialized = serde_json::to_string_pretty(&value).map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        return Ok((serialized, 0));
+    }
+
+    let doc_id = value.get("id").and_then(Value::as_str).map(String::from);
     let mut normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
-    normalized_count += normalize_unsupported_string_formats(&mut value);
-    let normalized_content = serde_json::to_string_pretty(&value)?;
+    normalized_count +=
+        normalize_string_formats(&mut value, source_path, doc_id.as_deref(), "$")?;
+    let normalized_content = serde_json::to_string_pretty(&value).map_err(|error| {
+        io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+    })?;
     Ok((normalized_content, normalized_count))
 }
 
-/// Jacquard hard-fails on any `format` outside its own `LexStringFormat` enum (today
-/// `space-ref`, used by the `com.atproto.space*` lexicons), so ask Jacquard what it accepts
-/// instead of restating the supported set here and drifting from it.
-fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
+fn normalize_string_formats(
+    value: &mut Value,
+    source_path: &Path,
+    doc_id: Option<&str>,
+    location: &str,
+) -> Result<usize, io::Error> {
     let mut normalized = 0usize;
     match value {
         Value::Object(map) => {
-            let unsupported = map.get("format").is_some_and(|format| {
-                serde_json::from_value::<LexStringFormat>(format.clone()).is_err()
-            });
-            if unsupported {
-                map.remove("format");
-                normalized += 1;
+            let is_string_type = map.get("type").and_then(Value::as_str) == Some("string");
+            if is_string_type {
+                if let Some(format_val) = map.get("format") {
+                    let format_loc = format!("{location}.format");
+                    let Some(format_str) = format_val.as_str() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid non-string format value at {format_loc} in {}",
+                                source_path.display()
+                            ),
+                        ));
+                    };
+
+                    let is_supported = serde_json::from_value::<LexStringFormat>(Value::String(
+                        format_str.to_string(),
+                    ))
+                    .is_ok();
+                    if is_supported {
+                        // Supported format, preserved as-is.
+                    } else if format_str == "space-ref" && is_known_space_schema(source_path, doc_id)
+                    {
+                        map.remove("format");
+                        normalized += 1;
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported or unrecognized string format {format_str:?} at {format_loc} in {}",
+                                source_path.display()
+                            ),
+                        ));
+                    }
+                }
             }
-            for child in map.values_mut() {
-                normalized += normalize_unsupported_string_formats(child);
+
+            for (key, child) in map.iter_mut() {
+                let child_loc = format!("{location}.{key}");
+                normalized += normalize_string_formats(child, source_path, doc_id, &child_loc)?;
             }
         }
         Value::Array(list) => {
-            for child in list {
-                normalized += normalize_unsupported_string_formats(child);
+            for (index, child) in list.iter_mut().enumerate() {
+                let child_loc = format!("{location}[{index}]");
+                normalized += normalize_string_formats(child, source_path, doc_id, &child_loc)?;
             }
         }
         _ => {}
     }
-    normalized
+    Ok(normalized)
+}
+
+fn is_known_space_schema(source_path: &Path, doc_id: Option<&str>) -> bool {
+    if let Some(id) = doc_id {
+        if id.starts_with("com.atproto.space.") || id.starts_with("com.atproto.simplespace.") {
+            return true;
+        }
+    }
+    let path_str = source_path.to_string_lossy();
+    path_str.contains("com/atproto/space") || path_str.contains("com/atproto/simplespace")
 }
 
 fn normalize_raw_byte_xrpc_bodies(value: &mut Value) -> usize {
@@ -450,7 +502,9 @@ mod tests {
     use super::load_preflight_documents;
     use super::normalize_lexicon_dirs;
     use super::normalize_raw_byte_xrpc_bodies;
+    use super::normalize_string_formats;
     use super::validate_strict_union_contracts;
+    use std::path::Path;
     use jacquard_lexicon::codegen::CodeGenerator;
     use jacquard_lexicon::corpus::LexiconCorpus;
     use serde_json::json;
@@ -566,6 +620,195 @@ mod tests {
             lexicon["defs"]["main"]["output"]["schema"]["type"],
             "object"
         );
+    }
+
+    #[test]
+    fn preserves_supported_string_formats() {
+        let mut lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.testSupportedFormats",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "at": { "type": "string", "format": "datetime" },
+                        "user": { "type": "string", "format": "did" },
+                        "handle": { "type": "string", "format": "handle" },
+                        "link": { "type": "string", "format": "uri" },
+                        "record": { "type": "string", "format": "at-uri" },
+                        "blob": { "type": "string", "format": "cid" },
+                        "rkey": { "type": "string", "format": "record-key" },
+                        "tid": { "type": "string", "format": "tid" },
+                        "nsid": { "type": "string", "format": "nsid" },
+                        "lang": { "type": "string", "format": "language" },
+                        "ident": { "type": "string", "format": "at-identifier" }
+                    }
+                }
+            }
+        });
+
+        let count = normalize_string_formats(
+            &mut lexicon,
+            Path::new("blue/catbird/testSupportedFormats.json"),
+            Some("blue.catbird.testSupportedFormats"),
+            "$",
+        )
+        .expect("supported formats must succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(lexicon["defs"]["main"]["properties"]["user"]["format"], "did");
+        assert_eq!(lexicon["defs"]["main"]["properties"]["at"]["format"], "datetime");
+        assert_eq!(lexicon["defs"]["main"]["properties"]["blob"]["format"], "cid");
+    }
+
+    #[test]
+    fn strips_space_ref_only_from_known_space_lexicons() {
+        let mut space_lexicon = json!({
+            "lexicon": 1,
+            "id": "com.atproto.space.getSpace",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "space": { "type": "string", "format": "space-ref" }
+                    }
+                }
+            }
+        });
+
+        let count = normalize_string_formats(
+            &mut space_lexicon,
+            Path::new("Petrel/generator/lexicons/com/atproto/space/getSpace.json"),
+            Some("com.atproto.space.getSpace"),
+            "$",
+        )
+        .expect("known space lexicon space-ref must be normalized");
+
+        assert_eq!(count, 1);
+        assert!(space_lexicon["defs"]["main"]["properties"]["space"].get("format").is_none());
+        assert_eq!(space_lexicon["defs"]["main"]["properties"]["space"]["type"], "string");
+
+        // Outside known space lexicons, space-ref must be rejected
+        let mut other_lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.other",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "space": { "type": "string", "format": "space-ref" }
+                    }
+                }
+            }
+        });
+
+        let err = normalize_string_formats(
+            &mut other_lexicon,
+            Path::new("blue/catbird/other.json"),
+            Some("blue.catbird.other"),
+            "$",
+        )
+        .expect_err("space-ref in non-space lexicon must be rejected");
+
+        assert!(err.to_string().contains("unsupported or unrecognized string format \"space-ref\""));
+    }
+
+    #[test]
+    fn rejects_unknown_string_format_or_typo() {
+        let mut lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.testTypo",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "badField": { "type": "string", "format": "date-time" }
+                    }
+                }
+            }
+        });
+
+        let err = normalize_string_formats(
+            &mut lexicon,
+            Path::new("blue/catbird/testTypo.json"),
+            Some("blue.catbird.testTypo"),
+            "$",
+        )
+        .expect_err("typo in format must be rejected");
+
+        assert!(err.to_string().contains("unsupported or unrecognized string format \"date-time\""));
+        assert!(err.to_string().contains("$.defs.main.properties.badField.format"));
+        assert!(err.to_string().contains("blue/catbird/testTypo.json"));
+
+        // Also non-string format value
+        let mut non_string_lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.testNonString",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "badField": { "type": "string", "format": 123 }
+                    }
+                }
+            }
+        });
+
+        let err2 = normalize_string_formats(
+            &mut non_string_lexicon,
+            Path::new("blue/catbird/testNonString.json"),
+            Some("blue.catbird.testNonString"),
+            "$",
+        )
+        .expect_err("non-string format must be rejected");
+
+        assert!(err2.to_string().contains("invalid non-string format value"));
+    }
+
+    #[test]
+    fn preserves_object_or_property_named_format() {
+        let mut lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.testFormatProperty",
+            "defs": {
+                "main": {
+                    "type": "object",
+                    "properties": {
+                        "format": {
+                            "type": "string",
+                            "description": "A property whose name happens to be format"
+                        },
+                        "typedFormat": {
+                            "type": "string",
+                            "format": "did"
+                        }
+                    }
+                },
+                "customObj": {
+                    "type": "object",
+                    "format": "video-container",
+                    "properties": {
+                        "width": { "type": "integer" }
+                    }
+                }
+            }
+        });
+
+        let count = normalize_string_formats(
+            &mut lexicon,
+            Path::new("blue/catbird/testFormatProperty.json"),
+            Some("blue.catbird.testFormatProperty"),
+            "$",
+        )
+        .expect("format property must succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(
+            lexicon["defs"]["main"]["properties"]["format"]["description"],
+            "A property whose name happens to be format"
+        );
+        assert_eq!(lexicon["defs"]["main"]["properties"]["typedFormat"]["format"], "did");
+        assert_eq!(lexicon["defs"]["customObj"]["format"], "video-container");
     }
 
     #[test]
