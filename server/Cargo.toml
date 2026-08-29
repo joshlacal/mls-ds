@@ -73,12 +73,10 @@ reqwest = { version = "0.12", features = ["json"] }
 # Disable default features to avoid pulling legacy rustls 0.21 (vulnerable
 # rustls-webpki 0.101.7 path). default-https-client still provides modern
 # rustls 0.23 + aws-lc-rs via aws-smithy-runtime's default-https-client feature.
-# `rustls` is also explicitly enabled so a TLS provider is guaranteed to be
-# selected at runtime when default features are off (per gemini PR #13 review:
-# in some AWS SDK v1 configurations, default-https-client alone fails to wire
-# a connector and S3 init crashes only on first call). Defense-in-depth.
-aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio", "rustls"] }
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso", "rustls"] }
+# Do not enable the legacy `rustls` compatibility feature: it selects Hyper
+# 0.14/h2 0.3. `default-https-client` is the supported aws-lc TLS connector.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
 
 # Caching and rate limiting
 moka = { version = "0.12", features = ["future", "sync"] }
@@ -107,7 +105,7 @@ a2 = "0.10"
 
 # Metrics
 metrics = "0.21"
-metrics-exporter-prometheus = "0.13"
+metrics-exporter-prometheus = { version = "0.13", default-features = false }
 prometheus = "0.14"
 
 # WebSocket support for subscriptions

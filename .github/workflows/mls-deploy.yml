@@ -248,7 +248,7 @@ jobs:
         image: postgres:15
         env:
           POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_USER: runner
+          POSTGRES_USER: anonymous
           POSTGRES_DB: catbird_chat_protocol_test_20260722
         options: >-
           --health-cmd pg_isready
