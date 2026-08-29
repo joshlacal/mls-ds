@@ -6716,8 +6716,8 @@ async fn apply_leaf_recovery_fulfillment(
     let ds_did_opt = match participant_row {
         None => {
             tracing::error!(
-                %conversation_id,
-                recipient_did = %recipient_did_str,
+                conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
+                recipient_did = %crate::crypto::redact_for_log(&recipient_did_str),
                 "welcome emission failed: recipient participant is absent from conversation"
             );
             return Err(ExecutorError::InconsistentPlan(
@@ -6737,8 +6737,8 @@ async fn apply_leaf_recovery_fulfillment(
 
     if is_local || historical_write_authority.is_some() {
         tracing::debug!(
-            %conversation_id,
-            recipient_did = %recipient_did_str,
+            conversation_id = %crate::crypto::redact_for_log(&conversation_id.hyphenated().to_string()),
+            recipient_did = %crate::crypto::redact_for_log(&recipient_did_str),
             "welcome emission: recipient is local participant or historical reconstruction, skipping remote federation enqueue"
         );
     } else {

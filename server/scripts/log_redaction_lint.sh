@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TARGET_DIR="${1:-src/handlers/mls_chat}"
+TARGET_DIR="${1:-src/chat_protocol}"
 
 if [ ! -d "$TARGET_DIR" ]; then
   echo "Target directory not found: $TARGET_DIR"
@@ -14,7 +14,7 @@ fi
 # `warn!("addMembers: missing member_dids")` because those are static text,
 # not interpolated values. The accepted redaction sigil is either `redact_for_log`
 # or `hash_for_log` (both are documented helpers in `crate::crypto`).
-violations_structured=$(rg -n --glob '*.rs' '(did|_did|convo_id|convoId|target_ds|sequencer|new_sequencer)\s*=\s*%[^,)]+' "$TARGET_DIR" | rg -v 'redact_for_log|hash_for_log' || true)
+violations_structured=$(rg -n --glob '*.rs' '((did|_did|convo_id|conversation_id|convoId|target_ds|sequencer|new_sequencer)\s*=\s*%[^,)]+|%(convo_id|conversation_id)\b)' "$TARGET_DIR" | rg -v 'redact_for_log|hash_for_log' || true)
 
 # Flag format-style logging WHEN the actual interpolation slot
 # `{user_did}` / `{convo_id}` etc. appears in the message. Bare mentions
@@ -22,7 +22,7 @@ violations_structured=$(rg -n --glob '*.rs' '(did|_did|convo_id|convoId|target_d
 # We require an interpolation slot (`{...}`) AND a non-redacted argument.
 # This avoids the previous false positives on lines like
 # `warn!("Empty convo_id provided")` which contain no interpolated value.
-violations_inline=$(rg -n --glob '*.rs' '(trace!|debug!|info!|warn!|error!)\(.*\{[^}]*\}.*,(.*?)(did|_did|convo_id|convoId)([^_a-zA-Z]|$)' "$TARGET_DIR" | rg -v 'redact_for_log|hash_for_log' || true)
+violations_inline=$(rg -n --glob '*.rs' '(trace!|debug!|info!|warn!|error!)\(.*\{[^}]*\}.*,(.*?)(did|_did|convo_id|conversation_id|convoId)([^_a-zA-Z]|$)' "$TARGET_DIR" | rg -v 'redact_for_log|hash_for_log' || true)
 
 violations=""
 if [ -n "$violations_inline" ]; then

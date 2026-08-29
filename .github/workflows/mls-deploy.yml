@@ -295,11 +295,9 @@ jobs:
           # actor reset paths attribute system resets to this DID.
           SERVICE_DID: did:web:ci-mls.test
           RUST_LOG: info
-        # --test-threads=1: bootstrap_reset_group's ignored cases share
-        # convo/group fixtures ("fixture isolation" ignore reason) and
-        # db_tests serializes via a static lock anyway; single-threaded
-        # execution keeps the gate deterministic. Concurrency inside each
-        # test (barriers/spawned tasks) is unaffected.
+        # --test-threads=1: db_tests serializes via a static lock; single-threaded
+        # execution keeps the gate deterministic. Concurrency inside each test
+        # (barriers/spawned tasks) is unaffected.
         #
         # --skip'd race_conditions cases are the documented stale-contract
         # tests (AddMembers without commit no longer advances epoch /
@@ -312,7 +310,6 @@ jobs:
           cargo test \
             --test sequencer_transfer_cas \
             --test db_tests \
-            --test bootstrap_reset_group \
             --test race_conditions \
             -- --include-ignored --test-threads=1 \
             --skip test_concurrent_add_members_no_duplicate_epochs \
