@@ -288,12 +288,10 @@ pub(crate) fn creation_existing_device_receipt_for_test(
     dpop_jkt: &str,
     signing_public_key: &[u8],
 ) -> Result<RepositoryAuthorityReceipt, AuthRepositoryError> {
-    let operation_id = match mutation.projection() {
-        VerifiedMutationProjection::Creation(creation) => {
-            Uuid::from_bytes(*creation.transition_id().as_bytes())
-        }
-        _ => return Err(AuthRepositoryError::UnsupportedAuthorizationShape),
+    let VerifiedMutationProjection::Creation(_) = mutation.projection() else {
+        return Err(AuthRepositoryError::UnsupportedAuthorizationShape);
     };
+    let operation_id = Uuid::from_bytes(*mutation.idempotency_key().as_bytes());
     let auth_generation = i64::try_from(mutation.auth_generation())
         .ok()
         .filter(|generation| *generation > 0)

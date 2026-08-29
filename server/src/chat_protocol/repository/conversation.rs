@@ -175,12 +175,14 @@ async fn load_pending_requests(
     ConversationStateReadError,
 > {
     let resets: Vec<PendingResetRow> = sqlx::query_as(
-        "SELECT reset_request_id, requester_did, requester_device_id, prior_generation,\
-                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,\
-                prior_confirmation_tag, reason, received_at, expires_at\
-           FROM chat.reset_requests\
-          WHERE conversation_id = $1 AND status = 'pending'\
-          ORDER BY reset_request_id",
+        r#"
+        SELECT reset_request_id, requester_did, requester_device_id, prior_generation,
+               prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,
+               prior_confirmation_tag, reason, received_at, expires_at
+          FROM chat.reset_requests
+         WHERE conversation_id = $1 AND status = 'pending'
+         ORDER BY reset_request_id
+        "#,
     )
     .bind(conversation_id)
     .fetch_all(&mut **transaction)
@@ -188,12 +190,14 @@ async fn load_pending_requests(
     .map_err(|_| ConversationStateReadError::Storage)?;
 
     let leaves: Vec<PendingLeaveRow> = sqlx::query_as(
-        "SELECT leave_request_id, requester_did, requester_device_id, prior_generation,\
-                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,\
-                prior_confirmation_tag, received_at, expires_at\
-           FROM chat.leave_requests\
-          WHERE conversation_id = $1 AND status = 'pending'\
-          ORDER BY leave_request_id",
+        r#"
+        SELECT leave_request_id, requester_did, requester_device_id, prior_generation,
+               prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,
+               prior_confirmation_tag, received_at, expires_at
+          FROM chat.leave_requests
+         WHERE conversation_id = $1 AND status = 'pending'
+         ORDER BY leave_request_id
+        "#,
     )
     .bind(conversation_id)
     .fetch_all(&mut **transaction)
@@ -308,4 +312,29 @@ fn leave_view(
             extra_data: None,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
+
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_request_queries_accept_empty_catalog() {
+        let (pool, _db) = fresh_db::fresh_full_catalog_pool("actor_convo_", 1).await;
+        let mut transaction = pool.begin().await.expect("begin transaction");
+
+        let (leaves, resets) = load_pending_requests(&mut transaction, Uuid::new_v4())
+            .await
+            .expect("load pending requests");
+
+        assert!(leaves.is_empty());
+        assert!(resets.is_empty());
+    }
 }

@@ -293,6 +293,7 @@ async fn execute_first_creation<T: PublicTransport>(
         .mutation()
         .ok_or(CreationFacadeError::MissingMutation)?;
     let (transition_id, conversation_id, kind, principals) = parse_creation(mutation)?;
+    let operation_id = Uuid::from_bytes(*mutation.idempotency_key().as_bytes());
     if let Some(r) = &routing {
         r.recheck_manifest_dids(&principals)
             .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
@@ -304,7 +305,7 @@ async fn execute_first_creation<T: PublicTransport>(
     let scope = CanonicalLockScope::new(principals.clone(), std::mem::take(&mut devices))?;
     let prelude =
         prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?;
-    let prelude = prelude.verify_creation_operation(transition_id, mutation)?;
+    let prelude = prelude.verify_creation_operation(operation_id, mutation)?;
     let scope_authority = prelude.scope_authority();
     let direct_lookup = if kind == "direct" {
         let [first, second] = principals.as_slice() else {
@@ -566,6 +567,7 @@ async fn lock_creation_replay_post_state(
     let authority = locked.authority();
     let mutation = authority.mutation();
     let (transition_id, _, _, _) = parse_creation(mutation)?;
+    let operation_id = Uuid::from_bytes(*mutation.idempotency_key().as_bytes());
     let rows = sqlx::query("SELECT transition_id,conversation_id,entry_seq,accepted_at FROM chat.transitions WHERE transition_id=$1 FOR SHARE").bind(transition_id).fetch_optional(&mut **transaction).await?.ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
     let conversation_id: Uuid = rows.try_get("conversation_id")?;
     let entry = sqlx::query(
@@ -575,7 +577,7 @@ async fn lock_creation_replay_post_state(
     .bind(transition_id)
     .fetch_one(&mut **transaction)
     .await?;
-    let idempotency = sqlx::query("SELECT completed_status,response_bytes,response_sha256 FROM chat.idempotency_records WHERE principal_did=$1 AND endpoint_nsid=$2 AND operation_id=$3 FOR SHARE").bind(authority.subject().as_str()).bind(ENDPOINT).bind(transition_id).fetch_one(&mut **transaction).await?;
+    let idempotency = sqlx::query("SELECT completed_status,response_bytes,response_sha256 FROM chat.idempotency_records WHERE principal_did=$1 AND endpoint_nsid=$2 AND operation_id=$3 FOR SHARE").bind(authority.subject().as_str()).bind(ENDPOINT).bind(operation_id).fetch_one(&mut **transaction).await?;
     let bytes: Vec<u8> = idempotency.try_get("response_bytes")?;
     let response = CreationCanonicalResponse::new(bytes)?;
     let post_state_digest = Sha256::digest(
@@ -603,7 +605,7 @@ async fn lock_creation_replay_post_state(
         .await?;
     let mut proof = CreationReplayPostStateProof {
         transaction_id: transaction_id.into_boxed_str(),
-        operation_id: transition_id,
+        operation_id,
         principal_did: authority.subject().as_str().to_owned().into_boxed_str(),
         endpoint_nsid: ENDPOINT.into(),
         mutation_kind: mutation.kind(),
@@ -734,6 +736,7 @@ mod tests {
         };
         let cid = Uuid::new_v4();
         let transition_id = Uuid::new_v4();
+        let idempotency_key = Uuid::new_v4();
         let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let group_id = [0x42u8; 32];
@@ -751,7 +754,7 @@ mod tests {
             "actorDid": &actor.did,
             "actorDeviceId": actor.device_id.hyphenated().to_string(),
             "authGeneration": 1,
-            "idempotencyKey": transition_id.hyphenated().to_string(),
+            "idempotencyKey": idempotency_key.hyphenated().to_string(),
             "keyId": &actor.key_id,
             "signedAt": &signed_at,
             "manifest": {
