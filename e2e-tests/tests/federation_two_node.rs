@@ -3,6 +3,7 @@
 //!
 //! Run with: `cargo test --test federation_two_node -- --ignored --nocapture`
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -907,6 +908,35 @@ async fn wait_for_signed_receipt(
     anyhow::bail!("timed out waiting for signed {endpoint} receipt")
 }
 
+/// Waits until the full semantic digest allowlist stops changing for longer than the
+/// five-second federation worker interval, then returns that quiesced digest snapshot.
+async fn wait_for_semantic_quiescence(
+    cluster: &TwoNodeCluster,
+    pg: &tokio_postgres::Client,
+) -> Result<BTreeMap<String, String>> {
+    const QUIET_PERIOD: Duration = Duration::from_secs(6);
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    let started = std::time::Instant::now();
+    let mut last_change = started;
+    let mut digests = cluster.table_digests(pg, DIGEST_ALLOWED_TABLES).await?;
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let current = cluster.table_digests(pg, DIGEST_ALLOWED_TABLES).await?;
+        if current != digests {
+            digests = current;
+            last_change = std::time::Instant::now();
+        }
+        if last_change.elapsed() >= QUIET_PERIOD {
+            return Ok(digests);
+        }
+        if started.elapsed() >= TIMEOUT {
+            anyhow::bail!("timed out waiting for federation semantic writes to quiesce");
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_federation_two_node_complete_lifecycle() {
@@ -1237,10 +1267,9 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     assert_eq!(outcome1.head_seq, 3);
     assert_eq!(outcome1.sequencer_term, 0);
 
-    // Capture DS2 table digests right after Applied
-    let ds2_digests_first = cluster
-        .table_digests(&ds2_pg, DIGEST_ALLOWED_TABLES)
-        .await?;
+    // Applied may schedule transport work on the five-second federation worker.
+    // Settle it before establishing the exact-replay baseline.
+    let ds2_digests_first = wait_for_semantic_quiescence(cluster, &ds2_pg).await?;
 
     // Step 10: Replay selector on DS2 (Second Invocation -> ExactReplay with zero semantic writes)
     tracing::info!("Step 10: Replaying selector fixture on DS2 (second invocation)...");
@@ -1254,9 +1283,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
     assert_eq!(outcome2.digest_sha256, outcome1.digest_sha256);
     assert_eq!(outcome2.sequencer_term, outcome1.sequencer_term);
 
-    let ds2_digests_replay = cluster
-        .table_digests(&ds2_pg, DIGEST_ALLOWED_TABLES)
-        .await?;
+    let ds2_digests_replay = wait_for_semantic_quiescence(cluster, &ds2_pg).await?;
     assert_eq!(
         ds2_digests_first, ds2_digests_replay,
         "DS2 semantic table content must be unchanged on exact replay"
