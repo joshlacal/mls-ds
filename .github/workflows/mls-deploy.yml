@@ -275,7 +275,7 @@ jobs:
 
       - name: Create legacy migration identities
         env:
-          MAINTENANCE_DATABASE_URL: postgresql://127.0.0.1:5432/postgres
+          MAINTENANCE_DATABASE_URL: postgresql://anonymous@127.0.0.1:5432/postgres
         run: |
           psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE ROLE catbird NOLOGIN"
           psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE DATABASE catbird OWNER anonymous"
