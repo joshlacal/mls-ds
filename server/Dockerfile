@@ -16,7 +16,7 @@ RUN mkdir -p server/src codegen/src \
     && echo "fn main() {}" > server/src/main.rs \
     && echo "" > server/src/lib.rs \
     && echo "fn main() {}" > codegen/src/main.rs \
-    && (cargo build --release -p catbird-server 2>/dev/null || true) \
+    && (cargo build --locked --release -p catbird-server 2>/dev/null || true) \
     && cargo clean --release -p catbird-server \
     && rm -rf server/src codegen/src
 
@@ -24,12 +24,12 @@ RUN mkdir -p server/src codegen/src \
 COPY server server
 COPY codegen codegen
 COPY lexicon lexicon
-RUN cargo build --release -p catbird-server
+RUN cargo build --locked --release -p catbird-server
 
 # ---------- federation-builder (test-only builder) ----------
 FROM builder AS federation-builder
 
-RUN cargo build --release -p catbird-server --features test-support --bin federation_fixture --bin catbird-server
+RUN cargo build --locked --release -p catbird-server --features test-support --bin federation_fixture --bin catbird-server
 
 # ---------- runtime-base ----------
 FROM debian:bookworm-slim AS runtime-base
