@@ -27,6 +27,10 @@ const SERVICE_AUTH_FUTURE_IAT_LEEWAY_SECONDS: i64 = 60;
 use crate::identity::{canonical_did, did_web_document_url};
 use crate::util::outbound_body::{decode_json_bounded, ResponseBodyBudget, DID_DOCUMENT_MAX_BYTES};
 
+fn audience_matches_expected(claimed: &str, expected: &str) -> bool {
+    claimed == expected || (expected.contains('#') && claimed == canonical_did(expected))
+}
+
 // ADR-016 remains endpoint-opt-in during observe/enroll rollout. Keeping the
 // foundation under auth prevents it from becoming implicit transition policy.
 #[path = "auth_device.rs"]
@@ -479,7 +483,7 @@ impl AuthMiddleware {
 
         // Audience enforcement
         if let Some(expected) = expected_aud {
-            if claims.aud != expected {
+            if !audience_matches_expected(&claims.aud, expected) {
                 tracing::warn!("JWT audience mismatch with expected audience {expected}");
                 return Err(AuthError::InvalidToken(
                     format!("aud does not match {expected}").into(),
@@ -1359,7 +1363,7 @@ fn validate_mls_service_claims<'a>(
     endpoint_nsid: &str,
     now: i64,
 ) -> Result<(&'a str, i64), AuthError> {
-    if claims.aud != MLS_APPVIEW_SERVICE_REF {
+    if !audience_matches_expected(&claims.aud, MLS_APPVIEW_SERVICE_REF) {
         return Err(AuthError::InvalidToken(
             "aud does not match the MLS AppView service reference".into(),
         ));
@@ -2398,8 +2402,15 @@ mod tests {
             ("did:plc:alice", now)
         );
 
+        let mut legacy_bare_aud = valid.clone();
+        legacy_bare_aud.aud = "did:web:chat.catbird.blue".into();
+        assert_eq!(
+            validate_mls_service_claims(&legacy_bare_aud, endpoint, now).unwrap(),
+            ("did:plc:alice", now)
+        );
+
         let mut wrong_aud = valid.clone();
-        wrong_aud.aud = "did:web:chat.catbird.blue".into();
+        wrong_aud.aud = "did:web:other.example#atproto_mls".into();
         assert!(matches!(
             validate_mls_service_claims(&wrong_aud, endpoint, now),
             Err(AuthError::InvalidToken(_))
