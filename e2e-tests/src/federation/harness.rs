@@ -388,13 +388,19 @@ impl TwoNodeCluster {
         Ok(())
     }
 
-    /// Calculate deterministic content digest for a table using closed allowlist.
+    /// Calculate a deterministic semantic-content digest for an allowlisted table.
     pub async fn table_digest(&self, pg: &tokio_postgres::Client, table: &str) -> Result<String> {
         if !DIGEST_ALLOWED_TABLES.contains(&table) {
             anyhow::bail!("table '{table}' is not in DIGEST_ALLOWED_TABLES allowlist");
         }
+        // Reconciliation heartbeats update these rows independently of prefix application.
+        let row_json = if table == "federation_sync_state" {
+            "to_jsonb(row_data) - 'last_reconciled_at' - 'updated_at'"
+        } else {
+            "to_jsonb(row_data)"
+        };
         let query = format!(
-            "SELECT encode(digest(COALESCE(jsonb_agg(to_jsonb(row_data) ORDER BY to_jsonb(row_data)::text)::text, '[]'), 'sha256'), 'hex') FROM (SELECT * FROM {table}) AS row_data"
+            "SELECT encode(digest(COALESCE(jsonb_agg({row_json} ORDER BY ({row_json})::text)::text, '[]'), 'sha256'), 'hex') FROM {table} AS row_data"
         );
         let row = pg
             .query_one(&query, &[])

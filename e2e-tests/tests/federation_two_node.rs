@@ -1259,7 +1259,7 @@ async fn run_live_scenario(cluster: &TwoNodeCluster) -> Result<()> {
         .await?;
     assert_eq!(
         ds2_digests_first, ds2_digests_replay,
-        "DS2 table content digests must be completely unchanged on exact replay"
+        "DS2 semantic table content must be unchanged on exact replay"
     );
     let _welcome_receipt_at = wait_for_signed_receipt(
         &cluster,
