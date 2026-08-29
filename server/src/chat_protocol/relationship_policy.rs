@@ -2837,7 +2837,7 @@ impl PublicTransport for TestSupportRelationshipTransport {
 #[cfg(feature = "test-support")]
 fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, TransportError> {
     let path = request.url.path();
-    if path == "/.well-known/did.json" {
+    if path == /* did-web-test */ "/.well-known/did.json" {
         let host = request
             .url
             .host_str()

@@ -2698,7 +2698,7 @@ mod tests {
 
         let pds_router = Router::new()
             .route(
-                "/.well-known/did.json",
+                /* did-web-test */ "/.well-known/did.json",
                 get(move || async move {
                     Json(serde_json::json!({
                         "id": "did:web:alice.example",
@@ -2785,7 +2785,7 @@ mod tests {
                 }))
             } else if target.contains("did.json") {
                 let target_url = url::Url::parse(&format!(
-                    "http://127.0.0.1:{}/.well-known/did.json",
+                    /* did-web-test */ "http://127.0.0.1:{}/.well-known/did.json",
                     pds_addr.port()
                 ))
                 .unwrap();

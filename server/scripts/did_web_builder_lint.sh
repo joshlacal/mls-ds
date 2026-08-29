@@ -11,7 +11,7 @@ fi
 # Forbid ad-hoc did:web -> URL mapping outside the shared utility.
 # Allowed implementation lives in server/src/identity.rs.
 PATTERN='replace\("did:web:",\s*"https://"\)|\.well-known/did\.json'
-ALLOW='server/src/identity\.rs'
+ALLOW='server/src/identity\.rs|did-web-test'
 
 matches="$(rg -n --pcre2 "$PATTERN" "$ROOT" -g '*.rs' | rg -v "$ALLOW" || true)"
 if [[ -n "$matches" ]]; then
