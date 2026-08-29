@@ -277,8 +277,9 @@ jobs:
         env:
           MAINTENANCE_DATABASE_URL: postgresql://anonymous@127.0.0.1:5432/postgres
         run: |
+          psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE ROLE runner LOGIN CREATEDB"
           psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE ROLE catbird NOLOGIN"
-          psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE DATABASE catbird OWNER anonymous"
+          psql "$MAINTENANCE_DATABASE_URL" --set ON_ERROR_STOP=on --command "CREATE DATABASE catbird OWNER runner"
 
       - name: Install sqlx-cli
         run: |

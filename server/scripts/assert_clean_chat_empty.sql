@@ -8,8 +8,8 @@
 -- rollback. It performs NO writes (no INSERT, UPDATE, DELETE, TRUNCATE, DDL).
 --
 -- Sealed _sqlx_migrations modes:
---   1. Pre-cutover: 74 migrations through 20260821000001 (52 chat tables)
---   2. Post-c855:   82 migrations through 20260828000003 (53 chat tables)
+--   1. Pre-cutover: 75 migrations through 20260824000001 (52 chat tables)
+--   2. Post-c855:   84 migrations through 20260828000005 (53 chat tables)
 --
 -- Requirements:
 --   - Exactly one sealed migration catalog matches with dirty=false.
@@ -120,15 +120,17 @@ DECLARE
         20260816000001::BIGINT,
         20260820000001::BIGINT,
         20260820000002::BIGINT,
-        20260821000001::BIGINT, -- 74: pre-cutover cutoff
-        20260824000001::BIGINT, -- 75: post-c855 cutoff start
+        20260821000001::BIGINT,
+        20260824000001::BIGINT, -- 75: pre-cutover cutoff
         20260824000002::BIGINT,
         20260824000003::BIGINT,
         20260824000004::BIGINT,
         20260824000005::BIGINT,
         20260828000001::BIGINT,
         20260828000002::BIGINT,
-        20260828000003::BIGINT
+        20260828000003::BIGINT,
+        20260828000004::BIGINT,
+        20260828000005::BIGINT
     ];
 
     v_expected_descriptions TEXT[] := ARRAY[
@@ -205,15 +207,17 @@ DECLARE
         'enable send message operation claims',
         'chat service auth admissions',
         'chat nullable legacy dpop jkt',
-        'fix expired inventory session gc', -- 74: pre-cutover cutoff
-        'chat performance indices',
+        'fix expired inventory session gc',
+        'chat performance indices', -- 75: pre-cutover cutoff
         'chat actor ds mapping',
         'chat federation routing',
         'chat federation delivery receipts',
         'chat federation outbox retry',
         'chat historical bootstrap quota',
         'chat historical bootstrap application',
-        'chat historical bootstrap cutoff validate'
+        'chat historical bootstrap cutoff validate',
+        'chat device push tokens',
+        'fix inventory session gc scoping'
     ];
     v_expected_checksums TEXT[] := ARRAY[
         'c576503a14746c83ea90b19d3e370012efe9a244830cbe9188be669fe8cfefb321f6a771d880f8cc205761b671079bfe',
@@ -272,7 +276,7 @@ DECLARE
         'db4df9d83f7030f5d9b4617a28d7d1130fb93acc8fc99a317e03ed2854aba2991dc262de3b21bf91b17680239b0c80ce',
         '97c6abc525bc50bab175130625551db85574d977e5d96b074554724fcd0cb1d7a620f31cf17cb6b765752193daaf3a66',
         'e178cc268e01aa4687b7b619d075368de481b55f437f1411713298efde61ce0669b45b70ae9a720425484689c0d1983b',
-        '20ac0db9cd73859486bc4b08a8bd4d211def74a2ce203bfcc5608e4b6106e3540ea41be2bc3b141e5e8a734d4a2b8b93',
+        'dd48feea7beafae59fbc11516e8c1ae91382b356b80366056f71d2493c10923bd39ff0739fe08cb4b0452b0ec82132ff',
         '86952763aaeb8f4cf8a8a18dd5d022a5357d450193e265a18da5a771513b9d4c7c8408bad27c4f4ba3b712b41b80e504',
         '310101886f60d3a663ee5df829bbc86a96a45e23adee754220d3b06fd74acfd708d23a138124872a5177244d3e14e8eb',
         '3f3d1660193bc37aa8c9876e636a4918f59404f0e055f509b9a67158b6028d947adc299c4d776a693bf8b75e647d90a8',
@@ -289,15 +293,17 @@ DECLARE
         'ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e',
         '2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac',
         'd1914c731e0fbf81f5b0a9bf9cd77c12f2943fd940c36b9a351b1156b5ca09b55f2b4b44c6810012b4377f6ac283955d',
-        'cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2', -- 74: pre-cutover cutoff
-        'e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0',
+        '42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a',
+        'e5f3f169724d2afc84043d80057bf9e494fbc9ad617ced0feaebb469d1be68788e7c19e19a67fb36296b85ee803139e0', -- 75: pre-cutover cutoff
         '57b80b7f4e753c12bd97553fc8308b4eb04f9f2e39809cc32ed2b65337319721d73c31d9acf33b3c8c64c8f516d60c31',
         '0a70985a3b5811483791911b6ae3b9d0ebd0fbcd9fc53363e65c59ca1c71a1cbd2a74fc02e87ba22dd0321c7f30713e6',
         '37ce660ad4630345dfdb0c106631b8926b2d2dfed0780210c072825e3a93f6455ba16a017ffdaaba243afe4c83f5f222',
         '6d20fd054646d7da6de338b9ae27fea7c81a19569dfebc6231de5bc23bc79ca9aa22ab790cead55d82b06846f81dd799',
         'c063fd2991cb28ce6947c587f11e2316bb5e02587873d86e89ff74476f880796c63ca1a90064f70c10fe7ed7cc0eb293',
         '7095f7c32b74c6660fcf8c03610ee88c8db5330639088a907fc996a20d7f47f948ca43ff64cef014a1107bf9626c0013',
-        '4e2387ebf31369278e1504a8e00e548a0fd80eafc2adb5a461c01ceab30be2bd84e841eba12a366f51f5a1b1617a3917'
+        '4e2387ebf31369278e1504a8e00e548a0fd80eafc2adb5a461c01ceab30be2bd84e841eba12a366f51f5a1b1617a3917',
+        'f8f4da493f6a3bf6261d2e09d6706ec6b4a395511a1eed6c5a557b5bb119b6f04aeabd9d3514db984e5e695894fe2fb1',
+        'cae43253509fd13c468a741f360d1371e0d9a099a67ed951c683b23fb98960861e2d00ed3522d341ff026801f86059a2'
     ];
     -- Base semantic tables (49 tables present in both modes)
     v_base_semantic_tables TEXT[] := ARRAY[
@@ -393,12 +399,12 @@ BEGIN
     SELECT COUNT(*), MAX(version) INTO v_mig_count, v_max_version
     FROM public._sqlx_migrations;
 
-    IF v_mig_count = 74 AND v_max_version = 20260821000001 THEN
+    IF v_mig_count = 75 AND v_max_version = 20260824000001 THEN
         v_mode := 'pre-cutover';
-    ELSIF v_mig_count = 82 AND v_max_version = 20260828000003 THEN
+    ELSIF v_mig_count = 84 AND v_max_version = 20260828000005 THEN
         v_mode := 'post-c855';
     ELSE
-        RAISE EXCEPTION 'preflight failed: unrecognized _sqlx_migrations catalog (count=%, max_version=%; expected count=74 max=20260821000001 or count=82 max=20260828000003)',
+        RAISE EXCEPTION 'preflight failed: unrecognized _sqlx_migrations catalog (count=%, max_version=%; expected count=75 max=20260824000001 or count=84 max=20260828000005)',
             v_mig_count, v_max_version;
     END IF;
 
