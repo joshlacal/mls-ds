@@ -18,7 +18,8 @@ use super::super::{
         CurrentConversationRelationshipWitness, OrdinaryReadEndpoint, ReadAuthorityError,
     },
     read_projection::{
-        conversation_coordinates_dto, conversation_state_view, CheckedConversationCoordinates,
+        conversation_coordinates_dto, conversation_state_view,
+        encode_canonical_generated_chat_json_v1, CheckedConversationCoordinates,
     },
 };
 
@@ -70,14 +71,25 @@ pub(crate) async fn read_conversation_state_for_admission(
     let result =
         read_conversation_state_in_transaction(&mut transaction, attempt, conversation_id).await;
     let _ = transaction.rollback().await;
-    result
+    let output = result?;
+    Ok(CanonicalConversationStateResponse {
+        bytes: canonical_conversation_state_response(
+            &output.state,
+            &output.pending_leave_requests,
+            &output.pending_reset_requests,
+        )?,
+    })
 }
 
 async fn read_conversation_state_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
     conversation_id: Uuid,
-) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
+) -> Result<
+    catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
+        GetConversationStateOutput,
+    ConversationStateReadError,
+>{
     let device = lock_read_device_authority_once(transaction, attempt)
         .await
         .map_err(map_authority_error)?;
@@ -100,16 +112,58 @@ async fn read_conversation_state_in_transaction(
             (Vec::new(), Vec::new())
         };
 
-    let output = catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
-        GetConversationStateOutput {
-            pending_leave_requests,
-            pending_reset_requests,
-            state,
-            extra_data: None,
-        };
-    Ok(CanonicalConversationStateResponse {
-        bytes: serde_json::to_vec(&output).map_err(|_| ConversationStateReadError::Invariant)?,
-    })
+    Ok(
+        catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
+            GetConversationStateOutput {
+                pending_leave_requests,
+                pending_reset_requests,
+                state,
+                extra_data: None,
+            },
+    )
+}
+
+fn append_canonical_array<T: serde::Serialize>(
+    bytes: &mut Vec<u8>,
+    values: &[T],
+    definition_id: &'static str,
+) -> Result<(), ConversationStateReadError> {
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            bytes.push(b',');
+        }
+        let canonical = encode_canonical_generated_chat_json_v1(value, definition_id)
+            .map_err(|_| ConversationStateReadError::Invariant)?;
+        bytes.extend_from_slice(canonical.bytes());
+    }
+    Ok(())
+}
+
+fn canonical_conversation_state_response(
+    state: &catbird_atproto::generated::blue_catbird::chat::ConversationState,
+    pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
+    pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
+) -> Result<Vec<u8>, ConversationStateReadError> {
+    let canonical_state =
+        encode_canonical_generated_chat_json_v1(state, "blue.catbird.chat.defs#conversationState")
+            .map_err(|_| ConversationStateReadError::Invariant)?;
+    let mut bytes = Vec::with_capacity(canonical_state.bytes().len() + 64);
+    bytes.extend_from_slice(br#"{"pendingLeaveRequests":["#);
+    append_canonical_array(
+        &mut bytes,
+        pending_leave_requests,
+        "blue.catbird.chat.defs#leaveRequestView",
+    )?;
+    bytes.extend_from_slice(br#"],"pendingResetRequests":["#);
+    append_canonical_array(
+        &mut bytes,
+        pending_reset_requests,
+        "blue.catbird.chat.defs#resetRequestView",
+    )?;
+    bytes.extend_from_slice(br#"],"state":"#);
+    bytes.extend_from_slice(canonical_state.bytes());
+    bytes.push(b'}');
+    Ok(bytes)
 }
 
 /// Pending leave/reset requests are established-member material: only a
@@ -371,5 +425,98 @@ mod tests {
 
         assert!(leaves.is_empty());
         assert!(resets.is_empty());
+    }
+
+    #[test]
+    fn conversation_state_response_uses_lexicon_bytes_objects() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        ))
+        .expect("parse fixture");
+        let state: catbird_atproto::generated::blue_catbird::chat::ConversationState<
+            jacquard_common::DefaultStr,
+        > = serde_json::from_value(fixture["vectors"][0]["value"].clone())
+            .expect("decode fixture state");
+        let conversation_id = Uuid::new_v4();
+        let pending_leave_requests = (0..2)
+            .map(|_| {
+                leave_view(
+                    PendingLeaveRow {
+                        leave_request_id: Uuid::new_v4(),
+                        requester_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        requester_device_id: Uuid::new_v4(),
+                        prior_generation: 0,
+                        prior_state_version: 1,
+                        prior_group_id: vec![1; 32],
+                        prior_epoch: 0,
+                        prior_group_context_hash: vec![2; 32],
+                        prior_confirmation_tag: vec![3; 32],
+                        received_at: Utc::now(),
+                        expires_at: Utc::now(),
+                    },
+                    conversation_id,
+                )
+                .expect("build leave view")
+            })
+            .collect::<Vec<_>>();
+        let pending_reset_requests = (0..2)
+            .map(|_| {
+                reset_view(
+                    PendingResetRow {
+                        reset_request_id: Uuid::new_v4(),
+                        requester_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                        requester_device_id: Uuid::new_v4(),
+                        prior_generation: 0,
+                        prior_state_version: 1,
+                        prior_group_id: vec![1; 32],
+                        prior_epoch: 0,
+                        prior_group_context_hash: vec![2; 32],
+                        prior_confirmation_tag: vec![3; 32],
+                        reason: "manualRecovery".to_owned(),
+                        received_at: Utc::now(),
+                        expires_at: Utc::now(),
+                    },
+                    conversation_id,
+                )
+                .expect("build reset view")
+            })
+            .collect::<Vec<_>>();
+        let response: serde_json::Value = serde_json::from_slice(
+            &canonical_conversation_state_response(
+                &state,
+                &pending_leave_requests,
+                &pending_reset_requests,
+            )
+            .expect("encode canonical response"),
+        )
+        .expect("decode response");
+
+        for path in [
+            "/state/metadataSnapshot/coordinate/conversationId/$bytes",
+            "/pendingLeaveRequests/0/prior/groupId/$bytes",
+            "/pendingResetRequests/0/prior/confirmationTag/$bytes",
+        ] {
+            assert!(
+                response
+                    .pointer(path)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "{path} must use the ATProto $bytes wire object"
+            );
+        }
+        assert_eq!(
+            response["pendingLeaveRequests"]
+                .as_array()
+                .expect("leave request array")
+                .len(),
+            2
+        );
+        assert_eq!(
+            response["pendingResetRequests"]
+                .as_array()
+                .expect("reset request array")
+                .len(),
+            2
+        );
     }
 }
