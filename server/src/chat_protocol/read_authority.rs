@@ -38,12 +38,12 @@
 // matrix over the hydrated conversation aggregate:
 //
 // - a current exact open leaf authorizes state and entries;
-// - an eligible active zero-leaf participant or group-pending participant
-//   authorizes current state only;
-// - direct-pending remains `NotEntitled`;
+// - an eligible active zero-leaf participant or pending participant authorizes
+//   current state only; direct-pending stays absent from enumerable inventory;
 // - a finite reset/remove interval for the requesting exact device takes
 //   precedence over same-DID current participation unless the same exact
-//   device has a later valid open interval (BREAD-05);
+//   device has a later valid open interval or the DID was re-invited later as
+//   a pending participant (BREAD-05);
 // - a known former, post-reset-old, or exact terminal-proof holder receives
 //   `AccessOutsideMembershipInterval`;
 // - an unrelated requester for an active or terminal conversation receives
@@ -561,7 +561,18 @@ fn exact_device_interval_facts<'a>(
 enum ClassifiedRelationshipArm {
     OpenLeaf { open_membership_interval_id: Uuid },
     ActiveParticipant,
-    GroupPendingParticipant,
+    PendingParticipant,
+}
+
+/// BREAD-05 precedence: an exact-device finite reset/remove interval keeps
+/// denying current state unless the DID was re-invited STRICTLY after the
+/// interval closed. An invitation at or before the close belongs to the
+/// consent period that interval already ended.
+pub(in crate::chat_protocol) fn finite_interval_takes_precedence(
+    interval_end_seq: u64,
+    pending_invitation_seq: Option<u64>,
+) -> bool {
+    pending_invitation_seq.is_none_or(|invitation_seq| invitation_seq <= interval_end_seq)
 }
 
 /// The exact readiness-amendment classification matrix, over the hydrated
@@ -574,14 +585,18 @@ enum ClassifiedRelationshipArm {
 /// `AccessOutsideMembershipInterval`.
 ///
 /// BREAD-05: the requesting exact device's finite reset/remove interval is
-/// classified BEFORE the DID-only zero-leaf participant arm, so a post-reset
-/// old exact device never inherits the DID's current participation.
+/// classified BEFORE DID-only active participation. A later pending invitation
+/// is a new consent period and may point-read state, but still cannot read
+/// entries or appear in direct-conversation inventory.
 fn classify_current_relationship(
     user_did: &str,
     device_id: Uuid,
     state: &ConversationState,
 ) -> Result<ClassifiedRelationshipArm, ReadAuthorityError> {
     let facts = exact_device_interval_facts(user_did, device_id, state)?;
+    let principal = PrincipalId::new(user_did.as_bytes().to_vec())
+        .map_err(|_| ReadAuthorityError::Invariant)?;
+    let participant = state.participant(&principal);
 
     if let Some(open_interval) = facts.open {
         // A later valid open interval for the exact device restores current
@@ -591,19 +606,22 @@ fn classify_current_relationship(
             open_membership_interval_id: interval_id(open_interval),
         });
     }
-    if facts.latest_finite.is_some() {
-        // Known former or post-reset-old exact device: the finite interval
-        // takes precedence over same-DID current participation, and there is
-        // no later open interval for this exact device.
-        return Err(ReadAuthorityError::AccessOutsideMembershipInterval);
+    if let Some(latest_finite) = facts.latest_finite {
+        let interval_end_seq = latest_finite
+            .end()
+            .ok_or(ReadAuthorityError::Invariant)?
+            .seq();
+        let pending_invitation_seq = participant
+            .filter(|participant| participant.is_pending())
+            .and_then(|participant| participant.invitation_transition_seq());
+        if finite_interval_takes_precedence(interval_end_seq, pending_invitation_seq) {
+            return Err(ReadAuthorityError::AccessOutsideMembershipInterval);
+        }
     }
 
-    // No exact-device interval at all. A participant relationship is required
-    // for state; an unrelated requester for an active or terminal conversation
-    // receives NotEntitled (BREAD-04).
-    let principal = PrincipalId::new(user_did.as_bytes().to_vec())
-        .map_err(|_| ReadAuthorityError::Invariant)?;
-    let participant = state.participant(&principal);
+    // A participant relationship is required for state; an unrelated
+    // requester for an active or terminal conversation receives NotEntitled
+    // (BREAD-04).
     let Some(participant) = participant else {
         if facts.terminal_proof_holder {
             return Err(ReadAuthorityError::AccessOutsideMembershipInterval);
@@ -622,18 +640,13 @@ fn classify_current_relationship(
         return Err(ReadAuthorityError::NotEntitled);
     }
 
-    match (
-        participant.is_active(),
-        participant.is_pending(),
-        state.kind(),
-    ) {
-        (true, _, _) => Ok(ClassifiedRelationshipArm::ActiveParticipant),
-        (_, true, ConversationKind::Group) => {
-            Ok(ClassifiedRelationshipArm::GroupPendingParticipant)
-        }
-        (_, true, ConversationKind::Direct) => Err(ReadAuthorityError::NotEntitled),
-        _ => Err(ReadAuthorityError::NotEntitled),
+    if participant.is_active() {
+        return Ok(ClassifiedRelationshipArm::ActiveParticipant);
     }
+    if participant.is_pending() {
+        return Ok(ClassifiedRelationshipArm::PendingParticipant);
+    }
+    Err(ReadAuthorityError::NotEntitled)
 }
 
 /// `AccessInterval` exposes its opening transition id as bytes; the schema
@@ -656,7 +669,7 @@ pub(crate) enum CurrentConversationRelationshipWitness {
     CurrentActiveParticipant {
         participant_period_id: Uuid,
     },
-    CurrentGroupPendingParticipant {
+    CurrentPendingParticipant {
         participant_period_id: Uuid,
     },
 }
@@ -671,7 +684,7 @@ impl CurrentConversationRelationshipWitness {
             | Self::CurrentActiveParticipant {
                 participant_period_id,
             }
-            | Self::CurrentGroupPendingParticipant {
+            | Self::CurrentPendingParticipant {
                 participant_period_id,
             } => *participant_period_id,
         }
@@ -868,8 +881,8 @@ pub(crate) async fn authorize_conversation_state(
                 participant_period_id,
             }
         }
-        ClassifiedRelationshipArm::GroupPendingParticipant => {
-            CurrentConversationRelationshipWitness::CurrentGroupPendingParticipant {
+        ClassifiedRelationshipArm::PendingParticipant => {
+            CurrentConversationRelationshipWitness::CurrentPendingParticipant {
                 participant_period_id,
             }
         }
@@ -1329,8 +1342,8 @@ async fn load_control_recipient_fence(
 /// Authorize exact application entries and the control-recipient fence for
 /// one locked read device. Succeeds only for a `CurrentOpenLeaf` relationship;
 /// a former-only, terminal-only, or post-reset-old device returns
-/// `AccessOutsideMembershipInterval`, and a state-only witness (zero-leaf
-/// participant, group-pending) returns `NotEntitled`.
+/// `AccessOutsideMembershipInterval`, and a state-only witness (zero-leaf or
+/// pending participant) returns `NotEntitled`.
 pub(crate) async fn authorize_entries(
     tx: &mut Transaction<'_, Postgres>,
     device: LockedReadDeviceAuthority,

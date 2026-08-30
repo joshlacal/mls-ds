@@ -15,7 +15,7 @@ use super::super::{
     dpop::VerifiedReadAdmission,
     read_authority::{
         authorize_conversation_state, into_single_read_admission, lock_read_device_authority_once,
-        OrdinaryReadEndpoint, ReadAuthorityError,
+        CurrentConversationRelationshipWitness, OrdinaryReadEndpoint, ReadAuthorityError,
     },
     read_projection::{
         conversation_coordinates_dto, conversation_state_view, CheckedConversationCoordinates,
@@ -81,9 +81,10 @@ async fn read_conversation_state_in_transaction(
     let device = lock_read_device_authority_once(transaction, attempt)
         .await
         .map_err(map_authority_error)?;
-    // This call holds the locked conversation head and the exact requester
-    // proof through all source and pending-request reads below.
-    authorize_conversation_state(transaction, device, conversation_id)
+    // Keep the checked relationship witness through projection: a pending
+    // invitee receives the conversation state it must sign acceptance over,
+    // but never the established members' pending control-plane requests.
+    let authority = authorize_conversation_state(transaction, device, conversation_id)
         .await
         .map_err(map_authority_error)?;
 
@@ -93,7 +94,11 @@ async fn read_conversation_state_in_transaction(
     let state =
         conversation_state_view(&source).map_err(|_| ConversationStateReadError::Invariant)?;
     let (pending_leave_requests, pending_reset_requests) =
-        load_pending_requests(transaction, conversation_id).await?;
+        if includes_pending_requests(authority.relationship()) {
+            load_pending_requests(transaction, conversation_id).await?
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     let output = catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
         GetConversationStateOutput {
@@ -105,6 +110,18 @@ async fn read_conversation_state_in_transaction(
     Ok(CanonicalConversationStateResponse {
         bytes: serde_json::to_vec(&output).map_err(|_| ConversationStateReadError::Invariant)?,
     })
+}
+
+/// Pending leave/reset requests are established-member material: only a
+/// current open leaf or an active participant receives them. A pending invitee
+/// receives the state alone, and any future witness arm must opt in here
+/// explicitly rather than inherit the requests by default.
+fn includes_pending_requests(relationship: &CurrentConversationRelationshipWitness) -> bool {
+    matches!(
+        relationship,
+        CurrentConversationRelationshipWitness::CurrentOpenLeaf { .. }
+            | CurrentConversationRelationshipWitness::CurrentActiveParticipant { .. }
+    )
 }
 
 fn map_authority_error(error: ReadAuthorityError) -> ConversationStateReadError {
@@ -324,6 +341,24 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn pending_participant_cannot_read_pending_control_requests() {
+        let relationship = CurrentConversationRelationshipWitness::CurrentPendingParticipant {
+            participant_period_id: Uuid::new_v4(),
+        };
+
+        assert!(!includes_pending_requests(&relationship));
+    }
+
+    #[test]
+    fn established_member_can_read_pending_control_requests() {
+        let relationship = CurrentConversationRelationshipWitness::CurrentActiveParticipant {
+            participant_period_id: Uuid::new_v4(),
+        };
+
+        assert!(includes_pending_requests(&relationship));
+    }
 
     #[tokio::test]
     async fn pending_request_queries_accept_empty_catalog() {

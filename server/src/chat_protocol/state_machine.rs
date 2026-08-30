@@ -343,6 +343,14 @@ impl ParticipantRecord {
         self.status == ParticipantStatus::Active
     }
 
+    /// The sealed invitation transition's sequence: the ordinal that orders an
+    /// invitation consent period against an access-interval close.
+    pub(crate) fn invitation_transition_seq(&self) -> Option<u64> {
+        self.invitation
+            .as_ref()
+            .map(|invitation| invitation.transition.seq())
+    }
+
     /// Retained invitation consent source used by the transaction-bound
     /// acceptance relationship scope. Callers cannot substitute an inviter.
     pub(crate) fn invitation_inviter(&self) -> Option<&DeviceIdentity> {

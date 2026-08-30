@@ -637,6 +637,19 @@ mod chat_protocol {
         use sqlx::{PgPool, Postgres, Transaction};
         use uuid::Uuid;
 
+        /// The BREAD-05 precedence predicate, handed to the crate root: the
+        /// gate pins the invitation/interval sequence boundary directly rather
+        /// than seeding one graph per sequence relationship.
+        pub fn finite_interval_takes_precedence(
+            interval_end_seq: u64,
+            pending_invitation_seq: Option<u64>,
+        ) -> bool {
+            super::read_authority::finite_interval_takes_precedence(
+                interval_end_seq,
+                pending_invitation_seq,
+            )
+        }
+
         /// Mint the ordinary budget and spend its single attempt, dropping it
         /// unspent on purpose: this probes the endpoint gate, which runs
         /// before any SQL.
@@ -1066,7 +1079,7 @@ mod chat_protocol {
         pub(crate) enum RelationshipArmView {
             OpenLeaf,
             ActiveParticipant,
-            GroupPendingParticipant,
+            PendingParticipant,
         }
 
         #[derive(Debug, Clone)]
@@ -1190,10 +1203,10 @@ mod chat_protocol {
                     leaf_period_id: None,
                     open_membership_interval_id: None,
                 },
-                CurrentConversationRelationshipWitness::CurrentGroupPendingParticipant {
+                CurrentConversationRelationshipWitness::CurrentPendingParticipant {
                     participant_period_id,
                 } => RelationshipWitnessView {
-                    arm: RelationshipArmView::GroupPendingParticipant,
+                    arm: RelationshipArmView::PendingParticipant,
                     participant_period_id: *participant_period_id,
                     leaf_period_id: None,
                     open_membership_interval_id: None,
@@ -6341,9 +6354,19 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
     assert_executor_db_absent(&maintenance_url, &db_name).await;
 }
 
+#[test]
+fn only_a_later_pending_invitation_bypasses_a_finite_interval() {
+    // The interval closed at seq 6: no re-invitation and a same-seq
+    // re-invitation leave it in force, and only a strictly later invitation
+    // reopens consent.
+    assert!(chat_protocol::read_authority_bridge::finite_interval_takes_precedence(6, None));
+    assert!(chat_protocol::read_authority_bridge::finite_interval_takes_precedence(6, Some(6)));
+    assert!(!chat_protocol::read_authority_bridge::finite_interval_takes_precedence(6, Some(7)));
+}
+
 #[tokio::test]
 #[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
-async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
+async fn pending_participants_get_state_only() {
     let fixture = executor_seed::private_genuine_group_pending_graph().await;
     let pool = fixture.pool.clone();
     let conversation_id = fixture.graph.conversation_id;
@@ -6389,8 +6412,8 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     );
     rollback_with_constraints(tx).await;
 
-    // The group-pending invitee authorizes current state only, with the
-    // group-pending witness.
+    // The group-pending invitee authorizes current state only, with a
+    // state-only pending witness.
     let invitee_admission = fixture_read_admission(
         &pool,
         "blue.catbird.chat.getConversationState",
@@ -6417,9 +6440,9 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     assert!(
         matches!(
             invitee_view.relationship.arm,
-            chat_protocol::read_authority_bridge::RelationshipArmView::GroupPendingParticipant
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
         ),
-        "the group-pending invitee carries the group-pending witness"
+        "the group-pending invitee carries the pending witness"
     );
     assert_eq!(
         invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
@@ -6458,7 +6481,8 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
         "group-pending authorizes state only, never application entries"
     );
 
-    // A direct-pending invitee is NotEntitled to current state.
+    // A direct-pending invitee can point-read the exact state needed to sign
+    // acceptConversation, while remaining absent from enumerable inventory.
     let direct = executor_seed::private_genuine_direct_pending_graph().await;
     let direct_pool = direct.pool.clone();
     let direct_admission = fixture_read_admission(
@@ -6476,20 +6500,54 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     )
     .await
     .expect("direct invitee single-attempt lock");
-    let direct_outcome = chat_protocol::read_authority::authorize_conversation_state(
+    let direct_state = chat_protocol::read_authority::authorize_conversation_state(
         &mut tx,
         direct_guard,
         direct.graph.conversation_id,
     )
     .await
-    .err()
-    .expect("a direct-pending invitee is not entitled to state");
+    .expect("a direct-pending invitee can point-read state for acceptance");
+    let direct_view = chat_protocol::read_authority_bridge::state_authority_view(&direct_state);
+    assert!(
+        matches!(
+            direct_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
+        ),
+        "the direct-pending invitee carries a state-only pending witness"
+    );
     assert_eq!(
-        direct_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-        "direct-pending remains NotEntitled"
+        direct_view.relationship.participant_period_id, direct.invitee.participant_period_id,
+        "the direct-pending witness binds the durable participant period"
     );
     rollback_with_constraints(tx).await;
+
+    let wire_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversationState",
+        &direct.invitee.did,
+        direct.invitee.device_id,
+        &direct.invitee.dpop_jkt,
+    )
+    .await;
+    let response = chat_protocol::repository::conversation::read_conversation_state_for_admission(
+        &direct_pool,
+        wire_admission,
+        direct.graph.conversation_id,
+    )
+    .await
+    .expect("the repository returns the acceptance coordinates");
+    let output: serde_json::Value =
+        serde_json::from_slice(&response.into_response_bytes()).expect("canonical state response");
+    assert_eq!(
+        output["pendingLeaveRequests"],
+        serde_json::json!([]),
+        "a pending invitee cannot inspect established members' leave requests"
+    );
+    assert_eq!(
+        output["pendingResetRequests"],
+        serde_json::json!([]),
+        "a pending invitee cannot inspect established members' reset requests"
+    );
 }
 
 #[tokio::test]
