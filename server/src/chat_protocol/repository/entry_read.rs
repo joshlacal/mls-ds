@@ -9,6 +9,7 @@ use super::delivery::{self, DeliveredEntryRow, DeliveryRepositoryError};
 use crate::chat_protocol::{
     dpop::VerifiedReadAdmission,
     read_authority::{self, EntryReadAuthority, ReadAuthorityError},
+    read_projection::encode_canonical_generated_chat_json_v1,
 };
 
 #[derive(Debug)]
@@ -114,6 +115,19 @@ async fn read_entries_in_transaction(
 }
 
 fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
+    if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
+        let bytes = crate::chat_protocol::transcript::persisted_control_entry_response_json(
+            &row.entry_kind,
+            &row.entry_id.hyphenated().to_string(),
+            &row.conversation_id.hyphenated().to_string(),
+            u64::try_from(row.seq).map_err(|_| EntryReadFacadeError::Invariant)?,
+            &row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            &row.signed_request_bytes,
+            &row.server_fields_bytes,
+        )
+        .map_err(|_| EntryReadFacadeError::Invariant)?;
+        return serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant);
+    }
     let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
         .map_err(|_| EntryReadFacadeError::Invariant)?;
     let mut object = Map::new();
@@ -132,21 +146,17 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
     );
     object.insert("seq".into(), Value::Number(row.seq.into()));
     object.insert("signedRequest".into(), signed_request);
-    if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
-        return crate::chat_protocol::transcript::persisted_control_entry_response_json(
-            &row.entry_kind,
-            &row.entry_id.hyphenated().to_string(),
-            &row.conversation_id.hyphenated().to_string(),
-            u64::try_from(row.seq).map_err(|_| EntryReadFacadeError::Invariant)?,
-            &row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
-            &row.signed_request_bytes,
-            &row.server_fields_bytes,
-        )
-        .map(|bytes| serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant))
-        .map_err(|_| EntryReadFacadeError::Invariant)?;
-    }
-    Ok(Value::Object(object))
+    let canonical = encode_canonical_generated_chat_json_v1(
+        &Value::Object(object),
+        "blue.catbird.chat.defs#conversationEntry",
+    )
+    .map_err(|error| {
+        tracing::error!("application entry response canonicalization failed: {error}");
+        EntryReadFacadeError::Invariant
+    })?;
+    serde_json::from_slice(canonical.bytes()).map_err(|_| EntryReadFacadeError::Invariant)
 }
+
 fn map_authority_error(error: ReadAuthorityError) -> EntryReadFacadeError {
     tracing::error!("get_entries map_authority_error: {:?}", error);
     match error {
@@ -235,5 +245,83 @@ mod tests {
             "conversationId must match row.conversation_id"
         );
         assert_eq!(json["seq"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn entry_json_application_entry_emits_lexicon_bytes_objects() {
+        let conversation_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let coordinates = json!({
+            "conversationId": conversation_id.hyphenated().to_string(),
+            "generation": 1,
+            "stateVersion": 2,
+            "groupId": STANDARD.encode([0x22_u8; 32]),
+            "epoch": 1,
+            "groupContextHash": STANDARD.encode([0x23_u8; 32]),
+            "confirmationTag": STANDARD.encode([0x24_u8; 32]),
+            "lifecycle": "active"
+        });
+        let signed_request = json!({
+            "body": {
+                "$type": "blue.catbird.chat.defs#applicationSendBody",
+                "signatureDomain": "CATBIRD-CHAT-MESSAGE\u{0000}",
+                "messageId": "51515151-5151-4151-9151-515151515151",
+                "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                "actorDeviceId": "70707070-7070-4070-b070-707070707070",
+                "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+                "authGeneration": 1,
+                "prior": coordinates.clone(),
+                "aad": {
+                    "protocolVersion": "1",
+                    "conversationId": STANDARD.encode([0x11_u8; 16]),
+                    "generation": 1,
+                    "messageId": STANDARD.encode([0x51_u8; 16]),
+                    "prior": {
+                        "conversationId": STANDARD.encode([0x11_u8; 16]),
+                        "generation": 1,
+                        "stateVersion": 2,
+                        "groupId": STANDARD.encode([0x22_u8; 32]),
+                        "epoch": 1,
+                        "groupContextHash": STANDARD.encode([0x23_u8; 32]),
+                        "confirmationTag": STANDARD.encode([0x24_u8; 32]),
+                        "lifecycle": "active"
+                    }
+                },
+                "applicationMessage": {
+                    "framing": "mlsMessage",
+                    "contentType": "privateMessageApplication",
+                    "bytes": STANDARD.encode([0x31_u8; 8]),
+                    "sha256": STANDARD.encode(Sha256::digest([0x31_u8; 8]))
+                },
+                "blobBindings": [],
+                "signedAt": "2026-07-22T12:34:55.000Z"
+            },
+            "signature": STANDARD.encode([0_u8; 64])
+        });
+        let row = DeliveredEntryRow {
+            conversation_id,
+            seq: 2,
+            entry_id: Uuid::parse_str("51515151-5151-4151-9151-515151515151").unwrap(),
+            entry_kind: delivery::APPLICATION_ENTRY_KIND.to_owned(),
+            signed_request_bytes: serde_json::to_vec(&signed_request).unwrap(),
+            request_digest: vec![0x11; 32],
+            signature: vec![0x22; 64],
+            server_fields_bytes: vec![0xA0],
+            outer_entry_fingerprint: vec![0x33; 32],
+            received_at: "2026-07-22T12:34:56.000Z".parse().unwrap(),
+        };
+
+        let value = entry_json(&row).expect("application entry projects");
+        assert_eq!(
+            value["signedRequest"]["body"]["prior"]["groupId"]["$bytes"],
+            STANDARD.encode([0x22_u8; 32])
+        );
+        assert_eq!(
+            value["signedRequest"]["body"]["applicationMessage"]["bytes"]["$bytes"],
+            STANDARD.encode([0x31_u8; 8])
+        );
+        assert_eq!(
+            value["signedRequest"]["signature"]["$bytes"],
+            STANDARD.encode([0_u8; 64])
+        );
     }
 }
