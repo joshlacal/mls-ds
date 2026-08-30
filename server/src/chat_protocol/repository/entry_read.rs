@@ -1,7 +1,7 @@
 // Repository-owned `getEntries` read composition.
 
 use chrono::{SecondsFormat, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
@@ -115,7 +115,18 @@ async fn read_entries_in_transaction(
 }
 
 fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
-    if row.entry_kind != delivery::APPLICATION_ENTRY_KIND {
+    let entry = if row.entry_kind == delivery::APPLICATION_ENTRY_KIND {
+        let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
+            .map_err(|_| EntryReadFacadeError::Invariant)?;
+        json!({
+            "$type": row.entry_kind,
+            "conversationId": row.conversation_id.hyphenated().to_string(),
+            "entryId": row.entry_id.hyphenated().to_string(),
+            "receivedAt": row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "seq": row.seq,
+            "signedRequest": signed_request,
+        })
+    } else {
         let bytes = crate::chat_protocol::transcript::persisted_control_entry_response_json(
             &row.entry_kind,
             &row.entry_id.hyphenated().to_string(),
@@ -126,34 +137,14 @@ fn entry_json(row: &DeliveredEntryRow) -> Result<Value, EntryReadFacadeError> {
             &row.server_fields_bytes,
         )
         .map_err(|_| EntryReadFacadeError::Invariant)?;
-        return serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant);
-    }
-    let signed_request: Value = serde_json::from_slice(&row.signed_request_bytes)
-        .map_err(|_| EntryReadFacadeError::Invariant)?;
-    let mut object = Map::new();
-    object.insert("$type".into(), Value::String(row.entry_kind.clone()));
-    object.insert(
-        "conversationId".into(),
-        Value::String(row.conversation_id.hyphenated().to_string()),
-    );
-    object.insert(
-        "entryId".into(),
-        Value::String(row.entry_id.hyphenated().to_string()),
-    );
-    object.insert(
-        "receivedAt".into(),
-        Value::String(row.received_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
-    );
-    object.insert("seq".into(), Value::Number(row.seq.into()));
-    object.insert("signedRequest".into(), signed_request);
-    let canonical = encode_canonical_generated_chat_json_v1(
-        &Value::Object(object),
-        "blue.catbird.chat.defs#conversationEntry",
-    )
-    .map_err(|error| {
-        tracing::error!("application entry response canonicalization failed: {error}");
-        EntryReadFacadeError::Invariant
-    })?;
+        serde_json::from_slice(&bytes).map_err(|_| EntryReadFacadeError::Invariant)?
+    };
+    let canonical =
+        encode_canonical_generated_chat_json_v1(&entry, "blue.catbird.chat.defs#conversationEntry")
+            .map_err(|error| {
+                tracing::error!("entry response canonicalization failed: {error}");
+                EntryReadFacadeError::Invariant
+            })?;
     serde_json::from_slice(canonical.bytes()).map_err(|_| EntryReadFacadeError::Invariant)
 }
 
@@ -245,6 +236,11 @@ mod tests {
             "conversationId must match row.conversation_id"
         );
         assert_eq!(json["seq"].as_u64(), Some(2));
+        assert_eq!(
+            json["signedRequest"]["signature"]["$bytes"],
+            STANDARD.encode(signature),
+            "control-entry bytes must use lexicon $bytes objects"
+        );
     }
 
     #[test]
