@@ -36,7 +36,7 @@ mod common;
 // `delivery` now consumes the sealed `WelcomeCasBinding` from the state machine.
 // Mirror the executor harness's real nested module graph instead of compiling a
 // second, context-free copy of the repository source.
-pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;

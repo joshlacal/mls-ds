@@ -20,6 +20,9 @@ backups/
 # Logs
 *.log
 
+# Python (tests/mls_chat_lexicon_contract.py)
+__pycache__/
+
 # OS
 .DS_Store
 Thumbs.db

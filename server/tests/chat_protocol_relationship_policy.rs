@@ -2,7 +2,7 @@
 
 mod common;
 
-pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -505,13 +505,16 @@ fn did_document_requires_the_exact_atproto_pds_service() {
 #[test]
 fn declaration_success_and_structured_record_not_found_are_exact() {
     let actor = did(3);
-    let uri = format!("at://{actor}/chat.bsky.actor.declaration/self");
+    let uri = format!("at://{actor}/blue.catbird.chat.declaration/self");
     let record = json!({
         "uri": uri,
         "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
         "value": {
-            "$type": "chat.bsky.actor.declaration",
-            "allowIncoming": "following"
+            "$type": "blue.catbird.chat.declaration",
+            "allowIncoming": "following",
+            "deliveryService": "did:web:chat.catbird.blue",
+            "protocolVersion": "1",
+            "createdAt": "2026-08-29T00:00:00Z"
         }
     });
     let parsed =
@@ -541,16 +544,16 @@ fn declaration_success_and_structured_record_not_found_are_exact() {
         (401, br#"{"error":"AuthRequired"}"#.as_slice()),
         (500, br#"{"error":"InternalServerError"}"#.as_slice()),
         (200, br#"{"uri":null,"value":{}}"#.as_slice()),
-        (200, br#"{"uri":"wrong","value":{"$type":"chat.bsky.actor.declaration","allowIncoming":"all"}}"#.as_slice()),
-        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/chat.bsky.actor.declaration/self","value":{"$type":"wrong","allowIncoming":"all"}}"#.as_slice()),
-        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/chat.bsky.actor.declaration/self","value":{"$type":"chat.bsky.actor.declaration","allowIncoming":"unknown"}}"#.as_slice()),
-        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/chat.bsky.actor.declaration/self","value":{"$type":"chat.bsky.actor.declaration","allowIncoming":null}}"#.as_slice()),
+        (200, br#"{"uri":"wrong","value":{"$type":"blue.catbird.chat.declaration","allowIncoming":"all","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}"#.as_slice()),
+        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/blue.catbird.chat.declaration/self","value":{"$type":"wrong","allowIncoming":"all","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}"#.as_slice()),
+        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/blue.catbird.chat.declaration/self","value":{"$type":"blue.catbird.chat.declaration","allowIncoming":"unknown","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}"#.as_slice()),
+        (200, br#"{"uri":"at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/blue.catbird.chat.declaration/self","value":{"$type":"blue.catbird.chat.declaration","allowIncoming":null,"deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}"#.as_slice()),
     ] {
         assert!(parse_declaration_response(&actor, status, body).is_err());
     }
 
     let duplicate = format!(
-        r#"{{"uri":"{uri}","value":{{"$type":"chat.bsky.actor.declaration","allowIncoming":"all","allowIncoming":"none"}}}}"#
+        r#"{{"uri":"{uri}","value":{{"$type":"blue.catbird.chat.declaration","allowIncoming":"all","allowIncoming":"none","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}}}"#
     );
     assert!(parse_declaration_response(&actor, 200, duplicate.as_bytes()).is_err());
 }
@@ -558,7 +561,7 @@ fn declaration_success_and_structured_record_not_found_are_exact() {
 #[test]
 fn declaration_cid_must_be_a_canonical_parsed_cid() {
     let actor = did(3);
-    let uri = format!("at://{actor}/chat.bsky.actor.declaration/self");
+    let uri = format!("at://{actor}/blue.catbird.chat.declaration/self");
     for malformed in [
         "ba",
         "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
@@ -570,8 +573,11 @@ fn declaration_cid_must_be_a_canonical_parsed_cid() {
             "uri": uri,
             "cid": malformed,
             "value": {
-                "$type": "chat.bsky.actor.declaration",
-                "allowIncoming": "following"
+                "$type": "blue.catbird.chat.declaration",
+                "allowIncoming": "following",
+                "deliveryService": "did:web:chat.catbird.blue",
+                "protocolVersion": "1",
+                "createdAt": "2026-08-29T00:00:00Z"
             }
         });
         assert!(
@@ -734,7 +740,6 @@ struct ScriptedTransport {
 struct ScriptedState {
     requests: Vec<PublicGet>,
     declarations: BTreeMap<String, IncomingPolicy>,
-    group_declarations: BTreeMap<String, IncomingPolicy>,
     blocked_pairs: BTreeMap<(String, String), usize>,
     non_following_pairs: BTreeSet<(String, String)>,
     missing_records: BTreeSet<String>,
@@ -760,14 +765,6 @@ impl ScriptedTransport {
             .unwrap()
             .declarations
             .insert(actor.into(), incoming);
-    }
-
-    fn set_group_declaration(&self, actor: &str, group: IncomingPolicy) {
-        self.state
-            .lock()
-            .unwrap()
-            .group_declarations
-            .insert(actor.into(), group);
     }
 
     fn mark_declaration_missing(&self, actor: &str) {
@@ -869,7 +866,7 @@ impl PublicTransport for ScriptedTransport {
             let actor = query_values(&request.url, "repo").remove(0);
             assert_eq!(
                 query_values(&request.url, "collection"),
-                ["chat.bsky.actor.declaration"]
+                ["blue.catbird.chat.declaration"]
             );
             assert_eq!(query_values(&request.url, "rkey"), ["self"]);
             if state.missing_records.contains(&actor) {
@@ -880,21 +877,17 @@ impl PublicTransport for ScriptedTransport {
                 .get(&actor)
                 .copied()
                 .unwrap_or(IncomingPolicy::Following);
-            let group = state.group_declarations.get(&actor).copied();
-            let mut value = json!({
-                "$type": "chat.bsky.actor.declaration",
+            let value = json!({
+                "$type": "blue.catbird.chat.declaration",
                 "allowIncoming": incoming.as_str(),
+                "deliveryService": "did:web:chat.catbird.blue",
+                "protocolVersion": "1",
+                "createdAt": "2026-08-29T00:00:00Z",
             });
-            if let Some(group) = group {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("allowGroupInvites".into(), json!(group.as_str()));
-            }
             return Ok(PublicResponse::json(
                 200,
                 json!({
-                    "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
+                    "uri": format!("at://{actor}/blue.catbird.chat.declaration/self"),
                     "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
                     "value": value,
                 }),
@@ -1057,6 +1050,22 @@ async fn collection_is_pds_first_and_never_short_circuits_on_denial() {
             false,
         ),
         Err(PolicyDenial::GroupInvitesDisabled)
+    );
+}
+
+#[tokio::test]
+async fn missing_clean_declaration_denies_even_when_graph_allows() {
+    let request = admission_request(2, AdmissionOperation::Direct);
+    let transport = ScriptedTransport::new();
+    transport.mark_declaration_missing(&request.pending_recipients[0]);
+    let source = HttpRelationshipSource::new(valid_config(), transport);
+    let projection = collect_admission_projection(&source, &StepClock::new(), request.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decision(&source, &projection, &request, false),
+        PolicyDenial::MessagesDisabled
     );
 }
 
@@ -2109,13 +2118,12 @@ async fn hydration_requires_exact_evidence_kind_and_trusted_decision_time() {
 }
 
 #[tokio::test]
-async fn persisted_declarations_retain_exact_present_absent_and_group_policy_evidence() {
+async fn persisted_declarations_retain_exact_present_and_absent_policy_evidence() {
     let request = admission_request(3, AdmissionOperation::Group);
     let transport = ScriptedTransport::new();
     transport.mark_declaration_missing(&request.pending_recipients[0]);
     transport.use_short_pds_service_id(&request.pending_recipients[0]);
     transport.set_declaration(&request.pending_recipients[1], IncomingPolicy::All);
-    transport.set_group_declaration(&request.pending_recipients[1], IncomingPolicy::None);
     let source = HttpRelationshipSource::new(valid_config(), transport);
     let live = collect_admission_projection(&source, &StepClock::new(), request.clone())
         .await
@@ -2141,8 +2149,8 @@ async fn persisted_declarations_retain_exact_present_absent_and_group_policy_evi
         DeclarationRecordEvidenceKind::RecordPresent
     );
     assert_eq!(present.incoming, IncomingPolicy::All);
-    assert_eq!(present.allow_group_invites, Some(IncomingPolicy::None));
-    assert_eq!(present.resolved_group_policy, IncomingPolicy::None);
+    assert_eq!(present.allow_group_invites, None);
+    assert_eq!(present.resolved_group_policy, IncomingPolicy::All);
     assert!(present.cid.is_some());
     assert_eq!(
         present.service_id,

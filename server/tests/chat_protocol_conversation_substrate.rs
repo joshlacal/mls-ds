@@ -6,7 +6,7 @@ mod executor_seed;
 #[path = "common/frozen_public_state.rs"]
 mod frozen_public_state;
 
-pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -6904,12 +6904,14 @@ mod historical_control_loader {
                     return Ok(PublicResponse::json(
                         200,
                         json!({
-                            "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
+                            "uri": format!("at://{actor}/blue.catbird.chat.declaration/self"),
                             "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
                             "value": {
-                                "$type": "chat.bsky.actor.declaration",
+                                "$type": "blue.catbird.chat.declaration",
                                 "allowIncoming": "following",
-                                "allowGroupInvites": "following",
+                                "deliveryService": "did:web:chat.catbird.blue",
+                                "protocolVersion": "1",
+                                "createdAt": "2026-08-29T00:00:00Z",
                             },
                         }),
                     ));

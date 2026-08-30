@@ -31,7 +31,7 @@
 
 mod common;
 
-pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;

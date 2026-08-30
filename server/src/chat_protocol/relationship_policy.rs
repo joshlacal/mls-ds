@@ -64,10 +64,10 @@ const FEDERATION_TEST_SOURCE_PROFILE: &[u8] = b"federation-test-allow-all/v1";
 
 const GRAPH_PATH: &str = "/xrpc/app.bsky.graph.getRelationships";
 const GET_RECORD_PATH: &str = "/xrpc/com.atproto.repo.getRecord";
-const DECLARATION_COLLECTION: &str = "chat.bsky.actor.declaration";
+const DECLARATION_COLLECTION: &str = "blue.catbird.chat.declaration";
 const DECLARATION_RKEY: &str = "self";
 const RELATIONSHIP_TYPE: &str = "app.bsky.graph.defs#relationship";
-const DECLARATION_TYPE: &str = "chat.bsky.actor.declaration";
+const DECLARATION_TYPE: &str = "blue.catbird.chat.declaration";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RelationshipPolicyConfigError {
@@ -1166,7 +1166,6 @@ impl IncomingPolicy {
 pub struct DeclarationRecord {
     incoming: IncomingPolicy,
     group: IncomingPolicy,
-    allow_group_invites: Option<IncomingPolicy>,
     absent: bool,
     cid: Option<String>,
 }
@@ -1211,7 +1210,6 @@ pub fn parse_declaration_response(
         return Ok(DeclarationRecord {
             incoming: IncomingPolicy::Following,
             group: IncomingPolicy::Following,
-            allow_group_invites: None,
             absent: true,
             cid: None,
         });
@@ -1235,20 +1233,27 @@ pub fn parse_declaration_response(
         .get("value")
         .ok_or(AuthorityError::Malformed)
         .and_then(object)?;
-    reject_unknown(record, &["$type", "allowIncoming", "allowGroupInvites"])?;
-    if required_string(record, "$type")? != DECLARATION_TYPE {
+    reject_unknown(
+        record,
+        &[
+            "$type",
+            "allowIncoming",
+            "deliveryService",
+            "protocolVersion",
+            "createdAt",
+        ],
+    )?;
+    if required_string(record, "$type")? != DECLARATION_TYPE
+        || !validate_bare_did(required_string(record, "deliveryService")?)
+        || required_string(record, "protocolVersion")? != "1"
+        || DateTime::parse_from_rfc3339(required_string(record, "createdAt")?).is_err()
+    {
         return Err(AuthorityError::Malformed);
     }
     let incoming = IncomingPolicy::parse(required_string(record, "allowIncoming")?)?;
-    let allow_group_invites = record
-        .get("allowGroupInvites")
-        .map(|value| IncomingPolicy::parse(value.as_str().ok_or(AuthorityError::Malformed)?))
-        .transpose()?;
-    let group = allow_group_invites.unwrap_or(incoming);
     Ok(DeclarationRecord {
         incoming,
-        group,
-        allow_group_invites,
+        group: incoming,
         absent: false,
         cid,
     })
@@ -2310,13 +2315,10 @@ fn hydrate_declaration_evidence(
         || values.fetch_revision == 0
         || values.fetched_at < started_at
         || values.fetched_at > completed_at
-        || values.resolved_group_policy != values.allow_group_invites.unwrap_or(values.incoming)
+        || values.allow_group_invites.is_some()
+        || values.resolved_group_policy != values.incoming
         || values.cid.as_deref().is_some_and(|cid| !valid_cid(cid))
-        || (absent
-            && (values.cid.is_some()
-                || values.incoming != IncomingPolicy::Following
-                || values.allow_group_invites.is_some()
-                || values.resolved_group_policy != IncomingPolicy::Following))
+        || (absent && (values.cid.is_some() || values.incoming != IncomingPolicy::Following))
     {
         return Err(ProjectionPersistenceError::Invalid);
     }
@@ -2870,7 +2872,9 @@ fn federation_allow_all_response(request: &PublicGet) -> Result<PublicResponse, 
                 "value": {
                     "$type": DECLARATION_TYPE,
                     "allowIncoming": "all",
-                    "allowGroupInvites": "all",
+                    "deliveryService": "did:web:chat.catbird.blue",
+                    "protocolVersion": "1",
+                    "createdAt": "2026-08-29T00:00:00Z",
                 },
             }),
         ));
@@ -3366,7 +3370,7 @@ async fn collect_admission_projection_with_kind<T: PublicTransport, C: Projectio
                     recipient: recipient.clone(),
                     incoming: record.incoming,
                     group: record.group,
-                    allow_group_invites: record.allow_group_invites,
+                    allow_group_invites: None,
                     absent: record.absent,
                     cid: record.cid,
                     service_id: resolved_pds_service.service_id,
@@ -4127,9 +4131,13 @@ pub fn consume_admission_projection<T: PublicTransport>(
             .iter()
             .find(|evidence| &evidence.recipient == recipient)
             .expect("fence proves declaration completeness");
-        match expected_request.operation {
-            AdmissionOperation::Direct => declaration.incoming,
-            AdmissionOperation::Group => declaration.group,
+        if declaration.absent {
+            IncomingPolicy::None
+        } else {
+            match expected_request.operation {
+                AdmissionOperation::Direct => declaration.incoming,
+                AdmissionOperation::Group => declaration.group,
+            }
         }
     };
     if expected_request
@@ -4889,6 +4897,48 @@ mod projection_integrity_tests {
                 ),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn parses_clean_chat_declaration() {
+        let actor = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let body = format!(
+            r#"{{"uri":"at://{actor}/blue.catbird.chat.declaration/self","cid":"bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku","value":{{"$type":"blue.catbird.chat.declaration","allowIncoming":"all","deliveryService":"did:web:chat.catbird.blue","protocolVersion":"1","createdAt":"2026-08-29T00:00:00Z"}}}}"#
+        );
+
+        let declaration = parse_declaration_response(actor, 200, body.as_bytes()).unwrap();
+        assert_eq!(declaration.incoming(), IncomingPolicy::All);
+
+        for field in ["deliveryService", "protocolVersion", "createdAt"] {
+            let mut invalid: Value = serde_json::from_str(&body).unwrap();
+            invalid["value"].as_object_mut().unwrap().remove(field);
+            assert!(
+                parse_declaration_response(actor, 200, &serde_json::to_vec(&invalid).unwrap())
+                    .is_err(),
+                "accepted declaration missing {field}"
+            );
+        }
+
+        for (field, value) in [
+            ("deliveryService", "not-a-did"),
+            ("protocolVersion", "2"),
+            ("createdAt", "not-a-date"),
+        ] {
+            let mut invalid: Value = serde_json::from_str(&body).unwrap();
+            invalid["value"][field] = Value::String(value.to_owned());
+            assert!(
+                parse_declaration_response(actor, 200, &serde_json::to_vec(&invalid).unwrap())
+                    .is_err(),
+                "accepted invalid declaration {field}"
+            );
+        }
+
+        let mut legacy: Value = serde_json::from_str(&body).unwrap();
+        legacy["value"]["allowGroupInvites"] = Value::String("all".to_owned());
+        assert!(
+            parse_declaration_response(actor, 200, &serde_json::to_vec(&legacy).unwrap()).is_err(),
+            "accepted the superseded group-only policy field"
         );
     }
 }

@@ -977,12 +977,14 @@ impl PublicTransport for DeterministicPublicTransport {
                 Ok(PublicResponse::json(
                     200,
                     json!({
-                        "uri": format!("at://{actor}/chat.bsky.actor.declaration/self"),
+                        "uri": format!("at://{actor}/blue.catbird.chat.declaration/self"),
                         "cid": "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
                         "value": {
-                            "$type": "chat.bsky.actor.declaration",
+                            "$type": "blue.catbird.chat.declaration",
                             "allowIncoming": "all",
-                            "allowGroupInvites": "all"
+                            "deliveryService": "did:web:chat.catbird.blue",
+                            "protocolVersion": "1",
+                            "createdAt": "2026-08-29T00:00:00Z"
                         }
                     }),
                 ))

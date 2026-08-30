@@ -45,7 +45,7 @@ DECLARE
     v_col_type TEXT;
     v_uuid_pattern TEXT := '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
 
-    -- Expected migrations: version, description, sha384_hex (79 total)
+    -- Expected migrations: version, description, sha384_hex (84 total)
     v_expected_versions BIGINT[] := ARRAY[
         20250101000000::BIGINT,
         20251125000001::BIGINT,

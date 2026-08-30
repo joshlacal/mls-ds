@@ -1,7 +1,7 @@
 //! Integration tests for Clean Chat zero-state preflight gate.
 //!
-//! Tests both pre-cutover (74 migrations, max 20260821000001) and
-//! post-migration (82 migrations, max 20260828000003) modes against disposable
+//! Tests both pre-cutover (75 migrations, max 20260824000001) and
+//! post-migration (84 migrations, max 20260828000005) modes against disposable
 //! PostgreSQL databases.
 //!
 //! Verifies:
@@ -87,19 +87,19 @@ impl<'s> MigrationSource<'s> for MigrationSliceSource {
     }
 }
 
-/// Set up a disposable database with pre-cutover migrations (74 migrations up to 20260821000001).
+/// Set up a disposable database with pre-cutover migrations (75 migrations up to 20260824000001).
 async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
     let full_migrator = sqlx::migrate!("./migrations");
     let pre_cutover_entries: Vec<Migration> = full_migrator
         .migrations
         .iter()
-        .filter(|m| m.version <= 20260821000001)
+        .filter(|m| m.version <= 20260824000001)
         .cloned()
         .collect();
     assert_eq!(
         pre_cutover_entries.len(),
-        74,
-        "pre-cutover catalog must contain exactly 74 migrations"
+        75,
+        "pre-cutover catalog must contain exactly 75 migrations"
     );
     let migrator = Migrator::new(MigrationSliceSource(pre_cutover_entries))
         .await
@@ -108,13 +108,13 @@ async fn setup_pre_cutover_db() -> (PgPool, DisposableDatabase) {
     setup_db(migrator).await
 }
 
-/// Set up a disposable database with post-migration migrations (all 82 migrations).
+/// Set up a disposable database with post-migration migrations (all 84 migrations).
 async fn setup_post_migration_db() -> (PgPool, DisposableDatabase) {
     let migrator = sqlx::migrate!("./migrations");
     assert_eq!(
         migrator.migrations.len(),
-        82,
-        "post-migration catalog must contain exactly 82 migrations"
+        84,
+        "post-migration catalog must contain exactly 84 migrations"
     );
     setup_db(migrator).await
 }
