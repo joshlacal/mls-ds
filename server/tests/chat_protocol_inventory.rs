@@ -28,7 +28,7 @@
 #![allow(dead_code)]
 
 mod common;
-pub use catbird_server::{auth, federation, handlers, identity, sqlx_jacquard, util};
+pub use catbird_server::{auth, crypto, federation, handlers, identity, sqlx_jacquard, util};
 
 #[path = "../src/chat_protocol/model.rs"]
 mod model;
@@ -2008,7 +2008,7 @@ async fn consume_final_page_cas(
     let sql = format!(
         "UPDATE chat.inventory_sessions SET {consumed_column} = TRUE, \
          {consumed_at_column} = $2 WHERE inventory_session_id = $1 \
-         AND {consumed_column} = FALSE"
+         AND {consumed_column} = FALSE AND {consumed_at_column} IS NULL"
     );
     sqlx::query(&sql)
         .bind(session_id)
@@ -4147,6 +4147,97 @@ async fn conversations_consumed_state(
     .fetch_one(pool)
     .await
     .expect("read the consumption state")
+}
+
+#[tokio::test]
+async fn production_empty_initial_pages_allow_alternate_limit_after_consumption() {
+    let (pool, _guard) = executor_seed::setup().await;
+    let fence = ensure_fence(&pool).await;
+    let now = whole_second(clock_now(&pool).await);
+    let device = seed_device_with_key(&pool, now).await;
+    let session_id = Uuid::new_v4();
+    let mut random = DeterministicRandom::new(0xC1E0);
+    seed_session_via_create_shape(
+        &pool,
+        &fence,
+        &device,
+        session_id,
+        now,
+        now + Duration::minutes(15),
+        &mut random,
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let request_100 = conversations_request(100);
+    let mut tx = pool.begin().await.expect("begin the limit-100 empty serve");
+    let served_100 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_100,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("the limit-100 empty page serves");
+    tx.commit().await.expect("commit the limit-100 empty serve");
+    assert_eq!(
+        extract_next_page_cursor(served_100.bytes()),
+        None,
+        "an empty initial page is final and mints no successor"
+    );
+    let consumed = conversations_consumed_state(&pool, session_id).await;
+    assert!(consumed.0, "the first empty final page consumes the domain");
+
+    let request_50 = conversations_request(50);
+    let mut tx = pool.begin().await.expect("begin the limit-50 empty serve");
+    let served_50 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_50,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("an alternate-limit empty page serves after domain consumption");
+    tx.commit().await.expect("commit the limit-50 empty serve");
+    assert_eq!(
+        served_50.bytes(),
+        served_100.bytes(),
+        "an empty page is limit-independent"
+    );
+    assert_eq!(
+        conversations_consumed_state(&pool, session_id).await,
+        consumed,
+        "the alternate limit does not repeat the consumption CAS"
+    );
+
+    let mut tx = pool.begin().await.expect("begin the limit-50 empty replay");
+    let replayed_50 = repository::inventory::serve_initial_inventory_page(
+        &mut tx,
+        Some(paging_device(&device)),
+        session_id,
+        &request_50,
+        &fence.sealer,
+        &mut random,
+    )
+    .await
+    .expect("the alternate-limit empty page replays");
+    tx.commit().await.expect("commit the limit-50 empty replay");
+    assert_eq!(
+        replayed_50.bytes(),
+        served_50.bytes(),
+        "the alternate-limit replay is byte-identical"
+    );
+    assert_eq!(
+        conversations_consumed_state(&pool, session_id).await,
+        consumed,
+        "replay does not repeat the consumption CAS"
+    );
 }
 
 /// Final-review fix-round coverage (C-1/C-2): the PRODUCTION paging

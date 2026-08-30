@@ -4958,6 +4958,11 @@ fn verify_continuation_binding(
 }
 
 /// The exact one-way `*_consumed` compare-and-set for the served final page.
+///
+/// A zero-row CAS is not automatically a failure: a fresh final page can be
+/// served at an alternate limit after the domain was already consumed. That is
+/// accepted only when the durable state proves the earlier consumption; every
+/// other state fails closed.
 async fn consume_final_page(
     transaction: &mut Transaction<'_, Postgres>,
     row: &InventorySessionFenceLockRow,
@@ -4971,20 +4976,36 @@ async fn consume_final_page(
         InventoryPageDomain::PendingWelcomes => ("welcomes_consumed", "welcomes_consumed_at"),
         InventoryPageDomain::LeafRecovery => ("recovery_consumed", "recovery_consumed_at"),
     };
-    let sql = format!(
+    let update_sql = format!(
         "UPDATE chat.inventory_sessions SET {consumed_column} = TRUE, \
          {consumed_at_column} = $2 WHERE inventory_session_id = $1 \
-         AND {consumed_column} = FALSE"
+         AND {consumed_column} = FALSE AND {consumed_at_column} IS NULL"
     );
-    let result = sqlx::query(&sql)
+    let result = sqlx::query(&update_sql)
         .bind(row.inventory_session_id)
         .bind(served_at)
         .execute(&mut **transaction)
         .await?;
-    if result.rows_affected() != 1 {
-        return Err(InventoryRepositoryError::RaceOrReuse);
+    if result.rows_affected() == 1 {
+        return Ok(());
     }
-    Ok(())
+
+    let state_sql = format!(
+        "SELECT {consumed_at_column} FROM chat.inventory_sessions \
+         WHERE inventory_session_id = $1 AND {consumed_column} = TRUE"
+    );
+    let consumed_at: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(&state_sql)
+        .bind(row.inventory_session_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    match consumed_at {
+        // Already consumed, with the durable timestamp that proves it.
+        Some(Some(_)) => Ok(()),
+        // The consumed flag is set without its required timestamp.
+        Some(None) => Err(InventoryRepositoryError::RaceOrReuse),
+        // The session is missing or the consumed flag remains false.
+        None => Err(InventoryRepositoryError::RaceOrReuse),
+    }
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {
