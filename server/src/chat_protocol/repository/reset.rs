@@ -326,7 +326,10 @@ impl ResetCanonicalResponse {
                     "expiresAt": canonical_datetime(expires_at),
                 },
             }))
-            .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+            .map_err(|error| {
+                tracing::warn!(%error, "requestReset canonical response does not decode as RequestResetOutput");
+                ResetFacadeError::InvalidCanonicalMaterial
+            })?;
         let bytes =
             serde_json::to_vec(&output).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
         Self::new(ResetOperationEndpoint::RequestReset, bytes)
@@ -456,6 +459,15 @@ impl PreparedResetExecutionGraph {
             || (expected == ResetOperationEndpoint::ActivateReset
                 && artifacts.genesis_group_info_bytes.is_none())
         {
+            tracing::warn!(
+                endpoint_match = response.endpoint() == expected,
+                response_matches = response.matches(expected, response.as_bytes()),
+                has_entry = artifacts.accepted_control_entry_bytes.is_some(),
+                has_primary_event = artifacts.primary_event_payload.is_some(),
+                welcome_dispositions = artifacts.welcome_disposition_event_payloads.len(),
+                has_group_info = artifacts.genesis_group_info_bytes.is_some(),
+                "reset execution graph rejected"
+            );
             return Err(ResetFacadeError::InvalidCanonicalMaterial);
         }
         Ok(Self {
@@ -507,14 +519,19 @@ fn coordinate_json(
         PublicGroupSnapshotLifecycle::Active => "active",
         PublicGroupSnapshotLifecycle::Superseded => "superseded",
     };
+    // Bytes fields must be `{"$bytes": …}` objects: that is what the
+    // generated `conversationCoordinates` DTO decodes, and what every other
+    // read projection emits. Bare base64 strings made every requestReset
+    // fail closed with `InvalidCanonicalMaterial`.
+    let bytes = |value: &[u8]| json!({ "$bytes": STANDARD.encode(value) });
     Ok(json!({
         "conversationId": Uuid::from_bytes(*coordinate.conversation_id()).hyphenated().to_string(),
         "generation": generation,
         "stateVersion": state_version,
-        "groupId": STANDARD.encode(coordinate.group_id()),
+        "groupId": bytes(coordinate.group_id()),
         "epoch": epoch,
-        "groupContextHash": STANDARD.encode(coordinate.group_context_hash()),
-        "confirmationTag": STANDARD.encode(coordinate.confirmation_tag()),
+        "groupContextHash": bytes(coordinate.group_context_hash()),
+        "confirmationTag": bytes(coordinate.confirmation_tag()),
         "lifecycle": lifecycle,
     }))
 }
@@ -2487,7 +2504,10 @@ fn map_aggregate_error(error: ConversationStateHydrationError) -> ResetRepositor
         | ConversationStateHydrationError::Head(ConversationHeadHydrationError::Database(error)) => {
             ResetRepositoryError::Database(error)
         }
-        _ => ResetRepositoryError::GuardInvariant,
+        other => {
+            tracing::warn!(error = ?other, "reset: conversation state hydration failed");
+            ResetRepositoryError::GuardInvariant
+        }
     }
 }
 
@@ -3832,4 +3852,36 @@ pub(crate) fn mutate_pending_reset_cas_expectation_for_test(
         guard.authorized_terminal,
     );
     guard
+}
+
+#[cfg(test)]
+mod canonical_response_tests {
+    use super::*;
+
+    /// Regression: the echoed coordinate's bytes fields were emitted as bare
+    /// base64 strings, which the generated coordinate DTO (and so every
+    /// `requestReset`/`activateReset` response) rejects — each first
+    /// `requestReset` failed closed with a 500.
+    #[test]
+    fn coordinate_json_decodes_as_generated_dto() {
+        let coordinate = PublicGroupSnapshotCoordinate::new(
+            *Uuid::new_v4().as_bytes(),
+            0,
+            2,
+            [0x11; 32],
+            1,
+            [0x22; 32],
+            [0x33; 32],
+            PublicGroupSnapshotLifecycle::Active,
+        );
+        let json = coordinate_json(&coordinate).expect("coordinate encodes");
+        for field in ["groupId", "groupContextHash", "confirmationTag"] {
+            assert!(
+                json[field].get("$bytes").is_some(),
+                "{field} must be a $bytes object"
+            );
+        }
+        serde_json::from_value::<chat_dto::ConversationCoordinates<DefaultStr>>(json)
+            .expect("coordinate must decode as the generated DTO");
+    }
 }
