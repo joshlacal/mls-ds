@@ -51,6 +51,7 @@ mod transcript;
 #[path = "../src/chat_protocol/validation.rs"]
 mod validation;
 
+#[path = "../src/chat_protocol"]
 mod chat_protocol {
     pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
     pub mod cursor {
@@ -1056,7 +1057,7 @@ mod chat_protocol {
         pub(crate) enum RelationshipArmView {
             OpenLeaf,
             ActiveParticipant,
-            GroupPendingParticipant,
+            PendingParticipant,
         }
 
         #[derive(Debug, Clone)]
@@ -1180,10 +1181,10 @@ mod chat_protocol {
                     leaf_period_id: None,
                     open_membership_interval_id: None,
                 },
-                CurrentConversationRelationshipWitness::CurrentGroupPendingParticipant {
+                CurrentConversationRelationshipWitness::CurrentPendingParticipant {
                     participant_period_id,
                 } => RelationshipWitnessView {
-                    arm: RelationshipArmView::GroupPendingParticipant,
+                    arm: RelationshipArmView::PendingParticipant,
                     participant_period_id: *participant_period_id,
                     leaf_period_id: None,
                     open_membership_interval_id: None,
@@ -1564,6 +1565,7 @@ mod chat_protocol {
     pub mod relationship_policy {
         pub use crate::relationship_policy_source::*;
     }
+    #[path = "repository"]
     pub mod repository {
         pub mod auth {
             #![allow(dead_code)]
@@ -1607,13 +1609,8 @@ mod chat_protocol {
                 "/src/chat_protocol/repository/ticket.rs"
             ));
         }
-        pub mod recovery {
-            #![allow(dead_code)]
-            include!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/chat_protocol/repository/recovery.rs"
-            ));
-        }
+        #[allow(dead_code)]
+        pub mod recovery;
         pub mod core {
             #![allow(dead_code)]
             include!(concat!(
@@ -1657,13 +1654,8 @@ mod chat_protocol {
             ));
         }
     }
-    pub mod state_machine {
-        #![allow(dead_code)]
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/chat_protocol/state_machine.rs"
-        ));
-    }
+    #[allow(dead_code)]
+    pub mod state_machine;
 }
 
 #[allow(dead_code)]
@@ -6133,7 +6125,7 @@ async fn revocation_jkt_and_generation_drift_after_admission_fail_closed() {
 
 #[tokio::test]
 #[ignore = "requires the dedicated gate database seeded with the B-read fixture corpus"]
-async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
+async fn pending_invitations_authorize_state_only_for_group_and_direct() {
     let fixture = executor_seed::private_genuine_group_pending_graph().await;
     let pool = fixture.pool.clone();
     let conversation_id = fixture.graph.conversation_id;
@@ -6180,7 +6172,7 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     rollback_with_constraints(tx).await;
 
     // The group-pending invitee authorizes current state only, with the
-    // group-pending witness.
+    // pending-participant witness.
     let invitee_admission = fixture_read_admission(
         &pool,
         "blue.catbird.chat.getConversationState",
@@ -6207,13 +6199,29 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     assert!(
         matches!(
             invitee_view.relationship.arm,
-            chat_protocol::read_authority_bridge::RelationshipArmView::GroupPendingParticipant
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
         ),
-        "the group-pending invitee carries the group-pending witness"
+        "the group-pending invitee carries the pending participant witness"
     );
     assert_eq!(
         invitee_view.relationship.participant_period_id, fixture.invitee.participant_period_id,
         "the witness binds the durable participant period"
+    );
+    assert_eq!(
+        invitee_view.relationship.leaf_period_id, None,
+        "the group-pending state capability carries no leaf period"
+    );
+    assert_eq!(
+        invitee_view.relationship.open_membership_interval_id, None,
+        "the group-pending state capability carries no open membership interval"
+    );
+    assert_ne!(
+        invitee_view.graph_digest, [0_u8; 32],
+        "the group-pending state aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        invitee_view.snapshot_digest, [0_u8; 32],
+        "the group-pending state aggregate carries a nonzero snapshot digest"
     );
     rollback_with_constraints(tx).await;
     // Entries require a current open leaf: the group-pending invitee is
@@ -6248,7 +6256,7 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
         "group-pending authorizes state only, never application entries"
     );
 
-    // A direct-pending invitee is NotEntitled to current state.
+    // A direct-pending invitee authorizes current state only, identically to group-pending.
     let direct = executor_seed::private_genuine_direct_pending_graph().await;
     let direct_pool = direct.pool.clone();
     let direct_admission = fixture_read_admission(
@@ -6266,18 +6274,168 @@ async fn group_pending_gets_state_and_direct_pending_is_not_entitled() {
     )
     .await
     .expect("direct invitee single-attempt lock");
-    let direct_outcome = chat_protocol::read_authority::authorize_conversation_state(
+    let direct_state = chat_protocol::read_authority::authorize_conversation_state(
         &mut tx,
         direct_guard,
         direct.graph.conversation_id,
     )
     .await
-    .err()
-    .expect("a direct-pending invitee is not entitled to state");
+    .expect("a direct-pending participant authorizes current state");
+    let direct_view = chat_protocol::read_authority_bridge::state_authority_view(&direct_state);
+    assert!(
+        matches!(
+            direct_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::PendingParticipant
+        ),
+        "the direct-pending invitee carries the pending participant witness"
+    );
     assert_eq!(
-        direct_outcome,
+        direct_view.relationship.participant_period_id,
+        direct.invitee.participant_period_id,
+        "the direct-pending witness binds the durable participant period"
+    );
+    assert_eq!(
+        direct_view.relationship.leaf_period_id, None,
+        "the direct-pending state capability carries no leaf period"
+    );
+    assert_eq!(
+        direct_view.relationship.open_membership_interval_id, None,
+        "the direct-pending state capability carries no open membership interval"
+    );
+    assert_ne!(
+        direct_view.graph_digest, [0_u8; 32],
+        "the direct-pending state aggregate carries a nonzero graph digest"
+    );
+    assert_ne!(
+        direct_view.snapshot_digest, [0_u8; 32],
+        "the direct-pending state aggregate carries a nonzero snapshot digest"
+    );
+    rollback_with_constraints(tx).await;
+
+    // Entries require a current open leaf: the direct-pending invitee is
+    // denied application entries.
+    let direct_entry_outcome = {
+        let admission = fixture_read_admission(
+            &direct_pool,
+            "blue.catbird.chat.getEntries",
+            &direct.invitee.did,
+            direct.invitee.device_id,
+            &direct.invitee.dpop_jkt,
+        )
+        .await;
+        let (guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+            &direct_pool,
+            admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("direct invitee entry single-attempt lock");
+        let outcome =
+            chat_protocol::read_authority::authorize_entries(&mut tx, guard, direct.graph.conversation_id)
+                .await
+                .err()
+                .expect("a direct-pending participant has no entry authority");
+        rollback_with_constraints(tx).await;
+        outcome
+    };
+    assert_eq!(
+        direct_entry_outcome,
         chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
-        "direct-pending remains NotEntitled"
+        "direct-pending authorizes state only, never application entries"
+    );
+
+    // No pending write authorization: pending participants have 0 active leaves
+    // and 0 application intervals in the database.
+    let direct_leaves: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.member_devices \
+         WHERE conversation_id=$1 AND user_did=$2 AND active",
+    )
+    .bind(direct.graph.conversation_id)
+    .bind(&direct.invitee.did)
+    .fetch_one(&direct_pool)
+    .await
+    .expect("count the direct invitee's active leaves");
+    assert_eq!(
+        direct_leaves, 0,
+        "a direct-pending participant has zero active leaves (no write capability)"
+    );
+
+    let direct_intervals: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.application_intervals \
+         WHERE conversation_id=$1 AND recipient_did=$2",
+    )
+    .bind(direct.graph.conversation_id)
+    .bind(&direct.invitee.did)
+    .fetch_one(&direct_pool)
+    .await
+    .expect("count the direct invitee's application intervals");
+    assert_eq!(
+        direct_intervals, 0,
+        "a direct-pending participant has zero application intervals"
+    );
+
+    // Unrelated DID remains NotEntitled to direct conversation state and entries.
+    let unrelated_did = b_read_fresh_did(0x0E);
+    let unrelated_device = Uuid::new_v4();
+    let unrelated_jkt =
+        register_read_device(&direct_pool, &unrelated_did, unrelated_device).await;
+    let unrelated_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getConversationState",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let (unrelated_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &direct_pool,
+        unrelated_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("unrelated single-attempt lock");
+    let unrelated_state_outcome = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        unrelated_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .err()
+    .expect("an unrelated requester is not entitled to direct conversation state");
+    assert_eq!(
+        unrelated_state_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "an unrelated DID remains NotEntitled to direct-pending conversation state"
+    );
+    rollback_with_constraints(tx).await;
+
+    let unrelated_entry_admission = fixture_read_admission(
+        &direct_pool,
+        "blue.catbird.chat.getEntries",
+        &unrelated_did,
+        unrelated_device,
+        &unrelated_jkt,
+    )
+    .await;
+    let (unrelated_entry_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &direct_pool,
+        unrelated_entry_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+    )
+    .await
+    .expect("unrelated entry single-attempt lock");
+    let unrelated_entry_outcome = chat_protocol::read_authority::authorize_entries(
+        &mut tx,
+        unrelated_entry_guard,
+        direct.graph.conversation_id,
+    )
+    .await
+    .err()
+    .expect("an unrelated requester has no entry authority on direct conversation");
+    assert_eq!(
+        unrelated_entry_outcome,
+        chat_protocol::read_authority::ReadAuthorityError::NotEntitled,
+        "an unrelated DID has no entry authority on direct conversation"
     );
     rollback_with_constraints(tx).await;
 }
@@ -6414,6 +6572,50 @@ async fn post_reset_old_exact_device_cannot_inherit_current_did_state() {
         "BREAD-05: the exact device's finite reset interval is classified before \
          the DID-only zero-leaf participant arm"
     );
+    // By contrast, a sibling device of the same reset-retired DID (which has NO
+    // exact-device finite interval) DOES authorize current state under the
+    // active-participant arm, proving exact-device finite interval precedence
+    // over the participant arm.
+    let sibling_device = Uuid::new_v4();
+    let sibling_jkt = register_read_device(&pool, &old.did, sibling_device).await;
+    let sibling_admission = fixture_read_admission(
+        &pool,
+        "blue.catbird.chat.getConversationState",
+        &old.did,
+        sibling_device,
+        &sibling_jkt,
+    )
+    .await;
+    let (sibling_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
+        &pool,
+        sibling_admission,
+        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetConversationState,
+    )
+    .await
+    .expect("sibling single-attempt lock");
+    let sibling_state = chat_protocol::read_authority::authorize_conversation_state(
+        &mut tx,
+        sibling_guard,
+        conversation_id,
+    )
+    .await
+    .expect("the sibling device without a finite interval authorizes state");
+    let sibling_view = chat_protocol::read_authority_bridge::state_authority_view(&sibling_state);
+    assert!(
+        matches!(
+            sibling_view.relationship.arm,
+            chat_protocol::read_authority_bridge::RelationshipArmView::ActiveParticipant
+        ),
+        "the sibling device carries the active-participant arm"
+    );
+    assert_eq!(
+        sibling_view.relationship.leaf_period_id, None,
+        "the sibling device has zero leaves"
+    );
+    assert_eq!(
+        sibling_view.relationship.open_membership_interval_id, None,
+        "the sibling device has no open membership interval"
+    );
     rollback_with_constraints(tx).await;
 }
 
@@ -6506,14 +6708,9 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
     let conversation_id = fixture.graph.conversation_id;
     let removed = &fixture.removed;
 
-    // A removed exact device is a FORMER leaf, so the entry capability is
-    // denied outright -- `authorize_entries` gates on a current open leaf.
-    // This is the frozen B-read rule and it matches
-    // `former_exact_device_gets_access_outside_membership_interval`, which
-    // asserts the same denial on this same fixture and device. The interval
-    // ordering / non-overlap / inclusive-terminal properties this test is named
-    // for are exercised against the creator below and, at the validator itself,
-    // by `interval_witness_boundary_tests`.
+    // A removed exact device has finite CONTROL-only authority. Current state
+    // and application history remain denied; the delivery facade intersects
+    // this finite interval with the exact per-entry control recipient set.
     let admission = fixture_read_admission(
         &pool,
         "blue.catbird.chat.getEntries",
@@ -6529,16 +6726,14 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
     )
     .await
     .expect("single-attempt lock");
-    let removed_outcome =
+    let removed_entries =
         chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
-            .await
-            .err()
-            .expect("a removed exact device holds no entry authority");
-    assert_eq!(
-        removed_outcome,
-        chat_protocol::read_authority::ReadAuthorityError::AccessOutsideMembershipInterval,
-        "the former-device denial is the outside-interval error, never an interval union"
-    );
+            .await.expect("a removed exact device can catch up finite terminal controls");
+    let removed_view = chat_protocol::read_authority_bridge::entry_authority_view(&removed_entries);
+    assert!(!removed_view.ordered_intervals.is_empty());
+    assert!(removed_view.ordered_intervals.iter().all(|interval| matches!(
+        interval.terminal, chat_protocol::read_authority_bridge::IntervalTerminalView::Closed { .. }
+    )));
     rollback_with_constraints(tx).await;
 
     // The creator's open interval is the last (only) interval and observes the
@@ -7079,7 +7274,8 @@ async fn inventory_precedence_is_close_open_finite_participant_none() {
         "the reset-closed exact device selects the removal arm, not state"
     );
 
-    // None arm: the direct-pending invitee is a candidate but yields no item.
+    // Participant arm (pending): the direct-pending invitee is a candidate AND
+    // receives its authorized state-only inventory item.
     let direct_fixture = executor_seed::private_genuine_direct_pending_graph().await;
     let direct_pool = direct_fixture.pool.clone();
     let direct_candidate: i64 = sqlx::query_scalar(
@@ -7092,8 +7288,7 @@ async fn inventory_precedence_is_close_open_finite_participant_none() {
     .expect("count the direct-pending candidate rows");
     assert_eq!(
         direct_candidate, 1,
-        "the direct-pending invitee IS a candidate (arm precedence excludes it, \
-         not candidate discovery)"
+        "the direct-pending invitee IS a candidate"
     );
     let direct_admission = fixture_read_admission(
         &direct_pool,
@@ -7111,9 +7306,80 @@ async fn inventory_precedence_is_close_open_finite_participant_none() {
     .await;
     assert_eq!(
         direct_run.authorities.len(),
-        0,
-        "direct-pending selects no inventory item"
+        1,
+        "direct-pending selects exactly one state inventory item"
     );
+    let direct_view = &direct_run.authorities[0];
+    assert_eq!(
+        direct_view.conversation_id,
+        direct_fixture.graph.conversation_id
+    );
+    match &direct_view.arm {
+        chat_protocol::read_authority_bridge::InventoryArmView::State {
+            participant_period_id,
+        } => {
+            assert_eq!(
+                *participant_period_id,
+                direct_fixture.invitee.participant_period_id,
+                "the state arm binds the direct-pending participant period"
+            );
+        }
+        other => panic!("direct-pending must select the state arm, found {other:?}"),
+    }
+    assert_eq!(direct_view.txid, direct_run.device_txid);
+    assert_eq!(direct_view.device_binding_sha256, direct_run.device_binding);
+    assert_eq!(
+        direct_view.fence.protocol_instance_id,
+        direct_fixture.graph.protocol_instance_id
+    );
+    assert_ne!(
+        direct_view.graph_digest, [0_u8; 32],
+        "inventory state carries nonzero graph digest"
+    );
+    assert_ne!(
+        direct_view.snapshot_digest, [0_u8; 32],
+        "inventory state carries nonzero snapshot digest"
+    );
+
+    // Group-pending invitee parity in inventory: also selects State arm.
+    let group_fixture = executor_seed::private_genuine_group_pending_graph().await;
+    let group_pool = group_fixture.pool.clone();
+    let group_admission = fixture_read_admission(
+        &group_pool,
+        "blue.catbird.chat.getConversations",
+        &group_fixture.invitee.did,
+        group_fixture.invitee.device_id,
+        &group_fixture.invitee.dpop_jkt,
+    )
+    .await;
+    let group_run = inventory_run_for_fixture(
+        &group_pool,
+        group_fixture.graph.protocol_instance_id,
+        group_admission,
+    )
+    .await;
+    assert_eq!(
+        group_run.authorities.len(),
+        1,
+        "group-pending selects exactly one state inventory item"
+    );
+    let group_view = &group_run.authorities[0];
+    assert_eq!(
+        group_view.conversation_id,
+        group_fixture.graph.conversation_id
+    );
+    match &group_view.arm {
+        chat_protocol::read_authority_bridge::InventoryArmView::State {
+            participant_period_id,
+        } => {
+            assert_eq!(
+                *participant_period_id,
+                group_fixture.invitee.participant_period_id,
+                "the state arm binds the group-pending participant period"
+            );
+        }
+        other => panic!("group-pending must select the state arm, found {other:?}"),
+    }
 
     // None: an unrelated requester is not even a candidate.
     let (unrelated_pool, _unrelated_guard, unrelated_graph) = private_genuine_graph().await;

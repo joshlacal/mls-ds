@@ -38,9 +38,10 @@
 // matrix over the hydrated conversation aggregate:
 //
 // - a current exact open leaf authorizes state and entries;
-// - an eligible active zero-leaf participant or group-pending participant
+// - a finite exact Remove/Close interval separately authorizes bounded control
+//   reads only; it grants neither current state nor application ciphertext;
+// - an eligible active zero-leaf participant or pending participant
 //   authorizes current state only;
-// - direct-pending remains `NotEntitled`;
 // - a finite reset/remove interval for the requesting exact device takes
 //   precedence over same-DID current participation unless the same exact
 //   device has a later valid open interval (BREAD-05);
@@ -98,7 +99,7 @@ use crate::chat_protocol::{
         ConversationStateHydrationError, LockedConversationStateGuard,
     },
     state_machine::{
-        AccessInterval, AccessIntervalEnd, ConversationKind, ConversationState, DeviceIdentity,
+        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity,
         PrincipalId,
     },
 };
@@ -553,7 +554,7 @@ fn exact_device_interval_facts<'a>(
 enum ClassifiedRelationshipArm {
     OpenLeaf { open_membership_interval_id: Uuid },
     ActiveParticipant,
-    GroupPendingParticipant,
+    PendingParticipant,
 }
 
 /// The exact readiness-amendment classification matrix, over the hydrated
@@ -617,13 +618,9 @@ fn classify_current_relationship(
     match (
         participant.is_active(),
         participant.is_pending(),
-        state.kind(),
     ) {
-        (true, _, _) => Ok(ClassifiedRelationshipArm::ActiveParticipant),
-        (_, true, ConversationKind::Group) => {
-            Ok(ClassifiedRelationshipArm::GroupPendingParticipant)
-        }
-        (_, true, ConversationKind::Direct) => Err(ReadAuthorityError::NotEntitled),
+        (true, _) => Ok(ClassifiedRelationshipArm::ActiveParticipant),
+        (_, true) => Ok(ClassifiedRelationshipArm::PendingParticipant),
         _ => Err(ReadAuthorityError::NotEntitled),
     }
 }
@@ -648,7 +645,7 @@ pub(crate) enum CurrentConversationRelationshipWitness {
     CurrentActiveParticipant {
         participant_period_id: Uuid,
     },
-    CurrentGroupPendingParticipant {
+    CurrentPendingParticipant {
         participant_period_id: Uuid,
     },
 }
@@ -663,7 +660,7 @@ impl CurrentConversationRelationshipWitness {
             | Self::CurrentActiveParticipant {
                 participant_period_id,
             }
-            | Self::CurrentGroupPendingParticipant {
+            | Self::CurrentPendingParticipant {
                 participant_period_id,
             } => *participant_period_id,
         }
@@ -836,8 +833,8 @@ pub(crate) async fn authorize_conversation_state(
                 participant_period_id,
             }
         }
-        ClassifiedRelationshipArm::GroupPendingParticipant => {
-            CurrentConversationRelationshipWitness::CurrentGroupPendingParticipant {
+        ClassifiedRelationshipArm::PendingParticipant => {
+            CurrentConversationRelationshipWitness::CurrentPendingParticipant {
                 participant_period_id,
             }
         }
@@ -966,18 +963,37 @@ impl ControlRecipientFenceWitness {
     }
 }
 
+/// Entry-only binding. A finite control read never mints current-state
+/// authority or a synthetic open-leaf relationship. The head and exact device
+/// locks remain owned until the entry facade has finished projecting rows.
+pub(crate) struct EntryConversationReadAuthority {
+    device: LockedReadDeviceAuthority,
+    _conversation: LockedConversationStateGuard,
+}
+impl EntryConversationReadAuthority {
+    pub(in crate::chat_protocol) fn user_did(&self) -> &str { self.device.user_did() }
+    pub(in crate::chat_protocol) fn device_id(&self) -> Uuid { self.device.device_id() }
+}
+
 /// The checked entry authority. `pub(crate)` per the frozen internal
 /// interfaces; accessors are `pub(in crate::chat_protocol)` (BREAD-08).
 pub(crate) struct EntryReadAuthority {
-    conversation: ConversationStateReadAuthority,
+    conversation: EntryConversationReadAuthority,
+    // Historical access is controls only, in this exact device's latest finite
+    // Remove/Close interval. None retains the existing current-open-leaf scope.
+    terminal_control_interval: Option<(u64, u64)>,
     ordered_intervals: Box<[EntryIntervalWitness]>,
     ordered_intervals_sha256: [u8; 32],
     control_recipient_fence: ControlRecipientFenceWitness,
 }
 
 impl EntryReadAuthority {
-    pub(in crate::chat_protocol) fn conversation(&self) -> &ConversationStateReadAuthority {
+    pub(in crate::chat_protocol) fn conversation(&self) -> &EntryConversationReadAuthority {
         &self.conversation
+    }
+
+    pub(in crate::chat_protocol) fn terminal_control_interval(&self) -> Option<(u64, u64)> {
+        self.terminal_control_interval
     }
 
     pub(in crate::chat_protocol) fn ordered_intervals(&self) -> &[EntryIntervalWitness] {
@@ -1294,30 +1310,42 @@ async fn load_control_recipient_fence(
     })
 }
 
-/// Authorize exact application entries and the control-recipient fence for
-/// one locked read device. Succeeds only for a `CurrentOpenLeaf` relationship;
-/// a former-only, terminal-only, or post-reset-old device returns
-/// `AccessOutsideMembershipInterval`, and a state-only witness (zero-leaf
-/// participant, group-pending) returns `NotEntitled`.
+/// Current exact open leaves retain their existing entry scope. An exact
+/// device whose latest finite interval ended in Remove or Close may obtain
+/// only separately entitled control entries within that interval. Current
+/// state, historical application ciphertext, same-DID sibling participation,
+/// and Reset/Replace-only intervals cannot mint this finite capability.
 pub(crate) async fn authorize_entries(
     tx: &mut Transaction<'_, Postgres>,
     device: LockedReadDeviceAuthority,
     conversation_id: Uuid,
 ) -> Result<EntryReadAuthority, ReadAuthorityError> {
-    let state = match authorize_conversation_state(tx, device, conversation_id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("authorize_entries step 1 authorize_conversation_state failed: {:?}", e);
-            return Err(e);
+    assert_same_transaction(tx, device.txid()).await?;
+    let locked_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+            .fetch_one(&mut **tx).await.map_err(|_| ReadAuthorityError::Storage)?;
+    let locked = hydrate_locked_conversation_state(tx, conversation_id, locked_at)
+        .await.map_err(map_hydration_error)?;
+    let facts = exact_device_interval_facts(device.user_did(), device.device_id(), locked.state())?;
+    let terminal_control_interval = if facts.open.is_some() {
+        // Preserve the current-open row witnesses required by the old gate.
+        load_participant_period_id(tx, conversation_id, device.user_did()).await?;
+        load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await?;
+        locked.locked_snapshot_digest().ok_or(ReadAuthorityError::Invariant)?;
+        None
+    } else if let Some(interval) = facts.latest_finite {
+        let end = interval.end().ok_or(ReadAuthorityError::Invariant)?;
+        match end.kind() {
+            crate::chat_protocol::state_machine::CloseKind::Remove => {}
+            crate::chat_protocol::state_machine::CloseKind::Terminal
+                if facts.terminal && facts.terminal_proof_holder => {}
+            _ => return Err(ReadAuthorityError::AccessOutsideMembershipInterval),
         }
-    };
-    if !matches!(
-        state.relationship(),
-        CurrentConversationRelationshipWitness::CurrentOpenLeaf { .. }
-    ) {
-        tracing::error!("authorize_entries step 2 relationship is not CurrentOpenLeaf: {:?}", state.relationship());
+        Some((interval.opening_seq(), end.seq()))
+    } else {
         return Err(ReadAuthorityError::NotEntitled);
-    }
+    };
+    let state = EntryConversationReadAuthority { device, _conversation: locked };
 
     let rows = match load_exact_device_interval_rows(tx, conversation_id, state.user_did(), state.device_id()).await {
         Ok(r) => r,
@@ -1362,6 +1390,7 @@ pub(crate) async fn authorize_entries(
     };
     Ok(EntryReadAuthority {
         conversation: state,
+        terminal_control_interval,
         ordered_intervals,
         ordered_intervals_sha256,
         control_recipient_fence,
@@ -1752,10 +1781,10 @@ fn classify_inventory_arm(
     if participant.is_active() {
         return Ok(InventoryArmDecision::State);
     }
-    if participant.is_pending() && state.kind() == ConversationKind::Group {
+    if participant.is_pending() {
         return Ok(InventoryArmDecision::State);
     }
-    // Direct-pending and unknown statuses yield no item.
+    // Ineligible or unknown participant statuses yield no item.
     Ok(InventoryArmDecision::None)
 }
 
