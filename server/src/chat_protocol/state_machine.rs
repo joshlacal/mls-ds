@@ -18709,6 +18709,37 @@ fn require_reset_activation_body(
         {
             Ok(())
         }
+        Some(TransitionBodyBinding::ResetActivation {
+            kind: signed_kind,
+            reset_request_id: signed_request_id,
+            prior: signed_prior,
+            retired: signed_retired,
+            successor: signed_successor,
+            manifest,
+            group_info_sha256,
+            metadata,
+            ..
+        }) => {
+            tracing::warn!(
+                kind_ok = *signed_kind == prior.kind,
+                request_id_ok = signed_request_id == reset_request_id,
+                prior_ok = signed_prior == &prior.coordinate,
+                retired_ok = signed_retired == retired,
+                successor_ok = signed_successor == successor,
+                no_authority = evidence.authority.is_none(),
+                group_info_ok =
+                    successor_public_state.verified_group_info_sha256() == Some(group_info_sha256),
+                manifest_ok = reset_manifest_matches(manifest, prior, actor),
+                metadata_ok = reset_metadata_matches(
+                    evidence,
+                    prior,
+                    metadata,
+                    successor_public_state.coordinate()
+                ),
+                "reset activation body rejected"
+            );
+            Err(StateMachineError::InvalidTransition)
+        }
         Some(_) => Err(StateMachineError::InvalidTransition),
         None => Ok(()),
     }
@@ -18736,6 +18767,22 @@ fn reset_metadata_matches(
         .is_some_and(|version| version == next.metadata_version)
         && next.origin_transition_id == evidence.transition_id
         && metadata_author_matches_evidence(next, evidence);
+    if !(reencrypted || fresh_empty) {
+        let authority = evidence.authority.as_ref();
+        tracing::warn!(
+            prev_version = previous.metadata_version,
+            next_version = next.metadata_version,
+            origin_tid_ok = next.origin_transition_id == evidence.transition_id,
+            author_ok = authority.is_some_and(|a| next.author_proof.author == a.actor),
+            key_ok = authority.is_some_and(|a| next.author_proof.author_key_id == a.key_id),
+            auth_gen_ok = authority
+                .is_some_and(|a| next.author_proof.auth_generation_at_origin == a.auth_generation),
+            proof_tid_ok = next.author_proof.origin_transition_id == evidence.transition_id,
+            proof_seq = next.author_proof.origin_seq,
+            evidence_seq = evidence.seq,
+            "reset metadata snapshot rejected"
+        );
+    }
     reencrypted || fresh_empty
 }
 

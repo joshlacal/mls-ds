@@ -62,7 +62,10 @@ fn map_snapshot_error(error: PublicGroupSnapshotError) -> PublicStateError {
         PublicGroupSnapshotError::SnapshotDigestMismatch => {
             PublicStateError::SnapshotDigestMismatch
         }
-        _ => PublicStateError::InvalidSnapshot,
+        other => {
+            tracing::warn!(error = ?other, "public group snapshot rejected");
+            PublicStateError::InvalidSnapshot
+        }
     }
 }
 

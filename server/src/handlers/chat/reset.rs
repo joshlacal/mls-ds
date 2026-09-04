@@ -111,6 +111,9 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
     use ResetRepositoryError as R;
     use StateMachineError as S;
 
+    // Invariant failures are never exposed to clients; keep the cause
+    // in the server log so a 500 here is diagnosable.
+    let detail = format!("{error:?}");
     match error {
         E::Database(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => prelude_failure(endpoint, error),
@@ -158,7 +161,10 @@ fn reset_failure(endpoint: ChatEndpoint, error: ResetFacadeError) -> ChatFailure
         | E::Repository(_)
         | E::StateMachine(_)
         | E::ExecutionContext(_)
-        | E::Executor(_) => ChatFailure::invariant(endpoint),
+        | E::Executor(_) => {
+            tracing::error!(endpoint = endpoint.nsid(), error = %detail, "reset handler invariant failure");
+            ChatFailure::invariant(endpoint)
+        }
     }
 }
 

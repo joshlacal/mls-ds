@@ -5660,7 +5660,9 @@ struct RetainedRecoveryInboxEntry {
     input: super::super::read_projection::LeafRecoveryInboxInput,
 }
 
-/// Every retained leaf-recovery request (all five statuses) and every retained
+/// Every retained leaf-recovery request (all five statuses) for the exact
+/// device, plus every *open* request in a conversation where this device
+/// holds a live leaf (only such a leaf can fulfil it), then every retained
 /// recovery-work item (all three statuses) for the exact device, in the
 /// canonical 0x00-requests-then-0x01-work ordinal order.
 async fn retained_recovery_inbox_entries(
@@ -5711,8 +5713,15 @@ async fn retained_recovery_inbox_entries(
             ON package.key_package_ref = reservation.key_package_ref
           JOIN chat.conversations AS conversation
             ON conversation.conversation_id = request.conversation_id
-         WHERE request.requester_did = $1
-           AND request.requester_device_id = $2
+         WHERE (request.requester_did = $1 AND request.requester_device_id = $2)
+            OR (request.status = 'open'
+                AND EXISTS (
+                    SELECT 1 FROM chat.member_devices AS leaf
+                     WHERE leaf.conversation_id = request.conversation_id
+                       AND leaf.generation = request.generation
+                       AND leaf.user_did = $1
+                       AND leaf.device_id = $2
+                       AND leaf.active))
          ORDER BY request.recovery_request_id
         "#,
     )
