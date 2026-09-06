@@ -248,6 +248,13 @@ struct LeafRecoverySourceRow {
 
 #[cfg(test)]
 mod tests {
+    mod fresh_db {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_support/fresh_db.rs"
+        ));
+    }
+
     use super::*;
     use chrono::Duration;
     use sha2::{Digest, Sha256};
@@ -348,12 +355,7 @@ mod tests {
     async fn pending_recovery_sql_enforces_target_coordinate_and_liveness() {
         // Copy column types into transaction-local temporary tables only. This
         // exercises production SQL without resetting or mutating durable rows.
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
-        assert_eq!(
-            url,
-            "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722"
-        );
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let (pool, _database) = fresh_db::fresh_full_catalog_pool("actor_convo_", 1).await;
         let mut tx = pool.begin().await.unwrap();
         for table in [
             "leaf_recovery_requests",
