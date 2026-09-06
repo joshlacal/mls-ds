@@ -294,6 +294,9 @@ fn map_repository_error(endpoint: ChatEndpoint, error: InventoryRepositoryError)
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CursorExpired)
         }
         E::Cursor(_) => ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest),
+        E::RateLimited { retry_after_secs } => ChatFailure::protocol_with_retry(
+            endpoint, ChatProtocolErrorCode::RateLimited, Some(retry_after_secs),
+        ),
         E::Database(_) => ChatFailure::storage(endpoint),
         E::SecureRandom(_)
         | E::Sealer(_)

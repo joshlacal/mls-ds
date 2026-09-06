@@ -15,14 +15,19 @@ use uuid::Uuid;
 use crate::chat_protocol::{
     dpop::VerifiedChatDeviceRequest,
     repository::{
-        core::{hydrate_locked_conversation_state, ConversationStateHydrationError},
+        core::{
+            hydrate_locked_conversation_state, hydrate_locked_reserved_recovery_package,
+            ConversationStateHydrationError, LockedConversationStateGuard,
+            LockedRecoveryPackageGuard, RecoveryPackageHydrationError,
+        },
         execution_context::{
             apply_prepared_leave_lifecycle_execution, prepare_leave_lifecycle_execution,
             ExecutionContextHydrationError,
         },
         prelude::{
-            CanonicalDeviceIdentity, CanonicalLockScope, OperationReservationGuard, PreludeError,
-            PreparedSignedOperation, PreparedSignedOperationState, ScopeBoundBusinessAuthority,
+            discover_conversation_event_lock_scope, CanonicalDeviceIdentity, CanonicalLockScope,
+            OperationReservationGuard, PreludeError, PreparedSignedOperation,
+            PreparedSignedOperationState, ScopeBoundBusinessAuthority,
         },
         transition::TransitionRepositoryError,
     },
@@ -179,6 +184,12 @@ async fn execute_first(
     {
         return Err(LeaveFacadeError::InvalidCanonicalMaterial);
     }
+    // The head may have changed between discovery and its lock. Rediscovery
+    // uses the same complete audience recipe, including historical Close
+    // recipients, before any executor can acquire an audience device lock.
+    if discover_scope(transaction, &authority, parsed.conversation_id).await? != initial_scope {
+        return Err(LeaveFacadeError::Prelude(PreludeError::ScopeDrift));
+    }
     let registration = HydrationAuthority::from_locked_conversation(&aggregate)?
         .locked_registration_from_scope_authority(scope_authority)?;
     let entry_id = CanonicalUuidV4::parse(&Uuid::new_v4().hyphenated().to_string())
@@ -195,14 +206,28 @@ async fn execute_first(
     )?;
     let products = CanonicalControlEntryProducts::mint(&entry)
         .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+    // Closing or removing a zero-leaf participant changes the coordinate and
+    // supersedes every open recovery reservation at that coordinate. Carry
+    // each locked package guard into the planner so those releases are atomic.
+    // Durable leave requests and cancellations do not change the coordinate.
+    let terminal_packages = match parsed.kind {
+        SignedMutationKind::ZeroLeafLeave | SignedMutationKind::ConversationClose => {
+            hydrate_terminal_recovery_packages(transaction, &aggregate).await?
+        }
+        _ => Vec::new(),
+    };
     let planned = match parsed.kind {
         SignedMutationKind::LeaveRequest => {
             hydration_plan_request(&aggregate, entry, registration)?
         }
-        SignedMutationKind::ZeroLeafLeave => HydrationAuthority::from_locked_conversation(
-            &aggregate,
-        )?
-        .plan_zero_leaf_leave_entry(&aggregate, entry, &registration, Vec::new())?,
+        SignedMutationKind::ZeroLeafLeave => {
+            HydrationAuthority::from_locked_conversation(&aggregate)?.plan_zero_leaf_leave_entry(
+                &aggregate,
+                entry,
+                &registration,
+                terminal_packages,
+            )?
+        }
         SignedMutationKind::LeaveCancellation => {
             HydrationAuthority::from_locked_conversation(&aggregate)?
                 .plan_leave_cancellation_entry(&aggregate, entry, registration)?
@@ -210,15 +235,20 @@ async fn execute_first(
         SignedMutationKind::ConversationClose => HydrationAuthority::from_locked_conversation(
             &aggregate,
         )?
-        .plan_close_entry(&aggregate, entry, &registration, Vec::new())?,
+        .plan_close_entry(&aggregate, entry, &registration, terminal_packages)?,
         _ => return Err(LeaveFacadeError::UnsupportedMutation),
     };
     let plan = planned.into_persistence_plan()?;
     let response_bytes = response_for_plan(&plan, products.canonical_response_json(), parsed)?;
     let (scope_authority, completion) = prepared.into_execution_parts();
-    let execution =
-        prepare_leave_lifecycle_execution(transaction, &plan, products.durable_json().to_vec())
-            .await?;
+    let event_scope = scope_authority.event_lock_scope();
+    let execution = prepare_leave_lifecycle_execution(
+        transaction,
+        &plan,
+        products.durable_json().to_vec(),
+        &event_scope,
+    )
+    .await?;
     let applied = apply_prepared_leave_lifecycle_execution(execution).await?;
     let event_position = applied.event_positions.first().copied();
     if event_position.is_none() {
@@ -234,6 +264,36 @@ async fn execute_first(
             completion,
         }),
     })
+}
+
+async fn hydrate_terminal_recovery_packages(
+    transaction: &mut Transaction<'_, Postgres>,
+    aggregate: &LockedConversationStateGuard,
+) -> Result<Vec<LockedRecoveryPackageGuard>, LeaveFacadeError> {
+    let mut request_ids = aggregate
+        .state()
+        .recovery_requests()
+        .iter()
+        .filter(|request| {
+            request.status() == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open
+        })
+        .map(|request| Uuid::from_bytes(*request.request_id()))
+        .collect::<Vec<_>>();
+    request_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut packages = Vec::with_capacity(request_ids.len());
+    for request_id in request_ids {
+        let package =
+            hydrate_locked_reserved_recovery_package(transaction, aggregate.head(), request_id)
+                .await
+                .map_err(|error| match error {
+                    RecoveryPackageHydrationError::Database(error) => {
+                        LeaveFacadeError::Database(error)
+                    }
+                    _ => LeaveFacadeError::InvalidCanonicalMaterial,
+                })?;
+        packages.push(package);
+    }
+    Ok(packages)
 }
 
 fn hydration_plan_request(
@@ -296,13 +356,26 @@ async fn discover_scope(
     let devices: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT device.user_did, device.device_id FROM chat.devices device JOIN chat.participants p ON p.user_did=device.user_did WHERE p.conversation_id=$1 AND p.current_membership UNION SELECT $2::text,$3::uuid ORDER BY 1,2",
     ).bind(conversation_id).bind(actor_did).bind(actor_device).fetch_all(&mut **transaction).await?;
-    CanonicalLockScope::new(
+    let seed = CanonicalLockScope::new(
         principals,
         devices
             .into_iter()
             .map(|(did, device_id)| CanonicalDeviceIdentity::new(did, device_id))
             .collect(),
+    )?;
+    // Closing also terminalizes historical schedules; their exact recipients
+    // must be locked even when their account no longer belongs to the chat.
+    let include_historical = authority
+        .mutation()
+        .is_some_and(|mutation| mutation.kind() == SignedMutationKind::ConversationClose);
+    discover_conversation_event_lock_scope(
+        transaction,
+        conversation_id,
+        &seed,
+        &[],
+        include_historical,
     )
+    .await
     .map_err(Into::into)
 }
 
@@ -373,7 +446,13 @@ fn build_entry(
     signing_key: &[u8],
 ) -> Result<crate::chat_protocol::transcript::VerifiedControlEntry, LeaveFacadeError> {
     let server_fields = if parsed.kind == SignedMutationKind::ConversationClose {
-        let tombstone = json!({"$type":"blue.catbird.chat.defs#conversationCloseTombstone","closedAt":authority.trusted_instant().as_canonical().as_str(),"closedByDeviceId":authority.device_id().as_str(),"closedByDid":authority.subject().as_str(),"conversationId":parsed.conversation_id.hyphenated().to_string(),"conversationKind":match aggregate.state().kind(){ConversationKind::Direct=>"direct",ConversationKind::Group=>"group"},"retired":coordinate_json(aggregate.state().coordinate())?,"terminalSeq":aggregate.head().next_entry_seq()});
+        let retired = match mutation.projection() {
+            VerifiedMutationProjection::ConversationClose(value) => {
+                coordinate_field(&value.body(), "retired")?
+            }
+            _ => return Err(LeaveFacadeError::UnsupportedMutation),
+        };
+        let tombstone = json!({"closedAt":authority.trusted_instant().as_canonical().as_str(),"closedByDeviceId":authority.device_id().as_str(),"closedByDid":authority.subject().as_str(),"conversationId":parsed.conversation_id.hyphenated().to_string(),"conversationKind":match aggregate.state().kind(){ConversationKind::Direct=>"direct",ConversationKind::Group=>"group"},"retired":coordinate_json(&retired)?,"terminalSeq":aggregate.head().next_entry_seq()});
         CanonicalControlServerFields::decode(
             ControlEntryKind::ConversationClose,
             serde_json::to_vec(&json!({"tombstone":tombstone}))
@@ -416,6 +495,18 @@ fn coordinate_json(coordinate: &PublicGroupSnapshotCoordinate) -> Result<Value, 
     )
 }
 
+fn response_coordinate_json(
+    coordinate: &PublicGroupSnapshotCoordinate,
+) -> Result<Value, LeaveFacadeError> {
+    let mut value = coordinate_json(coordinate)?;
+    // Closed-union DTO decoding goes through structured ATProto Data, whose
+    // byte fields require the explicit JSON bytes representation.
+    for field in ["groupId", "groupContextHash", "confirmationTag"] {
+        value[field] = json!({"$bytes": value[field].clone()});
+    }
+    Ok(value)
+}
+
 fn response_for_plan(
     plan: &crate::chat_protocol::state_machine::ConversationPersistencePlan,
     entry_json: &[u8],
@@ -433,7 +524,7 @@ fn response_for_plan(
             json!({"leaveRequest":leave_view_json(parsed.conversation_id,request)?,"entry":entry})
         }
         SignedMutationKind::ZeroLeafLeave => {
-            json!({"result":{"$type":"blue.catbird.chat.defs#zeroLeafLeaveResult","coordinates":coordinate_json(plan.successor_coordinate().ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?)?,"entry":entry}})
+            json!({"result":{"$type":"blue.catbird.chat.defs#zeroLeafLeaveResult","coordinates":response_coordinate_json(plan.successor_coordinate().ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?)?,"entry":entry}})
         }
         SignedMutationKind::ConversationClose => {
             json!({"result":{"tombstone":entry.get("tombstone").ok_or(LeaveFacadeError::InvalidCanonicalMaterial)?,"entry":entry}})
@@ -448,10 +539,9 @@ fn response_for_plan(
         SignedMutationKind::ConversationClose => serde_json::from_slice::<catbird_atproto::generated::blue_catbird::chat::close_conversation::CloseConversationOutput>(&bytes).and_then(|v|serde_json::to_vec(&v)),
         _ => return Err(LeaveFacadeError::UnsupportedMutation),
     }.map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
-    if valid != bytes {
-        return Err(LeaveFacadeError::InvalidCanonicalMaterial);
-    }
-    Ok(bytes)
+    // Generated DTO serialization is the response byte authority. Its field
+    // order differs from serde_json::Value even for the same valid object.
+    Ok(valid)
 }
 
 fn leave_view_json(
@@ -467,7 +557,7 @@ fn leave_view_json(
             .ok_or(LeaveFacadeError::InvalidCanonicalMaterial)
     };
     Ok(
-        json!({"leaveRequestId":Uuid::from_bytes(*request.request_id()).hyphenated().to_string(),"conversationId":conversation_id.hyphenated().to_string(),"requesterDid":requester_did,"requesterDeviceId":Uuid::from_bytes(*requester.device_id()).hyphenated().to_string(),"prior":coordinate_json(request.bound_coordinate())?,"status":match request.status(){LeaveRequestStatus::Pending=>"pending",LeaveRequestStatus::Fulfilled=>"fulfilled",LeaveRequestStatus::Cancelled=>"cancelled",LeaveRequestStatus::Expired=>"expired",LeaveRequestStatus::Stale=>"stale"},"requestedAt":at(request.received_at().unix_millis())?.to_rfc3339_opts(SecondsFormat::Millis,true),"expiresAt":at(request.expires_at().unix_millis())?.to_rfc3339_opts(SecondsFormat::Millis,true)}),
+        json!({"leaveRequestId":Uuid::from_bytes(*request.request_id()).hyphenated().to_string(),"conversationId":conversation_id.hyphenated().to_string(),"requesterDid":requester_did,"requesterDeviceId":Uuid::from_bytes(*requester.device_id()).hyphenated().to_string(),"prior":response_coordinate_json(request.bound_coordinate())?,"status":match request.status(){LeaveRequestStatus::Pending=>"pending",LeaveRequestStatus::Fulfilled=>"fulfilled",LeaveRequestStatus::Cancelled=>"cancelled",LeaveRequestStatus::Expired=>"expired",LeaveRequestStatus::Stale=>"stale"},"requestedAt":at(request.received_at().unix_millis())?.to_rfc3339_opts(SecondsFormat::Millis,true),"expiresAt":at(request.expires_at().unix_millis())?.to_rfc3339_opts(SecondsFormat::Millis,true)}),
     )
 }
 

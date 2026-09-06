@@ -5,6 +5,8 @@
 // locks and authorizes the exact requester device, and keeps that transaction
 // open while projecting the state and pending control-plane requests.
 
+mod recovery;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use jacquard_common::{deps::smol_str::SmolStr, types::string::Did};
 use sqlx::{FromRow, Postgres, Transaction};
@@ -75,6 +77,7 @@ pub(crate) async fn read_conversation_state_for_admission(
     Ok(CanonicalConversationStateResponse {
         bytes: canonical_conversation_state_response(
             &output.state,
+            output.pending_leaf_recovery_requests.as_deref().unwrap_or_default(),
             &output.pending_leave_requests,
             &output.pending_reset_requests,
         )?,
@@ -112,10 +115,14 @@ async fn read_conversation_state_in_transaction(
             (Vec::new(), Vec::new())
         };
 
+    let pending_leaf_recovery_requests =
+        recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
+
     Ok(
         catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
             GetConversationStateOutput {
                 pending_leave_requests,
+                pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
                 pending_reset_requests,
                 state,
                 extra_data: None,
@@ -141,6 +148,7 @@ fn append_canonical_array<T: serde::Serialize>(
 
 fn canonical_conversation_state_response(
     state: &catbird_atproto::generated::blue_catbird::chat::ConversationState,
+    pending_leaf_recovery_requests: &[catbird_atproto::generated::blue_catbird::chat::LeafRecoveryView],
     pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
     pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
 ) -> Result<Vec<u8>, ConversationStateReadError> {
@@ -148,7 +156,13 @@ fn canonical_conversation_state_response(
         encode_canonical_generated_chat_json_v1(state, "blue.catbird.chat.defs#conversationState")
             .map_err(|_| ConversationStateReadError::Invariant)?;
     let mut bytes = Vec::with_capacity(canonical_state.bytes().len() + 64);
-    bytes.extend_from_slice(br#"{"pendingLeaveRequests":["#);
+    bytes.extend_from_slice(br#"{"pendingLeafRecoveryRequests":["#);
+    append_canonical_array(
+        &mut bytes,
+        pending_leaf_recovery_requests,
+        "blue.catbird.chat.defs#leafRecoveryView",
+    )?;
+    bytes.extend_from_slice(br#"],"pendingLeaveRequests":["#);
     append_canonical_array(
         &mut bytes,
         pending_leave_requests,
@@ -484,12 +498,15 @@ mod tests {
         let response: serde_json::Value = serde_json::from_slice(
             &canonical_conversation_state_response(
                 &state,
+                &[],
                 &pending_leave_requests,
                 &pending_reset_requests,
             )
             .expect("encode canonical response"),
         )
         .expect("decode response");
+
+        assert_eq!(response["pendingLeafRecoveryRequests"], serde_json::json!([]));
 
         for path in [
             "/state/metadataSnapshot/coordinate/conversationId/$bytes",

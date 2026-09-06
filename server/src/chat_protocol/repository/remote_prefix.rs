@@ -6,6 +6,10 @@ use super::core;
 use super::execution_context::{
     hydrate_historical_execution_context, ExecutionContextHydrationError,
 };
+use super::prelude::{
+    discover_conversation_event_lock_scope, lock_conversation_event_scope, CanonicalDeviceIdentity,
+    CanonicalLockScope, ConversationEventLockScope,
+};
 use crate::chat_protocol::state_machine::executor::{
     apply_conversation_persistence_plan, ExecutionContext,
 };
@@ -125,6 +129,7 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
         selector: &RemotePrefixBootstrapSelector,
         participant_routes: &BTreeMap<String, Option<String>>,
         event: &StrictCleanRemoteEvent,
+        event_scope: &ConversationEventLockScope,
     ) -> Result<Self, RemotePrefixBootstrapError> {
         if admission_digest == &[0; 32] {
             return Err(RemotePrefixBootstrapError::Authority);
@@ -137,6 +142,16 @@ impl<'borrow, 'conn> HistoricalPrefixAuthority<'borrow, 'conn> {
         // 1. Read the canonical signer tuple from the exact signed wrapper.
         let (actor_did, actor_device_id, key_id_expected, auth_gen_expected) =
             canonical_event_signer(event)?;
+
+        // The transaction-wide union was locked before its first head lock.
+        // This check grants no authority; the original registration, signature,
+        // route, and historical-plan checks below still decide admission.
+        let signer_scope = CanonicalLockScope::new(
+            vec![],
+            vec![CanonicalDeviceIdentity::new(&actor_did, actor_device_id)],
+        )
+        .map_err(|_| RemotePrefixBootstrapError::Authority)?;
+        require_prefix_event_scope(transaction, event_scope, &signer_scope).await?;
 
         // 2. Lock and verify the signer's identity in the database.
         let row: Option<(
@@ -507,7 +522,10 @@ struct PreparedHistoricalPrefixStep<'borrow, 'conn> {
 
 impl<'borrow, 'conn> PreparedHistoricalPrefixStep<'borrow, 'conn> {
     /// Consume the step and apply it atomically inside the caller's transaction.
-    async fn apply(self) -> Result<AppliedTransition, ExecutorError> {
+    async fn apply(
+        self,
+        event_scope: &ConversationEventLockScope,
+    ) -> Result<AppliedTransition, ExecutorError> {
         let prepared = hydrate_historical_execution_context(
             self.transaction,
             &self.plan,
@@ -518,6 +536,7 @@ impl<'borrow, 'conn> PreparedHistoricalPrefixStep<'borrow, 'conn> {
             self.artifacts.sequencer_term,
             self.artifacts.participant_ds_dids,
             self.historical_authority,
+            event_scope,
         )
         .await
         .map_err(|err| match err {
@@ -792,6 +811,53 @@ async fn quarantine_from_local_state(
     })
 }
 
+/// Discover every event signer and prospective account before the first head
+/// lock. This only reserves a transaction-wide lock order; event signatures and
+/// sealed historical authority remain verified at their original execution seam.
+async fn lock_prefix_event_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    events: &[StrictCleanRemoteEvent],
+    participant_routes: &BTreeMap<String, Option<String>>,
+) -> Result<ConversationEventLockScope, RemotePrefixBootstrapError> {
+    let devices = events
+        .iter()
+        .map(|event| {
+            let (did, device_id, _, _) = canonical_event_signer(event)?;
+            Ok(CanonicalDeviceIdentity::new(did, device_id))
+        })
+        .collect::<Result<Vec<_>, RemotePrefixBootstrapError>>()?;
+    let prospective_principals = participant_routes.keys().cloned().collect::<Vec<_>>();
+    let seed = CanonicalLockScope::new(vec![], devices)
+        .map_err(|_| RemotePrefixBootstrapError::Authority)?;
+    let scope = discover_conversation_event_lock_scope(
+        tx,
+        conversation_id,
+        &seed,
+        &prospective_principals,
+        true,
+    )
+    .await
+    .map_err(map_hydration_error)?;
+    lock_conversation_event_scope(tx, &scope)
+        .await
+        .map_err(map_hydration_error)
+}
+
+async fn require_prefix_event_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    event_scope: &ConversationEventLockScope,
+    required: &CanonicalLockScope,
+) -> Result<(), RemotePrefixBootstrapError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| RemotePrefixBootstrapError::Database)?;
+    event_scope
+        .require_subset(&transaction_id, required)
+        .map_err(|_| RemotePrefixBootstrapError::Authority)
+}
+
 /// Atomically apply, replay, or quarantine one sealed remote clean prefix under the caller's transaction.
 pub(crate) async fn apply_remote_clean_prefix(
     tx: &mut Transaction<'_, Postgres>,
@@ -819,6 +885,12 @@ pub(crate) async fn apply_remote_clean_prefix(
     peer_policy::enforce_outbound_peer_policy_tx(tx, &sequencer_did)
         .await
         .map_err(|_| RemotePrefixBootstrapError::PeerDenied)?;
+
+    // Lock one union across all historical steps, prospective participant DIDs,
+    // retained Welcome recipients, and historical terminal recipients. Per-step
+    // locking would invert the order once an earlier step holds the head.
+    let event_scope =
+        lock_prefix_event_scope(tx, conversation_id, &events, &participant_routes).await?;
 
     // 3. Inspect existing conversation
     let existing_convo: Option<(bool, Option<String>, i64, Option<i64>)> = sqlx::query_as(
@@ -1149,6 +1221,18 @@ pub(crate) async fn apply_remote_clean_prefix(
         canonical_keys.insert((actor_did, actor_device_id, key_id));
     }
 
+    // Discovery is not authority. Reject scope drift before acquiring any of
+    // these post-head identity locks, including a newly registered sibling.
+    let required = CanonicalLockScope::new(
+        vec![],
+        canonical_devices
+            .iter()
+            .map(|(did, id)| CanonicalDeviceIdentity::new(did, *id))
+            .collect(),
+    )
+    .map_err(|_| RemotePrefixBootstrapError::Authority)?;
+    require_prefix_event_scope(tx, &event_scope, &required).await?;
+
     // Lock all devices in canonical order FOR SHARE
     for (user_did, device_id) in &canonical_devices {
         let device_row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
@@ -1233,6 +1317,7 @@ pub(crate) async fn apply_remote_clean_prefix(
             &selector,
             &participant_routes,
             event,
+            &event_scope,
         )
         .await?;
 
@@ -1248,7 +1333,7 @@ pub(crate) async fn apply_remote_clean_prefix(
             _ => return Err(RemotePrefixBootstrapError::InvalidEvent),
         };
 
-        step.apply().await.map_err(|err| match err {
+        step.apply(&event_scope).await.map_err(|err| match err {
             ExecutorError::HydrationDatabase(_) => RemotePrefixBootstrapError::Database,
             _ => RemotePrefixBootstrapError::Authority,
         })?;
@@ -1451,8 +1536,9 @@ pub mod test_support {
     /// Apply one prepared step and project the outcome the suites assert on.
     async fn apply_step(
         step: PreparedHistoricalPrefixStep<'_, '_>,
+        event_scope: &ConversationEventLockScope,
     ) -> Result<HistoricalStepOutcome, RemotePrefixBootstrapError> {
-        let applied = step.apply().await.map_err(|err| match err {
+        let applied = step.apply(event_scope).await.map_err(|err| match err {
             ExecutorError::HydrationDatabase(_) => RemotePrefixBootstrapError::Database,
             _ => RemotePrefixBootstrapError::Authority,
         })?;
@@ -1480,6 +1566,13 @@ pub mod test_support {
         event_json: serde_json::Value,
     ) -> Result<(), RemotePrefixBootstrapError> {
         let event = strict_event(event_json)?;
+        let event_scope = lock_prefix_event_scope(
+            transaction,
+            selector.conversation_id(),
+            std::slice::from_ref(&event),
+            &participant_routes,
+        )
+        .await?;
         HistoricalPrefixAuthority::verify_and_bind_for_event(
             transaction,
             &admission_digest,
@@ -1487,6 +1580,7 @@ pub mod test_support {
             &selector,
             &participant_routes,
             &event,
+            &event_scope,
         )
         .await?;
         Ok(())
@@ -1502,6 +1596,13 @@ pub mod test_support {
         event_json: serde_json::Value,
     ) -> Result<HistoricalStepOutcome, RemotePrefixBootstrapError> {
         let event = strict_event(event_json)?;
+        let event_scope = lock_prefix_event_scope(
+            transaction,
+            selector.conversation_id(),
+            std::slice::from_ref(&event),
+            &participant_routes,
+        )
+        .await?;
         let authority = HistoricalPrefixAuthority::verify_and_bind_for_event(
             transaction,
             &admission_digest,
@@ -1509,9 +1610,14 @@ pub mod test_support {
             &selector,
             &participant_routes,
             &event,
+            &event_scope,
         )
         .await?;
-        apply_step(plan_historical_creation_entry(authority, &event).await?).await
+        apply_step(
+            plan_historical_creation_entry(authority, &event).await?,
+            &event_scope,
+        )
+        .await
     }
 
     /// Test facade for planning and executing a historical policy entry from event JSON.
@@ -1524,6 +1630,13 @@ pub mod test_support {
         event_json: serde_json::Value,
     ) -> Result<HistoricalStepOutcome, RemotePrefixBootstrapError> {
         let event = strict_event(event_json)?;
+        let event_scope = lock_prefix_event_scope(
+            transaction,
+            selector.conversation_id(),
+            std::slice::from_ref(&event),
+            &participant_routes,
+        )
+        .await?;
         let authority = HistoricalPrefixAuthority::verify_and_bind_for_event(
             transaction,
             &admission_digest,
@@ -1531,9 +1644,14 @@ pub mod test_support {
             &selector,
             &participant_routes,
             &event,
+            &event_scope,
         )
         .await?;
-        apply_step(plan_historical_policy_add_entry(authority, &event).await?).await
+        apply_step(
+            plan_historical_policy_add_entry(authority, &event).await?,
+            &event_scope,
+        )
+        .await
     }
 
     /// Test facade for planning and executing a historical acceptance entry from event JSON.
@@ -1546,6 +1664,13 @@ pub mod test_support {
         event_json: serde_json::Value,
     ) -> Result<HistoricalStepOutcome, RemotePrefixBootstrapError> {
         let event = strict_event(event_json)?;
+        let event_scope = lock_prefix_event_scope(
+            transaction,
+            selector.conversation_id(),
+            std::slice::from_ref(&event),
+            &participant_routes,
+        )
+        .await?;
         let authority = HistoricalPrefixAuthority::verify_and_bind_for_event(
             transaction,
             &admission_digest,
@@ -1553,9 +1678,14 @@ pub mod test_support {
             &selector,
             &participant_routes,
             &event,
+            &event_scope,
         )
         .await?;
-        apply_step(plan_historical_acceptance_entry(authority, &event).await?).await
+        apply_step(
+            plan_historical_acceptance_entry(authority, &event).await?,
+            &event_scope,
+        )
+        .await
     }
 
     /// Test facade for planning and executing a historical recovery fulfillment entry from event JSON.
@@ -1568,6 +1698,13 @@ pub mod test_support {
         event_json: serde_json::Value,
     ) -> Result<HistoricalStepOutcome, RemotePrefixBootstrapError> {
         let event = strict_event(event_json)?;
+        let event_scope = lock_prefix_event_scope(
+            transaction,
+            selector.conversation_id(),
+            std::slice::from_ref(&event),
+            &participant_routes,
+        )
+        .await?;
         let authority = HistoricalPrefixAuthority::verify_and_bind_for_event(
             transaction,
             &admission_digest,
@@ -1575,9 +1712,14 @@ pub mod test_support {
             &selector,
             &participant_routes,
             &event,
+            &event_scope,
         )
         .await?;
-        apply_step(plan_historical_recovery_fulfillment_entry(authority, &event).await?).await
+        apply_step(
+            plan_historical_recovery_fulfillment_entry(authority, &event).await?,
+            &event_scope,
+        )
+        .await
     }
 }
 

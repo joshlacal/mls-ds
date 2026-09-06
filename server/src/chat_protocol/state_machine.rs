@@ -5,7 +5,7 @@
 // full-coordinate CAS and apply the returned state/effects atomically. No
 // function in this module writes storage or calls a legacy MLS handler.
 
-use std::{cmp::Ordering, collections::BTreeSet};
+use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
@@ -11084,8 +11084,17 @@ fn fulfillment_fingerprint_families_are_closed(
 ) -> bool {
     let exact_terminal = |terminal: &Option<WorkTerminalEvidence>| matches!(terminal, Some(WorkTerminalEvidence::Transition(value)) if value == producer);
 
-    let mut own_requests = 0usize;
-    let mut superseded_requests = BTreeSet::new();
+    let (own_request_id, prior) = match producer.body_binding.as_ref() {
+        Some(TransitionBodyBinding::LeafRecoveryFulfillment { recovery_request_id, prior, .. }) =>
+            (*recovery_request_id, *prior),
+        _ => return false,
+    };
+    let exact_due = |terminal: &Option<WorkTerminalEvidence>, expires_at: ServerTimestamp| {
+        expires_at <= producer.received_at
+            && matches!(terminal, Some(WorkTerminalEvidence::Expiry(at)) if *at == expires_at)
+    };
+    let mut own_request = None;
+    let mut peer_requests = BTreeMap::new();
     for change in &effects.recovery_request_changes {
         let (Some(before), Some(after)) = (&change.before, &change.after) else {
             return false;
@@ -11095,28 +11104,35 @@ fn fulfillment_fingerprint_families_are_closed(
             || before.kind != after.kind
             || before.source != after.source
             || before.bound_coordinate != after.bound_coordinate
+            || before.bound_coordinate != prior
             || before.key_package_ref != after.key_package_ref
             || before.received_at != after.received_at
             || before.expires_at != after.expires_at
+            || before.origin != after.origin
             || before.status != RecoveryRequestStatus::Open
             || before.terminal.is_some()
-            || !exact_terminal(&after.terminal)
         {
             return false;
         }
-        match after.status {
-            RecoveryRequestStatus::Fulfilled => own_requests += 1,
-            RecoveryRequestStatus::Superseded => {
-                if !superseded_requests.insert((after.request_id, after.key_package_ref)) {
-                    return false;
-                }
-            }
-            _ => return false,
+        let key = (after.request_id, after.key_package_ref);
+        if after.request_id == own_request_id {
+            if after.status != RecoveryRequestStatus::Fulfilled
+                || !exact_terminal(&after.terminal)
+                || own_request.replace(key).is_some()
+            { return false; }
+        } else {
+            let expired = match after.status {
+                RecoveryRequestStatus::Superseded if exact_terminal(&after.terminal) => false,
+                RecoveryRequestStatus::Expired if exact_due(&after.terminal, after.expires_at) => true,
+                _ => return false,
+            };
+            if peer_requests.insert(key, (after, expired)).is_some() { return false; }
         }
     }
 
-    let mut own_reservations = 0usize;
-    let mut released_reservations = BTreeSet::new();
+    let mut own_reservation = None;
+    let mut peer_reservations = BTreeMap::new();
+    let mut expected_packages = BTreeMap::new();
     for change in &effects.reservation_changes {
         let (Some(before), Some(after)) = (&change.before, &change.after) else {
             return false;
@@ -11124,45 +11140,54 @@ fn fulfillment_fingerprint_families_are_closed(
         if before.request_id != after.request_id
             || before.target != after.target
             || before.bound_coordinate != after.bound_coordinate
+            || before.bound_coordinate != prior
             || before.key_package_ref != after.key_package_ref
             || before.received_at != after.received_at
             || before.expires_at != after.expires_at
             || before.package_not_after != after.package_not_after
+            || before.expires_at > before.package_not_after
             || before.status != ReservationStatus::Active
             || before.terminal.is_some()
-            || !exact_terminal(&after.terminal)
         {
             return false;
         }
-        match after.status {
-            ReservationStatus::Consumed => own_reservations += 1,
-            ReservationStatus::Released => {
-                if !released_reservations.insert((after.request_id, after.key_package_ref)) {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
+        let key = (after.request_id, after.key_package_ref);
+        let successor = if after.request_id == own_request_id {
+            if after.status != ReservationStatus::Consumed
+                || !exact_terminal(&after.terminal)
+                || own_reservation.replace(key).is_some()
+            { return false; }
+            PackageStatus::Consumed
+        } else {
+            let expired = match after.status {
+                ReservationStatus::Released if exact_terminal(&after.terminal) => false,
+                ReservationStatus::Expired if exact_due(&after.terminal, after.expires_at) => true,
+                _ => return false,
+            };
+            let Some((request, request_expired)) = peer_requests.get(&key) else { return false; };
+            if *request_expired != expired
+                || request.target != after.target
+                || request.bound_coordinate != after.bound_coordinate
+                || request.received_at != after.received_at
+                || request.expires_at != after.expires_at
+                || peer_reservations.insert(key, ()).is_some()
+            { return false; }
+            // The executor admits only released peer packages. A package-end
+            // expiry is not this prior-bound family (minimum remaining package
+            // lifetime exceeds the request TTL) and must not enter its seal.
+            if expired && after.expires_at == after.package_not_after { return false; }
+            PackageStatus::Available
+        };
+        if expected_packages.insert(key, successor).is_some() { return false; }
     }
-
-    let consumed_packages = effects
-        .package_transitions
-        .iter()
-        .filter(|edge| edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Consumed)
-        .count();
-    let reactivated_packages = effects
-        .package_transitions
-        .iter()
-        .filter_map(|edge| {
-            (edge.from == PackageStatus::Reserved && edge.to == PackageStatus::Available)
-                .then_some((edge.request_id, edge.key_package_ref))
-        })
-        .collect::<BTreeSet<_>>();
-    if effects.package_transitions.iter().any(|edge| {
-        edge.from != PackageStatus::Reserved
+    let mut actual_packages = BTreeMap::new();
+    let mut package_refs = BTreeSet::new();
+    for edge in &effects.package_transitions {
+        if edge.from != PackageStatus::Reserved
             || !matches!(edge.to, PackageStatus::Consumed | PackageStatus::Available)
-    }) {
-        return false;
+            || actual_packages.insert((edge.request_id, edge.key_package_ref), edge.to).is_some()
+            || !package_refs.insert(edge.key_package_ref)
+        { return false; }
     }
 
     let mut own_welcomes = 0usize;
@@ -11225,12 +11250,11 @@ fn fulfillment_fingerprint_families_are_closed(
         )
     });
 
-    own_requests == 1
-        && own_reservations == 1
-        && consumed_packages == 1
+    own_request.is_some()
+        && own_request == own_reservation
         && own_welcomes == 1
-        && superseded_requests == released_reservations
-        && superseded_requests == reactivated_packages
+        && peer_requests.len() == peer_reservations.len()
+        && expected_packages == actual_packages
         && legal_reset
         && legal_leave
 }
@@ -13070,6 +13094,146 @@ mod recovery_plan_fingerprint_tests {
         illegal_welcome.effects.welcome_changes.push(malformed);
         assert!(recovery_plan_fingerprint(&illegal_welcome, Some(b"canonical-control")).is_err());
     }
+
+    fn fulfillment_with_due_peer(package_ends_at_deadline: bool) -> ConversationPersistencePlan {
+        let mut plan = fulfillment_plan();
+        let mut before = plan.effects.recovery_request_changes[0].before.clone().unwrap();
+        let prior = before.bound_coordinate;
+        before.request_id = uuid_from_test_byte(0x78);
+        before.target = device(0x79);
+        before.key_package_ref = [0x7a; 32];
+        let origin = request_evidence(RequestEntryKind::LeafRecoveryRequest,
+            before.request_id, before.target.clone(), prior, 0x7b);
+        before.received_at = origin.received_at;
+        before.expires_at = ServerTimestamp::from_unix_millis(11_000).unwrap();
+        before.origin = RecoveryOriginEvidence::Request(origin.clone());
+        let mut after = before.clone();
+        after.status = RecoveryRequestStatus::Expired;
+        after.terminal = Some(WorkTerminalEvidence::Expiry(after.expires_at));
+        let mut reservation = plan.effects.reservation_changes[0].before.clone().unwrap();
+        reservation.request_id = before.request_id;
+        reservation.target = before.target.clone();
+        reservation.key_package_ref = before.key_package_ref;
+        reservation.received_at = before.received_at;
+        reservation.expires_at = before.expires_at;
+        if package_ends_at_deadline { reservation.package_not_after = before.expires_at; }
+        let mut terminal_reservation = reservation.clone();
+        terminal_reservation.status = ReservationStatus::Expired;
+        terminal_reservation.terminal = Some(WorkTerminalEvidence::Expiry(before.expires_at));
+        let successor = if package_ends_at_deadline { PackageStatus::Expired } else { PackageStatus::Available };
+        let transaction_id = plan.effects.head_cas.as_ref().unwrap().transaction_id.clone();
+        let cas = recovery_package_cas(&transaction_id,&before,&reservation,
+            PackageStatus::Reserved,successor);
+        plan.effects.recovery_request_changes.push(StateChange { before:Some(before.clone()),after:Some(after.clone()) });
+        plan.effects.reservation_changes.push(StateChange { before:Some(reservation.clone()),after:Some(terminal_reservation) });
+        plan.effects.package_transitions.push(PackageTransition {
+            request_id:before.request_id,key_package_ref:before.key_package_ref,
+            from:PackageStatus::Reserved,to:successor });
+        plan.effects.recovery_package_cas.push(cas);
+        plan.state.recovery_requests.push(RecoveryRequestHydrationRow {
+            request_id:before.request_id,target:before.target.clone(),kind:before.kind,
+            source:before.source,bound_coordinate:prior,key_package_ref:before.key_package_ref,
+            received_at:before.received_at,expires_at:before.expires_at,status:after.status,
+            origin:RecoveryOriginHydrationRow::Request(origin),
+            terminal:Some(WorkTerminalHydrationRow::Expiry(before.expires_at)) });
+        plan.state.recovery_reservations.push(RecoveryReservationHydrationRow {
+            request_id:reservation.request_id,target:reservation.target,bound_coordinate:prior,
+            key_package_ref:reservation.key_package_ref,received_at:reservation.received_at,
+            expires_at:reservation.expires_at,package_not_after:reservation.package_not_after,
+            status:ReservationStatus::Expired,
+            terminal:Some(WorkTerminalHydrationRow::Expiry(reservation.expires_at)) });
+        plan
+    }
+
+    #[test]
+    fn fulfillment_fingerprint_accepts_exact_due_peer_release() {
+        let plan=fulfillment_with_due_peer(false);
+        assert_eq!(recovery_plan_fingerprint(&plan,Some(b"canonical-control")).unwrap().class(),
+            RecoveryPlanClass::Fulfillment);
+    }
+
+    #[test]
+    fn fulfillment_fingerprint_rejects_due_family_splices() {
+        let baseline=fulfillment_with_due_peer(false);
+        let rejected=|plan:&ConversationPersistencePlan| {
+            let Some(PlanAuthority::Transition(producer))=plan.effects.authority.as_ref() else { panic!("fixture authority"); };
+            assert!(!fulfillment_fingerprint_families_are_closed(&plan.effects,producer),
+                "the closed-family fence itself must reject, independently of CAS validation");
+            assert!(recovery_plan_fingerprint(plan,Some(b"canonical-control")).is_err());
+        };
+        let mut own_expiry=baseline.clone();
+        let own=own_expiry.effects.recovery_request_changes[0].after.as_mut().unwrap();
+        own.status=RecoveryRequestStatus::Expired;
+        own.terminal=Some(WorkTerminalEvidence::Expiry(own.expires_at));
+        rejected(&own_expiry);
+        let mut early=baseline.clone();
+        let deadline=ServerTimestamp::from_unix_millis(13_000).unwrap();
+        let change=&mut early.effects.recovery_request_changes[1];
+        for value in [&mut change.before,&mut change.after] { value.as_mut().unwrap().expires_at=deadline; }
+        change.after.as_mut().unwrap().terminal=Some(WorkTerminalEvidence::Expiry(deadline));
+        let change=&mut early.effects.reservation_changes[1];
+        for value in [&mut change.before,&mut change.after] { value.as_mut().unwrap().expires_at=deadline; }
+        change.after.as_mut().unwrap().terminal=Some(WorkTerminalEvidence::Expiry(deadline));
+        for row in &mut early.state.recovery_requests[1..] {
+            row.expires_at=deadline; row.terminal=Some(WorkTerminalHydrationRow::Expiry(deadline));
+        }
+        for row in &mut early.state.recovery_reservations[1..] {
+            row.expires_at=deadline; row.terminal=Some(WorkTerminalHydrationRow::Expiry(deadline));
+        }
+        rejected(&early);
+        let mut wrong_terminal=baseline.clone();
+        wrong_terminal.effects.recovery_request_changes[1].after.as_mut().unwrap().terminal=
+            Some(WorkTerminalEvidence::Expiry(ServerTimestamp::from_unix_millis(10_999).unwrap()));
+        rejected(&wrong_terminal);
+        let mut wrong_cause=baseline.clone();
+        let terminal=wrong_cause.effects.recovery_request_changes[0].after.as_ref().unwrap().terminal.clone();
+        wrong_cause.effects.recovery_request_changes[1].after.as_mut().unwrap().terminal=terminal.clone();
+        wrong_cause.effects.reservation_changes[1].after.as_mut().unwrap().terminal=terminal;
+        rejected(&wrong_cause);
+        let mut mismatched_deadline=baseline.clone();
+        let change=&mut mismatched_deadline.effects.reservation_changes[1];
+        for value in [&mut change.before,&mut change.after] {
+            value.as_mut().unwrap().expires_at=ServerTimestamp::from_unix_millis(10_999).unwrap();
+        }
+        change.after.as_mut().unwrap().terminal=
+            Some(WorkTerminalEvidence::Expiry(ServerTimestamp::from_unix_millis(10_999).unwrap()));
+        rejected(&mismatched_deadline);
+        for package_status in [PackageStatus::Consumed,PackageStatus::Expired] {
+            let mut wrong_package=baseline.clone();
+            wrong_package.effects.package_transitions[1].to=package_status;
+            let cas=&mut wrong_package.effects.recovery_package_cas[1];
+            cas.successor_status=package_status;
+            cas.authority_digest=recovery_package_cas_authority_digest(cas);
+            assert!(package_cas_bijection_valid(&wrong_package.effects));
+            rejected(&wrong_package);
+        }
+        let package_end=fulfillment_with_due_peer(true);
+        assert!(package_cas_bijection_valid(&package_end.effects));
+        rejected(&package_end);
+        let mut package_end_released=package_end.clone();
+        package_end_released.effects.package_transitions[1].to=PackageStatus::Available;
+        let cas=&mut package_end_released.effects.recovery_package_cas[1];
+        cas.successor_status=PackageStatus::Available;
+        cas.authority_digest=recovery_package_cas_authority_digest(cas);
+        assert!(package_cas_bijection_valid(&package_end_released.effects));
+        rejected(&package_end_released);
+        let mut duplicate=baseline.clone();
+        duplicate.effects.recovery_request_changes.push(duplicate.effects.recovery_request_changes[1].clone());
+        rejected(&duplicate);
+        let mut duplicate_reservation=baseline.clone();
+        duplicate_reservation.effects.reservation_changes.push(duplicate_reservation.effects.reservation_changes[1].clone());
+        rejected(&duplicate_reservation);
+        let mut duplicate_package=baseline.clone();
+        duplicate_package.effects.package_transitions.push(duplicate_package.effects.package_transitions[1].clone());
+        rejected(&duplicate_package);
+        let mut identity=baseline.clone();
+        identity.effects.reservation_changes[1].after.as_mut().unwrap().target=device(0x7c);
+        rejected(&identity);
+        let mut peer_coordinate=baseline.clone();
+        peer_coordinate.effects.recovery_request_changes[1].after.as_mut().unwrap().bound_coordinate=coordinate(6,9,0x72);
+        rejected(&peer_coordinate);
+    }
+
 }
 
 impl PlannedTransition {

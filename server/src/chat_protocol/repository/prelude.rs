@@ -51,6 +51,8 @@ pub(crate) enum PreludeError {
     OperationIdConflict,
     #[error("operation claim or receipt failed its integrity check")]
     ClaimIntegrity,
+    #[error("signature-valid unclaimed operation is past its first-execution window")]
+    SignedOperationExpired,
     #[error(transparent)]
     Authorization(#[from] auth::AuthRepositoryError),
     #[error("clean-chat prelude database error: {0}")]
@@ -126,6 +128,176 @@ impl CanonicalLockScope {
 
 pub(crate) fn canonical_operation_lock_key(operation_id: Uuid) -> String {
     format!("chat-operation-id:{operation_id}")
+}
+
+/// Evidence of device locks already held in this SQL transaction. This grants
+/// no request, membership, or execution authority. Keep the fields private so a
+/// caller cannot turn a discovered candidate set into a locked witness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationEventLockScope {
+    transaction_id: String,
+    principals: Vec<String>,
+    devices: Vec<CanonicalDeviceIdentity>,
+}
+
+impl ConversationEventLockScope {
+    pub(crate) fn require_subset(
+        &self,
+        transaction_id: &str,
+        required: &CanonicalLockScope,
+    ) -> Result<(), PreludeError> {
+        if self.transaction_id != transaction_id {
+            return Err(PreludeError::ForeignTransaction);
+        }
+        if required
+            .principals()
+            .iter()
+            .any(|did| !self.principals.contains(did))
+            || required
+                .devices()
+                .iter()
+                .any(|device| !self.devices.contains(device))
+        {
+            return Err(PreludeError::ScopeDrift);
+        }
+        Ok(())
+    }
+}
+
+/// Non-authoritative discovery before the first identity or conversation lock.
+/// The seed preserves endpoint-specific identities; prospective principals are
+/// expanded because a successor leaf can make all of that account's devices
+/// part of the existing standard-audience lock query. Welcome and historical
+/// recipients remain exact devices. Re-read the required set under the head and
+/// require it to be a subset of the locked witness before acquiring more locks.
+pub(crate) async fn discover_conversation_event_lock_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    seed: &CanonicalLockScope,
+    prospective_principals: &[String],
+    include_historical: bool,
+) -> Result<CanonicalLockScope, PreludeError> {
+    if conversation_id.get_version_num() != 4
+        || prospective_principals
+            .iter()
+            .any(|did| BareDid::parse(did).is_err())
+    {
+        return Err(PreludeError::CanonicalScope);
+    }
+    let audience_principals: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_did FROM chat.participants WHERE conversation_id=$1 AND current_membership
+        UNION SELECT user_did FROM chat.member_devices WHERE conversation_id=$1 AND active
+        UNION SELECT unnest($2::text[])
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(prospective_principals)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let candidates: Vec<(String, Uuid)> = sqlx::query_as(
+        r#"
+        WITH audience_dids AS (
+            SELECT user_did FROM chat.participants
+             WHERE conversation_id=$1 AND current_membership
+            UNION
+            SELECT user_did FROM chat.member_devices
+             WHERE conversation_id=$1 AND active
+            UNION SELECT unnest($2::text[])
+        ), exact_devices AS (
+            SELECT d.user_did,d.device_id FROM chat.devices d
+              JOIN audience_dids a ON a.user_did=d.user_did
+            UNION
+            SELECT wd.recipient_did,wd.recipient_device_id
+              FROM chat.welcome_bundles wb
+              JOIN chat.welcome_deliveries wd ON wd.welcome_id=wb.welcome_id
+             WHERE wb.conversation_id=$1 AND wd.status='pending'
+            UNION
+            SELECT recipient_did,recipient_device_id FROM chat.application_intervals
+             WHERE $3 AND conversation_id=$1
+            UNION
+            SELECT recipient_did,recipient_device_id
+              FROM chat.application_schedule_terminal_proofs
+             WHERE $3 AND conversation_id=$1
+        )
+        SELECT user_did,device_id FROM exact_devices
+         ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id)
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(prospective_principals)
+    .bind(include_historical)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut devices = seed.devices().to_vec();
+    devices.extend(
+        candidates
+            .into_iter()
+            .map(|(did, id)| CanonicalDeviceIdentity::new(did, id)),
+    );
+    let mut principals = seed.principals().to_vec();
+    principals.extend(audience_principals);
+    CanonicalLockScope::new(principals, devices)
+}
+
+/// Scheduler/federation lock-only prefix. It deliberately accepts no fabricated
+/// device request and mints no authentication capability. Call before any head
+/// or identity lock, with the union for every plan in the transaction, then keep
+/// all of the caller's existing admission and signed-state checks.
+pub(crate) async fn lock_conversation_event_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: &CanonicalLockScope,
+) -> Result<ConversationEventLockScope, PreludeError> {
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    let principals: Vec<String> = sqlx::query_scalar(
+        "SELECT user_did FROM chat.principals WHERE user_did=ANY($1::text[]) ORDER BY convert_to(user_did,'UTF8') FOR UPDATE",
+    ).bind(scope.principals()).fetch_all(&mut **transaction).await?;
+    if principals != scope.principals() {
+        return Err(PreludeError::MissingPrincipal);
+    }
+    let dids = scope
+        .devices()
+        .iter()
+        .map(|identity| identity.did().to_owned())
+        .collect::<Vec<_>>();
+    let ids = scope
+        .devices()
+        .iter()
+        .map(CanonicalDeviceIdentity::device_id)
+        .collect::<Vec<_>>();
+    let devices: Vec<(String, Uuid)> = sqlx::query_as(
+        r#"
+        WITH requested(user_did,device_id) AS (SELECT * FROM unnest($1::text[],$2::uuid[]))
+        SELECT d.user_did,d.device_id FROM requested JOIN chat.devices d USING(user_did,device_id)
+         ORDER BY convert_to(d.user_did,'UTF8'),uuid_send(d.device_id) FOR UPDATE OF d
+        "#,
+    )
+    .bind(&dids)
+    .bind(&ids)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if devices.len() != scope.devices().len()
+        || devices
+            .iter()
+            .zip(scope.devices())
+            .any(|((did, id), expected)| did != expected.did() || *id != expected.device_id())
+    {
+        return Err(PreludeError::MissingDevice);
+    }
+    sqlx::query(
+        r#"
+        WITH requested(user_did,device_id) AS (SELECT * FROM unnest($1::text[],$2::uuid[]))
+        SELECT k.user_did,k.device_id,k.key_id FROM requested JOIN chat.device_keys k USING(user_did,device_id)
+         ORDER BY convert_to(k.user_did,'UTF8'),uuid_send(k.device_id),convert_to(k.key_id,'UTF8') FOR UPDATE OF k
+        "#,
+    ).bind(&dids).bind(&ids).fetch_all(&mut **transaction).await?;
+    Ok(ConversationEventLockScope {
+        transaction_id,
+        principals,
+        devices: scope.devices().to_vec(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1484,6 +1656,18 @@ pub(crate) enum BootstrapCompletionJktShape {
 }
 
 impl ScopeBoundBusinessAuthority {
+    pub(crate) fn event_lock_scope(&self) -> ConversationEventLockScope {
+        ConversationEventLockScope {
+            transaction_id: self.transaction_id().to_owned(),
+            principals: self.principals().to_vec(),
+            devices: self
+                .devices()
+                .iter()
+                .map(|device| CanonicalDeviceIdentity::new(device.user_did(), device.device_id()))
+                .collect(),
+        }
+    }
+
     fn receipt_id(&self) -> Uuid {
         self.locked.receipt_id()
     }
@@ -2241,6 +2425,21 @@ pub(crate) async fn prepare_signed_operation(
         });
     }
 
+    // Only submitTransition exposes this terminal nonacceptance proof. The
+    // operation lock is held and no durable claim exists; completed operations
+    // already took the age-independent replay branch above. Verify the exact
+    // device signature before distinguishing an expired-past timestamp from
+    // cryptographic failure. Future timestamps retain ordinary auth errors.
+    let signed_at = admission.canonical().signed_at();
+    let trusted = admission.pre_replay().trusted_instant();
+    if binding.endpoint_nsid == "blue.catbird.chat.submitTransition"
+        && signed_at.datetime() < trusted.datetime()
+        && crate::chat_protocol::validation::validate_first_execution_signed_at(signed_at, trusted).is_err()
+    {
+        let _verified = admission.into_replay_authority()?;
+        return Err(PreludeError::SignedOperationExpired);
+    }
+
     let authority = admission.into_first_authority()?;
     if !binding.matches_authority(&authority)? {
         return Err(PreludeError::ClaimIntegrity);
@@ -2254,6 +2453,67 @@ pub(crate) async fn prepare_signed_operation(
             },
         },
     })
+}
+
+/// Discover only a bounded candidate lock scope. This grants no access: the
+/// signed coordinate and actual application audience are checked under the
+/// head lock by message_delivery before any append. Discovering the complete
+/// scope before taking any principal/device/key lock avoids actor-first cycles
+/// with another sender and with device-global event-chain FK/trigger locks.
+async fn application_send_lock_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+) -> Result<CanonicalLockScope, PreludeError> {
+    use crate::chat_protocol::transcript::CanonicalValueRef;
+    let Some(mutation) = authority.mutation() else {
+        return Err(PreludeError::UnsupportedAuthority);
+    };
+    let VerifiedMutationProjection::ApplicationSend(projection) = mutation.projection() else {
+        return Err(PreludeError::UnsupportedAuthority);
+    };
+    let conversation_id = match projection.prior().get("conversationId") {
+        Some(CanonicalValueRef::Uuid(value)) => Uuid::from_bytes(*value.as_bytes()),
+        _ => return Err(PreludeError::NonCanonicalOperation),
+    };
+    let generation = match projection.prior().get("generation") {
+        Some(CanonicalValueRef::Integer(value)) => i64::try_from(value)
+            .map_err(|_| PreludeError::NonCanonicalOperation)?,
+        _ => return Err(PreludeError::NonCanonicalOperation),
+    };
+    let actor_did = authority.subject().as_str();
+    let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
+    // The state machine allows at most 100 simultaneous leaves. One extra row
+    // detects an invalid/oversized scope without allocating an unbounded list.
+    // Require a candidate sender interval before selecting any peer identity.
+    let audience: Vec<(String, Uuid)> = sqlx::query_as(
+        r#"
+        SELECT i.recipient_did,i.recipient_device_id
+          FROM chat.conversations c
+          JOIN chat.application_intervals i
+            ON i.conversation_id=c.conversation_id AND i.generation=c.current_generation
+         WHERE c.conversation_id=$1 AND c.current_generation=$2
+           AND i.start_seq<=c.next_entry_seq
+           AND (i.terminal_seq IS NULL OR i.terminal_seq>=c.next_entry_seq)
+           AND EXISTS (
+               SELECT 1 FROM chat.application_intervals actor_i
+                WHERE actor_i.conversation_id=c.conversation_id
+                  AND actor_i.generation=c.current_generation
+                  AND actor_i.recipient_did=$3 AND actor_i.recipient_device_id=$4
+                  AND actor_i.start_seq<=c.next_entry_seq
+                  AND (actor_i.terminal_seq IS NULL OR actor_i.terminal_seq>=c.next_entry_seq)
+           )
+         ORDER BY convert_to(i.recipient_did,'UTF8'),uuid_send(i.recipient_device_id)
+         LIMIT 101
+        "#,
+    )
+    .bind(conversation_id).bind(generation).bind(actor_did).bind(actor_device_id)
+    .fetch_all(&mut **transaction).await?;
+    if audience.len()>100 || audience.windows(2).any(|pair| pair[0]==pair[1]) {
+        return Err(PreludeError::ScopeDrift);
+    }
+    let mut devices=audience.into_iter().map(|(did,id)| CanonicalDeviceIdentity::new(did,id)).collect::<Vec<_>>();
+    devices.push(CanonicalDeviceIdentity::new(actor_did,actor_device_id));
+    CanonicalLockScope::new(vec![actor_did.to_owned()],devices)
 }
 
 /// Prepare one ordinary signed send/typing admission using the same sealed
@@ -2283,7 +2543,12 @@ pub(crate) async fn prepare_chat_admission(
             authority,
             reservation,
         } => {
-            let business = prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let business = if authority.mutation().is_some_and(|mutation| mutation.kind() == SignedMutationKind::ApplicationSend) {
+                let scope=application_send_lock_scope(transaction,&authority).await?;
+                prepare_identity_scope_prelude(transaction,&authority,reservation,scope).await?
+            } else {
+                prepare_actor_prelude(transaction,&authority,reservation).await?
+            };
             let (scope, completion) = business.into_execution_parts();
             Ok(PreparedChatAdmission::First(PreparedChatOperation {
                 authority,
@@ -3246,3 +3511,7 @@ fn completion_authority_digest(
 #[cfg(test)]
 #[path = "../../../tests/common/chat_protocol_prelude_unit.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests/common/chat_protocol_event_scope_unit.rs"]
+mod event_scope_tests;

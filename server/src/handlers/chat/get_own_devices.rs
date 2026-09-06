@@ -86,8 +86,8 @@ async fn get_own_devices(
 fn facade_failure(error: ExistingDeviceReadFacadeError) -> ChatFailure {
     match error {
         ExistingDeviceReadFacadeError::Storage => ChatFailure::storage(ENDPOINT),
-        ExistingDeviceReadFacadeError::RateLimited => {
-            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::RateLimited)
+        ExistingDeviceReadFacadeError::RateLimited { retry_after_secs } => {
+            ChatFailure::protocol_with_retry(ENDPOINT, ChatProtocolErrorCode::RateLimited, retry_after_secs)
         }
         ExistingDeviceReadFacadeError::Invariant
         | ExistingDeviceReadFacadeError::RequestTooBroad

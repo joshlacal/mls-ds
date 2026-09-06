@@ -2477,13 +2477,12 @@ impl ControlEntryKind {
             Self::ConversationClose => "blue.catbird.chat.closeConversation",
             Self::ResetRequest => "blue.catbird.chat.requestReset",
             Self::ResetActivation => "blue.catbird.chat.activateReset",
-            Self::LeaveRequest => "blue.catbird.chat.requestLeave",
+            Self::LeaveRequest | Self::ZeroLeafLeave => "blue.catbird.chat.requestLeave",
             Self::LeaveCancellation => "blue.catbird.chat.cancelLeave",
             Self::Commit
             | Self::Policy
             | Self::Metadata
             | Self::LeafRecoveryFulfillment
-            | Self::ZeroLeafLeave
             | Self::LeaveCommitFulfillment => "blue.catbird.chat.submitTransition",
         }
     }

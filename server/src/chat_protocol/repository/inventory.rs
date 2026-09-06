@@ -72,6 +72,8 @@ pub(crate) enum InventoryRepositoryError {
     InconsistentRecoverySelection,
     #[error("inventory fence advanced during selection; retry the session create")]
     SnapshotConflict,
+    #[error("exact device inventory session capacity reached")]
+    RateLimited { retry_after_secs: u64 },
     #[error("device query names too many or zero DIDs")]
     RequestTooBroad,
     #[error(transparent)]
@@ -98,8 +100,8 @@ impl PartialEq for InventoryRepositoryError {
             BoundaryItemMismatch, Cursor, DeviceAuthorityMismatch, DomainAlreadyComplete,
             DurableRowInvalid, InconsistentConversationSelection, InconsistentRecoverySelection,
             InconsistentWelcomeSelection, InvalidMaterialization, ProtocolFenceMismatch,
-            RaceOrReuse, RequestTooBroad, RetryCeiling, Sealer, SecureRandom, SessionNotFound,
-            SessionPresentationMismatch, SnapshotConflict, TransactionMismatch,
+            RaceOrReuse, RateLimited, RequestTooBroad, RetryCeiling, Sealer, SecureRandom,
+            SessionNotFound, SessionPresentationMismatch, SnapshotConflict, TransactionMismatch,
         };
         match (self, other) {
             (SessionNotFound, SessionNotFound)
@@ -119,6 +121,7 @@ impl PartialEq for InventoryRepositoryError {
             | (RetryCeiling, RetryCeiling)
             | (InvalidMaterialization, InvalidMaterialization)
             | (SecureRandom(..), SecureRandom(..)) => true,
+            (RateLimited { retry_after_secs: left }, RateLimited { retry_after_secs: right }) => left == right,
             (Cursor(left), Cursor(right)) => left == right,
             (Sealer(left), Sealer(right)) => left == right,
             _ => false,
@@ -1613,6 +1616,18 @@ pub(crate) async fn create_inventory_session(
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
 ) -> Result<CreatedInventorySession, InventoryRepositoryError> {
+    create_inventory_session_for_generation(transaction, device, request, sealer, random, None)
+        .await
+}
+
+async fn create_inventory_session_for_generation(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: super::super::read_authority::LockedReadDeviceAuthority,
+    request: CreateInventorySessionRequest,
+    sealer: &CursorSealer,
+    random: &mut (dyn SecureRandom + Send),
+    generation: Option<&InventoryGenerationFence>,
+) -> Result<CreatedInventorySession, InventoryRepositoryError> {
     let created_at = request.created_at;
     let expires_at = request.expires_at;
     if unix_seconds(created_at).is_none()
@@ -1684,6 +1699,17 @@ pub(crate) async fn create_inventory_session(
         return Err(InventoryRepositoryError::ProtocolFenceMismatch);
     }
     let snapshot_event_position = head_event_position;
+    if let Some(expected) = generation {
+        if expected.protocol_instance_id != protocol.protocol_instance_id
+            || expected.cursor_key_id != protocol.cursor_key_id
+            || expected.retained_floor != retention.retained_floor
+            || expected.event_position
+                != i64::try_from(snapshot_event_position)
+                    .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?
+        {
+            return Err(InventoryRepositoryError::SnapshotConflict);
+        }
+    }
 
     // 2. Mint the random session/event-cursor capability and seal it at rest.
     //    The plaintext exists only in this stack frame; the durable lookup hash
@@ -1712,8 +1738,10 @@ pub(crate) async fn create_inventory_session(
         .seal_successor(capability.as_bytes(), &event_cursor_binding, random)
         .map_err(InventoryRepositoryError::Sealer)?;
 
-    // 2b. Reap expired and excess inventory sessions for this device so active sessions stay bounded
+    // Reap only expired authority, then reserve capacity under the exact-device
+    // UPDATE lock already held by the read admission. Never evict a live chain.
     reap_expired_and_excess_inventory_sessions(transaction, &user_did, device_id).await?;
+    check_inventory_session_capacity(transaction, &user_did, device_id).await?;
 
     // 3. Insert the session with all domains INCOMPLETE and all *_consumed
     //    FALSE first, so every item FK (including the recipient composite FK on
@@ -2175,6 +2203,44 @@ async fn reap_expired_and_excess_inventory_sessions(
     Ok(())
 }
 
+/// The caller holds the exact device UPDATE lock. Count with the same trusted
+/// transaction-time cutoff as the deferred cap, then advertise the earliest
+/// retained expiry using a fresh PostgreSQL clock observation. A transaction
+/// that waited past that expiry gets a one-second retry, never a new grant.
+async fn check_inventory_session_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+    user_did: &str,
+    device_id: Uuid,
+) -> Result<(), InventoryRepositoryError> {
+    let retry_after_secs: Option<i64> = sqlx::query_scalar(
+        r#"WITH active AS (
+               SELECT expires_at FROM chat.inventory_sessions
+                WHERE user_did=$1 AND device_id=$2 AND expires_at > transaction_timestamp()
+               UNION ALL
+               SELECT expires_at FROM chat.device_inventory_sessions
+                WHERE user_did=$1 AND device_id=$2 AND expires_at > transaction_timestamp()
+           )
+           SELECT CASE WHEN count(*) >= chat.max_active_inventory_sessions_per_device()
+                  THEN greatest(1, ceil(extract(epoch FROM
+                       (min(expires_at) - clock_timestamp()))))::bigint
+                  ELSE NULL END
+             FROM active"#,
+    )
+    .bind(user_did)
+    .bind(device_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if let Some(seconds) = retry_after_secs {
+        let retry_after_secs = u64::try_from(seconds)
+            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+        if retry_after_secs == 0 {
+            return Err(InventoryRepositoryError::DurableRowInvalid);
+        }
+        return Err(InventoryRepositoryError::RateLimited { retry_after_secs });
+    }
+    Ok(())
+}
+
 /// Create one retained own-device inventory session at `fence_revision` and
 /// materialize + complete its subject-device items in the same transaction. The
 /// requester device authority is validated up-front and re-checked by the
@@ -2234,11 +2300,12 @@ pub(crate) async fn create_device_inventory_session(
         return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
     }
 
-    // Reap prior device inventory sessions and expired sessions for this device in the same transaction
-    // so steady-state device directory polling never accumulates rows or trips the active cap.
+    // Replace the private own-device snapshot and reap expired shared sessions.
+    // Preserve live shared grants and enforce the combined cap before admission.
     reap_prior_device_inventory_sessions(transaction, request.user_did, request.device_id).await?;
     reap_expired_and_excess_inventory_sessions(transaction, request.user_did, request.device_id)
         .await?;
+    check_inventory_session_capacity(transaction, request.user_did, request.device_id).await?;
     sqlx::query(
         r#"
         INSERT INTO chat.device_inventory_sessions(
@@ -2437,8 +2504,8 @@ pub(crate) struct IntervalSummaryTerminalHint {
 /// so no caller can manufacture a snapshot lifetime.
 const OWN_DEVICE_SNAPSHOT_TTL_MINUTES: i64 = 10;
 
-/// Sanitized facade failure. Every variant is a unit variant, so no `Debug`
-/// rendering can carry requester DID, device, JKT, generation, key material,
+/// Sanitized facade failure. Only capacity carries a public retry duration;
+/// no `Debug` rendering can carry requester DID, device, JKT, generation, key material,
 /// replay identity, or transaction identity. Authority drift never appears as a
 /// distinct variant: it collapses into `Invariant` exactly like every other
 /// terminal condition, so the wire cannot distinguish "wrong JKT" from "wrong
@@ -2454,8 +2521,9 @@ pub(crate) enum ExistingDeviceReadFacadeError {
     /// The fixed three-attempt ceiling was reached (`getOwnDevices` only).
     /// The handler renders HTTP 503 + `Retry-After: 1`.
     RetryCeiling,
-    /// Active device inventory session cap was reached.
-    RateLimited,
+    /// Active device inventory session cap was reached. None preserves the
+    /// deferred-constraint fallback when no trustworthy retry duration exists.
+    RateLimited { retry_after_secs: Option<u64> },
 }
 
 /// Consuming canonical `getDevices` response bytes. Private field, no item
@@ -2673,6 +2741,9 @@ fn guard_protected_query(
 fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDeviceReadFacadeError {
     match error {
         InventoryRepositoryError::RequestTooBroad => ExistingDeviceReadFacadeError::RequestTooBroad,
+        InventoryRepositoryError::RateLimited { retry_after_secs } => {
+            ExistingDeviceReadFacadeError::RateLimited { retry_after_secs: Some(retry_after_secs) }
+        }
         InventoryRepositoryError::Database(_) => ExistingDeviceReadFacadeError::Storage,
         _ => ExistingDeviceReadFacadeError::Invariant,
     }
@@ -2861,7 +2932,7 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                         if dbe.code().as_deref() == Some("23514")
                             && dbe.message().contains("cap exceeded")
                         {
-                            return ExistingDeviceReadFacadeError::RateLimited;
+                            return ExistingDeviceReadFacadeError::RateLimited { retry_after_secs: None };
                         }
                     }
                     ExistingDeviceReadFacadeError::Storage
@@ -2890,10 +2961,45 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
     Err(ExistingDeviceReadFacadeError::RetryCeiling)
 }
 
+/// Acquire the complete own-device subject prefix before locking the requester.
+/// These are lock coordinates from the sealed admission, not directory payload
+/// or newly minted authority. The existing exact device/key verification still
+/// runs before any protected directory query or durable snapshot write.
+///
+/// The principal barrier matches canonical mutations and prevents enrollment
+/// from adding a subject mid-snapshot. Device rows follow the same byte order
+/// as mutation scopes, before any key row. This also makes the later subject
+/// foreign-key checks reentrant instead of acquiring sibling locks in reverse.
+async fn lock_own_device_snapshot_subjects(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: &super::super::dpop::ReadAdmissionAttempt,
+) -> Result<(), ExistingDeviceReadFacadeError> {
+    let coordinates = attempt.lock_coordinates();
+    let principal: Option<String> =
+        sqlx::query_scalar("SELECT user_did FROM chat.principals WHERE user_did=$1 FOR UPDATE")
+            .bind(coordinates.did)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    if principal.as_deref() != Some(coordinates.did) {
+        return Err(ExistingDeviceReadFacadeError::Invariant);
+    }
+    sqlx::query(
+        "SELECT device_id FROM chat.devices WHERE user_did=$1 \
+         ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id) FOR UPDATE",
+    )
+    .bind(coordinates.did)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    Ok(())
+}
+
 async fn materialize_own_device_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
 ) -> Result<OwnDeviceSnapshotOutcome, ExistingDeviceReadFacadeError> {
+    lock_own_device_snapshot_subjects(transaction, &attempt).await?;
     let lock = lock_and_verify_read_requester(transaction, attempt).await?;
 
     // PROTECTED QUERY — own-device directory read.
@@ -3273,6 +3379,76 @@ fn derive_inventory_session_uuid_for_version(
     Uuid::from_bytes(uuid_bytes)
 }
 
+#[derive(Clone, Debug)]
+struct InventoryGenerationFence {
+    protocol_instance_id: Uuid,
+    cursor_key_id: String,
+    retained_floor: i64,
+    event_position: i64,
+}
+
+impl InventoryGenerationFence {
+    fn session_uuid(&self, namespace: Uuid) -> Uuid {
+        let mut digest = Sha256::new();
+        digest.update(b"CATBIRD-CHAT-INVENTORY-GENERATION\0");
+        digest.update(namespace.as_bytes());
+        digest.update(self.protocol_instance_id.as_bytes());
+        digest.update((self.cursor_key_id.len() as u64).to_be_bytes());
+        digest.update(self.cursor_key_id.as_bytes());
+        digest.update(self.retained_floor.to_be_bytes());
+        digest.update(self.event_position.to_be_bytes());
+        let bytes: [u8; 32] = digest.finalize().into();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&bytes[..16]);
+        id[6] = (id[6] & 0x0F) | 0x40;
+        id[8] = (id[8] & 0x3F) | 0x80;
+        Uuid::from_bytes(id)
+    }
+
+    fn matches(&self, row: &InventorySessionFenceLockRow) -> bool {
+        self.protocol_instance_id == row.protocol_instance_id
+            && self.cursor_key_id == row.cursor_key_id
+            && self.retained_floor == row.snapshot_retained_floor
+            && self.event_position == row.snapshot_event_position
+    }
+}
+
+async fn capture_inventory_generation_fence(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<InventoryGenerationFence, InventoryRepositoryError> {
+    let (protocol_instance_id, cursor_key_id, retained_floor, event_position): (
+        Uuid,
+        String,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        r#"SELECT protocol.protocol_instance_id, protocol.cursor_key_id,
+                  retention.retained_floor,
+                  (SELECT coalesce(max(event_position),0)::bigint FROM chat.events
+                    WHERE protocol_instance_id=protocol.protocol_instance_id)
+             FROM chat.protocol_instances protocol
+             JOIN chat.event_retention retention USING(protocol_instance_id)
+            WHERE protocol.singleton=TRUE
+            FOR SHARE OF protocol, retention"#,
+    )
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::ProtocolFenceMismatch)?;
+    database_protocol_integer(retained_floor)
+        .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?;
+    database_protocol_integer(event_position)
+        .map_err(|_| InventoryRepositoryError::ProtocolFenceMismatch)?;
+    if retained_floor > event_position {
+        return Err(InventoryRepositoryError::ProtocolFenceMismatch);
+    }
+    Ok(InventoryGenerationFence {
+        protocol_instance_id,
+        cursor_key_id,
+        retained_floor,
+        event_position,
+    })
+}
+
 #[cfg(test)]
 mod materialization_version_tests {
     use super::*;
@@ -3390,6 +3566,56 @@ async fn lock_inventory_session_row(
     .bind(inventory_session_id)
     .fetch_optional(&mut **transaction)
     .await?)
+}
+
+/// Locate the exact retained capability, then reject rows from a different
+/// materialization namespace. Callers still verify its live fence and seal.
+pub(crate) async fn inventory_session_id_for_capability(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: &super::super::read_authority::LockedReadDeviceAuthority,
+    capability: &str,
+) -> Result<Uuid, InventoryRepositoryError> {
+    let hash = capability_hash(capability)?;
+    let id: Uuid = sqlx::query_scalar(
+        "SELECT inventory_session_id FROM chat.inventory_sessions WHERE token_hash=$1 AND snapshot_event_cursor_sha256=$1 AND user_did=$2 AND device_id=$3 AND jkt IS NOT DISTINCT FROM $4 AND auth_generation=$5",
+    )
+    .bind(hash.as_slice())
+    .bind(device.user_did())
+    .bind(device.device_id())
+    .bind(device.jkt())
+    .bind(i64::try_from(device.auth_generation())
+        .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    let row = lock_inventory_session_row(transaction, id)
+        .await?
+        .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    if row.user_did != device.user_did()
+        || row.device_id != device.device_id()
+        || row.jkt.as_deref() != device.jkt()
+        || row.auth_generation
+            != i64::try_from(device.auth_generation())
+                .map_err(|_| InventoryRepositoryError::DeviceAuthorityMismatch)?
+    {
+        return Err(InventoryRepositoryError::DeviceAuthorityMismatch);
+    }
+    let namespace = derive_inventory_session_uuid(
+        device.user_did(),
+        device.device_id(),
+        device.jkt(),
+        device.auth_generation(),
+    );
+    let generation = InventoryGenerationFence {
+        protocol_instance_id: row.protocol_instance_id,
+        cursor_key_id: row.cursor_key_id.clone(),
+        retained_floor: row.snapshot_retained_floor,
+        event_position: row.snapshot_event_position,
+    };
+    if id != namespace && id != generation.session_uuid(namespace) {
+        return Err(InventoryRepositoryError::SessionPresentationMismatch);
+    }
+    Ok(id)
 }
 
 /// The sole production caller of
@@ -4536,6 +4762,70 @@ pub(crate) async fn serve_initial_inventory_page(
     Ok(outcome.into_response())
 }
 
+/// Private publication metadata. It does not change canonical response bytes
+/// or their equality/hash contract.
+struct PreparedInventoryResponse {
+    canonical: CanonicalInventoryResponse,
+    not_before: DateTime<Utc>,
+}
+
+async fn prepare_initial_inventory_page(
+    transaction: &mut Transaction<'_, Postgres>,
+    device: Option<PagingDeviceAuthority>,
+    inventory_session_id: Uuid,
+    request: &InventoryPublicRequestBinding,
+    sealer: &CursorSealer,
+    random: &mut (dyn SecureRandom + Send),
+) -> Result<PreparedInventoryResponse, InventoryRepositoryError> {
+    let canonical = serve_initial_inventory_page(
+        transaction,
+        device,
+        inventory_session_id,
+        request,
+        sealer,
+        random,
+    )
+    .await?;
+    // The common serve path already owns this row's UPDATE lock, including
+    // explicit old capabilities and replay. Its creation instant is immutable.
+    let not_before = sqlx::query_scalar(
+        "SELECT created_at FROM chat.inventory_sessions WHERE inventory_session_id=$1",
+    )
+    .bind(inventory_session_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(InventoryRepositoryError::SessionNotFound)?;
+    Ok(PreparedInventoryResponse {
+        canonical,
+        not_before,
+    })
+}
+
+async fn await_inventory_publication(
+    pool: &sqlx::PgPool,
+    not_before: DateTime<Utc>,
+) -> Result<(), InventoryRepositoryError> {
+    // Materialization timestamps remain rounded up to include fractional-time
+    // source rows. Publish only after that timestamp is valid in PostgreSQL's
+    // clock domain. The caller has committed and released all transaction locks.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(pool)
+                .await?;
+            if observed_at >= not_before {
+                return Ok(());
+            }
+            let delay = (not_before - observed_at)
+                .to_std()
+                .map_err(|_| InventoryRepositoryError::SnapshotConflict)?;
+            tokio::time::sleep(delay).await;
+        }
+    })
+    .await
+    .map_err(|_| InventoryRepositoryError::SnapshotConflict)?
+}
+
 /// One per-attempt create-or-lock + first-page flow.
 async fn create_inventory_snapshot_attempt(
     transaction: &mut Transaction<'_, Postgres>,
@@ -4544,7 +4834,7 @@ async fn create_inventory_snapshot_attempt(
     expected_inventory_session_capability: Option<&str>,
     sealer: &CursorSealer,
     random: &mut (dyn SecureRandom + Send),
-) -> Result<CanonicalInventoryResponse, InventoryRepositoryError> {
+) -> Result<PreparedInventoryResponse, InventoryRepositoryError> {
     // Fresh B-read guard per attempt: two ordered FOR UPDATE statements, the
     // single locked-row constructor callsite, and the consuming verification.
     let device =
@@ -4552,59 +4842,64 @@ async fn create_inventory_snapshot_attempt(
             .await
             .map_err(InventoryRepositoryError::ReadAuthority)?;
 
-    // Deterministic, encoding-versioned session identity: one retained session
-    // per verified (DID, device, JKT, auth generation, materialization wire
-    // version), so repeated calls and the no-cursor Welcomes/recovery reads
-    // deterministically select the same current-version session and its
-    // initial receipts. A wire-version bump intentionally avoids reusing an
-    // older session whose retained payload bytes are already receipt-bound.
-    let inventory_session_id = derive_inventory_session_uuid(
+    if let Some(capability) = expected_inventory_session_capability {
+        let inventory_session_id =
+            inventory_session_id_for_capability(transaction, &device, capability).await?;
+        return prepare_initial_inventory_page(
+            transaction,
+            Some(device.into()),
+            inventory_session_id,
+            request,
+            sealer,
+            random,
+        )
+        .await;
+    }
+
+    // A new global fence gets its own immutable parent row. Old generations
+    // keep their pages, tickets and receipt chains until their original expiry.
+    let generation = capture_inventory_generation_fence(transaction).await?;
+    let namespace = derive_inventory_session_uuid(
         device.user_did(),
         device.device_id(),
         device.jkt(),
         device.auth_generation(),
     );
-    // Create-or-lock. On first sight the session row is created and fully
-    // materialized; a concurrent winner's committed row (unique violation on
-    // the session identity) and every later call take the replay path over the
-    // retained bytes. The device is consumed by the create path's fence
-    // verification; the replay path consumes it in the serve verification.
-    let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
-    if let Some(existing_row) = &existing {
-        let now = current_whole_second(transaction).await?;
-        let current_max_event: i64 = sqlx::query_scalar(
-            "SELECT coalesce(max(event_position), 0)::bigint FROM chat.events WHERE protocol_instance_id = $1",
-        )
-        .bind(existing_row.protocol_instance_id)
+    let mut inventory_session_id = generation.session_uuid(namespace);
+    // Expiry admission uses actual trusted time, never the rounded-up sealing
+    // timestamp: a retained chain stays valid through its original deadline.
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
         .fetch_one(&mut **transaction)
         .await?;
-        let is_stale = current_max_event > existing_row.snapshot_event_position;
-
-        if existing_row.expires_at <= now
-            || now.signed_duration_since(existing_row.created_at) > chrono::Duration::minutes(15)
-            || is_stale
-        {
-            let deleted: bool =
-                sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
-                    .bind(inventory_session_id)
-                    .bind(&existing_row.user_did)
-                    .bind(existing_row.device_id)
-                    .fetch_one(&mut **transaction)
-                    .await?;
-            if !deleted {
-                return Err(InventoryRepositoryError::DurableRowInvalid);
+    let mut existing = lock_inventory_session_row(transaction, inventory_session_id).await?;
+    if existing.as_ref().is_some_and(|row| row.expires_at <= now) {
+        let deleted: bool =
+            sqlx::query_scalar("SELECT chat.delete_inventory_session_exact($1,$2,$3)")
+                .bind(inventory_session_id)
+                .bind(device.user_did())
+                .bind(device.device_id())
+                .fetch_one(&mut **transaction)
+                .await?;
+        if !deleted {
+            return Err(InventoryRepositoryError::DurableRowInvalid);
+        }
+        existing = None;
+    }
+    // Preserve a compatible pre-generation v2 row when it already represents
+    // this exact fence. No retained payload is rewritten during the rollout.
+    if existing.is_none() {
+        if let Some(legacy) = lock_inventory_session_row(transaction, namespace).await? {
+            if legacy.expires_at > now && generation.matches(&legacy) {
+                inventory_session_id = namespace;
+                existing = Some(legacy);
             }
-            existing = None;
         }
     }
-    if let Some(expected_cap) = expected_inventory_session_capability {
-        let expected_hash = capability_hash(expected_cap)?;
-        let Some(existing_row) = &existing else {
-            return Err(InventoryRepositoryError::SessionNotFound);
-        };
-        if existing_row.snapshot_event_cursor_sha256 != expected_hash.as_slice() {
-            return Err(InventoryRepositoryError::SessionPresentationMismatch);
-        }
+    if existing
+        .as_ref()
+        .is_some_and(|row| !generation.matches(row))
+    {
+        return Err(InventoryRepositoryError::DurableRowInvalid);
     }
     let device = if existing.is_none() {
         let created_at = current_whole_second(transaction).await?;
@@ -4617,7 +4912,7 @@ async fn create_inventory_snapshot_attempt(
         sqlx::query("SAVEPOINT create_inventory_session_arm")
             .execute(&mut **transaction)
             .await?;
-        match create_inventory_session(
+        match create_inventory_session_for_generation(
             transaction,
             device,
             CreateInventorySessionRequest {
@@ -4627,6 +4922,7 @@ async fn create_inventory_snapshot_attempt(
             },
             sealer,
             random,
+            Some(&generation),
         )
         .await
         {
@@ -4653,7 +4949,7 @@ async fn create_inventory_snapshot_attempt(
         Some(device)
     };
 
-    serve_initial_inventory_page(
+    prepare_initial_inventory_page(
         transaction,
         device.map(Into::into),
         inventory_session_id,
@@ -4715,7 +5011,8 @@ pub(crate) async fn create_inventory_snapshot_and_first_page(
                     .commit()
                     .await
                     .map_err(InventoryRepositoryError::Database)?;
-                return Ok(response);
+                await_inventory_publication(pool, response.not_before).await?;
+                return Ok(response.canonical);
             }
             Err(InventoryRepositoryError::SnapshotConflict)
             | Err(InventoryRepositoryError::ReadAdmission(_))
@@ -5660,9 +5957,7 @@ struct RetainedRecoveryInboxEntry {
     input: super::super::read_projection::LeafRecoveryInboxInput,
 }
 
-/// Every retained leaf-recovery request (all five statuses) for the exact
-/// device, plus every *open* request in a conversation where this device
-/// holds a live leaf (only such a leaf can fulfil it), then every retained
+/// Every retained leaf-recovery request (all five statuses) and every retained
 /// recovery-work item (all three statuses) for the exact device, in the
 /// canonical 0x00-requests-then-0x01-work ordinal order.
 async fn retained_recovery_inbox_entries(
@@ -5713,15 +6008,8 @@ async fn retained_recovery_inbox_entries(
             ON package.key_package_ref = reservation.key_package_ref
           JOIN chat.conversations AS conversation
             ON conversation.conversation_id = request.conversation_id
-         WHERE (request.requester_did = $1 AND request.requester_device_id = $2)
-            OR (request.status = 'open'
-                AND EXISTS (
-                    SELECT 1 FROM chat.member_devices AS leaf
-                     WHERE leaf.conversation_id = request.conversation_id
-                       AND leaf.generation = request.generation
-                       AND leaf.user_did = $1
-                       AND leaf.device_id = $2
-                       AND leaf.active))
+         WHERE request.requester_did = $1
+           AND request.requester_device_id = $2
          ORDER BY request.recovery_request_id
         "#,
     )

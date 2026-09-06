@@ -481,7 +481,8 @@ impl PreparedWelcomeMutation {
             material,
             response,
         } = self;
-        let prepared = prepare_welcome_terminal_execution(transaction, &plan).await?;
+        let event_scope = completion.scope_authority.event_lock_scope();
+        let prepared = prepare_welcome_terminal_execution(transaction, &plan, &event_scope).await?;
         let applied = apply_prepared_welcome_terminal_execution(prepared).await?;
         Ok(AppliedWelcomeMutation {
             applied,

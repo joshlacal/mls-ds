@@ -45,7 +45,8 @@ use super::{
         ExecutionContextHydrationError,
     },
     prelude::{
-        complete_operation, lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
+        complete_operation, discover_conversation_event_lock_scope,
+        lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
         release_signed_operation_replay, CanonicalDeviceIdentity, CanonicalLockScope,
         LockedSignedOperationReplayAuthority, OperationReservationGuard, PreludeError,
         PreparedSignedOperation, PreparedSignedOperationState, ScopeBoundBusinessAuthority,
@@ -412,6 +413,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     {
         return Err(SubmitTransitionFacadeError::CandidateScopeDrift);
     }
+    validate_locked_scope(transaction, scope_authority, admitted, &parsed).await?;
     let hydration = HydrationAuthority::from_locked_conversation(&aggregate)?;
     let registration = hydration.locked_registration_from_scope_authority_at(
         scope_authority,
@@ -572,11 +574,13 @@ async fn execute_first_submit_transition<T: PublicTransport>(
     let expected_coordinate = plan.successor_coordinate().copied();
     let response_sha256 = *response.sha256();
     let (scope_authority, completion) = prelude.into_execution_parts();
+    let event_scope = scope_authority.event_lock_scope();
     let prepared_execution = prepare_submit_transition_execution(
         transaction,
         &plan,
         accepted_control_entry_bytes,
         routing,
+        &event_scope,
     )
     .await?;
     let applied = apply_prepared_submit_transition_execution(prepared_execution).await?;
@@ -856,13 +860,23 @@ async fn discover_submit_transition_identity_scope_for_actor(
     .bind(actor_device_id)
     .fetch_all(&mut **transaction)
     .await?;
-    CanonicalLockScope::new(
+    let seed = CanonicalLockScope::new(
         principals,
         devices
             .into_iter()
             .map(|(did, device_id)| CanonicalDeviceIdentity::new(did, device_id))
             .collect(),
+    )?;
+    // A pending account invitation emits to every existing device of the new
+    // principal. Include those devices before the conversation head lock.
+    discover_conversation_event_lock_scope(
+        transaction,
+        conversation_id,
+        &seed,
+        add_principals,
+        false,
     )
+    .await
     .map_err(SubmitTransitionFacadeError::from)
 }
 

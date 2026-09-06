@@ -273,6 +273,9 @@ async fn execute_first_acceptance<T: PublicTransport>(
             Uuid::from_bytes(*authority.device_id().as_bytes()),
         )],
     )?;
+    let scope = super::prelude::discover_conversation_event_lock_scope(
+        transaction, conversation_id, &scope, &[], false,
+    ).await?;
     let prelude = prepare_identity_scope_prelude(transaction, &authority, reservation, scope)
         .await?
         .verify_acceptance_operation(transition_id, mutation)?;
@@ -337,7 +340,30 @@ async fn execute_first_acceptance<T: PublicTransport>(
         server_fields,
     )?;
     let products = CanonicalControlEntryProducts::mint(&entry)?;
-    let terminal_packages = Vec::new();
+    // Acceptance advances the coordinate and supersedes prior recovery work.
+    // Lock those existing reservations as well as the accepting device's new
+    // package, so the executor can release them in the same transaction.
+    let mut terminal_request_ids = aggregate
+        .state()
+        .recovery_requests()
+        .iter()
+        .filter(|request| {
+            request.status() == crate::chat_protocol::state_machine::RecoveryRequestStatus::Open
+        })
+        .map(|request| Uuid::from_bytes(*request.request_id()))
+        .collect::<Vec<_>>();
+    terminal_request_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let mut terminal_packages = Vec::with_capacity(terminal_request_ids.len());
+    for request_id in terminal_request_ids {
+        terminal_packages.push(
+            super::core::hydrate_locked_reserved_recovery_package(
+                transaction,
+                aggregate.head(),
+                request_id,
+            )
+            .await?,
+        );
+    }
     let trusted_now = crate::chat_protocol::validation::TrustedRequestInstant::from_datetime(
         scope_authority.trusted_instant(),
     )?;
@@ -357,7 +383,7 @@ async fn execute_first_acceptance<T: PublicTransport>(
     let response = acceptance_response(&plan, products.canonical_response_json())?;
     let (scope, completion) = prelude.into_execution_parts();
     let prepared =
-        prepare_acceptance_execution(transaction, &plan, products.durable_json().to_vec()).await?;
+        prepare_acceptance_execution(transaction, &plan, products.durable_json().to_vec(), &scope.event_lock_scope()).await?;
     let applied = apply_prepared_acceptance_execution(prepared).await?;
     if applied.entry_id != transition_id {
         return Err(AcceptanceFacadeError::InvalidCanonicalMaterial);

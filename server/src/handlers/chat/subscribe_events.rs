@@ -12,7 +12,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use catbird_atproto::generated::blue_catbird::chat::SubscriptionMessage;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::realtime::StreamEvent;
 use crate::{
@@ -35,6 +35,35 @@ use super::{context, errors::ChatFailure, runtime::ChatRuntime};
 
 const ENDPOINT: ChatEndpoint = ChatEndpoint::SubscribeEvents;
 const BATCH_SIZE: i64 = 128;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// ATProto subscriptions carry two consecutive DAG-CBOR maps in one binary
+/// WebSocket message. Serialize the generated inner DTO directly: this moves
+/// only the outer union discriminator to the header and preserves nested union
+/// tags and byte strings without a JSON intermediate.
+fn encode_subscription_frame(
+    message: &SubscriptionMessage,
+) -> Result<Vec<u8>, ()> {
+    #[derive(Serialize)]
+    struct Header {
+        op: i64,
+        t: &'static str,
+    }
+    let (message_type, body) = match message {
+        SubscriptionMessage::EventEnvelope(envelope) => (
+            "blue.catbird.chat.defs#eventEnvelope",
+            serde_ipld_dagcbor::to_vec(envelope).map_err(|_| ())?,
+        ),
+        SubscriptionMessage::TypingEvent(typing) => (
+            "blue.catbird.chat.defs#typingEvent",
+            serde_ipld_dagcbor::to_vec(typing).map_err(|_| ())?,
+        ),
+    };
+    let mut frame = serde_ipld_dagcbor::to_vec(&Header { op: 1, t: message_type })
+        .map_err(|_| ())?;
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
 
 // The generated subscription parameter module is feature-gated by
 // catbird-atproto's client-side `streaming` feature. Keep the server extractor
@@ -224,6 +253,12 @@ async fn stream(
         return;
     }
     let mut typing_receivers = HashMap::new();
+    // Keep one transport timer across polling and incoming control frames.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Reconcile the replay/live race before waiting. Subsequent passes use
@@ -268,10 +303,10 @@ async fn stream(
                             return;
                         };
                         let message = SubscriptionMessage::TypingEvent(Box::new(typing));
-                        let Ok(frame) = serde_json::to_string(&message) else {
+                        let Ok(frame) = encode_subscription_frame(&message) else {
                             return;
                         };
-                        if socket.send(Message::Text(frame.into())).await.is_err() {
+                        if socket.send(Message::Binary(frame.into())).await.is_err() {
                             return;
                         }
                     }
@@ -283,6 +318,11 @@ async fn stream(
         }
 
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            },
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
                 Some(Ok(Message::Ping(payload))) => {
@@ -378,7 +418,7 @@ async fn send_through(
                 Ok(value) => value,
                 Err(_) => return false,
             };
-            let frame = match serde_json::to_string(&message) {
+            let frame = match encode_subscription_frame(&message) {
                 Ok(frame) => frame,
                 Err(_) => return false,
             };
@@ -392,7 +432,7 @@ async fn send_through(
         // Receipt commit precedes each frame. A lost response is replayed from
         // the sealed receipt; the client never observes an uncommitted cursor.
         for frame in frames {
-            if socket.send(Message::Text(frame.into())).await.is_err() {
+            if socket.send(Message::Binary(frame.into())).await.is_err() {
                 return false;
             }
         }

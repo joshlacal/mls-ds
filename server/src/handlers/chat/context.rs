@@ -341,6 +341,10 @@ pub(crate) fn operation_prelude_failure(
             ChatFailure::protocol(endpoint, C::DeviceNotRegistered)
         }
         E::OperationIdConflict => ChatFailure::protocol(endpoint, C::IdempotencyConflict),
+        E::SignedOperationExpired if endpoint == ChatEndpoint::SubmitTransition => {
+            ChatFailure::protocol(endpoint, C::SignedOperationExpired)
+        }
+        E::SignedOperationExpired => ChatFailure::invariant(endpoint),
         E::ForeignTransaction
         | E::UnsupportedAuthority
         | E::NonCanonicalOperation

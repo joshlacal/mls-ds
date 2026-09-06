@@ -74,6 +74,28 @@ pub async fn lock_delivery_id(
     Ok(())
 }
 
+/// Acquire only the canonical operation advisory lock from a decoded candidate.
+/// This mints no request/operation admission and makes no replay decision. The
+/// original authenticated arbitration below reacquires this same transaction
+/// lock after route, signature, and exact signed-operation checks have passed.
+async fn lock_candidate_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &CanonicalSignedMutation,
+) -> Result<(), FederationError> {
+    // Malformed or non-idempotent candidates still fail at their original
+    // validation seam; they cannot reach an accepted operation write.
+    let Ok(operation_id) = candidate.operation_id() else {
+        return Ok(());
+    };
+    let operation_id = Uuid::from_bytes(*operation_id.as_bytes());
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(prelude::canonical_operation_lock_key(operation_id))
+        .execute(&mut **tx)
+        .await
+        .map_err(FederationError::Database)?;
+    Ok(())
+}
+
 /// Check if an exact delivery receipt already exists, returning the stored response bytes on replay.
 /// Revalidates the stored receipt digest, envelope metadata, and (when supplied) the source locator.
 /// For submitCommit the source locator is only known after the transition is planned and applied,
@@ -1013,6 +1035,44 @@ pub async fn deliver_message_replication(
         });
     }
 
+    // This read-only candidate inspection does not authorize a delivery. Lock
+    // every identity the exact recipient check, actor verification, and final
+    // messageAvailable append can touch before taking the mailbox head. Keep
+    // quarantine, exact replay, routing, and signed-entry checks below intact.
+    let candidate_devices =
+        if let Ok(candidate) = decode_canonical_signed_mutation(&signed_request_bytes) {
+            lock_candidate_operation(tx, &candidate).await?;
+            vec![prelude::CanonicalDeviceIdentity::new(
+                candidate.actor_did().as_str(),
+                Uuid::from_bytes(*candidate.actor_device_id().as_bytes()),
+            )]
+        } else {
+            vec![]
+        };
+    let event_seed =
+        prelude::CanonicalLockScope::new(vec![recipient_did.clone()], candidate_devices).map_err(
+            |error| FederationError::InvalidEnvelope {
+                reason: format!("invalid delivery lock candidate: {error:?}"),
+            },
+        )?;
+    let prospective_principals = vec![recipient_did.clone()];
+    let candidate_scope = prelude::discover_conversation_event_lock_scope(
+        tx,
+        header.conversation_id,
+        &event_seed,
+        &prospective_principals,
+        true,
+    )
+    .await
+    .map_err(|error| FederationError::InvalidEnvelope {
+        reason: format!("delivery lock scope discovery failed: {error:?}"),
+    })?;
+    let event_scope = prelude::lock_conversation_event_scope(tx, &candidate_scope)
+        .await
+        .map_err(|error| FederationError::InvalidEnvelope {
+            reason: format!("delivery lock acquisition failed: {error:?}"),
+        })?;
+
     // 1. Lock conversation and verify remote mailbox routing and exact term.
     let convo_row: Option<(bool, Option<String>, i64, i64, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         r#"
@@ -1090,6 +1150,31 @@ pub async fn deliver_message_replication(
             current_term: sequencer_term,
         });
     }
+
+    // The head now fixes the mailbox graph. Re-read the complete required set,
+    // including every application interval the eventual event append reads,
+    // before the first post-head identity lock or any business write. An actor
+    // or sibling absent from the original union cannot be locked here.
+    let required_scope = prelude::discover_conversation_event_lock_scope(
+        tx,
+        header.conversation_id,
+        &event_seed,
+        &prospective_principals,
+        true,
+    )
+    .await
+    .map_err(|error| FederationError::InvalidEnvelope {
+        reason: format!("delivery lock scope recheck failed: {error:?}"),
+    })?;
+    let transaction_id: String = sqlx::query_scalar("SELECT txid_current()::text")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(FederationError::Database)?;
+    event_scope
+        .require_subset(&transaction_id, &required_scope)
+        .map_err(|error| FederationError::DeliveryConflict {
+            reason: format!("delivery event lock scope changed: {error:?}"),
+        })?;
 
     // 2. Verify recipient is a LOCAL participant (ds_did NULL/local) with an
     //    active member leaf, and the application interval covers the entry.
@@ -1768,6 +1853,45 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         return Ok(cached_output);
     }
 
+    // Candidate inspection grants no actor or transition authority. Preserve the
+    // original routing, signature, and operation-arbitration checks below, but
+    // acquire the complete event-device lock union before the conversation head.
+    // A malformed candidate still fails at the original canonical decode seam.
+    let event_scope = if let Ok(candidate) = decode_canonical_signed_mutation(&signed_request_bytes)
+    {
+        lock_candidate_operation(tx, &candidate).await?;
+        let seed = prelude::CanonicalLockScope::new(
+            vec![],
+            vec![prelude::CanonicalDeviceIdentity::new(
+                candidate.actor_did().as_str(),
+                Uuid::from_bytes(*candidate.actor_device_id().as_bytes()),
+            )],
+        )
+        .map_err(|error| FederationError::InvalidEnvelope {
+            reason: format!("invalid event lock candidate: {error:?}"),
+        })?;
+        let scope = prelude::discover_conversation_event_lock_scope(
+            tx,
+            header.conversation_id,
+            &seed,
+            &[],
+            true,
+        )
+        .await
+        .map_err(|error| FederationError::InvalidEnvelope {
+            reason: format!("event lock scope discovery failed: {error:?}"),
+        })?;
+        Some(
+            prelude::lock_conversation_event_scope(tx, &scope)
+                .await
+                .map_err(|error| FederationError::InvalidEnvelope {
+                    reason: format!("event lock acquisition failed: {error:?}"),
+                })?,
+        )
+    } else {
+        None
+    };
+
     // 1. Lock conversation on sequencer DS.
     let convo_row: Option<(bool, Option<String>, i64)> = sqlx::query_as(
         r#"
@@ -1832,6 +1956,10 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
             ),
         });
     }
+
+    let event_scope = event_scope.ok_or_else(|| FederationError::InvalidEnvelope {
+        reason: "canonical mutation lacks its transaction event lock scope".to_string(),
+    })?;
 
     let actor_did = canonical.actor_did().as_str();
     let actor_device_id = Uuid::from_bytes(*canonical.actor_device_id().as_bytes());
@@ -2196,12 +2324,17 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         outer_entry_fingerprint: outer_control_fingerprint,
     };
 
-    let prepared_execution =
-        prepare_submit_transition_execution(tx, &plan, accepted_control_entry_bytes, None)
-            .await
-            .map_err(|e| FederationError::InvalidEnvelope {
-                reason: format!("prepare_submit_transition_execution error: {e:?}"),
-            })?;
+    let prepared_execution = prepare_submit_transition_execution(
+        tx,
+        &plan,
+        accepted_control_entry_bytes,
+        None,
+        &event_scope,
+    )
+    .await
+    .map_err(|e| FederationError::InvalidEnvelope {
+        reason: format!("prepare_submit_transition_execution error: {e:?}"),
+    })?;
 
     let applied = apply_prepared_submit_transition_execution(prepared_execution)
         .await

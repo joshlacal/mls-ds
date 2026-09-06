@@ -89,13 +89,14 @@ async fn read_entries_in_transaction(
             tracing::error!("authorize_entries failed: {:?}", e);
             map_authority_error(e)
         })?;
-    let page = delivery::get_entries(
+    let page = delivery::get_entries_with_terminal_control_interval(
         transaction,
         conversation_id,
         authority.conversation().user_did(),
         authority.conversation().device_id(),
         after_seq,
         limit,
+        authority.terminal_control_interval(),
     )
     .await
     .map_err(map_delivery_error)?;

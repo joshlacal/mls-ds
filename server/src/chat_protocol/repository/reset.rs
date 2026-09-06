@@ -23,10 +23,11 @@ use super::{
         hydrate_execution_context, ExecutionContextArtifacts, ExecutionContextHydrationError,
     },
     prelude::{
-        lock_signed_operation_replay_authority, prepare_identity_scope_prelude,
-        release_signed_operation_replay, LockedSignedOperationReplayAuthority,
-        OperationCompletionGuard, OperationReservationGuard, PreludeError, PreparedSignedOperation,
-        PreparedSignedOperationState, SignedOperationReplayPostStateProof,
+        discover_conversation_event_lock_scope, lock_signed_operation_replay_authority,
+        prepare_identity_scope_prelude, release_signed_operation_replay,
+        LockedSignedOperationReplayAuthority, OperationCompletionGuard, OperationReservationGuard,
+        PreludeError, PreparedSignedOperation, PreparedSignedOperationState,
+        SignedOperationReplayPostStateProof,
     },
 };
 use super::{
@@ -37,8 +38,8 @@ use super::{
         LockedConversationStateGuard, LockedRecoveryPackageGuard,
     },
     prelude::{
-        CanonicalDeviceIdentity, CanonicalLockScope, PreparedBusinessPrelude,
-        ResetOperationEndpoint, ScopeBoundBusinessAuthority,
+        CanonicalDeviceIdentity, CanonicalLockScope, ConversationEventLockScope,
+        PreparedBusinessPrelude, ResetOperationEndpoint, ScopeBoundBusinessAuthority,
     },
 };
 use crate::chat_protocol::{
@@ -480,13 +481,15 @@ impl PreparedResetExecutionGraph {
     async fn apply(
         self,
         transaction: &mut Transaction<'_, Postgres>,
+        event_scope: &ConversationEventLockScope,
     ) -> Result<(AppliedTransition, ResetCanonicalResponse), ResetFacadeError> {
         let Self {
             plan,
             artifacts,
             response,
         } = self;
-        let prepared = hydrate_execution_context(transaction, &plan, artifacts).await?;
+        let prepared =
+            hydrate_execution_context(transaction, &plan, artifacts, event_scope).await?;
         let applied =
             crate::chat_protocol::state_machine::executor::apply_conversation_persistence_plan(
                 prepared,
@@ -1881,7 +1884,8 @@ async fn execute_first_reset(
         }
     };
     let (scope_authority, completion) = graph.1.into_execution_parts();
-    let (applied, response) = graph.0.apply(transaction).await?;
+    let event_scope = scope_authority.event_lock_scope();
+    let (applied, response) = graph.0.apply(transaction, &event_scope).await?;
     Ok(AppliedResetOperation {
         applied,
         completion: ResetCompletion {
@@ -2669,14 +2673,22 @@ async fn discover_reset_identity_scope_for_actor(
     .bind(actor_device_id)
     .fetch_all(&mut **transaction)
     .await?;
-    CanonicalLockScope::new(
+    let seed = CanonicalLockScope::new(
         principals,
         devices
             .into_iter()
             .map(|(did, device_id)| CanonicalDeviceIdentity::new(did, device_id))
             .collect(),
     )
-    .map_err(|_| ResetRepositoryError::NonCanonicalScope)
+    .map_err(|_| ResetRepositoryError::NonCanonicalScope)?;
+    // The seed retains exact pending-Welcome recipients. The shared union
+    // adds all current/prior-leaf devices before reset takes the head lock.
+    discover_conversation_event_lock_scope(transaction, conversation_id, &seed, &[], false)
+        .await
+        .map_err(|error| match error {
+            PreludeError::Database(error) => ResetRepositoryError::Database(error),
+            _ => ResetRepositoryError::NonCanonicalScope,
+        })
 }
 
 fn request_contains_exact_mutation(

@@ -649,12 +649,24 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
     let device = read_authority::lock_read_device_authority_once(&mut transaction, attempt)
         .await
         .map_err(|_| TicketRepositoryError::DeviceBindingMismatch)?;
-    let inventory_session_id = inventory::derive_inventory_session_uuid(
-        device.user_did(),
-        device.device_id(),
-        device.jkt(),
-        device.auth_generation(),
-    );
+    let inventory_session_id = inventory::inventory_session_id_for_capability(
+        &mut transaction,
+        &device,
+        inventory_session_capability,
+    )
+    .await
+    .map_err(|error| match error {
+        inventory::InventoryRepositoryError::SessionNotFound => {
+            TicketRepositoryError::SessionMissing
+        }
+        inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
+            TicketRepositoryError::DeviceBindingMismatch
+        }
+        inventory::InventoryRepositoryError::Database(error) => {
+            TicketRepositoryError::Database(error)
+        }
+        _ => TicketRepositoryError::SessionBindingMismatch,
+    })?;
     let (capability, session_expires_at) = inventory::snapshot_capability_for_ticket(
         &mut transaction,
         &device,
@@ -668,6 +680,9 @@ pub(crate) async fn mint_subscription_ticket_for_admission(
         }
         inventory::InventoryRepositoryError::DeviceAuthorityMismatch => {
             TicketRepositoryError::DeviceBindingMismatch
+        }
+        inventory::InventoryRepositoryError::Database(error) => {
+            TicketRepositoryError::Database(error)
         }
         _ => TicketRepositoryError::SessionBindingMismatch,
     })?;

@@ -2428,6 +2428,28 @@ pub(crate) async fn get_entries(
     after_seq: u64,
     limit: i64,
 ) -> Result<EntriesPage, DeliveryRepositoryError> {
+    get_entries_with_terminal_control_interval(transaction, conversation_id, caller_did,
+        caller_device_id, after_seq, limit, None).await
+}
+
+/// A former exact leaf may read only controls in its authenticated finite
+/// interval. This adds a ceiling/type restriction; it never replaces either
+/// canonical exact-device entitlement predicate below.
+pub(crate) async fn get_entries_with_terminal_control_interval(
+    transaction: &mut Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    caller_did: &str,
+    caller_device_id: Uuid,
+    after_seq: u64,
+    limit: i64,
+    terminal_control_interval: Option<(u64, u64)>,
+) -> Result<EntriesPage, DeliveryRepositoryError> {
+    let (control_start, control_end) = match terminal_control_interval {
+        Some((start, end)) if start < end => (Some(i64::try_from(start).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?),
+            Some(i64::try_from(end).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?)),
+        Some(_) => return Err(DeliveryRepositoryError::SequenceOverflow),
+        None => (None, None),
+    };
     let after_seq_i64 =
         i64::try_from(after_seq).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?;
     let fetch = limit
@@ -2448,6 +2470,9 @@ pub(crate) async fn get_entries(
               FROM chat.entries AS entry
              WHERE entry.conversation_id = $1
                AND entry.seq > $2
+               AND ($7::bigint IS NULL OR (
+                   entry.entry_kind <> $5 AND entry.seq >= $7 AND entry.seq <= $8
+               ))
                AND (
                  (
                    entry.entry_kind = $5
@@ -2494,6 +2519,8 @@ pub(crate) async fn get_entries(
     .bind(caller_device_id)
     .bind(APPLICATION_ENTRY_KIND)
     .bind(fetch)
+    .bind(control_start)
+    .bind(control_end)
     .fetch_all(&mut **transaction)
     .await?;
 

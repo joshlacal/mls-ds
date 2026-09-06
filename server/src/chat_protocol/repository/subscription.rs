@@ -21,7 +21,7 @@ use crate::{
     chat_protocol::cursor::{
         mint_capability_token, CursorSealer, OsSecureRandom, SealedCapability, SealerBinding,
     },
-    sqlx_jacquard::chrono_to_datetime,
+    sqlx_jacquard::{chrono_to_canonical_datetime, chrono_to_datetime},
 };
 
 const MAX_BATCH: i64 = 256;
@@ -164,8 +164,10 @@ pub(crate) async fn ensure_initial_receipt(
 }
 
 /// Materialize or replay the next cursor-bound generated envelope. The
-/// receipt is committed before the caller writes the frame, so a dropped
-/// response can be reconstructed byte-for-byte on a later ticket.
+/// receipt is committed before the caller writes the frame. Its immutable
+/// producer digest is verified on replay, including the one historical
+/// microsecond-timestamp producer. Transport always emits canonical millis;
+/// compatibility never rewrites the retained digest, cursor, or deadline.
 pub(crate) async fn materialize_envelope(
     transaction: &mut Transaction<'_, Postgres>,
     ticket: &ConsumedTicket,
@@ -174,6 +176,18 @@ pub(crate) async fn materialize_envelope(
     previous_cursor_hash: [u8; 32],
     sealer: &CursorSealer,
 ) -> Result<(SubscriptionMessage<DefaultStr>, String, [u8; 32]), TicketRepositoryError> {
+    // Same-session streams must share one committed successor. The caller has
+    // already revalidated device/protocol authority; lock the retained parent
+    // before looking for a receipt, including when that receipt is absent.
+    let session_present: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT inventory_session_id FROM chat.inventory_sessions WHERE inventory_session_id=$1 FOR UPDATE",
+    )
+    .bind(ticket.inventory_session_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if session_present.is_none() {
+        return Err(TicketRepositoryError::SessionMissing);
+    }
     let existing = sqlx::query(
         r#"SELECT cursor_hash, predecessor_cursor_hash, retained_floor_at_issue,
                   cursor_nonce, cursor_ciphertext, canonical_envelope_sha256,
@@ -253,8 +267,9 @@ pub(crate) async fn materialize_envelope(
         (cursor, cursor_hash, [0; 32])
     };
 
+    let event_created_at = event.created_at;
     let message = SubscriptionMessage::EventEnvelope(Box::new(EventEnvelope {
-        created_at: chrono_to_datetime(event.created_at),
+        created_at: chrono_to_canonical_datetime(event_created_at),
         cursor: cursor.clone().into(),
         payload: event.payload,
         previous_cursor: previous_cursor.into(),
@@ -266,7 +281,22 @@ pub(crate) async fn materialize_envelope(
 
     if expected_envelope_hash != [0; 32] {
         if expected_envelope_hash != envelope_hash {
-            return Err(TicketRepositoryError::InvalidReceipt);
+            // Exact read compatibility with the deployed producer: all event,
+            // predecessor, session, expiry and sealed-cursor checks above have
+            // passed. Recompute only its known six-digit UTC outer timestamp
+            // spelling on this same verified envelope. No arbitrary hash or
+            // parsed-wire fallback is accepted, and the receipt is untouched.
+            let mut legacy_message = message.clone();
+            let SubscriptionMessage::EventEnvelope(envelope) = &mut legacy_message else {
+                return Err(TicketRepositoryError::InvalidReceipt);
+            };
+            envelope.created_at = chrono_to_datetime(event_created_at);
+            let legacy_bytes = serde_json::to_vec(&legacy_message)
+                .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+            let legacy_hash: [u8; 32] = Sha256::digest(&legacy_bytes).into();
+            if expected_envelope_hash != legacy_hash {
+                return Err(TicketRepositoryError::InvalidReceipt);
+            }
         }
     } else {
         // Recreate the sealing inputs after envelope construction. This is
