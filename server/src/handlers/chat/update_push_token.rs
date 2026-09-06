@@ -74,20 +74,25 @@ async fn update_push_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let view = update_device_push_token(pool, principal.did(), parsed.token.as_deref(), target_device_id)
-        .await
-        .map_err(|err| match err {
-            UpdatePushTokenRepositoryError::DeviceNotRegistered => {
-                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceNotRegistered)
-            }
-            UpdatePushTokenRepositoryError::DeviceRevoked => {
-                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceRevoked)
-            }
-            UpdatePushTokenRepositoryError::Database(e) => {
-                tracing::error!("update_device_push_token database error: {:?}", e);
-                ChatFailure::storage(ENDPOINT)
-            }
-        })?;
+    let view = update_device_push_token(
+        pool,
+        principal.did(),
+        parsed.token.as_deref(),
+        target_device_id,
+    )
+    .await
+    .map_err(|err| match err {
+        UpdatePushTokenRepositoryError::DeviceNotRegistered => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceNotRegistered)
+        }
+        UpdatePushTokenRepositoryError::DeviceRevoked => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceRevoked)
+        }
+        UpdatePushTokenRepositoryError::Database(e) => {
+            tracing::error!("update_device_push_token database error: {:?}", e);
+            ChatFailure::storage(ENDPOINT)
+        }
+    })?;
 
     let device_dto = device_view_from_directory(&view);
     let output_json = json!({
@@ -143,7 +148,7 @@ mod tests {
             Err(ChatProtocolErrorCode::InvalidRequest)
         );
         assert_eq!(
-            validate_token(Some("0123456789abcdef\00123456789abcdef")),
+            validate_token(Some("0123456789abcdef\x000123456789abcdef")),
             Err(ChatProtocolErrorCode::InvalidRequest)
         );
     }

@@ -8,8 +8,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const OUTPUT: &str = "/tmp/mlsv2-canonical-wire-interop-20260905";
-
 fn preserve_identical(path: &Path, bytes: &[u8]) {
     if path.exists() {
         assert!(
@@ -24,8 +22,15 @@ fn preserve_identical(path: &Path, bytes: &[u8]) {
 
 #[test]
 fn actual_server_encoder_writes_public_interop_fixtures() {
-    let directory = Path::new(OUTPUT);
-    std::fs::create_dir_all(directory).unwrap();
+    let directory = std::env::var_os("CATBIRD_ATPROTO_STREAM_FIXTURE_OUTPUT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "catbird-atproto-stream-fixtures-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+    std::fs::create_dir_all(&directory).unwrap();
     let examples: [(&str, &str, Value); 2] = [
         (
             "envelope",

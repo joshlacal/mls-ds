@@ -456,21 +456,30 @@ mod tests {
     #[test]
     fn live_conversation_state_response_encodes_nonempty_recovery_bytes_canonically() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
-        ))).expect("fixture");
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
+        )))
+        .expect("fixture");
         let state: catbird_atproto::generated::blue_catbird::chat::ConversationState =
             serde_json::from_value(fixture["vectors"][0]["value"].clone()).expect("state");
         let recovery = project_recovery(source_row()).expect("recovery view");
         let expected_device = recovery.requester_device_id.to_string();
-        let encoded = super::super::canonical_conversation_state_response(
-            &state, &[recovery], &[], &[]
-        ).expect("canonical response");
+        let encoded =
+            super::super::canonical_conversation_state_response(&state, &[recovery], &[], &[])
+                .expect("canonical response");
         assert!(encoded.starts_with(br#"{"pendingLeafRecoveryRequests":["#));
         let decoded: serde_json::Value = serde_json::from_slice(&encoded).expect("decode response");
-        assert_eq!(decoded["pendingLeafRecoveryRequests"][0]["requesterDeviceId"], expected_device);
-        assert!(decoded.pointer("/pendingLeafRecoveryRequests/0/boundCoordinate/groupId/$bytes")
-            .and_then(serde_json::Value::as_str).is_some());
-        assert!(decoded.pointer("/pendingLeafRecoveryRequests/0/reservation/keyPackage/bytes/$bytes")
-            .and_then(serde_json::Value::as_str).is_some());
+        assert_eq!(
+            decoded["pendingLeafRecoveryRequests"][0]["requesterDeviceId"],
+            expected_device
+        );
+        assert!(decoded
+            .pointer("/pendingLeafRecoveryRequests/0/boundCoordinate/groupId/$bytes")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
+        assert!(decoded
+            .pointer("/pendingLeafRecoveryRequests/0/reservation/keyPackage/bytes/$bytes")
+            .and_then(serde_json::Value::as_str)
+            .is_some());
     }
 }

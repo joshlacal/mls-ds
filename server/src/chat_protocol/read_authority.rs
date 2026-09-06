@@ -1021,8 +1021,12 @@ pub(crate) struct EntryConversationReadAuthority {
     _conversation: LockedConversationStateGuard,
 }
 impl EntryConversationReadAuthority {
-    pub(in crate::chat_protocol) fn user_did(&self) -> &str { self.device.user_did() }
-    pub(in crate::chat_protocol) fn device_id(&self) -> Uuid { self.device.device_id() }
+    pub(in crate::chat_protocol) fn user_did(&self) -> &str {
+        self.device.user_did()
+    }
+    pub(in crate::chat_protocol) fn device_id(&self) -> Uuid {
+        self.device.device_id()
+    }
 }
 
 /// The checked entry authority. `pub(crate)` per the frozen internal
@@ -1373,15 +1377,20 @@ pub(crate) async fn authorize_entries(
     assert_same_transaction(tx, device.txid()).await?;
     let locked_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
-            .fetch_one(&mut **tx).await.map_err(|_| ReadAuthorityError::Storage)?;
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|_| ReadAuthorityError::Storage)?;
     let locked = hydrate_locked_conversation_state(tx, conversation_id, locked_at)
-        .await.map_err(map_hydration_error)?;
+        .await
+        .map_err(map_hydration_error)?;
     let facts = exact_device_interval_facts(device.user_did(), device.device_id(), locked.state())?;
     let terminal_control_interval = if facts.open.is_some() {
         // Preserve the current-open row witnesses required by the old gate.
         load_participant_period_id(tx, conversation_id, device.user_did()).await?;
         load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await?;
-        locked.locked_snapshot_digest().ok_or(ReadAuthorityError::Invariant)?;
+        locked
+            .locked_snapshot_digest()
+            .ok_or(ReadAuthorityError::Invariant)?;
         None
     } else if let Some(interval) = facts.latest_finite {
         let end = interval.end().ok_or(ReadAuthorityError::Invariant)?;
@@ -1395,7 +1404,10 @@ pub(crate) async fn authorize_entries(
     } else {
         return Err(ReadAuthorityError::NotEntitled);
     };
-    let state = EntryConversationReadAuthority { device, _conversation: locked };
+    let state = EntryConversationReadAuthority {
+        device,
+        _conversation: locked,
+    };
 
     let rows = match load_exact_device_interval_rows(
         tx,

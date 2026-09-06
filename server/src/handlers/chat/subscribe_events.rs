@@ -41,9 +41,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// WebSocket message. Serialize the generated inner DTO directly: this moves
 /// only the outer union discriminator to the header and preserves nested union
 /// tags and byte strings without a JSON intermediate.
-fn encode_subscription_frame(
-    message: &SubscriptionMessage,
-) -> Result<Vec<u8>, ()> {
+fn encode_subscription_frame(message: &SubscriptionMessage) -> Result<Vec<u8>, ()> {
     #[derive(Serialize)]
     struct Header {
         op: i64,
@@ -59,8 +57,11 @@ fn encode_subscription_frame(
             serde_ipld_dagcbor::to_vec(typing).map_err(|_| ())?,
         ),
     };
-    let mut frame = serde_ipld_dagcbor::to_vec(&Header { op: 1, t: message_type })
-        .map_err(|_| ())?;
+    let mut frame = serde_ipld_dagcbor::to_vec(&Header {
+        op: 1,
+        t: message_type,
+    })
+    .map_err(|_| ())?;
     frame.extend_from_slice(&body);
     Ok(frame)
 }
@@ -465,3 +466,7 @@ fn map_ticket_error(error: TicketRepositoryError) -> ChatFailure {
         E::InvalidReceipt => ChatFailure::invariant(ENDPOINT),
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "../../../tests/common/chat_protocol_atproto_stream_fixtures.rs"]
+mod atproto_stream_fixture_tests;

@@ -77,7 +77,10 @@ pub(crate) async fn read_conversation_state_for_admission(
     Ok(CanonicalConversationStateResponse {
         bytes: canonical_conversation_state_response(
             &output.state,
-            output.pending_leaf_recovery_requests.as_deref().unwrap_or_default(),
+            output
+                .pending_leaf_recovery_requests
+                .as_deref()
+                .unwrap_or_default(),
             &output.pending_leave_requests,
             &output.pending_reset_requests,
         )?,
@@ -506,7 +509,10 @@ mod tests {
         )
         .expect("decode response");
 
-        assert_eq!(response["pendingLeafRecoveryRequests"], serde_json::json!([]));
+        assert_eq!(
+            response["pendingLeafRecoveryRequests"],
+            serde_json::json!([])
+        );
 
         for path in [
             "/state/metadataSnapshot/coordinate/conversationId/$bytes",

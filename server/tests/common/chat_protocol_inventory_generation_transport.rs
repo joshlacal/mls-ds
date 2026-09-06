@@ -1152,3 +1152,12 @@ async fn ninth_inventory_fence_is_rate_limited_without_mutating_retained_session
     drop(socket);
     server.stop().await;
 }
+
+#[path = "chat_protocol_atproto_stream_transport.rs"]
+mod atproto_stream_transport_tests;
+
+#[path = "chat_protocol_canonical_receipt_digest.rs"]
+mod canonical_receipt_digest_tests;
+
+#[path = "chat_protocol_inventory_generation_admission.rs"]
+mod admission;

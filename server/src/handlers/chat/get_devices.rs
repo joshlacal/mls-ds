@@ -76,7 +76,11 @@ fn facade_failure(error: ExistingDeviceReadFacadeError) -> ChatFailure {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
         }
         ExistingDeviceReadFacadeError::RateLimited { retry_after_secs } => {
-            ChatFailure::protocol_with_retry(ENDPOINT, ChatProtocolErrorCode::RateLimited, retry_after_secs)
+            ChatFailure::protocol_with_retry(
+                ENDPOINT,
+                ChatProtocolErrorCode::RateLimited,
+                retry_after_secs,
+            )
         }
         ExistingDeviceReadFacadeError::Storage => ChatFailure::storage(ENDPOINT),
         ExistingDeviceReadFacadeError::Invariant | ExistingDeviceReadFacadeError::RetryCeiling => {

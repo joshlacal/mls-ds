@@ -2428,8 +2428,16 @@ pub(crate) async fn get_entries(
     after_seq: u64,
     limit: i64,
 ) -> Result<EntriesPage, DeliveryRepositoryError> {
-    get_entries_with_terminal_control_interval(transaction, conversation_id, caller_did,
-        caller_device_id, after_seq, limit, None).await
+    get_entries_with_terminal_control_interval(
+        transaction,
+        conversation_id,
+        caller_did,
+        caller_device_id,
+        after_seq,
+        limit,
+        None,
+    )
+    .await
 }
 
 /// A former exact leaf may read only controls in its authenticated finite
@@ -2445,8 +2453,10 @@ pub(crate) async fn get_entries_with_terminal_control_interval(
     terminal_control_interval: Option<(u64, u64)>,
 ) -> Result<EntriesPage, DeliveryRepositoryError> {
     let (control_start, control_end) = match terminal_control_interval {
-        Some((start, end)) if start < end => (Some(i64::try_from(start).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?),
-            Some(i64::try_from(end).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?)),
+        Some((start, end)) if start < end => (
+            Some(i64::try_from(start).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?),
+            Some(i64::try_from(end).map_err(|_| DeliveryRepositoryError::SequenceOverflow)?),
+        ),
         Some(_) => return Err(DeliveryRepositoryError::SequenceOverflow),
         None => (None, None),
     };

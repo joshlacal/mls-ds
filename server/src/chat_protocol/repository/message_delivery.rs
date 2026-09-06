@@ -205,21 +205,36 @@ async fn require_locked_application_audience(
     seq: u64,
     scope: &ScopeBoundBusinessAuthority,
 ) -> Result<(), MessageDeliveryError> {
-    let seq=i64::try_from(seq).map_err(|_|MessageDeliveryError::Invariant)?;
-    let audience: Vec<(String,Uuid)>=sqlx::query_as(
+    let seq = i64::try_from(seq).map_err(|_| MessageDeliveryError::Invariant)?;
+    let audience: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT recipient_did,recipient_device_id FROM chat.application_intervals \
          WHERE conversation_id=$1 AND generation=$2 AND start_seq<=$3 \
            AND (terminal_seq IS NULL OR terminal_seq>=$3) \
-         ORDER BY convert_to(recipient_did,'UTF8'),uuid_send(recipient_device_id) LIMIT 101"
-    ).bind(coordinate.conversation_id).bind(coordinate.generation).bind(seq)
-        .fetch_all(&mut **tx).await?;
-    if audience.is_empty() || audience.len()>100 || audience.windows(2).any(|pair|pair[0]==pair[1]) {
+         ORDER BY convert_to(recipient_did,'UTF8'),uuid_send(recipient_device_id) LIMIT 101",
+    )
+    .bind(coordinate.conversation_id)
+    .bind(coordinate.generation)
+    .bind(seq)
+    .fetch_all(&mut **tx)
+    .await?;
+    if audience.is_empty()
+        || audience.len() > 100
+        || audience.windows(2).any(|pair| pair[0] == pair[1])
+    {
         return Err(MessageDeliveryError::InvalidCoordinates);
     }
-    if !audience.iter().any(|(did,id)|did==scope.actor_did() && *id==scope.actor_device_id()) {
+    if !audience
+        .iter()
+        .any(|(did, id)| did == scope.actor_did() && *id == scope.actor_device_id())
+    {
         return Err(MessageDeliveryError::DeviceNotLeaf);
     }
-    if audience.iter().any(|(did,id)|!scope.devices().iter().any(|locked|locked.user_did()==did && locked.device_id()==*id)) {
+    if audience.iter().any(|(did, id)| {
+        !scope
+            .devices()
+            .iter()
+            .any(|locked| locked.user_did() == did && locked.device_id() == *id)
+    }) {
         return Err(MessageDeliveryError::InvalidCoordinates);
     }
     Ok(())
@@ -498,7 +513,7 @@ pub(crate) async fn send<T: PublicTransport>(
     let expected = coordinate(projection.prior())?;
     let head = lock_head(tx, expected).await?;
     require_current_leaf(tx, head.coordinate, &scope).await?;
-    require_locked_application_audience(tx,head.coordinate,head.next_seq,scope).await?;
+    require_locked_application_audience(tx, head.coordinate, head.next_seq, scope).await?;
     require_recipient_ready(tx, head.coordinate, &scope, &head).await?;
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());

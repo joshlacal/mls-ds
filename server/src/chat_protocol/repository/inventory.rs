@@ -121,7 +121,14 @@ impl PartialEq for InventoryRepositoryError {
             | (RetryCeiling, RetryCeiling)
             | (InvalidMaterialization, InvalidMaterialization)
             | (SecureRandom(..), SecureRandom(..)) => true,
-            (RateLimited { retry_after_secs: left }, RateLimited { retry_after_secs: right }) => left == right,
+            (
+                RateLimited {
+                    retry_after_secs: left,
+                },
+                RateLimited {
+                    retry_after_secs: right,
+                },
+            ) => left == right,
             (Cursor(left), Cursor(right)) => left == right,
             (Sealer(left), Sealer(right)) => left == right,
             _ => false,
@@ -2231,8 +2238,8 @@ async fn check_inventory_session_capacity(
     .fetch_one(&mut **transaction)
     .await?;
     if let Some(seconds) = retry_after_secs {
-        let retry_after_secs = u64::try_from(seconds)
-            .map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
+        let retry_after_secs =
+            u64::try_from(seconds).map_err(|_| InventoryRepositoryError::DurableRowInvalid)?;
         if retry_after_secs == 0 {
             return Err(InventoryRepositoryError::DurableRowInvalid);
         }
@@ -2742,7 +2749,9 @@ fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDevic
     match error {
         InventoryRepositoryError::RequestTooBroad => ExistingDeviceReadFacadeError::RequestTooBroad,
         InventoryRepositoryError::RateLimited { retry_after_secs } => {
-            ExistingDeviceReadFacadeError::RateLimited { retry_after_secs: Some(retry_after_secs) }
+            ExistingDeviceReadFacadeError::RateLimited {
+                retry_after_secs: Some(retry_after_secs),
+            }
         }
         InventoryRepositoryError::Database(_) => ExistingDeviceReadFacadeError::Storage,
         _ => ExistingDeviceReadFacadeError::Invariant,
@@ -2932,7 +2941,9 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                         if dbe.code().as_deref() == Some("23514")
                             && dbe.message().contains("cap exceeded")
                         {
-                            return ExistingDeviceReadFacadeError::RateLimited { retry_after_secs: None };
+                            return ExistingDeviceReadFacadeError::RateLimited {
+                                retry_after_secs: None,
+                            };
                         }
                     }
                     ExistingDeviceReadFacadeError::Storage

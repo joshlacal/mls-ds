@@ -2596,7 +2596,12 @@ impl PreparedRecoveryMutation {
         let Self { graph, completion } = self;
         let material = graph.material();
         let mut graph = graph;
-        let prepared = prepare_recovery_execution(transaction, &graph, &graph.persistence_witness.event_lock_scope).await?;
+        let prepared = prepare_recovery_execution(
+            transaction,
+            &graph,
+            &graph.persistence_witness.event_lock_scope,
+        )
+        .await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         let response = graph.take_response();
         Ok(AppliedRecoveryMutation {
@@ -2813,8 +2818,12 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
         VerifiedMutationProjection::LeafRecoveryRequest(_) => {
             let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
             let prelude = super::prelude::prepare_identity_scope_prelude(
-                transaction, &authority, reservation, scope,
-            ).await?;
+                transaction,
+                &authority,
+                reservation,
+                scope,
+            )
+            .await?;
             let domain = prepare_recovery_request_authority(transaction, prelude, mutation).await?;
             let input = domain
                 .into_plan_input(transaction, relationship_authority, &trusted)
@@ -2833,8 +2842,12 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
         VerifiedMutationProjection::LeafRecoveryCancellation(_) => {
             let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
             let prelude = super::prelude::prepare_identity_scope_prelude(
-                transaction, &authority, reservation, scope,
-            ).await?;
+                transaction,
+                &authority,
+                reservation,
+                scope,
+            )
+            .await?;
             match prepare_recovery_cancellation_authority(transaction, prelude, mutation).await? {
                 RecoveryCancellationRead::Execute(domain) => {
                     let applied = plan_recovery_cancellation(domain.into_plan_input(&trusted)?)?
@@ -3000,7 +3013,12 @@ impl PreparedSchedulerRecoveryExpiry {
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
         let material = self.graph.material();
-        let prepared = prepare_recovery_execution(transaction, &self.graph, &self.graph.persistence_witness.event_lock_scope).await?;
+        let prepared = prepare_recovery_execution(
+            transaction,
+            &self.graph,
+            &self.graph.persistence_witness.event_lock_scope,
+        )
+        .await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedSchedulerRecoveryExpiry { applied, material })
     }
@@ -3041,6 +3059,7 @@ pub(crate) fn plan_scheduler_recovery_expiry(
     not(feature = "server-bin")
 ))]
 #[allow(dead_code)]
+#[path = "recovery"]
 pub mod production_composition_proof {
     use super::*;
     use crate::chat_protocol::state_machine::executor::{DropSafetyProbe, DropSafetyProbeMode};
@@ -3048,6 +3067,10 @@ pub mod production_composition_proof {
     use serde_json::Value;
     use sqlx::PgPool;
     use std::panic::AssertUnwindSafe;
+
+    #[cfg(test)]
+    #[path = "../../../../tests/common/chat_protocol_inventory_generation_transport.rs"]
+    mod inventory_generation_transport_tests;
 
     mod production_proof_fixture {
         include!("recovery/production_proof_fixture.rs");
@@ -3687,9 +3710,13 @@ pub mod production_composition_proof {
         let before = residue_counts(&mut transaction, request_id).await?;
         let PreparedSchedulerRecoveryExpiry { graph } = prepared;
         {
-            let prepared_execution = prepare_recovery_execution(&mut transaction, &graph, &graph.persistence_witness.event_lock_scope)
-                .await
-                .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
+            let prepared_execution = prepare_recovery_execution(
+                &mut transaction,
+                &graph,
+                &graph.persistence_witness.event_lock_scope,
+            )
+            .await
+            .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
             let mode = match abort {
                 PostWriteAbort::Cancellation => DropSafetyProbeMode::Pending,
                 PostWriteAbort::Panic => DropSafetyProbeMode::Panic,
@@ -5190,14 +5217,19 @@ async fn expire_due_request_for_actor(
         [request_id] => *request_id,
         _ => return Err(RecoveryRepositoryError::InvalidDurableRow),
     };
-    let aggregate = hydrate_locked_conversation_state(
-        transaction, coordinate.conversation_id, trusted_instant,
-    ).await?;
+    let aggregate =
+        hydrate_locked_conversation_state(transaction, coordinate.conversation_id, trusted_instant)
+            .await?;
     let head = lock_head_graph(
-        transaction, coordinate.conversation_id, scope.actor_did(), scope.actor_device_id(),
-    ).await?;
+        transaction,
+        coordinate.conversation_id,
+        scope.actor_did(),
+        scope.actor_device_id(),
+    )
+    .await?;
     require_coordinate(&head, coordinate)?;
-    let (request_row, reservation_row, package) = lock_terminal_rows(transaction, request_id).await?;
+    let (request_row, reservation_row, package) =
+        lock_terminal_rows(transaction, request_id).await?;
     if request_row.conversation_id != coordinate.conversation_id
         || request_row.requester_did != scope.actor_did()
         || request_row.requester_device_id != scope.actor_device_id()
@@ -5206,25 +5238,34 @@ async fn expire_due_request_for_actor(
     }
     let signing_public_key = reverify_scoped_request(transaction, scope, &request_row).await?;
     let classification = validate_locked_triple(
-        &head, &request_row, &reservation_row, &package, trusted_instant, &signing_public_key,
+        &head,
+        &request_row,
+        &reservation_row,
+        &package,
+        trusted_instant,
+        &signing_public_key,
     )?;
     validate_scope_contains_requester(scope, &request_row, classification)?;
-    validate_historical_package_mapping(transaction, classification, &request_row, &package).await?;
+    validate_historical_package_mapping(transaction, classification, &request_row, &package)
+        .await?;
     validate_terminal_linkage(transaction, &request_row, &reservation_row).await?;
     if classification != RecoveryTerminalClassification::OpenDue {
         return Err(RecoveryRepositoryError::ReadSetMismatch);
     }
-    let execution_package = hydrate_locked_reserved_recovery_package(
-        transaction, aggregate.head(), request_id,
-    ).await?;
+    let execution_package =
+        hydrate_locked_reserved_recovery_package(transaction, aggregate.head(), request_id).await?;
     let request = new_request_from_row(&request_row)?;
     let reservation = new_reservation_from_row(&reservation_row)?;
     let authority_digest = expiry_authority_digest(
-        &transaction_id, trusted_instant, &head, &request, &reservation, &package,
+        &transaction_id,
+        trusted_instant,
+        &head,
+        &request,
+        &reservation,
+        &package,
     );
-    let aggregate_cross_binding = RecoveryAggregateCrossBinding::seal(
-        &transaction_id, trusted_instant, &aggregate, &head,
-    )?;
+    let aggregate_cross_binding =
+        RecoveryAggregateCrossBinding::seal(&transaction_id, trusted_instant, &aggregate, &head)?;
     let expiry = RecoverySchedulerExpiryAuthority {
         event_lock_scope: scope.event_lock_scope(),
         sql_authority: RecoverySqlAuthoritySeal::mint(),
@@ -5241,7 +5282,9 @@ async fn expire_due_request_for_actor(
         package,
         authority_digest,
     };
-    plan_scheduler_recovery_expiry(expiry.into_plan_input())?.apply(transaction).await?;
+    plan_scheduler_recovery_expiry(expiry.into_plan_input())?
+        .apply(transaction)
+        .await?;
     Ok(())
 }
 
@@ -5277,7 +5320,12 @@ pub(crate) async fn prepare_recovery_request_authority(
         .actor_auth_generation()
         .ok_or(RecoveryRepositoryError::AuthorityBindingMismatch)?;
     let verified_mutation = reverify_scope_mutation(scope, mutation)?;
-    Box::pin(expire_due_request_for_actor(transaction, scope, &coordinate)).await?;
+    Box::pin(expire_due_request_for_actor(
+        transaction,
+        scope,
+        &coordinate,
+    ))
+    .await?;
     let aggregate =
         hydrate_locked_conversation_state(transaction, coordinate.conversation_id, trusted_instant)
             .await?;
@@ -5552,7 +5600,10 @@ pub(crate) async fn discover_recovery_fulfillment_terminal_scope(
     authority: &VerifiedChatDeviceRequest,
     mutation: &VerifiedSignedMutation,
 ) -> Result<CanonicalLockScope, RecoveryRepositoryError> {
-    if !matches!(mutation.projection(), VerifiedMutationProjection::LeafRecoveryFulfillment(_)) {
+    if !matches!(
+        mutation.projection(),
+        VerifiedMutationProjection::LeafRecoveryFulfillment(_)
+    ) {
         return Err(RecoveryRepositoryError::UnsupportedAuthority);
     }
     discover_recovery_event_scope(transaction, authority, mutation).await
@@ -5570,29 +5621,48 @@ async fn discover_recovery_event_scope(
     }
     let actor_did = authority.subject().as_str().to_owned();
     let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
-    let mut devices = vec![CanonicalDeviceIdentity::new(actor_did.clone(), actor_device_id)];
+    let mut devices = vec![CanonicalDeviceIdentity::new(
+        actor_did.clone(),
+        actor_device_id,
+    )];
     let conversation_id = match mutation.projection() {
-        VerifiedMutationProjection::LeafRecoveryRequest(value) => signed_coordinate(value.prior())?.conversation_id,
+        VerifiedMutationProjection::LeafRecoveryRequest(value) => {
+            signed_coordinate(value.prior())?.conversation_id
+        }
         projection => {
             let request_id = match projection {
-                VerifiedMutationProjection::LeafRecoveryCancellation(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
-                VerifiedMutationProjection::LeafRecoveryFulfillment(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+                VerifiedMutationProjection::LeafRecoveryCancellation(value) => {
+                    Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                }
+                VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
+                    Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                }
                 _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
             };
             let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
-                .bind(request_id).fetch_optional(&mut **transaction).await?
+                .bind(request_id)
+                .fetch_optional(&mut **transaction)
+                .await?
                 .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
             if locator.recovery_request_id != request_id {
                 return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
             }
-            devices.push(CanonicalDeviceIdentity::new(locator.requester_did, locator.requester_device_id));
+            devices.push(CanonicalDeviceIdentity::new(
+                locator.requester_did,
+                locator.requester_device_id,
+            ));
             locator.conversation_id
         }
     };
     let seed = CanonicalLockScope::new(vec![actor_did], devices)?;
     Ok(super::prelude::discover_conversation_event_lock_scope(
-        transaction, conversation_id, &seed, &[], false,
-    ).await?)
+        transaction,
+        conversation_id,
+        &seed,
+        &[],
+        false,
+    )
+    .await?)
 }
 
 fn mutation_contains_exact_admission(
@@ -5677,12 +5747,21 @@ pub(crate) async fn prepare_recovery_expiry_authority(
     }
     let seed = CanonicalLockScope::new(
         vec![locator.requester_did.clone()],
-        vec![CanonicalDeviceIdentity::new(locator.requester_did.clone(), locator.requester_device_id)],
+        vec![CanonicalDeviceIdentity::new(
+            locator.requester_did.clone(),
+            locator.requester_device_id,
+        )],
     )?;
     let event_scope = super::prelude::discover_conversation_event_lock_scope(
-        transaction, locator.conversation_id, &seed, &[], false,
-    ).await?;
-    let event_lock_scope = super::prelude::lock_conversation_event_scope(transaction, &event_scope).await?;
+        transaction,
+        locator.conversation_id,
+        &seed,
+        &[],
+        false,
+    )
+    .await?;
+    let event_lock_scope =
+        super::prelude::lock_conversation_event_scope(transaction, &event_scope).await?;
     let principal: Option<String> = sqlx::query_scalar(LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL)
         .bind(&locator.requester_did)
         .fetch_optional(&mut **transaction)
@@ -5759,7 +5838,8 @@ pub(crate) async fn prepare_recovery_expiry_authority(
         trusted_instant,
         &signing_public_key,
     )?;
-    validate_historical_package_mapping(transaction, classification, &request_row, &package).await?;
+    validate_historical_package_mapping(transaction, classification, &request_row, &package)
+        .await?;
     validate_requester_liveness_at_rehydration(
         classification,
         request_row.requested_at,
@@ -5954,7 +6034,8 @@ async fn prepare_client_terminal_context(
         &requester_signing_public_key,
     )?;
     validate_scope_contains_requester(scope, &request_row, classification)?;
-    validate_historical_package_mapping(transaction, classification, &request_row, &package).await?;
+    validate_historical_package_mapping(transaction, classification, &request_row, &package)
+        .await?;
     validate_terminal_linkage(transaction, &request_row, &reservation_row).await?;
     let execution_package = if matches!(
         classification,
@@ -6520,11 +6601,14 @@ fn validate_replay_locked_triple(
                 && request.terminal_at == Some(request.expires_at)
                 && reservation.terminal_at == Some(request.expires_at)
                 && ((request.expires_at < package.not_after
-                        && released_package_shape_valid(package, request.expires_at))
+                    && released_package_shape_valid(package, request.expires_at))
                     || (package.not_after == request.expires_at
                         && expired_recovery_package_shape_valid(
-                            &package.status, package.not_after, package.terminal_at,
-                            package.terminal_transition_id, package.terminal_revocation_id,
+                            &package.status,
+                            package.not_after,
+                            package.terminal_at,
+                            package.terminal_transition_id,
+                            package.terminal_revocation_id,
                         )))
         }
         RecoveryTerminalClassification::RetainedSuperseded => {
@@ -6766,7 +6850,8 @@ fn released_package_shape_valid(package: &RecoveryPackageRow, released_at: DateT
     }
     match package.status.as_str() {
         "available" | "reserved" | "expired" => true,
-        "consumed" | "revoked" => package.terminal_at
+        "consumed" | "revoked" => package
+            .terminal_at
             .is_some_and(|at| at >= released_at && at < package.not_after),
         _ => false,
     }
@@ -6784,7 +6869,9 @@ async fn validate_historical_package_mapping(
     let released = match classification {
         RecoveryTerminalClassification::RetainedCancelled => true,
         RecoveryTerminalClassification::RetainedExpired => request.expires_at < package.not_after,
-        RecoveryTerminalClassification::RetainedSuperseded => request.terminal_transition_id.is_some(),
+        RecoveryTerminalClassification::RetainedSuperseded => {
+            request.terminal_transition_id.is_some()
+        }
         _ => false,
     };
     if released {
@@ -6871,7 +6958,9 @@ fn validate_terminal_shapes(
                 && request
                     .terminal_at
                     .is_some_and(|at| at >= request.requested_at && at < request.expires_at)
-                && request.terminal_at.is_some_and(|at| released_package_shape_valid(package, at))
+                && request
+                    .terminal_at
+                    .is_some_and(|at| released_package_shape_valid(package, at))
         }
         RecoveryTerminalClassification::RetainedExpired => {
             reservation.status == "expired"
@@ -6889,7 +6978,7 @@ fn validate_terminal_shapes(
                 && request.terminal_at == Some(request.expires_at)
                 && reservation.terminal_at == Some(request.expires_at)
                 && ((request.expires_at < package.not_after
-                        && released_package_shape_valid(package, request.expires_at))
+                    && released_package_shape_valid(package, request.expires_at))
                     || (package.not_after == request.expires_at
                         && expired_recovery_package_shape_valid(
                             &package.status,
@@ -6934,9 +7023,9 @@ fn validate_superseded_terminal_shapes(
         && reservation.terminal_at == request.terminal_at;
     common
         && match (transition, revocation) {
-            (Some(_), None) => {
-                request.terminal_at.is_some_and(|at| released_package_shape_valid(package, at))
-            }
+            (Some(_), None) => request
+                .terminal_at
+                .is_some_and(|at| released_package_shape_valid(package, at)),
             (None, Some(revocation_id)) => {
                 package.status == "revoked"
                     && package.terminal_transition_id.is_none()

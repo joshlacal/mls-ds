@@ -274,8 +274,13 @@ async fn execute_first_acceptance<T: PublicTransport>(
         )],
     )?;
     let scope = super::prelude::discover_conversation_event_lock_scope(
-        transaction, conversation_id, &scope, &[], false,
-    ).await?;
+        transaction,
+        conversation_id,
+        &scope,
+        &[],
+        false,
+    )
+    .await?;
     let prelude = prepare_identity_scope_prelude(transaction, &authority, reservation, scope)
         .await?
         .verify_acceptance_operation(transition_id, mutation)?;
@@ -382,8 +387,13 @@ async fn execute_first_acceptance<T: PublicTransport>(
         .into_persistence_plan()?;
     let response = acceptance_response(&plan, products.canonical_response_json())?;
     let (scope, completion) = prelude.into_execution_parts();
-    let prepared =
-        prepare_acceptance_execution(transaction, &plan, products.durable_json().to_vec(), &scope.event_lock_scope()).await?;
+    let prepared = prepare_acceptance_execution(
+        transaction,
+        &plan,
+        products.durable_json().to_vec(),
+        &scope.event_lock_scope(),
+    )
+    .await?;
     let applied = apply_prepared_acceptance_execution(prepared).await?;
     if applied.entry_id != transition_id {
         return Err(AcceptanceFacadeError::InvalidCanonicalMaterial);

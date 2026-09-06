@@ -538,6 +538,7 @@ pub(super) struct DurableRecoveryFulfillmentFixture {
     pub(super) requester_key_package_wrapper: Vec<u8>,
     pub(super) commit: Vec<u8>,
     pub(super) welcome: Vec<u8>,
+    pub(super) application_messages: Vec<Vec<u8>>,
 }
 
 struct TwoMemberFulfillmentProducts {
@@ -556,6 +557,7 @@ struct TwoMemberFulfillmentProducts {
     requester_key_package_init_key: Vec<u8>,
     commit: Vec<u8>,
     welcome: Vec<u8>,
+    application_messages: Vec<Vec<u8>>,
 }
 
 struct RealAcceptanceEntry {
@@ -1257,6 +1259,21 @@ fn build_two_member_fulfillment_products(
     )
     .map_err(|error| format!("verify genuine fulfiller Recovery Welcome: {error:?}"))?;
     let prior = add_verified.into_next();
+    requester_group.set_aad(Vec::new());
+    let mut application_messages = Vec::new();
+    for plaintext in [
+        b"inventory-generation-first".as_slice(),
+        b"inventory-generation-second".as_slice(),
+    ] {
+        let message = requester_group
+            .create_message(&provider, &requester_signer, plaintext)
+            .map_err(|error| format!("create actual retained-generation application: {error:?}"))?;
+        application_messages.push(
+            message
+                .tls_serialize_detached()
+                .map_err(|error| format!("serialize retained-generation application: {error:?}"))?,
+        );
+    }
     let join_message = MlsMessageIn::tls_deserialize_exact(&add_welcome)
         .map_err(|error| format!("parse fulfiller join Welcome: {error:?}"))?;
     let MlsMessageBodyIn::Welcome(join_welcome) = join_message.extract() else {
@@ -1356,6 +1373,7 @@ fn build_two_member_fulfillment_products(
         requester_key_package_init_key,
         commit,
         welcome,
+        application_messages,
     })
 }
 
@@ -1914,6 +1932,7 @@ pub(super) async fn seed_durable_recovery_fulfillment_fixture_for_identities(
         requester_key_package_wrapper: products.requester_key_package_wrapper,
         commit: products.commit,
         welcome: products.welcome,
+        application_messages: products.application_messages,
     })
 }
 

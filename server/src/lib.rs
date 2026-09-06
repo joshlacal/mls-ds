@@ -97,3 +97,10 @@ pub use catbird_atproto::builder_types;
 
 // sqlx conversion helpers for jacquard-common types
 pub mod sqlx_jacquard;
+
+#[cfg(all(test, feature = "test-support"))]
+extern crate self as catbird_server;
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "../tests/common/chat_protocol_heartbeat_transport.rs"]
+mod heartbeat_transport_tests;

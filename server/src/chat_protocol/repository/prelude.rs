@@ -2434,7 +2434,8 @@ pub(crate) async fn prepare_signed_operation(
     let trusted = admission.pre_replay().trusted_instant();
     if binding.endpoint_nsid == "blue.catbird.chat.submitTransition"
         && signed_at.datetime() < trusted.datetime()
-        && crate::chat_protocol::validation::validate_first_execution_signed_at(signed_at, trusted).is_err()
+        && crate::chat_protocol::validation::validate_first_execution_signed_at(signed_at, trusted)
+            .is_err()
     {
         let _verified = admission.into_replay_authority()?;
         return Err(PreludeError::SignedOperationExpired);
@@ -2476,8 +2477,9 @@ async fn application_send_lock_scope(
         _ => return Err(PreludeError::NonCanonicalOperation),
     };
     let generation = match projection.prior().get("generation") {
-        Some(CanonicalValueRef::Integer(value)) => i64::try_from(value)
-            .map_err(|_| PreludeError::NonCanonicalOperation)?,
+        Some(CanonicalValueRef::Integer(value)) => {
+            i64::try_from(value).map_err(|_| PreludeError::NonCanonicalOperation)?
+        }
         _ => return Err(PreludeError::NonCanonicalOperation),
     };
     let actor_did = authority.subject().as_str();
@@ -2506,14 +2508,21 @@ async fn application_send_lock_scope(
          LIMIT 101
         "#,
     )
-    .bind(conversation_id).bind(generation).bind(actor_did).bind(actor_device_id)
-    .fetch_all(&mut **transaction).await?;
-    if audience.len()>100 || audience.windows(2).any(|pair| pair[0]==pair[1]) {
+    .bind(conversation_id)
+    .bind(generation)
+    .bind(actor_did)
+    .bind(actor_device_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if audience.len() > 100 || audience.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(PreludeError::ScopeDrift);
     }
-    let mut devices=audience.into_iter().map(|(did,id)| CanonicalDeviceIdentity::new(did,id)).collect::<Vec<_>>();
-    devices.push(CanonicalDeviceIdentity::new(actor_did,actor_device_id));
-    CanonicalLockScope::new(vec![actor_did.to_owned()],devices)
+    let mut devices = audience
+        .into_iter()
+        .map(|(did, id)| CanonicalDeviceIdentity::new(did, id))
+        .collect::<Vec<_>>();
+    devices.push(CanonicalDeviceIdentity::new(actor_did, actor_device_id));
+    CanonicalLockScope::new(vec![actor_did.to_owned()], devices)
 }
 
 /// Prepare one ordinary signed send/typing admission using the same sealed
@@ -2543,11 +2552,14 @@ pub(crate) async fn prepare_chat_admission(
             authority,
             reservation,
         } => {
-            let business = if authority.mutation().is_some_and(|mutation| mutation.kind() == SignedMutationKind::ApplicationSend) {
-                let scope=application_send_lock_scope(transaction,&authority).await?;
-                prepare_identity_scope_prelude(transaction,&authority,reservation,scope).await?
+            let business = if authority
+                .mutation()
+                .is_some_and(|mutation| mutation.kind() == SignedMutationKind::ApplicationSend)
+            {
+                let scope = application_send_lock_scope(transaction, &authority).await?;
+                prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?
             } else {
-                prepare_actor_prelude(transaction,&authority,reservation).await?
+                prepare_actor_prelude(transaction, &authority, reservation).await?
             };
             let (scope, completion) = business.into_execution_parts();
             Ok(PreparedChatAdmission::First(PreparedChatOperation {
