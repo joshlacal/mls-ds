@@ -965,6 +965,7 @@ enum RecoveryPersistenceMode {
 /// the complete locked package row, and the aggregate/custom-head cross seal.
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::chat_protocol) struct RecoveryPersistenceWitness {
+    event_lock_scope: super::prelude::ConversationEventLockScope,
     sql_authority: RecoverySqlAuthoritySeal,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
@@ -1036,6 +1037,7 @@ impl RecoveryPersistenceWitness {
         } = context;
         (
             Self {
+                event_lock_scope: prelude.scope_authority().event_lock_scope(),
                 sql_authority,
                 transaction_id,
                 trusted_instant,
@@ -1614,6 +1616,7 @@ pub(crate) struct RecoveryClientExpiryAuthority {
 
 #[must_use]
 pub(crate) struct RecoverySchedulerExpiryAuthority {
+    event_lock_scope: super::prelude::ConversationEventLockScope,
     sql_authority: RecoverySqlAuthoritySeal,
     transaction_id: Box<str>,
     trusted_instant: DateTime<Utc>,
@@ -2593,7 +2596,7 @@ impl PreparedRecoveryMutation {
         let Self { graph, completion } = self;
         let material = graph.material();
         let mut graph = graph;
-        let prepared = prepare_recovery_execution(transaction, &graph).await?;
+        let prepared = prepare_recovery_execution(transaction, &graph, &graph.persistence_witness.event_lock_scope).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         let response = graph.take_response();
         Ok(AppliedRecoveryMutation {
@@ -2808,8 +2811,10 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
         .ok_or(RecoveryRepositoryError::UnsupportedAuthority)?;
     match mutation.projection() {
         VerifiedMutationProjection::LeafRecoveryRequest(_) => {
-            let prelude =
-                super::prelude::prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
+            let prelude = super::prelude::prepare_identity_scope_prelude(
+                transaction, &authority, reservation, scope,
+            ).await?;
             let domain = prepare_recovery_request_authority(transaction, prelude, mutation).await?;
             let input = domain
                 .into_plan_input(transaction, relationship_authority, &trusted)
@@ -2826,8 +2831,10 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
             .await
         }
         VerifiedMutationProjection::LeafRecoveryCancellation(_) => {
-            let prelude =
-                super::prelude::prepare_actor_prelude(transaction, &authority, reservation).await?;
+            let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
+            let prelude = super::prelude::prepare_identity_scope_prelude(
+                transaction, &authority, reservation, scope,
+            ).await?;
             match prepare_recovery_cancellation_authority(transaction, prelude, mutation).await? {
                 RecoveryCancellationRead::Execute(domain) => {
                     let applied = plan_recovery_cancellation(domain.into_plan_input(&trusted)?)?
@@ -2993,7 +3000,7 @@ impl PreparedSchedulerRecoveryExpiry {
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
         let material = self.graph.material();
-        let prepared = prepare_recovery_execution(transaction, &self.graph).await?;
+        let prepared = prepare_recovery_execution(transaction, &self.graph, &self.graph.persistence_witness.event_lock_scope).await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedSchedulerRecoveryExpiry { applied, material })
     }
@@ -3052,6 +3059,86 @@ pub mod production_composition_proof {
 
     mod production_fulfillment_proof {
         include!("recovery/production_fulfillment_proof.rs");
+    }
+
+    mod production_inventory_lock_proof {
+        include!("recovery/production_inventory_lock_proof.rs");
+    }
+
+    pub async fn run_inventory_lock_order(pool: &PgPool) -> Result<(), String> {
+        production_inventory_lock_proof::run_inventory_lock_order(pool).await
+    }
+
+    mod production_recovery_inventory_proof {
+        include!("recovery/production_recovery_inventory_proof.rs");
+    }
+
+    pub async fn run_request_inventory_concurrency(pool: &PgPool) -> Result<(), String> {
+        production_recovery_inventory_proof::run_request_inventory_concurrency(pool).await
+    }
+
+    mod production_package_reuse_proof {
+        include!("recovery/production_package_reuse_proof.rs");
+    }
+
+    pub async fn run_superseded_recovery_package_reuse(pool: &PgPool) -> Result<(), String> {
+        production_package_reuse_proof::run_package_reuse(pool, true).await
+    }
+
+    pub async fn run_cancelled_recovery_package_reuse(pool: &PgPool) -> Result<(), String> {
+        production_package_reuse_proof::run_package_reuse(pool, false).await
+    }
+
+    mod production_creation_scope_proof {
+        include!("recovery/production_creation_scope_proof.rs");
+    }
+
+    mod production_control_scope_proof {
+        include!("recovery/production_control_scope_proof.rs");
+    }
+
+    pub async fn run_control_prospective_scope_and_drift(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_prospective_scope_and_drift(pool).await
+    }
+
+    pub async fn run_control_pending_welcome_scope(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_pending_welcome_scope(pool).await
+    }
+
+    pub async fn run_control_close_historical_scope(pool: &PgPool) -> Result<(), String> {
+        production_control_scope_proof::run_control_close_historical_scope(pool).await
+    }
+
+    pub async fn run_creation_with_enrolled_sibling(pool: &PgPool) -> Result<(), String> {
+        production_creation_scope_proof::run_creation_with_enrolled_sibling(pool).await
+    }
+
+    mod production_leave_proof {
+        include!("recovery/production_leave_proof.rs");
+    }
+
+    mod production_concurrent_send_proof {
+        include!("recovery/production_concurrent_send_proof.rs");
+    }
+
+    pub async fn run_concurrent_signed_sends(pool: &PgPool) -> Result<(), String> {
+        production_concurrent_send_proof::run_concurrent_signed_sends(pool).await
+    }
+
+    pub async fn run_unlocked_send_audience_rejected(pool: &PgPool) -> Result<(), String> {
+        production_concurrent_send_proof::run_unlocked_send_audience_rejected(pool).await
+    }
+
+    pub async fn run_leafless_direct_close_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, true, false).await
+    }
+
+    pub async fn run_zero_leaf_leave_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, false, false).await
+    }
+
+    pub async fn run_acceptance_with_open_recovery(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_leafless_lifecycle_with_open_recovery(pool, false, true).await
     }
 
     mod production_fallback_minter {
@@ -3126,6 +3213,15 @@ pub mod production_composition_proof {
         pool: &PgPool,
     ) -> Result<(), String> {
         production_client_proof::run_leaf_recovery_cancellation_due_for_expiry_ordering(pool).await
+    }
+
+    #[doc(hidden)]
+    pub async fn run_removed_device_terminal_entry_read(pool: &PgPool) -> Result<(), String> {
+        production_leave_proof::run_removed_device_terminal_entry_read(pool).await
+    }
+
+    pub async fn run_signed_operation_age_fence(pool: &PgPool) -> Result<(), String> {
+        production_fulfillment_proof::run_signed_operation_age_fence(pool).await
     }
 
     #[doc(hidden)]
@@ -3680,7 +3776,7 @@ pub mod production_composition_proof {
         let before = residue_counts(&mut transaction, request_id).await?;
         let PreparedSchedulerRecoveryExpiry { graph } = prepared;
         {
-            let prepared_execution = prepare_recovery_execution(&mut transaction, &graph)
+            let prepared_execution = prepare_recovery_execution(&mut transaction, &graph, &graph.persistence_witness.event_lock_scope)
                 .await
                 .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
             let mode = match abort {
@@ -4445,6 +4541,7 @@ impl RecoveryClientExpiryPlanInput {
         let terminal_at = request.expires_at;
         let request_id = request.recovery_request_id;
         let persistence_witness = RecoveryPersistenceWitness {
+            event_lock_scope: prelude.scope_authority().event_lock_scope(),
             sql_authority,
             transaction_id,
             trusted_instant,
@@ -4493,6 +4590,7 @@ impl RecoverySchedulerExpiryPlanInput {
             return Err(RecoveryRepositoryError::ReadSetMismatch);
         }
         let RecoverySchedulerExpiryAuthority {
+            event_lock_scope,
             sql_authority,
             transaction_id,
             trusted_instant,
@@ -4510,6 +4608,7 @@ impl RecoverySchedulerExpiryPlanInput {
         let terminal_at = request.expires_at;
         let request_id = request.recovery_request_id;
         let persistence_witness = RecoveryPersistenceWitness {
+            event_lock_scope,
             sql_authority,
             transaction_id,
             trusted_instant,
@@ -5447,33 +5546,47 @@ pub(crate) async fn discover_recovery_fulfillment_terminal_scope(
     authority: &VerifiedChatDeviceRequest,
     mutation: &VerifiedSignedMutation,
 ) -> Result<CanonicalLockScope, RecoveryRepositoryError> {
-    let request_id = match mutation.projection() {
-        VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
-            Uuid::from_bytes(*value.recovery_request_id().as_bytes())
-        }
-        _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
-    };
-    if !mutation_contains_exact_admission(authority, mutation) {
-        return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+    if !matches!(mutation.projection(), VerifiedMutationProjection::LeafRecoveryFulfillment(_)) {
+        return Err(RecoveryRepositoryError::UnsupportedAuthority);
     }
-    let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
-        .bind(request_id)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
-    if locator.recovery_request_id != request_id {
+    discover_recovery_event_scope(transaction, authority, mutation).await
+}
+
+/// Lock-free scope discovery only; all operation and membership authority is
+/// still verified against the locked head by the existing preparation path.
+async fn discover_recovery_event_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    authority: &VerifiedChatDeviceRequest,
+    mutation: &VerifiedSignedMutation,
+) -> Result<CanonicalLockScope, RecoveryRepositoryError> {
+    if !mutation_contains_exact_admission(authority, mutation) {
         return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
     }
     let actor_did = authority.subject().as_str().to_owned();
     let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
-    CanonicalLockScope::new(
-        vec![actor_did.clone(), locator.requester_did.clone()],
-        vec![
-            CanonicalDeviceIdentity::new(actor_did, actor_device_id),
-            CanonicalDeviceIdentity::new(locator.requester_did, locator.requester_device_id),
-        ],
-    )
-    .map_err(|_| RecoveryRepositoryError::NonCanonicalOperation)
+    let mut devices = vec![CanonicalDeviceIdentity::new(actor_did.clone(), actor_device_id)];
+    let conversation_id = match mutation.projection() {
+        VerifiedMutationProjection::LeafRecoveryRequest(value) => signed_coordinate(value.prior())?.conversation_id,
+        projection => {
+            let request_id = match projection {
+                VerifiedMutationProjection::LeafRecoveryCancellation(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+                VerifiedMutationProjection::LeafRecoveryFulfillment(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+                _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
+            };
+            let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
+                .bind(request_id).fetch_optional(&mut **transaction).await?
+                .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
+            if locator.recovery_request_id != request_id {
+                return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
+            }
+            devices.push(CanonicalDeviceIdentity::new(locator.requester_did, locator.requester_device_id));
+            locator.conversation_id
+        }
+    };
+    let seed = CanonicalLockScope::new(vec![actor_did], devices)?;
+    Ok(super::prelude::discover_conversation_event_lock_scope(
+        transaction, conversation_id, &seed, &[], false,
+    ).await?)
 }
 
 fn mutation_contains_exact_admission(
@@ -5556,6 +5669,14 @@ pub(crate) async fn prepare_recovery_expiry_authority(
     if locator.recovery_request_id != request_id {
         return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
     }
+    let seed = CanonicalLockScope::new(
+        vec![locator.requester_did.clone()],
+        vec![CanonicalDeviceIdentity::new(locator.requester_did.clone(), locator.requester_device_id)],
+    )?;
+    let event_scope = super::prelude::discover_conversation_event_lock_scope(
+        transaction, locator.conversation_id, &seed, &[], false,
+    ).await?;
+    let event_lock_scope = super::prelude::lock_conversation_event_scope(transaction, &event_scope).await?;
     let principal: Option<String> = sqlx::query_scalar(LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL)
         .bind(&locator.requester_did)
         .fetch_optional(&mut **transaction)
@@ -5663,6 +5784,7 @@ pub(crate) async fn prepare_recovery_expiry_authority(
             )?;
             Ok(RecoverySchedulerExpiryRead::Authority(
                 RecoverySchedulerExpiryAuthority {
+                    event_lock_scope,
                     sql_authority: RecoverySqlAuthoritySeal::mint(),
                     transaction_id: transaction_id.into_boxed_str(),
                     trusted_instant,

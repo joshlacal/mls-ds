@@ -42,12 +42,19 @@ services:
     build:
       context: ../server
       dockerfile: Dockerfile
+      target: federation-test
     depends_on:
       ds1-postgres:
         condition: service_healthy
       ds1-redis:
         condition: service_healthy
     environment:
+      APP_ENV: "test"
+      FEDERATION_CAPABILITIES: "baseline,reconciliation-v1,canonical-prefix-bootstrap-v1"
+      FEDERATION_TEST_INITIALIZE_CHAT_FENCE: "true"
+      CHAT_CUTOVER_ENABLED: "true"
+      CHAT_CURSOR_KEY_ID: "${CHAT_CURSOR_KEY_ID:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+      CHAT_CURSOR_SEALING_SECRET: "${CHAT_CURSOR_SEALING_SECRET:-AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE}"
       DATABASE_URL: postgres://catbird:catbird@ds1-postgres:5432/ds1_catbird
       REDIS_URL: redis://ds1-redis:6379
       SERVER_PORT: "${DS1_PORT:-3101}"
@@ -100,12 +107,19 @@ services:
     build:
       context: ../server
       dockerfile: Dockerfile
+      target: federation-test
     depends_on:
       ds2-postgres:
         condition: service_healthy
       ds2-redis:
         condition: service_healthy
     environment:
+      APP_ENV: "test"
+      FEDERATION_CAPABILITIES: "baseline,reconciliation-v1,canonical-prefix-bootstrap-v1"
+      FEDERATION_TEST_INITIALIZE_CHAT_FENCE: "true"
+      CHAT_CUTOVER_ENABLED: "true"
+      CHAT_CURSOR_KEY_ID: "${CHAT_CURSOR_KEY_ID:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA}"
+      CHAT_CURSOR_SEALING_SECRET: "${CHAT_CURSOR_SEALING_SECRET:-AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE}"
       DATABASE_URL: postgres://catbird:catbird@ds2-postgres:5432/ds2_catbird
       REDIS_URL: redis://ds2-redis:6379
       SERVER_PORT: "${DS2_PORT:-3102}"

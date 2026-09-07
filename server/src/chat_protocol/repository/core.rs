@@ -6072,9 +6072,47 @@ pub(crate) struct RecoveryRequestTerminalColumns<'a> {
     pub(crate) package_not_after: DateTime<Utc>,
 }
 
-/// Select one exact request/reservation/package terminal family before loading
-/// its cryptographic cause. This is deliberately closed over every nullable
-/// terminal column: no arm accepts surplus provenance.
+/// A released reservation retains its own terminal cause while its reusable
+/// package can enter a later reservation or terminal lifecycle. Validate the
+/// current package's closed status shape and require any later terminal to lie
+/// after the retained release and within the package's immutable lifetime.
+fn released_recovery_package_shape_valid(
+    columns: &RecoveryRequestTerminalColumns<'_>,
+    released_at: DateTime<Utc>,
+) -> bool {
+    if released_at >= columns.package_not_after {
+        return false;
+    }
+    let no_terminal = columns.package_terminal_transition_id.is_none()
+        && columns.package_terminal_revocation_id.is_none()
+        && columns.package_terminal_at.is_none();
+    let later_terminal = columns
+        .package_terminal_at
+        .is_some_and(|at| at >= released_at && at < columns.package_not_after);
+    match columns.package_status {
+        "available" | "reserved" => no_terminal,
+        "consumed" => {
+            columns.package_terminal_transition_id.is_some()
+                && columns.package_terminal_revocation_id.is_none()
+                && later_terminal
+        }
+        "expired" => {
+            columns.package_terminal_transition_id.is_none()
+                && columns.package_terminal_revocation_id.is_none()
+                && columns.package_terminal_at == Some(columns.package_not_after)
+        }
+        "revoked" => {
+            columns.package_terminal_transition_id.is_none()
+                && columns.package_terminal_revocation_id.is_some()
+                && later_terminal
+        }
+        _ => false,
+    }
+}
+
+/// Select the exact request/reservation terminal family before loading its
+/// cryptographic cause, and validate the package's current lifecycle. No arm
+/// accepts surplus request or reservation terminal provenance.
 pub(crate) fn select_recovery_request_terminal(
     columns: RecoveryRequestTerminalColumns<'_>,
 ) -> Result<RecoveryRequestTerminalSelection, RecoveryHydrationError> {
@@ -6114,8 +6152,9 @@ pub(crate) fn select_recovery_request_terminal(
                 && in_terminal_window
                 && columns.request_reservation_binding_matches
                 && columns.reservation_status == ReservationStatus::Released
-                && columns.package_status == "available"
-                && package_has_no_terminal =>
+                && columns
+                    .terminal_at
+                    .is_some_and(|at| released_recovery_package_shape_valid(&columns, at)) =>
         {
             let terminal_at = columns
                 .terminal_at
@@ -6161,7 +6200,7 @@ pub(crate) fn select_recovery_request_terminal(
                     && columns.package_terminal_revocation_id.is_none()
                     && columns.package_terminal_at == Some(columns.expires_at)
             } else {
-                columns.expires_at < columns.package_not_after
+                released_recovery_package_shape_valid(&columns, columns.expires_at)
             };
             if !package_shape_valid {
                 return Err(RecoveryHydrationError::TerminalMismatch);
@@ -6202,7 +6241,7 @@ pub(crate) fn select_recovery_request_terminal(
                 return Err(RecoveryHydrationError::TerminalMismatch);
             }
             if let Some(transition_id) = columns.terminal_transition_id {
-                if columns.package_status != "available" || !package_has_no_terminal {
+                if !released_recovery_package_shape_valid(&columns, terminal_at) {
                     return Err(RecoveryHydrationError::TerminalMismatch);
                 }
                 SupersededByTransition {
@@ -6820,12 +6859,10 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     && terminal_at
                         .is_some_and(|value| value >= requested_at && value < expires_at)
                     && request_reservation_binding_matches
-                    && reservation_status == ReservationStatus::Released
-                    && package_status == "available"
-                    && package_terminal_transition_id.is_none()
-                    && package_terminal_revocation_id.is_none()
-                    && package_terminal_at.is_none() =>
+                    && reservation_status == ReservationStatus::Released =>
             {
+                // Current package progression was checked by the selector;
+                // the retained cancellation still requires its exact signature.
                 let raw = terminal_signed_request_bytes
                     .as_deref()
                     .ok_or(RecoveryHydrationError::TerminalMismatch)?;
@@ -6900,19 +6937,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                         } if *reservation_terminal_at == expires_at
                     ) =>
             {
-                let package_not_after = reservation.row.package_not_after;
-                let expires_at_timestamp = recovery_timestamp(expires_at)?;
-                let package_shape_valid = if expires_at_timestamp == package_not_after {
-                    package_status == "expired"
-                        && package_terminal_transition_id.is_none()
-                        && package_terminal_revocation_id.is_none()
-                        && package_terminal_at == Some(expires_at)
-                } else {
-                    expires_at_timestamp < package_not_after
-                };
-                if !package_shape_valid {
-                    return Err(RecoveryHydrationError::TerminalMismatch);
-                }
+                // The selector checked exact lifetime expiry or a valid later
+                // lifecycle of the package released by this expired request.
                 let terminal = load_work_terminal_hydration_row(
                     transaction,
                     authority,
@@ -6956,13 +6982,8 @@ pub(crate) async fn load_recovery_work_hydration_rows(
                     return Err(RecoveryHydrationError::TerminalMismatch);
                 }
                 let terminal = if let Some(transition_id) = terminal_transition_id {
-                    if package_status != "available"
-                        || package_terminal_transition_id.is_some()
-                        || package_terminal_revocation_id.is_some()
-                        || package_terminal_at.is_some()
-                    {
-                        return Err(RecoveryHydrationError::TerminalMismatch);
-                    }
+                    // The selector permits valid later package progression;
+                    // this immutable supersession still binds its exact cause.
                     let terminal = load_work_terminal_hydration_row(
                         transaction,
                         authority,
@@ -10504,4 +10525,263 @@ pub(crate) async fn hydrate_locked_conversation_state(
         .map_err(ConversationStateHydrationError::State)?;
     seal_locked_conversation(state, head, graph_digest, snapshot_digest)
         .ok_or(ConversationStateHydrationError::Seal)
+}
+
+#[cfg(test)]
+mod retained_recovery_package_tests {
+    use super::*;
+    fn instant(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+    #[test]
+    fn recovery_retained_terminal_selector_is_closed_over_all_cause_columns() {
+        let requested_at = instant("2030-01-01T00:00:00.000Z");
+        let terminal_at = instant("2030-01-01T00:01:00.000Z");
+        let expires_at = instant("2030-01-01T00:05:00.000Z");
+        let package_not_after = instant("2030-01-02T00:00:00.000Z");
+        let transition_id = Uuid::new_v4();
+        let revocation_id = Uuid::new_v4();
+        let digest = [0x41; 32];
+        let no_terminal = RecoveryReservationTerminal::None;
+        let cancellation_terminal = RecoveryReservationTerminal::Released {
+            transition_id: None,
+            revocation_id: None,
+            request_digest: Some(digest),
+            terminal_at,
+        };
+        let expiry_terminal = RecoveryReservationTerminal::Expiry {
+            terminal_at: expires_at,
+        };
+        let transition_terminal = RecoveryReservationTerminal::Released {
+            transition_id: Some(transition_id),
+            revocation_id: None,
+            request_digest: None,
+            terminal_at,
+        };
+        let revocation_terminal = RecoveryReservationTerminal::Released {
+            transition_id: None,
+            revocation_id: Some(revocation_id),
+            request_digest: None,
+            terminal_at,
+        };
+
+        let open = RecoveryRequestTerminalColumns {
+            status: "open",
+            fulfilling_transition_id: None,
+            terminal_transition_id: None,
+            terminal_revocation_id: None,
+            request_has_any_signed_terminal: false,
+            request_has_complete_signed_terminal: false,
+            terminal_request_digest: None,
+            terminal_at: None,
+            requested_at,
+            expires_at,
+            request_reservation_binding_matches: true,
+            reservation_status: ReservationStatus::Active,
+            reservation_terminal: &no_terminal,
+            package_status: "reserved",
+            package_terminal_transition_id: None,
+            package_terminal_revocation_id: None,
+            package_terminal_at: None,
+            package_not_after,
+        };
+        assert_eq!(
+            select_recovery_request_terminal(open).unwrap(),
+            RecoveryRequestTerminalSelection::Open
+        );
+
+        let cancelled = RecoveryRequestTerminalColumns {
+            status: "cancelled",
+            request_has_any_signed_terminal: true,
+            request_has_complete_signed_terminal: true,
+            terminal_request_digest: Some(&digest),
+            terminal_at: Some(terminal_at),
+            reservation_status: ReservationStatus::Released,
+            reservation_terminal: &cancellation_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(cancelled).unwrap(),
+            RecoveryRequestTerminalSelection::Cancelled {
+                terminal_at,
+                terminal_request_digest: digest,
+            }
+        );
+
+        let expired_available = RecoveryRequestTerminalColumns {
+            status: "expired",
+            terminal_at: Some(expires_at),
+            reservation_status: ReservationStatus::Expired,
+            reservation_terminal: &expiry_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(expired_available).unwrap(),
+            RecoveryRequestTerminalSelection::Expired {
+                terminal_at: expires_at,
+            }
+        );
+        let expired_package = RecoveryRequestTerminalColumns {
+            package_status: "expired",
+            package_terminal_at: Some(expires_at),
+            package_not_after: expires_at,
+            ..expired_available
+        };
+        assert_eq!(
+            select_recovery_request_terminal(expired_package).unwrap(),
+            RecoveryRequestTerminalSelection::Expired {
+                terminal_at: expires_at,
+            }
+        );
+
+        let transition_superseded = RecoveryRequestTerminalColumns {
+            status: "superseded",
+            terminal_transition_id: Some(transition_id),
+            terminal_at: Some(terminal_at),
+            reservation_status: ReservationStatus::Released,
+            reservation_terminal: &transition_terminal,
+            package_status: "available",
+            ..open
+        };
+        assert_eq!(
+            select_recovery_request_terminal(transition_superseded).unwrap(),
+            RecoveryRequestTerminalSelection::SupersededByTransition {
+                transition_id,
+                terminal_at,
+            }
+        );
+        let revocation_superseded = RecoveryRequestTerminalColumns {
+            terminal_transition_id: None,
+            terminal_revocation_id: Some(revocation_id),
+            reservation_terminal: &revocation_terminal,
+            package_status: "revoked",
+            package_terminal_revocation_id: Some(revocation_id),
+            package_terminal_at: Some(terminal_at),
+            ..transition_superseded
+        };
+        assert_eq!(
+            select_recovery_request_terminal(revocation_superseded).unwrap(),
+            RecoveryRequestTerminalSelection::SupersededByRevocation {
+                revocation_id,
+                terminal_at,
+            }
+        );
+
+        // A released package can be reserved again, then consumed, expired,
+        // or revoked. Its later lifecycle must not rewrite the immutable
+        // terminal cause of an older cancellation or supersession.
+        let later = expires_at + chrono::Duration::seconds(1);
+        for retained in [cancelled, transition_superseded, expired_available] {
+            let expected = select_recovery_request_terminal(retained).unwrap();
+            for (status, transition, revocation, package_terminal_at) in [
+                ("reserved", None, None, None),
+                ("consumed", Some(Uuid::new_v4()), None, Some(later)),
+                ("expired", None, None, Some(package_not_after)),
+                ("revoked", None, Some(Uuid::new_v4()), Some(later)),
+            ] {
+                assert_eq!(
+                    select_recovery_request_terminal(RecoveryRequestTerminalColumns {
+                        package_status: status,
+                        package_terminal_transition_id: transition,
+                        package_terminal_revocation_id: revocation,
+                        package_terminal_at,
+                        ..retained
+                    })
+                    .unwrap(),
+                    expected,
+                    "retained {} with current package {status}",
+                    retained.status,
+                );
+            }
+            for (status, transition, revocation, package_terminal_at) in [
+                ("unknown", None, None, None),
+                ("reserved", Some(Uuid::new_v4()), None, None),
+                ("consumed", None, None, Some(later)),
+                (
+                    "consumed",
+                    Some(Uuid::new_v4()),
+                    Some(Uuid::new_v4()),
+                    Some(later),
+                ),
+                ("consumed", Some(Uuid::new_v4()), None, Some(requested_at)),
+                (
+                    "consumed",
+                    Some(Uuid::new_v4()),
+                    None,
+                    Some(package_not_after),
+                ),
+                ("expired", None, None, Some(later)),
+                ("revoked", None, None, Some(later)),
+                ("revoked", None, Some(Uuid::new_v4()), Some(requested_at)),
+            ] {
+                assert!(
+                    matches!(
+                        select_recovery_request_terminal(RecoveryRequestTerminalColumns {
+                            package_status: status,
+                            package_terminal_transition_id: transition,
+                            package_terminal_revocation_id: revocation,
+                            package_terminal_at,
+                            ..retained
+                        }),
+                        Err(RecoveryHydrationError::TerminalMismatch)
+                    ),
+                    "retained {} must reject invalid current package {status}",
+                    retained.status
+                );
+            }
+        }
+
+        let malformed = [
+            RecoveryRequestTerminalColumns {
+                request_has_complete_signed_terminal: false,
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_request_digest: Some(&[0x42; 32]),
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_transition_id: Some(Uuid::new_v4()),
+                ..cancelled
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_at: Some(terminal_at),
+                ..expired_available
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_transition_id: Some(Uuid::new_v4()),
+                ..expired_package
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_revocation_id: Some(Uuid::new_v4()),
+                ..expired_package
+            },
+            RecoveryRequestTerminalColumns {
+                terminal_revocation_id: Some(Uuid::new_v4()),
+                ..transition_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_at: Some(terminal_at),
+                ..transition_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                package_terminal_revocation_id: Some(Uuid::new_v4()),
+                ..revocation_superseded
+            },
+            RecoveryRequestTerminalColumns {
+                request_reservation_binding_matches: false,
+                ..revocation_superseded
+            },
+        ];
+        for columns in malformed {
+            assert!(matches!(
+                select_recovery_request_terminal(columns),
+                Err(RecoveryHydrationError::TerminalMismatch)
+            ));
+        }
+    }
 }

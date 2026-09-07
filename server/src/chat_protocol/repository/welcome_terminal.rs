@@ -481,7 +481,8 @@ impl PreparedWelcomeMutation {
             material,
             response,
         } = self;
-        let prepared = prepare_welcome_terminal_execution(transaction, &plan).await?;
+        let event_scope = completion.scope_authority.event_lock_scope();
+        let prepared = prepare_welcome_terminal_execution(transaction, &plan, &event_scope).await?;
         let applied = apply_prepared_welcome_terminal_execution(prepared).await?;
         Ok(AppliedWelcomeMutation {
             applied,
@@ -537,7 +538,6 @@ impl From<ExecutorError> for WelcomeTerminalFacadeError {
         Self::Execution(value)
     }
 }
-
 
 pub(crate) async fn prepare_welcome_terminal(
     transaction: &mut Transaction<'_, Postgres>,
@@ -678,7 +678,6 @@ async fn prepare_first_welcome_terminal(
         }
     }
 }
-
 
 async fn prepare_completed_welcome_replay(
     transaction: &mut Transaction<'_, Postgres>,

@@ -25,8 +25,8 @@
 //      route — `hydrate_locked_conversation_state` -> `lock_welcome_terminal` ->
 //      `HydrationAuthority::plan_welcome_expiry_entry` ->
 //      `prepare_welcome_terminal_execution` -> the sealed executor arm — in the
-//      canonical lock order (conversation aggregate first, then the exact
-//      Welcome), which is exactly the order
+//      canonical lock order (exact recipient principal/device/key,
+//      conversation aggregate, then the exact Welcome), which is exactly the order
 //      `state_machine::plan_welcome_expiry_entry` documents for an expiry worker
 //      and exactly the order the client acknowledge/reject facade uses. Nothing
 //      here bypasses the CAS bindings, the head verify, or the plan seal: a due
@@ -66,6 +66,8 @@ use crate::chat_protocol::state_machine::{ExecutorError, HydrationAuthority, Sta
 pub(crate) enum ExpirySweepError {
     #[error("clean-chat expiry sweep database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("clean-chat expiry sweep identity lock failed: {0}")]
+    Prelude(#[from] super::prelude::PreludeError),
     #[error("clean-chat expiry sweep observed a non-whole-millisecond server instant")]
     TrustedInstantMismatch,
     #[error("clean-chat expiry sweep aggregate hydration failed: {0}")]
@@ -172,6 +174,19 @@ pub(crate) async fn expire_due_welcome_delivery(
     if observed_at.timestamp_subsec_nanos() % 1_000_000 != 0 {
         return Err(ExpirySweepError::TrustedInstantMismatch);
     }
+    // Discovery grants no authority. Lock the exact stored recipient before the
+    // head, then retain the existing aggregate/Welcome CAS and dueness gates.
+    let recipient: Option<(String, Uuid)> = sqlx::query_as(
+        "SELECT wd.recipient_did,wd.recipient_device_id FROM chat.welcome_bundles wb JOIN chat.welcome_deliveries wd USING(welcome_id) WHERE wb.conversation_id=$1 AND wb.welcome_id=$2",
+    ).bind(conversation_id).bind(welcome_id).fetch_optional(&mut **transaction).await?;
+    let Some((did, device_id)) = recipient else {
+        return Ok(WelcomeSweepOutcome::Missing);
+    };
+    let scope = super::prelude::CanonicalLockScope::new(
+        vec![did.clone()],
+        vec![super::prelude::CanonicalDeviceIdentity::new(did, device_id)],
+    )?;
+    let event_scope = super::prelude::lock_conversation_event_scope(transaction, &scope).await?;
     let aggregate =
         hydrate_locked_conversation_state(transaction, conversation_id, observed_at).await?;
     let welcome_guard = match lock_welcome_terminal(transaction, &aggregate, welcome_id).await {
@@ -186,7 +201,7 @@ pub(crate) async fn expire_due_welcome_delivery(
     let plan = hydration
         .plan_welcome_expiry_entry(&aggregate, welcome_guard)?
         .into_persistence_plan()?;
-    let prepared = prepare_welcome_terminal_execution(transaction, &plan).await?;
+    let prepared = prepare_welcome_terminal_execution(transaction, &plan, &event_scope).await?;
     apply_prepared_welcome_terminal_execution(prepared).await?;
     Ok(WelcomeSweepOutcome::Expired)
 }

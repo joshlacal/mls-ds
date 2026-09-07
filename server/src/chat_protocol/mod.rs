@@ -107,7 +107,19 @@ pub mod wire;
 ))]
 #[doc(hidden)]
 pub mod production_proof {
+    pub use super::repository::recovery::production_composition_proof::run_request_inventory_concurrency;
     pub use super::repository::recovery::production_composition_proof::{
+        run_control_prospective_scope_and_drift, run_control_pending_welcome_scope,
+        run_control_close_historical_scope,
+    };
+    pub use super::repository::recovery::production_composition_proof::run_creation_with_enrolled_sibling;
+    pub use super::repository::recovery::production_composition_proof::{
+        run_cancelled_recovery_package_reuse, run_superseded_recovery_package_reuse,
+    };
+    pub use super::repository::recovery::production_composition_proof::run_inventory_lock_order;
+    pub use super::repository::recovery::production_composition_proof::{run_concurrent_signed_sends,run_unlocked_send_audience_rejected};
+    pub use super::repository::recovery::production_composition_proof::{
+        run_removed_device_terminal_entry_read, run_signed_operation_age_fence, run_acceptance_with_open_recovery, run_leafless_direct_close_with_open_recovery, run_zero_leaf_leave_with_open_recovery,
         commit_open_recovery_request, mint_singleton_recovery_reservation_fallback,
         mint_two_party_recovery_fallbacks, run_aggregate_graph_drift_negative,
         run_foreign_transaction_negative, run_leaf_recovery_cancellation_due_for_expiry_ordering,

@@ -453,7 +453,8 @@ fn normalize_def(
         | LexUserType::Blob(_)
         | LexUserType::Token(_)
         | LexUserType::CidLink(_)
-        | LexUserType::PermissionSet(_) => Err(ProjectionError::new(
+        | LexUserType::PermissionSet(_)
+        | LexUserType::Space(_) => Err(ProjectionError::new(
             ProjectionErrorKind::UnsupportedSchema,
             path,
             "definition type is not encodable by the canonical chat encoder",

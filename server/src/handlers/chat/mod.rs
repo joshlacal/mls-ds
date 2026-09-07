@@ -362,3 +362,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(feature = "chat-protocol-production-proof", not(feature = "server-bin")))]
+pub(crate) fn production_proof_signed_operation_failure(
+    error: crate::chat_protocol::repository::prelude::PreludeError,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    context::operation_prelude_failure(crate::chat_protocol::error::ChatEndpoint::SubmitTransition,error).into_response()
+}

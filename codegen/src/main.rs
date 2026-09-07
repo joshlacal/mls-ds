@@ -358,9 +358,34 @@ fn copy_and_normalize_lexicons(
 
 fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
     let mut value: Value = serde_json::from_str(content)?;
-    let normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
+    let normalized_count =
+        normalize_raw_byte_xrpc_bodies(&mut value) + normalize_unsupported_string_formats(&mut value);
     let normalized_content = serde_json::to_string_pretty(&value)?;
     Ok((normalized_content, normalized_count))
+}
+
+fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
+    let mut normalized = 0usize;
+    match value {
+        Value::Object(map) => {
+            if let Some(format_val) = map.get("format") {
+                if format_val.as_str() == Some("space-ref") {
+                    map.remove("format");
+                    normalized += 1;
+                }
+            }
+            for child in map.values_mut() {
+                normalized += normalize_unsupported_string_formats(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalized += normalize_unsupported_string_formats(item);
+            }
+        }
+        _ => {}
+    }
+    normalized
 }
 
 fn normalize_raw_byte_xrpc_bodies(value: &mut Value) -> usize {
@@ -536,6 +561,30 @@ mod tests {
             lexicon["defs"]["main"]["output"]["schema"]["type"],
             "object"
         );
+    }
+    #[test]
+    fn test_jacquard_corpus_with_space_type() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let lexicon = json!({
+            "lexicon": 1,
+            "id": "blue.catbird.circle",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "tid",
+                    "name": "Catbird Circle",
+                    "description": "An author-owned private posting audience",
+                    "collections": [
+                        "blue.catbird.circle.metadata",
+                        "app.bsky.feed.post",
+                        "app.bsky.feed.like"
+                    ]
+                }
+            }
+        });
+        write_lexicon_at(fixture.path(), "circle.json", &lexicon);
+        let err = LexiconCorpus::load_from_dir(fixture.path()).unwrap_err();
+        println!("load_from_dir error: {:?}", err);
     }
 
     #[test]

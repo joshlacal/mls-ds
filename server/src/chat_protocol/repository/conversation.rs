@@ -5,6 +5,8 @@
 //! locks and authorizes the exact requester device, and keeps that transaction
 //! open while projecting the state and pending control-plane requests.
 
+mod recovery;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use jacquard_common::{deps::smol_str::SmolStr, types::string::Did};
 use sqlx::{FromRow, Postgres, Transaction};
@@ -83,7 +85,7 @@ async fn read_conversation_state_in_transaction(
         .map_err(map_authority_error)?;
     // This call holds the locked conversation head and the exact requester
     // proof through all source and pending-request reads below.
-    authorize_conversation_state(transaction, device, conversation_id)
+    let authority = authorize_conversation_state(transaction, device, conversation_id)
         .await
         .map_err(map_authority_error)?;
 
@@ -95,9 +97,13 @@ async fn read_conversation_state_in_transaction(
     let (pending_leave_requests, pending_reset_requests) =
         load_pending_requests(transaction, conversation_id).await?;
 
+    let pending_leaf_recovery_requests =
+        recovery::load_pending_leaf_recoveries(transaction, &authority).await?;
+
     let output = catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
         GetConversationStateOutput {
             pending_leave_requests,
+            pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
             pending_reset_requests,
             state,
             extra_data: None,

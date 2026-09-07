@@ -21,6 +21,7 @@ pub(crate) mod inventory;
 pub(crate) mod key_packages;
 pub(crate) mod leave;
 pub(crate) mod message_delivery;
+mod message_event;
 pub(crate) mod prelude;
 #[allow(dead_code)]
 pub(crate) mod recovery;

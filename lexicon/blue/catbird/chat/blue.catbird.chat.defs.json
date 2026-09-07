@@ -89,7 +89,7 @@
         "bytes": {"type": "bytes", "minLength": 8, "maxLength": 1048576},
         "sha256": {"type": "ref", "ref": "#artifactHash"}
       },
-      "description": "Exactly one MLS 1.0 MLSMessage wire-format 4 wrapper. OpenMLS 0.8.1 GroupInfo extensions are frozen to exactly ratchet_tree followed by external_pub; every other GroupInfo extension is rejected. external_pub presence does not authorize external commits, which protocol policy forbids."
+      "description": "Exactly one MLS 1.0 MLSMessage wire-format 4 wrapper. GroupInfo extensions are frozen to exactly ratchet_tree followed by external_pub; every other GroupInfo extension is rejected. external_pub presence does not authorize external commits, which protocol policy forbids."
     },
     "privateApplicationMessage": {
       "type": "object",
@@ -121,7 +121,7 @@
         "metadataProfile": {"type": "string", "const": "exporterAes256Gcm1"},
         "typingProfile": {"type": "string", "const": "signedClearEphemeral1"}
       },
-      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; OpenMLS 0.8.1 GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy."
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy."
     },
     "deviceView": {
       "type": "object",
@@ -633,7 +633,7 @@
 
     "conversationState": {
       "type": "object", "required": ["conversationKind", "coordinates", "cipherSuite", "participants", "leaves", "metadataSnapshot", "snapshotSeq"],
-      "properties": {"conversationKind": {"type": "ref", "ref": "#conversationKind"}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "cipherSuite": {"type": "ref", "ref": "#cipherSuite"}, "participants": {"type": "array", "items": {"type": "ref", "ref": "#participantView"}, "minLength": 1, "maxLength": 100}, "leaves": {"type": "array", "items": {"type": "ref", "ref": "#deviceLeafView"}, "minLength": 1, "maxLength": 100}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "snapshotSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}},
+      "properties": {"conversationKind": {"type": "ref", "ref": "#conversationKind"}, "coordinates": {"type": "ref", "ref": "#conversationCoordinates"}, "cipherSuite": {"type": "ref", "ref": "#cipherSuite"}, "participants": {"type": "array", "items": {"type": "ref", "ref": "#participantView"}, "minLength": 1, "maxLength": 100}, "leaves": {"type": "array", "items": {"type": "ref", "ref": "#deviceLeafView"}, "minLength": 1, "maxLength": 100}, "metadataSnapshot": {"type": "ref", "ref": "#metadataSnapshot"}, "snapshotSeq": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}, "sequencerDid": {"type": "ref", "ref": "#bareDid"}, "sequencerTerm": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}},
       "description": "conversationKind is immutable across every transition and reset and is never inferred from participant count. Every active post-state has 1-100 unique logical participants, at least one active admin, and 1-100 MLS leaves. Group pending participants are members; the sole direct pending invitee is admin-role but unauthorized until active. Every pending participant has zero leaves and every MLS leaf belongs to an active participant. Direct has exactly two fixed admin-role participants until close and at most one nonterminal conversation per unordered DID pair; group remains group at every participant count. A DID has at most 20 leaves. There is exactly one leaf per (userDid, deviceId), BasicCredential identity, and public-tree leaf index; every leaf binds the exact registered immutable device/key and may open only while both are active. Later revocation immediately removes authentication and delivery eligibility but may leave that dead cryptographic leaf MLS-active until a signed Remove, reset, or close. snapshotSeq is the greatest committed conversation seq included in the transactionally observed state snapshot; it is not a caller entry cursor or proof of application visibility. Output participants are strictly ordered by userDid exact UTF-8 bytes; leaves are strictly ordered by (userDid exact UTF-8 bytes, deviceId raw UUID bytes)."
     },
     "conversationInventoryState": {"type": "object", "required": ["state"], "properties": {"state": {"type": "ref", "ref": "#conversationState"}}},

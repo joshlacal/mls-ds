@@ -166,6 +166,10 @@
           "name": "RelationshipPolicyUnavailable"
         },
         {
+          "name": "SignedOperationExpired",
+          "description": "The exact signed operation has no durable operation claim and its signedAt is older than the first-execution acceptance window. The server verified the device signature after global idempotency arbitration. This operation was not accepted and cannot execute; completed operations remain replayable regardless of age."
+        },
+        {
           "name": "StaleCoordinates"
         },
         {

@@ -22,6 +22,10 @@ use super::core::LockedG6Prelude;
 use super::delivery::{
     EntryEntitlementKind, EventEntitlementKind, EventKind, OutboxWorkKind, WelcomeRejectionReason,
 };
+use super::prelude::{
+    discover_conversation_event_lock_scope, CanonicalDeviceIdentity, CanonicalLockScope,
+    ConversationEventLockScope,
+};
 use super::recovery::PreparedRecoveryExecutionGraph;
 use super::transition::{MetadataAvatarBinding, ResetReason, TransitionActorRole};
 use crate::chat_protocol::public_state::encode_public_tree_summary;
@@ -1804,11 +1808,68 @@ async fn recovery_open(
 /// events for one device. G6 is the deliberate exception: its prelude freezes
 /// initial tails before any head lock and its single-use state-machine cursor
 /// advances them across the completely preflighted batch.
+async fn required_conversation_event_scope(
+    transaction: &mut Transaction<'_, Postgres>,
+    plan: &ConversationPersistencePlan,
+    actor: &DeviceIdentity,
+) -> Result<CanonicalLockScope, ExecutionContextHydrationError> {
+    let mut exact = vec![CanonicalDeviceIdentity::new(
+        device_did(actor)?,
+        device_uuid(actor),
+    )];
+    // Include new and terminal Welcome targets before their first event or FK
+    // write. Pending stored recipients are added by common discovery below.
+    for change in plan.effects().welcome_changes() {
+        for welcome in [change.before(), change.after()].into_iter().flatten() {
+            exact.push(CanonicalDeviceIdentity::new(
+                device_did(welcome.recipient())?,
+                device_uuid(welcome.recipient()),
+            ));
+        }
+    }
+    let terminal_welcome = matches!(
+        plan.effects().kind(),
+        PlanKind::WelcomeAcknowledgement | PlanKind::WelcomeRejection | PlanKind::WelcomeExpiry
+    );
+    let prospective_principals = if terminal_welcome {
+        Vec::new()
+    } else {
+        for leaf in &plan.state().leaves {
+            exact.push(CanonicalDeviceIdentity::new(
+                device_did(&leaf.device)?,
+                device_uuid(&leaf.device),
+            ));
+        }
+        plan.state()
+            .leaves
+            .iter()
+            .map(|leaf| device_did(&leaf.device))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let seed = CanonicalLockScope::new(Vec::new(), exact)
+        .map_err(|_| ExecutionContextHydrationError::AudienceMismatch)?;
+    // Dedicated Welcome terminal paths have one exact historical recipient and
+    // intentionally never acquire the broad current-conversation device set.
+    if terminal_welcome {
+        return Ok(seed);
+    }
+    discover_conversation_event_lock_scope(
+        transaction,
+        Uuid::from_bytes(*plan.state().coordinate.conversation_id()),
+        &seed,
+        &prospective_principals,
+        plan.effects().kind() == PlanKind::Close,
+    )
+    .await
+    .map_err(|_| ExecutionContextHydrationError::AudienceMismatch)
+}
+
 async fn hydrate_execution_context_inner_with_g6(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
     g6_prelude: Option<&LockedG6Prelude>,
+    event_scope: Option<&ConversationEventLockScope>,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
     if g6_prelude.is_some() {
         // This SQL-free shape gate runs before the first transaction query.
@@ -1838,6 +1899,13 @@ async fn hydrate_execution_context_inner_with_g6(
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
     let conversation_id = Uuid::from_bytes(*plan.state().coordinate.conversation_id());
+    if g6_prelude.is_none() {
+        let required = required_conversation_event_scope(transaction, plan, &facts.actor).await?;
+        event_scope
+            .ok_or(ExecutionContextHydrationError::AuthorityMismatch)?
+            .require_subset(&transaction_id, &required)
+            .map_err(|_| ExecutionContextHydrationError::AudienceMismatch)?;
+    }
     // Device rows are the device-global event-chain serialization point. Lock
     // the complete relevant audience once, in canonical order, before locking
     // the actor/key or reading any predecessor. Close deliberately uses only
@@ -2205,8 +2273,10 @@ async fn hydrate_execution_context_inner(
     transaction: &mut Transaction<'_, Postgres>,
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
-    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, None).await
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, None, Some(event_scope))
+        .await
 }
 
 async fn hydrate_g6_execution_context_inner(
@@ -2215,7 +2285,7 @@ async fn hydrate_g6_execution_context_inner(
     artifacts: ExecutionContextArtifacts,
     prelude: &LockedG6Prelude,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
-    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, Some(prelude)).await
+    hydrate_execution_context_inner_with_g6(transaction, plan, artifacts, Some(prelude), None).await
 }
 
 /// Unforgeable proof that execution-context hydration completed inside the
@@ -2239,6 +2309,7 @@ pub(crate) async fn hydrate_execution_context<'borrow, 'connection, 'plan>(
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2250,7 +2321,8 @@ pub(crate) async fn hydrate_execution_context<'borrow, 'connection, 'plan>(
     if is_recovery_plan(plan) {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
-    hydrate_execution_context_after_authority_validation(transaction, plan, artifacts).await
+    hydrate_execution_context_after_authority_validation(transaction, plan, artifacts, event_scope)
+        .await
 }
 
 fn is_recovery_plan(plan: &ConversationPersistencePlan) -> bool {
@@ -2275,6 +2347,7 @@ async fn hydrate_execution_context_after_authority_validation<'borrow, 'connecti
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2288,7 +2361,8 @@ async fn hydrate_execution_context_after_authority_validation<'borrow, 'connecti
     if !plan_transaction_bindings_match(plan, &expected_transaction_id) {
         return Err(ExecutionContextHydrationError::AuthorityMismatch);
     }
-    let context = hydrate_execution_context_inner(transaction, plan, artifacts).await?;
+    let context =
+        hydrate_execution_context_inner(transaction, plan, artifacts, event_scope).await?;
     Ok(PreparedConversationExecution::from_hydrated_parts(
         transaction,
         plan,
@@ -2304,6 +2378,7 @@ async fn hydrate_execution_context_after_authority_validation<'borrow, 'connecti
 pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'plan>(
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2314,7 +2389,13 @@ pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'pl
     ) {
         return Err(ExecutionContextHydrationError::ArtifactMismatch);
     }
-    hydrate_execution_context(transaction, plan, ExecutionContextArtifacts::default()).await
+    hydrate_execution_context(
+        transaction,
+        plan,
+        ExecutionContextArtifacts::default(),
+        event_scope,
+    )
+    .await
 }
 
 /// Recovery-only production capsule constructor. Route callers cannot supply
@@ -2324,6 +2405,7 @@ pub(crate) async fn prepare_welcome_terminal_execution<'borrow, 'connection, 'pl
 pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'connection, 'plan>(
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     graph: &'plan PreparedRecoveryExecutionGraph,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2343,6 +2425,7 @@ pub(in crate::chat_protocol) async fn prepare_recovery_execution<'borrow, 'conne
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
         },
+        event_scope,
     )
     .await
     .map(|prepared| prepared.with_recovery_write_authority(recovery_write_authority))
@@ -2367,6 +2450,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_exec
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2384,6 +2468,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_submit_transition_exec
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
         },
+        event_scope,
     )
     .await
 }
@@ -2440,6 +2525,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
     plan: &'plan ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
     genesis_group_info_bytes: Vec<u8>,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2457,6 +2543,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_creation_execution<
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
         },
+        event_scope,
     )
     .await
 }
@@ -2476,6 +2563,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_acceptance_execution<
     transaction: &'borrow mut Transaction<'connection, Postgres>,
     plan: &'plan ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<
     PreparedConversationExecution<'borrow, 'connection, 'plan>,
     ExecutionContextHydrationError,
@@ -2493,6 +2581,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_acceptance_execution<
             primary_event_payload: Some(primary_event_payload),
             welcome_disposition_event_payloads: Vec::new(),
         },
+        event_scope,
     )
     .await
 }
@@ -2524,6 +2613,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_leave_lifecycle_execut
     transaction: &'a mut Transaction<'c, Postgres>,
     plan: &'p ConversationPersistencePlan,
     accepted_control_entry_bytes: Vec<u8>,
+    event_scope: &ConversationEventLockScope,
 ) -> Result<PreparedConversationExecution<'a, 'c, 'p>, ExecutionContextHydrationError> {
     if !matches!(
         plan.effects().kind(),
@@ -2543,6 +2633,7 @@ pub(in crate::chat_protocol::repository) async fn prepare_leave_lifecycle_execut
             primary_event_payload: Some(canonical_leave_event_payload(plan)?),
             welcome_disposition_event_payloads: Vec::new(),
         },
+        event_scope,
     )
     .await
 }
@@ -2649,7 +2740,12 @@ pub(crate) async fn hydrate_execution_context_unscoped_for_test(
     plan: &ConversationPersistencePlan,
     artifacts: ExecutionContextArtifacts,
 ) -> Result<ExecutionContext, ExecutionContextHydrationError> {
-    hydrate_execution_context_inner(transaction, plan, artifacts).await
+    let actor = authority_facts(plan)?.actor;
+    let required = required_conversation_event_scope(transaction, plan, &actor).await?;
+    let event_scope = super::prelude::lock_conversation_event_scope(transaction, &required)
+        .await
+        .map_err(|_| ExecutionContextHydrationError::AudienceMismatch)?;
+    hydrate_execution_context_inner(transaction, plan, artifacts, &event_scope).await
 }
 
 /// Test-only constructor for exercising the exact production capsule and

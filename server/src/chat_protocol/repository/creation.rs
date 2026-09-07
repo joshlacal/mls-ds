@@ -290,6 +290,9 @@ async fn execute_first_creation<T: PublicTransport>(
         Uuid::from_bytes(*authority.device_id().as_bytes()),
     )];
     let scope = CanonicalLockScope::new(principals.clone(), std::mem::take(&mut devices))?;
+    let scope = super::prelude::discover_conversation_event_lock_scope(
+        transaction, conversation_id, &scope, &principals, false,
+    ).await?;
     let prelude =
         prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?;
     let prelude = prelude.verify_creation_operation(transition_id, mutation)?;
@@ -460,7 +463,7 @@ async fn execute_first_creation<T: PublicTransport>(
     };
     let expected = plan.successor_coordinate().copied();
     let (scope, completion) = prelude.into_execution_parts();
-    let prepared = prepare_creation_execution(transaction, &plan, accepted, genesis).await?;
+    let prepared = prepare_creation_execution(transaction, &plan, accepted, genesis, &scope.event_lock_scope()).await?;
     let applied = apply_prepared_creation_execution(prepared).await?;
     if applied.entry_id != transition_id
         || applied.allocated_seq != 1

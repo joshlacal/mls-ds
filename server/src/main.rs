@@ -38,7 +38,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, blob_store, block_sync, config, crypto, db, federation, handlers, health,
+    actors, auth, blob_store, config, crypto, db, federation, handlers, health,
     metrics, middleware, models, realtime, workers,
 };
 
@@ -59,7 +59,6 @@ struct AppState {
     /// struct on every request.
     inline_trigger_cfg: Arc<config::InlineTriggerConfig>,
     notification_service: Option<Arc<catbird_server::notifications::NotificationService>>,
-    block_sync: Arc<block_sync::BlockSyncService>,
     // Federation
     federation_config: federation::FederationConfig,
     resolver: Arc<federation::DsResolver>,
@@ -121,6 +120,130 @@ fn is_production_environment() -> bool {
 }
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(feature = "test-support")]
+async fn init_federation_test_chat_fence(pool: &sqlx::PgPool) -> Result<(), String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    let app_env = std::env::var("APP_ENV").map_err(|_| {
+        "FEDERATION_TEST_INITIALIZE_CHAT_FENCE requires APP_ENV to be set".to_string()
+    })?;
+    if app_env != "test" {
+        return Err(format!(
+            "FEDERATION_TEST_INITIALIZE_CHAT_FENCE is only permitted when APP_ENV=test (found: {app_env})"
+        ));
+    }
+
+    let raw_key_id = std::env::var("CHAT_CURSOR_KEY_ID").map_err(|_| {
+        "CHAT_CURSOR_KEY_ID is required for test chat fence initialization".to_string()
+    })?;
+    let decoded_key_id = URL_SAFE_NO_PAD
+        .decode(raw_key_id.trim())
+        .map_err(|_| "CHAT_CURSOR_KEY_ID is not canonical base64url".to_string())?;
+    if decoded_key_id.len() != 32 {
+        return Err("CHAT_CURSOR_KEY_ID must decode to exactly 32 bytes".to_string());
+    }
+    let expected_key_id = URL_SAFE_NO_PAD.encode(&decoded_key_id);
+
+    let existing_instance = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances WHERE singleton = TRUE",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("failed to query chat.protocol_instances: {e}"))?;
+
+    let protocol_instance_id = match existing_instance {
+        Some((existing_id, existing_cursor_key_id)) => {
+            if existing_cursor_key_id != expected_key_id {
+                return Err(format!(
+                    "existing protocol_instances cursor_key_id mismatch: expected {}, found {}",
+                    expected_key_id, existing_cursor_key_id
+                ));
+            }
+            existing_id
+        }
+        None => {
+            let new_id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO chat.protocol_instances (singleton, protocol_version, protocol_instance_id, cursor_key_id, created_at) \
+                 VALUES (TRUE, '1', $1, $2, clock_timestamp()) \
+                 ON CONFLICT (singleton) DO NOTHING",
+            )
+            .bind(new_id)
+            .bind(&expected_key_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("failed to insert chat.protocol_instances: {e}"))?;
+
+            let confirmed = sqlx::query_as::<_, (uuid::Uuid, String)>(
+                "SELECT protocol_instance_id, cursor_key_id FROM chat.protocol_instances WHERE singleton = TRUE",
+            )
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("failed to re-query chat.protocol_instances: {e}"))?
+            .ok_or_else(|| "chat.protocol_instances singleton row not found after insert".to_string())?;
+
+            if confirmed.1 != expected_key_id {
+                return Err(format!(
+                    "inserted protocol_instances cursor_key_id mismatch: expected {}, found {}",
+                    expected_key_id, confirmed.1
+                ));
+            }
+            confirmed.0
+        }
+    };
+
+    let existing_retention = sqlx::query_scalar::<_, i64>(
+        "SELECT retained_floor FROM chat.event_retention WHERE protocol_instance_id = $1",
+    )
+    .bind(protocol_instance_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("failed to query chat.event_retention: {e}"))?;
+
+    match existing_retention {
+        Some(retained_floor) => {
+            if retained_floor < 0 {
+                return Err(format!(
+                    "existing event_retention retained_floor is invalid: {retained_floor}"
+                ));
+            }
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO chat.event_retention (protocol_instance_id, retained_floor, updated_at) \
+                 VALUES ($1, 0, clock_timestamp()) \
+                 ON CONFLICT (protocol_instance_id) DO NOTHING",
+            )
+            .bind(protocol_instance_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("failed to insert chat.event_retention: {e}"))?;
+
+            let confirmed_retention = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM chat.event_retention WHERE protocol_instance_id = $1)",
+            )
+            .bind(protocol_instance_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("failed to verify chat.event_retention existence: {e}"))?;
+
+            if !confirmed_retention {
+                return Err(format!(
+                    "chat.event_retention row missing for protocol instance {protocol_instance_id} after insert"
+                ));
+            }
+        }
+    }
+
+    tracing::info!(
+        protocol_instance_id = %protocol_instance_id,
+        cursor_key_id = %expected_key_id,
+        "Federation test chat fence initialized"
+    );
+    Ok(())
+}
 const BLOB_UPLOAD_BODY_LIMIT_BYTES: usize = 11 * 1024 * 1024;
 // MLS JSON encodes `bytes` fields as base64. A valid 10 MiB ciphertext or
 // GroupInfo therefore needs nearly 13.34 MiB on the wire before the small JSON
@@ -687,8 +810,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Device-auth replay cleanup worker started");
 
     // Create composite app state
-    let block_sync_service = Arc::new(block_sync::BlockSyncService::new());
-    tracing::info!("Block sync service initialized");
 
     // ── Federation setup ──────────────────────────────────────────────
     let fed_config = federation::FederationConfig::from_env();
@@ -877,6 +998,21 @@ async fn main() -> anyhow::Result<()> {
         ),
     );
 
+    // Phase 2 test infrastructure initializer: when running in test environment with test-support,
+    // initialize or exact-compare the protocol fence singleton before validating it.
+    #[cfg(feature = "test-support")]
+    if truthy_env_var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE") {
+        init_federation_test_chat_fence(&db_pool).await.unwrap_or_else(|error| {
+            tracing::error!("federation test chat fence initialization failed: {error}");
+            std::process::exit(1);
+        });
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    if truthy_env_var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE") {
+        panic!("FEDERATION_TEST_INITIALIZE_CHAT_FENCE is not supported without the test-support feature");
+    }
+
     // Clean-chat expiry sweeper. Overdue OPEN leaf-recovery requests and overdue
     // PENDING Welcome deliveries hold reserved key packages and block their
     // owner's re-request; nothing clears them on a quiet conversation. This is
@@ -918,7 +1054,6 @@ async fn main() -> anyhow::Result<()> {
         actor_registry,
         inline_trigger_cfg,
         notification_service,
-        block_sync: block_sync_service,
         federation_config: fed_config.clone(),
         resolver,
         service_auth: service_auth.clone(),

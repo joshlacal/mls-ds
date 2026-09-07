@@ -2964,10 +2964,46 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
     Err(ExistingDeviceReadFacadeError::RetryCeiling)
 }
 
+/// Acquire the complete own-device subject prefix before locking the requester.
+/// These are lock coordinates from the sealed admission, not directory payload
+/// or newly minted authority. The existing exact device/key verification still
+/// runs before any protected directory query or durable snapshot write.
+///
+/// The principal barrier matches canonical mutations and prevents enrollment
+/// from adding a subject mid-snapshot. Device rows follow the same byte order
+/// as mutation scopes, before any key row. This also makes the later subject
+/// foreign-key checks reentrant instead of acquiring sibling locks in reverse.
+async fn lock_own_device_snapshot_subjects(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: &super::super::dpop::ReadAdmissionAttempt,
+) -> Result<(), ExistingDeviceReadFacadeError> {
+    let coordinates = attempt.lock_coordinates();
+    let principal: Option<String> = sqlx::query_scalar(
+        "SELECT user_did FROM chat.principals WHERE user_did=$1 FOR UPDATE",
+    )
+    .bind(coordinates.did)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    if principal.as_deref() != Some(coordinates.did) {
+        return Err(ExistingDeviceReadFacadeError::Invariant);
+    }
+    sqlx::query(
+        "SELECT device_id FROM chat.devices WHERE user_did=$1 \
+         ORDER BY convert_to(user_did,'UTF8'),uuid_send(device_id) FOR UPDATE",
+    )
+    .bind(coordinates.did)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ExistingDeviceReadFacadeError::Storage)?;
+    Ok(())
+}
+
 async fn materialize_own_device_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: super::super::dpop::ReadAdmissionAttempt,
 ) -> Result<OwnDeviceSnapshotOutcome, ExistingDeviceReadFacadeError> {
+    lock_own_device_snapshot_subjects(transaction, &attempt).await?;
     let lock = lock_and_verify_read_requester(transaction, attempt).await?;
 
     // PROTECTED QUERY — own-device directory read.
