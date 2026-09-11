@@ -335,8 +335,20 @@ fn copy_and_normalize_lexicons(
         }
 
         let content = fs::read_to_string(&source_path)?;
+        let value: Value = serde_json::from_str(&content).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "failed to parse JSON file {}: {error}",
+                    source_path.display()
+                ),
+            )
+        })?;
+        if is_unsupported_space_definition(&value) {
+            continue;
+        }
         let (normalized_content, normalized_count) =
-            normalize_lexicon_json(&content).map_err(|error| {
+            normalize_lexicon_value(value).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -346,7 +358,6 @@ fn copy_and_normalize_lexicons(
                 )
             })?;
         normalized += normalized_count;
-
         if let Some(parent) = destination_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -355,15 +366,27 @@ fn copy_and_normalize_lexicons(
 
     Ok(normalized)
 }
+fn is_unsupported_space_definition(value: &Value) -> bool {
+    let Some(defs) = value.get("defs").and_then(Value::as_object) else {
+        return false;
+    };
+    defs.values()
+        .any(|def| def.get("type").and_then(Value::as_str) == Some("space"))
+}
 
-fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
-    let mut value: Value = serde_json::from_str(content)?;
-    let normalized_count =
-        normalize_raw_byte_xrpc_bodies(&mut value) + normalize_unsupported_string_formats(&mut value);
+fn normalize_lexicon_value(mut value: Value) -> Result<(String, usize), serde_json::Error> {
+    let normalized_count = normalize_raw_byte_xrpc_bodies(&mut value);
     let normalized_content = serde_json::to_string_pretty(&value)?;
     Ok((normalized_content, normalized_count))
 }
 
+#[allow(dead_code)]
+fn normalize_lexicon_json(content: &str) -> Result<(String, usize), serde_json::Error> {
+    let value: Value = serde_json::from_str(content)?;
+    normalize_lexicon_value(value)
+}
+
+#[allow(dead_code)]
 fn normalize_unsupported_string_formats(value: &mut Value) -> usize {
     let mut normalized = 0usize;
     match value {
