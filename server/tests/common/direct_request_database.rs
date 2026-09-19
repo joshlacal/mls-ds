@@ -143,6 +143,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000013_direct_request_signed_json_projection.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000014,
+        Cow::Borrowed("direct request nul comparison"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000014_direct_request_nul_comparison.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
