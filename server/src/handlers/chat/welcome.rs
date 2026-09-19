@@ -137,6 +137,7 @@ fn welcome_failure(endpoint: ChatEndpoint, error: WelcomeTerminalFacadeError) ->
     use WelcomeTerminalFacadeError as E;
 
     match error {
+        E::FreshMissing => ChatFailure::protocol(endpoint,C::WelcomeNotFound),
         E::FreshTerminal => ChatFailure::protocol(endpoint, if endpoint == ChatEndpoint::AcknowledgeWelcome { C::AcknowledgementConflict } else { C::RejectionConflict }),
         E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
         E::Retention(_) => ChatFailure::protocol_with_retry(endpoint, C::CapacityUnavailable, Some(30)),

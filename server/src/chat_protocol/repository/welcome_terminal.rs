@@ -517,6 +517,8 @@ pub(crate) enum WelcomeTerminalTransactionOutcome {
 pub(crate) enum WelcomeTerminalFacadeError {
     #[error("request Welcome is already terminal for another operation")]
     FreshTerminal,
+    #[error("request Welcome not found for this device or conversation")]
+    FreshMissing,
     #[error(transparent)]
     Retention(#[from] super::direct_request_retention::RetentionError),
     #[error("Welcome request body is out of domain")]
@@ -620,6 +622,7 @@ async fn prepare_first_welcome_terminal(
             mutation.actor_did().as_str(),
             Uuid::from_bytes(*mutation.actor_device_id().as_bytes()),
             parsed.operation_id,
+            mutation.request_digest(),
             charged,
         )
         .await?;
@@ -1654,7 +1657,17 @@ async fn direct_request_welcome_terminal(
     let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest,slot.operation_id AS retained_operation_id FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id LEFT JOIN chat.direct_request_welcome_slots slot ON slot.request_id=d.request_id AND slot.recipient_did=d.owner_did AND slot.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
         .bind(parsed.welcome_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).bind(parsed.conversation_id)
         .fetch_optional(&mut **tx).await?;
-    let Some(row) = row else { return Ok(None) };
+    let Some(row) = row else {
+        // Accepted request conversations can later have ordinary recovery
+        // Welcomes. Only an exact persisted delivery may use that legacy path;
+        // unknown IDs/devices in a known request scope must not retain claims.
+        let request_scope:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.direct_request_publications WHERE request_id=$1) OR (EXISTS(SELECT 1 FROM chat.direct_request_publications WHERE conversation_id=$2) AND NOT EXISTS(SELECT 1 FROM chat.welcome_bundles w JOIN chat.welcome_deliveries d USING(welcome_id) WHERE w.welcome_id=$1 AND w.conversation_id=$2 AND d.recipient_did=$3 AND d.recipient_device_id=$4))")
+            .bind(parsed.welcome_id).bind(parsed.conversation_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).fetch_one(&mut **tx).await?;
+        if request_scope {
+            return Err(WelcomeTerminalFacadeError::FreshMissing);
+        }
+        return Ok(None);
+    };
     let original: Option<Uuid> = row.try_get("retained_operation_id")?;
     if first
         && (row.try_get::<Option<String>, _>("status")?.is_some()

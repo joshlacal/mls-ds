@@ -110,6 +110,8 @@ fn map_failure(endpoint: ChatEndpoint, error: LeaveFacadeError) -> ChatFailure {
     use LeaveFacadeError as E;
     use StateMachineError as S;
     match error {
+        E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
+        E::Retention(_) => ChatFailure::protocol_with_retry(endpoint,C::CapacityUnavailable,Some(30)),
         E::Database(_) | E::Authorization(_) => ChatFailure::storage(endpoint),
         E::Prelude(error) => context::operation_prelude_failure(endpoint, error),
         E::Conversation(_) => ChatFailure::protocol(endpoint, C::ConversationNotFound),

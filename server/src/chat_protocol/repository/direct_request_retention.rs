@@ -99,6 +99,7 @@ pub(super) async fn consume_welcome(
     did: &str,
     device: Uuid,
     operation: Uuid,
+    request_digest: &[u8; 32],
     bytes: u64,
 ) -> Result<(), RetentionError> {
     let limit:Option<i64>=sqlx::query_scalar("SELECT r.welcome_bytes_per_delivery FROM chat.direct_request_lifecycle_reserves r JOIN chat.direct_request_device_deliveries d USING(request_id) WHERE r.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 FOR UPDATE OF r")
@@ -106,8 +107,8 @@ pub(super) async fn consume_welcome(
     if limit.is_none_or(|limit| bytes > limit as u64) {
         return Err(RetentionError::CapacityUnavailable);
     }
-    let inserted=sqlx::query("INSERT INTO chat.direct_request_welcome_slots(request_id,recipient_did,recipient_device_id,operation_id,charged_bytes) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING")
-        .bind(request).bind(did).bind(device).bind(operation).bind(bytes as i64).execute(&mut **tx).await?;
+    let inserted=sqlx::query("INSERT INTO chat.direct_request_welcome_slots(request_id,recipient_did,recipient_device_id,operation_id,request_digest,charged_bytes) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
+        .bind(request).bind(did).bind(device).bind(operation).bind(request_digest.as_slice()).bind(bytes as i64).execute(&mut **tx).await?;
     if inserted.rows_affected() != 1 {
         return Err(RetentionError::AlreadyConsumed);
     }

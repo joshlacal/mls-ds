@@ -81,9 +81,10 @@ async fn inner(
     receipt["$type"] = serde_json::json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
     let response = serde_json::to_vec(&serde_json::json!({"outcome":receipt}))
         .map_err(|_| ChatFailure::invariant(endpoint))?;
-    tx.commit()
-        .await
-        .map_err(|_| ChatFailure::storage(endpoint))?;
+    tx.commit().await.map_err(|error| {
+        trace_database_failure("commit", &error);
+        ChatFailure::storage(endpoint)
+    })?;
     Ok(context::json_ok(response))
 }
 fn failure(error: PublicationError) -> ChatFailure {
@@ -93,7 +94,8 @@ fn failure(error: PublicationError) -> ChatFailure {
         PublicationError::Disabled => {
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CutoverRequired)
         }
-        PublicationError::Database(_) | PublicationError::Store(E::Database(_)) => {
+        PublicationError::Database(error) | PublicationError::Store(E::Database(error)) => {
+            trace_database_failure("prepare_or_execute", &error);
             ChatFailure::storage(endpoint)
         }
         PublicationError::Store(E::IdentityConflict) => {
@@ -116,4 +118,27 @@ fn failure(error: PublicationError) -> ChatFailure {
         }
         _ => ChatFailure::invariant(endpoint),
     }
+}
+
+fn trace_database_failure(stage: &'static str, error: &sqlx::Error) {
+    use sha2::{Digest, Sha256};
+    // Database messages/details can interpolate a rejected row's contents.
+    // A fingerprint identifies static migration exceptions without logging
+    // signed envelopes, ciphertext, registration tokens, or SQL parameters.
+    let database = error.as_database_error();
+    tracing::error!(
+        stage,
+        code = database
+            .and_then(|error| error.code())
+            .as_deref()
+            .unwrap_or("non_database"),
+        constraint = database
+            .and_then(|error| error.constraint())
+            .unwrap_or("none"),
+        message_fingerprint = database
+            .map(|error| format!("{:x}", Sha256::digest(error.message().as_bytes())))
+            .as_deref()
+            .unwrap_or("none"),
+        "encrypted request publication transaction failed"
+    );
 }

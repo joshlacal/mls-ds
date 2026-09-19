@@ -106,6 +106,22 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000010_direct_request_retained_artifacts.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000011,
+        Cow::Borrowed("direct request lifecycle slots"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000011_direct_request_lifecycle_slots.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000012,
+        Cow::Borrowed("direct request welcome slot digest"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000012_direct_request_welcome_slot_digest.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
