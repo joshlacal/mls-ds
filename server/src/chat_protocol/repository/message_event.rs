@@ -1,10 +1,13 @@
 //! Application event append parity with the deployed7ad source.
 //! Source helper SHA256: b14506719c6ce7baa5d4f22911bfb562c6aed00bd4d737369788232e87bc5438
 //! Preserve the existing device-row, foreign-key, and deferred-chain fences.
-use chrono::{DateTime,Utc};
-use sqlx::{Postgres,Transaction};
+use super::delivery::{
+    append_event, enqueue_outbox, insert_event_recipients, DeliveryRepositoryError,
+    EventEntitlementKind, EventKind, EventRecipient, NewEvent, OutboxWorkKind,
+};
+use chrono::{DateTime, Utc};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
-use super::delivery::{append_event,insert_event_recipients,enqueue_outbox,DeliveryRepositoryError,EventRecipient,EventEntitlementKind,NewEvent,EventKind,OutboxWorkKind};
 
 pub(crate) async fn append_message_available_event(
     transaction: &mut Transaction<'_, Postgres>,
@@ -97,4 +100,3 @@ pub(crate) async fn append_message_available_event(
     .await?;
     Ok(event_position)
 }
-

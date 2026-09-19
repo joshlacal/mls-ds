@@ -1983,7 +1983,7 @@ impl HydrationAuthority {
     /// Consume the exact signed Policy body and the complete relationship
     /// projection under the conversation lock. No caller-selected roster or
     /// participant-change command crosses this seam.
-        pub(crate) fn plan_policy<T: PublicTransport>(
+    pub(crate) fn plan_policy<T: PublicTransport>(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2273,7 +2273,7 @@ impl HydrationAuthority {
     /// fulfillments have distinct sealed entry points below so their extra
     /// package, target-registration, consent, and work-row authorities cannot
     /// be bypassed by variant dispatch.
-        pub(crate) fn plan_commit_entry(
+    pub(crate) fn plan_commit_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2454,7 +2454,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_leave_fulfillment_entry(
+    pub(crate) fn plan_leave_fulfillment_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2574,7 +2574,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_metadata_entry(
+    pub(crate) fn plan_metadata_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2607,7 +2607,7 @@ impl HydrationAuthority {
             .bind_terminal_package_guards(prior, terminal_packages, &transaction_id)
     }
 
-        pub(crate) fn plan_zero_leaf_leave_entry(
+    pub(crate) fn plan_zero_leaf_leave_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2647,7 +2647,7 @@ impl HydrationAuthority {
         )
     }
 
-        pub(crate) fn plan_close_entry(
+    pub(crate) fn plan_close_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2781,7 +2781,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-        pub(crate) fn plan_leave_request_entry(
+    pub(crate) fn plan_leave_request_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -2810,7 +2810,7 @@ impl HydrationAuthority {
         plan.bind_control_request_authority(authority, head, &transaction_id, trusted_read_at)
     }
 
-        pub(crate) fn plan_leave_cancellation_entry(
+    pub(crate) fn plan_leave_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         entry: VerifiedControlEntry,
@@ -3025,7 +3025,7 @@ impl HydrationAuthority {
             .bind_recovery_package_cas(package_cas)
     }
 
-        pub(crate) fn plan_leaf_recovery_cancellation_entry(
+    pub(crate) fn plan_leaf_recovery_cancellation_entry(
         &self,
         locked: &LockedConversationStateGuard,
         envelope: DurableSignedRequestEnvelope,
@@ -3085,7 +3085,7 @@ impl HydrationAuthority {
     /// Consume the exact request repository input and produce one fully bound
     /// transition. No handler identity, prelude, durable row, or payload enters
     /// this planner as a separate argument.
-        pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
+    pub(crate) fn plan_recovery_request_input<T: PublicTransport>(
         input: RecoveryRequestPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3136,7 +3136,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_recovery_cancellation_input(
+    pub(crate) fn plan_recovery_cancellation_input(
         input: RecoveryCancellationPlanInput,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
         let parts = input.into_planner_parts();
@@ -3180,7 +3180,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
+    pub(crate) fn plan_recovery_fulfillment_input<T: PublicTransport>(
         input: RecoveryFulfillmentPlanInput,
         relationship_authority: &RelationshipAuthority<T>,
     ) -> Result<PlannedRecoveryMutation, StateMachineError> {
@@ -3261,7 +3261,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_client_recovery_expiry_input(
+    pub(crate) fn plan_client_recovery_expiry_input(
         input: RecoveryClientExpiryPlanInput,
     ) -> Result<PlannedClientRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3301,7 +3301,7 @@ impl HydrationAuthority {
         })
     }
 
-        pub(crate) fn plan_scheduler_recovery_expiry_input(
+    pub(crate) fn plan_scheduler_recovery_expiry_input(
         input: RecoverySchedulerExpiryPlanInput,
     ) -> Result<PlannedSchedulerRecoveryExpiry, StateMachineError> {
         let parts = input
@@ -3703,7 +3703,7 @@ impl HydrationAuthority {
     /// fanout manifest proves completeness, including the legal empty case;
     /// callers cannot omit a conversation, request, Welcome, or reserved
     /// package and still obtain a persistence plan.
-        pub(crate) fn plan_device_revocation_batch(
+    pub(crate) fn plan_device_revocation_batch(
         mutation: VerifiedSignedMutation,
         actor_registration: LockedRegistrationProjection,
         target_guard: LockedRevocationTargetGuard,
@@ -4426,7 +4426,7 @@ impl HydrationAuthority {
     /// Project an exact non-actor device registration solely from the locked
     /// business scope. Recovery fulfillment uses this for the original request
     /// target; no handler-selected key material crosses the planner boundary.
-        fn locked_registration_for_scoped_device(
+    fn locked_registration_for_scoped_device(
         &self,
         scope: &ScopeBoundBusinessAuthority,
         did: &str,
@@ -4762,7 +4762,10 @@ pub(crate) fn classify_role_producer(
     role: ParticipantRole,
 ) -> Result<Option<TransitionEvidence>, StateMachineError> {
     match evidence.body_binding.as_ref() {
-        Some(TransitionBodyBinding::Creation { .. } | TransitionBodyBinding::DirectRequestPublication { .. }) => Ok(None),
+        Some(
+            TransitionBodyBinding::Creation { .. }
+            | TransitionBodyBinding::DirectRequestPublication { .. },
+        ) => Ok(None),
         Some(TransitionBodyBinding::Policy {
             participant_changes,
             ..
@@ -4854,10 +4857,15 @@ pub(crate) fn classify_acceptance(
 ) -> Result<TransitionEvidence, StateMachineError> {
     let records_acceptance = matches!(
         evidence.body_binding.as_ref(),
-        Some(TransitionBodyBinding::Acceptance { .. } | TransitionBodyBinding::DirectRequestAcceptance { .. })
+        Some(
+            TransitionBodyBinding::Acceptance { .. }
+                | TransitionBodyBinding::DirectRequestAcceptance { .. }
+        )
     ) && evidence.authority.as_ref().is_some_and(|authority| {
-        matches!(authority.kind, SignedMutationKind::ParticipantAcceptance | SignedMutationKind::DirectRequestAcceptance)
-            && authority.actor.principal() == principal
+        matches!(
+            authority.kind,
+            SignedMutationKind::ParticipantAcceptance | SignedMutationKind::DirectRequestAcceptance
+        ) && authority.actor.principal() == principal
     });
     if !records_acceptance {
         return Err(StateMachineError::InvalidHydrationAuthority);
@@ -5318,18 +5326,32 @@ fn historical_transition_evidence(
     let (transition_id, body_binding) = match entry.mutation().projection() {
         VerifiedMutationProjection::DirectRequestPublication(value) => {
             let body = value.body();
-            (closed_uuid(&body, "requestId")?, parse_direct_request_publication(&body)?)
-        },
+            (
+                closed_uuid(&body, "requestId")?,
+                parse_direct_request_publication(&body)?,
+            )
+        }
         VerifiedMutationProjection::DirectRequestAcceptance(value) => {
             let body = value.body();
             let prior = closed_coordinate_from_field(&body, "prior")?;
             let next = closed_coordinate_from_field(&body, "next")?;
-            if coordinate_only_successor(&prior)? != next { return Err(StateMachineError::InvalidHydrationAuthority); }
-            let Some(CanonicalValueRef::Object(invitation)) = body.get("invitationProvenance") else { return Err(StateMachineError::InvalidHydrationAuthority); };
-            (closed_uuid(&body, "transitionId")?, TransitionBodyBinding::DirectRequestAcceptance {
-                request_id: closed_uuid(&body, "requestId")?, prior, next, invitation: parse_invitation(&invitation)?,
-            })
-        },
+            if coordinate_only_successor(&prior)? != next {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            }
+            let Some(CanonicalValueRef::Object(invitation)) = body.get("invitationProvenance")
+            else {
+                return Err(StateMachineError::InvalidHydrationAuthority);
+            };
+            (
+                closed_uuid(&body, "transitionId")?,
+                TransitionBodyBinding::DirectRequestAcceptance {
+                    request_id: closed_uuid(&body, "requestId")?,
+                    prior,
+                    next,
+                    invitation: parse_invitation(&invitation)?,
+                },
+            )
+        }
         VerifiedMutationProjection::Creation(value) => (
             *value.transition_id().as_bytes(),
             TransitionBodyBinding::Creation {
@@ -5674,41 +5696,78 @@ fn canonical_server_timestamp(
     ServerTimestamp::from_unix_millis(value.datetime().timestamp_millis())
 }
 
-fn parse_direct_request_publication(body: &super::transcript::ClosedObjectRef<'_>) -> Result<TransitionBodyBinding, StateMachineError> {
+fn parse_direct_request_publication(
+    body: &super::transcript::ClosedObjectRef<'_>,
+) -> Result<TransitionBodyBinding, StateMachineError> {
     let next = closed_coordinate_from_field(body, "next")?;
     let recipient = closed_principal(body, "recipientDid")?;
     let actor = closed_device(body, "actorDid", "actorDeviceId")?;
-    let Some(CanonicalValueRef::Object(origin)) = body.get("origin") else { return Err(StateMachineError::InvalidHydrationAuthority); };
+    let Some(CanonicalValueRef::Object(origin)) = body.get("origin") else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
     let prior = match closed_text(&origin, "$type")? {
         "blue.catbird.chat.defs#freshDirectOrigin" => None,
-        "blue.catbird.chat.defs#legacyPendingDirectOrigin" => Some(closed_coordinate_from_field(&origin, "exactPrior")?),
+        "blue.catbird.chat.defs#legacyPendingDirectOrigin" => {
+            Some(closed_coordinate_from_field(&origin, "exactPrior")?)
+        }
         _ => return Err(StateMachineError::InvalidHydrationAuthority),
     };
-    if next.state_version() != 1 || next.epoch() != 1 || next.lifecycle() != PublicGroupSnapshotLifecycle::Active
+    if next.state_version() != 1
+        || next.epoch() != 1
+        || next.lifecycle() != PublicGroupSnapshotLifecycle::Active
         || next.conversation_id() != &closed_uuid(body, "conversationId")?
         || actor.principal() == &recipient
-        || prior.as_ref().map_or(next.generation() != 0, |p| p.conversation_id() != next.conversation_id() || p.generation().checked_add(1) != Some(next.generation()) || p.group_id() == next.group_id() || p.lifecycle() != PublicGroupSnapshotLifecycle::Active)
-    { return Err(StateMachineError::InvalidHydrationAuthority); }
-    let Some(CanonicalValueRef::Object(artifacts)) = body.get("artifacts") else { return Err(StateMachineError::InvalidHydrationAuthority); };
-    let Some(CanonicalValueRef::Object(metadata)) = artifacts.get("metadataSnapshot") else { return Err(StateMachineError::InvalidHydrationAuthority); };
+        || prior.as_ref().map_or(next.generation() != 0, |p| {
+            p.conversation_id() != next.conversation_id()
+                || p.generation().checked_add(1) != Some(next.generation())
+                || p.group_id() == next.group_id()
+                || p.lifecycle() != PublicGroupSnapshotLifecycle::Active
+        })
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    let Some(CanonicalValueRef::Object(artifacts)) = body.get("artifacts") else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
+    let Some(CanonicalValueRef::Object(metadata)) = artifacts.get("metadataSnapshot") else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
     let metadata = parse_metadata_snapshot(&metadata)?;
-    let Some(CanonicalValueRef::Object(welcome)) = artifacts.get("welcome") else { return Err(StateMachineError::InvalidHydrationAuthority); };
-    let Some(CanonicalValueRef::Array(deliveries)) = welcome.get("deliveries") else { return Err(StateMachineError::InvalidHydrationAuthority); };
+    let Some(CanonicalValueRef::Object(welcome)) = artifacts.get("welcome") else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
+    let Some(CanonicalValueRef::Array(deliveries)) = welcome.get("deliveries") else {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    };
     let mut devices = vec![actor.clone()];
     for i in 0..deliveries.len() {
-        let Some(CanonicalValueRef::Object(delivery)) = deliveries.get(i) else { return Err(StateMachineError::InvalidHydrationAuthority); };
+        let Some(CanonicalValueRef::Object(delivery)) = deliveries.get(i) else {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        };
         let device = closed_device(&delivery, "recipientDid", "recipientDeviceId")?;
-        if device.principal() != actor.principal() && device.principal() != &recipient { return Err(StateMachineError::InvalidHydrationAuthority); }
+        if device.principal() != actor.principal() && device.principal() != &recipient {
+            return Err(StateMachineError::InvalidHydrationAuthority);
+        }
         devices.push(device);
     }
     devices.sort();
-    if devices.len() < 2 || devices.len() > MAX_LEAVES || devices.windows(2).any(|p|p[0] == p[1])
-        || !devices.iter().any(|d|d.principal() == &recipient)
+    if devices.len() < 2
+        || devices.len() > MAX_LEAVES
+        || devices.windows(2).any(|p| p[0] == p[1])
+        || !devices.iter().any(|d| d.principal() == &recipient)
         || !metadata_coordinate_matches(&metadata, &next)
         || metadata.origin_transition_id != closed_uuid(body, "requestId")?
         || metadata.metadata_version != 1
-    { return Err(StateMachineError::InvalidHydrationAuthority); }
-    Ok(TransitionBodyBinding::DirectRequestPublication { prior, next, recipient, devices, metadata })
+    {
+        return Err(StateMachineError::InvalidHydrationAuthority);
+    }
+    Ok(TransitionBodyBinding::DirectRequestPublication {
+        prior,
+        next,
+        recipient,
+        devices,
+        metadata,
+    })
 }
 
 fn closed_uuid(
@@ -6042,8 +6101,12 @@ fn transition_binding_is_route_bound(
         coordinate.conversation_id() == conversation_id
     };
     match binding {
-        TransitionBodyBinding::DirectRequestPublication { prior, next, .. } => prior.as_ref().is_none_or(coordinate_matches) && coordinate_matches(next),
-        TransitionBodyBinding::DirectRequestAcceptance { prior, next, .. } => coordinate_matches(prior) && coordinate_matches(next),
+        TransitionBodyBinding::DirectRequestPublication { prior, next, .. } => {
+            prior.as_ref().is_none_or(coordinate_matches) && coordinate_matches(next)
+        }
+        TransitionBodyBinding::DirectRequestAcceptance { prior, next, .. } => {
+            coordinate_matches(prior) && coordinate_matches(next)
+        }
         TransitionBodyBinding::Creation { next, .. } => coordinate_matches(next),
         TransitionBodyBinding::Commit { prior, next, .. }
         | TransitionBodyBinding::Policy { prior, next, .. }
@@ -10888,13 +10951,32 @@ impl RecoveryPlanEncoder {
 
     fn transition_body(&mut self, value: &TransitionBodyBinding) {
         match value {
-            TransitionBodyBinding::DirectRequestPublication { prior, next, recipient, devices, metadata } => {
-                self.u8(11); self.option(prior.as_ref(), Self::coordinate); self.coordinate(next);
-                self.bytes(recipient.as_bytes()); self.slice(devices, Self::device); self.metadata(metadata);
-            },
-            TransitionBodyBinding::DirectRequestAcceptance { request_id, prior, next, invitation } => {
-                self.u8(12); self.bytes(request_id); self.coordinate(prior); self.coordinate(next); self.invitation_binding(invitation);
-            },
+            TransitionBodyBinding::DirectRequestPublication {
+                prior,
+                next,
+                recipient,
+                devices,
+                metadata,
+            } => {
+                self.u8(11);
+                self.option(prior.as_ref(), Self::coordinate);
+                self.coordinate(next);
+                self.bytes(recipient.as_bytes());
+                self.slice(devices, Self::device);
+                self.metadata(metadata);
+            }
+            TransitionBodyBinding::DirectRequestAcceptance {
+                request_id,
+                prior,
+                next,
+                invitation,
+            } => {
+                self.u8(12);
+                self.bytes(request_id);
+                self.coordinate(prior);
+                self.coordinate(next);
+                self.invitation_binding(invitation);
+            }
             TransitionBodyBinding::Creation {
                 kind,
                 next,
@@ -12752,7 +12834,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn bind_device_revocation_authority(
+    fn bind_device_revocation_authority(
         mut self,
         evidence: DeviceRevocationEvidence,
         head: &LockedConversationHeadGuard,
@@ -12817,7 +12899,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn bind_recovery_expiry_authority(
+    fn bind_recovery_expiry_authority(
         mut self,
         evidence: RecoveryExpiryPlanAuthority,
         head: &LockedConversationHeadGuard,
@@ -12986,7 +13068,7 @@ impl PlannedTransition {
         Ok(self)
     }
 
-        fn into_revocation_batch_member_plan(
+    fn into_revocation_batch_member_plan(
         self,
     ) -> Result<ConversationPersistencePlan, StateMachineError> {
         if !matches!(
@@ -13006,7 +13088,7 @@ impl PlannedTransition {
         })
     }
 
-        fn bind_revocation_package_cas(
+    fn bind_revocation_package_cas(
         mut self,
         binding: RevocationPackageCasBinding,
     ) -> Result<Self, StateMachineError> {
@@ -16842,7 +16924,11 @@ fn ensure_active(state: &ConversationState) -> Result<(), StateMachineError> {
         return Err(StateMachineError::ConversationClosed);
     }
     if state.public_state().coordinate() != &state.coordinate {
-        tracing::error!("coordinate mismatch: public_state={:?} != state_coord={:?}", state.public_state().coordinate(), state.coordinate);
+        tracing::error!(
+            "coordinate mismatch: public_state={:?} != state_coord={:?}",
+            state.public_state().coordinate(),
+            state.coordinate
+        );
         return Err(StateMachineError::InvalidPublicState);
     }
     Ok(())
@@ -17140,7 +17226,12 @@ fn validate_state(state: &ConversationState) -> Result<(), StateMachineError> {
             .iter()
             .filter(|leaf| leaf.device.principal() == &participant.principal)
             .count();
-        if (participant.status == ParticipantStatus::Pending && state.leaves.iter().filter(|leaf| leaf.device.principal() == &participant.principal).any(|leaf| !pending_request_leaf_is_bound(state, leaf)))
+        if (participant.status == ParticipantStatus::Pending
+            && state
+                .leaves
+                .iter()
+                .filter(|leaf| leaf.device.principal() == &participant.principal)
+                .any(|leaf| !pending_request_leaf_is_bound(state, leaf)))
             || leaf_count > MAX_LEAVES_PER_PRINCIPAL
         {
             return Err(StateMachineError::InvariantViolation);
@@ -17149,7 +17240,9 @@ fn validate_state(state: &ConversationState) -> Result<(), StateMachineError> {
     if state.leaves.iter().any(|leaf| {
         state
             .participant(leaf.device.principal())
-            .is_none_or(|participant| !participant.is_active() && !pending_request_leaf_is_bound(state, leaf))
+            .is_none_or(|participant| {
+                !participant.is_active() && !pending_request_leaf_is_bound(state, leaf)
+            })
             || leaf.basic_credential != leaf.device.basic_credential()
             || leaf.signature_key.len() != 32
             || leaf.encryption_key.is_empty()
@@ -17254,7 +17347,12 @@ fn initial_participant_role(
     match participant.invitation.as_ref() {
         None => Some(ParticipantRole::Admin),
         Some(invitation) => match invitation.transition.body_binding.as_ref() {
-            Some(TransitionBodyBinding::DirectRequestPublication { recipient, .. }) if conversation_kind == ConversationKind::Direct && recipient == &participant.principal => Some(ParticipantRole::Admin),
+            Some(TransitionBodyBinding::DirectRequestPublication { recipient, .. })
+                if conversation_kind == ConversationKind::Direct
+                    && recipient == &participant.principal =>
+            {
+                Some(ParticipantRole::Admin)
+            }
             Some(TransitionBodyBinding::Creation { kind, .. }) if *kind == conversation_kind => {
                 Some(if conversation_kind == ConversationKind::Direct {
                     ParticipantRole::Admin
@@ -17337,7 +17435,15 @@ fn invitation_matches_participant(
         return false;
     }
     match invitation.transition.body_binding.as_ref() {
-        Some(TransitionBodyBinding::DirectRequestPublication { prior: None, recipient, .. }) => authority.kind == SignedMutationKind::DirectRequestPublication && conversation_kind == ConversationKind::Direct && recipient == &participant.principal,
+        Some(TransitionBodyBinding::DirectRequestPublication {
+            prior: None,
+            recipient,
+            ..
+        }) => {
+            authority.kind == SignedMutationKind::DirectRequestPublication
+                && conversation_kind == ConversationKind::Direct
+                && recipient == &participant.principal
+        }
         Some(TransitionBodyBinding::Creation { kind, manifest, .. }) => {
             let invitation_role = if *kind == ConversationKind::Direct {
                 ParticipantRole::Admin
@@ -17393,7 +17499,13 @@ fn acceptance_matches_participant(
     let Some(authority) = acceptance.authority.as_ref() else {
         return true;
     };
-    if let Some(TransitionBodyBinding::DirectRequestAcceptance { request_id, prior, next, invitation: signed_invitation }) = acceptance.body_binding.as_ref() {
+    if let Some(TransitionBodyBinding::DirectRequestAcceptance {
+        request_id,
+        prior,
+        next,
+        invitation: signed_invitation,
+    }) = acceptance.body_binding.as_ref()
+    {
         return authority.kind == SignedMutationKind::DirectRequestAcceptance
             && authority.actor.principal() == &participant.principal
             && signed_invitation.transition_id == invitation.transition.transition_id
@@ -17474,8 +17586,18 @@ fn current_state_producer_matches(state: &ConversationState) -> bool {
         return false;
     }
     match (authority.kind, evidence.body_binding.as_ref()) {
-        (SignedMutationKind::DirectRequestPublication, Some(TransitionBodyBinding::DirectRequestPublication { next, metadata, .. })) => state.kind == ConversationKind::Direct && next == &state.coordinate && metadata_author_matches_evidence(metadata, evidence),
-        (SignedMutationKind::DirectRequestAcceptance, Some(TransitionBodyBinding::DirectRequestAcceptance { next, .. })) => state.kind == ConversationKind::Direct && next == &state.coordinate,
+        (
+            SignedMutationKind::DirectRequestPublication,
+            Some(TransitionBodyBinding::DirectRequestPublication { next, metadata, .. }),
+        ) => {
+            state.kind == ConversationKind::Direct
+                && next == &state.coordinate
+                && metadata_author_matches_evidence(metadata, evidence)
+        }
+        (
+            SignedMutationKind::DirectRequestAcceptance,
+            Some(TransitionBodyBinding::DirectRequestAcceptance { next, .. }),
+        ) => state.kind == ConversationKind::Direct && next == &state.coordinate,
 
         (
             SignedMutationKind::Creation,
@@ -17535,12 +17657,14 @@ fn metadata_provenance_matches(state: &ConversationState) -> bool {
                 return false;
             }
             producer.authority.as_ref().is_none_or(|authority| {
-                (authority.kind != SignedMutationKind::DirectRequestPublication || metadata_author_matches_evidence(metadata, producer))
+                (authority.kind != SignedMutationKind::DirectRequestPublication
+                    || metadata_author_matches_evidence(metadata, producer))
                     && authority.control_conversation_id.as_ref()
-                    == Some(state.coordinate.conversation_id())
+                        == Some(state.coordinate.conversation_id())
                     && matches!(
                         authority.kind,
-                        SignedMutationKind::DirectRequestPublication | SignedMutationKind::Creation
+                        SignedMutationKind::DirectRequestPublication
+                            | SignedMutationKind::Creation
                             | SignedMutationKind::CommitTransition
                             | SignedMutationKind::MetadataTransition
                             | SignedMutationKind::ResetActivation
@@ -17813,18 +17937,37 @@ fn require_commit_body(
             let c_meta = commit_metadata_matches(prior_state, metadata, next);
             tracing::error!("LeafRecoveryFulfillment check: prior={}, next={}, req={}, commit_sha={}, aad_sha={}, meta={}", c_prior, c_next, c_req, c_commit_sha, c_aad_sha, c_meta);
             if !c_prior {
-                tracing::error!("prior mismatch: signed_prior={:?} != prior={:?}", signed_prior, prior);
+                tracing::error!(
+                    "prior mismatch: signed_prior={:?} != prior={:?}",
+                    signed_prior,
+                    prior
+                );
             }
             if !c_next {
-                tracing::error!("next mismatch: signed_next={:?} != next={:?}", signed_next, next);
+                tracing::error!(
+                    "next mismatch: signed_next={:?} != next={:?}",
+                    signed_next,
+                    next
+                );
             }
             if !c_commit_sha {
-                tracing::error!("commit_sha mismatch: verified={:?} != signed={:?}", commit.verified_commit_sha256(), commit_sha256);
+                tracing::error!(
+                    "commit_sha mismatch: verified={:?} != signed={:?}",
+                    commit.verified_commit_sha256(),
+                    commit_sha256
+                );
             }
             if !c_aad_sha {
-                tracing::error!("aad_sha mismatch: verified={:?} != signed={:?}", commit.verified_aad_sha256(), aad_digest);
+                tracing::error!(
+                    "aad_sha mismatch: verified={:?} != signed={:?}",
+                    commit.verified_aad_sha256(),
+                    aad_digest
+                );
             }
-            c_prior && c_next && c_req && (evidence.authority.is_none() || (c_commit_sha && c_aad_sha && c_meta))
+            c_prior
+                && c_next
+                && c_req
+                && (evidence.authority.is_none() || (c_commit_sha && c_aad_sha && c_meta))
         }
         (
             SignedMutationKind::LeaveCommitFulfillment,
@@ -17872,13 +18015,34 @@ fn commit_metadata_matches(
     let c_auth = next_metadata.author_proof == prior_metadata.author_proof;
     let c_avatar = next_metadata.avatar_binding == prior_metadata.avatar_binding;
     let c_nonce = next_metadata.nonce != prior_metadata.nonce;
-    tracing::error!("commit_metadata_matches: next_len={}, prior_len={}", next_metadata.ciphertext.len(), prior_metadata.ciphertext.len());
-    tracing::error!("commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}", c_coord, c_ver, c_ot, c_len, c_auth, c_avatar, c_nonce);
+    tracing::error!(
+        "commit_metadata_matches: next_len={}, prior_len={}",
+        next_metadata.ciphertext.len(),
+        prior_metadata.ciphertext.len()
+    );
+    tracing::error!(
+        "commit_metadata_matches: coord={}, ver={}, ot={}, len={}, auth={}, avatar={}, nonce={}",
+        c_coord,
+        c_ver,
+        c_ot,
+        c_len,
+        c_auth,
+        c_avatar,
+        c_nonce
+    );
     if !c_coord {
-        tracing::error!("metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}", next_metadata.coordinate, next_coordinate);
+        tracing::error!(
+            "metadata coordinate mismatch: next_metadata={:?} != next_coord={:?}",
+            next_metadata.coordinate,
+            next_coordinate
+        );
     }
     if !c_auth {
-        tracing::error!("author_proof mismatch: next={:?} != prior={:?}", next_metadata.author_proof, prior_metadata.author_proof);
+        tracing::error!(
+            "author_proof mismatch: next={:?} != prior={:?}",
+            next_metadata.author_proof,
+            prior_metadata.author_proof
+        );
     }
     c_coord && c_ver && c_ot && c_len && c_auth && c_avatar && c_nonce
 }
@@ -17973,7 +18137,10 @@ fn require_commit_manifest(
             let c_pc = manifest.participant_changes.is_empty();
             let c_adds_len = adds.len() == 1;
             let c_adds_tgt = adds.get(0).map(|a| a.0 == target).unwrap_or(false);
-            let c_adds_req = adds.get(0).map(|a| a.1 == recovery_request_id).unwrap_or(false);
+            let c_adds_req = adds
+                .get(0)
+                .map(|a| a.1 == recovery_request_id)
+                .unwrap_or(false);
             let c_adds_kp = adds.get(0).map(|a| a.2 == key_package_ref).unwrap_or(false);
             let c_m_req = manifest.leaf_recovery_request_id.as_ref() == Some(recovery_request_id);
             let c_w_id = &signed_welcome.welcome_id == welcome_id;
@@ -17981,9 +18148,22 @@ fn require_commit_manifest(
             let c_w_req = &signed_welcome.recovery_request_id == recovery_request_id;
             let c_w_kp = &signed_welcome.key_package_ref == key_package_ref;
             let c_w_wire = signed_welcome.opaque_welcome == welcome.wire_bytes();
-            let c_w_sha = signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
+            let c_w_sha =
+                signed_welcome.sha256 == <[u8; 32]>::from(Sha256::digest(welcome.wire_bytes()));
             tracing::error!("InvalidWelcomeMapping checks: pc={}, adds_len={}, adds_tgt={}, adds_req={}, adds_kp={}, m_req={}, w_id={}, w_rcp={}, w_req={}, w_kp={}, w_wire={}, w_sha={}", c_pc, c_adds_len, c_adds_tgt, c_adds_req, c_adds_kp, c_m_req, c_w_id, c_w_rcp, c_w_req, c_w_kp, c_w_wire, c_w_sha);
-            if !c_pc || !c_adds_len || !c_adds_tgt || !c_adds_req || !c_adds_kp || !c_m_req || !c_w_id || !c_w_rcp || !c_w_req || !c_w_kp || !c_w_wire || !c_w_sha {
+            if !c_pc
+                || !c_adds_len
+                || !c_adds_tgt
+                || !c_adds_req
+                || !c_adds_kp
+                || !c_m_req
+                || !c_w_id
+                || !c_w_rcp
+                || !c_w_req
+                || !c_w_kp
+                || !c_w_wire
+                || !c_w_sha
+            {
                 return Err(StateMachineError::InvalidWelcomeMapping);
             }
         }
@@ -18235,7 +18415,10 @@ fn validate_intervals(
     }
     for interval in intervals {
         let opening_kind_valid = match interval.opening_kind {
-            OpeningKind::DirectRequest => transition_has_one_of_kinds(&interval.opening, &[SignedMutationKind::DirectRequestPublication]),
+            OpeningKind::DirectRequest => transition_has_one_of_kinds(
+                &interval.opening,
+                &[SignedMutationKind::DirectRequestPublication],
+            ),
             OpeningKind::Creation => {
                 transition_has_one_of_kinds(&interval.opening, &[SignedMutationKind::Creation])
             }
@@ -18249,7 +18432,10 @@ fn validate_intervals(
             ),
         };
         let end_kind_valid = interval.end.as_ref().is_none_or(|end| match end.kind {
-            CloseKind::DirectRequest => transition_has_one_of_kinds(&end.evidence, &[SignedMutationKind::DirectRequestPublication]),
+            CloseKind::DirectRequest => transition_has_one_of_kinds(
+                &end.evidence,
+                &[SignedMutationKind::DirectRequestPublication],
+            ),
             CloseKind::Replace => transition_has_one_of_kinds(
                 &end.evidence,
                 &[SignedMutationKind::LeafRecoveryFulfillment],
@@ -18307,9 +18493,12 @@ fn validate_intervals(
             .ok_or(StateMachineError::InvalidIntervalBoundary)?;
         let touching = end.evidence.seq == window[1].opening.seq;
         let valid_touch = match (end.kind, window[1].opening_kind) {
-            (CloseKind::DirectRequest, OpeningKind::DirectRequest) => window[0].generation.checked_add(1) == Some(window[1].generation)
-                && window[1].opening_context.state_version() == 1 && window[1].opening_context.epoch() == 1
-                && window[1].opening_context.group_id() != window[0].opening_context.group_id(),
+            (CloseKind::DirectRequest, OpeningKind::DirectRequest) => {
+                window[0].generation.checked_add(1) == Some(window[1].generation)
+                    && window[1].opening_context.state_version() == 1
+                    && window[1].opening_context.epoch() == 1
+                    && window[1].opening_context.group_id() != window[0].opening_context.group_id()
+            }
             (CloseKind::Replace, OpeningKind::Add) => {
                 window[1].generation == window[0].generation
                     && window[1].opening_context.group_id() == window[0].opening_context.group_id()
@@ -18345,10 +18534,16 @@ fn opening_matches_interval(
         return true;
     };
     match (interval.opening_kind, evidence.body_binding.as_ref()) {
-        (OpeningKind::DirectRequest, Some(TransitionBodyBinding::DirectRequestPublication { next, devices, .. })) =>
-            authority.kind == SignedMutationKind::DirectRequestPublication && conversation_kind == ConversationKind::Direct
-                && next == &interval.opening_context && devices.contains(&interval.recipient)
-                && coordinate_is_in_lineage(next, root),
+        (
+            OpeningKind::DirectRequest,
+            Some(TransitionBodyBinding::DirectRequestPublication { next, devices, .. }),
+        ) => {
+            authority.kind == SignedMutationKind::DirectRequestPublication
+                && conversation_kind == ConversationKind::Direct
+                && next == &interval.opening_context
+                && devices.contains(&interval.recipient)
+                && coordinate_is_in_lineage(next, root)
+        }
 
         (
             OpeningKind::Creation,
@@ -18443,9 +18638,20 @@ fn end_matches_interval(
         return true;
     };
     match (end.kind, authority.kind, evidence.body_binding.as_ref()) {
-        (CloseKind::DirectRequest, SignedMutationKind::DirectRequestPublication, Some(TransitionBodyBinding::DirectRequestPublication { prior: Some(prior), next, .. })) =>
-            conversation_kind == ConversationKind::Direct && coordinate_after_opening(prior, &interval.opening_context)
-                && prior.generation().checked_add(1) == Some(next.generation()) && coordinate_is_in_lineage(next, root),
+        (
+            CloseKind::DirectRequest,
+            SignedMutationKind::DirectRequestPublication,
+            Some(TransitionBodyBinding::DirectRequestPublication {
+                prior: Some(prior),
+                next,
+                ..
+            }),
+        ) => {
+            conversation_kind == ConversationKind::Direct
+                && coordinate_after_opening(prior, &interval.opening_context)
+                && prior.generation().checked_add(1) == Some(next.generation())
+                && coordinate_is_in_lineage(next, root)
+        }
 
         (
             CloseKind::Replace,
@@ -18724,7 +18930,9 @@ fn transition_consumes_coordinate(
         return false;
     }
     match evidence.body_binding.as_ref() {
-        Some(TransitionBodyBinding::DirectRequestPublication { prior: Some(prior), .. })
+        Some(TransitionBodyBinding::DirectRequestPublication {
+            prior: Some(prior), ..
+        })
         | Some(TransitionBodyBinding::DirectRequestAcceptance { prior, .. })
         | Some(TransitionBodyBinding::Commit { prior, .. })
         | Some(TransitionBodyBinding::Policy { prior, .. })
@@ -19841,8 +20049,17 @@ mod direct_request_history_tests {
     use serde_json::{json, Value};
 
     fn vector(kind: &str) -> Value {
-        let vectors: Value = serde_json::from_str(include_str!("../../tests/fixtures/direct_request_vectors.json")).unwrap();
-        vectors["signed"].as_array().unwrap().iter().find(|v| v["kind"] == kind).unwrap()["body"].clone()
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/direct_request_vectors.json"
+        ))
+        .unwrap();
+        vectors["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["kind"] == kind)
+            .unwrap()["body"]
+            .clone()
     }
     fn publication_body(key: &SigningKey) -> Value {
         let mut body = vector("Publish");
@@ -19859,72 +20076,288 @@ mod direct_request_history_tests {
         let request = body["requestId"].clone();
         let metadata = &mut body["artifacts"]["metadataSnapshot"];
         metadata.as_object_mut().unwrap().remove("avatarBinding");
-        metadata["coordinate"]["conversationId"] = json!(STANDARD.encode(uuid::Uuid::parse_str(next["conversationId"].as_str().unwrap()).unwrap().as_bytes()));
+        metadata["coordinate"]["conversationId"] = json!(STANDARD.encode(
+            uuid::Uuid::parse_str(next["conversationId"].as_str().unwrap())
+                .unwrap()
+                .as_bytes()
+        ));
         metadata["coordinate"]["epoch"] = json!(1);
         metadata["originTransitionId"] = request.clone();
         metadata["metadataVersion"] = json!(1);
-        let ciphertext = STANDARD.decode(metadata["ciphertext"].as_str().unwrap()).unwrap();
+        let ciphertext = STANDARD
+            .decode(metadata["ciphertext"].as_str().unwrap())
+            .unwrap();
         metadata["ciphertextSize"] = json!(ciphertext.len());
         metadata["ciphertextSha256"] = json!(STANDARD.encode(Sha256::digest(ciphertext)));
         metadata["authorProof"]["authorKeyId"] = json!(key_id);
-        metadata["authorProof"]["signaturePublicKey"] = json!(STANDARD.encode(key.verifying_key().as_bytes()));
+        metadata["authorProof"]["signaturePublicKey"] =
+            json!(STANDARD.encode(key.verifying_key().as_bytes()));
         metadata["authorProof"]["originTransitionId"] = request;
         body
     }
-    fn hydrate(body: Value, kind: &str, key: &SigningKey, seq: u64) -> (TransitionEvidence, Vec<u8>, Vec<u8>) {
-        use super::super::direct_request_transcript::{direct_request_signing_bytes, DirectRequestKind};
-        let direct_kind = if kind == "directRequestEntry" { DirectRequestKind::Publish } else { DirectRequestKind::Accept };
-        let bytes = direct_request_signing_bytes(direct_kind, &serde_json::to_vec(&body).unwrap()).unwrap();
+    fn hydrate(
+        body: Value,
+        kind: &str,
+        key: &SigningKey,
+        seq: u64,
+    ) -> (TransitionEvidence, Vec<u8>, Vec<u8>) {
+        use super::super::direct_request_transcript::{
+            direct_request_signing_bytes, DirectRequestKind,
+        };
+        let direct_kind = if kind == "directRequestEntry" {
+            DirectRequestKind::Publish
+        } else {
+            DirectRequestKind::Accept
+        };
+        let bytes =
+            direct_request_signing_bytes(direct_kind, &serde_json::to_vec(&body).unwrap()).unwrap();
         let wrapper = json!({"body":body,"signature":STANDARD.encode(key.sign(&bytes).to_bytes())});
-        let conversation = if kind == "directRequestEntry" { &wrapper["body"]["conversationId"] } else { &wrapper["body"]["prior"]["conversationId"] };
+        let conversation = if kind == "directRequestEntry" {
+            &wrapper["body"]["conversationId"]
+        } else {
+            &wrapper["body"]["prior"]["conversationId"]
+        };
         let entry = json!({"$type":format!("blue.catbird.chat.defs#{kind}"),"entryId":"00000000-0000-4000-8000-000000000009","conversationId":conversation,"seq":seq,"signedRequest":wrapper,"receivedAt":"2026-09-19T12:00:00.000Z"});
         let row = serde_json::to_vec(&entry).unwrap();
         let signed = serde_json::to_vec(&wrapper).unwrap();
         // Dedicated admission remains mandatory; historical kinds are never v1 mutations.
         assert!(super::super::transcript::decode_canonical_signed_mutation(&signed).is_err());
-        let authority = HistoricalRehydrationAuthority::new(*uuid::Uuid::parse_str(conversation.as_str().unwrap()).unwrap().as_bytes(),seq+1).unwrap();
-        let evidence = authority.hydrate_historical_control_from_durable_bytes(row.clone(),signed.clone(),key.verifying_key().as_bytes()).unwrap().into_transition().unwrap();
+        let authority = HistoricalRehydrationAuthority::new(
+            *uuid::Uuid::parse_str(conversation.as_str().unwrap())
+                .unwrap()
+                .as_bytes(),
+            seq + 1,
+        )
+        .unwrap();
+        let evidence = authority
+            .hydrate_historical_control_from_durable_bytes(
+                row.clone(),
+                signed.clone(),
+                key.verifying_key().as_bytes(),
+            )
+            .unwrap()
+            .into_transition()
+            .unwrap();
         assert!(validate_transition_evidence(&evidence));
-        (evidence,row,signed)
+        let mut wire = entry.clone();
+        wire.as_object_mut().unwrap().remove("$type");
+        let wire = serde_json::to_vec(&wire).unwrap();
+        let expected = if kind == "directRequestEntry" {
+            super::super::direct_request_transcript::direct_request_entry_hash(&wire).unwrap()
+        } else {
+            super::super::direct_request_transcript::direct_request_acceptance_entry_hash(&wire)
+                .unwrap()
+        };
+        assert_eq!(evidence.outer_entry_fingerprint, expected);
+        (evidence, row, signed)
     }
     #[test]
     fn direct_request_history_binds_metadata_pending_leaves_and_recipient_acceptance() {
-        let key = SigningKey::from_bytes(&[7;32]);
+        let key = SigningKey::from_bytes(&[7; 32]);
         let body = publication_body(&key);
-        let (publication,row,signed) = hydrate(body.clone(),"directRequestEntry",&key,1);
-        let Some(TransitionBodyBinding::DirectRequestPublication { next, recipient, devices, metadata, .. }) = publication.body_binding.as_ref() else { panic!("publication binding"); };
-        assert!(metadata_author_matches_evidence(metadata,&publication));
-        let recipient_device = devices.iter().find(|d|d.principal()==recipient).unwrap().clone();
+        let (publication, row, signed) = hydrate(body.clone(), "directRequestEntry", &key, 1);
+        let Some(TransitionBodyBinding::DirectRequestPublication {
+            next,
+            recipient,
+            devices,
+            metadata,
+            ..
+        }) = publication.body_binding.as_ref()
+        else {
+            panic!("publication binding");
+        };
+        assert!(metadata_author_matches_evidence(metadata, &publication));
+        let recipient_device = devices
+            .iter()
+            .find(|d| d.principal() == recipient)
+            .unwrap()
+            .clone();
         let inviter = publication.authority.as_ref().unwrap().actor.clone();
-        let invitation = InvitationProvenance { transition: publication.clone(), inviter: inviter.clone() };
-        let mut participant = ParticipantRecord { principal:recipient.clone(),status:ParticipantStatus::Pending,role:ParticipantRole::Admin,role_producer:None,invitation:Some(invitation.clone()),acceptance:None };
-        assert!(invitation_matches_participant(ConversationKind::Direct,&participant,&invitation));
-        let interval = AccessInterval {recipient:recipient_device.clone(),generation:next.generation(),opening:publication.clone(),opening_kind:OpeningKind::DirectRequest,opening_context:*next,end:None};
-        assert!(opening_matches_interval(&interval,ConversationKind::Direct,next));
-        let mut state = ConversationState {kind:ConversationKind::Direct,coordinate:*next,producer:publication.clone(),public_state:None,metadata:Some(metadata.clone()),metadata_producer:Some(publication.clone()),participants:vec![],leaves:vec![],intervals:vec![interval],terminal_proofs:vec![],recovery_requests:vec![],recovery_reservations:vec![],reset_requests:vec![],leave_requests:vec![],welcomes:vec![]};
-        let leaf = LeafRecord {device:recipient_device.clone(),leaf_index:1,basic_credential:recipient_device.basic_credential(),signature_key:vec![1;32],encryption_key:vec![2;32],key_package_ref:Some([3;32])};
-        assert!(pending_request_leaf_is_bound(&state,&leaf));
-        state.intervals[0].opening_kind=OpeningKind::Add;
-        assert!(!pending_request_leaf_is_bound(&state,&leaf));
-        state.intervals[0].opening_kind=OpeningKind::DirectRequest;
+        let invitation = InvitationProvenance {
+            transition: publication.clone(),
+            inviter: inviter.clone(),
+        };
+        let mut participant = ParticipantRecord {
+            principal: recipient.clone(),
+            status: ParticipantStatus::Pending,
+            role: ParticipantRole::Admin,
+            role_producer: None,
+            invitation: Some(invitation.clone()),
+            acceptance: None,
+        };
+        assert!(invitation_matches_participant(
+            ConversationKind::Direct,
+            &participant,
+            &invitation
+        ));
+        let interval = AccessInterval {
+            recipient: recipient_device.clone(),
+            generation: next.generation(),
+            opening: publication.clone(),
+            opening_kind: OpeningKind::DirectRequest,
+            opening_context: *next,
+            end: None,
+        };
+        assert!(opening_matches_interval(
+            &interval,
+            ConversationKind::Direct,
+            next
+        ));
+        let mut state = ConversationState {
+            kind: ConversationKind::Direct,
+            coordinate: *next,
+            producer: publication.clone(),
+            public_state: None,
+            metadata: Some(metadata.clone()),
+            metadata_producer: Some(publication.clone()),
+            participants: vec![],
+            leaves: vec![],
+            intervals: vec![interval],
+            terminal_proofs: vec![],
+            recovery_requests: vec![],
+            recovery_reservations: vec![],
+            reset_requests: vec![],
+            leave_requests: vec![],
+            welcomes: vec![],
+        };
+        let leaf = LeafRecord {
+            device: recipient_device.clone(),
+            leaf_index: 1,
+            basic_credential: recipient_device.basic_credential(),
+            signature_key: vec![1; 32],
+            encryption_key: vec![2; 32],
+            key_package_ref: Some([3; 32]),
+        };
+        // Exercise the complete production invariant gate with a test-only public
+        // snapshot binding; crypto validity is covered by the separate real corpus.
+        state.leaves = vec![
+            LeafRecord {
+                device: inviter.clone(),
+                leaf_index: 0,
+                basic_credential: inviter.basic_credential(),
+                signature_key: key.verifying_key().as_bytes().to_vec(),
+                encryption_key: vec![4; 32],
+                key_package_ref: None,
+            },
+            leaf.clone(),
+        ];
+        state.participants = vec![
+            ParticipantRecord {
+                principal: inviter.principal().clone(),
+                status: ParticipantStatus::Active,
+                role: ParticipantRole::Admin,
+                role_producer: None,
+                invitation: None,
+                acceptance: None,
+            },
+            participant.clone(),
+        ];
+        state.intervals.insert(
+            0,
+            AccessInterval {
+                recipient: inviter.clone(),
+                generation: next.generation(),
+                opening: publication.clone(),
+                opening_kind: OpeningKind::DirectRequest,
+                opening_context: *next,
+                end: None,
+            },
+        );
+        let snapshot = vec![1, 2, 3];
+        let tree = super::super::snapshot::PublicGroupSnapshotTreeSummary::new(
+            [5; 32],
+            state
+                .leaves
+                .iter()
+                .map(|l| {
+                    super::super::snapshot::PublicGroupSnapshotLeaf::new(
+                        l.leaf_index,
+                        l.basic_credential.clone(),
+                        l.signature_key.clone(),
+                        l.encryption_key.clone(),
+                    )
+                })
+                .collect(),
+        );
+        let binding = super::super::snapshot::PublicGroupSnapshotBinding::new(
+            *next.conversation_id(),
+            next.generation(),
+            next.state_version(),
+            *next.group_id(),
+            next.epoch(),
+            *next.group_context_hash(),
+            *next.confirmation_tag(),
+            next.lifecycle(),
+            Sha256::digest(&snapshot).into(),
+            tree,
+        );
+        state.public_state =
+            Some(ActivePublicState::for_test_from_persisted_binding(snapshot, binding).unwrap());
+        assert!(validate_state(&state).is_ok());
+        assert!(pending_request_leaf_is_bound(&state, &leaf));
+        state.intervals[1].opening_kind = OpeningKind::Add;
+        assert!(!pending_request_leaf_is_bound(&state, &leaf));
+        state.intervals[1].opening_kind = OpeningKind::DirectRequest;
         let mut accept = vector("Accept");
-        accept["actorDid"] = body["recipientDid"].clone(); accept["actorDeviceId"] = json!(uuid::Uuid::from_bytes(*recipient_device.device_id()).to_string());
-        accept["keyId"] = body["keyId"].clone(); accept["prior"] = body["next"].clone(); accept["next"] = body["next"].clone(); accept["next"]["stateVersion"] = json!(2);
+        accept["actorDid"] = body["recipientDid"].clone();
+        accept["actorDeviceId"] =
+            json!(uuid::Uuid::from_bytes(*recipient_device.device_id()).to_string());
+        accept["keyId"] = body["keyId"].clone();
+        accept["prior"] = body["next"].clone();
+        accept["next"] = body["next"].clone();
+        accept["next"]["stateVersion"] = json!(2);
         accept["invitationProvenance"] = json!({"invitationTransitionId":body["requestId"],"invitedByDid":body["actorDid"],"invitedByDeviceId":body["actorDeviceId"]});
-        let (accepted,_,_) = hydrate(accept,"directRequestAcceptanceEntry",&key,2);
-        state.coordinate=coordinate_only_successor(next).unwrap(); state.producer=accepted.clone();
-        participant.status=ParticipantStatus::Active;participant.acceptance=Some(accepted.clone());
-        assert!(acceptance_matches_participant(&state,&participant,&invitation,&accepted));
-        assert!(current_state_producer_matches(&state)); assert!(metadata_provenance_matches(&state));
+        let (accepted, _, _) = hydrate(accept, "directRequestAcceptanceEntry", &key, 2);
+        state.coordinate = coordinate_only_successor(next).unwrap();
+        state.producer = accepted.clone();
+        participant.status = ParticipantStatus::Active;
+        participant.acceptance = Some(accepted.clone());
+        state.participants[1] = participant.clone();
+        state.public_state = Some(ActivePublicState::for_test(
+            state.public_state.as_ref().unwrap(),
+            state.coordinate,
+        ));
+        assert!(validate_state(&state).is_ok());
+        assert!(acceptance_matches_participant(
+            &state,
+            &participant,
+            &invitation,
+            &accepted
+        ));
+        assert!(current_state_producer_matches(&state));
+        assert!(metadata_provenance_matches(&state));
         // A later accepted coordinate preserves provenance; no recovery request is fabricated.
-        state.coordinate=coordinate_only_successor(&state.coordinate).unwrap();
-        assert!(acceptance_matches_participant(&state,&participant,&invitation,&accepted));
-        assert!(opening_matches_interval(&state.intervals[0],ConversationKind::Direct,&state.coordinate));
+        state.coordinate = coordinate_only_successor(&state.coordinate).unwrap();
+        assert!(acceptance_matches_participant(
+            &state,
+            &participant,
+            &invitation,
+            &accepted
+        ));
+        assert!(opening_matches_interval(
+            &state.intervals[0],
+            ConversationKind::Direct,
+            &state.coordinate
+        ));
         // Frozen entry/head and exact-wrapper splice rejection.
-        let authority=HistoricalRehydrationAuthority::new(*next.conversation_id(),2).unwrap();
-        let mut tampered:Value=serde_json::from_slice(&row).unwrap();tampered["seq"]=json!(2);
-        assert!(authority.hydrate_historical_control_from_durable_bytes(serde_json::to_vec(&tampered).unwrap(),signed.clone(),key.verifying_key().as_bytes()).is_err());
-        let mut tampered:Value=serde_json::from_slice(&signed).unwrap();tampered["body"]["recipientDid"]=body["actorDid"].clone();
-        assert!(authority.hydrate_historical_control_from_durable_bytes(row,serde_json::to_vec(&tampered).unwrap(),key.verifying_key().as_bytes()).is_err());
+        let authority = HistoricalRehydrationAuthority::new(*next.conversation_id(), 2).unwrap();
+        let mut tampered: Value = serde_json::from_slice(&row).unwrap();
+        tampered["seq"] = json!(2);
+        assert!(authority
+            .hydrate_historical_control_from_durable_bytes(
+                serde_json::to_vec(&tampered).unwrap(),
+                signed.clone(),
+                key.verifying_key().as_bytes()
+            )
+            .is_err());
+        let mut tampered: Value = serde_json::from_slice(&signed).unwrap();
+        tampered["body"]["recipientDid"] = body["actorDid"].clone();
+        assert!(authority
+            .hydrate_historical_control_from_durable_bytes(
+                row,
+                serde_json::to_vec(&tampered).unwrap(),
+                key.verifying_key().as_bytes()
+            )
+            .is_err());
     }
 }

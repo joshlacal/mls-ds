@@ -650,7 +650,9 @@ fn project_object(
         .ok_or_else(|| AuthPrimitiveError::invalid("invalid embedded required fields"))?;
     for name in required.iter().filter_map(SchemaValue::as_str) {
         if !output.contains_key(name) {
-            return Err(AuthPrimitiveError::invalid("missing required closed object field"));
+            return Err(AuthPrimitiveError::invalid(
+                "missing required closed object field",
+            ));
         }
     }
     if let Some(name) = definition_name {
@@ -943,8 +945,16 @@ macro_rules! signed_mutation_kinds {
 }
 
 signed_mutation_kinds!(
-    (DirectRequestPublication, "directRequestPublicationBody", "CATBIRD-DIRECT-REQUEST-PUBLISH\0"),
-    (DirectRequestAcceptance, "directRequestAcceptanceBody", "CATBIRD-DIRECT-REQUEST-ACCEPT\0"),
+    (
+        DirectRequestPublication,
+        "directRequestPublicationBody",
+        "CATBIRD-DIRECT-REQUEST-PUBLISH\0"
+    ),
+    (
+        DirectRequestAcceptance,
+        "directRequestAcceptanceBody",
+        "CATBIRD-DIRECT-REQUEST-ACCEPT\0"
+    ),
     (
         DeviceEnrollment,
         "deviceEnrollmentBody",
@@ -1289,13 +1299,20 @@ pub fn decode_canonical_signed_mutation(
     raw_json: &[u8],
 ) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
     let canonical = decode_historical_signed_mutation(raw_json)?;
-    if matches!(canonical.kind(), SignedMutationKind::DirectRequestPublication | SignedMutationKind::DirectRequestAcceptance) {
-        return Err(AuthPrimitiveError::invalid("direct request requires dedicated admission"));
+    if matches!(
+        canonical.kind(),
+        SignedMutationKind::DirectRequestPublication | SignedMutationKind::DirectRequestAcceptance
+    ) {
+        return Err(AuthPrimitiveError::invalid(
+            "direct request requires dedicated admission",
+        ));
     }
     Ok(canonical)
 }
 
-fn decode_historical_signed_mutation(raw_json: &[u8]) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
+fn decode_historical_signed_mutation(
+    raw_json: &[u8],
+) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
     let raw = decode_raw_json(raw_json)?;
     let RawJson::Object(wrapper) = raw else {
         return Err(AuthPrimitiveError::invalid("signed wrapper must be object"));
@@ -1571,8 +1588,16 @@ projection_types!(
 
 fn projection_for(value: &VerifiedSignedMutation) -> VerifiedMutationProjection<'_> {
     match value.kind() {
-        SignedMutationKind::DirectRequestPublication => VerifiedMutationProjection::DirectRequestPublication(DirectRequestPublicationProjection(value)),
-        SignedMutationKind::DirectRequestAcceptance => VerifiedMutationProjection::DirectRequestAcceptance(DirectRequestAcceptanceProjection(value)),
+        SignedMutationKind::DirectRequestPublication => {
+            VerifiedMutationProjection::DirectRequestPublication(
+                DirectRequestPublicationProjection(value),
+            )
+        }
+        SignedMutationKind::DirectRequestAcceptance => {
+            VerifiedMutationProjection::DirectRequestAcceptance(DirectRequestAcceptanceProjection(
+                value,
+            ))
+        }
         SignedMutationKind::DeviceEnrollment => {
             VerifiedMutationProjection::DeviceEnrollment(DeviceEnrollmentProjection(value))
         }
@@ -2482,8 +2507,18 @@ macro_rules! control_entry_kinds {
 }
 
 control_entry_kinds!(
-    (DirectRequestPublication, "directRequestEntry", DirectRequestPublication, None),
-    (DirectRequestAcceptance, "directRequestAcceptanceEntry", DirectRequestAcceptance, None),
+    (
+        DirectRequestPublication,
+        "directRequestEntry",
+        DirectRequestPublication,
+        None
+    ),
+    (
+        DirectRequestAcceptance,
+        "directRequestAcceptanceEntry",
+        DirectRequestAcceptance,
+        None
+    ),
     (Commit, "commitEntry", CommitTransition, None),
     (Policy, "policyEntry", PolicyTransition, None),
     (Metadata, "metadataEntry", MetadataTransition, None),
@@ -3495,16 +3530,34 @@ fn finish_verified_control_entry(
         "receivedAt".into(),
         DagValue::Timestamp(received_at.clone()),
     );
-    let fingerprint = if matches!(kind, ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance) {
+    let fingerprint = if matches!(
+        kind,
+        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance
+    ) {
         let row = BTreeMap::from([
             ("entryId".to_owned(), DagValue::Uuid(entry_id.clone())),
-            ("conversationId".to_owned(), DagValue::Uuid(conversation_id.clone())),
+            (
+                "conversationId".to_owned(),
+                DagValue::Uuid(conversation_id.clone()),
+            ),
             ("seq".to_owned(), DagValue::Integer(seq)),
-            ("receivedAt".to_owned(), DagValue::Timestamp(received_at.clone())),
-            ("signedRequest".to_owned(), DagValue::Map(BTreeMap::from([
-                ("body".to_owned(), DagValue::Map(mutation.canonical.body.clone())),
-                ("signature".to_owned(), DagValue::Bytes(mutation.signature().to_vec())),
-            ]))),
+            (
+                "receivedAt".to_owned(),
+                DagValue::Timestamp(received_at.clone()),
+            ),
+            (
+                "signedRequest".to_owned(),
+                DagValue::Map(BTreeMap::from([
+                    (
+                        "body".to_owned(),
+                        DagValue::Map(mutation.canonical.body.clone()),
+                    ),
+                    (
+                        "signature".to_owned(),
+                        DagValue::Bytes(mutation.signature().to_vec()),
+                    ),
+                ])),
+            ),
         ]);
         let canonical_projection = serde_ipld_dagcbor::to_vec(&DagMapRef(&row))
             .map_err(|_| AuthPrimitiveError::invalid("direct entry canonical encoding"))?;
@@ -3512,9 +3565,17 @@ fn finish_verified_control_entry(
             ControlEntryKind::DirectRequestPublication => b"CATBIRD-DIRECT-REQUEST-ENTRY\0",
             _ => b"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-ENTRY\0",
         };
-        let mut hash = Sha256::new(); hash.update(domain); hash.update(&canonical_projection);
-        CanonicalControlFingerprint { kind, canonical_projection, fingerprint: hash.finalize().into() }
-    } else { control_fingerprint_from_projection(kind, &projection)? };
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        hash.update(&canonical_projection);
+        CanonicalControlFingerprint {
+            kind,
+            canonical_projection,
+            fingerprint: hash.finalize().into(),
+        }
+    } else {
+        control_fingerprint_from_projection(kind, &projection)?
+    };
     Ok(VerifiedControlEntry {
         kind,
         entry_id,
@@ -3559,7 +3620,9 @@ fn signed_body_conversation_id(
 ) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
     if matches!(
         canonical.kind(),
-        SignedMutationKind::Creation | SignedMutationKind::LeaveCancellation | SignedMutationKind::DirectRequestPublication
+        SignedMutationKind::Creation
+            | SignedMutationKind::LeaveCancellation
+            | SignedMutationKind::DirectRequestPublication
     ) {
         return Ok(body_uuid(&canonical.body, "conversationId"));
     }
@@ -3602,17 +3665,29 @@ impl VerifiedControlEntry {
 }
 
 /// Strict projection bridge for the closed direct-request transcript module.
-pub(crate) fn project_direct_request_contract(raw: &[u8], name: &str, tagged: bool) -> Result<Vec<u8>, AuthPrimitiveError> {
+pub(crate) fn project_direct_request_contract(
+    raw: &[u8],
+    name: &str,
+    tagged: bool,
+) -> Result<Vec<u8>, AuthPrimitiveError> {
     let input = decode_raw_json(raw)?;
     let value = project_ref(name, &input, tagged)?;
-    serde_ipld_dagcbor::to_vec(&value).map_err(|_| AuthPrimitiveError::invalid("direct request DAG-CBOR projection"))
+    serde_ipld_dagcbor::to_vec(&value)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request DAG-CBOR projection"))
 }
 
-pub(crate) fn validate_direct_request_strict_json(raw:&[u8])->Result<(),AuthPrimitiveError> {decode_raw_json(raw)?;Ok(())}
+pub(crate) fn validate_direct_request_strict_json(raw: &[u8]) -> Result<(), AuthPrimitiveError> {
+    decode_raw_json(raw)?;
+    Ok(())
+}
 
 impl<'a> DirectRequestPublicationProjection<'a> {
-    pub fn body(&self) -> ClosedObjectRef<'a> { ClosedObjectRef(&self.0.canonical.body) }
+    pub fn body(&self) -> ClosedObjectRef<'a> {
+        ClosedObjectRef(&self.0.canonical.body)
+    }
 }
 impl<'a> DirectRequestAcceptanceProjection<'a> {
-    pub fn body(&self) -> ClosedObjectRef<'a> { ClosedObjectRef(&self.0.canonical.body) }
+    pub fn body(&self) -> ClosedObjectRef<'a> {
+        ClosedObjectRef(&self.0.canonical.body)
+    }
 }

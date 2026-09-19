@@ -8,6 +8,12 @@ mod common {
     pub mod direct_request_database;
 }
 mod repository {
+    mod device_directory {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/chat_protocol/repository/device_directory.rs"
+        ));
+    }
     pub mod prelude {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),

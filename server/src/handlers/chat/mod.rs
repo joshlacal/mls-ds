@@ -28,7 +28,6 @@ mod conversation_state;
 mod create_conversation;
 mod device_views;
 mod direct_requests;
-mod publish_direct_request;
 mod enroll_device;
 mod errors;
 mod expiry_worker;
@@ -37,6 +36,7 @@ mod get_entries;
 mod get_own_devices;
 mod inventory;
 mod leave;
+mod publish_direct_request;
 mod publish_typing;
 mod recovery;
 mod recovery_scheduler;
@@ -142,11 +142,26 @@ where
     BlobStore: FromRef<S>,
 {
     let router = Router::new()
-        .route(&xrpc_path(ChatEndpoint::PublishDirectRequestKeys),post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)))
-        .route(&xrpc_path(ChatEndpoint::PublishDirectRequest),post(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)))
-        .route(&xrpc_path(ChatEndpoint::PrepareDirectRequest),post(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)))
-        .route(&xrpc_path(ChatEndpoint::CancelDirectRequestPreparation),post(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)))
-        .route(&xrpc_path(ChatEndpoint::GetDirectRequestOutcome),get(direct_requests::outcome))
+        .route(
+            &xrpc_path(ChatEndpoint::PublishDirectRequestKeys),
+            post(direct_requests::publish_keys).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PublishDirectRequest),
+            post(publish_direct_request::handle).layer(DefaultBodyLimit::max(16_777_216)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::PrepareDirectRequest),
+            post(direct_requests::prepare).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::CancelDirectRequestPreparation),
+            post(direct_requests::cancel).layer(DefaultBodyLimit::max(65_536)),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetDirectRequestOutcome),
+            get(direct_requests::outcome),
+        )
         .route(
             &xrpc_path(ChatEndpoint::EnrollDevice),
             post(enroll_device::handle),
@@ -375,10 +390,17 @@ mod tests {
     }
 }
 
-#[cfg(all(feature = "chat-protocol-production-proof", not(feature = "server-bin")))]
+#[cfg(all(
+    feature = "chat-protocol-production-proof",
+    not(feature = "server-bin")
+))]
 pub(crate) fn production_proof_signed_operation_failure(
     error: crate::chat_protocol::repository::prelude::PreludeError,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    context::operation_prelude_failure(crate::chat_protocol::error::ChatEndpoint::SubmitTransition,error).into_response()
+    context::operation_prelude_failure(
+        crate::chat_protocol::error::ChatEndpoint::SubmitTransition,
+        error,
+    )
+    .into_response()
 }

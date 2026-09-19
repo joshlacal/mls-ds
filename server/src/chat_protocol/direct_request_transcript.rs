@@ -761,11 +761,18 @@ pub fn direct_request_acceptance_endpoint_is_v2(raw_endpoint: &[u8]) -> Result<b
         return Err(error("acceptance requires exactly one versioned request"));
     }
     if object.contains_key("signedRequest") {
-        project(
-            &serde_json::to_vec(&object["signedRequest"]).map_err(error)?,
-            "signedParticipantAcceptance",
-            false,
-        )?;
+        // Version selection precedes the established v1 DTO normalization.
+        // The legacy signed body may be untagged at this host boundary; its
+        // existing canonical decoder remains the signature/schema authority.
+        let wrapper = object["signedRequest"]
+            .as_object()
+            .ok_or_else(|| error("legacy signed wrapper"))?;
+        if wrapper.len() != 2
+            || !wrapper.get("body").is_some_and(Value::is_object)
+            || !wrapper.contains_key("signature")
+        {
+            return Err(error("legacy signed wrapper fields"));
+        }
         Ok(false)
     } else if object.contains_key("directRequest") {
         project(
@@ -800,6 +807,16 @@ mod acceptance_presence_tests {
         let new = json!({"body":new_body,"signature":STANDARD.encode([0;64])});
         let legacy = json!({"signedRequest":old});
         let direct = json!({"directRequest":new});
+        let mut untagged_legacy = legacy.clone();
+        untagged_legacy["signedRequest"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$type");
+        assert!(!direct_request_acceptance_endpoint_is_v2(
+            &serde_json::to_vec(&untagged_legacy).unwrap()
+        )
+        .unwrap());
+
         assert!(
             !direct_request_acceptance_endpoint_is_v2(&serde_json::to_vec(&legacy).unwrap())
                 .unwrap()

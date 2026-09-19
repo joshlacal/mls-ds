@@ -668,3 +668,57 @@ mod revocation_tests {
         ));
     }
 }
+
+/// Exact-device replenishment hint. The caller must already hold and verify
+/// the own-device snapshot requester; this is never peer/public directory data.
+#[derive(sqlx::FromRow)]
+pub(crate) struct DirectRequestPoolHint {
+    pub(crate) enabled: bool,
+    pub(crate) revision: i64,
+    pub(crate) usable_count: i64,
+    pub(crate) reserved_count: i64,
+    pub(crate) as_of: DateTime<Utc>,
+    pub(crate) usable_until: DateTime<Utc>,
+}
+pub(crate) async fn read_direct_request_pool_hint(
+    tx: &mut Transaction<'_, Postgres>,
+    did: &str,
+    device: Uuid,
+    key_id: &str,
+    generation: i64,
+) -> Result<Option<DirectRequestPoolHint>, DeviceDirectoryError> {
+    let present: bool =
+        sqlx::query_scalar("SELECT to_regclass('chat.direct_request_capabilities') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    if !present {
+        return Ok(None);
+    }
+    // A single statement timestamp and exact capability/key/generation binding
+    // make both counts describe one hint horizon. Final prepare is authoritative.
+    Ok(sqlx::query_as(r#"
+      WITH instant AS (SELECT date_trunc('milliseconds',clock_timestamp()) AS at)
+      SELECT c.enabled,c.revision,
+        count(p.key_package_ref) FILTER(WHERE p.status='available' AND NOT EXISTS(
+          SELECT 1 FROM chat.direct_request_selected_devices s WHERE s.key_package_ref=p.key_package_ref)
+          AND NOT EXISTS(SELECT 1 FROM chat.direct_request_retired_packages r WHERE r.key_package_ref=p.key_package_ref)) AS usable_count,
+        count(p.key_package_ref) FILTER(WHERE p.status='reserved') AS reserved_count,
+        instant.at AS as_of,instant.at+INTERVAL '605400 seconds' AS usable_until
+      FROM instant CROSS JOIN chat.direct_request_capabilities c
+      JOIN chat.devices d ON d.user_did=c.owner_did AND d.device_id=c.owner_device_id
+      JOIN chat.device_keys k ON k.user_did=d.user_did AND k.device_id=d.device_id
+      LEFT JOIN chat.key_packages p ON c.enabled AND d.status='active' AND k.revoked_at IS NULL
+        AND p.owner_did=c.owner_did AND p.owner_device_id=c.owner_device_id
+        AND p.owner_key_id=c.owner_key_id AND p.owner_auth_generation=c.auth_generation
+        AND p.usage_scope='direct-request' AND p.status IN('available','reserved')
+        AND p.not_before<=instant.at AND p.not_after>=instant.at+INTERVAL '605400 seconds'
+        AND EXISTS(SELECT 1 FROM chat.direct_request_grants g WHERE g.key_package_ref=p.key_package_ref
+          AND g.owner_did=p.owner_did AND g.owner_device_id=p.owner_device_id AND g.owner_key_id=p.owner_key_id
+          AND g.auth_generation=p.owner_auth_generation AND g.revoked_at IS NULL
+          AND g.purpose='direct-request-bootstrap' AND g.protocol_version='2' AND g.profile='encryptedIntroduction1'
+          AND g.expires_at>=instant.at+INTERVAL '605400 seconds')
+      WHERE c.owner_did=$1 AND c.owner_device_id=$2 AND c.owner_key_id=$3 AND c.auth_generation=$4
+        AND d.auth_generation=c.auth_generation AND k.key_id=c.owner_key_id
+      GROUP BY c.enabled,c.revision,instant.at
+    "#).bind(did).bind(device).bind(key_id).bind(generation).fetch_optional(&mut **tx).await?)
+}

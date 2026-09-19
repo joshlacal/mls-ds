@@ -116,7 +116,9 @@ impl IntoResponse for ChatFailure {
                     .into_response();
                 if let Some(retry_after) = self.retry_after_secs {
                     if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
-                        response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+                        response
+                            .headers_mut()
+                            .insert(axum::http::header::RETRY_AFTER, value);
                     }
                 }
                 response
@@ -176,7 +178,10 @@ mod tests {
         let response = failure.into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            response.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
             Some("42")
         );
     }

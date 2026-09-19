@@ -109,7 +109,9 @@ const AUDIENCE: &str = "did:web:chat.catbird.blue";
 
 fn control_endpoint(kind: ControlEntryKind) -> &'static str {
     match kind {
-        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance => panic!("v2 history is not a v1 append route"),
+        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance => {
+            panic!("v2 history is not a v1 append route")
+        }
         ControlEntryKind::Creation => "blue.catbird.chat.createConversation",
         ControlEntryKind::ParticipantAcceptance => "blue.catbird.chat.acceptConversation",
         ControlEntryKind::ConversationClose => "blue.catbird.chat.closeConversation",

@@ -136,6 +136,11 @@ name = "federation_fixture"
 path = "src/bin/federation_fixture.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "encrypted_request_server_fixture"
+path = "../e2e-tests/support/encrypted_request_server_fixture.rs"
+required-features = ["test-support"]
+
 [[test]]
 name = "chat_protocol_production_cfg"
 path = "tests/chat_protocol_production_cfg.rs"

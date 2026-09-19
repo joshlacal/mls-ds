@@ -44,7 +44,9 @@ fn input_validation_token_bounds() {
     // 4. Valid 64-char hex APNs token
     let valid_hex = "740f4707bebcf74f9b7c25d48e3358945f6aa01da5ddb387462c7eaf61bb78ad";
     assert_eq!(valid_hex.len(), 64);
-    assert!(!valid_hex.chars().any(|c| c.is_control() || c.is_whitespace()));
+    assert!(!valid_hex
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace()));
 }
 
 #[test]

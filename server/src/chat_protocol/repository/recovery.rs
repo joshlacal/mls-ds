@@ -2597,7 +2597,12 @@ impl PreparedRecoveryMutation {
         let Self { graph, completion } = self;
         let material = graph.material();
         let mut graph = graph;
-        let prepared = prepare_recovery_execution(transaction, &graph, &graph.persistence_witness.event_lock_scope).await?;
+        let prepared = prepare_recovery_execution(
+            transaction,
+            &graph,
+            &graph.persistence_witness.event_lock_scope,
+        )
+        .await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         let response = graph.take_response();
         Ok(AppliedRecoveryMutation {
@@ -2814,8 +2819,12 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
         VerifiedMutationProjection::LeafRecoveryRequest(_) => {
             let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
             let prelude = super::prelude::prepare_identity_scope_prelude(
-                transaction, &authority, reservation, scope,
-            ).await?;
+                transaction,
+                &authority,
+                reservation,
+                scope,
+            )
+            .await?;
             let domain = prepare_recovery_request_authority(transaction, prelude, mutation).await?;
             let input = domain
                 .into_plan_input(transaction, relationship_authority, &trusted)
@@ -2834,8 +2843,12 @@ pub(crate) async fn execute_prepared_recovery<T: PublicTransport>(
         VerifiedMutationProjection::LeafRecoveryCancellation(_) => {
             let scope = discover_recovery_event_scope(transaction, &authority, mutation).await?;
             let prelude = super::prelude::prepare_identity_scope_prelude(
-                transaction, &authority, reservation, scope,
-            ).await?;
+                transaction,
+                &authority,
+                reservation,
+                scope,
+            )
+            .await?;
             match prepare_recovery_cancellation_authority(transaction, prelude, mutation).await? {
                 RecoveryCancellationRead::Execute(domain) => {
                     let applied = plan_recovery_cancellation(domain.into_plan_input(&trusted)?)?
@@ -3001,7 +3014,12 @@ impl PreparedSchedulerRecoveryExpiry {
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<AppliedSchedulerRecoveryExpiry, RecoveryRepositoryError> {
         let material = self.graph.material();
-        let prepared = prepare_recovery_execution(transaction, &self.graph, &self.graph.persistence_witness.event_lock_scope).await?;
+        let prepared = prepare_recovery_execution(
+            transaction,
+            &self.graph,
+            &self.graph.persistence_witness.event_lock_scope,
+        )
+        .await?;
         let applied = apply_prepared_recovery_execution(prepared).await?;
         Ok(AppliedSchedulerRecoveryExpiry { applied, material })
     }
@@ -3777,9 +3795,13 @@ pub mod production_composition_proof {
         let before = residue_counts(&mut transaction, request_id).await?;
         let PreparedSchedulerRecoveryExpiry { graph } = prepared;
         {
-            let prepared_execution = prepare_recovery_execution(&mut transaction, &graph, &graph.persistence_witness.event_lock_scope)
-                .await
-                .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
+            let prepared_execution = prepare_recovery_execution(
+                &mut transaction,
+                &graph,
+                &graph.persistence_witness.event_lock_scope,
+            )
+            .await
+            .map_err(|error| format!("prepare post-write abort execution: {error:?}"))?;
             let mode = match abort {
                 PostWriteAbort::Cancellation => DropSafetyProbeMode::Pending,
                 PostWriteAbort::Panic => DropSafetyProbeMode::Panic,
@@ -4185,7 +4207,7 @@ pub mod production_composition_proof {
 }
 
 impl RecoveryRequestAuthority {
-        pub(crate) async fn into_plan_input<T: PublicTransport>(
+    pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,
@@ -4322,7 +4344,7 @@ impl RecoveryCancellationAuthority {
 }
 
 impl RecoveryFulfillmentAuthority {
-        pub(crate) async fn into_plan_input<T: PublicTransport>(
+    pub(crate) async fn into_plan_input<T: PublicTransport>(
         self,
         transaction: &mut Transaction<'_, Postgres>,
         relationship_authority: &RelationshipAuthority<T>,
@@ -5547,7 +5569,10 @@ pub(crate) async fn discover_recovery_fulfillment_terminal_scope(
     authority: &VerifiedChatDeviceRequest,
     mutation: &VerifiedSignedMutation,
 ) -> Result<CanonicalLockScope, RecoveryRepositoryError> {
-    if !matches!(mutation.projection(), VerifiedMutationProjection::LeafRecoveryFulfillment(_)) {
+    if !matches!(
+        mutation.projection(),
+        VerifiedMutationProjection::LeafRecoveryFulfillment(_)
+    ) {
         return Err(RecoveryRepositoryError::UnsupportedAuthority);
     }
     discover_recovery_event_scope(transaction, authority, mutation).await
@@ -5565,29 +5590,48 @@ async fn discover_recovery_event_scope(
     }
     let actor_did = authority.subject().as_str().to_owned();
     let actor_device_id = Uuid::from_bytes(*authority.device_id().as_bytes());
-    let mut devices = vec![CanonicalDeviceIdentity::new(actor_did.clone(), actor_device_id)];
+    let mut devices = vec![CanonicalDeviceIdentity::new(
+        actor_did.clone(),
+        actor_device_id,
+    )];
     let conversation_id = match mutation.projection() {
-        VerifiedMutationProjection::LeafRecoveryRequest(value) => signed_coordinate(value.prior())?.conversation_id,
+        VerifiedMutationProjection::LeafRecoveryRequest(value) => {
+            signed_coordinate(value.prior())?.conversation_id
+        }
         projection => {
             let request_id = match projection {
-                VerifiedMutationProjection::LeafRecoveryCancellation(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
-                VerifiedMutationProjection::LeafRecoveryFulfillment(value) => Uuid::from_bytes(*value.recovery_request_id().as_bytes()),
+                VerifiedMutationProjection::LeafRecoveryCancellation(value) => {
+                    Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                }
+                VerifiedMutationProjection::LeafRecoveryFulfillment(value) => {
+                    Uuid::from_bytes(*value.recovery_request_id().as_bytes())
+                }
                 _ => return Err(RecoveryRepositoryError::UnsupportedAuthority),
             };
             let locator: RecoveryTerminalLocatorRow = sqlx::query_as(RECOVERY_TERMINAL_LOCATOR_SQL)
-                .bind(request_id).fetch_optional(&mut **transaction).await?
+                .bind(request_id)
+                .fetch_optional(&mut **transaction)
+                .await?
                 .ok_or(RecoveryRepositoryError::RecoveryMissing)?;
             if locator.recovery_request_id != request_id {
                 return Err(RecoveryRepositoryError::AuthorityBindingMismatch);
             }
-            devices.push(CanonicalDeviceIdentity::new(locator.requester_did, locator.requester_device_id));
+            devices.push(CanonicalDeviceIdentity::new(
+                locator.requester_did,
+                locator.requester_device_id,
+            ));
             locator.conversation_id
         }
     };
     let seed = CanonicalLockScope::new(vec![actor_did], devices)?;
     Ok(super::prelude::discover_conversation_event_lock_scope(
-        transaction, conversation_id, &seed, &[], false,
-    ).await?)
+        transaction,
+        conversation_id,
+        &seed,
+        &[],
+        false,
+    )
+    .await?)
 }
 
 fn mutation_contains_exact_admission(
@@ -5672,12 +5716,21 @@ pub(crate) async fn prepare_recovery_expiry_authority(
     }
     let seed = CanonicalLockScope::new(
         vec![locator.requester_did.clone()],
-        vec![CanonicalDeviceIdentity::new(locator.requester_did.clone(), locator.requester_device_id)],
+        vec![CanonicalDeviceIdentity::new(
+            locator.requester_did.clone(),
+            locator.requester_device_id,
+        )],
     )?;
     let event_scope = super::prelude::discover_conversation_event_lock_scope(
-        transaction, locator.conversation_id, &seed, &[], false,
-    ).await?;
-    let event_lock_scope = super::prelude::lock_conversation_event_scope(transaction, &event_scope).await?;
+        transaction,
+        locator.conversation_id,
+        &seed,
+        &[],
+        false,
+    )
+    .await?;
+    let event_lock_scope =
+        super::prelude::lock_conversation_event_scope(transaction, &event_scope).await?;
     let principal: Option<String> = sqlx::query_scalar(LOCK_RECOVERY_EXPIRY_PRINCIPAL_SQL)
         .bind(&locator.requester_did)
         .fetch_optional(&mut **transaction)

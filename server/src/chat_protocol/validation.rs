@@ -553,7 +553,6 @@ const CHAT_ENDPOINTS: [&str; 38] = [
     "blue.catbird.chat.getDirectRequestOutcome",
     "blue.catbird.chat.cancelDirectRequestPreparation",
     "blue.catbird.chat.publishDirectRequest",
-
     "blue.catbird.chat.enrollDevice",
     "blue.catbird.chat.replenishKeyPackages",
     "blue.catbird.chat.rebindDeviceAuthentication",

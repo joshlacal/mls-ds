@@ -84,12 +84,10 @@ async fn send(
                 tracing::error!("complete_operation error: {:?}", e);
                 context::operation_prelude_failure(ENDPOINT, e)
             })?;
-            tx.commit()
-                .await
-                .map_err(|e| {
-                    tracing::error!("tx.commit error: {:?}", e);
-                    ChatFailure::storage(ENDPOINT)
-                })?;
+            tx.commit().await.map_err(|e| {
+                tracing::error!("tx.commit error: {:?}", e);
+                ChatFailure::storage(ENDPOINT)
+            })?;
             context::canonical_json_response(ENDPOINT, 200, response_bytes)
         }
     }

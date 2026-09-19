@@ -341,10 +341,19 @@ pub struct AuthMiddleware {
     cache_ttl_seconds: u64,
     rate_limit_quota: Quota,
     did_host_allowlist: Option<Vec<String>>,
+    #[cfg(feature = "test-support")]
+    test_https_fixture: Option<TestHttpsDidFixture>,
     #[cfg(test)]
     service_did_override: Option<String>,
     #[cfg(test)]
     test_service_did_source: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+struct TestHttpsDidFixture {
+    host: String,
+    port: u16,
 }
 
 impl AuthMiddleware {
@@ -400,11 +409,56 @@ impl AuthMiddleware {
             cache_ttl_seconds,
             rate_limit_quota: quota,
             did_host_allowlist,
+            #[cfg(feature = "test-support")]
+            test_https_fixture: None,
             #[cfg(test)]
             service_did_override: None,
             #[cfg(test)]
             test_service_did_source: None,
         }
+    }
+
+    /// Construct the standard authentication middleware with one explicitly
+    /// trusted loopback HTTPS DID authority for an external-process fixture.
+    ///
+    /// This exists only in `test-support` builds. It does not seed the DID
+    /// cache or bypass JWT verification: the resolver still performs a real
+    /// HTTPS request and the ordinary signature, audience, lxm, JTI, device,
+    /// and operation admission checks run unchanged.
+    #[cfg(feature = "test-support")]
+    fn with_test_https_did_fixture(
+        host: &str,
+        port: u16,
+        ca_certificate_pem: &[u8],
+    ) -> Result<Self, String> {
+        let normalized_host = host.trim().to_ascii_lowercase();
+        let fixture_is_loopback = normalized_host == "localhost"
+            || normalized_host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !fixture_is_loopback || port == 0 {
+            return Err("test HTTPS DID fixture must be an explicit loopback host and port".into());
+        }
+        let certificate = reqwest::Certificate::from_pem(ca_certificate_pem)
+            .map_err(|_| "test HTTPS DID fixture CA is not a PEM certificate".to_owned())?;
+        let timeout_seconds = std::env::var("DID_RESOLUTION_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10);
+        let mut middleware = Self::with_config(300, 100, 60);
+        middleware.http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .redirect(reqwest::redirect::Policy::none())
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(certificate)
+            .build()
+            .map_err(|_| "failed to construct test HTTPS DID resolver".to_owned())?;
+        middleware.test_https_fixture = Some(TestHttpsDidFixture {
+            host: normalized_host,
+            port,
+        });
+        Ok(middleware)
     }
 
     #[cfg(test)]
@@ -749,7 +803,14 @@ impl AuthMiddleware {
             AuthError::DidResolutionFailed(format!("Invalid did:web URL for {}: {}", did, e))
         })?;
         let host = parsed.host_str().unwrap_or("");
-        if is_disallowed_host(host) {
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        #[cfg(feature = "test-support")]
+        let is_exact_test_fixture = self.test_https_fixture.as_ref().is_some_and(|fixture| {
+            host.eq_ignore_ascii_case(&fixture.host) && port == fixture.port
+        });
+        #[cfg(not(feature = "test-support"))]
+        let is_exact_test_fixture = false;
+        if is_disallowed_host(host) && !is_exact_test_fixture {
             return Err(AuthError::DidResolutionFailed(
                 "disallowed did:web host".into(),
             ));
@@ -761,8 +822,9 @@ impl AuthMiddleware {
                 ));
             }
         }
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        validate_resolved_host_is_public(host, port).await?;
+        if !is_exact_test_fixture {
+            validate_resolved_host_is_public(host, port).await?;
+        }
 
         self.send_and_decode_did_document(self.http_client.get(&url), |status| {
             format!("Web server returned status {status}")
@@ -903,8 +965,36 @@ static JTI_CACHE: Lazy<moka::sync::Cache<String, ()>> = Lazy::new(|| {
 
 static AUTH_MIDDLEWARE: Lazy<AuthMiddleware> = Lazy::new(AuthMiddleware::new);
 
+#[cfg(feature = "test-support")]
+static TEST_AUTH_MIDDLEWARE: once_cell::sync::OnceCell<AuthMiddleware> =
+    once_cell::sync::OnceCell::new();
+
+fn shared_auth_middleware() -> &'static AuthMiddleware {
+    #[cfg(feature = "test-support")]
+    if let Some(middleware) = TEST_AUTH_MIDDLEWARE.get() {
+        return middleware;
+    }
+    &AUTH_MIDDLEWARE
+}
+
+/// Install the one process-wide resolver used by the external-process
+/// encrypted-request fixture. The caller must do this before serving requests.
+/// Installation is single-assignment so later test code cannot swap trust
+/// authority underneath an already authenticated process.
+#[cfg(feature = "test-support")]
+pub fn install_test_https_did_resolver(
+    host: &str,
+    port: u16,
+    ca_certificate_pem: &[u8],
+) -> Result<(), String> {
+    let middleware = AuthMiddleware::with_test_https_did_fixture(host, port, ca_certificate_pem)?;
+    TEST_AUTH_MIDDLEWARE
+        .set(middleware)
+        .map_err(|_| "test HTTPS DID resolver is already installed".to_owned())
+}
+
 pub async fn cache_test_did_document(doc: DidDocument) {
-    AUTH_MIDDLEWARE.cache_did_document(doc).await;
+    shared_auth_middleware().cache_did_document(doc).await;
 }
 
 /// Keep the binary startup gate and library request gate on identical flag semantics.
@@ -1245,7 +1335,7 @@ pub(crate) async fn verify_mls_service_principal(
     let token = authorization
         .strip_prefix("Bearer ")
         .ok_or(AuthError::InvalidAuthFormat)?;
-    let claims = AUTH_MIDDLEWARE
+    let claims = shared_auth_middleware()
         .verify_jwt_for_audience(token, Some(MLS_APPVIEW_SERVICE_REF))
         .await?;
     let now = Utc::now().timestamp();
@@ -1446,7 +1536,7 @@ where
         })?;
 
         // Use shared auth middleware (cached DID docs, rate limiting)
-        let middleware: &AuthMiddleware = &AUTH_MIDDLEWARE;
+        let middleware: &AuthMiddleware = shared_auth_middleware();
 
         // Verify JWT and extract claims
         let claims = middleware.verify_jwt(token).await?;

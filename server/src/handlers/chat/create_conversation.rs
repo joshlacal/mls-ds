@@ -41,7 +41,8 @@ async fn handle_inner(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let admission = context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
+    let admission =
+        context::admit_signed_operation_only(pool, runtime, endpoint, headers, body).await?;
     let mut transaction = pool
         .begin()
         .await
@@ -64,7 +65,10 @@ async fn handle_inner(
         outcome.status(),
         outcome.response_bytes().to_vec(),
     )?;
-    transaction.commit().await.map_err(|_| ChatFailure::storage(endpoint))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ChatFailure::storage(endpoint))?;
     Ok(response)
 }
 
@@ -144,7 +148,8 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn creation_failure_maps_conversation_exists_to_conversation_already_exists_wire_response() {
+    async fn creation_failure_maps_conversation_exists_to_conversation_already_exists_wire_response(
+    ) {
         let endpoint = ChatEndpoint::CreateConversation;
         let err = CreationFacadeError::CreationHead(CreationHeadHydrationError::ConversationExists);
         let failure = creation_failure(endpoint, err);

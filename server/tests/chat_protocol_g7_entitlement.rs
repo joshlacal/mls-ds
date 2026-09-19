@@ -53,7 +53,9 @@ mod validation;
 
 #[path = "../src/chat_protocol"]
 mod chat_protocol {
-    pub mod direct_request_transcript { pub use catbird_server::chat_protocol::direct_request_transcript::*; }
+    pub mod direct_request_transcript {
+        pub use catbird_server::chat_protocol::direct_request_transcript::*;
+    }
     pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
     pub mod cursor {
         pub use crate::cursor::*;
@@ -6291,8 +6293,7 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         "the direct-pending invitee carries the pending participant witness"
     );
     assert_eq!(
-        direct_view.relationship.participant_period_id,
-        direct.invitee.participant_period_id,
+        direct_view.relationship.participant_period_id, direct.invitee.participant_period_id,
         "the direct-pending witness binds the durable participant period"
     );
     assert_eq!(
@@ -6331,11 +6332,14 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         )
         .await
         .expect("direct invitee entry single-attempt lock");
-        let outcome =
-            chat_protocol::read_authority::authorize_entries(&mut tx, guard, direct.graph.conversation_id)
-                .await
-                .err()
-                .expect("a direct-pending participant has no entry authority");
+        let outcome = chat_protocol::read_authority::authorize_entries(
+            &mut tx,
+            guard,
+            direct.graph.conversation_id,
+        )
+        .await
+        .err()
+        .expect("a direct-pending participant has no entry authority");
         rollback_with_constraints(tx).await;
         outcome
     };
@@ -6378,8 +6382,7 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
     // Unrelated DID remains NotEntitled to direct conversation state and entries.
     let unrelated_did = b_read_fresh_did(0x0E);
     let unrelated_device = Uuid::new_v4();
-    let unrelated_jkt =
-        register_read_device(&direct_pool, &unrelated_did, unrelated_device).await;
+    let unrelated_jkt = register_read_device(&direct_pool, &unrelated_did, unrelated_device).await;
     let unrelated_admission = fixture_read_admission(
         &direct_pool,
         "blue.catbird.chat.getConversationState",
@@ -6418,13 +6421,14 @@ async fn pending_invitations_authorize_state_only_for_group_and_direct() {
         &unrelated_jkt,
     )
     .await;
-    let (unrelated_entry_guard, mut tx) = chat_protocol::read_authority_bridge::lock_single_attempt(
-        &direct_pool,
-        unrelated_entry_admission,
-        chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
-    )
-    .await
-    .expect("unrelated entry single-attempt lock");
+    let (unrelated_entry_guard, mut tx) =
+        chat_protocol::read_authority_bridge::lock_single_attempt(
+            &direct_pool,
+            unrelated_entry_admission,
+            chat_protocol::read_authority_bridge::OrdinaryReadEndpoint::GetEntries,
+        )
+        .await
+        .expect("unrelated entry single-attempt lock");
     let unrelated_entry_outcome = chat_protocol::read_authority::authorize_entries(
         &mut tx,
         unrelated_entry_guard,
@@ -6729,12 +6733,17 @@ async fn entry_intervals_are_ordered_nonoverlapping_open_last_and_inclusive() {
     .expect("single-attempt lock");
     let removed_entries =
         chat_protocol::read_authority::authorize_entries(&mut tx, guard, conversation_id)
-            .await.expect("a removed exact device can catch up finite terminal controls");
+            .await
+            .expect("a removed exact device can catch up finite terminal controls");
     let removed_view = chat_protocol::read_authority_bridge::entry_authority_view(&removed_entries);
     assert!(!removed_view.ordered_intervals.is_empty());
-    assert!(removed_view.ordered_intervals.iter().all(|interval| matches!(
-        interval.terminal, chat_protocol::read_authority_bridge::IntervalTerminalView::Closed { .. }
-    )));
+    assert!(removed_view
+        .ordered_intervals
+        .iter()
+        .all(|interval| matches!(
+            interval.terminal,
+            chat_protocol::read_authority_bridge::IntervalTerminalView::Closed { .. }
+        )));
     rollback_with_constraints(tx).await;
 
     // The creator's open interval is the last (only) interval and observes the
@@ -7320,8 +7329,7 @@ async fn inventory_precedence_is_close_open_finite_participant_none() {
             participant_period_id,
         } => {
             assert_eq!(
-                *participant_period_id,
-                direct_fixture.invitee.participant_period_id,
+                *participant_period_id, direct_fixture.invitee.participant_period_id,
                 "the state arm binds the direct-pending participant period"
             );
         }
@@ -7374,8 +7382,7 @@ async fn inventory_precedence_is_close_open_finite_participant_none() {
             participant_period_id,
         } => {
             assert_eq!(
-                *participant_period_id,
-                group_fixture.invitee.participant_period_id,
+                *participant_period_id, group_fixture.invitee.participant_period_id,
                 "the state arm binds the group-pending participant period"
             );
         }

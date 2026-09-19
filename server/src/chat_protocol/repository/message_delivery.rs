@@ -195,21 +195,36 @@ async fn require_locked_application_audience(
     seq: u64,
     scope: &ScopeBoundBusinessAuthority,
 ) -> Result<(), MessageDeliveryError> {
-    let seq=i64::try_from(seq).map_err(|_|MessageDeliveryError::Invariant)?;
-    let audience: Vec<(String,Uuid)>=sqlx::query_as(
+    let seq = i64::try_from(seq).map_err(|_| MessageDeliveryError::Invariant)?;
+    let audience: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT recipient_did,recipient_device_id FROM chat.application_intervals \
          WHERE conversation_id=$1 AND generation=$2 AND start_seq<=$3 \
            AND (terminal_seq IS NULL OR terminal_seq>=$3) \
-         ORDER BY convert_to(recipient_did,'UTF8'),uuid_send(recipient_device_id) LIMIT 101"
-    ).bind(coordinate.conversation_id).bind(coordinate.generation).bind(seq)
-        .fetch_all(&mut **tx).await?;
-    if audience.is_empty() || audience.len()>100 || audience.windows(2).any(|pair|pair[0]==pair[1]) {
+         ORDER BY convert_to(recipient_did,'UTF8'),uuid_send(recipient_device_id) LIMIT 101",
+    )
+    .bind(coordinate.conversation_id)
+    .bind(coordinate.generation)
+    .bind(seq)
+    .fetch_all(&mut **tx)
+    .await?;
+    if audience.is_empty()
+        || audience.len() > 100
+        || audience.windows(2).any(|pair| pair[0] == pair[1])
+    {
         return Err(MessageDeliveryError::InvalidCoordinates);
     }
-    if !audience.iter().any(|(did,id)|did==scope.actor_did() && *id==scope.actor_device_id()) {
+    if !audience
+        .iter()
+        .any(|(did, id)| did == scope.actor_did() && *id == scope.actor_device_id())
+    {
         return Err(MessageDeliveryError::DeviceNotLeaf);
     }
-    if audience.iter().any(|(did,id)|!scope.devices().iter().any(|locked|locked.user_did()==did && locked.device_id()==*id)) {
+    if audience.iter().any(|(did, id)| {
+        !scope
+            .devices()
+            .iter()
+            .any(|locked| locked.user_did() == did && locked.device_id() == *id)
+    }) {
         return Err(MessageDeliveryError::InvalidCoordinates);
     }
     Ok(())
@@ -306,17 +321,14 @@ async fn require_relationship_policy<T: PublicTransport>(
             tracing::error!(?error, "traffic fallback scope sealing failed");
             MessageDeliveryError::RelationshipPolicyUnavailable
         })?;
-    let (projection, decision) = super::relationship::load_fallback_traffic_projection(
-        tx,
-        fallback,
-        relationship_authority,
-    )
-    .await
-    .map_err(|error| {
-        tracing::error!(?error, "traffic fallback loading failed");
-        MessageDeliveryError::RelationshipPolicyUnavailable
-    })?
-    .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
+    let (projection, decision) =
+        super::relationship::load_fallback_traffic_projection(tx, fallback, relationship_authority)
+            .await
+            .map_err(|error| {
+                tracing::error!(?error, "traffic fallback loading failed");
+                MessageDeliveryError::RelationshipPolicyUnavailable
+            })?
+            .ok_or(MessageDeliveryError::RelationshipPolicyUnavailable)?;
     super::relationship::consume_locked_traffic_projection(
         &projection,
         &decision,
@@ -491,7 +503,7 @@ pub(crate) async fn send<T: PublicTransport>(
     let expected = coordinate(projection.prior())?;
     let head = lock_head(tx, expected).await?;
     require_current_leaf(tx, head.coordinate, &scope).await?;
-    require_locked_application_audience(tx,head.coordinate,head.next_seq,scope).await?;
+    require_locked_application_audience(tx, head.coordinate, head.next_seq, scope).await?;
     require_recipient_ready(tx, head.coordinate, &scope, &head).await?;
     require_relationship_policy(tx, scope, head.coordinate, relationship_authority).await?;
     let message_id = Uuid::from_bytes(*projection.message_id().as_bytes());
@@ -519,11 +531,10 @@ pub(crate) async fn send<T: PublicTransport>(
     )
     .map_err(|_| MessageDeliveryError::Invariant)?;
     let response = json!({"entry": {"entryId": entry_id_text, "conversationId": conversation_id_text, "seq": head.next_seq, "signedRequest": signed_request, "receivedAt": authority.trusted_instant().as_str()}});
-    let response_bytes =
-        serde_json::to_vec(&response).map_err(|e| {
-            tracing::error!("response serde error: {:?}", e);
-            MessageDeliveryError::Invariant
-        })?;
+    let response_bytes = serde_json::to_vec(&response).map_err(|e| {
+        tracing::error!("response serde error: {:?}", e);
+        MessageDeliveryError::Invariant
+    })?;
     let append = delivery::AppendEntry {
         conversation_id: expected.conversation_id,
         entry_id: Uuid::from_bytes(*entry.entry_id().as_bytes()),
@@ -625,8 +636,14 @@ pub(crate) async fn send<T: PublicTransport>(
         })?;
     }
     let event_position = super::message_event::append_message_available_event(
-        tx, expected.conversation_id, expected.generation, seq, scope.trusted_instant(),
-    ).await.map_err(|error| match error {
+        tx,
+        expected.conversation_id,
+        expected.generation,
+        seq,
+        scope.trusted_instant(),
+    )
+    .await
+    .map_err(|error| match error {
         delivery::DeliveryRepositoryError::Database(error) => MessageDeliveryError::Database(error),
         _ => MessageDeliveryError::Invariant,
     })?;

@@ -10,7 +10,6 @@
 mod common;
 pub use catbird_server::{auth, crypto};
 
-
 #[allow(dead_code)]
 #[path = "../src/chat_protocol/cursor.rs"]
 mod cursor;
@@ -91,13 +90,15 @@ use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use openmls::prelude::{
-    tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, CredentialType,
-    CredentialWithKey, Ciphersuite, GroupId, Lifetime, MlsGroup, MlsGroupCreateConfig,
+    tls_codec::Serialize as TlsSerialize, BasicCredential, Capabilities, Ciphersuite,
+    CredentialType, CredentialWithKey, GroupId, Lifetime, MlsGroup, MlsGroupCreateConfig,
     ProtocolVersion,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
-use p256::ecdsa::{signature::Signer as _, Signature as P256Signature, SigningKey as P256SigningKey};
+use p256::ecdsa::{
+    signature::Signer as _, Signature as P256Signature, SigningKey as P256SigningKey,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower_util::ServiceExt;
@@ -196,10 +197,7 @@ async fn ensure_verifier_env(pool: &DbPool) {
     if let Some(key_id) = key_id {
         std::env::set_var("CHAT_CURSOR_KEY_ID", key_id);
     } else {
-        std::env::set_var(
-            "CHAT_CURSOR_KEY_ID",
-            URL_SAFE_NO_PAD.encode([0x11_u8; 32]),
-        );
+        std::env::set_var("CHAT_CURSOR_KEY_ID", URL_SAFE_NO_PAD.encode([0x11_u8; 32]));
     }
     std::env::set_var(
         "CHAT_CURSOR_SEALING_SECRET",
@@ -259,7 +257,6 @@ async fn stateless_router(cutover_enabled: bool) -> Router {
         .expect("lazy pool");
     router_with(pool, cutover_enabled).await
 }
-
 
 fn xrpc(nsid: &str) -> String {
     format!("/xrpc/{nsid}")
@@ -380,7 +377,10 @@ fn build_test_creation_fixture(trusted_at: DateTime<Utc>) -> CreationTestFixture
     build_test_creation_fixture_with_invitee(trusted_at, None)
 }
 
-fn build_test_creation_fixture_with_invitee(trusted_at: DateTime<Utc>, invitee_did: Option<&str>) -> CreationTestFixture {
+fn build_test_creation_fixture_with_invitee(
+    trusted_at: DateTime<Utc>,
+    invitee_did: Option<&str>,
+) -> CreationTestFixture {
     let cid = Uuid::new_v4();
     let transition_id = Uuid::new_v4();
     let actor_did = random_did();
@@ -390,7 +390,10 @@ fn build_test_creation_fixture_with_invitee(trusted_at: DateTime<Utc>, invitee_d
     seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     let ed_signing = Ed25519SigningKey::from_bytes(&seed);
     let public_key_bytes = ed_signing.verifying_key().to_bytes();
-    let actor_key_id = ed25519_key_id(&public_key_bytes).unwrap().as_str().to_owned();
+    let actor_key_id = ed25519_key_id(&public_key_bytes)
+        .unwrap()
+        .as_str()
+        .to_owned();
 
     let signed_at = (trusted_at - chrono::Duration::milliseconds(500))
         .to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -423,9 +426,8 @@ fn build_test_creation_fixture_with_invitee(trusted_at: DateTime<Utc>, invitee_d
         .lifetime(lifetime)
         .build();
 
-    let group_id: [u8; 32] = Sha256::digest(
-        [b"CATBIRD-TEST-GROUP\0".as_ref(), cid.as_bytes()].concat(),
-    ).into();
+    let group_id: [u8; 32] =
+        Sha256::digest([b"CATBIRD-TEST-GROUP\0".as_ref(), cid.as_bytes()].concat()).into();
 
     let group = MlsGroup::new_with_group_id(
         &provider,
@@ -436,7 +438,8 @@ fn build_test_creation_fixture_with_invitee(trusted_at: DateTime<Utc>, invitee_d
             credential: BasicCredential::new(actor_credential.clone()).into(),
             signature_key: signer.to_public_vec().into(),
         },
-    ).expect("create MLS group");
+    )
+    .expect("create MLS group");
 
     let genesis_group_info = group
         .export_group_info(provider.crypto(), &signer, true)
@@ -556,7 +559,8 @@ fn build_test_creation_fixture_with_invitee(trusted_at: DateTime<Utc>, invitee_d
         "signature": STANDARD.encode([0_u8; 64]),
     });
     let unsigned = serde_json::to_vec(&wrapper).unwrap();
-    let canonical = decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
+    let canonical =
+        decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
     let signature = ed_signing.sign(canonical.transcript_bytes());
     wrapper["signature"] = json!(STANDARD.encode(signature.to_bytes()));
 
@@ -580,12 +584,14 @@ async fn seed_device_for_creation(
     dpop_jkt: &str,
 ) {
     let now = chrono::Utc::now();
-    sqlx::query("INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(user_did)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("seed principal");
+    sqlx::query(
+        "INSERT INTO chat.principals (user_did, created_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(user_did)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed principal");
 
     sqlx::query(
         r#"
@@ -861,14 +867,25 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
         &dpop_jwk,
         &dpop_jkt,
         "blue.catbird.chat.getConversations",
-        &format!("actorDeviceId={}&limit=50", fixture.actor_device_id.hyphenated()),
+        &format!(
+            "actorDeviceId={}&limit=50",
+            fixture.actor_device_id.hyphenated()
+        ),
     );
     let (get_status, get_response_bytes) = send_raw(router.clone(), get_convos_req).await;
     let get_text = String::from_utf8_lossy(&get_response_bytes);
     println!("getConversations HTTP status: {get_status}, response: {get_text}");
-    assert_eq!(get_status, StatusCode::OK, "getConversations must return 200 OK: {get_text}");
-    let get_body: Value = serde_json::from_slice(&get_response_bytes).expect("parse getConversations json");
-    assert!(get_body["items"].is_array(), "items must be an array: {get_text}");
+    assert_eq!(
+        get_status,
+        StatusCode::OK,
+        "getConversations must return 200 OK: {get_text}"
+    );
+    let get_body: Value =
+        serde_json::from_slice(&get_response_bytes).expect("parse getConversations json");
+    assert!(
+        get_body["items"].is_array(),
+        "items must be an array: {get_text}"
+    );
     let items = get_body["items"].as_array().unwrap();
     assert_eq!(
         items[0]["state"]["coordinates"]["conversationId"],
@@ -899,7 +916,10 @@ async fn create_then_list_returns_conversation_for_both_creator_and_invitee() {
     invitee_seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
     invitee_seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     let invitee_ed_signing = Ed25519SigningKey::from_bytes(&invitee_seed);
-    let invitee_key_id = ed25519_key_id(&invitee_ed_signing.verifying_key().to_bytes()).unwrap().as_str().to_string();
+    let invitee_key_id = ed25519_key_id(&invitee_ed_signing.verifying_key().to_bytes())
+        .unwrap()
+        .as_str()
+        .to_string();
 
     seed_device_for_creation(
         &pool,
@@ -942,7 +962,11 @@ async fn create_then_list_returns_conversation_for_both_creator_and_invitee() {
     );
     let (status, create_bytes) = send_raw(router.clone(), create_request).await;
     let create_text = String::from_utf8_lossy(&create_bytes);
-    assert_eq!(status, StatusCode::OK, "createConversation must succeed (200 OK): {create_text}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "createConversation must succeed (200 OK): {create_text}"
+    );
 
     // 1. Creator calls getConversations:
     let creator_list_req = build_authenticated_get_request(
@@ -952,14 +976,28 @@ async fn create_then_list_returns_conversation_for_both_creator_and_invitee() {
         &dpop_jwk,
         &dpop_jkt,
         "blue.catbird.chat.getConversations",
-        &format!("actorDeviceId={}&limit=50", fixture.actor_device_id.hyphenated()),
+        &format!(
+            "actorDeviceId={}&limit=50",
+            fixture.actor_device_id.hyphenated()
+        ),
     );
     let (creator_status, creator_bytes) = send_raw(router.clone(), creator_list_req).await;
     let creator_text = String::from_utf8_lossy(&creator_bytes);
-    assert_eq!(creator_status, StatusCode::OK, "creator getConversations must succeed: {creator_text}");
-    let creator_body: Value = serde_json::from_slice(&creator_bytes).expect("parse creator getConversations json");
-    let creator_items = creator_body["items"].as_array().expect("creator items array");
-    assert_eq!(creator_items.len(), 1, "creator must see exactly 1 conversation: {creator_text}");
+    assert_eq!(
+        creator_status,
+        StatusCode::OK,
+        "creator getConversations must succeed: {creator_text}"
+    );
+    let creator_body: Value =
+        serde_json::from_slice(&creator_bytes).expect("parse creator getConversations json");
+    let creator_items = creator_body["items"]
+        .as_array()
+        .expect("creator items array");
+    assert_eq!(
+        creator_items.len(),
+        1,
+        "creator must see exactly 1 conversation: {creator_text}"
+    );
     assert_eq!(
         creator_items[0]["state"]["coordinates"]["conversationId"],
         fixture.cid.hyphenated().to_string(),
@@ -978,10 +1016,21 @@ async fn create_then_list_returns_conversation_for_both_creator_and_invitee() {
     );
     let (invitee_status, invitee_bytes) = send_raw(router.clone(), invitee_list_req).await;
     let invitee_text = String::from_utf8_lossy(&invitee_bytes);
-    assert_eq!(invitee_status, StatusCode::OK, "invitee getConversations must succeed: {invitee_text}");
-    let invitee_body: Value = serde_json::from_slice(&invitee_bytes).expect("parse invitee getConversations json");
-    let invitee_items = invitee_body["items"].as_array().expect("invitee items array");
-    assert_eq!(invitee_items.len(), 1, "invitee must see exactly 1 conversation: {invitee_text}");
+    assert_eq!(
+        invitee_status,
+        StatusCode::OK,
+        "invitee getConversations must succeed: {invitee_text}"
+    );
+    let invitee_body: Value =
+        serde_json::from_slice(&invitee_bytes).expect("parse invitee getConversations json");
+    let invitee_items = invitee_body["items"]
+        .as_array()
+        .expect("invitee items array");
+    assert_eq!(
+        invitee_items.len(),
+        1,
+        "invitee must see exactly 1 conversation: {invitee_text}"
+    );
     assert_eq!(
         invitee_items[0]["state"]["coordinates"]["conversationId"],
         fixture.cid.hyphenated().to_string(),
@@ -1126,7 +1175,10 @@ async fn submit_transition_negative_invalid_request_returns_declared_4xx() {
     seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     let ed_signing = Ed25519SigningKey::from_bytes(&seed);
     let actor_ed25519_public_key = ed_signing.verifying_key().to_bytes().to_vec();
-    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key).unwrap().as_str().to_string();
+    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key)
+        .unwrap()
+        .as_str()
+        .to_string();
     seed_device_for_creation(
         &pool,
         &actor_did,
@@ -1171,7 +1223,10 @@ async fn submit_transition_negative_corrupted_signature_returns_invalid_signatur
     seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
     let ed_signing = Ed25519SigningKey::from_bytes(&seed);
     let actor_ed25519_public_key = ed_signing.verifying_key().to_bytes().to_vec();
-    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key).unwrap().as_str().to_string();
+    let actor_key_id = ed25519_key_id(&actor_ed25519_public_key)
+        .unwrap()
+        .as_str()
+        .to_string();
 
     seed_device_for_creation(
         &pool,

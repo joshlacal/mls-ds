@@ -98,6 +98,7 @@ impl AttemptRow {
 
 /// Transaction witness minted only after the prelude operation/budget lock.
 /// No constructor is exposed to handlers or other repositories.
+#[derive(Clone)]
 struct LockedAttempt {
     transaction_id: String,
     identity: AttemptIdentity,
@@ -204,8 +205,11 @@ async fn finish_terminal(
         {
             return Err(DirectRequestStoreError::Expired);
         }
-        sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6 WHERE request_id=$1 AND status='prepared'")
+        let written = sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6 WHERE request_id=$1 AND status='prepared' AND ($2<>'published' OR lease_expires_at>clock_timestamp())")
             .bind(lock.identity.request_id).bind(outcome.as_str()).bind(now).bind(receipt).bind(digest).bind(publication_digest).execute(&mut **tx).await?;
+        if written.rows_affected() != 1 {
+            return Err(DirectRequestStoreError::Expired);
+        }
         // Cancelled/expired exposed one-time packages remain reserved forever
         // (until ordinary package expiry/revocation); never return to available.
         sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes-$1,retained_bytes=retained_bytes-$2 WHERE singleton")

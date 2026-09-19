@@ -2211,7 +2211,10 @@ fn canonical_locked_scope_digest(
         bind_bytes(&mut digest, device.user_did.as_bytes());
         digest.update(device.device_id.as_bytes());
         bind_bytes(&mut digest, device.status.as_bytes());
-        bind_bytes(&mut digest, device.dpop_jkt.as_deref().unwrap_or_default().as_bytes());
+        bind_bytes(
+            &mut digest,
+            device.dpop_jkt.as_deref().unwrap_or_default().as_bytes(),
+        );
         digest.update(device.auth_generation.to_be_bytes());
         bind_optional_instant(&mut digest, device.revoked_at);
     }
@@ -2687,7 +2690,8 @@ async fn validate_completed_self_revocation_authority(
     let generation = i64::try_from(mutation.auth_generation())
         .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?;
     if receipt.class() != RepositoryAuthorityClass::ExistingDevice
-        || (!authority.is_standard_service_auth() && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
+        || (!authority.is_standard_service_auth()
+            && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
         || receipt.locked_auth_generation() != Some(generation)
         || receipt.locked_key_id() != Some(mutation.key_id().as_str())
         || receipt.locked_signing_key_sha256().is_none()
@@ -3133,7 +3137,7 @@ async fn arbitrate_signed(
                 material,
                 pre_replay.subject().as_str(),
                 canonical_uuid(pre_replay.device_id()),
-            pre_replay.dpop_jkt().map(|k| k.as_str()),
+                pre_replay.dpop_jkt().map(|k| k.as_str()),
                 canonical.key_id().as_str(),
                 i64::try_from(canonical.auth_generation())
                     .map_err(|_| AuthRepositoryError::AuthenticationGenerationMismatch)?,
@@ -3183,7 +3187,9 @@ fn validate_completed_enrollment_authority(
     body: &VerifiedEnrollmentBody,
     state: &LockedDeviceAuthority,
 ) -> Result<(), AuthRepositoryError> {
-    if !pre_replay.is_standard_service_auth() && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str()) {
+    if !pre_replay.is_standard_service_auth()
+        && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str())
+    {
         return Err(AuthRepositoryError::DpopBindingMismatch);
     }
     if state.auth_generation != 1 {
@@ -3234,7 +3240,8 @@ fn validate_completed_rebind_business_authority(
         _ => return Err(AuthRepositoryError::RequestBindingMismatch),
     };
     if state.dpop_jkt.as_deref() != Some(new_jkt)
-        || (!authority.is_standard_service_auth() && state.dpop_jkt.as_deref() != authority.dpop_jkt().map(|k| k.as_str()))
+        || (!authority.is_standard_service_auth()
+            && state.dpop_jkt.as_deref() != authority.dpop_jkt().map(|k| k.as_str()))
     {
         return Err(AuthRepositoryError::DpopBindingMismatch);
     }
@@ -3291,7 +3298,8 @@ fn validate_completed_rebind_replay_authority(
     let signing_key_sha256: [u8; 32] = Sha256::digest(&state.signing_public_key).into();
     if pre_replay.endpoint().as_str() != "blue.catbird.chat.rebindDeviceAuthentication"
         || state.dpop_jkt.as_deref() != Some(new_jkt)
-        || (!pre_replay.is_standard_service_auth() && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str()))
+        || (!pre_replay.is_standard_service_auth()
+            && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str()))
         || state.auth_generation != completed_generation
         || state.key_id != mutation.key_id().as_str()
         || receipt.class() != RepositoryAuthorityClass::RebindBootstrap
@@ -3490,7 +3498,8 @@ pub(super) async fn load_validated_completed_replenishment_replay(
         .locked_signing_key_sha256()
         .ok_or(AuthRepositoryError::RequestBindingMismatch)?;
     if receipt.class() != RepositoryAuthorityClass::ExistingDevice
-        || (!authority.is_standard_service_auth() && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
+        || (!authority.is_standard_service_auth()
+            && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
         || receipt.locked_auth_generation() != Some(generation)
         || receipt.locked_key_id() != Some(authority.mutation().key_id().as_str())
     {
@@ -3678,7 +3687,8 @@ async fn validate_signed_operation_replay_identity(
     };
     if exact_self_revocation {
         if receipt.class() != RepositoryAuthorityClass::ExistingDevice
-            || (!authority.is_standard_service_auth() && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
+            || (!authority.is_standard_service_auth()
+                && receipt.locked_jkt() != authority.dpop_jkt().map(|k| k.as_str()))
             || receipt.locked_auth_generation() != Some(generation)
             || receipt.locked_key_id() != Some(mutation.key_id().as_str())
             || receipt.locked_signing_key_sha256().is_none()
@@ -3786,7 +3796,9 @@ async fn lock_existing_authority(
         canonical_uuid(pre_replay.device_id()),
     )
     .await?;
-    if !pre_replay.is_standard_service_auth() && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str()) {
+    if !pre_replay.is_standard_service_auth()
+        && state.dpop_jkt.as_deref() != pre_replay.dpop_jkt().map(|k| k.as_str())
+    {
         return Err(AuthRepositoryError::DpopBindingMismatch);
     }
     Ok(state)
@@ -4269,7 +4281,8 @@ fn validate_replenishment_binding(
     let public_key = STANDARD
         .decode(public_key_text)
         .map_err(|_| AuthRepositoryError::RequestBindingMismatch)?;
-    if (!pre_replay.is_standard_service_auth() && pre_replay.dpop_jkt().map(|k| k.as_str()) != state.dpop_jkt.as_deref())
+    if (!pre_replay.is_standard_service_auth()
+        && pre_replay.dpop_jkt().map(|k| k.as_str()) != state.dpop_jkt.as_deref())
         || public_key != state.signing_public_key
         || STANDARD.encode(&public_key) != public_key_text
     {

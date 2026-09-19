@@ -56,14 +56,14 @@ async fn acceptance_releases_prior_recovery_and_preserves_own_successor_reservat
 
 #[tokio::test]
 async fn signed_operation_expiry_distinguishes_absence_from_completed_replay() {
-    let pool=pool().await;
+    let pool = pool().await;
     catbird_server::chat_protocol::production_proof::run_signed_operation_age_fence(&pool).await
         .expect("expired absent operation must be distinguishable while completed replay preserves exact bytes");
 }
 
 #[tokio::test]
 async fn removed_device_can_read_only_its_finite_terminal_controls() {
-    let pool=pool().await;
+    let pool = pool().await;
     catbird_server::chat_protocol::production_proof::run_removed_device_terminal_entry_read(&pool).await
         .expect("removed device must fetch authenticated terminal control without historical message access");
 }

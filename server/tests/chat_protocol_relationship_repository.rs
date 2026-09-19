@@ -1517,11 +1517,7 @@ async fn missing_traffic_fallback_recollection_preserves_block_denial() {
             .expect("missing blocked traffic scope is recollected");
     assert_eq!(projection.scope(), &expected_scope);
     assert_eq!(
-        relationship_policy::consume_traffic_projection(
-            &projection,
-            &authority,
-            &decision,
-        ),
+        relationship_policy::consume_traffic_projection(&projection, &authority, &decision,),
         Err(PolicyDenial::BlockedRelationship)
     );
     transaction.rollback().await.unwrap();

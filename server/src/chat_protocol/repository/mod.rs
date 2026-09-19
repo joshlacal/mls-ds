@@ -5,8 +5,8 @@ pub(crate) mod auth;
 #[allow(dead_code)]
 pub(crate) mod blobs;
 pub(crate) mod conversation;
-pub(crate) mod core;
 pub(crate) mod coordinate;
+pub(crate) mod core;
 pub(crate) mod creation;
 pub(crate) mod delivery;
 #[allow(dead_code)]

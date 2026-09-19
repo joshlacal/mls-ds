@@ -1,6 +1,5 @@
 //! `blue.catbird.chat.updatePushToken` — update or clear APNs push notification token.
 
-use std::sync::Arc;
 use axum::{
     extract::State,
     http::HeaderMap,
@@ -8,6 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
@@ -53,13 +53,15 @@ async fn update_push_token(
     let parsed: UpdatePushTokenBody = if body.is_empty() {
         UpdatePushTokenBody { token: None }
     } else {
-        serde_json::from_slice(body).map_err(|_| {
-            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
-        })?
+        serde_json::from_slice(body)
+            .map_err(|_| ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest))?
     };
 
     if let Some(tok) = &parsed.token {
-        if tok.is_empty() || tok.len() > 512 || tok.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        if tok.is_empty()
+            || tok.len() > 512
+            || tok.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
             return Err(ChatFailure::protocol(
                 ENDPOINT,
                 ChatProtocolErrorCode::InvalidRequest,
@@ -72,28 +74,32 @@ async fn update_push_token(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let view = update_device_push_token(pool, principal.did(), parsed.token.as_deref(), target_device_id)
-        .await
-        .map_err(|err| match err {
-            UpdatePushTokenRepositoryError::DeviceNotRegistered => {
-                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceNotRegistered)
-            }
-            UpdatePushTokenRepositoryError::DeviceRevoked => {
-                ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceRevoked)
-            }
-            UpdatePushTokenRepositoryError::Database(e) => {
-                tracing::error!("update_device_push_token database error: {:?}", e);
-                ChatFailure::storage(ENDPOINT)
-            }
-        })?;
+    let view = update_device_push_token(
+        pool,
+        principal.did(),
+        parsed.token.as_deref(),
+        target_device_id,
+    )
+    .await
+    .map_err(|err| match err {
+        UpdatePushTokenRepositoryError::DeviceNotRegistered => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceNotRegistered)
+        }
+        UpdatePushTokenRepositoryError::DeviceRevoked => {
+            ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::DeviceRevoked)
+        }
+        UpdatePushTokenRepositoryError::Database(e) => {
+            tracing::error!("update_device_push_token database error: {:?}", e);
+            ChatFailure::storage(ENDPOINT)
+        }
+    })?;
 
     let device_dto = device_view_from_directory(&view);
     let output_json = json!({
         "device": device_dto
     });
 
-    let bytes = serde_json::to_vec(&output_json)
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let bytes = serde_json::to_vec(&output_json).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
 
     Ok(context::json_ok(bytes))
 }
@@ -183,7 +189,10 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        assert_eq!(failure_unreg.into_response().status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            failure_unreg.into_response().status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
 
         let err_revoked = UpdatePushTokenRepositoryError::DeviceRevoked;
         let failure_revoked = match err_revoked {
@@ -192,6 +201,9 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        assert_eq!(failure_revoked.into_response().status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            failure_revoked.into_response().status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
     }
 }

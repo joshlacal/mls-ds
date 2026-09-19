@@ -70,7 +70,9 @@ fn validate_sequencer_did(did: &str) -> Result<(), String> {
     }
 
     if did.contains(|c: char| c.is_ascii_whitespace() || c.is_ascii_control()) {
-        return Err("configuredSequencerDid must not contain whitespace or control characters".to_string());
+        return Err(
+            "configuredSequencerDid must not contain whitespace or control characters".to_string(),
+        );
     }
 
     if let Some(host) = did.strip_prefix("did:web:") {
@@ -78,11 +80,16 @@ fn validate_sequencer_did(did: &str) -> Result<(), String> {
             return Err("did:web hostname must not be empty".to_string());
         }
         if host.contains('/') || host.contains('?') || host.contains('#') || host.contains(':') {
-            return Err("did:web hostname must not contain path, port, query, or fragment segments".to_string());
+            return Err(
+                "did:web hostname must not contain path, port, query, or fragment segments"
+                    .to_string(),
+            );
         }
     } else if let Some(plc_id) = did.strip_prefix("did:plc:") {
         if plc_id.len() != 24 || !plc_id.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
-            return Err("did:plc identifier must be exactly 24 lowercase base32 characters".to_string());
+            return Err(
+                "did:plc identifier must be exactly 24 lowercase base32 characters".to_string(),
+            );
         }
     } else {
         return Err(format!(
@@ -105,8 +112,8 @@ fn validate_sequencer_did(did: &str) -> Result<(), String> {
 /// 7. The selector is executed and one compact JSON outcome is written to stdout.
 pub async fn run_federation_fixture() -> Result<(), String> {
     // 1. APP_ENV check must precede argv, path, and DB access
-    let app_env = std::env::var("APP_ENV")
-        .map_err(|_| "APP_ENV must be set to 'test'".to_string())?;
+    let app_env =
+        std::env::var("APP_ENV").map_err(|_| "APP_ENV must be set to 'test'".to_string())?;
     if app_env != "test" {
         return Err(format!(
             "federation fixture is only permitted when APP_ENV=test (found: '{app_env}')"
@@ -115,9 +122,9 @@ pub async fn run_federation_fixture() -> Result<(), String> {
 
     // 2. Exactly one argv argument
     let mut args = std::env::args().skip(1);
-    let path_str = args
-        .next()
-        .ok_or_else(|| "missing fixture file path argument; expected exactly one file path".to_string())?;
+    let path_str = args.next().ok_or_else(|| {
+        "missing fixture file path argument; expected exactly one file path".to_string()
+    })?;
     if args.next().is_some() {
         return Err("unexpected extra arguments; expected exactly one file path".to_string());
     }
@@ -205,7 +212,9 @@ pub async fn run_federation_fixture() -> Result<(), String> {
                 conversation_id: convo_id,
                 sequencer_term: selector.configured_sequencer_term,
                 last_seq: (next_seq - 1).max(0),
-                digest_sha256: tag.unwrap_or_else(|| "0000000000000000000000000000000000000000000000000000000000000000".to_string()),
+                digest_sha256: tag.unwrap_or_else(|| {
+                    "0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                }),
             }
         }
         None => {
@@ -214,7 +223,8 @@ pub async fn run_federation_fixture() -> Result<(), String> {
                 conversation_id: selector.conversation_id,
                 sequencer_term: selector.configured_sequencer_term,
                 last_seq: 0,
-                digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                digest_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
             }
         }
     };

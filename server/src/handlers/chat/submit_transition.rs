@@ -88,7 +88,10 @@ async fn submit(
                 outcome.response_bytes().to_vec(),
             )
             .map_err(|error| {
-                tracing::error!(?error, "submitTransition canonical response construction failed");
+                tracing::error!(
+                    ?error,
+                    "submitTransition canonical response construction failed"
+                );
                 error
             })?
         }
@@ -142,9 +145,7 @@ fn submit_failure(
         E::Conversation(CS::Metadata(_)) => {
             ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
         }
-        E::Conversation(CS::Snapshot(_)) => {
-            ChatFailure::protocol(ENDPOINT, C::InvalidCommit)
-        }
+        E::Conversation(CS::Snapshot(_)) => ChatFailure::protocol(ENDPOINT, C::InvalidCommit),
         E::Conversation(CS::State(s) | CS::Authority(s)) => {
             map_state_machine_error(mutation_kind, s)
         }
@@ -154,19 +155,15 @@ fn submit_failure(
         E::Relationship(R::InvalidProjection) => {
             ChatFailure::protocol(ENDPOINT, C::BlockedRelationship)
         }
-        E::InvitationQuota(_) => {
-            ChatFailure::protocol(ENDPOINT, C::InvitationLimitReached)
-        }
-        E::RecoveryPackage(_) => {
-            ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound)
-        }
+        E::InvitationQuota(_) => ChatFailure::protocol(ENDPOINT, C::InvitationLimitReached),
+        E::RecoveryPackage(_) => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryNotFound),
         E::StateMachine(s) => map_state_machine_error(mutation_kind, s),
-        E::MissingMutation
-        | E::UnsupportedMutation
-        | E::InvalidCanonicalMaterial => ChatFailure::protocol(ENDPOINT, C::InvalidRequest),
-        E::Conversation(_)
-        | E::ExecutionContext(_)
-        | E::Executor(_) => ChatFailure::invariant(ENDPOINT),
+        E::MissingMutation | E::UnsupportedMutation | E::InvalidCanonicalMaterial => {
+            ChatFailure::protocol(ENDPOINT, C::InvalidRequest)
+        }
+        E::Conversation(_) | E::ExecutionContext(_) | E::Executor(_) => {
+            ChatFailure::invariant(ENDPOINT)
+        }
     }
 }
 
@@ -197,9 +194,7 @@ fn map_state_machine_error(
             ChatFailure::protocol(ENDPOINT, C::LeaveRequestExpired)
         }
         S::WorkExpired => ChatFailure::protocol(ENDPOINT, C::LeafRecoveryExpired),
-        S::InvalidMetadataAuthority => {
-            ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot)
-        }
+        S::InvalidMetadataAuthority => ChatFailure::protocol(ENDPOINT, C::InvalidMetadataSnapshot),
         S::InvalidTransition | S::InvalidCommitEffects | S::InvalidPublicState
             if mutation_kind == SignedMutationKind::MetadataTransition =>
         {

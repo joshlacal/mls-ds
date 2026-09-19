@@ -343,3 +343,61 @@ async fn request_operation_namespace_conflicts_with_keys_and_legacy_claims() {
     ));
     tx.rollback().await.unwrap();
 }
+
+#[tokio::test]
+async fn request_pool_hint_is_exact_device_current_grant_and_full_horizon_scoped() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let device = seed_request_device(
+        &mut tx,
+        "did:plc:cccccccccccccccccccccccc",
+        "direct-request",
+        true,
+    )
+    .await;
+    seed_request_device(&mut tx, &device.owner_did, "recovery", false).await;
+    let hint = super::device_directory::read_direct_request_pool_hint(
+        &mut tx,
+        &device.owner_did,
+        device.owner_device_id,
+        &device.owner_key_id,
+        1,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(hint.enabled);
+    assert_eq!(hint.revision, 1);
+    assert_eq!(hint.usable_count, 1);
+    assert_eq!(hint.reserved_count, 0);
+    assert_eq!((hint.usable_until - hint.as_of).num_seconds(), 605400);
+    assert!(super::device_directory::read_direct_request_pool_hint(
+        &mut tx,
+        &device.owner_did,
+        device.owner_device_id,
+        &device.owner_key_id,
+        2
+    )
+    .await
+    .unwrap()
+    .is_none());
+    sqlx::query(
+        "UPDATE chat.direct_request_grants SET revoked_at=clock_timestamp() WHERE grant_id=$1",
+    )
+    .bind(device.grant_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let hint = super::device_directory::read_direct_request_pool_hint(
+        &mut tx,
+        &device.owner_did,
+        device.owner_device_id,
+        &device.owner_key_id,
+        1,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(hint.usable_count, 0);
+    tx.rollback().await.unwrap();
+}

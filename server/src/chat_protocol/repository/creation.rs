@@ -291,8 +291,13 @@ async fn execute_first_creation<T: PublicTransport>(
     )];
     let scope = CanonicalLockScope::new(principals.clone(), std::mem::take(&mut devices))?;
     let scope = super::prelude::discover_conversation_event_lock_scope(
-        transaction, conversation_id, &scope, &principals, false,
-    ).await?;
+        transaction,
+        conversation_id,
+        &scope,
+        &principals,
+        false,
+    )
+    .await?;
     let prelude =
         prepare_identity_scope_prelude(transaction, &authority, reservation, scope).await?;
     let prelude = prelude.verify_creation_operation(transition_id, mutation)?;
@@ -463,7 +468,14 @@ async fn execute_first_creation<T: PublicTransport>(
     };
     let expected = plan.successor_coordinate().copied();
     let (scope, completion) = prelude.into_execution_parts();
-    let prepared = prepare_creation_execution(transaction, &plan, accepted, genesis, &scope.event_lock_scope()).await?;
+    let prepared = prepare_creation_execution(
+        transaction,
+        &plan,
+        accepted,
+        genesis,
+        &scope.event_lock_scope(),
+    )
+    .await?;
     let applied = apply_prepared_creation_execution(prepared).await?;
     if applied.entry_id != transition_id
         || applied.allocated_seq != 1
@@ -641,7 +653,9 @@ mod tests {
         arbitrate_operation, OperationArbitration, PreparedSignedOperation,
     };
     use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
-    use crate::chat_protocol::snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle};
+    use crate::chat_protocol::snapshot::{
+        PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle,
+    };
     use crate::chat_protocol::transcript::decode_canonical_signed_mutation;
     use crate::chat_protocol::validation::ed25519_key_id;
     use chrono::{DateTime, SecondsFormat, Utc};
@@ -650,8 +664,9 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
     async fn test_pool() -> PgPool {
-        let url = std::env::var("TEST_DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string());
+        let url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://127.0.0.1:5432/catbird_chat_protocol_test_20260722".to_string()
+        });
         PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
@@ -692,7 +707,10 @@ mod tests {
         seed[16..].copy_from_slice(id_bytes.as_bytes());
         let signing_key = SigningKey::from_bytes(&seed);
         let public_key_bytes = signing_key.verifying_key().to_bytes().to_vec();
-        let key_id = ed25519_key_id(&public_key_bytes).unwrap().as_str().to_owned();
+        let key_id = ed25519_key_id(&public_key_bytes)
+            .unwrap()
+            .as_str()
+            .to_owned();
         let did = random_test_did(did_prefix);
         let device_id = Uuid::new_v4();
         let dpop_jkt = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
@@ -808,12 +826,15 @@ mod tests {
             "signature": base64::engine::general_purpose::STANDARD.encode([0_u8; 64]),
         });
         let unsigned = serde_json::to_vec(&wrapper).unwrap();
-        let canonical = decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
+        let canonical =
+            decode_canonical_signed_mutation(&unsigned).expect("canonicalize creation body");
         let signature = actor.signing_key.sign(canonical.transcript_bytes());
-        wrapper["signature"] = json!(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
+        wrapper["signature"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(signature.to_bytes()));
 
         let signed_raw = serde_json::to_vec(&wrapper).unwrap();
-        let canonical = decode_canonical_signed_mutation(&signed_raw).expect("canonicalize signed creation body");
+        let canonical = decode_canonical_signed_mutation(&signed_raw)
+            .expect("canonicalize signed creation body");
         let pre_replay = dpop::repository_test_evidence::ordinary_device_with_binding(
             Uuid::new_v4(),
             *Uuid::new_v4().as_bytes().first_chunk::<12>().unwrap(),
@@ -824,11 +845,22 @@ mod tests {
             &actor.dpop_jkt,
         );
         let receipt = creation_existing_device_receipt_for_test(
-            &crate::chat_protocol::transcript::decode_and_verify_signed_mutation(&signed_raw, &actor.public_key_bytes).unwrap(),
+            &crate::chat_protocol::transcript::decode_and_verify_signed_mutation(
+                &signed_raw,
+                &actor.public_key_bytes,
+            )
+            .unwrap(),
             &actor.dpop_jkt,
             &actor.public_key_bytes,
-        ).unwrap();
-        dpop::mint_signed_repository_authority(pre_replay, canonical, &actor.public_key_bytes, receipt).unwrap()
+        )
+        .unwrap();
+        dpop::mint_signed_repository_authority(
+            pre_replay,
+            canonical,
+            &actor.public_key_bytes,
+            receipt,
+        )
+        .unwrap()
     }
 
     async fn seed_test_direct_environment(
@@ -949,25 +981,38 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
-    async fn direct_dedup_member_caller_returns_existing_conversation_and_preserves_wire_contract() {
+    async fn direct_dedup_member_caller_returns_existing_conversation_and_preserves_wire_contract()
+    {
         let pool = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
-        let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
+        let trusted_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
 
         let alice = new_test_actor("alice");
         let bob_did = random_test_did("bob");
         let charlie = new_test_actor("charlie");
         let existing_convo_id = Uuid::new_v4();
 
-        seed_test_direct_environment(&mut tx, &alice, &bob_did, &charlie, existing_convo_id, trusted_at).await;
+        seed_test_direct_environment(
+            &mut tx,
+            &alice,
+            &bob_did,
+            &charlie,
+            existing_convo_id,
+            trusted_at,
+        )
+        .await;
 
-        let request = build_signed_direct_creation_request(&alice, &alice.did, &bob_did, trusted_at);
-        let reservation = match arbitrate_operation(&mut tx, &request).await.expect("arbitrate operation") {
+        let request =
+            build_signed_direct_creation_request(&alice, &alice.did, &bob_did, trusted_at);
+        let reservation = match arbitrate_operation(&mut tx, &request)
+            .await
+            .expect("arbitrate operation")
+        {
             OperationArbitration::First(res) => res,
             OperationArbitration::Replay(_) => panic!("unexpected replay"),
         };
@@ -1002,10 +1047,9 @@ mod tests {
             "wire response bytes must be byte-identical to creation_existing_response"
         );
 
-
         // 4. Assert decoded JSON payload fields
-        let parsed: serde_json::Value =
-            serde_json::from_slice(outcome.response_bytes()).expect("parse canonical json response");
+        let parsed: serde_json::Value = serde_json::from_slice(outcome.response_bytes())
+            .expect("parse canonical json response");
         assert_eq!(
             parsed["result"]["$type"],
             "blue.catbird.chat.defs#existingDirectConversationResult"
@@ -1074,19 +1118,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_dedup_non_member_caller_rejects_with_conversation_already_exists_and_no_mutation() {
+    async fn direct_dedup_non_member_caller_rejects_with_conversation_already_exists_and_no_mutation(
+    ) {
         let pool = test_pool().await;
         let mut tx = pool.begin().await.expect("begin transaction");
-        let trusted_at: DateTime<Utc> = sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
+        let trusted_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
         let alice = new_test_actor("alice");
         let bob_did = random_test_did("bob");
         let charlie = new_test_actor("charlie");
         let existing_convo_id = Uuid::new_v4();
 
-        seed_test_direct_environment(&mut tx, &alice, &bob_did, &charlie, existing_convo_id, trusted_at).await;
+        seed_test_direct_environment(
+            &mut tx,
+            &alice,
+            &bob_did,
+            &charlie,
+            existing_convo_id,
+            trusted_at,
+        )
+        .await;
 
         // Baseline conversation and participant state
         let (kind_before, lifecycle_before, cur_gen_before, cur_ver_before, next_seq_before): (
@@ -1103,13 +1157,15 @@ mod tests {
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-        let total_convos_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
+        let total_convos_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM chat.conversations")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
 
         // Charlie (non-member) tries to create direct conversation for pair (alice, bob)
-        let request = build_signed_direct_creation_request(&charlie, &alice.did, &bob_did, trusted_at);
+        let request =
+            build_signed_direct_creation_request(&charlie, &alice.did, &bob_did, trusted_at);
         let operation_id = match request.mutation().expect("creation mutation").projection() {
             crate::chat_protocol::transcript::VerifiedMutationProjection::Creation(c) => {
                 Uuid::from_bytes(*c.transition_id().as_bytes())
@@ -1117,7 +1173,10 @@ mod tests {
             _ => panic!("expected creation projection"),
         };
 
-        let reservation = match arbitrate_operation(&mut tx, &request).await.expect("arbitrate operation") {
+        let reservation = match arbitrate_operation(&mut tx, &request)
+            .await
+            .expect("arbitrate operation")
+        {
             OperationArbitration::First(res) => res,
             OperationArbitration::Replay(_) => panic!("unexpected replay"),
         };
@@ -1138,7 +1197,6 @@ mod tests {
             ),
             "non-member must be rejected with CreationHeadHydrationError::ConversationExists, got: {err:?}"
         );
-
 
         // 3. Assert database state inside transaction before rollback
         let (kind_after, lifecycle_after, cur_gen_after, cur_ver_after, next_seq_after): (
@@ -1165,7 +1223,10 @@ mod tests {
             .fetch_one(&mut *tx)
             .await
             .unwrap();
-        assert_eq!(total_convos_after, total_convos_before, "no new conversation row created");
+        assert_eq!(
+            total_convos_after, total_convos_before,
+            "no new conversation row created"
+        );
 
         let participants: Vec<(String, String, bool)> = sqlx::query_as(
             "SELECT user_did, status, current_membership \
@@ -1232,8 +1293,12 @@ mod tests {
             [0x44; 32],
             PublicGroupSnapshotLifecycle::Active,
         );
-        let response = creation_existing_response(convo_id, &coord).expect("encode existing response");
-        assert!(response.validates(), "canonical response digest must validate");
+        let response =
+            creation_existing_response(convo_id, &coord).expect("encode existing response");
+        assert!(
+            response.validates(),
+            "canonical response digest must validate"
+        );
 
         let parsed: serde_json::Value =
             serde_json::from_slice(response.as_bytes()).expect("parse canonical json");

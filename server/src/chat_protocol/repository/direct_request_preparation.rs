@@ -493,6 +493,15 @@ pub(super) async fn complete_publication(
     disposition: PublicationDisposition,
     receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
 ) -> Result<Vec<u8>, DirectRequestStoreError> {
+    complete_publication_inner(tx, &candidate, disposition, receipt).await
+}
+
+async fn complete_publication_inner(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: &LockedDirectRequestPublication,
+    disposition: PublicationDisposition,
+    receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
+) -> Result<Vec<u8>, DirectRequestStoreError> {
     use base64::Engine as _;
     let body = &receipt.body()["receipt"];
     let bytes = |key: &str| {
@@ -534,13 +543,66 @@ pub(super) async fn complete_publication(
     }
     finish_terminal(
         tx,
-        candidate.lock,
+        candidate.lock.clone(),
         outcome,
         receipt.bytes(),
         Some(candidate.signed.request_digest()),
         candidate.now,
     )
     .await
+}
+
+pub(super) enum PublicationCompletion {
+    Published(Vec<u8>),
+    Rejected(Vec<u8>),
+}
+
+/// Consumes the external publication capability exactly once. A failed final
+/// lease/authority validation produces a durable rejection, and the distinct
+/// arm prevents the caller from continuing with conversation effects.
+pub(super) async fn complete_published_publication(
+    tx: &mut Transaction<'_, Postgres>,
+    mut candidate: LockedDirectRequestPublication,
+    published_receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
+    signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+) -> Result<PublicationCompletion, DirectRequestStoreError> {
+    match complete_publication_inner(
+        tx,
+        &candidate,
+        PublicationDisposition::Published,
+        published_receipt,
+    )
+    .await
+    {
+        Ok(bytes) => Ok(PublicationCompletion::Published(bytes)),
+        Err(error) => {
+            let code = match error {
+                DirectRequestStoreError::Expired => "PreparationExpired",
+                DirectRequestStoreError::IncludedAuthorityChanged => "PreparationRevoked",
+                DirectRequestStoreError::IdentityConflict => "PreparationConflict",
+                other => return Err(other),
+            };
+            candidate.refresh_instant(tx).await?;
+            let receipt = terminal_receipt(
+                signer,
+                &candidate.lock.identity,
+                "directRequestRejectedReceipt",
+                "publish",
+                candidate.signed.request_digest(),
+                candidate.now,
+                serde_json::json!({"code":code}),
+            )?;
+            Ok(PublicationCompletion::Rejected(
+                complete_publication_inner(
+                    tx,
+                    &candidate,
+                    PublicationDisposition::Rejected,
+                    &receipt,
+                )
+                .await?,
+            ))
+        }
+    }
 }
 
 /// Repository-minted relationship witness. No external constructor, no claimed

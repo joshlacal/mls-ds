@@ -41,7 +41,9 @@ mod validation;
 // repository-boundary target compiles without weakening production paths.
 #[allow(dead_code)]
 mod chat_protocol {
-    pub mod direct_request_transcript { pub use catbird_server::chat_protocol::direct_request_transcript::*; }
+    pub mod direct_request_transcript {
+        pub use catbird_server::chat_protocol::direct_request_transcript::*;
+    }
     pub mod cursor {
         pub use crate::cursor::*;
     }

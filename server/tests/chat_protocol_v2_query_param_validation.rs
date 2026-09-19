@@ -111,7 +111,11 @@ async fn get_uri(uri: &str) -> (StatusCode, Value) {
     (status, body)
 }
 
-async fn post_uri(uri: &str, content_type: Option<&str>, body_bytes: Vec<u8>) -> (StatusCode, Value) {
+async fn post_uri(
+    uri: &str,
+    content_type: Option<&str>,
+    body_bytes: Vec<u8>,
+) -> (StatusCode, Value) {
     let mut builder = Request::builder().method("POST").uri(uri);
     if let Some(ct) = content_type {
         builder = builder.header("content-type", ct);
@@ -817,8 +821,15 @@ async fn get_subscription_ticket_accepts_case_insensitive_content_type() {
             serde_json::to_vec(&body).unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "failed for Content-Type: {ct}");
-        assert_eq!(body["error"], "NotAuthorized", "failed for Content-Type: {ct}");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "failed for Content-Type: {ct}"
+        );
+        assert_eq!(
+            body["error"], "NotAuthorized",
+            "failed for Content-Type: {ct}"
+        );
     }
 }
 
@@ -840,8 +851,15 @@ async fn get_subscription_ticket_rejects_malformed_content_type_params() {
             serde_json::to_vec(&body).unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "failed to reject Content-Type: {ct}");
-        assert_eq!(body["error"], "InvalidRequest", "failed to reject Content-Type: {ct}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "failed to reject Content-Type: {ct}"
+        );
+        assert_eq!(
+            body["error"], "InvalidRequest",
+            "failed to reject Content-Type: {ct}"
+        );
     }
 }
 
@@ -942,6 +960,7 @@ fn subscribe_events_rejects_bogus_key() {
 #[test]
 fn subscribe_events_rejects_duplicate_key() {
     let ticket = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
-    let result = parse_subscribe_events_query(Some(&format!("ticket={ticket}&ticket={ticket}&cursor=123")));
+    let result =
+        parse_subscribe_events_query(Some(&format!("ticket={ticket}&ticket={ticket}&cursor=123")));
     assert!(result.is_err());
 }

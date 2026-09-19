@@ -499,24 +499,29 @@ fn parse_get_blob_query(query: Option<&str>) -> Result<(String, Uuid), ChatFailu
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "blobId" if blob_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
-                let uuid = Uuid::parse_str(canonical.as_str())
-                    .map_err(|_| ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+                })?;
+                let uuid = Uuid::parse_str(canonical.as_str()).map_err(|_| {
+                    ChatFailure::protocol(GET_BLOB, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 blob_id = Some(uuid);
             }
             _ => {
@@ -541,17 +546,20 @@ fn parse_get_blob_usage_query(query: Option<&str>) -> Result<String, ChatFailure
         .split('&')
         .filter(|pair| !pair.is_empty())
     {
-        let (raw_key, raw_value) = pair
-            .split_once('=')
-            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
-        let key = percent_decode(raw_key)
-            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
-        let value = percent_decode(raw_value)
-            .ok_or_else(|| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+        let (raw_key, raw_value) = pair.split_once('=').ok_or_else(|| {
+            ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let key = percent_decode(raw_key).ok_or_else(|| {
+            ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest)
+        })?;
+        let value = percent_decode(raw_value).ok_or_else(|| {
+            ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest)
+        })?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(GET_USAGE, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             _ => {
@@ -583,8 +591,9 @@ fn parse_upload_blob_query(query: Option<&str>) -> Result<(String, String), Chat
             .ok_or_else(|| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
         match key.as_str() {
             "actorDeviceId" if actor_device_id.is_none() => {
-                let canonical = CanonicalUuidV4::parse(&value)
-                    .map_err(|_| ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest))?;
+                let canonical = CanonicalUuidV4::parse(&value).map_err(|_| {
+                    ChatFailure::protocol(UPLOAD, ChatProtocolErrorCode::InvalidRequest)
+                })?;
                 actor_device_id = Some(canonical.as_str().to_string());
             }
             "uploadTicket" if upload_ticket.is_none() => {

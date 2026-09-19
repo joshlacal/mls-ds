@@ -38,8 +38,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // Import from library crate instead of re-declaring modules
 use catbird_server::{
-    actors, auth, blob_store, config, crypto, db, federation, handlers, health,
-    metrics, middleware, models, realtime, workers,
+    actors, auth, blob_store, config, crypto, db, federation, handlers, health, metrics,
+    middleware, models, realtime, workers,
 };
 
 // These modules are only in main.rs (not in lib.rs)
@@ -1002,10 +1002,12 @@ async fn main() -> anyhow::Result<()> {
     // initialize or exact-compare the protocol fence singleton before validating it.
     #[cfg(feature = "test-support")]
     if truthy_env_var("FEDERATION_TEST_INITIALIZE_CHAT_FENCE") {
-        init_federation_test_chat_fence(&db_pool).await.unwrap_or_else(|error| {
-            tracing::error!("federation test chat fence initialization failed: {error}");
-            std::process::exit(1);
-        });
+        init_federation_test_chat_fence(&db_pool)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!("federation test chat fence initialization failed: {error}");
+                std::process::exit(1);
+            });
     }
 
     #[cfg(not(feature = "test-support"))]
@@ -1547,7 +1549,10 @@ mod tests {
         let base_router = Router::new()
             .route("/xrpc/blue.catbird.chat.sendMessage", post(consume_body))
             .route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body))
-            .route("/xrpc/blue.catbird.mlsDS.deliverMessage", post(consume_body));
+            .route(
+                "/xrpc/blue.catbird.mlsDS.deliverMessage",
+                post(consume_body),
+            );
         let app = merge_application_routers(
             base_router,
             Router::new(),

@@ -39,7 +39,10 @@ fn app_env_must_be_test_before_file_access() {
         .output()
         .expect("execute federation_fixture binary");
 
-    assert!(!output.status.success(), "expected failure when APP_ENV is production");
+    assert!(
+        !output.status.success(),
+        "expected failure when APP_ENV is production"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("APP_ENV=test") || stderr.contains("APP_ENV"),

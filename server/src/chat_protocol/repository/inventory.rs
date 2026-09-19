@@ -3110,7 +3110,18 @@ async fn materialize_own_device_snapshot(
     let mut items = Vec::with_capacity(views.len());
     let mut subjects = Vec::with_capacity(views.len());
     for view in &views {
+        let direct_request_key_pool = if view.device_id == lock.row_device_id {
+            super::device_directory::read_direct_request_pool_hint(transaction, &lock.row_user_did,
+                lock.row_device_id, &view.key_id, lock.row_auth_generation).await
+                .map_err(|_|ExistingDeviceReadFacadeError::Storage)?
+                .map(|hint|catbird_atproto::generated::blue_catbird::chat::DirectRequestKeyPoolStats {
+                    enabled:hint.enabled, revision:hint.revision, usable_count:hint.usable_count,
+                    reserved_count:hint.reserved_count, as_of:crate::sqlx_jacquard::chrono_to_datetime(hint.as_of),
+                    usable_until:crate::sqlx_jacquard::chrono_to_datetime(hint.usable_until), extra_data:None,
+                })
+        } else { None };
         let own = catbird_atproto::generated::blue_catbird::chat::OwnDeviceView {
+            direct_request_key_pool,
             device: read_facade_device_view(view),
             extra_data: None,
         };
