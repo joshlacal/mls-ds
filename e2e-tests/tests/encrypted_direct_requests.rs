@@ -329,12 +329,35 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         selected.len() == 1,
         "C01 expected one selected recipient device"
     );
-    let import_until = chrono::DateTime::parse_from_rfc3339(
-        preparation["minimumImportUntil"]
-            .as_str()
-            .context("minimumImportUntil")?,
-    )?
-    .timestamp() as u64;
+    let minimum_import_until = u64::try_from(
+        chrono::DateTime::parse_from_rfc3339(
+            preparation["minimumImportUntil"]
+                .as_str()
+                .context("minimumImportUntil")?,
+        )?
+        .timestamp(),
+    )?;
+    let mut authority_import_until = u64::MAX;
+    for device in selected {
+        let grant = protocol::verify_signed_request(
+            DirectRequestKind::Grant,
+            &serde_json::to_vec(&device["grant"])?,
+            &bob_public,
+        )?;
+        let expires_at = u64::try_from(
+            chrono::DateTime::parse_from_rfc3339(
+                grant.body()["expiresAt"]
+                    .as_str()
+                    .context("selected grant expiresAt")?,
+            )?
+            .timestamp(),
+        )?;
+        authority_import_until = authority_import_until.min(expires_at);
+    }
+    anyhow::ensure!(
+        authority_import_until >= minimum_import_until,
+        "selected authenticated grant expires before preparation import floor"
+    );
     let context = json!({
         "protocolVersion":"2",
         "requestId":request_id.to_string(),
@@ -355,7 +378,7 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         state_version: 1,
         key_packages: vec![bob_package.clone()],
         expected_package_refs: vec![bob_package_ref.clone()],
-        authority_import_until: import_until,
+        authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: server.receipt_public_key.clone(),
         text: "Real encrypted first contact".into(),
