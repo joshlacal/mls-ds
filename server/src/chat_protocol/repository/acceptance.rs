@@ -1133,11 +1133,20 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         .bind(conversation_id).bind(generation).bind(version).bind(version+1).bind(transition_id).bind(now).execute(&mut **tx).await?;
     sqlx::query("UPDATE chat.participants SET status='active',accepted_at=$3,acceptance_transition_id=$4,acceptance_entry_id=$4 WHERE conversation_id=$1 AND user_did=$2 AND current_membership AND status='pending'")
         .bind(conversation_id).bind(principal.did()).bind(now).bind(transition_id).execute(&mut **tx).await?;
-    sqlx::query("UPDATE chat.conversations SET current_state_version=$2 WHERE conversation_id=$1")
-        .bind(conversation_id)
-        .bind(version + 1)
-        .execute(&mut **tx)
-        .await?;
+    // Acceptance changes policy state without changing the MLS generation or
+    // epoch. Both canonical pointers must advance to the same immutable state.
+    let generation_updated = sqlx::query("UPDATE chat.generations SET current_state_version=$4 WHERE conversation_id=$1 AND generation=$2 AND current_state_version=$3 AND lifecycle='active'")
+        .bind(conversation_id).bind(generation).bind(version).bind(version + 1)
+        .execute(&mut **tx).await?;
+    if generation_updated.rows_affected() != 1 {
+        return Err(DirectAcceptanceError::Invariant);
+    }
+    let conversation_updated = sqlx::query("UPDATE chat.conversations SET current_state_version=$4 WHERE conversation_id=$1 AND current_generation=$2 AND current_state_version=$3 AND lifecycle='active'")
+        .bind(conversation_id).bind(generation).bind(version).bind(version + 1)
+        .execute(&mut **tx).await?;
+    if conversation_updated.rows_affected() != 1 {
+        return Err(DirectAcceptanceError::Invariant);
+    }
     sqlx::query("INSERT INTO chat.direct_request_lifecycle(request_id,conversation_id,consent,acceptance_proof,acceptance_digest,accepted_at) VALUES($1,$2,'accepted',$3,$4,$5)")
         .bind(request_id).bind(conversation_id).bind(proof_bytes).bind(signed.request_digest().as_slice()).bind(now).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.direct_request_pending_releases(request_id,released_bytes,released_at,reason) SELECT request_id,reserved_bytes,$2,'accepted' FROM chat.direct_request_attempts WHERE request_id=$1 ON CONFLICT(request_id) DO NOTHING")

@@ -82,7 +82,10 @@ async fn handle_inner(
             match error {
                 E::Retention(crate::chat_protocol::repository::direct_request_retention::RetentionError::Database(_)) => ChatFailure::storage(endpoint),
                 E::Retention(_) => ChatFailure::protocol_with_retry(endpoint,C::CapacityUnavailable,Some(30)),
-                E::Database(_) => ChatFailure::storage(endpoint),
+                E::Database(error) => {
+                    log_direct_acceptance_storage_error("execution", &error);
+                    ChatFailure::storage(endpoint)
+                },
                 E::InvalidSignature => ChatFailure::protocol(endpoint, C::InvalidSignature),
                 E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),
                 E::NotPending | E::Expired => {
@@ -95,9 +98,10 @@ async fn handle_inner(
                 E::Invariant => ChatFailure::invariant(endpoint),
             }
         })?;
-        tx.commit()
-            .await
-            .map_err(|_| ChatFailure::storage(endpoint))?;
+        tx.commit().await.map_err(|error| {
+            log_direct_acceptance_storage_error("commit", &error);
+            ChatFailure::storage(endpoint)
+        })?;
         return Ok(context::json_ok(bytes));
     }
     let admission =
@@ -176,4 +180,21 @@ fn acceptance_failure(endpoint: ChatEndpoint, error: AcceptanceFacadeError) -> C
         | E::ExecutionContext(_)
         | E::Executor(_) => ChatFailure::invariant(endpoint),
     }
+}
+
+fn log_direct_acceptance_storage_error(stage: &'static str, error: &sqlx::Error) {
+    use sha2::{Digest, Sha256};
+    let database = error.as_database_error();
+    tracing::error!(
+        stage,
+        sqlstate = database
+            .and_then(|e| e.code())
+            .as_deref()
+            .unwrap_or("non_database"),
+        constraint = database.and_then(|e| e.constraint()).unwrap_or("none"),
+        message_fingerprint = database
+            .map(|e| format!("{:x}", Sha256::digest(e.message().as_bytes())))
+            .unwrap_or_else(|| "none".into()),
+        "direct request acceptance database failure"
+    );
 }
