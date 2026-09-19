@@ -272,7 +272,7 @@ async fn live_device_pair_and_global_budgets_reject_without_consuming_more_packa
     let mut next = i.clone();
     next.request_id = Uuid::new_v4();
     assert!(matches!(
-        check_preparation_budget(&mut tx, &next, now).await,
+        check_preparation_budget(&mut tx, &next, now, MAX_BUNDLE_BYTES).await,
         Err(DirectRequestStoreError::QuotaExceeded)
     ));
     let lock = locked(&mut tx, i).await;
@@ -286,13 +286,13 @@ async fn live_device_pair_and_global_budgets_reject_without_consuming_more_packa
     )
     .await
     .unwrap();
-    check_preparation_budget(&mut tx, &next, now).await.unwrap();
+    check_preparation_budget(&mut tx, &next, now, MAX_BUNDLE_BYTES).await.unwrap();
     sqlx::query("UPDATE chat.direct_request_budget SET retained_bytes=8589934592 WHERE singleton")
         .execute(&mut *tx)
         .await
         .unwrap();
     assert!(matches!(
-        check_preparation_budget(&mut tx, &next, now).await,
+        check_preparation_budget(&mut tx, &next, now, MAX_BUNDLE_BYTES).await,
         Err(DirectRequestStoreError::QuotaExceeded)
     ));
     sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")

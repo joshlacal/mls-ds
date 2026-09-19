@@ -48,13 +48,14 @@ async fn cancellation_of_unknown_fences_delayed_preparation_and_publication() {
     .unwrap();
     assert_eq!(replay, result);
     let lock = test_lock(&mut tx, i).await;
-    let replay = finish_terminal(
+    let replay = finish_terminal_charged(
         &mut tx,
         lock,
         TerminalOutcome::Published,
         b"must-not-publish",
         Some(&[9; 32]),
         now + Duration::seconds(600),
+        Some(MAX_BUNDLE_BYTES),
     )
     .await
     .unwrap();
@@ -148,13 +149,14 @@ async fn published_receipt_replays_after_lease_expiry_and_cancel_cannot_overwrit
     sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,prepared_at,lease_expires_at,created_at) VALUES($1,$2,$3,$4,1,$5,$6,'prepared','prepared',$7,$8,$9,$8)")
         .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4_u8;32]).bind(now).bind(now+Duration::seconds(300)).execute(&mut *tx).await.unwrap();
     let lock = test_lock(&mut tx, i.clone()).await;
-    finish_terminal(
+    finish_terminal_charged(
         &mut tx,
         lock,
         TerminalOutcome::Published,
         b"published-exact",
         Some(&[8; 32]),
         now,
+        Some(MAX_BUNDLE_BYTES),
     )
     .await
     .unwrap();
@@ -269,13 +271,14 @@ async fn publication_compare_exchange_rejects_expiry_after_captured_admission_ti
         .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4_u8;32]).bind(admitted).bind(now-Duration::seconds(1)).execute(&mut *tx).await.unwrap();
     let lock = test_lock(&mut tx, i.clone()).await;
     assert!(matches!(
-        finish_terminal(
+        finish_terminal_charged(
             &mut tx,
             lock,
             TerminalOutcome::Published,
             b"must-not-publish",
             Some(&[8; 32]),
-            admitted
+            admitted,
+            Some(MAX_BUNDLE_BYTES),
         )
         .await,
         Err(DirectRequestStoreError::Expired)
@@ -299,4 +302,164 @@ async fn publication_compare_exchange_rejects_expiry_after_captured_admission_ti
     .await
     .unwrap();
     tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn publication_artifact_topup_and_capacity_rejection_are_atomic() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let i = test_identity();
+    let now = Utc::now();
+    let _lock = test_lock(&mut tx, i.clone()).await;
+    sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,prepared_at,lease_expires_at,reserved_bytes,created_at) VALUES($1,$2,$3,$4,1,$5,$6,'prepared','prepared',$7,$8,$9,$10,$8)")
+        .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4_u8;32]).bind(now).bind(now+Duration::seconds(300)).bind(MAX_BUNDLE_BYTES).execute(&mut *tx).await.unwrap();
+    sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes+$1,retained_bytes=retained_bytes+$1 WHERE singleton")
+        .bind(MAX_BUNDLE_BYTES).execute(&mut *tx).await.unwrap();
+    let before: (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_budget WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("SAVEPOINT before_charge")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let lock = test_lock(&mut tx, i.clone()).await;
+    finish_terminal_charged(
+        &mut tx,
+        lock,
+        TerminalOutcome::Published,
+        b"synthetic-large-publication",
+        Some(&[8; 32]),
+        now,
+        Some(MAX_BUNDLE_BYTES * 2),
+    )
+    .await
+    .unwrap();
+    let after: (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_budget WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        after,
+        (before.0 + MAX_BUNDLE_BYTES, before.1 + MAX_BUNDLE_BYTES)
+    );
+    let charge: i64 = sqlx::query_scalar(
+        "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id=$1",
+    )
+    .bind(i.request_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(charge, MAX_BUNDLE_BYTES * 2);
+    sqlx::query("ROLLBACK TO SAVEPOINT before_charge")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let restored: (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_budget WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(restored, before);
+    sqlx::query("UPDATE chat.direct_request_budget SET retained_bytes=$1 WHERE singleton")
+        .bind(MAX_RETAINED_GLOBAL_BYTES)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let lock = test_lock(&mut tx, i.clone()).await;
+    assert!(matches!(
+        finish_terminal_charged(
+            &mut tx,
+            lock,
+            TerminalOutcome::Published,
+            b"no-capacity",
+            Some(&[8; 32]),
+            now,
+            Some(MAX_BUNDLE_BYTES * 2)
+        )
+        .await,
+        Err(DirectRequestStoreError::QuotaExceeded)
+    ));
+    let unchanged: (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_budget WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, (before.0, MAX_RETAINED_GLOBAL_BYTES));
+    let lock = test_lock(&mut tx, i.clone()).await;
+    finish_terminal(
+        &mut tx,
+        lock,
+        TerminalOutcome::Rejected,
+        b"capacity-rejection",
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    let settled: i64 = sqlx::query_scalar(
+        "SELECT charged_bytes FROM chat.direct_request_retained_charges WHERE request_id=$1",
+    )
+    .bind(i.request_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert!(settled > 0 && settled < MAX_BUNDLE_BYTES);
+    let final_budget: (i64, i64) = sqlx::query_as(
+        "SELECT pending_bytes,retained_bytes FROM chat.direct_request_budget WHERE singleton",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        final_budget,
+        (
+            before.0 - MAX_BUNDLE_BYTES,
+            MAX_RETAINED_GLOBAL_BYTES - MAX_BUNDLE_BYTES + settled
+        )
+    );
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_history_is_charged_to_each_account_after_pending_ends() {
+    let pool = crate::common::direct_request_database::setup().await;
+    for recipient_history in [false, true] {
+        let mut tx = pool.begin().await.unwrap();
+        let i = test_identity();
+        let now = Utc::now();
+        let lock = test_lock(&mut tx, i.clone()).await;
+        let mut prior = test_identity();
+        if recipient_history {
+            prior.actor_did = i.recipient_did.clone();
+            prior.recipient_did = "did:plc:cccccccccccccccccccccccc".into();
+        } else {
+            prior.actor_did = "did:plc:cccccccccccccccccccccccc".into();
+            prior.recipient_did = i.actor_did.clone();
+        }
+        let charged = retained_account_limit().unwrap() - 4 * 1024 * 1024;
+        // Synthetic immutable history isolates accounting from cryptographic
+        // validation; this transaction never commits a protocol receipt.
+        sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,terminal_at,terminal_response,terminal_response_sha256,reserved_bytes,created_at) VALUES($1,$2,$3,$4,1,$5,$6,'cancelled',$7,'retained-history',$8,$9,$7)")
+            .bind(prior.request_id).bind(&prior.actor_did).bind(prior.actor_device_id).bind(&prior.actor_key_id).bind(&prior.recipient_did).bind(&prior.prepare_digest).bind(now).bind(Sha256::digest(b"retained-history").to_vec()).bind(charged).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO chat.direct_request_retained_charges(request_id,charged_bytes,model_version,recorded_at) VALUES($1,$2,1,$3)")
+            .bind(prior.request_id).bind(charged).bind(now).execute(&mut *tx).await.unwrap();
+        sqlx::query("UPDATE chat.direct_request_budget SET retained_bytes=retained_bytes+$1 WHERE singleton")
+            .bind(charged).execute(&mut *tx).await.unwrap();
+        assert!(matches!(
+            validate_terminal_charge(&mut tx, &lock, MAX_BUNDLE_BYTES * 2, true).await,
+            Err(DirectRequestStoreError::QuotaExceeded)
+        ));
+        tx.rollback().await.unwrap();
+    }
 }

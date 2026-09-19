@@ -329,6 +329,13 @@ pub(super) struct LockedDirectRequestPublication {
     now: DateTime<Utc>,
 }
 impl LockedDirectRequestPublication {
+    pub(super) async fn existing_artifact_bytes(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<u64, DirectRequestStoreError> {
+        Ok(existing_attempt_artifact_bytes(tx, &self.lock).await? as u64)
+    }
+
     pub(super) fn signed(
         &self,
     ) -> &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest {
@@ -496,7 +503,7 @@ pub(super) async fn complete_publication(
     if matches!(disposition, PublicationDisposition::Published) {
         return Err(DirectRequestStoreError::InvalidReceipt);
     }
-    complete_publication_inner(tx, &candidate, disposition, receipt).await
+    complete_publication_inner(tx, &candidate, disposition, receipt, None).await
 }
 
 async fn complete_publication_inner(
@@ -504,6 +511,7 @@ async fn complete_publication_inner(
     candidate: &LockedDirectRequestPublication,
     disposition: PublicationDisposition,
     receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
+    retained_artifact_bytes: Option<i64>,
 ) -> Result<Vec<u8>, DirectRequestStoreError> {
     use base64::Engine as _;
     let body = &receipt.body()["receipt"];
@@ -544,13 +552,14 @@ async fn complete_publication_inner(
     if body["$type"].as_str() != Some(format!("blue.catbird.chat.defs#{kind}").as_str()) {
         return Err(DirectRequestStoreError::InvalidReceipt);
     }
-    finish_terminal(
+    finish_terminal_charged(
         tx,
         candidate.lock.clone(),
         outcome,
         receipt.bytes(),
         Some(candidate.signed.request_digest()),
         candidate.now,
+        retained_artifact_bytes,
     )
     .await
 }
@@ -568,18 +577,21 @@ pub(super) async fn complete_published_publication(
     mut candidate: LockedDirectRequestPublication,
     published_receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
     signer: &super::direct_request_receipts::DirectRequestReceiptSigner,
+    retained_artifact_bytes: u64,
 ) -> Result<PublicationCompletion, DirectRequestStoreError> {
     match complete_publication_inner(
         tx,
         &candidate,
         PublicationDisposition::Published,
         published_receipt,
+        i64::try_from(retained_artifact_bytes).ok(),
     )
     .await
     {
         Ok(bytes) => Ok(PublicationCompletion::Published(bytes)),
         Err(error) => {
             let code = match error {
+                DirectRequestStoreError::QuotaExceeded => "CapacityUnavailable",
                 DirectRequestStoreError::Expired => "PreparationExpired",
                 DirectRequestStoreError::IncludedAuthorityChanged => "PreparationRevoked",
                 DirectRequestStoreError::IdentityConflict => "PreparationConflict",
@@ -601,6 +613,7 @@ pub(super) async fn complete_published_publication(
                     &candidate,
                     PublicationDisposition::Rejected,
                     &receipt,
+                    None,
                 )
                 .await?,
             ))
@@ -845,7 +858,7 @@ pub(crate) async fn prepare_direct_request<
     let prepared = async {
     let b = actor.signed.body();
     let i = &lock.identity;
-    check_preparation_budget(tx,i,now).await?;
+    check_preparation_budget(tx,i,now,MAX_BUNDLE_BYTES).await?;
     let (recent,pair_pending,recipient_pending):(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND invitation_transition_id IS NOT NULL AND created_at >= $3-INTERVAL '24 hours'),(SELECT count(*) FROM chat.participants WHERE created_by_did=$1 AND user_did=$2 AND current_membership AND status='pending'),(SELECT count(*) FROM chat.participants WHERE user_did=$2 AND current_membership AND status='pending')")
         .bind(&i.actor_did).bind(&i.recipient_did).bind(now).fetch_one(&mut **tx).await?;
     let quota_exceeded = recent >= 100 || pair_pending >= 5 || recipient_pending >= 100;

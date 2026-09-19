@@ -12,6 +12,79 @@ const MAX_BUNDLE_BYTES: i64 = 8_388_608;
 const MAX_PENDING_ACCOUNT_BYTES: i64 = 67_108_864;
 const MAX_PENDING_GLOBAL_BYTES: i64 = 1_073_741_824;
 const MAX_RETAINED_GLOBAL_BYTES: i64 = 8_589_934_592;
+const RETAINED_ROW_CHARGE_BYTES: i64 = 16_384;
+
+fn retained_account_limit() -> Result<i64, DirectRequestStoreError> {
+    let limit = match std::env::var("CHAT_DIRECT_REQUEST_MAX_RETAINED_ACCOUNT_BYTES") {
+        Ok(value) => value
+            .parse::<i64>()
+            .map_err(|_| DirectRequestStoreError::QuotaExceeded)?,
+        Err(std::env::VarError::NotPresent) => 268_435_456,
+        Err(_) => return Err(DirectRequestStoreError::QuotaExceeded),
+    };
+    if !(MAX_PENDING_ACCOUNT_BYTES..=MAX_RETAINED_GLOBAL_BYTES).contains(&limit) {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    Ok(limit)
+}
+
+async fn existing_attempt_artifact_bytes(
+    tx: &mut Transaction<'_, Postgres>,
+    lock: &LockedAttempt,
+) -> Result<i64, DirectRequestStoreError> {
+    require_transaction(tx, lock).await?;
+    let selected: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.direct_request_selected_devices WHERE request_id=$1",
+    )
+    .bind(lock.identity.request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let snapshot = lock
+        .row
+        .as_ref()
+        .and_then(|r| r.prepare_response.as_ref())
+        .map_or(0, Vec::len) as i64;
+    // Attempt plus immutable accounting row; selected rows contain only bounded
+    // identities/digests, not copies of the separately bounded package pool.
+    Ok(snapshot + (2 + selected) * RETAINED_ROW_CHARGE_BYTES)
+}
+
+async fn validate_terminal_charge(
+    tx: &mut Transaction<'_, Postgres>,
+    lock: &LockedAttempt,
+    charge: i64,
+    published: bool,
+) -> Result<(i64, i64), DirectRequestStoreError> {
+    if charge <= 0 || charge > MAX_RETAINED_GLOBAL_BYTES {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    let old = lock.row.as_ref().map_or(0, |r| r.reserved_bytes);
+    let retained_delta = charge - old;
+    let pending_delta = if published { charge - old } else { -old };
+    let (pending,retained):(i64,i64) = sqlx::query_as("SELECT pending_bytes,retained_bytes FROM chat.direct_request_effective_budget WHERE singleton")
+        .fetch_one(&mut **tx).await?;
+    let (account_pending,account_retained):(i64,i64)=sqlx::query_as(r#"
+        SELECT max(pending)::bigint,max(retained)::bigint FROM (
+          SELECT who.did,
+            COALESCE(sum(a.reserved_bytes) FILTER(WHERE a.status IN('prepared','published') AND NOT EXISTS(SELECT 1 FROM chat.direct_request_pending_releases r WHERE r.request_id=a.request_id)),0) AS pending,
+            COALESCE(sum(COALESCE(c.charged_bytes,a.reserved_bytes)),0) AS retained
+          FROM (VALUES($1::text),($2::text)) who(did)
+          LEFT JOIN chat.direct_request_attempts a ON a.actor_did=who.did OR a.recipient_did=who.did
+          LEFT JOIN chat.direct_request_retained_charges c ON c.request_id=a.request_id
+          GROUP BY who.did
+        ) totals
+    "#).bind(&lock.identity.actor_did).bind(&lock.identity.recipient_did).fetch_one(&mut **tx).await?;
+    if (pending_delta > 0
+        && (pending + pending_delta > MAX_PENDING_GLOBAL_BYTES
+            || account_pending + pending_delta > MAX_PENDING_ACCOUNT_BYTES))
+        || (retained_delta > 0
+            && (retained + retained_delta > MAX_RETAINED_GLOBAL_BYTES
+                || account_retained + retained_delta > retained_account_limit()?))
+    {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    Ok((pending_delta, retained_delta))
+}
 const MIN_PACKAGE_HORIZON_SECONDS: i64 = 604_800 + 300 + PREPARATION_TTL_SECONDS;
 
 #[derive(Debug, Error)]
@@ -180,6 +253,18 @@ async fn finish_terminal(
     publication_digest: Option<&[u8]>,
     now: DateTime<Utc>,
 ) -> Result<Vec<u8>, DirectRequestStoreError> {
+    finish_terminal_charged(tx, lock, outcome, receipt, publication_digest, now, None).await
+}
+
+async fn finish_terminal_charged(
+    tx: &mut Transaction<'_, Postgres>,
+    lock: LockedAttempt,
+    outcome: TerminalOutcome,
+    receipt: &[u8],
+    publication_digest: Option<&[u8]>,
+    now: DateTime<Utc>,
+    published_artifact_bytes: Option<i64>,
+) -> Result<Vec<u8>, DirectRequestStoreError> {
     require_transaction(tx, &lock).await?;
     if let Some(row) = &lock.row {
         if let Some(bytes) = row.terminal_bytes()? {
@@ -198,6 +283,16 @@ async fn finish_terminal(
     {
         return Err(DirectRequestStoreError::InvalidReceipt);
     }
+    let base = existing_attempt_artifact_bytes(tx, &lock).await? + receipt.len() as i64;
+    let charge = if outcome == TerminalOutcome::Published {
+        published_artifact_bytes
+            .filter(|bytes| *bytes >= base)
+            .ok_or(DirectRequestStoreError::InvalidReceipt)?
+    } else {
+        base
+    };
+    let (pending_delta, retained_delta) =
+        validate_terminal_charge(tx, &lock, charge, outcome == TerminalOutcome::Published).await?;
     let digest = Sha256::digest(receipt).to_vec();
     if let Some(row) = &lock.row {
         if outcome == TerminalOutcome::Published
@@ -205,24 +300,23 @@ async fn finish_terminal(
         {
             return Err(DirectRequestStoreError::Expired);
         }
-        let written = sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6 WHERE request_id=$1 AND status='prepared' AND ($2<>'published' OR lease_expires_at>clock_timestamp())")
-            .bind(lock.identity.request_id).bind(outcome.as_str()).bind(now).bind(receipt).bind(digest).bind(publication_digest).execute(&mut **tx).await?;
+        let written = sqlx::query("UPDATE chat.direct_request_attempts SET status=$2,terminal_at=$3,terminal_response=$4,terminal_response_sha256=$5,publication_digest=$6,reserved_bytes=$7 WHERE request_id=$1 AND status='prepared' AND ($2<>'published' OR lease_expires_at>clock_timestamp())")
+            .bind(lock.identity.request_id).bind(outcome.as_str()).bind(now).bind(receipt).bind(digest).bind(publication_digest).bind(charge).execute(&mut **tx).await?;
         if written.rows_affected() != 1 {
             return Err(DirectRequestStoreError::Expired);
         }
-        // Cancelled/expired exposed one-time packages remain reserved forever
-        // (until ordinary package expiry/revocation); never return to available.
-        sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes-$1,retained_bytes=retained_bytes-$2 WHERE singleton")
-            .bind(if outcome == TerminalOutcome::Published { 0 } else { row.reserved_bytes }).bind(if outcome == TerminalOutcome::Published { 0 } else { row.reserved_bytes })
-            .execute(&mut **tx).await?;
     } else {
         if outcome == TerminalOutcome::Published {
             return Err(DirectRequestStoreError::InvalidReceipt);
         }
         let i = &lock.identity;
-        sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,terminal_at,terminal_response,terminal_response_sha256,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$11,$8,$9,$10,$8)")
-            .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(i.actor_auth_generation).bind(&i.recipient_did).bind(&i.prepare_digest).bind(now).bind(receipt).bind(digest).bind(outcome.as_str()).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,terminal_at,terminal_response,terminal_response_sha256,created_at,reserved_bytes) VALUES($1,$2,$3,$4,$5,$6,$7,$11,$8,$9,$10,$8,$12)")
+            .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(i.actor_auth_generation).bind(&i.recipient_did).bind(&i.prepare_digest).bind(now).bind(receipt).bind(digest).bind(outcome.as_str()).bind(charge).execute(&mut **tx).await?;
     }
+    sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes+$1,retained_bytes=retained_bytes+$2 WHERE singleton")
+        .bind(pending_delta).bind(retained_delta).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO chat.direct_request_retained_charges(request_id,charged_bytes,model_version,recorded_at) VALUES($1,$2,1,$3)")
+        .bind(lock.identity.request_id).bind(charge).bind(now).execute(&mut **tx).await?;
     Ok(receipt.to_vec())
 }
 
@@ -312,15 +406,20 @@ async fn reserve_preparation(
         return Err(DirectRequestStoreError::InvalidReceipt);
     }
     let i = &lock.identity;
-    check_preparation_budget(tx, &lock.identity, now).await?;
+    let reserved = MAX_BUNDLE_BYTES.max(
+        signed_response.len() as i64
+            + (2 + selected.len() as i64) * RETAINED_ROW_CHARGE_BYTES
+            + 65_536,
+    );
+    check_preparation_budget(tx, &lock.identity, now, reserved).await?;
     let updated=sqlx::query("UPDATE chat.direct_request_budget SET pending_bytes=pending_bytes+$1,retained_bytes=retained_bytes+$1 WHERE singleton AND (SELECT pending_bytes FROM chat.direct_request_effective_budget)+$1 <= $2 AND retained_bytes+$1 <= $3")
-        .bind(MAX_BUNDLE_BYTES).bind(MAX_PENDING_GLOBAL_BYTES).bind(MAX_RETAINED_GLOBAL_BYTES).execute(&mut **tx).await?;
+        .bind(reserved).bind(MAX_PENDING_GLOBAL_BYTES).bind(MAX_RETAINED_GLOBAL_BYTES).execute(&mut **tx).await?;
     if updated.rows_affected() != 1 {
         return Err(DirectRequestStoreError::QuotaExceeded);
     }
     sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,prepared_at,lease_expires_at,reserved_bytes,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,'prepared',$8,$9,$10,$11,$12,$10)")
         .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(i.actor_auth_generation).bind(&i.recipient_did).bind(&i.prepare_digest)
-        .bind(signed_response).bind(selection_digest).bind(now).bind(now+Duration::seconds(PREPARATION_TTL_SECONDS)).bind(MAX_BUNDLE_BYTES).execute(&mut **tx).await?;
+        .bind(signed_response).bind(selection_digest).bind(now).bind(now+Duration::seconds(PREPARATION_TTL_SECONDS)).bind(reserved).execute(&mut **tx).await?;
     let refs = selected
         .iter()
         .map(|d| d.key_package_ref.clone())
@@ -372,6 +471,7 @@ async fn check_preparation_budget(
     tx: &mut Transaction<'_, Postgres>,
     i: &AttemptIdentity,
     now: DateTime<Utc>,
+    charge: i64,
 ) -> Result<(), DirectRequestStoreError> {
     let (sender_live,pair_live,recipient_live,hourly,account_bytes): (i64,i64,i64,i64,i64) = sqlx::query_as(r#"
         SELECT count(*) FILTER(WHERE status='prepared' AND actor_did=$1),
@@ -385,8 +485,13 @@ async fn check_preparation_budget(
         || pair_live >= 1
         || recipient_live >= 4
         || hourly >= 20
-        || account_bytes + MAX_BUNDLE_BYTES > MAX_PENDING_ACCOUNT_BYTES
+        || account_bytes + charge > MAX_PENDING_ACCOUNT_BYTES
     {
+        return Err(DirectRequestStoreError::QuotaExceeded);
+    }
+    let account_retained:i64=sqlx::query_scalar("SELECT max(bytes)::bigint FROM (SELECT who.did,COALESCE(sum(COALESCE(c.charged_bytes,a.reserved_bytes)),0) bytes FROM (VALUES($1::text),($2::text)) who(did) LEFT JOIN chat.direct_request_attempts a ON a.actor_did=who.did OR a.recipient_did=who.did LEFT JOIN chat.direct_request_retained_charges c USING(request_id) GROUP BY who.did) totals")
+        .bind(&i.actor_did).bind(&i.recipient_did).fetch_one(&mut **tx).await?;
+    if account_retained + charge > retained_account_limit()? {
         return Err(DirectRequestStoreError::QuotaExceeded);
     }
     let (pending, retained): (i64, i64) = sqlx::query_as(
@@ -394,8 +499,7 @@ async fn check_preparation_budget(
     )
     .fetch_one(&mut **tx)
     .await?;
-    if pending + MAX_BUNDLE_BYTES > MAX_PENDING_GLOBAL_BYTES
-        || retained + MAX_BUNDLE_BYTES > MAX_RETAINED_GLOBAL_BYTES
+    if pending + charge > MAX_PENDING_GLOBAL_BYTES || retained + charge > MAX_RETAINED_GLOBAL_BYTES
     {
         return Err(DirectRequestStoreError::QuotaExceeded);
     }
