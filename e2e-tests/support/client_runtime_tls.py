@@ -173,6 +173,14 @@ def self_test():
             for extra in ["Host: attacker.invalid\n", "Origin: https://attacker.invalid\n", "Content-Length: 1\n", "Transfer-Encoding: chunked\n", "Sec-WebSocket-Version: 12\n"]:
                 with self.assertRaises(ValueError): validate_ws(self.headers(extra),path,origin)
             with self.assertRaises(ValueError): validate_ws(self.headers(),"/other?ticket=opaque",origin)
+        def test_native_absent_and_browser_exact_origin(self):
+            origin="http://127.0.0.1:5173"
+            path="/xrpc/blue.catbird.chat.subscribeEvents?ticket=opaque&cursor=opaque"
+            # Native clients omit Origin. The shipping route still requires its one-use ticket.
+            validate_ws(self.headers(),path,origin)
+            validate_ws(self.headers("Origin: " + origin + "\n"),path,origin)
+            for extra in ["Origin: " + origin + "\nOrigin: " + origin + "\n", "Origin: https://attacker.invalid\n", "Origin: null\n"]:
+                with self.assertRaises(ValueError): validate_ws(self.headers(extra),path,origin)
         def test_protected_target(self):
             with tempfile.TemporaryDirectory() as d:
                 p=os.path.join(d,"config.json")
