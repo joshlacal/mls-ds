@@ -17,6 +17,7 @@ use mls_e2e_tests::local_runtime_fixture::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     future::IntoFuture,
@@ -651,7 +652,36 @@ async fn main() -> Result<()> {
         &config.output_dir.join("ca.pem"),
         &std::fs::read(&https.ca_pem)?,
     )?;
-    let public = json!({"fixtureOnly":true,"origin":origin,"corsOrigin":config.cors_origin,"caPem":config.output_dir.join("ca.pem"),"hosts":mapping,"accounts":proxy.actors.iter().zip(["alice","bob"]).map(|(a,label)|json!({"label":label,"did":a.identity.did,"deviceId":a.identity.device_id.to_string()})).collect::<Vec<_>>()});
+    let tls_certificate = config.output_dir.join("tls-certificate.pem");
+    protected_write(
+        &tls_certificate,
+        &std::fs::read(https.root.join("server.pem"))?,
+    )?;
+    let public_pem = Command::new("openssl")
+        .args(["x509", "-pubkey", "-noout", "-in"])
+        .arg(&tls_certificate)
+        .output()?;
+    ensure!(
+        public_pem.status.success(),
+        "fixture certificate public key extraction failed"
+    );
+    let mut spki = Command::new("openssl")
+        .args(["pkey", "-pubin", "-outform", "DER"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    spki.stdin
+        .take()
+        .context("SPKI input")?
+        .write_all(&public_pem.stdout)?;
+    let spki = spki.wait_with_output()?;
+    ensure!(
+        spki.status.success(),
+        "fixture certificate SPKI extraction failed"
+    );
+    let tls_spki_sha256 = STANDARD.encode(Sha256::digest(&spki.stdout));
+    let public = json!({"fixtureOnly":true,"origin":origin,"corsOrigin":config.cors_origin,"caPem":config.output_dir.join("ca.pem"),"tlsCertificatePem":tls_certificate,"tlsSpkiSha256":tls_spki_sha256,"hosts":mapping,"accounts":proxy.actors.iter().zip(["alice","bob"]).map(|(a,label)|json!({"label":label,"did":a.identity.did,"deviceId":a.identity.device_id.to_string()})).collect::<Vec<_>>()});
     // Readiness means strict TLS and session/origin guards have actually run.
     let address = format!("127.0.0.1:{tls_port}").parse()?;
     let untrusted = reqwest::Client::builder()
@@ -742,6 +772,14 @@ mod tests {
             lifetime_seconds: 60,
         };
         assert!(validate_config(&c).is_ok());
+        for seconds in [0, 3601] {
+            assert!(validate_config(&Config {
+                output_dir: c.output_dir.clone(),
+                cors_origin: c.cors_origin.clone(),
+                lifetime_seconds: seconds
+            })
+            .is_err());
+        }
         for origin in [
             "https://example.com",
             "http://127.0.0.1:5173/",

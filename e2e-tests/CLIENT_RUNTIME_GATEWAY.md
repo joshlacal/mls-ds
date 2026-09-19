@@ -34,6 +34,8 @@ The database must already have the reviewed baseline and additive migrations. Th
   "origin": "https://gateway-<run>.request-fixture.catbird.blue",
   "corsOrigin": "http://127.0.0.1:5173",
   "caPem": "/absolute/output/ca.pem",
+  "tlsCertificatePem": "/absolute/output/tls-certificate.pem",
+  "tlsSpkiSha256": "<base64 SHA256 of exact TLS leaf SubjectPublicKeyInfo>",
   "hosts": {"<synthetic-host>": "127.0.0.1:<tls-port>"},
   "accounts": [{"label": "alice", "did": "did:web:alice-<run>.request-fixture.catbird.blue", "deviceId": "<reserved-native-device-uuid>"}]
 }
