@@ -50,6 +50,16 @@ pub async fn setup() -> PgPool {
         MigrationType::Simple,
         Cow::Borrowed(service_auth),
     ));
+    let pending_inventory =
+        include_str!("../../migrations/20260907000001_chat_direct_pending_inventory.sql");
+    assert_eq!(format!("{:x}",sha2::Sha384::digest(pending_inventory.as_bytes())),
+        "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1");
+    migrations.push(Migration::new(
+        20260907000001,
+        Cow::Borrowed("chat direct pending inventory"),
+        MigrationType::Simple,
+        Cow::Borrowed(pending_inventory),
+    ));
     migrations.push(Migration::new(
         20260919000001,
         Cow::Borrowed("direct request preparation"),

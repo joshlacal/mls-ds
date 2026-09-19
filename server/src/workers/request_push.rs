@@ -561,4 +561,114 @@ mod tests {
         dispatch(&config, &signer, &row).await.unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renewal_rechecks_database_clock_after_waiting_for_row_lock() {
+        const DATABASE_URL: &str =
+            "postgresql://127.0.0.1:5432/catbird_direct_requests_test_20260919";
+        assert_eq!(
+            std::env::var("REQUEST_TEST_DATABASE_URL").as_deref(),
+            Ok(DATABASE_URL),
+            "exact dedicated request database is required"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(DATABASE_URL)
+            .await
+            .expect("connect dedicated request database");
+        let (database, user, owner, host): (String, String, String, Option<String>) =
+            sqlx::query_as(
+                "SELECT current_database(),current_user,pg_get_userbyid(datdba),\
+                 host(inet_server_addr()) FROM pg_database WHERE datname=current_database()",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read database authority");
+        assert_eq!(database, "catbird_direct_requests_test_20260919");
+        assert_eq!(user, owner);
+        assert_eq!(host.as_deref(), Some("127.0.0.1"));
+
+        let outbox_id: Uuid = sqlx::query_scalar(
+            "SELECT work.outbox_id FROM chat.outbox work \
+             JOIN chat.direct_request_push_events mapped ON mapped.outbox_id=work.outbox_id \
+             ORDER BY mapped.event_position DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("C01 retained publication must provide one mapped push event");
+        let original: (
+            String,
+            i64,
+            DateTime<Utc>,
+            Option<Uuid>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT status,attempt_count,next_attempt_at,lease_owner,lease_expires_at,delivered_at \
+             FROM chat.outbox WHERE outbox_id=$1",
+        )
+        .bind(outbox_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read original outbox state");
+
+        let lease_owner = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE chat.outbox SET status='leased',attempt_count=0,delivered_at=NULL,\
+             lease_owner=$2,lease_expires_at=clock_timestamp()+interval '500 milliseconds' \
+             WHERE outbox_id=$1",
+        )
+        .bind(outbox_id)
+        .bind(lease_owner)
+        .execute(&pool)
+        .await
+        .expect("install short test lease");
+
+        let result = async {
+            let mut blocker = pool.begin().await?;
+            sqlx::query("SELECT outbox_id FROM chat.outbox WHERE outbox_id=$1 FOR UPDATE")
+                .bind(outbox_id)
+                .fetch_one(&mut *blocker)
+                .await?;
+            let waiting_pool = pool.clone();
+            let waiter = tokio::spawn(async move {
+                renew_request_push_lease_for_test(&waiting_pool, outbox_id, lease_owner).await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            blocker.commit().await?;
+
+            let renewal = waiter.await.expect("renewal task joined");
+            assert!(renewal.is_err(), "an expired blocked lease was renewed");
+            let (status, same_owner, expired): (String, bool, bool) = sqlx::query_as(
+                "SELECT status,lease_owner=$2,lease_expires_at<=clock_timestamp() \
+                 FROM chat.outbox WHERE outbox_id=$1",
+            )
+            .bind(outbox_id)
+            .bind(lease_owner)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(status, "leased");
+            assert!(same_owner);
+            assert!(expired);
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+
+        sqlx::query(
+            "UPDATE chat.outbox SET status=$2,attempt_count=$3,next_attempt_at=$4,\
+             lease_owner=$5,lease_expires_at=$6,delivered_at=$7 WHERE outbox_id=$1",
+        )
+        .bind(outbox_id)
+        .bind(&original.0)
+        .bind(original.1)
+        .bind(original.2)
+        .bind(original.3)
+        .bind(original.4)
+        .bind(original.5)
+        .execute(&pool)
+        .await
+        .expect("restore exact original outbox state");
+        result.expect("held-row-lock lease regression");
+    }
 }

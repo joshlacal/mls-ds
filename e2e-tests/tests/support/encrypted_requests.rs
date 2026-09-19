@@ -188,6 +188,10 @@ fn reviewed_send_message_prerequisite() -> BaselineMigration {
     baseline!(20260816000001, "enable send message operation claims", "20260816000001_enable_send_message_operation_claims.sql", "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e")
 }
 
+fn reviewed_pending_inventory_prerequisite() -> BaselineMigration {
+    baseline!(20260907000001, "chat direct pending inventory", "20260907000001_chat_direct_pending_inventory.sql", "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1")
+}
+
 fn validate_reviewed_baseline_source() -> Result<()> {
     let baseline = reviewed_baseline();
     anyhow::ensure!(
@@ -335,8 +339,19 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
             && service_auth.checksum == SERVICE_AUTH_MIGRATION_SHA384,
         "service-auth migration ledger drift"
     );
+    let pending_expected = reviewed_pending_inventory_prerequisite();
+    let pending_actual = ledger
+        .get(baseline.len() + 2)
+        .context("pending-inventory prerequisite missing")?;
+    anyhow::ensure!(
+        pending_actual.version == pending_expected.version
+            && pending_actual.description == pending_expected.description
+            && pending_actual.success
+            && pending_actual.checksum == pending_expected.reviewed_sha384,
+        "pending-inventory prerequisite ledger drift"
+    );
     let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + 2..];
+    let actual_request = &ledger[baseline.len() + 3..];
     anyhow::ensure!(
         actual_request.len() == expected_request.len(),
         "request migration ledger count drift: expected {}, found {}",
@@ -486,6 +501,15 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
     );
     if !installed_versions.contains(&send_message.version) {
         apply_migration(&send_message)?;
+    }
+    let pending_inventory = reviewed_pending_inventory_prerequisite();
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(pending_inventory.sql.as_bytes()))
+            == pending_inventory.reviewed_sha384,
+        "pending-inventory prerequisite source checksum mismatch"
+    );
+    if !installed_versions.contains(&pending_inventory.version) {
+        apply_migration(&pending_inventory)?;
     }
     for migration in reviewed_request_migrations() {
         if !installed_versions.contains(&migration.version) {
