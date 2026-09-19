@@ -20,3 +20,4 @@ async-trait = "0.1"
 catbird_mls = { path = "../../catbird-mls" }
 hex = "0.4"
 ulid = "1.2.1"
+sha2 = "0.10"

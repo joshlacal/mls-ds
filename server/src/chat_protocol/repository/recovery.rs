@@ -587,6 +587,7 @@ pub(crate) const LOCK_AVAILABLE_RECOVERY_PACKAGE_SQL: &str = r#"
       AND kp.owner_key_id = $3
       AND kp.owner_auth_generation = $4
       AND kp.status = 'available'
+      AND kp.usage_scope = 'recovery'
       AND kp.terminal_transition_id IS NULL
       AND kp.terminal_revocation_id IS NULL
       AND kp.terminal_at IS NULL
@@ -685,7 +686,7 @@ pub(crate) const LOCK_RECOVERY_PACKAGE_SQL: &str = r#"
         kp.terminal_at,
         kp.created_at
     FROM chat.key_packages kp
-    WHERE kp.key_package_ref = $1
+    WHERE kp.key_package_ref = $1 AND kp.usage_scope = 'recovery'
     FOR UPDATE OF kp
 "#;
 

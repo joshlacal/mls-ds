@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.acceptConversation",
-  "description": "Accepts one exact pending invitation from the target participant's active registered device. Under the conversation mutation lock it verifies immutable invitation provenance, consent and every-pair block policy, changes only pending to active at prior stateVersion plus one, and atomically creates one add-kind target-device-signed recovery request with a request-bound KeyPackage reservation. A different current leaf later fulfills the one-device Add Commit and Welcome.",
+  "description": "Accepts one exact pending invitation from the target participant's active registered device. Under the conversation mutation lock it verifies immutable invitation provenance, consent and every-pair block policy, changes only pending to active at prior stateVersion plus one, and atomically creates one add-kind target-device-signed recovery request with a request-bound KeyPackage reservation. A different current leaf later fulfills the one-device Add Commit and Welcome. Wire protocol 2 directRequestAcceptance is policy-only and never reserves or adds a leaf; accepted devices recover separately. Version 1 keeps its mandatory recovery semantics.",
   "defs": {
     "main": {
       "type": "procedure",
@@ -14,8 +14,12 @@
           ],
           "properties": {
             "signedRequest": {
-              "type": "ref",
-              "ref": "blue.catbird.chat.defs#signedParticipantAcceptance"
+              "type": "union",
+              "refs": [
+                "blue.catbird.chat.defs#signedParticipantAcceptance",
+                "blue.catbird.chat.defs#signedDirectRequestAcceptance"
+              ],
+              "closed": true
             }
           }
         }
@@ -26,8 +30,7 @@
           "type": "object",
           "required": [
             "coordinates",
-            "entry",
-            "recovery"
+            "entry"
           ],
           "properties": {
             "coordinates": {
@@ -35,12 +38,20 @@
               "ref": "blue.catbird.chat.defs#conversationCoordinates"
             },
             "entry": {
-              "type": "ref",
-              "ref": "blue.catbird.chat.defs#participantAcceptanceEntry"
+              "type": "union",
+              "refs": [
+                "blue.catbird.chat.defs#participantAcceptanceEntry",
+                "blue.catbird.chat.defs#directRequestAcceptanceEntry"
+              ],
+              "closed": true
             },
             "recovery": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#leafRecoveryView"
+            },
+            "acceptanceProof": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#directRequestAcceptanceProof"
             }
           }
         }

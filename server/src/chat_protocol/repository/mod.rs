@@ -11,6 +11,10 @@ pub(crate) mod creation;
 pub(crate) mod delivery;
 #[allow(dead_code)]
 pub(crate) mod device_directory;
+#[allow(dead_code)]
+pub(crate) mod direct_request_preparation;
+#[allow(dead_code)]
+pub(crate) mod direct_request_receipts;
 pub(crate) mod entry_read;
 #[allow(dead_code)]
 pub(crate) mod execution_context;

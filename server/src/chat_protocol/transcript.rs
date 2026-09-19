@@ -3563,3 +3563,12 @@ impl VerifiedControlEntry {
         &self.mutation
     }
 }
+
+/// Strict projection bridge for the closed direct-request transcript module.
+pub(crate) fn project_direct_request_contract(raw: &[u8], name: &str, tagged: bool) -> Result<Vec<u8>, AuthPrimitiveError> {
+    let input = decode_raw_json(raw)?;
+    let value = project_ref(name, &input, tagged)?;
+    serde_ipld_dagcbor::to_vec(&value).map_err(|_| AuthPrimitiveError::invalid("direct request DAG-CBOR projection"))
+}
+
+pub(crate) fn validate_direct_request_strict_json(raw:&[u8])->Result<(),AuthPrimitiveError> {decode_raw_json(raw)?;Ok(())}

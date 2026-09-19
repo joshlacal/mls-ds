@@ -1,7 +1,7 @@
 {
   "lexicon": 1,
   "id": "blue.catbird.chat.getSubscriptionTicket",
-  "description": "After conversations, pending Welcomes, and recovery inbox have all reached hasMore=false for one inventorySession, a service-authenticated call atomically marks that barrier complete and mints a one-use short-lived ticket. The ticket binds the authenticated DID, actorDeviceId, authGeneration, inventorySessionId, exact event cursor, and subscription path. The first durable envelope's previousCursor equals that cursor.",
+  "description": "After conversations, pending Welcomes, and recovery inbox have all reached hasMore=false for one inventorySession, a service-authenticated call atomically marks that barrier complete and mints a one-use short-lived ticket. The ticket binds the authenticated DID, actorDeviceId, authGeneration, inventorySessionId, exact event cursor, and subscription path. The first durable envelope's previousCursor equals that cursor. Protocol-two scopes bind audience, inventory/page/event cursors and ticket. Unscoped legacy sessions must fail ProtocolUpgradeRequired before any successful partial inventory if unsupported state exists. Omission is never removal evidence.",
   "defs": {
     "main": {
       "type": "procedure",
@@ -30,6 +30,18 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 512
+            },
+            "supportedProtocolVersions": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "1",
+                  "2"
+                ]
+              },
+              "minLength": 1,
+              "maxLength": 2
             }
           }
         }
@@ -58,6 +70,10 @@
             "expiresAt": {
               "type": "ref",
               "ref": "blue.catbird.chat.defs#canonicalDatetime"
+            },
+            "inventoryScope": {
+              "type": "ref",
+              "ref": "blue.catbird.chat.defs#directRequestInventoryScope"
             }
           }
         }

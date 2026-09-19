@@ -895,6 +895,8 @@ async fn prepare_device_revocation_replay(
         updated_at: target.updated_at,
         available_package_count: target.available_package_count,
         reserved_package_count: target.reserved_package_count,
+        request_available_package_count: 0,
+        request_reserved_package_count: 0,
         capabilities_json: target.capabilities_json,
     };
     let expected_response_sha256 =

@@ -3773,3 +3773,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../../../tests/common/chat_protocol_event_scope_unit.rs"]
 mod event_scope_tests;
+
+#[path = "direct_request_lock.rs"]
+mod direct_request_lock;
+pub(super) use direct_request_lock::{lock_direct_request_operation, lock_direct_request_identity_scope, DirectRequestOperationLock};

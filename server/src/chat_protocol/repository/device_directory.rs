@@ -83,6 +83,8 @@ pub(crate) struct DeviceDirectoryView {
     pub(crate) updated_at: DateTime<Utc>,
     pub(crate) available_package_count: i64,
     pub(crate) reserved_package_count: i64,
+    pub(crate) request_available_package_count: i64,
+    pub(crate) request_reserved_package_count: i64,
     pub(crate) capabilities_json: String,
 }
 
@@ -121,6 +123,8 @@ impl LockedRevocationDeviceView {
             .active
             .available_package_count
             .checked_add(self.active.reserved_package_count)
+            .and_then(|value| value.checked_add(self.active.request_available_package_count))
+            .and_then(|value| value.checked_add(self.active.request_reserved_package_count))
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(RevocationDeviceViewError::Projection)?;
         let expected_digest = revocation_device_view_digest(
@@ -150,6 +154,8 @@ impl LockedRevocationDeviceView {
             updated_at: accepted_at,
             available_package_count: 0,
             reserved_package_count: 0,
+            request_available_package_count: 0,
+            request_reserved_package_count: 0,
             capabilities_json: self.active.capabilities_json,
         })
     }
@@ -172,6 +178,8 @@ struct ActiveRevocationDeviceViewRow {
     key_revocation_id: Option<Uuid>,
     available_package_count: i64,
     reserved_package_count: i64,
+    request_available_package_count: i64,
+    request_reserved_package_count: i64,
     capabilities_json: String,
 }
 
@@ -189,12 +197,14 @@ const SELECT_DEVICE_VIEW: &str = r#"
               FROM chat.key_packages kp
              WHERE kp.owner_did = device.user_did
                AND kp.owner_device_id = device.device_id
-               AND kp.status = 'available') AS available_package_count,
+               AND kp.usage_scope = 'recovery' AND kp.status = 'available') AS available_package_count,
            (SELECT count(*)
               FROM chat.key_packages kp
              WHERE kp.owner_did = device.user_did
                AND kp.owner_device_id = device.device_id
-               AND kp.status = 'reserved') AS reserved_package_count
+               AND kp.usage_scope = 'recovery' AND kp.status = 'reserved') AS reserved_package_count,
+           (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='available') AS request_available_package_count,
+           (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='reserved') AS request_reserved_package_count
       FROM chat.devices device
       JOIN chat.device_keys device_key
         ON device_key.user_did = device.user_did
@@ -353,12 +363,14 @@ pub(crate) async fn lock_active_revocation_device_view(
                   FROM chat.key_packages kp
                  WHERE kp.owner_did=device.user_did
                    AND kp.owner_device_id=device.device_id
-                   AND kp.status='available') AS available_package_count,
+                   AND kp.usage_scope='recovery' AND kp.status='available') AS available_package_count,
                (SELECT count(*)
                   FROM chat.key_packages kp
                  WHERE kp.owner_did=device.user_did
                    AND kp.owner_device_id=device.device_id
-                   AND kp.status='reserved') AS reserved_package_count
+                   AND kp.usage_scope='recovery' AND kp.status='reserved') AS reserved_package_count,
+               (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='available') AS request_available_package_count,
+               (SELECT count(*) FROM chat.key_packages kp WHERE kp.owner_did=device.user_did AND kp.owner_device_id=device.device_id AND kp.usage_scope='direct-request' AND kp.status='reserved') AS request_reserved_package_count
           FROM chat.devices device
           JOIN chat.device_keys device_key
             ON device_key.user_did=device.user_did
@@ -423,6 +435,8 @@ fn validate_active_revocation_device_view_row(
         || locked_at.timestamp_subsec_nanos() % 1_000_000 != 0
         || row.available_package_count < 0
         || row.reserved_package_count < 0
+        || row.request_available_package_count < 0
+        || row.request_reserved_package_count < 0
     {
         return Err(RevocationDeviceViewError::Projection);
     }
@@ -458,6 +472,8 @@ fn validate_active_revocation_device_view_row(
         updated_at: row.updated_at,
         available_package_count: row.available_package_count,
         reserved_package_count: row.reserved_package_count,
+        request_available_package_count: row.request_available_package_count,
+        request_reserved_package_count: row.request_reserved_package_count,
         capabilities_json: row.capabilities_json,
     })
 }
@@ -506,6 +522,8 @@ fn revocation_device_view_digest(
     digest.update(view.updated_at.timestamp_micros().to_be_bytes());
     digest.update(view.available_package_count.to_be_bytes());
     digest.update(view.reserved_package_count.to_be_bytes());
+    digest.update(view.request_available_package_count.to_be_bytes());
+    digest.update(view.request_reserved_package_count.to_be_bytes());
     digest.update(locked_at.timestamp_millis().to_be_bytes());
     digest.finalize().into()
 }
@@ -526,6 +544,8 @@ mod revocation_tests {
             updated_at: DateTime::from_timestamp_millis(1_700_000_001_000).unwrap(),
             available_package_count: 2,
             reserved_package_count: 1,
+            request_available_package_count: 0,
+            request_reserved_package_count: 0,
             capabilities_json: "{\"mlsProtocolVersion\":\"1.0\"}".to_owned(),
         }
     }
@@ -564,6 +584,8 @@ mod revocation_tests {
             key_revocation_id: None,
             available_package_count: view.available_package_count,
             reserved_package_count: view.reserved_package_count,
+            request_available_package_count: view.request_available_package_count,
+            request_reserved_package_count: view.request_reserved_package_count,
             capabilities_json: view.capabilities_json,
         }
     }
