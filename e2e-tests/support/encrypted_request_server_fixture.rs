@@ -149,9 +149,21 @@ async fn main() -> Result<()> {
         runtime,
         blob_store: BlobStore::for_route_tests(),
     });
-    let listen =
-        std::env::var("REQUEST_FIXTURE_LISTEN").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-    let listener = tokio::net::TcpListener::bind(&listen)
+    let configured_listen = std::env::var("REQUEST_FIXTURE_LISTEN").ok();
+    let listen: std::net::SocketAddr = configured_listen
+        .as_deref()
+        .unwrap_or("127.0.0.1:0")
+        .parse()
+        .context("REQUEST_FIXTURE_LISTEN must be a numeric socket address")?;
+    anyhow::ensure!(
+        listen.ip().is_loopback(),
+        "REQUEST_FIXTURE_LISTEN must be loopback"
+    );
+    anyhow::ensure!(
+        configured_listen.is_none() || listen.port() != 0,
+        "configured REQUEST_FIXTURE_LISTEN must use a nonzero reserved port"
+    );
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
     let address = listener.local_addr().context("read fixture address")?;
