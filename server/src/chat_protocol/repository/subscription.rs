@@ -82,9 +82,12 @@ pub(crate) async fn visible_events(
               AND event.event_position > $4
               AND event.event_position <= $5
               AND (session.supported_protocol_versions IS NULL
-                   OR NOT (convert_from(event.payload_bytes, 'UTF8')::jsonb ? 'conversationId')
+                   OR event.event_kind = 'watermark'
                    OR EXISTS (SELECT 1 FROM chat.conversations c
-                       WHERE c.conversation_id::text = convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId'
+                       WHERE c.conversation_id::text = COALESCE(
+                           convert_from(event.payload_bytes, 'UTF8')::jsonb->>'conversationId',
+                           (SELECT w.conversation_id::text FROM chat.welcome_bundles w
+                            WHERE w.welcome_id = (convert_from(event.payload_bytes, 'UTF8')::jsonb->>'welcomeId')::uuid))
                          AND c.protocol_version = ANY(session.supported_protocol_versions)))
             ORDER BY event.event_position
             LIMIT $6"#,
