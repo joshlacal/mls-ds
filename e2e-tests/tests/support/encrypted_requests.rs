@@ -861,8 +861,8 @@ fn read_child_line(child: &mut Child, label: &str) -> Result<String> {
 pub struct ServiceIdentity {
     pub did: String,
     pub device_id: Uuid,
-    pub jwt_key: SigningKey,
-    pub jwt_jwk: Value,
+    jwt_key: SigningKey,
+    jwt_jwk: Value,
 }
 
 impl ServiceIdentity {
@@ -962,6 +962,61 @@ impl ServiceIdentity {
             .send()
             .await
             .context("shipping authenticated read")?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
+    }
+
+    /// Forward one exact client-produced XRPC body/query through the normal
+    /// scoped service-auth verifier. The synthetic identity and signing key
+    /// stay process-local; this helper neither injects actor coordinates nor
+    /// parses and reserializes the client's wire bytes.
+    pub async fn forward_exact_service_request(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        method: reqwest::Method,
+        nsid: &str,
+        encoded_query: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        let suffix = nsid
+            .strip_prefix("blue.catbird.chat.")
+            .context("local fixture only forwards blue.catbird.chat endpoints")?;
+        anyhow::ensure!(
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "invalid local fixture endpoint NSID"
+        );
+        anyhow::ensure!(
+            encoded_query.is_none_or(|query| !query.starts_with('?') && !query.contains('#')),
+            "encoded query must omit '?' and fragments"
+        );
+        match method {
+            reqwest::Method::GET => anyhow::ensure!(body.is_none(), "GET body is forbidden"),
+            reqwest::Method::POST => {
+                anyhow::ensure!(body.is_some(), "POST body is required")
+            }
+            _ => anyhow::bail!("local fixture permits only GET and POST"),
+        }
+        let mut url = format!("{base_url}/xrpc/{nsid}");
+        if let Some(query) = encoded_query.filter(|query| !query.is_empty()) {
+            url.push('?');
+            url.push_str(query);
+        }
+        let mut request = client
+            .request(method, url)
+            .bearer_auth(self.jwt(nsid, true));
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_vec());
+        }
+        let response = request
+            .send()
+            .await
+            .context("local fixture exact service forwarding")?;
         let status = response.status();
         Ok((status, response.bytes().await?.to_vec()))
     }
