@@ -446,13 +446,17 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     // subsequent write is in this same transaction, so a failed effect also
     // rolls this receipt back.
     let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"]}})).map_err(|_|PublicationError::Invariant)?;
-    let response = preparation::complete_publication(
+    let response = match preparation::complete_published_publication(
         tx,
         prepared.candidate,
-        PublicationDisposition::Published,
         &receipt,
+        signer,
     )
-    .await?;
+    .await?
+    {
+        preparation::PublicationCompletion::Published(bytes) => bytes,
+        preparation::PublicationCompletion::Rejected(bytes) => return Ok(bytes),
+    };
     let digest = prepared.bootstrap.publication_digest().as_slice();
     if let Some(prior) = prepared.prior {
         let retirement = prior

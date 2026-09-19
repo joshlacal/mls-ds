@@ -698,7 +698,8 @@ pub(crate) async fn read_direct_request_pool_hint(
     // make both counts describe one hint horizon. Final prepare is authoritative.
     Ok(sqlx::query_as(r#"
       WITH instant AS (SELECT date_trunc('milliseconds',clock_timestamp()) AS at)
-      SELECT c.enabled,c.revision,
+      SELECT (c.enabled AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
+        AND d.status='active' AND k.revoked_at IS NULL) AS enabled,c.revision,
         count(p.key_package_ref) FILTER(WHERE p.status='available' AND NOT EXISTS(
           SELECT 1 FROM chat.direct_request_selected_devices s WHERE s.key_package_ref=p.key_package_ref)
           AND NOT EXISTS(SELECT 1 FROM chat.direct_request_retired_packages r WHERE r.key_package_ref=p.key_package_ref)) AS usable_count,
@@ -708,6 +709,7 @@ pub(crate) async fn read_direct_request_pool_hint(
       JOIN chat.devices d ON d.user_did=c.owner_did AND d.device_id=c.owner_device_id
       JOIN chat.device_keys k ON k.user_did=d.user_did AND k.device_id=d.device_id
       LEFT JOIN chat.key_packages p ON c.enabled AND d.status='active' AND k.revoked_at IS NULL
+        AND c.auth_generation=d.auth_generation AND c.owner_key_id=k.key_id
         AND p.owner_did=c.owner_did AND p.owner_device_id=c.owner_device_id
         AND p.owner_key_id=c.owner_key_id AND p.owner_auth_generation=c.auth_generation
         AND p.usage_scope='direct-request' AND p.status IN('available','reserved')
@@ -717,8 +719,7 @@ pub(crate) async fn read_direct_request_pool_hint(
           AND g.auth_generation=p.owner_auth_generation AND g.revoked_at IS NULL
           AND g.purpose='direct-request-bootstrap' AND g.protocol_version='2' AND g.profile='encryptedIntroduction1'
           AND g.expires_at>=instant.at+INTERVAL '605400 seconds')
-      WHERE c.owner_did=$1 AND c.owner_device_id=$2 AND c.owner_key_id=$3 AND c.auth_generation=$4
-        AND d.auth_generation=c.auth_generation AND k.key_id=c.owner_key_id
-      GROUP BY c.enabled,c.revision,instant.at
+      WHERE c.owner_did=$1 AND c.owner_device_id=$2 AND k.key_id=$3 AND d.auth_generation=$4
+      GROUP BY c.enabled,c.revision,c.auth_generation,c.owner_key_id,d.auth_generation,d.status,k.key_id,k.revoked_at,instant.at
     "#).bind(did).bind(device).bind(key_id).bind(generation).fetch_optional(&mut **tx).await?)
 }

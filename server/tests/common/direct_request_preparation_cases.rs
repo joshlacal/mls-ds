@@ -399,5 +399,27 @@ async fn request_pool_hint_is_exact_device_current_grant_and_full_horizon_scoped
     .unwrap()
     .unwrap();
     assert_eq!(hint.usable_count, 0);
+    // Keep an unrevoked grant on this second device to prove generation fencing
+    // independently of the revocation filter exercised above.
+    let stale = seed_request_device(&mut tx, &device.owner_did, "direct-request", true).await;
+    sqlx::query("UPDATE chat.devices SET auth_generation=2,dpop_jkt=repeat('A',43),updated_at=clock_timestamp() WHERE user_did=$1 AND device_id=$2")
+        .bind(&stale.owner_did)
+        .bind(stale.owner_device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let rebound = super::device_directory::read_direct_request_pool_hint(
+        &mut tx,
+        &stale.owner_did,
+        stale.owner_device_id,
+        &stale.owner_key_id,
+        2,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!rebound.enabled);
+    assert_eq!(rebound.revision, 1);
+    assert_eq!((rebound.usable_count, rebound.reserved_count), (0, 0));
     tx.rollback().await.unwrap();
 }

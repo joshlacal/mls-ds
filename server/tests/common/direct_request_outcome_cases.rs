@@ -256,3 +256,47 @@ async fn acceptance_operation_prefix_sorts_all_ids_before_budget_lock() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn publication_compare_exchange_rejects_expiry_after_captured_admission_time() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let i = test_identity();
+    let now = Utc::now();
+    let admitted = now - Duration::seconds(299);
+    let _lock = test_lock(&mut tx, i.clone()).await;
+    sqlx::query("INSERT INTO chat.direct_request_attempts(request_id,actor_did,actor_device_id,actor_key_id,actor_auth_generation,recipient_did,prepare_digest,status,prepare_response,selected_digest,prepared_at,lease_expires_at,created_at) VALUES($1,$2,$3,$4,1,$5,$6,'prepared','prepared',$7,$8,$9,$8)")
+        .bind(i.request_id).bind(&i.actor_did).bind(i.actor_device_id).bind(&i.actor_key_id).bind(&i.recipient_did).bind(&i.prepare_digest).bind(vec![4_u8;32]).bind(admitted).bind(now-Duration::seconds(1)).execute(&mut *tx).await.unwrap();
+    let lock = test_lock(&mut tx, i.clone()).await;
+    assert!(matches!(
+        finish_terminal(
+            &mut tx,
+            lock,
+            TerminalOutcome::Published,
+            b"must-not-publish",
+            Some(&[8; 32]),
+            admitted
+        )
+        .await,
+        Err(DirectRequestStoreError::Expired)
+    ));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM chat.direct_request_attempts WHERE request_id=$1")
+            .bind(i.request_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(status, "prepared");
+    let lock = test_lock(&mut tx, i).await;
+    finish_terminal(
+        &mut tx,
+        lock,
+        TerminalOutcome::Rejected,
+        b"expiry-rejection",
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
+}

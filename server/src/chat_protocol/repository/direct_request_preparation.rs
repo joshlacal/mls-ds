@@ -493,6 +493,9 @@ pub(super) async fn complete_publication(
     disposition: PublicationDisposition,
     receipt: &super::direct_request_receipts::SignedDirectRequestReceipt,
 ) -> Result<Vec<u8>, DirectRequestStoreError> {
+    if matches!(disposition, PublicationDisposition::Published) {
+        return Err(DirectRequestStoreError::InvalidReceipt);
+    }
     complete_publication_inner(tx, &candidate, disposition, receipt).await
 }
 
@@ -883,6 +886,12 @@ pub(crate) async fn prepare_direct_request<
     signed_admission::require_fresh_at(&actor, now)?;
     let selected = select_devices(tx, &lock, now).await?;
     let minimum_import_until = now + Duration::seconds(604_800 + 300);
+    let minimum_import_until = DateTime::from_timestamp(
+        minimum_import_until.timestamp()
+            + i64::from(minimum_import_until.timestamp_subsec_nanos() != 0),
+        0,
+    )
+    .ok_or(DirectRequestStoreError::InvalidReceipt)?;
     let devices=selected.iter().map(|d|Ok(serde_json::json!({"actorDid":d.owner_did,"actorDeviceId":d.owner_device_id.to_string(),"keyId":d.owner_key_id,"authGeneration":d.auth_generation,"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":base64::engine::general_purpose::STANDARD.encode(&d.wrapper_bytes),"sha256":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&d.wrapper_bytes)),"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(&d.key_package_ref)},"grant":serde_json::from_slice::<serde_json::Value>(&d.signed_grant).map_err(|_|DirectRequestStoreError::InvalidReceipt)?}))).collect::<Result<Vec<_>,DirectRequestStoreError>>()?;
     let mut snapshot = serde_json::json!({"protocolVersion":"2","requestId":b["requestId"],"firstMessageId":b["firstMessageId"],"conversationId":b["conversationId"],"recipientDid":b["recipientDid"],"origin":b["origin"],"profile":b["profile"],"creator":{"actorDid":i.actor_did,"actorDeviceId":i.actor_device_id.to_string(),"keyId":i.actor_key_id,"authGeneration":i.actor_auth_generation},"selectedDevices":devices,"preparedAt":time_string(now),"leaseExpiresAt":time_string(now+Duration::seconds(300)),"minimumImportUntil":time_string(minimum_import_until),"preparationRequestDigest":base64::engine::general_purpose::STANDARD.encode(&i.prepare_digest),"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":signer.key_id()});
     let (snapshot_digest, signature) = signer
