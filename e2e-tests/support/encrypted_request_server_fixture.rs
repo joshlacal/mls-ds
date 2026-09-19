@@ -5,7 +5,7 @@ use axum::{extract::FromRef, Router};
 use catbird_server::{
     auth::install_test_https_did_resolver,
     blob_store::BlobStore,
-    handlers::chat::{chat_router, ChatRuntime},
+    handlers::chat::{chat_router, install_test_https_relationship_resolver, ChatRuntime},
     realtime::SseState,
     storage::DbPool,
 };
@@ -72,6 +72,8 @@ async fn main() -> Result<()> {
     let resolver_ca = std::fs::read(&resolver_ca_path)
         .with_context(|| format!("read resolver CA {resolver_ca_path}"))?;
     install_test_https_did_resolver(&resolver_hosts, resolver_port, &resolver_ca)
+        .map_err(anyhow::Error::msg)?;
+    install_test_https_relationship_resolver(&resolver_hosts, resolver_port, &resolver_ca)
         .map_err(anyhow::Error::msg)?;
 
     let pool = PgPoolOptions::new()

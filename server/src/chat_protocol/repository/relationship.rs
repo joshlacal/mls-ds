@@ -32,11 +32,15 @@ use super::super::relationship_policy::{
     hydrate_persisted_fallback_traffic_projection, AdmissionOperation, AdmissionRequest,
     DeclarationRecordEvidenceKind, EvidenceKind, IncomingPolicy, PersistedDeclarationEvidence,
     PersistedGraphRelationshipEvidence, PersistedRelationshipProjection,
-    PersistedTrafficProjection, ProjectionOperationScope, ProjectionScope, PublicTransport,
-    RelationshipAuthority, RelationshipPolicyConfig, RelationshipPolicyConfigError,
-    RelationshipProjection, ReqwestPinnedTransport, SealedRelationshipProjection,
-    SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope, TrafficProjection,
-    TransportError, TransportSecurityProfile,
+    PersistedTrafficProjection, ProductionRelationshipTransport, ProjectionOperationScope,
+    ProjectionScope, PublicTransport, RelationshipAuthority, RelationshipPolicyConfig,
+    RelationshipPolicyConfigError, RelationshipProjection, ReqwestPinnedTransport,
+    SealedRelationshipProjection, SealedTrafficProjection, SystemDnsResolver, TrafficGraphScope,
+    TrafficProjection, TransportError, TransportSecurityProfile, HARDENED_SOURCE_PROFILE_V1,
+};
+#[cfg(feature = "test-support")]
+use super::super::relationship_policy::{
+    installed_test_https_relationship_transport, TEST_HTTPS_SOURCE_PROFILE_V1,
 };
 use super::core::AllocatedProjectionRevisionGuard;
 
@@ -82,7 +86,8 @@ impl From<sqlx::Error> for RelationshipRepositoryError {
 /// configuration and constructed the audited transport internally. Its fields
 pub struct RelationshipAuthorityStartupGuard {
     config: RelationshipPolicyConfig,
-    transport: ReqwestPinnedTransport<SystemDnsResolver>,
+    transport: ProductionRelationshipTransport,
+    source_profile: &'static [u8],
 }
 
 /// Exact durable operation/scope witness for a relationship snapshot load.
@@ -439,6 +444,14 @@ pub(crate) fn load_fixed_relationship_authority_startup_guard(
 ) -> Result<RelationshipAuthorityStartupGuard, RelationshipAuthorityStartupError> {
     let config = fixed_production_relationship_policy_config()
         .map_err(RelationshipAuthorityStartupError::InvalidConfiguration)?;
+    #[cfg(feature = "test-support")]
+    if let Some(transport) = installed_test_https_relationship_transport() {
+        return Ok(RelationshipAuthorityStartupGuard {
+            config,
+            transport: ProductionRelationshipTransport::TestHttps(transport),
+            source_profile: TEST_HTTPS_SOURCE_PROFILE_V1,
+        });
+    }
     let transport = ReqwestPinnedTransport::new(SystemDnsResolver, config.max_dns_answers())
         .map_err(RelationshipAuthorityStartupError::InvalidTransport)?;
     if ReqwestPinnedTransport::<SystemDnsResolver>::security_profile()
@@ -452,7 +465,11 @@ pub(crate) fn load_fixed_relationship_authority_startup_guard(
     {
         return Err(RelationshipAuthorityStartupError::InsecureTransportProfile);
     }
-    Ok(RelationshipAuthorityStartupGuard { config, transport })
+    Ok(RelationshipAuthorityStartupGuard {
+        config,
+        transport: ProductionRelationshipTransport::Public(transport),
+        source_profile: HARDENED_SOURCE_PROFILE_V1,
+    })
 }
 
 impl RelationshipAuthorityStartupGuard {
@@ -460,9 +477,10 @@ impl RelationshipAuthorityStartupGuard {
         self,
     ) -> (
         RelationshipPolicyConfig,
-        ReqwestPinnedTransport<SystemDnsResolver>,
+        ProductionRelationshipTransport,
+        &'static [u8],
     ) {
-        (self.config, self.transport)
+        (self.config, self.transport, self.source_profile)
     }
 }
 

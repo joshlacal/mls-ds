@@ -55,6 +55,8 @@ pub use errors::ChatFailure;
 pub use expiry_worker::{
     run_chat_expiry_sweeper, run_chat_expiry_sweeper_with_blob_store, ChatExpirySweepConfig,
 };
+#[cfg(feature = "test-support")]
+pub use runtime::install_test_https_relationship_resolver;
 pub use runtime::ChatRuntime;
 pub use subscribe_events::{parse_query as parse_subscribe_events_query, SubscribeEventsQuery};
 

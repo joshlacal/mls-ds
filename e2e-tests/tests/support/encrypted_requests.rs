@@ -43,6 +43,7 @@ pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
 pub const REQUEST_SERVER_FIXTURE_BINARY_ENV: &str = "REQUEST_SERVER_FIXTURE_BINARY";
 pub const ALICE_DID_HOST: &str = "alice.request-fixture.catbird.blue";
 pub const BOB_DID_HOST: &str = "bob.request-fixture.catbird.blue";
+pub const RELATIONSHIP_APPVIEW_HOST: &str = "public.api.bsky.app";
 const AUTH_JTI_MIGRATION: &str =
     include_str!("../../../server/migrations/20260214000002_auth_jti_nonce.sql");
 const AUTH_JTI_MIGRATION_SHA384: &str =
@@ -582,7 +583,7 @@ impl HttpsDidFixture {
         let extension = root.join("server.ext");
         std::fs::write(
             &extension,
-            &format!("subjectAltName=DNS:{ALICE_DID_HOST},DNS:{BOB_DID_HOST}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n"),
+            &format!("subjectAltName=DNS:{ALICE_DID_HOST},DNS:{BOB_DID_HOST},DNS:{RELATIONSHIP_APPVIEW_HOST}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n"),
         )?;
         run_checked(
             Command::new("openssl")
@@ -722,6 +723,7 @@ impl ServiceIdentity {
     }
 
     pub fn did_document(&self) -> Value {
+        let pds_host = self.did.strip_prefix("did:web:").expect("fixture did:web");
         json!({
             "id":self.did,
             "verificationMethod":[{
@@ -729,6 +731,11 @@ impl ServiceIdentity {
                 "type":"JsonWebKey2020",
                 "controller":self.did,
                 "publicKeyJwk":self.jwt_jwk
+            }],
+            "service":[{
+                "id":"#atproto_pds",
+                "type":"AtprotoPersonalDataServer",
+                "serviceEndpoint":format!("https://{pds_host}")
             }]
         })
     }
@@ -924,7 +931,7 @@ impl ShippingServerFixture {
             .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
             .env(
                 "REQUEST_FIXTURE_DID_HOSTS",
-                format!("{ALICE_DID_HOST},{BOB_DID_HOST}"),
+                format!("{ALICE_DID_HOST},{BOB_DID_HOST},{RELATIONSHIP_APPVIEW_HOST}"),
             )
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
             .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)

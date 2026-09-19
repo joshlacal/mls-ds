@@ -12,6 +12,19 @@ use zeroize::Zeroizing;
 
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{relationship_policy::ProductionRelationshipAuthority, CursorSealer};
+
+#[cfg(feature = "test-support")]
+pub fn install_test_https_relationship_resolver(
+    hosts: &[String],
+    port: u16,
+    ca_certificate_pem: &[u8],
+) -> Result<(), String> {
+    crate::chat_protocol::relationship_policy::install_test_https_relationship_transport(
+        hosts,
+        port,
+        ca_certificate_pem,
+    )
+}
 use crate::db::DbPool;
 use crate::realtime::{SseState, StreamEvent};
 

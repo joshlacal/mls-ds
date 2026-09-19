@@ -55,8 +55,11 @@ const MAX_PERSISTED_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const CANONICAL_DID_SET_MAGIC: &[u8; 8] = b"CBDID001";
 const CANONICAL_RELATIONSHIP_EVIDENCE_MAGIC: &[u8; 8] = b"CBREL001";
 const MAX_PINNED_CLIENT_POOL_ENTRIES: usize = MAX_ROSTER_SIZE * 2 + 2;
-const HARDENED_SOURCE_PROFILE_V1: &[u8] =
+pub(crate) const HARDENED_SOURCE_PROFILE_V1: &[u8] =
     b"reqwest-pinned-system-dns/no-proxy/no-redirect/public-only/credential-free/v1";
+#[cfg(feature = "test-support")]
+pub(crate) const TEST_HTTPS_SOURCE_PROFILE_V1: &[u8] =
+    b"test-support/exact-host-loopback/custom-ca/no-proxy/no-redirect/credential-free/v1";
 #[cfg(test)]
 const UNTRUSTED_TEST_SOURCE_PROFILE: &[u8] = b"untrusted-test-source";
 
@@ -701,6 +704,158 @@ pub trait PublicTransport: Clone + Send + Sync + 'static {
 #[async_trait]
 pub trait DnsResolver: Clone + Send + Sync + 'static {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, TransportError>;
+}
+
+/// The transport used by the shipping relationship authority. Production
+/// builds contain only the hardened public-network variant. A `test-support`
+/// build may install one process-wide, exact-host HTTPS fixture before runtime
+/// construction; its distinct source profile prevents locally collected
+/// evidence from being confused with production-network evidence.
+#[derive(Clone)]
+pub(crate) enum ProductionRelationshipTransport {
+    Public(ReqwestPinnedTransport<SystemDnsResolver>),
+    #[cfg(feature = "test-support")]
+    TestHttps(TestHttpsRelationshipTransport),
+}
+
+#[async_trait]
+impl PublicTransport for ProductionRelationshipTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        match self {
+            Self::Public(transport) => transport.get(request).await,
+            #[cfg(feature = "test-support")]
+            Self::TestHttps(transport) => transport.get(request).await,
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub(crate) struct TestHttpsRelationshipTransport {
+    hosts: Arc<BTreeSet<String>>,
+    port: u16,
+    client: reqwest::Client,
+}
+
+#[cfg(feature = "test-support")]
+static TEST_HTTPS_RELATIONSHIP_TRANSPORT: once_cell::sync::OnceCell<
+    TestHttpsRelationshipTransport,
+> = once_cell::sync::OnceCell::new();
+
+/// Install one CA-validated HTTPS authority for the external-process request
+/// harness. This does not seed relationship evidence or alter the projection
+/// parser. Every DID document, declaration, and graph row is fetched through
+/// the ordinary collector and checked by the ordinary policy rules.
+#[cfg(feature = "test-support")]
+pub(crate) fn install_test_https_relationship_transport(
+    hosts: &[String],
+    port: u16,
+    ca_certificate_pem: &[u8],
+) -> Result<(), String> {
+    let hosts = hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if hosts.is_empty()
+        || hosts.len() > HARD_MAX_DNS_ANSWERS
+        || hosts.iter().any(|host| {
+            host.is_empty()
+                || host == "localhost"
+                || host.parse::<IpAddr>().is_ok()
+                || !validate_public_hostname(host)
+        })
+        || port == 0
+    {
+        return Err(
+            "test HTTPS relationship fixture requires bounded explicit public DNS hosts and a port"
+                .into(),
+        );
+    }
+    let certificate = reqwest::Certificate::from_pem(ca_certificate_pem)
+        .map_err(|_| "test HTTPS relationship fixture CA is not a PEM certificate".to_owned())?;
+    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(RedirectPolicy::none())
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(certificate);
+    for host in &hosts {
+        client = client.resolve(host, loopback);
+    }
+    let transport = TestHttpsRelationshipTransport {
+        hosts: Arc::new(hosts),
+        port,
+        client: client
+            .build()
+            .map_err(|_| "failed to construct test HTTPS relationship transport".to_owned())?,
+    };
+    TEST_HTTPS_RELATIONSHIP_TRANSPORT
+        .set(transport)
+        .map_err(|_| "test HTTPS relationship transport is already installed".to_owned())
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn installed_test_https_relationship_transport() -> Option<TestHttpsRelationshipTransport>
+{
+    TEST_HTTPS_RELATIONSHIP_TRANSPORT.get().cloned()
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl PublicTransport for TestHttpsRelationshipTransport {
+    async fn get(&self, request: PublicGet) -> Result<PublicResponse, TransportError> {
+        if request.max_body_bytes == 0 || request.max_body_bytes > HARD_MAX_RESPONSE_BYTES {
+            return Err(TransportError::InvalidRequest);
+        }
+        validate_public_request_url(&request.url)?;
+        let host = request
+            .url
+            .host_str()
+            .ok_or(TransportError::UnsafeDestination)?
+            .to_ascii_lowercase();
+        if !self.hosts.contains(&host)
+            || !matches!(request.url.port(), None | Some(443))
+            || request.credentials != PublicCredentials::None
+        {
+            return Err(TransportError::UnsafeDestination);
+        }
+        let mut fixture_url = request.url;
+        fixture_url
+            .set_port(Some(self.port))
+            .map_err(|_| TransportError::UnsafeDestination)?;
+        let response =
+            tokio::time::timeout_at(request.deadline, self.client.get(fixture_url).send())
+                .await
+                .map_err(|_| TransportError::Deadline)?
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        TransportError::Deadline
+                    } else {
+                        TransportError::Network
+                    }
+                })?;
+        if response.status().is_redirection() {
+            return Err(TransportError::Redirect);
+        }
+        let status = response.status().as_u16();
+        let body = collect_bounded(
+            response,
+            ResponseBodyBudget::new(request.max_body_bytes, request.deadline),
+        )
+        .await
+        .map_err(|error| match error {
+            outbound_body::OutboundBodyError::DeclaredTooLarge { .. }
+            | outbound_body::OutboundBodyError::StreamedTooLarge { .. }
+            | outbound_body::OutboundBodyError::LengthOverflow => TransportError::BodyTooLarge,
+            outbound_body::OutboundBodyError::DeadlineExceeded => TransportError::Deadline,
+            outbound_body::OutboundBodyError::ReadFailed(source) if source.is_timeout() => {
+                TransportError::Deadline
+            }
+            outbound_body::OutboundBodyError::ReadFailed(_)
+            | outbound_body::OutboundBodyError::InvalidJson(_) => TransportError::Network,
+        })?;
+        Ok(PublicResponse::new(status, body.to_vec()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2801,7 +2956,7 @@ pub struct RelationshipAuthority<T: PublicTransport> {
 /// concrete here prevents runtime or handler code from substituting origins,
 /// DNS behavior, redirects, proxies, credentials, or an arbitrary HTTP client.
 pub(crate) type ProductionRelationshipAuthority =
-    RelationshipAuthority<ReqwestPinnedTransport<SystemDnsResolver>>;
+    RelationshipAuthority<ProductionRelationshipTransport>;
 
 #[cfg(test)]
 pub type HttpRelationshipSource<T> = RelationshipAuthority<T>;
@@ -3039,8 +3194,8 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
 
 impl ProductionRelationshipAuthority {
     pub(crate) fn from_startup_guard(guard: RelationshipAuthorityStartupGuard) -> Self {
-        let (config, transport) = guard.into_parts();
-        Self::from_parts(config, transport, HARDENED_SOURCE_PROFILE_V1)
+        let (config, transport, source_profile) = guard.into_parts();
+        Self::from_parts(config, transport, source_profile)
     }
 }
 
