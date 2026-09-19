@@ -159,6 +159,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000015_direct_request_entry_identity.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000016,
+        Cow::Borrowed("direct request push bindings"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000016_direct_request_push_bindings.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,
