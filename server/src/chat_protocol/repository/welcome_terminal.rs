@@ -534,7 +534,9 @@ pub(crate) enum WelcomeTerminalFacadeError {
 }
 
 impl From<sqlx::Error> for WelcomeTerminalFacadeError {
-    fn from(value: sqlx::Error) -> Self { Self::Prelude(PreludeError::Database(value)) }
+    fn from(value: sqlx::Error) -> Self {
+        Self::Prelude(PreludeError::Database(value))
+    }
 }
 
 impl From<ExecutorError> for WelcomeTerminalFacadeError {
@@ -584,10 +586,22 @@ async fn prepare_first_welcome_terminal(
         return Err(WelcomeTerminalFacadeError::InvalidRequest);
     }
 
-    if let Some((material,_,_,_)) = direct_request_welcome_terminal(transaction,&parsed,&mutation,trusted_instant.datetime(),true).await? {
-        let response=canonical_welcome_response(parsed.endpoint,&material)?;
-        let (scope_authority,completion)=prelude.into_execution_parts();
-        return Ok(WelcomeTerminalTransactionOutcome::Classified {completion:WelcomeCompletion::new(authority,scope_authority,completion,&response),material,response});
+    if let Some((material, _, _, _)) = direct_request_welcome_terminal(
+        transaction,
+        &parsed,
+        &mutation,
+        trusted_instant.datetime(),
+        true,
+    )
+    .await?
+    {
+        let response = canonical_welcome_response(parsed.endpoint, &material)?;
+        let (scope_authority, completion) = prelude.into_execution_parts();
+        return Ok(WelcomeTerminalTransactionOutcome::Classified {
+            completion: WelcomeCompletion::new(authority, scope_authority, completion, &response),
+            material,
+            response,
+        });
     }
 
     let aggregate = hydrate_locked_conversation_state(
@@ -705,35 +719,49 @@ async fn prepare_completed_welcome_replay(
     let aggregate =
         hydrate_locked_conversation_state(transaction, parsed.conversation_id, trusted_instant)
             .await?;
-    let direct = direct_request_welcome_terminal(transaction,&parsed,authority.mutation(),trusted_instant,false).await?;
-    let (material, terminal_classification, terminal_at, locked_terminal_digest) = if let Some(direct)=direct { direct } else {
-        match lock_welcome_terminal(transaction, &aggregate, parsed.welcome_id).await {
-            Ok(terminal) => {
-                let exact_replay =
-                    validate_locked_welcome_replay(&parsed, authority.mutation(), &terminal)?;
-                let snapshot = welcome_terminal_snapshot(&terminal);
-                let terminal_classification = snapshot.classification;
-                let terminal_at = snapshot.terminal_at;
-                let material = completed_replay_material(
-                    parsed.welcome_id,
-                    parsed.endpoint,
-                    snapshot,
-                    exact_replay,
-                )?;
-                let digest =
-                    locked_welcome_replay_digest(&aggregate, parsed.welcome_id, Some(&terminal))?;
-                (material, Some(terminal_classification), terminal_at, digest)
+    let direct = direct_request_welcome_terminal(
+        transaction,
+        &parsed,
+        authority.mutation(),
+        trusted_instant,
+        false,
+    )
+    .await?;
+    let (material, terminal_classification, terminal_at, locked_terminal_digest) =
+        if let Some(direct) = direct {
+            direct
+        } else {
+            match lock_welcome_terminal(transaction, &aggregate, parsed.welcome_id).await {
+                Ok(terminal) => {
+                    let exact_replay =
+                        validate_locked_welcome_replay(&parsed, authority.mutation(), &terminal)?;
+                    let snapshot = welcome_terminal_snapshot(&terminal);
+                    let terminal_classification = snapshot.classification;
+                    let terminal_at = snapshot.terminal_at;
+                    let material = completed_replay_material(
+                        parsed.welcome_id,
+                        parsed.endpoint,
+                        snapshot,
+                        exact_replay,
+                    )?;
+                    let digest = locked_welcome_replay_digest(
+                        &aggregate,
+                        parsed.welcome_id,
+                        Some(&terminal),
+                    )?;
+                    (material, Some(terminal_classification), terminal_at, digest)
+                }
+                Err(WelcomeLockError::Missing) => (
+                    WelcomeCanonicalMaterial::WelcomeNotFound {
+                        welcome_id: parsed.welcome_id,
+                    },
+                    None,
+                    None,
+                    locked_welcome_replay_digest(&aggregate, parsed.welcome_id, None)?,
+                ),
+                Err(error) => return Err(error.into()),
             }
-            Err(WelcomeLockError::Missing) => (
-                WelcomeCanonicalMaterial::WelcomeNotFound {
-                    welcome_id: parsed.welcome_id,
-                },
-                None,
-                None,
-                locked_welcome_replay_digest(&aggregate, parsed.welcome_id, None)?,
-            ),
-            Err(error) => return Err(error.into()),
-        } };
+        };
     let expected_response = canonical_welcome_response(parsed.endpoint, &material)?;
     if completed_replay_status(&material) != Some(expected_response.status()) {
         return Err(WelcomeTerminalFacadeError::ReplayPostState);
@@ -1580,48 +1608,139 @@ mod tests {
 /// acceptance never supersedes this historical coordinate. No peer event is
 /// produced, and neither expiry nor rejection changes account consent.
 async fn direct_request_welcome_terminal(
-    tx: &mut Transaction<'_,Postgres>, parsed: &ParsedWelcomeRequest,
-    mutation: &VerifiedSignedMutation, now: DateTime<Utc>, first: bool,
-) -> Result<Option<(WelcomeCanonicalMaterial,Option<WelcomeTerminalClass>,Option<DateTime<Utc>>,[u8;32])>,WelcomeTerminalFacadeError> {
-    use sqlx::Row;
+    tx: &mut Transaction<'_, Postgres>,
+    parsed: &ParsedWelcomeRequest,
+    mutation: &VerifiedSignedMutation,
+    now: DateTime<Utc>,
+    first: bool,
+) -> Result<
+    Option<(
+        WelcomeCanonicalMaterial,
+        Option<WelcomeTerminalClass>,
+        Option<DateTime<Utc>>,
+        [u8; 32],
+    )>,
+    WelcomeTerminalFacadeError,
+> {
     use serde_json::Value;
-    let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
+    use sqlx::Row;
+    let row=sqlx::query("SELECT d.import_until,p.signed_publication,p.request_entry,p.publication_digest,p.generation,c.current_generation,c.lifecycle,c.closed_at,c.close_transition_id,o.status,o.terminal_at,o.signed_request_bytes,o.request_digest FROM chat.direct_request_device_deliveries d JOIN chat.direct_request_publications p USING(request_id) JOIN chat.conversations c ON c.conversation_id=p.conversation_id LEFT JOIN chat.direct_request_welcome_outcomes o ON o.request_id=d.request_id AND o.recipient_did=d.owner_did AND o.recipient_device_id=d.owner_device_id WHERE d.request_id=$1 AND d.owner_did=$2 AND d.owner_device_id=$3 AND p.conversation_id=$4 FOR UPDATE OF c,d")
         .bind(parsed.welcome_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).bind(parsed.conversation_id)
         .fetch_optional(&mut **tx).await?;
-    let Some(row)=row else{return Ok(None)};
-    let publication:Value=serde_json::from_slice(&row.try_get::<Vec<u8>,_>("signed_publication")?).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?;
-    let entry:Value=serde_json::from_slice(&row.try_get::<Vec<u8>,_>("request_entry")?).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?;
-    let raw=mutation.accepted_wrapper_bytes().ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
-    let request:Value=serde_json::from_slice(raw).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?;
-    if request["body"]["coordinates"] != publication["body"]["next"] || entry["seq"].as_u64()!=Some(parsed.transition_seq) {return Err(WelcomeTerminalFacadeError::InvalidRequest);}
-    let mut status:Option<String>=row.try_get("status")?;
-    let mut terminal_at:Option<DateTime<Utc>>=row.try_get("terminal_at")?;
-    let stored:Option<Vec<u8>>=row.try_get("signed_request_bytes")?;
-    let exact=stored.as_deref()==Some(raw);
-    let expires:DateTime<Utc>=row.try_get("import_until")?;
-    if status.is_none() && row.try_get::<String,_>("lifecycle")? != "active" {
-        let transition:Uuid=row.try_get::<Option<Uuid>,_>("close_transition_id")?.ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
-        let at:DateTime<Utc>=row.try_get::<Option<DateTime<Utc>>,_>("closed_at")?.ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
+    let Some(row) = row else { return Ok(None) };
+    // Lock waits cannot extend the immutable Welcome import horizon.
+    let now = if first {
+        sqlx::query_scalar("SELECT date_trunc('milliseconds',clock_timestamp())")
+            .fetch_one(&mut **tx)
+            .await?
+    } else {
+        now
+    };
+    let publication: Value =
+        serde_json::from_slice(&row.try_get::<Vec<u8>, _>("signed_publication")?)
+            .map_err(|_| WelcomeTerminalFacadeError::InvalidRequest)?;
+    let entry: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("request_entry")?)
+        .map_err(|_| WelcomeTerminalFacadeError::InvalidRequest)?;
+    let raw = mutation
+        .accepted_wrapper_bytes()
+        .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
+    let request: Value =
+        serde_json::from_slice(raw).map_err(|_| WelcomeTerminalFacadeError::InvalidRequest)?;
+    if request["body"]["coordinates"] != publication["body"]["next"]
+        || entry["seq"].as_u64() != Some(parsed.transition_seq)
+    {
+        return Err(WelcomeTerminalFacadeError::InvalidRequest);
+    }
+    let mut status: Option<String> = row.try_get("status")?;
+    let mut terminal_at: Option<DateTime<Utc>> = row.try_get("terminal_at")?;
+    let stored: Option<Vec<u8>> = row.try_get("signed_request_bytes")?;
+    let exact = stored.as_deref() == Some(raw);
+    let expires: DateTime<Utc> = row.try_get("import_until")?;
+    if status.is_none() && row.try_get::<String, _>("lifecycle")? != "active" {
+        let transition: Uuid = row
+            .try_get::<Option<Uuid>, _>("close_transition_id")?
+            .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
+        let at: DateTime<Utc> = row
+            .try_get::<Option<DateTime<Utc>>, _>("closed_at")?
+            .ok_or(WelcomeTerminalFacadeError::InvalidRequest)?;
         let digest=Sha256::digest(serde_json::to_vec(&json!({"request":parsed.welcome_id,"device":mutation.actor_device_id().as_str(),"close":transition,"at":at})).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?).into();
-        return Ok(Some((WelcomeCanonicalMaterial::WelcomeSuperseded{welcome_id:parsed.welcome_id,cause:WelcomeSupersessionCause::Transition(transition)},Some(WelcomeTerminalClass::SupersededByTransition),Some(at),digest)));
+        return Ok(Some((
+            WelcomeCanonicalMaterial::WelcomeSuperseded {
+                welcome_id: parsed.welcome_id,
+                cause: WelcomeSupersessionCause::Transition(transition),
+            },
+            Some(WelcomeTerminalClass::SupersededByTransition),
+            Some(at),
+            digest,
+        )));
+    }
+    if status.is_none()
+        && row.try_get::<i64, _>("current_generation")? != row.try_get::<i64, _>("generation")?
+    {
+        let (transition,at):(Uuid,DateTime<Utc>) = sqlx::query_as("SELECT producing_transition_id,created_at FROM chat.generation_states WHERE conversation_id=$1 AND generation=$2 AND state_version=0")
+            .bind(parsed.conversation_id).bind(row.try_get::<i64,_>("current_generation")?).fetch_one(&mut **tx).await?;
+        let digest=Sha256::digest(serde_json::to_vec(&json!({"request":parsed.welcome_id,"device":mutation.actor_device_id().as_str(),"reset":transition,"at":at})).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?).into();
+        return Ok(Some((
+            WelcomeCanonicalMaterial::WelcomeSuperseded {
+                welcome_id: parsed.welcome_id,
+                cause: WelcomeSupersessionCause::Transition(transition),
+            },
+            Some(WelcomeTerminalClass::SupersededByTransition),
+            Some(at),
+            digest,
+        )));
     }
     if status.is_none() {
-        if !first {return Err(WelcomeTerminalFacadeError::ReplayPostState);}
-        let (next,at)=if expires<=now {("expired",expires)} else if parsed.endpoint==WelcomeEndpoint::Acknowledge {("acknowledged",now)} else {("rejected",now)};
+        if !first {
+            return Err(WelcomeTerminalFacadeError::ReplayPostState);
+        }
+        let (next, at) = if expires <= now {
+            ("expired", expires)
+        } else if parsed.endpoint == WelcomeEndpoint::Acknowledge {
+            ("acknowledged", now)
+        } else {
+            ("rejected", now)
+        };
         sqlx::query("INSERT INTO chat.direct_request_welcome_outcomes(request_id,recipient_did,recipient_device_id,status,terminal_at,signed_request_bytes,request_digest) VALUES($1,$2,$3,$4,$5,$6,$7)")
             .bind(parsed.welcome_id).bind(mutation.actor_did().as_str()).bind(Uuid::from_bytes(*mutation.actor_device_id().as_bytes())).bind(next).bind(at)
             .bind((next!="expired").then_some(raw)).bind((next!="expired").then_some(mutation.request_digest().as_slice())).execute(&mut **tx).await?;
-        status=Some(next.into());terminal_at=Some(at);
+        status = Some(next.into());
+        terminal_at = Some(at);
     }
-    let class=match status.as_deref(){Some("acknowledged")=>WelcomeTerminalClass::Acknowledged,Some("rejected")=>WelcomeTerminalClass::Rejected,Some("expired")=>WelcomeTerminalClass::Expired,_=>return Err(WelcomeTerminalFacadeError::ReplayPostState)};
-    let at=terminal_at.ok_or(WelcomeTerminalFacadeError::ReplayPostState)?;
-    let material=if stored.is_none() && first {
+    let class = match status.as_deref() {
+        Some("acknowledged") => WelcomeTerminalClass::Acknowledged,
+        Some("rejected") => WelcomeTerminalClass::Rejected,
+        Some("expired") => WelcomeTerminalClass::Expired,
+        _ => return Err(WelcomeTerminalFacadeError::ReplayPostState),
+    };
+    let at = terminal_at.ok_or(WelcomeTerminalFacadeError::ReplayPostState)?;
+    let material = if stored.is_none() && first {
         match class {
-            WelcomeTerminalClass::Acknowledged=>WelcomeCanonicalMaterial::Acknowledged{welcome_id:parsed.welcome_id,terminal_at:at},
-            WelcomeTerminalClass::Rejected=>WelcomeCanonicalMaterial::Rejected{welcome_id:parsed.welcome_id,terminal_at:at},
-            _=>WelcomeCanonicalMaterial::WelcomeExpired{welcome_id:parsed.welcome_id,expired_at:at},
+            WelcomeTerminalClass::Acknowledged => WelcomeCanonicalMaterial::Acknowledged {
+                welcome_id: parsed.welcome_id,
+                terminal_at: at,
+            },
+            WelcomeTerminalClass::Rejected => WelcomeCanonicalMaterial::Rejected {
+                welcome_id: parsed.welcome_id,
+                terminal_at: at,
+            },
+            _ => WelcomeCanonicalMaterial::WelcomeExpired {
+                welcome_id: parsed.welcome_id,
+                expired_at: at,
+            },
         }
-    } else { completed_replay_material(parsed.welcome_id,parsed.endpoint,WelcomeTerminalSnapshot{classification:class,terminal_at:Some(at),cause:None},exact)? };
+    } else {
+        completed_replay_material(
+            parsed.welcome_id,
+            parsed.endpoint,
+            WelcomeTerminalSnapshot {
+                classification: class,
+                terminal_at: Some(at),
+                cause: None,
+            },
+            exact,
+        )?
+    };
     let digest=Sha256::digest(serde_json::to_vec(&json!({"request":parsed.welcome_id,"device":mutation.actor_device_id().as_str(),"did":mutation.actor_did().as_str(),"status":status,"at":at,"publication":row.try_get::<Vec<u8>,_>("publication_digest")?,"requestDigest":row.try_get::<Option<Vec<u8>>,_>("request_digest")?})).map_err(|_|WelcomeTerminalFacadeError::InvalidRequest)?).into();
-    Ok(Some((material,Some(class),Some(at),digest)))
+    Ok(Some((material, Some(class), Some(at), digest)))
 }

@@ -99,8 +99,7 @@ use crate::chat_protocol::{
         ConversationStateHydrationError, LockedConversationStateGuard,
     },
     state_machine::{
-        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity,
-        PrincipalId,
+        AccessInterval, AccessIntervalEnd, ConversationState, DeviceIdentity, PrincipalId,
     },
 };
 
@@ -421,7 +420,11 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
     let Some(device) = device else {
-        tracing::error!("lock_read_device_authority_once: missing device row for did={} device_id={}", lock_did, lock_device_id);
+        tracing::error!(
+            "lock_read_device_authority_once: missing device row for did={} device_id={}",
+            lock_did,
+            lock_device_id
+        );
         return Err(ReadAuthorityError::Invariant);
     };
     // BARRIER 2 — a SEPARATE statement for the exact requester key row, issued
@@ -433,7 +436,11 @@ pub(in crate::chat_protocol) async fn lock_read_device_authority_once(
         .await
         .map_err(|_| ReadAuthorityError::Storage)?;
     let Some(key) = key else {
-        tracing::error!("lock_read_device_authority_once: missing key row for did={} device_id={}", lock_did, lock_device_id);
+        tracing::error!(
+            "lock_read_device_authority_once: missing key row for did={} device_id={}",
+            lock_did,
+            lock_device_id
+        );
         return Err(ReadAuthorityError::Invariant);
     };
     let signing_public_key_sha256: [u8; 32] = Sha256::digest(&key.signing_public_key).into();
@@ -615,10 +622,7 @@ fn classify_current_relationship(
         return Err(ReadAuthorityError::NotEntitled);
     }
 
-    match (
-        participant.is_active(),
-        participant.is_pending(),
-    ) {
+    match (participant.is_active(), participant.is_pending()) {
         (true, _) => Ok(ClassifiedRelationshipArm::ActiveParticipant),
         (_, true) => Ok(ClassifiedRelationshipArm::PendingParticipant),
         _ => Err(ReadAuthorityError::NotEntitled),
@@ -793,34 +797,58 @@ pub(crate) async fn authorize_conversation_state(
     let locked = match hydrate_locked_conversation_state(tx, conversation_id, locked_at).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("authorize_conversation_state hydrate_locked_conversation_state failed: {:?}", e);
+            tracing::error!(
+                "authorize_conversation_state hydrate_locked_conversation_state failed: {:?}",
+                e
+            );
             return Err(map_hydration_error(e));
         }
     };
 
     let graph_digest = *locked.locked_graph_digest();
-    let arm = match classify_current_relationship(device.user_did(), device.device_id(), locked.state()) {
+    let arm = match classify_current_relationship(
+        device.user_did(),
+        device.device_id(),
+        locked.state(),
+    ) {
         Ok(a) => a,
         Err(e) => {
-            tracing::error!("authorize_conversation_state classify_current_relationship failed: {:?}", e);
+            tracing::error!(
+                "authorize_conversation_state classify_current_relationship failed: {:?}",
+                e
+            );
             return Err(e);
         }
     };
-    let participant_period_id = match load_participant_period_id(tx, conversation_id, device.user_did()).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("authorize_conversation_state load_participant_period_id failed: {:?}", e);
-            return Err(e);
-        }
-    };
+    let participant_period_id =
+        match load_participant_period_id(tx, conversation_id, device.user_did()).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "authorize_conversation_state load_participant_period_id failed: {:?}",
+                    e
+                );
+                return Err(e);
+            }
+        };
     let relationship = match arm {
         ClassifiedRelationshipArm::OpenLeaf {
             open_membership_interval_id,
         } => {
-            let leaf_period_id = match load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await {
+            let leaf_period_id = match load_leaf_period_id(
+                tx,
+                conversation_id,
+                device.user_did(),
+                device.device_id(),
+            )
+            .await
+            {
                 Ok(l) => l,
                 Err(e) => {
-                    tracing::error!("authorize_conversation_state load_leaf_period_id failed: {:?}", e);
+                    tracing::error!(
+                        "authorize_conversation_state load_leaf_period_id failed: {:?}",
+                        e
+                    );
                     return Err(e);
                 }
             };
@@ -992,8 +1020,12 @@ pub(crate) struct EntryConversationReadAuthority {
     _conversation: LockedConversationStateGuard,
 }
 impl EntryConversationReadAuthority {
-    pub(in crate::chat_protocol) fn user_did(&self) -> &str { self.device.user_did() }
-    pub(in crate::chat_protocol) fn device_id(&self) -> Uuid { self.device.device_id() }
+    pub(in crate::chat_protocol) fn user_did(&self) -> &str {
+        self.device.user_did()
+    }
+    pub(in crate::chat_protocol) fn device_id(&self) -> Uuid {
+        self.device.device_id()
+    }
 }
 
 /// The checked entry authority. `pub(crate)` per the frozen internal
@@ -1238,7 +1270,9 @@ fn build_ordered_interval_witnesses(
                         // visible through the closed interval's inclusive terminal.
                         let kinds_pair = matches!(
                             (closing_kind.as_str(), row.opening_kind.as_str()),
-                            ("replace", "add") | ("reset", "reset")
+                            ("replace", "add")
+                                | ("reset", "reset")
+                                | ("directRequest", "directRequest")
                         );
                         if !kinds_pair
                             || *closing_transition_id != row.opening_transition_id
@@ -1344,15 +1378,20 @@ pub(crate) async fn authorize_entries(
     assert_same_transaction(tx, device.txid()).await?;
     let locked_at: DateTime<Utc> =
         sqlx::query_scalar("SELECT date_trunc('milliseconds', clock_timestamp())")
-            .fetch_one(&mut **tx).await.map_err(|_| ReadAuthorityError::Storage)?;
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|_| ReadAuthorityError::Storage)?;
     let locked = hydrate_locked_conversation_state(tx, conversation_id, locked_at)
-        .await.map_err(map_hydration_error)?;
+        .await
+        .map_err(map_hydration_error)?;
     let facts = exact_device_interval_facts(device.user_did(), device.device_id(), locked.state())?;
     let terminal_control_interval = if facts.open.is_some() {
         // Preserve the current-open row witnesses required by the old gate.
         load_participant_period_id(tx, conversation_id, device.user_did()).await?;
         load_leaf_period_id(tx, conversation_id, device.user_did(), device.device_id()).await?;
-        locked.locked_snapshot_digest().ok_or(ReadAuthorityError::Invariant)?;
+        locked
+            .locked_snapshot_digest()
+            .ok_or(ReadAuthorityError::Invariant)?;
         None
     } else if let Some(interval) = facts.latest_finite {
         let end = interval.end().ok_or(ReadAuthorityError::Invariant)?;
@@ -1366,12 +1405,25 @@ pub(crate) async fn authorize_entries(
     } else {
         return Err(ReadAuthorityError::NotEntitled);
     };
-    let state = EntryConversationReadAuthority { device, _conversation: locked };
+    let state = EntryConversationReadAuthority {
+        device,
+        _conversation: locked,
+    };
 
-    let rows = match load_exact_device_interval_rows(tx, conversation_id, state.user_did(), state.device_id()).await {
+    let rows = match load_exact_device_interval_rows(
+        tx,
+        conversation_id,
+        state.user_did(),
+        state.device_id(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("authorize_entries step 3 load_exact_device_interval_rows failed: {:?}", e);
+            tracing::error!(
+                "authorize_entries step 3 load_exact_device_interval_rows failed: {:?}",
+                e
+            );
             return Err(e);
         }
     };
@@ -1380,7 +1432,8 @@ pub(crate) async fn authorize_entries(
     )
     .bind(conversation_id)
     .fetch_one(&mut **tx)
-    .await {
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("authorize_entries step 4 query max seq failed: {:?}", e);
@@ -1390,14 +1443,20 @@ pub(crate) async fn authorize_entries(
     let head_seq_u64 = match u64::try_from(observed_head_seq) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("authorize_entries step 5 u64 try_from observed_head_seq failed: {:?}", e);
+            tracing::error!(
+                "authorize_entries step 5 u64 try_from observed_head_seq failed: {:?}",
+                e
+            );
             return Err(ReadAuthorityError::Invariant);
         }
     };
     let ordered_intervals = match build_ordered_interval_witnesses(rows, head_seq_u64) {
         Ok(i) => i,
         Err(e) => {
-            tracing::error!("authorize_entries step 6 build_ordered_interval_witnesses failed: {:?}", e);
+            tracing::error!(
+                "authorize_entries step 6 build_ordered_interval_witnesses failed: {:?}",
+                e
+            );
             return Err(e);
         }
     };
@@ -1405,7 +1464,10 @@ pub(crate) async fn authorize_entries(
     let control_recipient_fence = match load_control_recipient_fence(tx, conversation_id).await {
         Ok(f) => f,
         Err(e) => {
-            tracing::error!("authorize_entries step 7 load_control_recipient_fence failed: {:?}", e);
+            tracing::error!(
+                "authorize_entries step 7 load_control_recipient_fence failed: {:?}",
+                e
+            );
             return Err(e);
         }
     };

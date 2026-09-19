@@ -1467,6 +1467,7 @@ impl EvidenceKind {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionOperationScope {
     DirectRequestPreparation,
+    DirectRequestAcceptance,
     Creation,
     PendingAdd,
     Acceptance,
@@ -1479,6 +1480,7 @@ impl ProjectionOperationScope {
     pub(crate) const fn as_persisted_str(self) -> &'static str {
         match self {
             Self::DirectRequestPreparation => "directRequestPreparation",
+            Self::DirectRequestAcceptance => "directRequestAcceptance",
             Self::Creation => "creation",
             Self::PendingAdd => "pendingAdd",
             Self::Acceptance => "acceptance",
@@ -1491,6 +1493,7 @@ impl ProjectionOperationScope {
     pub(crate) fn from_persisted_str(value: &str) -> Result<Self, ProjectionPersistenceError> {
         match value {
             "directRequestPreparation" => Ok(Self::DirectRequestPreparation),
+            "directRequestAcceptance" => Ok(Self::DirectRequestAcceptance),
             "creation" => Ok(Self::Creation),
             "pendingAdd" => Ok(Self::PendingAdd),
             "acceptance" => Ok(Self::Acceptance),
@@ -1619,7 +1622,6 @@ impl Clone for ProjectionPersistenceAuthority {
         Self(Mutex::new(None))
     }
 }
-
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ProjectionPersistenceError {
@@ -2892,7 +2894,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         &self.config
     }
 
-
     pub(crate) async fn collect_admission_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -2910,7 +2911,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         .await
     }
 
-
     pub(crate) async fn collect_block_projection(
         &self,
         allocated_revision: AllocatedProjectionRevisionGuard,
@@ -2927,7 +2927,6 @@ impl<T: PublicTransport> RelationshipAuthority<T> {
         )
         .await
     }
-
 
     pub(crate) async fn collect_traffic_projection(
         &self,
@@ -3637,7 +3636,8 @@ fn relationship_operation_scope_matches(
                 | ProjectionOperationScope::Acceptance,
             ProjectionScope::Admission(_)
         ) | (
-            ProjectionOperationScope::RecoveryReservation
+            ProjectionOperationScope::DirectRequestAcceptance
+                | ProjectionOperationScope::RecoveryReservation
                 | ProjectionOperationScope::RecoveryFulfillment,
             ProjectionScope::BlockOnly(_)
         )
@@ -3974,6 +3974,7 @@ fn projection_operation_scope_tag(scope: ProjectionOperationScope) -> u8 {
         ProjectionOperationScope::RecoveryFulfillment => 4,
         ProjectionOperationScope::Traffic => 5,
         ProjectionOperationScope::DirectRequestPreparation => 6,
+        ProjectionOperationScope::DirectRequestAcceptance => 7,
     }
 }
 

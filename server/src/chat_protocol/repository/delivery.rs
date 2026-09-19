@@ -884,6 +884,7 @@ impl IntervalOpeningKind {
 /// `application_intervals_close_kind_check` exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IntervalCloseKind {
+    DirectRequest,
     Remove,
     Replace,
     Reset,
@@ -893,6 +894,7 @@ pub(crate) enum IntervalCloseKind {
 impl IntervalCloseKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::DirectRequest => "directRequest",
             Self::Remove => "remove",
             Self::Replace => "replace",
             Self::Reset => "reset",

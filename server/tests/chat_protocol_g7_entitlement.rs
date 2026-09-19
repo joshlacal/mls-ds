@@ -53,6 +53,7 @@ mod validation;
 
 #[path = "../src/chat_protocol"]
 mod chat_protocol {
+    pub mod direct_request_transcript { pub use catbird_server::chat_protocol::direct_request_transcript::*; }
     pub(crate) use cursor::{CursorSealer, OsSecureRandom, SecureRandom};
     pub mod cursor {
         pub use crate::cursor::*;

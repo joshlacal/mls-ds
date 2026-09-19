@@ -4791,12 +4791,12 @@ pub(crate) async fn load_historical_control_evidence(
     conversation_id: Uuid,
     transition_id: Uuid,
 ) -> Result<PersistedControlAuthority, ControlEvidenceLoadError> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
         r#"
         SELECT
             e.accepted_payload_bytes,
             e.signed_request_bytes,
-            dk.signing_public_key
+            dk.signing_public_key, e.outer_entry_fingerprint
         FROM chat.entries e
         JOIN chat.device_keys dk
           ON dk.user_did = e.actor_did
@@ -4811,9 +4811,17 @@ pub(crate) async fn load_historical_control_evidence(
     .fetch_optional(&mut **transaction)
     .await?;
 
-    let (public_row_json, raw_signed_wrapper, signing_public_key) =
+    let (public_row_json, raw_signed_wrapper, signing_public_key, stored_fingerprint) =
         row.ok_or(ControlEvidenceLoadError::EntryMissing)?;
 
+    let decoded = super::super::transcript::decode_and_verify_control_entry(&public_row_json, &signing_public_key)
+        .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)?;
+    if decoded.outer_control_fingerprint().as_slice() != stored_fingerprint {
+        return Err(ControlEvidenceLoadError::InvalidEvidence);
+    }
+    if matches!(decoded.mutation().kind(), SignedMutationKind::DirectRequestPublication | SignedMutationKind::DirectRequestAcceptance) {
+        verify_direct_request_durable_proof(transaction, conversation_id, transition_id, &public_row_json, &raw_signed_wrapper, &signing_public_key).await?;
+    }
     authority
         .hydrate_historical_control_from_durable_bytes(
             public_row_json,
@@ -4821,6 +4829,75 @@ pub(crate) async fn load_historical_control_evidence(
             &signing_public_key,
         )
         .map_err(|_| ControlEvidenceLoadError::InvalidEvidence)
+}
+
+/// Read-time authority for v2 rows includes the dedicated server receipt and
+/// immutable preparation, never a caller-provided verifying key. Historical
+/// keys were pinned from the configured authority DID at startup and retained.
+async fn verify_direct_request_durable_proof(
+    tx: &mut Transaction<'_, Postgres>, conversation_id: Uuid, transition_id: Uuid,
+    row_bytes: &[u8], signed_bytes: &[u8], actor_key: &[u8],
+) -> Result<(), ControlEvidenceLoadError> {
+    use super::super::direct_request_transcript::{verify_signed_request, verify_direct_request_preparation, verify_direct_request_acceptance_proof, DirectRequestKind};
+    use serde_json::Value;
+    let invalid = || ControlEvidenceLoadError::InvalidEvidence;
+    let row: Value = serde_json::from_slice(row_bytes).map_err(|_| invalid())?;
+    let publication = row["$type"] == "blue.catbird.chat.defs#directRequestEntry";
+    let verified = verify_signed_request(if publication { DirectRequestKind::Publish } else { DirectRequestKind::Accept }, signed_bytes, actor_key).map_err(|_| invalid())?;
+    let body = verified.body();
+    let request = Uuid::parse_str(body["requestId"].as_str().ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let mut untagged = row.clone(); untagged.as_object_mut().ok_or_else(invalid)?.remove("$type");
+    if publication {
+        let (prepare_bytes, terminal_bytes, stored_signed, stored_entry): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT a.prepare_response,a.terminal_response,p.signed_publication,p.request_entry FROM chat.direct_request_attempts a JOIN chat.direct_request_publications p USING(request_id) WHERE a.request_id=$1 AND p.conversation_id=$2 AND a.status='published'")
+            .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+        if request != transition_id || stored_signed != signed_bytes || stored_entry != row_bytes { return Err(invalid()); }
+        let prepare: Value = serde_json::from_slice(&prepare_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(tx, prepare["receiptKeyId"].as_str().ok_or_else(invalid)?).await?;
+        let prepare = verify_direct_request_preparation(&prepare_bytes, &key).map_err(|_| invalid())?;
+        for field in ["requestId", "firstMessageId", "conversationId", "recipientDid", "origin", "profile", "preparationDigest", "preparationRequestDigest"] {
+            if prepare[field] != body[field] { return Err(invalid()); }
+        }
+        for (creator, publication) in [("actorDid","actorDid"),("actorDeviceId","actorDeviceId"),("keyId","keyId"),("authGeneration","authGeneration")] {
+            if prepare["creator"][creator] != body[publication] { return Err(invalid()); }
+        }
+        let terminal: Value = serde_json::from_slice(&terminal_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(tx, terminal["body"]["keyId"].as_str().ok_or_else(invalid)?).await?;
+        let terminal = verify_signed_request(DirectRequestKind::Outcome, &terminal_bytes, &key).map_err(|_| invalid())?;
+        let receipt = &terminal.body()["receipt"];
+        if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
+            || receipt["requestId"] != body["requestId"] || receipt["coordinates"] != body["next"]
+            || receipt["firstMessageId"] != body["firstMessageId"]
+            || receipt["requestDigest"].as_str() != Some(base64::engine::general_purpose::STANDARD.encode(verified.request_digest()).as_str())
+            || receipt["preparationRequestDigest"] != body["preparationRequestDigest"]
+            || receipt["actorDid"] != body["actorDid"] || receipt["actorDeviceId"] != body["actorDeviceId"]
+            || receipt["actorKeyId"] != body["keyId"] || receipt["authGeneration"] != body["authGeneration"]
+        { return Err(invalid()); }
+        let selected = prepare["selectedDevices"].as_array().ok_or_else(invalid)?;
+        let deliveries = body["artifacts"]["welcome"]["deliveries"].as_array().ok_or_else(invalid)?;
+        if selected.len() != deliveries.len() || selected.iter().any(|s| deliveries.iter().filter(|d|
+            d["recipientDid"] == s["actorDid"] && d["recipientDeviceId"] == s["actorDeviceId"]
+            && d["keyPackageRef"] == s["keyPackage"]["keyPackageRef"]).count() != 1) { return Err(invalid()); }
+    } else {
+        let (proof_bytes, publication_bytes, sender_key): (Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT l.acceptance_proof,p.signed_publication,k.signing_public_key FROM chat.direct_request_lifecycle l JOIN chat.direct_request_publications p USING(request_id) JOIN chat.device_keys k ON k.user_did=p.actor_did AND k.device_id=p.actor_device_id AND k.key_id=p.actor_key_id WHERE l.request_id=$1 AND p.conversation_id=$2 AND l.consent IN ('accepted','closed') AND l.accepted_at IS NOT NULL AND l.acceptance_proof IS NOT NULL")
+            .bind(request).bind(conversation_id).fetch_optional(&mut **tx).await?.ok_or_else(invalid)?;
+        let proof: Value = serde_json::from_slice(&proof_bytes).map_err(|_| invalid())?;
+        let key = historical_request_receipt_key(tx, proof["receipt"]["body"]["keyId"].as_str().ok_or_else(invalid)?).await?;
+        let proof = verify_direct_request_acceptance_proof(&proof_bytes, &key, actor_key).map_err(|_| invalid())?;
+        let publication = verify_signed_request(DirectRequestKind::Publish, &publication_bytes, &sender_key).map_err(|_| invalid())?;
+        if proof["entry"] != untagged || body["transitionId"].as_str() != Some(transition_id.to_string().as_str())
+            || body["requestId"] != publication.body()["requestId"] || body["actorDid"] != publication.body()["recipientDid"]
+            || body["prior"]["conversationId"] != publication.body()["next"]["conversationId"]
+            || body["prior"]["generation"] != publication.body()["next"]["generation"]
+        { return Err(invalid()); }
+    }
+    Ok(())
+}
+
+async fn historical_request_receipt_key(tx: &mut Transaction<'_, Postgres>, key_id: &str) -> Result<Vec<u8>, ControlEvidenceLoadError> {
+    sqlx::query_scalar("SELECT public_key FROM chat.direct_request_receipt_keys WHERE key_id=$1 AND authority_did='did:web:chat.catbird.blue'")
+        .bind(key_id).fetch_optional(&mut **tx).await?.ok_or(ControlEvidenceLoadError::InvalidEvidence)
 }
 
 // ===========================================================================
@@ -5298,6 +5375,7 @@ pub(crate) async fn load_interval_hydration_rows(
             .map_err(|_| IntervalHydrationError::OutOfDomain)?;
         let generation = interval_u64(generation)?;
         let opening_kind = match opening_kind.as_str() {
+            "directRequest" => OpeningKind::DirectRequest,
             "creation" => OpeningKind::Creation,
             "add" => OpeningKind::Add,
             "reset" => OpeningKind::Reset,
@@ -5330,6 +5408,7 @@ pub(crate) async fn load_interval_hydration_rows(
             (None, None) => None,
             (Some(closing_transition_id), Some(closing_kind)) => {
                 let kind = match closing_kind.as_str() {
+                    "directRequest" => CloseKind::DirectRequest,
                     "remove" => CloseKind::Remove,
                     "replace" => CloseKind::Replace,
                     "reset" => CloseKind::Reset,
@@ -5604,6 +5683,8 @@ pub(crate) fn retained_metadata_head_from_current_evidence<'a>(
         .ok_or(MetadataHydrationError::InvalidProvenance)?
         .kind();
     let kind = match signed_kind {
+        SignedMutationKind::DirectRequestPublication => "directRequestPublication",
+        SignedMutationKind::DirectRequestAcceptance => "directRequestAcceptance",
         SignedMutationKind::Creation => "creation",
         SignedMutationKind::CommitTransition => "commit",
         SignedMutationKind::PolicyTransition => "policy",
@@ -5618,6 +5699,7 @@ pub(crate) fn retained_metadata_head_from_current_evidence<'a>(
     };
     if matches!(
         signed_kind,
+        SignedMutationKind::DirectRequestPublication |
         SignedMutationKind::Creation
             | SignedMutationKind::CommitTransition
             | SignedMutationKind::MetadataTransition
@@ -5712,14 +5794,14 @@ pub(crate) fn select_retained_metadata_producer(
     }
 
     match head.current_kind {
-        "creation" | "commit" | "metadata" | "leafRecovery" | "leaveCommit" | "resetActivation" => {
+        "directRequestPublication" | "creation" | "commit" | "metadata" | "leafRecovery" | "leaveCommit" | "resetActivation" => {
             if candidate.transition_id != head.current_transition_id
                 || candidate.seq != head.current_seq
             {
                 return Err(MetadataHydrationError::OutOfDomain);
             }
         }
-        "policy" | "acceptConversation" | "leavePolicy" | "closeConversation" => {
+        "directRequestAcceptance" | "policy" | "acceptConversation" | "leavePolicy" | "closeConversation" => {
             if candidate.transition_id == head.current_transition_id
                 || candidate.seq >= head.current_seq
             {
@@ -10097,6 +10179,7 @@ fn graph_digest_interval(digest: &mut Sha256, value: &IntervalHydrationRow) {
     digest.update(value.generation.to_be_bytes());
     graph_digest_transition(digest, &value.opening);
     digest.update([match value.opening_kind {
+        OpeningKind::DirectRequest => 4,
         OpeningKind::Creation => 1,
         OpeningKind::Add => 2,
         OpeningKind::Reset => 3,
@@ -10105,6 +10188,7 @@ fn graph_digest_interval(digest: &mut Sha256, value: &IntervalHydrationRow) {
     graph_digest_option(digest, value.end.as_ref(), |digest, end| {
         graph_digest_transition(digest, &end.evidence);
         digest.update([match end.kind {
+            CloseKind::DirectRequest => 5,
             CloseKind::Remove => 1,
             CloseKind::Replace => 2,
             CloseKind::Reset => 3,

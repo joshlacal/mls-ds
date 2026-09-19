@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PublicationError {
+    #[error("request publication producers disabled")]
+    Disabled,
     #[error(transparent)]
     Store(#[from] DirectRequestStoreError),
     #[error(transparent)]
@@ -29,7 +31,7 @@ pub(crate) enum PublicationError {
 }
 pub(crate) enum PublicationPreparation {
     Terminal(Vec<u8>),
-    Ready(PreparedPublication),
+    Ready(Box<PreparedPublication>),
 }
 /// Private, single-use authority. It is intentionally not Clone. A HTTP
 /// handler cannot synthesize this from a DTO or reuse it in another transaction.
@@ -115,6 +117,7 @@ pub(crate) async fn prepare_publication<T: PublicTransport>(
     signer: &DirectRequestReceiptSigner,
     policy: &RelationshipAuthority<T>,
     now: DateTime<Utc>,
+    producers_enabled: bool,
 ) -> Result<PublicationPreparation, PublicationError> {
     let candidate = match preparation::admit_publication(tx, principal, raw, now).await? {
         DirectRequestPublicationAdmission::Terminal(bytes) => {
@@ -122,6 +125,9 @@ pub(crate) async fn prepare_publication<T: PublicTransport>(
         }
         DirectRequestPublicationAdmission::Candidate(candidate) => candidate,
     };
+    if !producers_enabled {
+        return Err(PublicationError::Disabled);
+    }
     if let Err(error) = candidate.validate_preparation(tx).await {
         let code = match error {
             DirectRequestStoreError::Expired => "PreparationExpired",
@@ -256,7 +262,11 @@ pub(crate) async fn prepare_publication<T: PublicTransport>(
         &actor_key,
         &selected,
         prior.as_ref(),
-        u64::try_from(now.timestamp()).map_err(|_| PublicationError::Invariant)?,
+        u64::try_from(
+            candidate.trusted_instant().timestamp()
+                + i64::from(candidate.trusted_instant().timestamp_subsec_nanos() != 0),
+        )
+        .map_err(|_| PublicationError::Invariant)?,
     ) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
@@ -290,15 +300,17 @@ pub(crate) async fn prepare_publication<T: PublicTransport>(
     let transaction_id = sqlx::query_scalar("SELECT txid_current()::text")
         .fetch_one(&mut **tx)
         .await?;
-    Ok(PublicationPreparation::Ready(PreparedPublication {
-        transaction_id,
-        candidate,
-        bootstrap,
-        actor_key,
-        selected,
-        prior,
-        next_seq,
-    }))
+    Ok(PublicationPreparation::Ready(Box::new(
+        PreparedPublication {
+            transaction_id,
+            candidate,
+            bootstrap,
+            actor_key,
+            selected,
+            prior,
+            next_seq,
+        },
+    )))
 }
 
 fn binary(value: &Value) -> Result<Vec<u8>, PublicationError> {
@@ -319,12 +331,46 @@ fn encode(value: &Value) -> Result<Vec<u8>, PublicationError> {
 /// group or sends the initial message independently.
 pub(crate) async fn execute_publication<T: PublicTransport>(
     tx: &mut Transaction<'_, Postgres>,
-    prepared: PreparedPublication,
+    mut prepared: PreparedPublication,
     signer: &DirectRequestReceiptSigner,
     policy: &RelationshipAuthority<T>,
 ) -> Result<Vec<u8>, PublicationError> {
     prepared.require_transaction(tx).await?;
     prepared.candidate.validate_policy(tx, policy).await?;
+    prepared.candidate.refresh_instant(tx).await?;
+    let now = prepared.candidate.trusted_instant();
+    // Round upward: the SQL deadline includes fractional acceptance seconds.
+    // Revalidate after every lock/policy wait, before constructing persisted time.
+    prepared.bootstrap = match direct_request::verify_bootstrap(
+        prepared.candidate.signed(),
+        &prepared.actor_key,
+        &prepared.selected,
+        prepared.prior.as_ref(),
+        u64::try_from(now.timestamp() + i64::from(now.timestamp_subsec_nanos() != 0))
+            .map_err(|_| PublicationError::Invariant)?,
+    ) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            let code = match error {
+                direct_request::BootstrapError::ImportDeadline => "ImportHorizonTooShort",
+                direct_request::BootstrapError::LegacyIneligible => "StaleLegacyPrior",
+                _ => "InvalidBootstrap",
+            };
+            return match terminal(
+                tx,
+                prepared.candidate,
+                signer,
+                PublicationDisposition::Rejected,
+                "directRequestRejectedReceipt",
+                json!({"code":code}),
+            )
+            .await?
+            {
+                PublicationPreparation::Terminal(bytes) => Ok(bytes),
+                PublicationPreparation::Ready(_) => Err(PublicationError::Invariant),
+            };
+        }
+    };
     let b = prepared.candidate.signed().body().clone();
     let signed_bytes = prepared
         .candidate
@@ -429,6 +475,10 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         .bind(request).bind(convo).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(&signed_bytes).bind(encode(&b)?).bind(&transcript).bind(digest).bind(&signature).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64)).bind(generation).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64+1)).bind(prepared.prior.map(|_|generation)).bind(prepared.prior.map(|_|1i64)).bind(metadata_id).bind(seq).bind(now).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at,message_id) VALUES($1,$2,$3,'blue.catbird.chat.defs#directRequestEntry',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16,$17,$18)")
         .bind(convo).bind(seq).bind(entry_id).bind(&entry_bytes).bind(Sha256::digest(&entry_bytes).as_slice()).bind(&signed_bytes).bind(digest).bind(&signature).bind(&server_fields).bind(fingerprint.as_slice()).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(generation).bind(request).bind(now).bind(id(&b["firstMessageId"])?).execute(&mut **tx).await?;
+    // A successor entry also closes every predecessor device's schedule.
+    // Keep intervalClose if a device is included again in the successor.
+    sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) SELECT conversation_id,$2,recipient_did,recipient_device_id,'intervalClose' FROM chat.application_intervals WHERE conversation_id=$1 AND closing_transition_id=$3")
+        .bind(convo).bind(seq).bind(request).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.metadata_snapshots(metadata_snapshot_id,conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,producing_transition_id,origin_transition_id,metadata_version,nonce,ciphertext,ciphertext_sha256,ciphertext_size,author_did,author_device_id,author_key_id,author_public_key,author_auth_generation,author_origin_seq,author_role,author_device_status,created_at) VALUES($1,$2,$3,1,$4,1,$5,$6,$7,$7,1,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'admin','active',$18)")
         .bind(metadata_id).bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(next.group_context_hash().as_slice()).bind(next.confirmation_tag().as_slice()).bind(request).bind(binary(&metadata["nonce"])?).bind(&metadata_ciphertext).bind(Sha256::digest(&metadata_ciphertext).as_slice()).bind(metadata_ciphertext.len() as i64).bind(actor).bind(actor_device).bind(actor_key).bind(&prepared.actor_key).bind(auth).bind(seq).bind(now).execute(&mut **tx).await?;
     if prepared.prior.is_none() {
@@ -461,6 +511,8 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
             .selected
             .iter()
             .find(|s| s.did == did && s.device_id == device);
+        sqlx::query("INSERT INTO chat.entry_recipients(conversation_id,seq,user_did,device_id,entitlement_kind) VALUES($1,$2,$3,$4,'control') ON CONFLICT DO NOTHING")
+            .bind(convo).bind(seq).bind(did).bind(device).execute(&mut **tx).await?;
         let leaf_id = Uuid::new_v4();
         sqlx::query("INSERT INTO chat.member_devices(leaf_period_id,participant_period_id,conversation_id,generation,user_did,device_id,leaf_index,basic_credential,leaf_signature_key,leaf_key_id,leaf_auth_generation,origin,join_key_package_ref,joined_state_version,joined_transition_id,joined_seq,active,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14,$15,true,$16)")
             .bind(leaf_id).bind(participant).bind(convo).bind(generation).bind(did).bind(device).bind(leaf.leaf_index() as i64).bind(leaf.basic_credential()).bind(leaf.signature_key()).bind(key_id.as_str()).bind(generation_auth).bind(if selected.is_some(){"keyPackage"}else{"genesis"}).bind(selected.map(|s|s.package_ref.to_vec())).bind(request).bind(seq).bind(now).execute(&mut **tx).await?;
@@ -488,16 +540,8 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     )?;
     let position:i64=sqlx::query_scalar("INSERT INTO chat.events(event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id) SELECT $1,'conversationChanged',$2,$3,$4,protocol_instance_id FROM chat.protocol_instances RETURNING event_position")
         .bind(event_id).bind(&event).bind(Sha256::digest(&event).as_slice()).bind(now).fetch_one(&mut **tx).await?;
-    for leaf in final_state.binding().tree_summary().leaves() {
-        let identity = std::str::from_utf8(leaf.basic_credential())
-            .map_err(|_| PublicationError::Invariant)?;
-        let (did, device) = identity
-            .rsplit_once('#')
-            .ok_or(PublicationError::Invariant)?;
-        let device = Uuid::parse_str(device).map_err(|_| PublicationError::Invariant)?;
-        sqlx::query("INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) VALUES($1,$2,$3,'leaf',(SELECT max(event_position) FROM chat.event_recipients WHERE user_did=$2 AND device_id=$3))")
-            .bind(position).bind(did).bind(device).execute(&mut **tx).await?;
-    }
+    sqlx::query("INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) SELECT $1,r.user_did,r.device_id,CASE WHEN EXISTS(SELECT 1 FROM chat.member_devices m WHERE m.conversation_id=r.conversation_id AND m.user_did=r.user_did AND m.device_id=r.device_id AND m.joined_transition_id=$4) THEN 'leaf' ELSE 'historicalSchedule' END,(SELECT max(previous.event_position) FROM chat.event_recipients previous WHERE previous.user_did=r.user_did AND previous.device_id=r.device_id) FROM chat.entry_recipients r WHERE r.conversation_id=$2 AND r.seq=$3 ORDER BY r.user_did,r.device_id")
+        .bind(position).bind(convo).bind(seq).bind(request).execute(&mut **tx).await?;
     for kind in ["stream", "notification"] {
         sqlx::query("INSERT INTO chat.outbox(outbox_id,event_position,work_kind,status,next_attempt_at,created_at) VALUES($1,$2,$3,'pending',$4,$4)").bind(Uuid::new_v4()).bind(position).bind(kind).bind(now).execute(&mut **tx).await?;
     }

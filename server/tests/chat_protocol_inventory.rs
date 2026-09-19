@@ -48,6 +48,7 @@ mod relationship_policy_source;
 // populated materialization tests, and so the B-read admission seam
 // (`dpop`/`read_authority`/`repository::auth`) is drivable for real.
 mod chat_protocol {
+    pub mod direct_request_transcript { pub use catbird_server::chat_protocol::direct_request_transcript::*; }
     pub mod cursor {
         pub use crate::cursor::*;
     }

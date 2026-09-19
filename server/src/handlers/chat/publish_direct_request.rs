@@ -61,6 +61,7 @@ async fn inner(
         signer,
         runtime.relationship_authority().as_ref(),
         now,
+        runtime.request_producers_enabled(),
     )
     .await
     .map_err(failure)?;
@@ -68,7 +69,7 @@ async fn inner(
         PublicationPreparation::Terminal(bytes) => bytes,
         PublicationPreparation::Ready(prepared) => direct_request_publication::execute_publication(
             &mut tx,
-            prepared,
+            *prepared,
             signer,
             runtime.relationship_authority().as_ref(),
         )
@@ -89,6 +90,9 @@ fn failure(error: PublicationError) -> ChatFailure {
     use crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError as E;
     let endpoint = ChatEndpoint::PublishDirectRequest;
     match error {
+        PublicationError::Disabled => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CutoverRequired)
+        }
         PublicationError::Database(_) | PublicationError::Store(E::Database(_)) => {
             ChatFailure::storage(endpoint)
         }

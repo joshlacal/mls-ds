@@ -943,6 +943,8 @@ macro_rules! signed_mutation_kinds {
 }
 
 signed_mutation_kinds!(
+    (DirectRequestPublication, "directRequestPublicationBody", "CATBIRD-DIRECT-REQUEST-PUBLISH\0"),
+    (DirectRequestAcceptance, "directRequestAcceptanceBody", "CATBIRD-DIRECT-REQUEST-ACCEPT\0"),
     (
         DeviceEnrollment,
         "deviceEnrollmentBody",
@@ -1286,6 +1288,14 @@ fn canonical_from_projected(
 pub fn decode_canonical_signed_mutation(
     raw_json: &[u8],
 ) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
+    let canonical = decode_historical_signed_mutation(raw_json)?;
+    if matches!(canonical.kind(), SignedMutationKind::DirectRequestPublication | SignedMutationKind::DirectRequestAcceptance) {
+        return Err(AuthPrimitiveError::invalid("direct request requires dedicated admission"));
+    }
+    Ok(canonical)
+}
+
+fn decode_historical_signed_mutation(raw_json: &[u8]) -> Result<CanonicalSignedMutation, AuthPrimitiveError> {
     let raw = decode_raw_json(raw_json)?;
     let RawJson::Object(wrapper) = raw else {
         return Err(AuthPrimitiveError::invalid("signed wrapper must be object"));
@@ -1527,6 +1537,8 @@ macro_rules! projection_types {
 }
 
 projection_types!(
+    (DirectRequestPublication, DirectRequestPublicationProjection),
+    (DirectRequestAcceptance, DirectRequestAcceptanceProjection),
     (DeviceEnrollment, DeviceEnrollmentProjection),
     (KeyPackageReplenishment, KeyPackageReplenishmentProjection),
     (
@@ -1559,6 +1571,8 @@ projection_types!(
 
 fn projection_for(value: &VerifiedSignedMutation) -> VerifiedMutationProjection<'_> {
     match value.kind() {
+        SignedMutationKind::DirectRequestPublication => VerifiedMutationProjection::DirectRequestPublication(DirectRequestPublicationProjection(value)),
+        SignedMutationKind::DirectRequestAcceptance => VerifiedMutationProjection::DirectRequestAcceptance(DirectRequestAcceptanceProjection(value)),
         SignedMutationKind::DeviceEnrollment => {
             VerifiedMutationProjection::DeviceEnrollment(DeviceEnrollmentProjection(value))
         }
@@ -2468,6 +2482,8 @@ macro_rules! control_entry_kinds {
 }
 
 control_entry_kinds!(
+    (DirectRequestPublication, "directRequestEntry", DirectRequestPublication, None),
+    (DirectRequestAcceptance, "directRequestAcceptanceEntry", DirectRequestAcceptance, None),
     (Commit, "commitEntry", CommitTransition, None),
     (Policy, "policyEntry", PolicyTransition, None),
     (Metadata, "metadataEntry", MetadataTransition, None),
@@ -2516,6 +2532,7 @@ control_entry_kinds!(
 impl ControlEntryKind {
     fn endpoint(self) -> &'static str {
         match self {
+            Self::DirectRequestPublication | Self::DirectRequestAcceptance => "historical-only",
             Self::Creation => "blue.catbird.chat.createConversation",
             Self::ParticipantAcceptance => "blue.catbird.chat.acceptConversation",
             Self::ConversationClose => "blue.catbird.chat.closeConversation",
@@ -3376,7 +3393,8 @@ pub fn rebind_persisted_control_entry(
     raw_signed_wrapper: &[u8],
     historical_public_key: &[u8],
 ) -> Result<VerifiedControlEntry, AuthPrimitiveError> {
-    let mutation = decode_and_verify_signed_mutation(raw_signed_wrapper, historical_public_key)?;
+    let canonical = decode_historical_signed_mutation(raw_signed_wrapper)?;
+    let mutation = verify_signed_mutation(canonical, historical_public_key)?;
     let original = entry.mutation();
     if mutation.kind() != original.kind()
         || mutation.type_id() != original.type_id()
@@ -3477,7 +3495,26 @@ fn finish_verified_control_entry(
         "receivedAt".into(),
         DagValue::Timestamp(received_at.clone()),
     );
-    let fingerprint = control_fingerprint_from_projection(kind, &projection)?;
+    let fingerprint = if matches!(kind, ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance) {
+        let row = BTreeMap::from([
+            ("entryId".to_owned(), DagValue::Uuid(entry_id.clone())),
+            ("conversationId".to_owned(), DagValue::Uuid(conversation_id.clone())),
+            ("seq".to_owned(), DagValue::Integer(seq)),
+            ("receivedAt".to_owned(), DagValue::Timestamp(received_at.clone())),
+            ("signedRequest".to_owned(), DagValue::Map(BTreeMap::from([
+                ("body".to_owned(), DagValue::Map(mutation.canonical.body.clone())),
+                ("signature".to_owned(), DagValue::Bytes(mutation.signature().to_vec())),
+            ]))),
+        ]);
+        let canonical_projection = serde_ipld_dagcbor::to_vec(&DagMapRef(&row))
+            .map_err(|_| AuthPrimitiveError::invalid("direct entry canonical encoding"))?;
+        let domain: &[u8] = match kind {
+            ControlEntryKind::DirectRequestPublication => b"CATBIRD-DIRECT-REQUEST-ENTRY\0",
+            _ => b"CATBIRD-DIRECT-REQUEST-ACCEPTANCE-ENTRY\0",
+        };
+        let mut hash = Sha256::new(); hash.update(domain); hash.update(&canonical_projection);
+        CanonicalControlFingerprint { kind, canonical_projection, fingerprint: hash.finalize().into() }
+    } else { control_fingerprint_from_projection(kind, &projection)? };
     Ok(VerifiedControlEntry {
         kind,
         entry_id,
@@ -3522,7 +3559,7 @@ fn signed_body_conversation_id(
 ) -> Result<&CanonicalUuidV4, AuthPrimitiveError> {
     if matches!(
         canonical.kind(),
-        SignedMutationKind::Creation | SignedMutationKind::LeaveCancellation
+        SignedMutationKind::Creation | SignedMutationKind::LeaveCancellation | SignedMutationKind::DirectRequestPublication
     ) {
         return Ok(body_uuid(&canonical.body, "conversationId"));
     }
@@ -3572,3 +3609,10 @@ pub(crate) fn project_direct_request_contract(raw: &[u8], name: &str, tagged: bo
 }
 
 pub(crate) fn validate_direct_request_strict_json(raw:&[u8])->Result<(),AuthPrimitiveError> {decode_raw_json(raw)?;Ok(())}
+
+impl<'a> DirectRequestPublicationProjection<'a> {
+    pub fn body(&self) -> ClosedObjectRef<'a> { ClosedObjectRef(&self.0.canonical.body) }
+}
+impl<'a> DirectRequestAcceptanceProjection<'a> {
+    pub fn body(&self) -> ClosedObjectRef<'a> { ClosedObjectRef(&self.0.canonical.body) }
+}

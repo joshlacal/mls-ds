@@ -10383,6 +10383,7 @@ fn closing_leaf_period(
 
 fn repo_interval_close_kind(kind: CloseKind) -> IntervalCloseKind {
     match kind {
+        CloseKind::DirectRequest => IntervalCloseKind::DirectRequest,
         CloseKind::Remove => IntervalCloseKind::Remove,
         CloseKind::Replace => IntervalCloseKind::Replace,
         CloseKind::Reset => IntervalCloseKind::Reset,

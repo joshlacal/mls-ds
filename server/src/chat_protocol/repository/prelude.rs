@@ -2782,6 +2782,7 @@ pub(crate) async fn prepare_typing_admission(
             .collect::<Vec<_>>(),
     )
     .await?;
+    super::direct_request_lifecycle::enforce_ordinary_mutation(transaction, &authority).await?;
     Ok(PreparedTypingOperation {
         authority,
         scope: ScopeBoundBusinessAuthority { locked: business },

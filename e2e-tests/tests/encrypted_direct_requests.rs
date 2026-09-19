@@ -60,7 +60,7 @@ async fn guarded_database_is_local_owned_and_contains_reviewed_baseline() -> any
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn enrollment_uses_independent_real_mls_stores() -> anyhow::Result<()> {
     let mut rig = RequestRig::local().await?;
     rig.enroll("alice", 2).await?;
@@ -70,7 +70,7 @@ async fn enrollment_uses_independent_real_mls_stores() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow::Result<()> {
     let mut rig = RequestRig::local().await?;
     rig.enroll("alice", 1).await?;

@@ -81,6 +81,11 @@ fn timestamp(value: &Value) -> Result<u64, BootstrapError> {
     let instant =
         chrono::DateTime::parse_from_rfc3339(value.as_str().ok_or(BootstrapError::Binding)?)
             .map_err(|_| BootstrapError::Binding)?;
+    // MLS leaf lifetimes and the native bootstrap deadline use whole seconds.
+    // Reject fractional deadlines instead of truncating signed authority.
+    if instant.timestamp_subsec_nanos() != 0 {
+        return Err(BootstrapError::Binding);
+    }
     u64::try_from(instant.timestamp()).map_err(|_| BootstrapError::Binding)
 }
 fn coordinate(value: &Value) -> Result<PublicGroupSnapshotCoordinate, BootstrapError> {
@@ -353,4 +358,142 @@ pub(crate) fn verify_bootstrap(
         import_until: until,
         total_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    // Deliberately opt-in: retained randomized XWING bytes are evidence inputs,
+    // not fabricated MLS messages or an authority-construction test shortcut.
+    #[test]
+    #[ignore = "requires T02_CORPUS_DIR retained real XWING corpus"]
+    fn complete_signed_real_bootstrap_validation() {
+        let root = std::env::var("T02_CORPUS_DIR").expect("retained corpus path");
+        for (name, leaves, valid) in [
+            ("leaves-2", 2, true),
+            ("leaves-3", 3, false),
+            ("leaves-40", 40, true),
+            ("leaves-2-legacy", 2, true),
+        ] {
+            let dir = std::path::Path::new(&root).join(name);
+            let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+            let ctx: Value = serde_json::from_slice(&read("context.json")).unwrap();
+            let next: Value = serde_json::from_slice(&read("coordinates.json")).unwrap();
+            let times: Value = serde_json::from_slice(&read("lifetimes.json")).unwrap();
+            let now = times["now"].as_u64().unwrap();
+            let until = times["minimumImportUntil"].as_u64().unwrap();
+            let format_time = |seconds| {
+                chrono::DateTime::from_timestamp(seconds as i64, 0)
+                    .unwrap()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            };
+            let actor_key = read("actor-signature-public-key.bin");
+            let signing = SigningKey::from_bytes(&[1; 32]);
+            assert_eq!(signing.verifying_key().as_bytes().as_slice(), actor_key);
+            let context_hash =
+                transcript::direct_request_context_hash(&serde_json::to_vec(&ctx).unwrap())
+                    .unwrap();
+            let mut selected = Vec::new();
+            let mut deliveries = Vec::new();
+            for index in 1..leaves {
+                let key = SigningKey::from_bytes(&[index as u8 + 1; 32]);
+                let did = ctx[if index % 2 == 0 {
+                    "actorDid"
+                } else {
+                    "recipientDid"
+                }]
+                .as_str()
+                .unwrap();
+                let device =
+                    Uuid::parse_str(&format!("00000000-0000-4000-8000-{index:012}")).unwrap();
+                let grant = Uuid::new_v4();
+                let package_ref = hash(&times["expectedAddedPackageRefs"][index - 1]).unwrap();
+                selected.push(GrantedRequestDevice {
+                    did: did.into(),
+                    device_id: device,
+                    signature_key: key.verifying_key().as_bytes().to_vec(),
+                    package_ref,
+                    grant_id: grant,
+                    grant_revision: 1,
+                    grant_expires_at: until,
+                });
+                deliveries.push(json!({"recipientDid":did,"recipientDeviceId":device.to_string(),"provenance":{"requestId":ctx["requestId"],"preparationDigest":ctx["preparationDigest"],"contextHash":STANDARD.encode(context_hash),"grantId":grant.to_string(),"grantRevision":1,"keyPackageRef":STANDARD.encode(package_ref),"importUntil":format_time(until)}}));
+            }
+            let mut metadata_coord = next.clone();
+            metadata_coord
+                .as_object_mut()
+                .unwrap()
+                .remove("stateVersion");
+            metadata_coord.as_object_mut().unwrap().remove("lifecycle");
+            metadata_coord["conversationId"] = json!(STANDARD.encode(
+                Uuid::parse_str(ctx["conversationId"].as_str().unwrap())
+                    .unwrap()
+                    .as_bytes()
+            ));
+            let metadata = read("metadata.bin");
+            let artifact = |file, content| {
+                let raw = read(file);
+                json!({"framing":"mlsMessage","contentType":content,"bytes":STANDARD.encode(&raw),"sha256":STANDARD.encode(Sha256::digest(raw))})
+            };
+            let welcome = read("welcome.mls");
+            let metadata_snapshot = json!({"coordinate":metadata_coord,"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(read("metadata-nonce.bin")),"ciphertext":STANDARD.encode(&metadata),"ciphertextSha256":STANDARD.encode(Sha256::digest(&metadata)),"ciphertextSize":metadata.len(),"authorProof":{"authorDid":ctx["actorDid"],"authorDeviceId":ctx["actorDeviceId"],"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(&actor_key),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
+            let artifacts = json!({"genesisGroupInfo":artifact("genesis.mls","groupInfo"),"addCommit":artifact("add.mls","publicMessageCommit"),"finalGroupInfo":artifact("final.mls","groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&welcome),"sha256":STANDARD.encode(Sha256::digest(&welcome)),"deliveries":deliveries},"metadataSnapshot":metadata_snapshot,"initialCiphertext":STANDARD.encode(read("application.mls"))});
+            let mut body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode([43u8;32]),"contextHash":STANDARD.encode(context_hash),"next":next,"importUntil":format_time(until),"artifacts":artifacts,"idempotencyKey":Uuid::new_v4().to_string(),"signedAt":format_time(now)});
+            let verify = |body: &Value| {
+                let message = transcript::direct_request_signing_bytes(
+                    DirectRequestKind::Publish,
+                    &serde_json::to_vec(body).unwrap(),
+                )
+                .unwrap();
+                let wrapper = json!({"body":body,"signature":STANDARD.encode(signing.sign(&message).to_bytes())});
+                transcript::verify_signed_request(
+                    DirectRequestKind::Publish,
+                    &serde_json::to_vec(&wrapper).unwrap(),
+                    &actor_key,
+                )
+                .unwrap()
+            };
+            let prior = if name.ends_with("legacy") {
+                Some(coordinate(&ctx["origin"]["exactPrior"]).unwrap())
+            } else {
+                None
+            };
+            let result =
+                verify_bootstrap(&verify(&body), &actor_key, &selected, prior.as_ref(), now);
+            if valid {
+                assert!(
+                    result.is_ok(),
+                    "{name}: {}",
+                    result.err().map(|e| e.to_string()).unwrap_or_default()
+                );
+                let mut fractional_deadline = body.clone();
+                fractional_deadline["importUntil"] =
+                    json!(format_time(until).replace(".000Z", ".123Z"));
+                assert!(matches!(
+                    verify_bootstrap(
+                        &verify(&fractional_deadline),
+                        &actor_key,
+                        &selected,
+                        prior.as_ref(),
+                        now
+                    ),
+                    Err(BootstrapError::Binding)
+                ));
+                body["artifacts"]["metadataSnapshot"]["authorProof"]["authorDid"] =
+                    ctx["recipientDid"].clone();
+                assert!(
+                    verify_bootstrap(&verify(&body), &actor_key, &selected, prior.as_ref(), now)
+                        .is_err(),
+                    "signed substituted metadata author must fail"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(BootstrapError::ImportDeadline)),
+                    "short sibling must bound complete bootstrap"
+                );
+            }
+        }
+    }
 }

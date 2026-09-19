@@ -42,30 +42,60 @@ async fn handle_inner(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ChatFailure> {
-    let v2 = crate::chat_protocol::direct_request_transcript::direct_request_acceptance_endpoint_is_v2(body)
+    let v2 =
+        crate::chat_protocol::direct_request_transcript::direct_request_acceptance_endpoint_is_v2(
+            body,
+        )
         .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
     if v2 {
         context::require_cutover(runtime, endpoint)?;
-        let signer = runtime.request_receipt_signer().ok_or_else(|| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CutoverRequired))?;
+        let signer = runtime.request_receipt_signer().ok_or_else(|| {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::CutoverRequired)
+        })?;
         let principal = context::verify_service_principal(pool, endpoint, headers).await?;
         #[derive(serde::Deserialize)]
-        struct Envelope<'a> { #[serde(rename="directRequest", borrow)] request: &'a serde_json::value::RawValue }
-        let envelope: Envelope = serde_json::from_slice(body).map_err(|_|ChatFailure::protocol(endpoint,ChatProtocolErrorCode::InvalidRequest))?;
-        let now = crate::chat_protocol::validation::TrustedRequestInstant::capture().map_err(|_|ChatFailure::invariant(endpoint))?.datetime();
-        let mut tx = pool.begin().await.map_err(|_|ChatFailure::storage(endpoint))?;
-        let bytes = acceptance::accept_direct_request(&mut tx, &principal, envelope.request.get().as_bytes(), signer, now).await.map_err(|error| {
+        struct Envelope<'a> {
+            #[serde(rename = "directRequest", borrow)]
+            request: &'a serde_json::value::RawValue,
+        }
+        let envelope: Envelope = serde_json::from_slice(body)
+            .map_err(|_| ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidRequest))?;
+        let now = crate::chat_protocol::validation::TrustedRequestInstant::capture()
+            .map_err(|_| ChatFailure::invariant(endpoint))?
+            .datetime();
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
+        let bytes = acceptance::accept_direct_request(
+            &mut tx,
+            &principal,
+            envelope.request.get().as_bytes(),
+            signer,
+            runtime.relationship_authority().as_ref(),
+            now,
+        )
+        .await
+        .map_err(|error| {
             use acceptance::DirectAcceptanceError as E;
             use ChatProtocolErrorCode as C;
             match error {
                 E::Database(_) => ChatFailure::storage(endpoint),
-                E::InvalidSignature => ChatFailure::protocol(endpoint,C::InvalidSignature),
-                E::InvalidRequest => ChatFailure::protocol(endpoint,C::InvalidRequest),
-                E::NotPending | E::Expired => ChatFailure::protocol(endpoint,C::InvitationNotPending),
-                E::StaleCoordinates => ChatFailure::protocol(endpoint,C::StaleCoordinates),
+                E::InvalidSignature => ChatFailure::protocol(endpoint, C::InvalidSignature),
+                E::InvalidRequest => ChatFailure::protocol(endpoint, C::InvalidRequest),
+                E::NotPending | E::Expired => {
+                    ChatFailure::protocol(endpoint, C::InvitationNotPending)
+                }
+                E::StaleCoordinates => ChatFailure::protocol(endpoint, C::StaleCoordinates),
+                E::PolicyUnavailable => {
+                    ChatFailure::protocol(endpoint, C::RelationshipPolicyUnavailable)
+                }
                 E::Invariant => ChatFailure::invariant(endpoint),
             }
         })?;
-        tx.commit().await.map_err(|_|ChatFailure::storage(endpoint))?;
+        tx.commit()
+            .await
+            .map_err(|_| ChatFailure::storage(endpoint))?;
         return Ok(context::json_ok(bytes));
     }
     let admission =

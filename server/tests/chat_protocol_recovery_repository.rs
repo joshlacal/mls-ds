@@ -20,6 +20,7 @@ mod snapshot {
 }
 
 mod chat_protocol {
+    pub mod direct_request_transcript { pub use catbird_server::chat_protocol::direct_request_transcript::*; }
     pub mod dpop {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
