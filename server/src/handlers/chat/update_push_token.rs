@@ -26,7 +26,12 @@ const ENDPOINT: ChatEndpoint = ChatEndpoint::UpdatePushToken;
 #[derive(Deserialize)]
 struct UpdatePushTokenBody {
     token: Option<String>,
+    #[serde(default, deserialize_with = "present_registration")]
     registration: Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>,
+}
+
+fn present_registration<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<catbird_atproto::blue_catbird::chat::SignedPushRegistration>, D::Error> {
+    catbird_atproto::blue_catbird::chat::SignedPushRegistration::deserialize(deserializer).map(Some)
 }
 
 pub(super) async fn handle(
@@ -75,15 +80,11 @@ async fn update_push_token(
                 ));
             }
         }
-        let now = crate::chat_protocol::validation::TrustedRequestInstant::capture()
-            .map_err(|_| ChatFailure::invariant(ENDPOINT))?
-            .datetime();
         let (view, binding) = crate::chat_protocol::repository::push_binding::register(
             pool,
             principal.did(),
             registration,
             parsed.token.as_deref(),
-            now,
         )
         .await
         .map_err(|error| match error {
@@ -165,6 +166,14 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn present_null_or_malformed_registration_never_uses_legacy_clear() {
+        for payload in [r#"{"registration":null}"#, r#"{"registration":{}}"#, r#"{"registration":false}"#] {
+            assert!(serde_json::from_str::<UpdatePushTokenBody>(payload).is_err());
+        }
+        assert!(serde_json::from_str::<UpdatePushTokenBody>("{}").unwrap().registration.is_none());
     }
 
     #[test]
