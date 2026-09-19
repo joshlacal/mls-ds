@@ -295,18 +295,22 @@ mod tests {
         .await
         .unwrap());
         let other_device = Uuid::new_v4();
+        let other_key = SigningKey::from_bytes(&[71; 32]);
+        let other_public = other_key.verifying_key().to_bytes();
+        let other_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(other_public));
         sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'push collision fixture','active',$3,1,chat.protocol_capabilities(),$4,$4)")
-            .bind(&did).bind(other_device).bind(body.key_id.as_str()).bind(now).execute(&mut *tx).await.unwrap();
+            .bind(&did).bind(other_device).bind(&other_key_id).bind(now).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,$5)")
-            .bind(&did).bind(other_device).bind(body.key_id.as_str()).bind(public.as_slice()).bind(now).execute(&mut *tx).await.unwrap();
+            .bind(&did).bind(other_device).bind(&other_key_id).bind(other_public.as_slice()).bind(now).execute(&mut *tx).await.unwrap();
         let mut collision = body.clone();
         collision.actor_device_id = other_device.to_string().into();
+        collision.key_id = other_key_id.into();
         sqlx::query("SAVEPOINT registration_collision")
             .execute(&mut *tx)
             .await
             .unwrap();
         assert!(matches!(
-            register_in_transaction(&mut tx, &did, signed(collision, 1, None, &key), None).await,
+            register_in_transaction(&mut tx, &did, signed(collision, 1, None, &other_key), None).await,
             Err(PushBindingError::Protocol(Code::RegistrationConflict))
         ));
         sqlx::query("ROLLBACK TO SAVEPOINT registration_collision")
