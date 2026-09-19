@@ -223,7 +223,15 @@ async fn committed_operation_rejects_resigned_artifact_digest_id_and_signature_c
             "{field} collision unexpectedly returned {status}"
         );
         let error: Value = serde_json::from_slice(&response)?;
-        anyhow::ensure!(error["error"].is_string(), "collision lacked typed error");
+        let expected = if field == "signature" {
+            "InvalidSignature"
+        } else {
+            "PreparationConflict"
+        };
+        assert_eq!(
+            error["error"], expected,
+            "unexpected collision error for {field}"
+        );
         anyhow::ensure!(
             durable_graph(&f)? == before,
             "{field} collision altered retained publication graph"

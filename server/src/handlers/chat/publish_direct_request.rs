@@ -98,6 +98,9 @@ fn failure(error: PublicationError) -> ChatFailure {
             trace_database_failure("prepare_or_execute", &error);
             ChatFailure::storage(endpoint)
         }
+        PublicationError::Store(E::InvalidSignature) => {
+            ChatFailure::protocol(endpoint, ChatProtocolErrorCode::InvalidSignature)
+        }
         PublicationError::Store(E::IdentityConflict) => {
             ChatFailure::protocol(endpoint, ChatProtocolErrorCode::PreparationConflict)
         }
@@ -141,4 +144,31 @@ fn trace_database_failure(stage: &'static str, error: &sqlx::Error) {
             .unwrap_or("none"),
         "encrypted request publication transaction failed"
     );
+}
+
+#[cfg(test)]
+mod signature_error_tests {
+    use super::*;
+    use crate::chat_protocol::repository::direct_request_preparation::DirectRequestStoreError;
+
+    #[tokio::test]
+    async fn invalid_publication_signature_uses_declared_public_error() {
+        let failure = failure(PublicationError::Store(
+            DirectRequestStoreError::InvalidSignature,
+        ));
+        assert_eq!(
+            failure.code(),
+            Some(ChatProtocolErrorCode::InvalidSignature)
+        );
+        let response = failure.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"error":"InvalidSignature", "message":"InvalidSignature"})
+        );
+    }
 }
