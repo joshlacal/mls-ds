@@ -592,7 +592,10 @@ fn graph(conversation: Uuid) -> anyhow::Result<Value> {
 pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<()> {
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
-    let mut f = publish_request(!accept_before_import).await?;
+    // Both scenarios start with an unimported recipient. The sender must be
+    // offline before the first recipient Welcome import, not merely before
+    // acceptance and reply.
+    let mut f = publish_request(false).await?;
     // Exercise pending point-read and retained Welcome presentation through
     // the shipping HTTP facade before account consent changes.
     let (pending_status, pending_bytes) = f
@@ -706,8 +709,26 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
         &f.server.receipt_public_key,
     )?;
     assert_eq!(alice_engine.epoch(&group)?, epoch);
-    // No sender context exists during acceptance or reply; reopen is deferred.
+    assert!(
+        f.bob_engine.epoch(&group).is_err(),
+        "recipient imported while sender was still online"
+    );
+    // No sender context exists during import, acceptance or reply; reopen is deferred.
     let offline_sender = alice_engine.close_for_offline()?;
+    assert!(f.alice_engine.is_none());
+    if !accept_before_import {
+        f.bob_engine.process_direct_request(&f.welcome_input)?;
+        let DirectRequestIntroductionResult::Ready { plaintext } =
+            f.bob_engine.decrypt_direct_request(&f.welcome_input)?
+        else {
+            anyhow::bail!("pending introduction unavailable with sender offline")
+        };
+        assert_eq!(
+            protocol::decode_direct_request_introduction(&plaintext)?["text"],
+            "Real encrypted first contact"
+        );
+        assert_eq!(graph(f.conversation_id)?, before);
+    }
     let bob_identity = format!("{}#{}", f.bob.did, f.bob.device_id);
     let bob_public = f.bob_engine.identity_public_key(&bob_identity)?;
     let transition = Uuid::new_v4();
