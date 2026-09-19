@@ -723,3 +723,16 @@ pub(crate) async fn read_direct_request_pool_hint(
       GROUP BY c.enabled,c.revision,c.auth_generation,c.owner_key_id,d.auth_generation,d.status,k.key_id,k.revoked_at,instant.at
     "#).bind(did).bind(device).bind(key_id).bind(generation).fetch_optional(&mut **tx).await?)
 }
+
+/// Exact immutable candidate material, including revoked historical devices.
+/// Caller must already hold verified requester read admission; these bytes
+/// alone confer no current or historical authorization.
+pub(super) async fn read_immutable_candidate_key(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &str,
+    device: Uuid,
+    key_id: &str,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    sqlx::query_scalar("SELECT signing_public_key FROM chat.device_keys WHERE user_did=$1 AND device_id=$2 AND key_id=$3")
+        .bind(owner).bind(device).bind(key_id).fetch_optional(&mut **tx).await
+}

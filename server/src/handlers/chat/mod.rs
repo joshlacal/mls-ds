@@ -31,6 +31,7 @@ mod direct_requests;
 mod enroll_device;
 mod errors;
 mod expiry_worker;
+mod get_device_key;
 mod get_devices;
 mod get_entries;
 mod get_own_devices;
@@ -102,6 +103,7 @@ fn is_implemented(endpoint: ChatEndpoint) -> bool {
             | ChatEndpoint::CancelDirectRequestPreparation
             | ChatEndpoint::EnrollDevice
             | ChatEndpoint::ReplenishKeyPackages
+            | ChatEndpoint::GetDeviceKey
             | ChatEndpoint::GetDevices
             | ChatEndpoint::GetOwnDevices
             | ChatEndpoint::RequestLeave
@@ -171,6 +173,10 @@ where
         .route(
             &xrpc_path(ChatEndpoint::ReplenishKeyPackages),
             post(replenish_key_packages::handle),
+        )
+        .route(
+            &xrpc_path(ChatEndpoint::GetDeviceKey),
+            get(get_device_key::handle),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetDevices),

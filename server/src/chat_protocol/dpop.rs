@@ -642,6 +642,11 @@ pub(in crate::chat_protocol) struct GetDevicesReadAdmission {
     attempt: ReadAdmissionAttempt,
 }
 
+/// Closed one-attempt historical candidate-key read budget.
+pub(in crate::chat_protocol) struct GetDeviceKeyReadAdmission {
+    attempt: ReadAdmissionAttempt,
+}
+
 /// Closed fixed three-attempt `GetOwnDevices` budget.
 pub(in crate::chat_protocol) struct GetOwnDevicesReadAdmission {
     attempts: [ReadAdmissionAttempt; GET_OWN_DEVICES_ATTEMPT_BUDGET],
@@ -848,6 +853,21 @@ impl VerifiedReadAdmission {
         })
     }
 
+    /// Mint one exact-endpoint attempt for an immutable candidate-key read.
+    pub(in crate::chat_protocol) fn into_get_device_key_read_admission(
+        self,
+    ) -> Result<GetDeviceKeyReadAdmission, ReadAdmissionBindingError> {
+        let binding = self.into_closed_endpoint_binding(
+            "blue.catbird.chat.getDeviceKey",
+            READ_ENDPOINT_CANONICAL_METHOD,
+        )?;
+        Ok(GetDeviceKeyReadAdmission {
+            attempt: ReadAdmissionAttempt {
+                binding: Arc::new(binding),
+            },
+        })
+    }
+
     /// Mint the closed `GetOwnDevices` budget: exactly three attempts.
     pub(in crate::chat_protocol) fn into_get_own_devices_read_admission(
         self,
@@ -871,6 +891,12 @@ impl VerifiedReadAdmission {
 }
 
 impl GetDevicesReadAdmission {
+    pub(in crate::chat_protocol) fn into_attempt(self) -> ReadAdmissionAttempt {
+        self.attempt
+    }
+}
+
+impl GetDeviceKeyReadAdmission {
     pub(in crate::chat_protocol) fn into_attempt(self) -> ReadAdmissionAttempt {
         self.attempt
     }

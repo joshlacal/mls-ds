@@ -72,6 +72,7 @@ define_error_codes!(
     CutoverRequired,
     DeviceAlreadyExists,
     DeviceBindingMismatch,
+    DeviceKeyNotFound,
     DeviceLimitReached,
     DeviceNotFound,
     DeviceNotLeaf,
@@ -612,6 +613,11 @@ define_endpoint_contracts!(
         ProtocolUpgradeRequired,
         NotAuthorized,
         DeviceBindingMismatch,
+    ]),
+    GetDeviceKey => ("blue.catbird.chat.getDeviceKey", [
+        AccountSessionExpired, CutoverRequired, DeviceNotRegistered,
+        DeviceRevoked, DeviceKeyNotFound, InvalidRequest, RateLimited,
+        ProtocolUpgradeRequired, NotAuthorized, DeviceBindingMismatch,
     ]),
     GetDevices => ("blue.catbird.chat.getDevices", [
         AccountSessionExpired,

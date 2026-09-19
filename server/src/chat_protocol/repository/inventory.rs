@@ -6401,3 +6401,70 @@ pub(crate) async fn reject_unsupported_inventory(
     }
     Ok(())
 }
+
+/// Candidate public bytes only. No current/historical authorization flag is
+/// projected; the consumer must verify an independent receipt/entry authority.
+#[derive(Debug)]
+pub(crate) enum DeviceKeyReadError {
+    NotFound,
+    Storage,
+    Invariant,
+}
+impl From<ExistingDeviceReadFacadeError> for DeviceKeyReadError {
+    fn from(error: ExistingDeviceReadFacadeError) -> Self {
+        match error {
+            ExistingDeviceReadFacadeError::Storage => Self::Storage,
+            _ => Self::Invariant,
+        }
+    }
+}
+pub(crate) async fn read_device_key_for_admission(
+    pool: &sqlx::PgPool,
+    admission: super::super::dpop::VerifiedReadAdmission,
+    owner: &str,
+    device: Uuid,
+    key_id: &str,
+) -> Result<Vec<u8>, DeviceKeyReadError> {
+    let attempt = admission
+        .into_get_device_key_read_admission()
+        .map_err(|_| DeviceKeyReadError::Invariant)?
+        .into_attempt();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| DeviceKeyReadError::Storage)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| DeviceKeyReadError::Storage)?;
+    let lock = lock_and_verify_read_requester(&mut tx, attempt).await?;
+    guard_protected_query(&lock)?;
+    // Target keys are immutable, including after revocation; acquiring target
+    // device locks here would invert the established requester lock order.
+    let public =
+        super::device_directory::read_immutable_candidate_key(&mut tx, owner, device, key_id)
+            .await
+            .map_err(|_| DeviceKeyReadError::Storage)?;
+    let public = public.ok_or(DeviceKeyReadError::NotFound)?;
+    let derived = super::super::validation::ed25519_key_id(&public)
+        .map_err(|_| DeviceKeyReadError::Invariant)?;
+    if derived.as_str() != key_id {
+        return Err(DeviceKeyReadError::Invariant);
+    }
+    let output =
+        catbird_atproto::generated::blue_catbird::chat::get_device_key::GetDeviceKeyOutput::<
+            jacquard_common::DefaultStr,
+        > {
+            owner_did: jacquard_common::types::string::Did::new_owned(owner)
+                .map_err(|_| DeviceKeyReadError::Invariant)?,
+            device_id: jacquard_common::deps::smol_str::SmolStr::from(device.to_string()),
+            key_id: jacquard_common::deps::smol_str::SmolStr::from(key_id),
+            signature_public_key: jacquard_common::deps::bytes::Bytes::from(public),
+            extra_data: None,
+        };
+    let response = serde_json::to_vec(&output).map_err(|_| DeviceKeyReadError::Invariant)?;
+    tx.rollback()
+        .await
+        .map_err(|_| DeviceKeyReadError::Storage)?;
+    Ok(response)
+}

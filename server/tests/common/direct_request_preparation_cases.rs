@@ -286,7 +286,9 @@ async fn live_device_pair_and_global_budgets_reject_without_consuming_more_packa
     )
     .await
     .unwrap();
-    check_preparation_budget(&mut tx, &next, now, MAX_BUNDLE_BYTES).await.unwrap();
+    check_preparation_budget(&mut tx, &next, now, MAX_BUNDLE_BYTES)
+        .await
+        .unwrap();
     sqlx::query("UPDATE chat.direct_request_budget SET retained_bytes=8589934592 WHERE singleton")
         .execute(&mut *tx)
         .await
@@ -421,5 +423,67 @@ async fn request_pool_hint_is_exact_device_current_grant_and_full_horizon_scoped
     assert!(!rebound.enabled);
     assert_eq!(rebound.revision, 1);
     assert_eq!((rebound.usable_count, rebound.reserved_count), (0, 0));
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn immutable_candidate_key_lookup_is_exact_and_retains_revoked_material() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let key = seed_request_device(
+        &mut tx,
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "direct-request",
+        true,
+    )
+    .await;
+    let read = super::device_directory::read_immutable_candidate_key;
+    let expected = read(
+        &mut tx,
+        &key.owner_did,
+        key.owner_device_id,
+        &key.owner_key_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(expected.len(), 32);
+    assert!(read(
+        &mut tx,
+        "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+        key.owner_device_id,
+        &key.owner_key_id
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert!(
+        read(&mut tx, &key.owner_did, Uuid::new_v4(), &key.owner_key_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let other_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([99u8; 32]);
+    assert!(
+        read(&mut tx, &key.owner_did, key.owner_device_id, &other_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Deferred full revocation graph is rolled back; this probes immutable
+    // candidate selection, not a claim of complete revocation authorization.
+    sqlx::query("UPDATE chat.device_keys SET revoked_at=clock_timestamp(),revocation_id=$3 WHERE user_did=$1 AND device_id=$2")
+        .bind(&key.owner_did).bind(key.owner_device_id).bind(Uuid::new_v4()).execute(&mut *tx).await.unwrap();
+    assert_eq!(
+        read(
+            &mut tx,
+            &key.owner_did,
+            key.owner_device_id,
+            &key.owner_key_id
+        )
+        .await
+        .unwrap(),
+        Some(expected)
+    );
     tx.rollback().await.unwrap();
 }
