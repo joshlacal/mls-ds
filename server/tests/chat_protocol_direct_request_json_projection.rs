@@ -56,11 +56,13 @@ async fn signed_json_projection_preserves_bytes_and_rejects_ambiguous_inputs() {
     assert_eq!(retained, signed, "comparison must not rewrite signed bytes");
     assert_eq!(
         projected.pointer("/body/signatureDomain"),
-        Some(&Value::String("CATBIRD-DIRECT-REQUEST-PUBLISH".to_owned()))
+        Some(&Value::String(
+            "CATBIRD-DIRECT-REQUEST-PUBLISH\u{1}0".to_owned()
+        ))
     );
     assert_eq!(
         projected.pointer("/body/nested/0/signatureDomain"),
-        Some(&Value::String("CATBIRD-INNER".to_owned()))
+        Some(&Value::String("CATBIRD-INNER\u{1}0".to_owned()))
     );
     assert_eq!(
         projected.pointer("/body/nested/0/count"),
@@ -88,6 +90,53 @@ async fn signed_json_projection_preserves_bytes_and_rejects_ambiguous_inputs() {
     .expect("compare changed signed inputs");
     assert_eq!(equality, (true, false, false));
 
+    let (nul_value, soh_value, literal_escape, internal_domain, nul_key, soh_key): (
+        Value,
+        Value,
+        Value,
+        Value,
+        Value,
+        Value,
+    ) = sqlx::query_as(
+        "SELECT \
+         chat.direct_request_json_projection($1::json), \
+         chat.direct_request_json_projection($2::json), \
+         chat.direct_request_json_projection($3::json), \
+         chat.direct_request_json_projection($4::json), \
+         chat.direct_request_json_projection($5::json), \
+         chat.direct_request_json_projection($6::json)",
+    )
+    .bind(r#"{"ordinary":"A\u0000B"}"#)
+    .bind(r#"{"ordinary":"A\u0001B"}"#)
+    .bind(r#"{"ordinary":"A\\u0000B"}"#)
+    .bind(r#"{"signatureDomain":"CATBIRD-INTERNAL\u0000-NUL\u0000"}"#)
+    .bind(r#"{"key\u0000":1}"#)
+    .bind(r#"{"key\u0001":1}"#)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("project every escaped atom case");
+    assert_eq!(
+        nul_value.pointer("/ordinary"),
+        Some(&Value::String("A\u{1}0B".to_owned()))
+    );
+    assert_eq!(
+        soh_value.pointer("/ordinary"),
+        Some(&Value::String("A\u{1}1B".to_owned()))
+    );
+    assert_eq!(
+        literal_escape.pointer("/ordinary"),
+        Some(&Value::String(r"A\u0000B".to_owned()))
+    );
+    assert_eq!(
+        internal_domain.pointer("/signatureDomain"),
+        Some(&Value::String(
+            "CATBIRD-INTERNAL\u{1}0-NUL\u{1}0".to_owned()
+        ))
+    );
+    assert_ne!(nul_value, soh_value);
+    assert_ne!(nul_value, literal_escape);
+    assert_ne!(nul_key, soh_key);
+
     expect_projection_error(
         &mut tx,
         br#"{"field":1,"field":2}"#,
@@ -102,34 +151,6 @@ async fn signed_json_projection_preserves_bytes_and_rejects_ambiguous_inputs() {
         "request signature domain must be a string",
     )
     .await;
-    expect_projection_error(
-        &mut tx,
-        br#"{"signatureDomain":"CATBIRD-MISSING-NUL"}"#,
-        "23514",
-        "request signature domain lacks terminal NUL",
-    )
-    .await;
-    expect_projection_error(
-        &mut tx,
-        br#"{"signatureDomain":"CATBIRD-INTERNAL\u0000-NUL\u0000"}"#,
-        "22P05",
-        "unsupported Unicode escape sequence",
-    )
-    .await;
-    expect_projection_error(
-        &mut tx,
-        br#"{"signatureDomain":"CATBIRD-LITERAL\\u0000"}"#,
-        "22P02",
-        "invalid input syntax for type json",
-    )
-    .await;
-    expect_projection_error(
-        &mut tx,
-        br#"{"ordinary":"NUL\u0000must-still-fail"}"#,
-        "22P05",
-        "unsupported Unicode escape sequence",
-    )
-    .await;
     let deeply_nested = format!("{}0{}", "[".repeat(66), "]".repeat(66));
     expect_projection_error(
         &mut tx,
@@ -139,5 +160,5 @@ async fn signed_json_projection_preserves_bytes_and_rejects_ambiguous_inputs() {
     )
     .await;
 
-    tx.rollback().await.expect("rollback migration 13 fixture");
+    tx.rollback().await.expect("rollback projection fixture");
 }

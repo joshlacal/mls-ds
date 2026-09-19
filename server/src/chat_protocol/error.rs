@@ -155,6 +155,8 @@ define_error_codes!(
     StaleLegacyPrior,
     RequestNotAccepted,
     UnavailableIntroduction,
+    StaleAuthGeneration,
+    RegistrationConflict,
 );
 
 impl ChatProtocolErrorCode {
@@ -950,6 +952,10 @@ define_endpoint_contracts!(
         NotAuthorized,
         ProtocolUpgradeRequired,
         RateLimited,
+        InvalidSignature,
+        StaleAuthGeneration,
+        RegistrationConflict,
+        CapacityUnavailable,
     ]),
 );
 
