@@ -1623,6 +1623,7 @@ impl EvidenceKind {
 pub(crate) enum ProjectionOperationScope {
     DirectRequestPreparation,
     DirectRequestAcceptance,
+    DirectRequestPushEligibility,
     Creation,
     PendingAdd,
     Acceptance,
@@ -1636,6 +1637,7 @@ impl ProjectionOperationScope {
         match self {
             Self::DirectRequestPreparation => "directRequestPreparation",
             Self::DirectRequestAcceptance => "directRequestAcceptance",
+            Self::DirectRequestPushEligibility => "directRequestPushEligibility",
             Self::Creation => "creation",
             Self::PendingAdd => "pendingAdd",
             Self::Acceptance => "acceptance",
@@ -1649,6 +1651,7 @@ impl ProjectionOperationScope {
         match value {
             "directRequestPreparation" => Ok(Self::DirectRequestPreparation),
             "directRequestAcceptance" => Ok(Self::DirectRequestAcceptance),
+            "directRequestPushEligibility" => Ok(Self::DirectRequestPushEligibility),
             "creation" => Ok(Self::Creation),
             "pendingAdd" => Ok(Self::PendingAdd),
             "acceptance" => Ok(Self::Acceptance),
@@ -3792,6 +3795,7 @@ fn relationship_operation_scope_matches(
             ProjectionScope::Admission(_)
         ) | (
             ProjectionOperationScope::DirectRequestAcceptance
+                | ProjectionOperationScope::DirectRequestPushEligibility
                 | ProjectionOperationScope::RecoveryReservation
                 | ProjectionOperationScope::RecoveryFulfillment,
             ProjectionScope::BlockOnly(_)
@@ -4130,6 +4134,7 @@ fn projection_operation_scope_tag(scope: ProjectionOperationScope) -> u8 {
         ProjectionOperationScope::Traffic => 5,
         ProjectionOperationScope::DirectRequestPreparation => 6,
         ProjectionOperationScope::DirectRequestAcceptance => 7,
+        ProjectionOperationScope::DirectRequestPushEligibility => 8,
     }
 }
 

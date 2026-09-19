@@ -86,6 +86,15 @@ async fn register_in_transaction(
         .map_err(|_| PushBindingError::Protocol(Code::InvalidRequest))?;
     let registration = Uuid::parse_str(body.registration_id.as_ref())
         .map_err(|_| PushBindingError::Protocol(Code::InvalidRequest))?;
+    // A competing first INSERT may otherwise wait on the global UUID index
+    // after the freshness check. Serialize that identity before any authority
+    // locks, then read the decision clock after all possible lock waits.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('chat-request-push-registration:' || $1,0))",
+    )
+    .bind(registration.to_string())
+    .execute(&mut **tx)
+    .await?;
     let current=sqlx::query("SELECT status,auth_generation FROM chat.devices WHERE user_did=$1 AND device_id=$2 FOR UPDATE")
         .bind(principal).bind(device).fetch_optional(&mut **tx).await?
         .ok_or(PushBindingError::Protocol(Code::DeviceNotRegistered))?;
@@ -304,7 +313,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            register_in_transaction(&mut tx, &did, signed(collision, 1, None, &other_key), None).await,
+            register_in_transaction(&mut tx, &did, signed(collision, 1, None, &other_key), None)
+                .await,
             Err(PushBindingError::Protocol(Code::RegistrationConflict))
         ));
         sqlx::query("ROLLBACK TO SAVEPOINT registration_collision")
@@ -328,6 +338,89 @@ mod tests {
         ));
         tx.rollback().await.unwrap();
     }
+    #[tokio::test]
+    async fn guarded_registration_identity_wait_cannot_extend_signature_freshness() {
+        let pool = super::direct_request_database::setup().await;
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../catbird-atproto/tests/fixtures/push-registration.json"
+        ))
+        .unwrap();
+        let mut body: PushRegistrationBody =
+            serde_json::from_value(fixture["body"].clone()).unwrap();
+        let key = SigningKey::from_bytes(&std::array::from_fn(|i| i as u8));
+        let device = Uuid::new_v4();
+        let registration = Uuid::new_v4();
+        let did = format!("did:web:push-lock-{}.example.org", device.simple());
+        body.actor_did = did.parse().unwrap();
+        body.actor_device_id = device.to_string().into();
+        body.registration_id = registration.to_string().into();
+        body.auth_generation = 1;
+        let mut setup = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO chat.principals(user_did,created_at) VALUES($1,clock_timestamp())",
+        )
+        .bind(&did)
+        .execute(&mut *setup)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) VALUES($1,$2,'push lock fixture','active',$3,1,chat.protocol_capabilities(),clock_timestamp(),clock_timestamp())")
+            .bind(&did).bind(device).bind(body.key_id.as_str()).execute(&mut *setup).await.unwrap();
+        sqlx::query("INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) VALUES($1,$2,$3,$4,1,clock_timestamp())")
+            .bind(&did).bind(device).bind(body.key_id.as_str()).bind(key.verifying_key().to_bytes().as_slice()).execute(&mut *setup).await.unwrap();
+        setup.commit().await.unwrap();
+        // This fixture is retained in the dedicated test DB; no identity tombstone
+        // or other test's data is deleted to clean up the contention scenario.
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('chat-request-push-registration:' || $1,0))")
+            .bind(registration.to_string()).execute(&mut *blocker).await.unwrap();
+        let signed_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() - interval '299 seconds'")
+                .fetch_one(&mut *blocker)
+                .await
+                .unwrap();
+        body.signed_at = signed_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            .parse()
+            .unwrap();
+        let request = signed(body, 1, None, &key);
+        let task_pool = pool.clone();
+        let task_did = did.clone();
+        let pending =
+            tokio::spawn(async move { register(&task_pool, &task_did, request, None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !pending.is_finished(),
+            "registration bypassed the global identity lock"
+        );
+        loop {
+            let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *blocker)
+                .await
+                .unwrap();
+            if now.signed_duration_since(signed_at).num_milliseconds() > 300_100 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        blocker.rollback().await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(PushBindingError::Protocol(Code::InvalidRequest))
+        ));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM chat.request_push_bindings WHERE registration_id=$1",
+        )
+        .bind(registration)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
     fn body_with_token(
         body: &PushRegistrationBody,
         generation: i64,

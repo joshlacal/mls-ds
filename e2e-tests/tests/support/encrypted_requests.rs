@@ -152,7 +152,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 16] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 17] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -170,6 +170,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 16] {
         baseline!(20260919000014, "direct request nul comparison", "20260919000014_direct_request_nul_comparison.sql", "2f47a3019d459b7989f544773da035e10914af95b85ad553afd70e84367189085a3c8507b7314bfa84d4cc4335a1d8b8"),
         baseline!(20260919000015, "direct request entry identity", "20260919000015_direct_request_entry_identity.sql", "157cac50d04bd77388897fe386acd915ece5046c40923dec21675726ed091ac5b709691664a57241f67c8415e73cf29d"),
         baseline!(20260919000016, "direct request push bindings", "20260919000016_direct_request_push_bindings.sql", "483aee1650f60a488d2a6498c11e4ce229906889ca1a655c37f080fefccf610bc4f552b06a63719ff471f95c060360f8"),
+        baseline!(20260919000017, "direct request push outbox", "20260919000017_direct_request_push_outbox.sql", "813c165f4e1739fb81d1cd26b2e1cea505745b1df77d22d6ca4882ba44bf2a9446a0929be20320e04a22c93e2bdc380b"),
     ]
 }
 
@@ -894,6 +895,30 @@ impl ServiceIdentity {
         let status = response.status();
         let bytes = response.bytes().await?.to_vec();
         Ok((status, bytes))
+    }
+
+    pub async fn get(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        nsid: &str,
+        parameters: &[(String, String)],
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        anyhow::ensure!(
+            !parameters.iter().any(|(key, _)| key == "actorDeviceId"),
+            "actor is supplied by fixture identity"
+        );
+        let mut query = vec![("actorDeviceId".to_owned(), self.device_id.to_string())];
+        query.extend_from_slice(parameters);
+        let response = client
+            .get(format!("{base_url}/xrpc/{nsid}"))
+            .bearer_auth(self.jwt(nsid, true))
+            .query(&query)
+            .send()
+            .await
+            .context("shipping authenticated read")?;
+        let status = response.status();
+        Ok((status, response.bytes().await?.to_vec()))
     }
 
     pub async fn get_device_key(

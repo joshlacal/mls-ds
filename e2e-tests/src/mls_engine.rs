@@ -20,14 +20,15 @@ use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 
 // ── In-memory keychain (no iOS Keychain in tests) ────────────────────────
 
+#[derive(Clone)]
 struct InMemoryKeychain {
-    store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl InMemoryKeychain {
     fn new() -> Self {
         Self {
-            store: Mutex::new(HashMap::new()),
+            store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -55,6 +56,8 @@ impl KeychainAccess for InMemoryKeychain {
 pub struct MlsEngine {
     ctx: Arc<MLSContext>,
     _temp_dir: PathBuf,
+    db_key: String,
+    keychain: InMemoryKeychain,
 }
 
 impl Drop for MlsEngine {
@@ -77,18 +80,53 @@ impl MlsEngine {
             .with_context(|| format!("create temp dir {:?}", temp_dir))?;
 
         let db_path = temp_dir.join("mls.db");
-        let keychain = Box::new(InMemoryKeychain::new());
+        let keychain = InMemoryKeychain::new();
+        let db_key = format!("test-key-{}", user_label);
         let ctx = MLSContext::new(
             db_path.to_string_lossy().to_string(),
-            format!("test-key-{}", user_label),
-            keychain,
+            db_key.clone(),
+            Box::new(keychain.clone()),
         )
         .map_err(|e| anyhow::anyhow!("MLSContext::new failed: {e}"))?;
 
         Ok(Self {
             ctx,
             _temp_dir: temp_dir,
+            db_key,
+            keychain,
         })
+    }
+
+    /// Flush and drop the actual native context while retaining its exact store.
+    pub fn close_for_offline(mut self) -> Result<ClosedMlsEngine> {
+        self.ctx
+            .flush_and_prepare_close()
+            .map_err(|e| anyhow::anyhow!("close native context: {e}"))?;
+        let retained = ClosedMlsEngine {
+            path: std::mem::take(&mut self._temp_dir),
+            db_key: self.db_key.clone(),
+            keychain: self.keychain.clone(),
+        };
+        drop(self);
+        Ok(retained)
+    }
+
+    pub fn persist_request_publication(&self, request_id: &str, exact: &[u8]) -> Result<()> {
+        self.ctx
+            .persist_direct_request_publish(request_id, exact)
+            .map_err(|e| anyhow::anyhow!("persist request publication: {e}"))
+    }
+
+    pub fn confirm_request_publication(
+        &self,
+        request_id: &str,
+        receipt: &[u8],
+        authority_key: &[u8],
+    ) -> Result<()> {
+        self.ctx
+            .confirm_published_bootstrap(request_id, receipt, authority_key)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("confirm published request: {e}"))
     }
 
     /// Generate a real MLS key package for the given identity.
@@ -173,6 +211,36 @@ impl MlsEngine {
         Ok(result.group_id)
     }
 
+    /// Delegate to the shipping canonical-AAD encryption path, not a test bypass.
+    pub fn encrypt_canonical(
+        &self,
+        group_id: &[u8],
+        plaintext: &[u8],
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<Vec<u8>> {
+        self.ctx
+            .encrypt_message_with_aad(group_id.to_vec(), plaintext.to_vec(), aad, expected_epoch)
+            .map(|result| result.ciphertext)
+            .map_err(|e| anyhow::anyhow!("canonical encryption: {e}"))
+    }
+
+    pub fn decrypt_authenticated(
+        &self,
+        group_id: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<catbird_mls::DecryptResult> {
+        self.ctx
+            .decrypt_message(group_id.to_vec(), ciphertext.to_vec())
+            .map_err(|e| anyhow::anyhow!("authenticated decryption: {e}"))
+    }
+
+    pub fn epoch(&self, group_id: &[u8]) -> Result<u64> {
+        self.ctx
+            .get_epoch(group_id.to_vec())
+            .map_err(|e| anyhow::anyhow!("native epoch: {e}"))
+    }
+
     /// Encrypt a plaintext message. Returns `(padded_ciphertext, padded_size)`.
     pub fn encrypt(&self, group_id: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, u32)> {
         let result = self
@@ -212,5 +280,28 @@ impl MlsEngine {
     pub fn extract_key_package_sig_key(kp_bytes: &[u8]) -> Result<Vec<u8>> {
         catbird_mls::mls_extract_key_package_signature_public_key(kp_bytes.to_vec())
             .map_err(|e| anyhow::anyhow!("extract_kp_sig_key: {e}"))
+    }
+}
+
+/// Offline state contains custody, not a running MLS context or network client.
+pub struct ClosedMlsEngine {
+    path: PathBuf,
+    db_key: String,
+    keychain: InMemoryKeychain,
+}
+impl ClosedMlsEngine {
+    pub fn reopen(self) -> Result<MlsEngine> {
+        let ctx = MLSContext::new(
+            self.path.join("mls.db").to_string_lossy().into_owned(),
+            self.db_key.clone(),
+            Box::new(self.keychain.clone()),
+        )
+        .map_err(|e| anyhow::anyhow!("reopen captured native store: {e}"))?;
+        Ok(MlsEngine {
+            ctx,
+            _temp_dir: self.path,
+            db_key: self.db_key,
+            keychain: self.keychain,
+        })
     }
 }

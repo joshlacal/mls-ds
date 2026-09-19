@@ -18,6 +18,7 @@ pub(crate) mod direct_request_publication;
 #[allow(dead_code)]
 pub(crate) mod direct_request_receipts;
 pub(crate) mod direct_request_retention;
+pub(crate) mod direct_request_push;
 pub(crate) mod entry_read;
 #[allow(dead_code)]
 pub(crate) mod execution_context;

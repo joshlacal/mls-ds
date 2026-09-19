@@ -2465,6 +2465,7 @@ fn relationship_operation_matches_scope(
             ProjectionScope::Admission(_)
         ) | (
             ProjectionOperationScope::DirectRequestAcceptance
+                | ProjectionOperationScope::DirectRequestPushEligibility
                 | ProjectionOperationScope::RecoveryReservation
                 | ProjectionOperationScope::RecoveryFulfillment,
             ProjectionScope::BlockOnly(_)
@@ -2572,4 +2573,64 @@ pub(super) async fn verify_direct_request_acceptance_policy<T: PublicTransport>(
         false,
     )
     .map_err(|_| RelationshipRepositoryError::InvalidProjection)
+}
+
+/// Push eligibility never reads a cached/fallback projection. It collects a
+/// fresh bilateral block graph after the caller's complete mutable read set is
+/// locked, persists that exact live evidence, then consumes it under the same
+/// transaction-bound witness. Collection/storage failure remains retryable;
+/// an authenticated current block is a signed negative decision.
+pub(super) async fn verify_direct_request_push_policy<T: PublicTransport>(
+    transaction: &mut Transaction<'_, Postgres>,
+    witness: &super::direct_request_push::LockedDirectRequestPushEligibility,
+    authority: &RelationshipAuthority<T>,
+) -> Result<bool, RelationshipRepositoryError> {
+    let (transaction_id, sender, recipient, actor_digest, read_set_digest) = witness.parts();
+    let mut roster = vec![sender.to_owned(), recipient.to_owned()];
+    roster.sort();
+    roster.dedup();
+    let scope = ProjectionScope::BlockOnly(
+        plan_block_only_graph(&roster)
+            .map_err(|_| RelationshipRepositoryError::InvalidProjection)?
+            .scope,
+    );
+    let make_scope = || {
+        LockedRelationshipFallbackScope::from_locked_read_set(
+            transaction_id.to_owned(),
+            ProjectionOperationScope::DirectRequestPushEligibility,
+            scope.clone(),
+            actor_digest,
+            read_set_digest,
+        )
+    };
+    require_witness_transaction(transaction, transaction_id).await?;
+    let allocation = allocate_projection_revision(transaction).await?;
+    let projection = authority
+        .collect_block_projection(
+            allocation,
+            ProjectionOperationScope::DirectRequestPushEligibility,
+            roster,
+        )
+        .await
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    let persistence = observe_relationship_persistence();
+    let sealed = projection
+        .export_persisted(authority, &persistence)
+        .map_err(|_| RelationshipRepositoryError::InvalidProjection)?;
+    persist_relationship_projection(transaction, sealed).await?;
+    let decision = observe_locked_relationship_decision(transaction, make_scope()?).await?;
+    match consume_resealed_relationship_projection(
+        &projection,
+        &decision,
+        make_scope()?,
+        &scope,
+        authority,
+        false,
+    ) {
+        Ok(()) => Ok(true),
+        Err(RelationshipConsumptionError::PolicyDenied) => Ok(false),
+        Err(RelationshipConsumptionError::InvalidWitness) => {
+            Err(RelationshipRepositoryError::InvalidProjection)
+        }
+    }
 }

@@ -25,15 +25,19 @@ pub(super) fn charge(
     parts: &PublicationArtifactLengths,
 ) -> Option<u64> {
     // Fresh: conversation, generation, state, transition, entry, metadata,
-    // two participants, publication, event and two outbox rows. A successor
-    // reuses the conversation/participants and adds one retirement state.
-    let base_rows: u64 = if parts.legacy_successor { 10 } else { 12 };
+    // two participants, publication, event, two outbox rows, and the immutable
+    // request-push event mapping. A successor reuses the
+    // conversation/participants and adds one retirement state.
+    let base_rows: u64 = if parts.legacy_successor { 11 } else { 13 };
     // Each final leaf adds membership, interval, entry and event audience rows.
     // The predecessor union can overlap, so charging all old audience rows is
     // deliberately conservative; the transaction never undercharges that union.
     let rows = base_rows
         .checked_add(parts.final_leaves.checked_mul(4)?)?
-        .checked_add(parts.deliveries)?
+        // One delivery row and, conservatively, one request-push audience row
+        // per selected delivery. Sender siblings are excluded from the actual
+        // push audience, so this bound can overcharge but never undercharges.
+        .checked_add(parts.deliveries.checked_mul(2)?)?
         .checked_add(parts.predecessor_intervals.checked_mul(2)?)?;
     let mut total = existing_attempt
         .checked_add(u64::try_from(receipt).ok()?)?

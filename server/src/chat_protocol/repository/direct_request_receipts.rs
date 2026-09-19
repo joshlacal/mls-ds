@@ -12,6 +12,11 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
+use super::super::request_push::{
+    envelope_signing_bytes, RequestPushEligibilityBody, RequestPushEventBody,
+    SignedInternalEnvelope, REQUEST_PUSH_ELIGIBILITY_DOMAIN, REQUEST_PUSH_EVENT_DOMAIN,
+};
+
 pub(crate) const REQUEST_RECEIPT_AUTHORITY: &str = "did:web:chat.catbird.blue";
 
 pub(crate) struct DirectRequestReceiptSigner {
@@ -238,6 +243,73 @@ mod tests {
             .verify(b"test-domain\0test-transcript", &signature)
             .is_err());
     }
+
+    #[test]
+    fn request_push_domains_are_distinct_and_sign_exact_base64url_body_bytes() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use chrono::{Duration, SecondsFormat, Utc};
+        use p256::ecdsa::signature::Verifier;
+        use uuid::Uuid;
+
+        let receipt = key(41);
+        let service = key(42);
+        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let signer = DirectRequestReceiptSigner::configured(
+            pem.as_str(),
+            service_pem.as_str(),
+            &document(&[&receipt]),
+        )
+        .unwrap();
+        let event = Uuid::new_v4();
+        let request = Uuid::new_v4();
+        let conversation = Uuid::new_v4();
+        let first = Uuid::new_v4();
+        let device = Uuid::new_v4();
+        let now = Utc::now();
+        let payload = super::super::super::request_push::request_push_event_payload_digest(
+            event,
+            request,
+            conversation,
+            first,
+            "did:web:alice.example.org",
+            "did:web:bob.example.org",
+            &[device],
+        )
+        .unwrap();
+        let envelope = signer
+            .seal_request_push_event(RequestPushEventBody {
+                protocol_version: 1,
+                authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
+                key_id: signer.key_id().into(),
+                event_id: event.to_string(),
+                request_id: request.to_string(),
+                conversation_id: conversation.to_string(),
+                first_message_id: first.to_string(),
+                sender_did: "did:web:alice.example.org".into(),
+                recipient_did: "did:web:bob.example.org".into(),
+                recipient_device_ids: vec![device.to_string()],
+                payload_digest: URL_SAFE_NO_PAD.encode(payload),
+                issued_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                expires_at: (now + Duration::seconds(30))
+                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+            })
+            .unwrap();
+        let body = URL_SAFE_NO_PAD.decode(&envelope.body).unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD.decode(&envelope.signature).unwrap(),
+        )
+        .unwrap();
+        assert!(signature.normalize_s().is_none());
+        let event_bytes = envelope_signing_bytes(REQUEST_PUSH_EVENT_DOMAIN, &body).unwrap();
+        receipt.verifying_key().verify(&event_bytes, &signature).unwrap();
+        let wrong_domain =
+            envelope_signing_bytes(REQUEST_PUSH_ELIGIBILITY_DOMAIN, &body).unwrap();
+        assert!(receipt
+            .verifying_key()
+            .verify(&wrong_domain, &signature)
+            .is_err());
+    }
 }
 
 /// Opaque receipt produced by the configured dedicated authority, not by a
@@ -277,5 +349,45 @@ impl DirectRequestReceiptSigner {
             &direct_request_signing_bytes(DirectRequestKind::AcceptanceCommit, body)
                 .map_err(|e| e.to_string())?,
         ))
+    }
+
+    pub(crate) fn seal_request_push_event(
+        &self,
+        body: RequestPushEventBody,
+    ) -> Result<SignedInternalEnvelope, String> {
+        body.validate(chrono::Utc::now())
+            .map_err(|e| e.to_string())?;
+        self.seal_internal_push_body(body, REQUEST_PUSH_EVENT_DOMAIN)
+    }
+
+    pub(crate) fn seal_request_push_eligibility(
+        &self,
+        body: RequestPushEligibilityBody,
+    ) -> Result<SignedInternalEnvelope, String> {
+        body.validate(chrono::Utc::now())
+            .map_err(|e| e.to_string())?;
+        self.seal_internal_push_body(body, REQUEST_PUSH_ELIGIBILITY_DOMAIN)
+    }
+
+    fn seal_internal_push_body<T: serde::Serialize>(
+        &self,
+        body: T,
+        domain: &[u8],
+    ) -> Result<SignedInternalEnvelope, String> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let body = serde_json::to_vec(&body).map_err(|_| "invalid request push body")?;
+        let value: Value =
+            serde_json::from_slice(&body).map_err(|_| "invalid request push JSON")?;
+        if value["authorityDid"].as_str() != Some(REQUEST_RECEIPT_AUTHORITY)
+            || value["keyId"].as_str() != Some(self.key_id())
+        {
+            return Err("request push receipt authority mismatch".into());
+        }
+        let signing = envelope_signing_bytes(domain, &body).map_err(|e| e.to_string())?;
+        Ok(SignedInternalEnvelope {
+            body: URL_SAFE_NO_PAD.encode(&body),
+            signature: URL_SAFE_NO_PAD.encode(self.sign(&signing)),
+        })
     }
 }

@@ -92,6 +92,7 @@ pub(crate) mod public_state;
 pub(crate) mod read_authority;
 pub(crate) mod read_projection;
 pub(crate) mod relationship_policy;
+pub(crate) mod request_push;
 pub(crate) mod repository;
 pub mod snapshot;
 pub(crate) mod state_machine;
