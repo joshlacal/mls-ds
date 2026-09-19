@@ -2720,6 +2720,8 @@ dependencies = [
  "chrono",
  "hex",
  "jsonwebtoken",
+ "multibase",
+ "p256",
  "rand 0.8.5",
  "reqwest",
  "serde",

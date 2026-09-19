@@ -441,6 +441,40 @@ mod tests {
             let metadata_snapshot = json!({"coordinate":metadata_coord,"originTransitionId":ctx["requestId"],"metadataVersion":1,"nonce":STANDARD.encode(read("metadata-nonce.bin")),"ciphertext":STANDARD.encode(&metadata),"ciphertextSha256":STANDARD.encode(Sha256::digest(&metadata)),"ciphertextSize":metadata.len(),"authorProof":{"authorDid":ctx["actorDid"],"authorDeviceId":ctx["actorDeviceId"],"authorKeyId":ctx["actorKeyId"],"signaturePublicKey":STANDARD.encode(&actor_key),"authGenerationAtOrigin":1,"originTransitionId":ctx["requestId"],"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"}});
             let artifacts = json!({"genesisGroupInfo":artifact("genesis.mls","groupInfo"),"addCommit":artifact("add.mls","publicMessageCommit"),"finalGroupInfo":artifact("final.mls","groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&welcome),"sha256":STANDARD.encode(Sha256::digest(&welcome)),"deliveries":deliveries},"metadataSnapshot":metadata_snapshot,"initialCiphertext":STANDARD.encode(read("application.mls"))});
             let mut body = json!({"$type":"blue.catbird.chat.defs#directRequestPublicationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PUBLISH\u{0}","protocolVersion":"2","actorDid":ctx["actorDid"],"actorDeviceId":ctx["actorDeviceId"],"keyId":ctx["actorKeyId"],"authGeneration":1,"requestId":ctx["requestId"],"firstMessageId":ctx["firstMessageId"],"conversationId":ctx["conversationId"],"recipientDid":ctx["recipientDid"],"origin":ctx["origin"],"profile":"encryptedIntroduction1","preparationDigest":ctx["preparationDigest"],"preparationRequestDigest":STANDARD.encode([43u8;32]),"contextHash":STANDARD.encode(context_hash),"next":next,"importUntil":format_time(until),"artifacts":artifacts,"idempotencyKey":Uuid::new_v4().to_string(),"signedAt":format_time(now)});
+            // Exercise the durable preparation/publication comparison with the
+            // actual selected package references and real bootstrap artifacts.
+            // This projection is not an authority-signed preparation: signature
+            // verification is covered independently by transcript fixtures.
+            let mut prepared_projection = serde_json::Map::new();
+            for field in [
+                "requestId",
+                "firstMessageId",
+                "conversationId",
+                "recipientDid",
+                "origin",
+                "profile",
+                "preparationDigest",
+                "preparationRequestDigest",
+            ] {
+                prepared_projection.insert(field.into(), body[field].clone());
+            }
+            prepared_projection.insert("creator".into(), json!({"actorDid":body["actorDid"],"actorDeviceId":body["actorDeviceId"],"keyId":body["keyId"],"authGeneration":body["authGeneration"]}));
+            prepared_projection.insert("selectedDevices".into(), Value::Array(selected.iter().map(|device| json!({"actorDid":device.did,"actorDeviceId":device.device_id.to_string(),"keyPackage":{"keyPackageRef":STANDARD.encode(device.package_ref)},"grant":{"body":{"grantId":device.grant_id.to_string(),"grantRevision":device.grant_revision}}})).collect()));
+            let prepared_projection = Value::Object(prepared_projection);
+            assert!(
+                transcript::direct_request_preparation_matches_publication(
+                    &prepared_projection,
+                    &body
+                ),
+                "{name}: real package selection must match nested delivery provenance"
+            );
+            let mut substituted = body.clone();
+            substituted["artifacts"]["welcome"]["deliveries"][0]["provenance"]["keyPackageRef"] =
+                json!(STANDARD.encode([0u8; 32]));
+            assert!(!transcript::direct_request_preparation_matches_publication(
+                &prepared_projection,
+                &substituted
+            ));
             let verify = |body: &Value| {
                 let message = transcript::direct_request_signing_bytes(
                     DirectRequestKind::Publish,

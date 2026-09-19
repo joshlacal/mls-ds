@@ -20339,6 +20339,61 @@ mod direct_request_history_tests {
             ConversationKind::Direct,
             &state.coordinate
         ));
+        // A normal v1 close after v2 acceptance keeps historical v2 evidence.
+        let mut prior_json = body["next"].clone();
+        prior_json["stateVersion"] = json!(2);
+        let mut retired_json = prior_json.clone();
+        retired_json["stateVersion"] = json!(3);
+        retired_json["lifecycle"] = json!("superseded");
+        let close_body = json!({"$type":"blue.catbird.chat.defs#conversationCloseBody","signatureDomain":"CATBIRD-CHAT-CLOSE\0","transitionId":"00000000-0000-4000-8000-000000000003","conversationKind":"direct","actorDid":body["actorDid"],"actorDeviceId":body["actorDeviceId"],"keyId":body["keyId"],"authGeneration":1,"prior":prior_json,"retired":retired_json,"idempotencyKey":"00000000-0000-4000-8000-000000000004","signedAt":body["signedAt"]});
+        let mut wrapper = json!({"body":close_body,"signature":STANDARD.encode([0;64])});
+        let canonical = super::super::transcript::decode_canonical_signed_mutation(
+            &serde_json::to_vec(&wrapper).unwrap(),
+        )
+        .unwrap();
+        wrapper["signature"] =
+            json!(STANDARD.encode(key.sign(canonical.transcript_bytes()).to_bytes()));
+        let close_row = json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry","entryId":"00000000-0000-4000-8000-000000000005","conversationId":body["conversationId"],"seq":3,"signedRequest":wrapper,"receivedAt":body["signedAt"],"tombstone":{"conversationId":body["conversationId"],"conversationKind":"direct","retired":retired_json,"closedByDid":body["actorDid"],"closedByDeviceId":body["actorDeviceId"],"terminalSeq":3,"closedAt":body["signedAt"]}});
+        let history = HistoricalRehydrationAuthority::new(*next.conversation_id(), 4).unwrap();
+        let close = history
+            .hydrate_historical_control_from_durable_bytes(
+                serde_json::to_vec(&close_row).unwrap(),
+                serde_json::to_vec(&wrapper).unwrap(),
+                key.verifying_key().as_bytes(),
+            )
+            .unwrap()
+            .into_transition()
+            .unwrap();
+        let Some(TransitionBodyBinding::ConversationClose { prior, retired, .. }) =
+            close.body_binding.as_ref()
+        else {
+            panic!("close binding");
+        };
+        assert!(recovery_supersession_terminal_matches(
+            &close,
+            prior,
+            close.received_at
+        ));
+        state.coordinate = *retired;
+        state.producer = close.clone();
+        state.public_state = None;
+        state.leaves.clear();
+        for interval in &mut state.intervals {
+            interval.end = Some(AccessIntervalEnd {
+                evidence: close.clone(),
+                kind: CloseKind::Terminal,
+            });
+        }
+        state.terminal_proofs = state
+            .intervals
+            .iter()
+            .map(|i| ScheduleTerminalProof {
+                recipient: i.recipient.clone(),
+                conversation_id: *next.conversation_id(),
+                evidence: close.clone(),
+            })
+            .collect();
+        assert!(validate_terminal_state(&state).is_ok());
         // Frozen entry/head and exact-wrapper splice rejection.
         let authority = HistoricalRehydrationAuthority::new(*next.conversation_id(), 2).unwrap();
         let mut tampered: Value = serde_json::from_slice(&row).unwrap();

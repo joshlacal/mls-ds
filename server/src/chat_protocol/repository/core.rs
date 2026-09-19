@@ -4897,29 +4897,10 @@ async fn verify_direct_request_durable_proof(
         .await?;
         let prepare =
             verify_direct_request_preparation(&prepare_bytes, &key).map_err(|_| invalid())?;
-        for field in [
-            "requestId",
-            "firstMessageId",
-            "conversationId",
-            "recipientDid",
-            "origin",
-            "profile",
-            "preparationDigest",
-            "preparationRequestDigest",
-        ] {
-            if prepare[field] != body[field] {
-                return Err(invalid());
-            }
-        }
-        for (creator, publication) in [
-            ("actorDid", "actorDid"),
-            ("actorDeviceId", "actorDeviceId"),
-            ("keyId", "keyId"),
-            ("authGeneration", "authGeneration"),
-        ] {
-            if prepare["creator"][creator] != body[publication] {
-                return Err(invalid());
-            }
+        if !super::super::direct_request_transcript::direct_request_preparation_matches_publication(
+            &prepare, body,
+        ) {
+            return Err(invalid());
         }
         let terminal: Value = serde_json::from_slice(&terminal_bytes).map_err(|_| invalid())?;
         let key = historical_request_receipt_key(
@@ -4945,25 +4926,6 @@ async fn verify_direct_request_durable_proof(
             || receipt["actorDeviceId"] != body["actorDeviceId"]
             || receipt["actorKeyId"] != body["keyId"]
             || receipt["authGeneration"] != body["authGeneration"]
-        {
-            return Err(invalid());
-        }
-        let selected = prepare["selectedDevices"].as_array().ok_or_else(invalid)?;
-        let deliveries = body["artifacts"]["welcome"]["deliveries"]
-            .as_array()
-            .ok_or_else(invalid)?;
-        if selected.len() != deliveries.len()
-            || selected.iter().any(|s| {
-                deliveries
-                    .iter()
-                    .filter(|d| {
-                        d["recipientDid"] == s["actorDid"]
-                            && d["recipientDeviceId"] == s["actorDeviceId"]
-                            && d["keyPackageRef"] == s["keyPackage"]["keyPackageRef"]
-                    })
-                    .count()
-                    != 1
-            })
         {
             return Err(invalid());
         }

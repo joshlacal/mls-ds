@@ -11,17 +11,31 @@
 
 use std::{
     collections::HashMap,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
 };
 
 use anyhow::{bail, Context, Result};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
+use catbird_mls::chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind};
+use catbird_mls::orchestrator::direct_request_bootstrap::{
+    DirectRequestBootstrapInput, DirectRequestWelcomeInput,
+};
 use mls_e2e_tests::mls_engine::MlsEngine;
+use p256::{
+    ecdsa::{signature::Signer as _, Signature, SigningKey},
+    pkcs8::{EncodePrivateKey, LineEnding},
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha384};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256, Sha384};
+use uuid::Uuid;
 
 pub const REQUEST_TEST_DATABASE_NAME: &str = "catbird_direct_requests_test_20260919";
 pub const REQUEST_TEST_DATABASE_URL: &str =
@@ -29,6 +43,7 @@ pub const REQUEST_TEST_DATABASE_URL: &str =
 pub const REQUEST_TEST_DATABASE_ENV: &str = "REQUEST_TEST_DATABASE_URL";
 pub const REQUEST_SERVER_BINARY_ENV: &str = "REQUEST_SERVER_BINARY";
 pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
+pub const REQUEST_SERVER_FIXTURE_BINARY_ENV: &str = "REQUEST_SERVER_FIXTURE_BINARY";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -507,6 +522,386 @@ pub struct ServerSnapshot {
     pub message_rows: usize,
     pub welcome_rows: usize,
     pub plaintext_matches: usize,
+}
+
+pub struct FixtureProcess {
+    child: Child,
+}
+
+impl Drop for FixtureProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub struct HttpsDidFixture {
+    pub port: u16,
+    pub ca_pem: PathBuf,
+    pub root: PathBuf,
+    _process: FixtureProcess,
+}
+
+impl HttpsDidFixture {
+    pub fn reserve_port() -> Result<u16> {
+        Ok(std::net::TcpListener::bind("127.0.0.1:0")
+            .context("reserve HTTPS DID fixture port")?
+            .local_addr()?
+            .port())
+    }
+
+    pub fn start(port: u16, documents: &[(String, Value)]) -> Result<Self> {
+        let root = std::env::temp_dir().join(format!(
+            "catbird-request-did-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let ca_key = root.join("ca-key.pem");
+        let ca_pem = root.join("ca.pem");
+        let server_key = root.join("server-key.pem");
+        let server_csr = root.join("server.csr");
+        let server_pem = root.join("server.pem");
+        let extension = root.join("server.ext");
+        std::fs::write(
+            &extension,
+            "subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n",
+        )?;
+        run_checked(
+            Command::new("openssl")
+                .args([
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-days",
+                    "1",
+                    "-subj",
+                    "/CN=Catbird Request Fixture CA",
+                    "-keyout",
+                ])
+                .arg(&ca_key)
+                .arg("-out")
+                .arg(&ca_pem),
+            "generate HTTPS fixture CA",
+        )?;
+        run_checked(
+            Command::new("openssl")
+                .args([
+                    "req",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-subj",
+                    "/CN=localhost",
+                    "-keyout",
+                ])
+                .arg(&server_key)
+                .arg("-out")
+                .arg(&server_csr),
+            "generate HTTPS fixture CSR",
+        )?;
+        run_checked(
+            Command::new("openssl")
+                .args([
+                    "x509",
+                    "-req",
+                    "-days",
+                    "1",
+                    "-sha256",
+                    "-CAcreateserial",
+                    "-in",
+                ])
+                .arg(&server_csr)
+                .arg("-CA")
+                .arg(&ca_pem)
+                .arg("-CAkey")
+                .arg(&ca_key)
+                .arg("-extfile")
+                .arg(&extension)
+                .arg("-out")
+                .arg(&server_pem),
+            "sign HTTPS fixture certificate",
+        )?;
+        for (did, document) in documents {
+            let path = did
+                .strip_prefix(&format!("did:web:localhost%3A{port}:"))
+                .context("fixture DID does not bind its exact HTTPS port")?;
+            let directory = root.join(path.replace(':', "/"));
+            std::fs::create_dir_all(&directory)?;
+            std::fs::write(directory.join("did.json"), serde_json::to_vec(document)?)?;
+        }
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("support/https_did_fixture.py");
+        let mut child = Command::new("python3")
+            .arg(script)
+            .arg(&root)
+            .arg(&server_pem)
+            .arg(&server_key)
+            .arg(port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("start HTTPS DID fixture")?;
+        let ready = read_child_line(&mut child, "HTTPS DID fixture")?;
+        let ready: Value = serde_json::from_str(&ready)?;
+        anyhow::ensure!(ready["port"] == port, "HTTPS DID fixture port drift");
+        Ok(Self {
+            port,
+            ca_pem,
+            root,
+            _process: FixtureProcess { child },
+        })
+    }
+}
+
+fn run_checked(command: &mut Command, label: &str) -> Result<()> {
+    let output = command.output().with_context(|| label.to_owned())?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{label}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn read_child_line(child: &mut Child, label: &str) -> Result<String> {
+    let stdout = child.stdout.take().context(format!("{label} stdout"))?;
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .with_context(|| format!("read {label} readiness"))?;
+    anyhow::ensure!(!line.trim().is_empty(), "{label} exited before readiness");
+    Ok(line)
+}
+
+#[derive(Clone)]
+pub struct ServiceIdentity {
+    pub did: String,
+    pub device_id: Uuid,
+    pub jwt_key: SigningKey,
+    pub jwt_jwk: Value,
+}
+
+impl ServiceIdentity {
+    pub fn new(did: String) -> Self {
+        let jwt_key = SigningKey::random(&mut rand::thread_rng());
+        let point = jwt_key.verifying_key().to_encoded_point(false);
+        let jwt_jwk = json!({
+            "kty":"EC", "crv":"P-256",
+            "x":URL_SAFE_NO_PAD.encode(point.x().expect("P256 x")),
+            "y":URL_SAFE_NO_PAD.encode(point.y().expect("P256 y"))
+        });
+        Self {
+            did,
+            device_id: Uuid::new_v4(),
+            jwt_key,
+            jwt_jwk,
+        }
+    }
+
+    pub fn did_document(&self) -> Value {
+        json!({
+            "id":self.did,
+            "verificationMethod":[{
+                "id":format!("{}#atproto", self.did),
+                "type":"JsonWebKey2020",
+                "controller":self.did,
+                "publicKeyJwk":self.jwt_jwk
+            }]
+        })
+    }
+
+    fn jwt(&self, nsid: &str, valid_signature: bool) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(
+                &json!({"alg":"ES256","typ":"JWT","kid":format!("{}#atproto",self.did)}),
+            )
+            .unwrap(),
+        );
+        let claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"iss":self.did,"aud":"did:web:chat.catbird.blue#atproto_mls","lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()})).unwrap(),
+        );
+        let input = format!("{header}.{claims}");
+        let signature: Signature = if valid_signature {
+            self.jwt_key.sign(input.as_bytes())
+        } else {
+            SigningKey::from_bytes((&[99_u8; 32]).into())
+                .expect("negative key")
+                .sign(input.as_bytes())
+        };
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    pub async fn post(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        nsid: &str,
+        body: &Value,
+        valid_signature: bool,
+    ) -> Result<(StatusCode, Vec<u8>)> {
+        let response = client
+            .post(format!("{base_url}/xrpc/{nsid}"))
+            .bearer_auth(self.jwt(nsid, valid_signature))
+            .json(body)
+            .send()
+            .await
+            .context("shipping router request")?;
+        let status = response.status();
+        let bytes = response.bytes().await?.to_vec();
+        Ok((status, bytes))
+    }
+}
+
+pub fn seed_service_device(identity: &ServiceIdentity, mls_public_key: &[u8]) -> Result<()> {
+    let jkt = jwk_thumbprint(&identity.jwt_jwk)?;
+    let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(mls_public_key));
+    let public_hex = hex::encode(mls_public_key);
+    psql_exec(&format!(
+        "BEGIN; \
+         INSERT INTO chat.principals(user_did,created_at) VALUES('{did}',clock_timestamp()) ON CONFLICT DO NOTHING; \
+         INSERT INTO chat.devices(user_did,device_id,device_name,status,dpop_jkt,auth_generation,capabilities,created_at,updated_at) \
+         VALUES('{did}','{device}','c01-fixture','active','{jkt}',1,chat.protocol_capabilities(),clock_timestamp(),clock_timestamp()) \
+         ON CONFLICT(user_did,device_id) DO NOTHING; \
+         INSERT INTO chat.device_keys(user_did,device_id,key_id,signing_public_key,enrollment_auth_generation,created_at) \
+         VALUES('{did}','{device}','{key_id}',decode('{public_hex}','hex'),1,clock_timestamp()) \
+         ON CONFLICT(user_did,device_id,key_id) DO NOTHING; COMMIT;",
+        did = identity.did,
+        device = identity.device_id,
+    ))
+}
+
+fn jwk_thumbprint(jwk: &Value) -> Result<String> {
+    let canonical = format!(
+        "{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{}\",\"y\":\"{}\"}}",
+        jwk["x"].as_str().context("JWK x")?,
+        jwk["y"].as_str().context("JWK y")?
+    );
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+}
+
+pub fn signed_mls_request(
+    engine: &MlsEngine,
+    identity: &str,
+    kind: DirectRequestKind,
+    body: Value,
+) -> Result<Value> {
+    let transcript = protocol::direct_request_signing_bytes(kind, &serde_json::to_vec(&body)?)?;
+    let signature = engine.sign_identity(identity, transcript)?;
+    let wrapper = json!({"body":body,"signature":STANDARD.encode(signature)});
+    let public = engine.identity_public_key(identity)?;
+    protocol::verify_signed_request(kind, &serde_json::to_vec(&wrapper)?, &public)?;
+    Ok(wrapper)
+}
+
+pub fn canonical_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+pub fn canonical_future(days: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::days(days))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+pub fn request_database_snapshot(request_id: Uuid) -> Result<ServerSnapshot> {
+    let row = psql_query(&format!(
+        "SELECT \
+          (SELECT count(*) FROM chat.direct_request_attempts WHERE request_id='{request_id}'), \
+          (SELECT count(*) FROM chat.entries WHERE transition_id='{request_id}'), \
+          (SELECT count(*) FROM chat.direct_request_device_deliveries WHERE request_id='{request_id}'), \
+          (SELECT count(*) FROM chat.entries WHERE transition_id='{request_id}' AND position(convert_to('Real encrypted first contact','UTF8') in accepted_payload_bytes)>0)"
+    ))?;
+    let fields = row.trim().split('\t').collect::<Vec<_>>();
+    anyhow::ensure!(fields.len() == 4, "unexpected request snapshot");
+    Ok(ServerSnapshot {
+        request_rows: fields[0].parse()?,
+        message_rows: fields[1].parse()?,
+        welcome_rows: fields[2].parse()?,
+        plaintext_matches: fields[3].parse()?,
+    })
+}
+
+pub struct ShippingServerFixture {
+    pub base_url: String,
+    pub receipt_document: Vec<u8>,
+    pub receipt_public_key: Vec<u8>,
+    _process: FixtureProcess,
+}
+
+impl ShippingServerFixture {
+    pub fn start(https: &HttpsDidFixture) -> Result<Self> {
+        let binary = required_file(REQUEST_SERVER_FIXTURE_BINARY_ENV)?;
+        anyhow::ensure!(
+            binary.file_name().and_then(|name| name.to_str())
+                == Some("encrypted_request_server_fixture"),
+            "{REQUEST_SERVER_FIXTURE_BINARY_ENV} must name encrypted_request_server_fixture"
+        );
+        let receipt = SigningKey::from_bytes((&[41_u8; 32]).into())?;
+        let service = SigningKey::from_bytes((&[42_u8; 32]).into())?;
+        let receipt_point = receipt.verifying_key().to_encoded_point(true);
+        let receipt_key_id = protocol::direct_request_receipt_key_id(receipt_point.as_bytes())?;
+        let mut multikey = vec![0x80, 0x24];
+        multikey.extend_from_slice(receipt_point.as_bytes());
+        let receipt_document = serde_json::to_vec(&json!({
+            "id":"did:web:chat.catbird.blue",
+            "verificationMethod":[{
+                "id":receipt_key_id,
+                "controller":"did:web:chat.catbird.blue",
+                "type":"Multikey",
+                "publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)
+            }]
+        }))?;
+        let cursor_key_id =
+            psql_query("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")?;
+        let mut child = Command::new(binary)
+            .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
+            .env("REQUEST_FIXTURE_DID_HOST", "localhost")
+            .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
+            .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
+            .env("DID_RESOLUTION_HOST_ALLOWLIST", "localhost")
+            .env("CHAT_CUTOVER_ENABLED", "1")
+            .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
+            .env("CHAT_CURSOR_KEY_ID", cursor_key_id.trim())
+            .env(
+                "CHAT_CURSOR_SEALING_SECRET",
+                URL_SAFE_NO_PAD.encode([0xA5_u8; 32]),
+            )
+            .env(
+                "CHAT_SUBSCRIPTION_ENDPOINT",
+                "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+            )
+            .env(
+                "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
+                receipt.to_pkcs8_pem(LineEnding::LF)?.as_str(),
+            )
+            .env(
+                "SIGNING_KEY_PEM",
+                service.to_pkcs8_pem(LineEnding::LF)?.as_str(),
+            )
+            .env(
+                "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
+                String::from_utf8(receipt_document.clone())?,
+            )
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("start shipping router fixture")?;
+        let ready = read_child_line(&mut child, "shipping router fixture")?;
+        let ready: Value = serde_json::from_str(&ready)?;
+        let base_url = ready["baseUrl"]
+            .as_str()
+            .context("shipping router readiness lacks baseUrl")?
+            .to_owned();
+        Ok(Self {
+            base_url,
+            receipt_document,
+            receipt_public_key: receipt_point.as_bytes().to_vec(),
+            _process: FixtureProcess { child },
+        })
+    }
 }
 
 struct AccountState {

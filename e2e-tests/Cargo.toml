@@ -21,3 +21,5 @@ catbird_mls = { path = "../../catbird-mls" }
 hex = "0.4"
 ulid = "1.2.1"
 sha2 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+multibase = "0.9"

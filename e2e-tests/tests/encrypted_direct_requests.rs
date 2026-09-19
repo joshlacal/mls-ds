@@ -9,10 +9,28 @@
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
 
-use encrypted_requests::{
-    connect_guarded_request_database, reviewed_baseline, validate_request_test_database_url,
-    DeterministicFaultTransport, FaultBoundary, RequestRig, REQUEST_TEST_DATABASE_URL,
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
 };
+use catbird_mls::{
+    chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind},
+    metadata::GroupMetadataV1,
+    orchestrator::direct_request_bootstrap::{
+        metadata_coordinate, DirectRequestBootstrapInput, DirectRequestIntroductionResult,
+        DirectRequestWelcomeInput,
+    },
+};
+use encrypted_requests::{
+    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
+    reviewed_baseline, seed_service_device, signed_mls_request, validate_request_test_database_url,
+    DeterministicFaultTransport, FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity,
+    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+};
+use mls_e2e_tests::mls_engine::MlsEngine;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 #[test]
 fn database_url_gate_accepts_only_the_exact_local_target() {
@@ -80,5 +98,318 @@ async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow
         .await
         .unwrap_err();
     assert!(error.to_string().contains("T02/T03/T04"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() -> anyhow::Result<()>
+{
+    let authority = connect_guarded_request_database(5).await?;
+    assert!(authority.additive_migrations >= 9);
+
+    let did_port = HttpsDidFixture::reserve_port()?;
+    let alice = ServiceIdentity::new(format!("did:web:localhost%3A{did_port}:alice"));
+    let bob = ServiceIdentity::new(format!("did:web:localhost%3A{did_port}:bob"));
+    let https = HttpsDidFixture::start(
+        did_port,
+        &[
+            (alice.did.clone(), alice.did_document()),
+            (bob.did.clone(), bob.did_document()),
+        ],
+    )?;
+
+    let alice_engine = MlsEngine::new("c01-alice")?;
+    let bob_engine = MlsEngine::new("c01-bob")?;
+    let alice_identity = format!("{}#{}", alice.did, alice.device_id);
+    let bob_identity = format!("{}#{}", bob.did, bob.device_id);
+    let (_alice_package, _alice_package_ref) = alice_engine.create_key_package(&alice_identity)?;
+    let (bob_package, bob_package_ref) = bob_engine.create_key_package(&bob_identity)?;
+    let alice_public = alice_engine.identity_public_key(&alice_identity)?;
+    let bob_public = bob_engine.identity_public_key(&bob_identity)?;
+    seed_service_device(&alice, &alice_public)?;
+    seed_service_device(&bob, &bob_public)?;
+
+    let server = ShippingServerFixture::start(&https)?;
+    let client = reqwest::Client::builder().build()?;
+    let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
+    let grant_id = Uuid::new_v4();
+    let grant = json!({
+        "$type":"blue.catbird.chat.defs#directRequestGrantBody",
+        "signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\0",
+        "protocolVersion":"2",
+        "actorDid":bob.did,
+        "actorDeviceId":bob.device_id,
+        "keyId":bob_key_id,
+        "authGeneration":1,
+        "grantId":grant_id,
+        "grantRevision":1,
+        "purpose":"direct-request-bootstrap",
+        "profile":"encryptedIntroduction1",
+        "keyPackageRef":STANDARD.encode(&bob_package_ref),
+        "keyPackageSha256":STANDARD.encode(Sha256::digest(&bob_package)),
+        "expiresAt":canonical_future(29),
+        "idempotencyKey":grant_id,
+        "signedAt":canonical_now()
+    });
+    let grant = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Grant, grant)?;
+    let keys_operation = Uuid::new_v4();
+    let keys = signed_mls_request(
+        &bob_engine,
+        &bob_identity,
+        DirectRequestKind::Keys,
+        json!({
+            "$type":"blue.catbird.chat.defs#directRequestKeysPublicationBody",
+            "signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\0",
+            "protocolVersion":"2",
+            "actorDid":bob.did,
+            "actorDeviceId":bob.device_id,
+            "keyId":bob_key_id,
+            "authGeneration":1,
+            "revision":1,
+            "enabled":true,
+            "keys":[{
+                "keyPackage":{
+                    "framing":"mlsMessage",
+                    "contentType":"keyPackage",
+                    "bytes":STANDARD.encode(&bob_package),
+                    "sha256":STANDARD.encode(Sha256::digest(&bob_package)),
+                    "keyPackageRef":STANDARD.encode(&bob_package_ref)
+                },
+                "grant":grant
+            }],
+            "idempotencyKey":keys_operation,
+            "signedAt":canonical_now()
+        }),
+    )?;
+    let keys_envelope = json!({"signedRequest":keys});
+    let (bad_status, _) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &keys_envelope,
+            false,
+        )
+        .await?;
+    assert_eq!(bad_status, reqwest::StatusCode::UNAUTHORIZED);
+    let (keys_status, keys_response) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.publishDirectRequestKeys",
+            &keys_envelope,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        keys_status == reqwest::StatusCode::OK,
+        "publish keys failed {keys_status}: {}",
+        String::from_utf8_lossy(&keys_response)
+    );
+
+    let request_id = Uuid::new_v4();
+    let first_message_id = Uuid::new_v4();
+    let conversation_id = Uuid::new_v4();
+    let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
+    let prepare = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Prepare,
+        json!({
+            "$type":"blue.catbird.chat.defs#directRequestPreparationBody",
+            "signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0",
+            "protocolVersion":"2",
+            "actorDid":alice.did,
+            "actorDeviceId":alice.device_id,
+            "keyId":alice_key_id,
+            "authGeneration":1,
+            "requestId":request_id,
+            "firstMessageId":first_message_id,
+            "conversationId":conversation_id,
+            "recipientDid":bob.did,
+            "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
+            "profile":"encryptedIntroduction1",
+            "idempotencyKey":request_id,
+            "signedAt":canonical_now()
+        }),
+    )?;
+    let (prepare_status, prepare_response) = alice
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.prepareDirectRequest",
+            &json!({"signedRequest":prepare}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        prepare_status == reqwest::StatusCode::OK,
+        "prepare failed {prepare_status}: {}",
+        String::from_utf8_lossy(&prepare_response)
+    );
+    let response: Value = serde_json::from_slice(&prepare_response)?;
+    let preparation = response["outcome"]["preparation"].clone();
+    let preparation_bytes = serde_json::to_vec(&preparation)?;
+    protocol::verify_direct_request_preparation(&preparation_bytes, &server.receipt_public_key)?;
+    let verified_prepare = protocol::verify_signed_request(
+        DirectRequestKind::Prepare,
+        &serde_json::to_vec(&prepare)?,
+        &alice_public,
+    )?;
+    let selected = preparation["selectedDevices"]
+        .as_array()
+        .context("preparation selectedDevices")?;
+    anyhow::ensure!(
+        selected.len() == 1,
+        "C01 expected one selected recipient device"
+    );
+    let import_until = chrono::DateTime::parse_from_rfc3339(
+        preparation["minimumImportUntil"]
+            .as_str()
+            .context("minimumImportUntil")?,
+    )?
+    .timestamp() as u64;
+    let context = json!({
+        "protocolVersion":"2",
+        "requestId":request_id,
+        "firstMessageId":first_message_id,
+        "conversationId":conversation_id,
+        "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
+        "actorDid":alice.did,
+        "actorDeviceId":alice.device_id,
+        "actorKeyId":alice_key_id,
+        "recipientDid":bob.did,
+        "preparationDigest":preparation["preparationDigest"]
+    });
+    let journal = alice_engine.prepare_direct_request(&DirectRequestBootstrapInput {
+        draft_id: Uuid::new_v4().to_string(),
+        context_json: serde_json::to_vec(&context)?,
+        group_id: rand::random::<[u8; 32]>().to_vec(),
+        generation: 0,
+        state_version: 1,
+        key_packages: vec![bob_package.clone()],
+        expected_package_refs: vec![bob_package_ref.clone()],
+        authority_import_until: import_until,
+        preparation_request_digest: *verified_prepare.request_digest(),
+        receipt_authority_key: server.receipt_public_key.clone(),
+        text: "Real encrypted first contact".into(),
+        invitation: None,
+        metadata: GroupMetadataV1 {
+            version: 1,
+            title: String::new(),
+            description: String::new(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        },
+    })?;
+    let bootstrap = &journal.bootstrap;
+    let mut publish_body = prepare["body"].clone();
+    publish_body["$type"] = json!("blue.catbird.chat.defs#directRequestPublicationBody");
+    publish_body["signatureDomain"] = json!("CATBIRD-DIRECT-REQUEST-PUBLISH\0");
+    publish_body["signedAt"] = json!(canonical_now());
+    publish_body["preparationDigest"] = preparation["preparationDigest"].clone();
+    publish_body["preparationRequestDigest"] =
+        json!(STANDARD.encode(verified_prepare.request_digest()));
+    publish_body["contextHash"] = json!(STANDARD.encode(bootstrap.context_hash));
+    publish_body["next"] = bootstrap.coordinates.clone();
+    publish_body["importUntil"] = json!(chrono::DateTime::from_timestamp(
+        bootstrap.import_until as i64,
+        0
+    )
+    .context("import timestamp")?
+    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let artifact = |data: &[u8], content_type: &str| {
+        json!({
+            "framing":"mlsMessage","contentType":content_type,
+            "bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))
+        })
+    };
+    let deliveries = selected
+        .iter()
+        .map(|device| {
+            json!({
+                "recipientDid":device["actorDid"],
+                "recipientDeviceId":device["actorDeviceId"],
+                "provenance":{
+                    "requestId":request_id,
+                    "preparationDigest":preparation["preparationDigest"],
+                    "contextHash":STANDARD.encode(bootstrap.context_hash),
+                    "grantId":device["grant"]["body"]["grantId"],
+                    "grantRevision":device["grant"]["body"]["grantRevision"],
+                    "keyPackageRef":device["keyPackage"]["keyPackageRef"],
+                    "importUntil":publish_body["importUntil"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let author = json!({
+        "authorDid":alice.did,"authorDeviceId":alice.device_id,"authorKeyId":alice_key_id,
+        "signaturePublicKey":STANDARD.encode(&alice_public),"authGenerationAtOrigin":1,
+        "originTransitionId":request_id,"originSeq":1,"roleAtOrigin":"admin",
+        "deviceStatusAtOrigin":"active"
+    });
+    publish_body["artifacts"] = json!({
+        "genesisGroupInfo":artifact(&bootstrap.genesis_group_info,"groupInfo"),
+        "addCommit":artifact(&bootstrap.add_commit,"publicMessageCommit"),
+        "finalGroupInfo":artifact(&bootstrap.final_group_info,"groupInfo"),
+        "welcome":{"opaqueWelcome":STANDARD.encode(&bootstrap.welcome),"sha256":STANDARD.encode(Sha256::digest(&bootstrap.welcome)),"deliveries":deliveries},
+        "initialCiphertext":STANDARD.encode(&bootstrap.initial_ciphertext),
+        "metadataSnapshot":{
+            "coordinate":metadata_coordinate(&bootstrap.coordinates)?,
+            "originTransitionId":request_id,"metadataVersion":1,
+            "nonce":STANDARD.encode(&bootstrap.metadata_nonce),
+            "ciphertext":STANDARD.encode(&bootstrap.metadata_ciphertext),
+            "ciphertextSha256":STANDARD.encode(Sha256::digest(&bootstrap.metadata_ciphertext)),
+            "ciphertextSize":bootstrap.metadata_ciphertext.len(),"authorProof":author
+        }
+    });
+    let publication = signed_mls_request(
+        &alice_engine,
+        &alice_identity,
+        DirectRequestKind::Publish,
+        publish_body,
+    )?;
+    let (publish_status, publish_response) = alice
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.publishDirectRequest",
+            &json!({"signedRequest":publication}),
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        publish_status == reqwest::StatusCode::OK,
+        "publish failed {publish_status}: {}",
+        String::from_utf8_lossy(&publish_response)
+    );
+    let published: Value = serde_json::from_slice(&publish_response)?;
+    let mut receipt = published["outcome"].clone();
+    receipt
+        .as_object_mut()
+        .context("published outcome object")?
+        .remove("$type");
+    let welcome_input = DirectRequestWelcomeInput {
+        bootstrap: bootstrap.clone(),
+        local_identity: bob_identity.as_bytes().to_vec(),
+        local_package_ref: bob_package_ref,
+        publication_request: serde_json::to_vec(&publication)?,
+        actor_signature_public_key: alice_public,
+        published_receipt: serde_json::to_vec(&receipt)?,
+        receipt_authority_key: server.receipt_public_key,
+        preparation_request_digest: *verified_prepare.request_digest(),
+    };
+    bob_engine.process_direct_request(&welcome_input)?;
+    let decrypted = bob_engine.decrypt_direct_request(&welcome_input)?;
+    let DirectRequestIntroductionResult::Ready { plaintext } = decrypted else {
+        anyhow::bail!("recipient introduction unavailable")
+    };
+    let introduction = protocol::decode_direct_request_introduction(&plaintext)?;
+    assert_eq!(introduction["text"], "Real encrypted first contact");
+    let snapshot = request_database_snapshot(request_id)?;
+    assert_eq!(snapshot.request_rows, 1);
+    assert_eq!(snapshot.message_rows, 1);
+    assert_eq!(snapshot.welcome_rows, 1);
+    assert_eq!(snapshot.plaintext_matches, 0);
     Ok(())
 }
