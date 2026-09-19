@@ -151,6 +151,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000014_direct_request_nul_comparison.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000015,
+        Cow::Borrowed("direct request entry identity"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000015_direct_request_entry_identity.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,

@@ -152,7 +152,7 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
-pub fn reviewed_request_migrations() -> [BaselineMigration; 14] {
+pub fn reviewed_request_migrations() -> [BaselineMigration; 15] {
     [
         baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
         baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
@@ -168,6 +168,7 @@ pub fn reviewed_request_migrations() -> [BaselineMigration; 14] {
         baseline!(20260919000012, "direct request welcome slot digest", "20260919000012_direct_request_welcome_slot_digest.sql", "dbe9835b66cba3edd3c21ca1756ae1ee2b13a8c0fbb67fea3dc3b1f754bc5eca90d7a36fff1ff10c6ad568f52eb3312d"),
         baseline!(20260919000013, "direct request signed json projection", "20260919000013_direct_request_signed_json_projection.sql", "d8170f613b3c2c2fc087b8ab7c5f24d15dd4379ba3605048390beccbdecdd85a525f5d70c3b340d98d053c543d924156"),
         baseline!(20260919000014, "direct request nul comparison", "20260919000014_direct_request_nul_comparison.sql", "2f47a3019d459b7989f544773da035e10914af95b85ad553afd70e84367189085a3c8507b7314bfa84d4cc4335a1d8b8"),
+        baseline!(20260919000015, "direct request entry identity", "20260919000015_direct_request_entry_identity.sql", "157cac50d04bd77388897fe386acd915ece5046c40923dec21675726ed091ac5b709691664a57241f67c8415e73cf29d"),
     ]
 }
 
