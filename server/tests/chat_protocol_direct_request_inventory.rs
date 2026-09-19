@@ -80,5 +80,39 @@ async fn scoped_session_initializes_once_before_materialization() {
         .execute(&mut *tx)
         .await
         .unwrap();
+    sqlx::query("SAVEPOINT scope_insert")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let error=sqlx::query("INSERT INTO chat.inventory_sessions SELECT (jsonb_populate_record(NULL::chat.inventory_sessions,to_jsonb(s)||jsonb_build_object('inventory_session_id',$2::uuid,'token_hash',to_jsonb($3::bytea),'scoped_conversation_ids',jsonb_build_array($4::uuid)))).* FROM chat.inventory_sessions s WHERE inventory_session_id=$1")
+        .bind(session).bind(Uuid::new_v4()).bind(vec![8u8;32]).bind(Uuid::new_v4()).execute(&mut *tx).await.expect_err("direct INSERT cannot mint an unverified scope audience");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    assert!(error
+        .as_database_error()
+        .unwrap()
+        .message()
+        .contains("scope audience version mismatch"));
+    sqlx::query("ROLLBACK TO SAVEPOINT scope_insert")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn acknowledged_welcome_requires_nonnull_signed_digest() {
+    let pool = common::direct_request_database::setup().await;
+    let mut tx = pool.begin().await.unwrap();
+    let error=sqlx::query("INSERT INTO chat.direct_request_welcome_outcomes(request_id,recipient_did,recipient_device_id,status,terminal_at,signed_request_bytes,request_digest) VALUES($1,'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa',$2,'acknowledged',clock_timestamp(),$3,NULL)")
+        .bind(uuid::Uuid::new_v4()).bind(uuid::Uuid::new_v4()).bind(b"{}".as_slice()).execute(&mut *tx).await.expect_err("unsigned digest must be rejected before delivery FK evaluation");
+    let database = error.as_database_error().unwrap();
+    assert_eq!(database.code().as_deref(), Some("23514"));
+    assert_eq!(
+        database.constraint(),
+        Some("direct_request_welcome_outcomes_nonnull_digest")
+    );
     tx.rollback().await.unwrap();
 }

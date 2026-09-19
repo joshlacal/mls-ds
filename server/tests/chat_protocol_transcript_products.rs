@@ -35,6 +35,7 @@ use validation::{
 
 fn control_endpoint(kind: ControlEntryKind) -> &'static str {
     match kind {
+        ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance => panic!("v2 history is not a v1 append route"),
         ControlEntryKind::Creation => "blue.catbird.chat.createConversation",
         ControlEntryKind::ParticipantAcceptance => "blue.catbird.chat.acceptConversation",
         ControlEntryKind::ConversationClose => "blue.catbird.chat.closeConversation",
@@ -66,6 +67,7 @@ fn all_thirteen_verified_control_variants_mint_one_strict_durable_and_response_p
     assert_eq!(cases.len(), 13);
     let actual_kinds = ControlEntryKind::ALL
         .into_iter()
+        .filter(|kind| !matches!(kind, ControlEntryKind::DirectRequestPublication | ControlEntryKind::DirectRequestAcceptance))
         .map(ControlEntryKind::type_id)
         .collect::<BTreeSet<_>>();
     let expected_kinds = BTreeSet::from([

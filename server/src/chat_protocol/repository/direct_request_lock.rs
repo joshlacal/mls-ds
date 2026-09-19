@@ -19,10 +19,26 @@ pub(crate) async fn lock_direct_request_operation(
     transaction: &mut Transaction<'_, Postgres>,
     request_id: Uuid,
 ) -> Result<DirectRequestOperationLock, sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(format!("chat-operation-id:{request_id}"))
-        .execute(&mut **transaction)
-        .await?;
+    lock_direct_request_operation_set(transaction, request_id, &[]).await
+}
+
+/// Acceptance locks its own immutable mutation ID and the original request
+/// together, in UUID-byte order, before budget or identity state.
+pub(crate) async fn lock_direct_request_operation_set(
+    transaction: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+    additional_ids: &[Uuid],
+) -> Result<DirectRequestOperationLock, sqlx::Error> {
+    let mut ids = additional_ids.to_vec();
+    ids.push(request_id);
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(format!("chat-operation-id:{id}"))
+            .execute(&mut **transaction)
+            .await?;
+    }
     sqlx::query("SELECT singleton FROM chat.direct_request_budget WHERE singleton FOR UPDATE")
         .fetch_one(&mut **transaction)
         .await?;

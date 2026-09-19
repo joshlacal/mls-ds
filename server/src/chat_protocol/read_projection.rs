@@ -1325,7 +1325,10 @@ pub(crate) struct CheckedParticipantView {
 
 impl CheckedParticipantView {
     pub(crate) fn for_direct_request(
-        user_did: &str, role: &str, status: &str, leaf_count: i64,
+        user_did: &str,
+        role: &str,
+        status: &str,
+        leaf_count: i64,
         invitation: Option<CheckedInvitationProvenance>,
         publication: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
     ) -> Result<Self, ProjectionError> {
@@ -1334,10 +1337,23 @@ impl CheckedParticipantView {
             return Self::new(user_did, role, status, leaf_count, invitation);
         }
         let body = publication.body();
-        let included = body["artifacts"]["welcome"]["deliveries"].as_array().map(|rows| rows.iter().filter(|row|row["recipientDid"].as_str()==Some(user_did)).count()).unwrap_or(0);
-        if publication.kind() != DirectRequestKind::Publish || body["recipientDid"].as_str() != Some(user_did)
-            || included as i64 != leaf_count || role != MEMBER_ROLE_ADMIN {
-            return Err(source_inconsistency("participant.leafCount", "pending request leaves require exact signed publication coverage"));
+        let included = body["artifacts"]["welcome"]["deliveries"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row["recipientDid"].as_str() == Some(user_did))
+                    .count()
+            })
+            .unwrap_or(0);
+        if publication.kind() != DirectRequestKind::Publish
+            || body["recipientDid"].as_str() != Some(user_did)
+            || included as i64 != leaf_count
+            || role != MEMBER_ROLE_ADMIN
+        {
+            return Err(source_inconsistency(
+                "participant.leafCount",
+                "pending request leaves require exact signed publication coverage",
+            ));
         }
         let mut view = Self::new(user_did, role, status, 0, invitation)?;
         view.leaf_count = leaf_count;
@@ -1746,9 +1762,22 @@ pub(crate) struct CheckedConversationClose {
 }
 
 impl ConversationProjectionSource {
-    pub(crate) fn with_direct_request(mut self, request: chat_dto::DirectRequestState<DefaultStr>) -> Result<Self, ProjectionError> {
-        let Self::State(state) = &mut self else { return Err(source_inconsistency("directRequest", "request state requires conversation state")); };
-        if state.conversation_kind != CONVERSATION_KIND_DIRECT { return Err(source_inconsistency("directRequest", "request state requires direct conversation")); }
+    pub(crate) fn with_direct_request(
+        mut self,
+        request: chat_dto::DirectRequestState<DefaultStr>,
+    ) -> Result<Self, ProjectionError> {
+        let Self::State(state) = &mut self else {
+            return Err(source_inconsistency(
+                "directRequest",
+                "request state requires conversation state",
+            ));
+        };
+        if state.conversation_kind != CONVERSATION_KIND_DIRECT {
+            return Err(source_inconsistency(
+                "directRequest",
+                "request state requires direct conversation",
+            ));
+        }
         state.direct_request = Some(request);
         Ok(self)
     }

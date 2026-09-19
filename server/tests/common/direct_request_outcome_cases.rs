@@ -227,3 +227,32 @@ async fn nullable_receipt_and_snapshot_fields_cannot_bypass_database_checks() {
         tx.rollback().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn acceptance_operation_prefix_sorts_all_ids_before_budget_lock() {
+    let pool = crate::common::direct_request_database::setup().await;
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut tx = pool.begin().await.unwrap();
+    super::prelude::lock_direct_request_operation_set(&mut tx, first, &[second])
+        .await
+        .unwrap();
+    let pool2 = pool.clone();
+    let mut competing = tokio::spawn(async move {
+        let mut tx = pool2.begin().await.unwrap();
+        super::prelude::lock_direct_request_operation_set(&mut tx, second, &[first])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), competing)
+        .await
+        .unwrap()
+        .unwrap();
+}

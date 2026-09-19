@@ -90,9 +90,13 @@ async fn read_conversation_state_in_transaction(
         .await
         .map_err(map_authority_error)?;
 
-    let source = super::inventory::load_conversation_state_source(transaction, conversation_id, &requester_did)
-        .await
-        .map_err(map_inventory_error)?;
+    let source = super::inventory::load_conversation_state_source(
+        transaction,
+        conversation_id,
+        &requester_did,
+    )
+    .await
+    .map_err(map_inventory_error)?;
     let state =
         conversation_state_view(&source).map_err(|_| ConversationStateReadError::Invariant)?;
     let (pending_leave_requests, pending_reset_requests) =

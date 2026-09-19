@@ -958,6 +958,9 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
         .require_transaction(tx)
         .await
         .map_err(|_| DirectAcceptanceError::Invariant)?;
+    if let Some(response) = actor.recorded_response() {
+        return Ok(response.to_vec());
+    }
     let signed = actor.signed();
     let body = signed.body();
     let text = |v: &Value| {
@@ -970,6 +973,9 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     let conversation_id = uuid(&body["prior"]["conversationId"])?;
     let request_id = uuid(&body["requestId"])?;
     let transition_id = uuid(&body["transitionId"])?;
+    if transition_id != actor.operation_id() {
+        return Err(DirectAcceptanceError::Invariant);
+    }
     let actor_device_id = uuid(&body["actorDeviceId"])?;
     let head = sqlx::query("SELECT c.current_generation,c.current_state_version,c.next_entry_seq,c.lifecycle,c.protocol_version,s.group_id,s.epoch,s.group_context_hash,s.confirmation_tag,p.recipient_did,p.generation AS publication_generation FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version JOIN chat.direct_request_publications p ON p.conversation_id=c.conversation_id AND p.request_id=$2 WHERE c.conversation_id=$1 FOR UPDATE OF c")
         .bind(conversation_id).bind(request_id).fetch_optional(&mut **tx).await?.ok_or(DirectAcceptanceError::NotPending)?;
@@ -980,18 +986,7 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     }
     let existing: Option<(String,Option<Vec<u8>>,Option<Vec<u8>>)> = sqlx::query_as("SELECT consent,acceptance_digest,acceptance_proof FROM chat.direct_request_lifecycle WHERE request_id=$1")
         .bind(request_id).fetch_optional(&mut **tx).await?;
-    if let Some((consent, digest, proof)) = existing {
-        if matches!(consent.as_str(), "accepted" | "closed")
-            && digest.as_deref() == Some(signed.request_digest().as_slice())
-        {
-            let proof: Value =
-                serde_json::from_slice(&proof.ok_or(DirectAcceptanceError::Invariant)?)
-                    .map_err(|_| DirectAcceptanceError::Invariant)?;
-            return serde_json::to_vec(
-                &json!({"coordinates":proof["receipt"]["body"]["next"],"acceptanceProof":proof}),
-            )
-            .map_err(|_| DirectAcceptanceError::Invariant);
-        }
+    if existing.is_some() {
         return Err(DirectAcceptanceError::NotPending);
     }
     if head.try_get::<String, _>("lifecycle")? != "active"
@@ -1158,8 +1153,13 @@ pub(crate) async fn accept_direct_request<T: PublicTransport>(
     )
     .await
     .map_err(|_| DirectAcceptanceError::Invariant)?;
-    serde_json::to_vec(&json!({"coordinates":next,"acceptanceProof":proof}))
-        .map_err(|_| DirectAcceptanceError::Invariant)
+    let response = serde_json::to_vec(&json!({"coordinates":next,"acceptanceProof":proof}))
+        .map_err(|_| DirectAcceptanceError::Invariant)?;
+    sqlx::query("INSERT INTO chat.direct_request_acceptance_claims(operation_id,request_id,principal_did,request_digest,accepted_request,signature,response_bytes,response_sha256,recorded_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        .bind(actor.operation_id()).bind(request_id).bind(principal.did()).bind(signed.request_digest().as_slice())
+        .bind(signed.accepted_wrapper_bytes()).bind(signed.signature().as_slice()).bind(&response)
+        .bind(Sha256::digest(&response).to_vec()).bind(now).execute(&mut **tx).await?;
+    Ok(response)
 }
 
 #[derive(Debug)]

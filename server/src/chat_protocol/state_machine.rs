@@ -17535,7 +17535,8 @@ fn metadata_provenance_matches(state: &ConversationState) -> bool {
                 return false;
             }
             producer.authority.as_ref().is_none_or(|authority| {
-                authority.control_conversation_id.as_ref()
+                (authority.kind != SignedMutationKind::DirectRequestPublication || metadata_author_matches_evidence(metadata, producer))
+                    && authority.control_conversation_id.as_ref()
                     == Some(state.coordinate.conversation_id())
                     && matches!(
                         authority.kind,
@@ -18723,7 +18724,9 @@ fn transition_consumes_coordinate(
         return false;
     }
     match evidence.body_binding.as_ref() {
-        Some(TransitionBodyBinding::Commit { prior, .. })
+        Some(TransitionBodyBinding::DirectRequestPublication { prior: Some(prior), .. })
+        | Some(TransitionBodyBinding::DirectRequestAcceptance { prior, .. })
+        | Some(TransitionBodyBinding::Commit { prior, .. })
         | Some(TransitionBodyBinding::Policy { prior, .. })
         | Some(TransitionBodyBinding::Acceptance { prior, .. })
         | Some(TransitionBodyBinding::Metadata { prior, .. })

@@ -131,7 +131,7 @@ async fn load_locked_attempt(
     if operation.transaction_id() != txid || operation.request_id() != identity.request_id {
         return Err(DirectRequestStoreError::ForeignTransaction);
     }
-    let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1)")
+    let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_acceptance_claims WHERE operation_id=$1)")
         .bind(identity.request_id).fetch_one(&mut **tx).await?;
     if collision {
         return Err(DirectRequestStoreError::IdentityConflict);

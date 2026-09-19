@@ -90,6 +90,14 @@ pub async fn setup() -> PgPool {
             "../../migrations/20260919000008_direct_request_lifecycle_fences.sql"
         )),
     ));
+    migrations.push(Migration::new(
+        20260919000009,
+        Cow::Borrowed("direct request acceptance claims"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000009_direct_request_acceptance_claims.sql"
+        )),
+    ));
     let migrator = Migrator {
         migrations: Cow::Owned(migrations),
         ignore_missing: false,

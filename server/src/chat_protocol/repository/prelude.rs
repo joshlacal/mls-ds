@@ -3780,4 +3780,4 @@ mod event_scope_tests;
 
 #[path = "direct_request_lock.rs"]
 mod direct_request_lock;
-pub(super) use direct_request_lock::{lock_direct_request_operation, lock_direct_request_identity_scope, DirectRequestOperationLock};
+pub(super) use direct_request_lock::{lock_direct_request_operation_set, lock_direct_request_operation, lock_direct_request_identity_scope, DirectRequestOperationLock};

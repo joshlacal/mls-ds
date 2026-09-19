@@ -97,8 +97,32 @@ mod signed_admission {
                 "requestId"
             },
         )?;
+        let acceptance_operation = if kind == DirectRequestKind::Accept {
+            let id = uuid_field(signed.body(), "transitionId")?;
+            if uuid_field(signed.body(), "idempotencyKey")? != id || id == operation_id {
+                return invalid();
+            }
+            Some(id)
+        } else {
+            None
+        };
+        let additional = acceptance_operation.into_iter().collect::<Vec<_>>();
         let operation =
-            super::super::prelude::lock_direct_request_operation(tx, operation_id).await?;
+            super::super::prelude::lock_direct_request_operation_set(tx, operation_id, &additional)
+                .await?;
+        let acceptance_collision:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.direct_request_acceptance_claims WHERE operation_id=$1)")
+            .bind(operation_id).fetch_one(&mut **tx).await?;
+        if acceptance_collision {
+            return invalid();
+        }
+        if let Some(id) = acceptance_operation {
+            let conflict:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1)")
+                .bind(id).fetch_one(&mut **tx).await?;
+            if conflict {
+                return invalid();
+            }
+            load_acceptance_replay(tx, &signed).await?;
+        }
         let collision: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chat.operation_claims WHERE operation_id=$1) OR EXISTS(SELECT 1 FROM chat.direct_request_attempts WHERE request_id=$1 AND $2) OR EXISTS(SELECT 1 FROM chat.direct_request_key_publications WHERE operation_id=$1 AND NOT $2)")
             .bind(operation_id).bind(kind == DirectRequestKind::Keys).fetch_one(&mut **tx).await?;
         if collision {
@@ -861,12 +885,48 @@ pub(crate) async fn prepare_direct_request<
     }
 }
 
+async fn load_acceptance_replay(
+    tx: &mut Transaction<'_, Postgres>,
+    signed: &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
+) -> Result<Option<Vec<u8>>, DirectRequestStoreError> {
+    let id = Uuid::parse_str(
+        signed.body()["transitionId"]
+            .as_str()
+            .ok_or(DirectRequestStoreError::IdentityConflict)?,
+    )
+    .map_err(|_| DirectRequestStoreError::IdentityConflict)?;
+    let row:Option<(Uuid,String,Vec<u8>,Vec<u8>,Vec<u8>,Vec<u8>,Vec<u8>)>=sqlx::query_as("SELECT request_id,principal_did,request_digest,accepted_request,signature,response_bytes,response_sha256 FROM chat.direct_request_acceptance_claims WHERE operation_id=$1")
+        .bind(id).fetch_optional(&mut **tx).await?;
+    let Some((request, did, digest, raw, signature, response, response_hash)) = row else {
+        return Ok(None);
+    };
+    if Some(request.to_string().as_str()) != signed.request_id()
+        || Some(did.as_str()) != signed.actor_did()
+        || digest != signed.request_digest()
+        || raw != signed.accepted_wrapper_bytes()
+        || signature != signed.signature()
+        || response_hash != Sha256::digest(&response).as_slice()
+    {
+        return Err(DirectRequestStoreError::IdentityConflict);
+    }
+    Ok(Some(response))
+}
+
 pub(super) struct LockedDirectRequestAcceptance {
     transaction_id: String,
+    operation_id: Uuid,
+    recorded_response: Option<Vec<u8>>,
     signed: crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest,
     now: DateTime<Utc>,
 }
 impl LockedDirectRequestAcceptance {
+    pub(super) fn operation_id(&self) -> Uuid {
+        self.operation_id
+    }
+    pub(super) fn recorded_response(&self) -> Option<&[u8]> {
+        self.recorded_response.as_deref()
+    }
+
     pub(super) fn signed(
         &self,
     ) -> &crate::chat_protocol::direct_request_transcript::VerifiedDirectRequest {
@@ -901,8 +961,17 @@ pub(super) async fn admit_acceptance(
     .await?;
     // The consent owner must arbitrate exact completed replay before applying
     // first-execution age; this helper does not grant that bypass to effects.
+    let operation_id = Uuid::parse_str(
+        actor.signed.body()["transitionId"]
+            .as_str()
+            .ok_or(DirectRequestStoreError::IdentityConflict)?,
+    )
+    .map_err(|_| DirectRequestStoreError::IdentityConflict)?;
+    let recorded_response = load_acceptance_replay(tx, &actor.signed).await?;
     Ok(LockedDirectRequestAcceptance {
         transaction_id: transaction_id(tx).await?,
+        operation_id,
+        recorded_response,
         now: actor.now,
         signed: actor.signed,
     })
