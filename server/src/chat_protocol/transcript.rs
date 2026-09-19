@@ -363,7 +363,7 @@ fn contract() -> &'static SchemaValue {
     })
 }
 
-fn definition(name: &str) -> Result<&'static SchemaValue, AuthPrimitiveError> {
+pub(super) fn definition(name: &str) -> Result<&'static SchemaValue, AuthPrimitiveError> {
     contract()["defs"]
         .get(name)
         .ok_or_else(|| AuthPrimitiveError::invalid("unknown embedded contract definition"))
@@ -3676,6 +3676,71 @@ pub(crate) fn project_direct_request_contract(
         .map_err(|_| AuthPrimitiveError::invalid("direct request DAG-CBOR projection"))
 }
 
+/// Presentation-only bridge after signature verification. The generated DTO's
+/// byte helpers and byte aliases have different JSON forms; the schema owns
+/// that distinction. Re-projecting the generated round trip must preserve the
+/// complete canonical DAG value, including every signature and exact type tag.
+pub(crate) fn decode_direct_request_generated_view<T: serde::de::DeserializeOwned + Serialize>(
+    raw: &[u8],
+    name: &str,
+    tagged: bool,
+) -> Result<T, AuthPrimitiveError> {
+    if !matches!(name, "directRequestState" | "directRequestWelcomeView") {
+        return Err(AuthPrimitiveError::invalid(
+            "direct request presentation definition",
+        ));
+    }
+    let canonical = project_ref(name, &decode_raw_json(raw)?, tagged)?;
+    let generated = dag_value_generated_json(definition(name)?, &canonical)?;
+    let dto: T = serde_json::from_value(generated)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request generated view decode"))?;
+    let encoded = serde_json::to_value(&dto)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request generated view encode"))?;
+    let normalized = normalize_generated_response_json(definition(name)?, &encoded)?;
+    let round_trip = project_ref(
+        name,
+        &decode_raw_json(
+            &serde_json::to_vec(&normalized)
+                .map_err(|_| AuthPrimitiveError::invalid("direct request presentation JSON"))?,
+        )?,
+        tagged,
+    )?;
+    let before = serde_ipld_dagcbor::to_vec(&canonical)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request original presentation CBOR"))?;
+    let after = serde_ipld_dagcbor::to_vec(&round_trip)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request generated presentation CBOR"))?;
+    if before != after {
+        return Err(AuthPrimitiveError::invalid(
+            "direct request presentation changed signed material",
+        ));
+    }
+    Ok(dto)
+}
+
+pub(crate) fn direct_request_generated_view_wire<T: Serialize>(
+    dto: &T,
+    name: &str,
+    tagged: bool,
+) -> Result<SchemaValue, AuthPrimitiveError> {
+    if !matches!(name, "directRequestState" | "directRequestWelcomeView") {
+        return Err(AuthPrimitiveError::invalid(
+            "direct request presentation definition",
+        ));
+    }
+    let generated = serde_json::to_value(dto)
+        .map_err(|_| AuthPrimitiveError::invalid("direct request generated view encode"))?;
+    let normalized = normalize_generated_response_json(definition(name)?, &generated)?;
+    project_ref(
+        name,
+        &decode_raw_json(
+            &serde_json::to_vec(&normalized)
+                .map_err(|_| AuthPrimitiveError::invalid("direct request presentation JSON"))?,
+        )?,
+        tagged,
+    )?;
+    Ok(normalized)
+}
+
 pub(crate) fn validate_direct_request_strict_json(raw: &[u8]) -> Result<(), AuthPrimitiveError> {
     decode_raw_json(raw)?;
     Ok(())
@@ -3689,5 +3754,148 @@ impl<'a> DirectRequestPublicationProjection<'a> {
 impl<'a> DirectRequestAcceptanceProjection<'a> {
     pub fn body(&self) -> ClosedObjectRef<'a> {
         ClosedObjectRef(&self.0.canonical.body)
+    }
+}
+
+#[cfg(test)]
+mod request_presentation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> SchemaValue {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/direct_request_vectors.json"
+        ))
+        .unwrap()
+    }
+    fn body(kind: &str) -> SchemaValue {
+        fixture()["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == kind)
+            .unwrap()["body"]
+            .clone()
+    }
+    fn state(accepted: bool) -> SchemaValue {
+        let p = body("Publish");
+        let mut state = json!({"requestId":p["requestId"],"senderDid":p["actorDid"],
+            "recipientDid":p["recipientDid"],"firstMessageId":p["firstMessageId"],
+            "contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],
+            "importUntil":p["importUntil"],"consent":if accepted {"accepted"} else {"incomingPending"}});
+        if accepted {
+            // Presentation tests deliberately do not mint authority. Live C02
+            // independently verifies real native and server signatures.
+            state["acceptanceProof"] = json!({"entry":{"seq":2,"entryId":body("Accept")["transitionId"],"conversationId":body("Accept")["prior"]["conversationId"],"receivedAt":body("Accept")["signedAt"],"signedRequest":{
+                "body":body("Accept"),"signature":STANDARD.encode([17u8;64])}},
+                "receipt":{"body":body("AcceptanceCommit"),"signature":STANDARD.encode([23u8;64])}});
+        }
+        state
+    }
+    #[test]
+    fn pending_and_accepted_request_views_preserve_all_canonical_binary_material() {
+        for accepted in [false, true] {
+            let value = state(accepted);
+            let raw = serde_json::to_vec(&value).unwrap();
+            let typed: chat_dto::DirectRequestState =
+                decode_direct_request_generated_view(&raw, "directRequestState", false).unwrap();
+            let wire =
+                direct_request_generated_view_wire(&typed, "directRequestState", false).unwrap();
+            assert_eq!(wire, value);
+            assert_eq!(
+                typed.context_hash.as_ref(),
+                STANDARD
+                    .decode(value["contextHash"].as_str().unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                typed.preparation_digest.as_ref(),
+                STANDARD
+                    .decode(value["preparationDigest"].as_str().unwrap())
+                    .unwrap()
+            );
+            if accepted {
+                let proof = typed.acceptance_proof.unwrap();
+                assert_eq!(proof.entry.signed_request.signature.as_ref(), &[17u8; 64]);
+                assert_eq!(proof.receipt.signature.as_ref(), &[23u8; 64]);
+            }
+        }
+    }
+    #[test]
+    fn tagged_welcome_and_inventory_proof_round_trip_without_binary_changes() {
+        let p = body("Publish");
+        let welcome = &p["artifacts"]["welcome"];
+        let delivery = &welcome["deliveries"][0];
+        let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView",
+            "welcomeId":p["requestId"],"conversationId":p["conversationId"],
+            "transitionSeq":1,"coordinates":p["next"],"status":"pending",
+            "opaqueWelcome":welcome["opaqueWelcome"],"sha256":welcome["sha256"],
+            "recipientDid":delivery["recipientDid"],"recipientDeviceId":delivery["recipientDeviceId"],
+            "provenance":delivery["provenance"]});
+        type Welcome = chat_dto::get_pending_welcomes::GetPendingWelcomesOutputItemsItem;
+        let typed: Welcome = decode_direct_request_generated_view(
+            &serde_json::to_vec(&view).unwrap(),
+            "directRequestWelcomeView",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            direct_request_generated_view_wire(&typed, "directRequestWelcomeView", true).unwrap(),
+            view
+        );
+        let mut changed = view.clone();
+        changed["$type"] = json!("blue.catbird.chat.defs#welcomeView");
+        assert!(decode_direct_request_generated_view::<Welcome>(
+            &serde_json::to_vec(&changed).unwrap(),
+            "directRequestWelcomeView",
+            true
+        )
+        .is_err());
+        let value = state(true);
+        let typed: chat_dto::DirectRequestState = decode_direct_request_generated_view(
+            &serde_json::to_vec(&value).unwrap(),
+            "directRequestState",
+            false,
+        )
+        .unwrap();
+        let inventory =
+            crate::chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                &typed,
+                "blue.catbird.chat.defs#directRequestState",
+            )
+            .unwrap();
+        let reparsed: chat_dto::DirectRequestState =
+            decode_direct_request_generated_view(inventory.bytes(), "directRequestState", false)
+                .unwrap();
+        assert_eq!(
+            direct_request_generated_view_wire(&reparsed, "directRequestState", false).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn request_view_bridge_rejects_unknown_or_changed_signed_type() {
+        for bad_type in ["blue.catbird.chat.defs#directRequestGrantBody", "unknown"] {
+            let mut value = state(true);
+            value["acceptanceProof"]["entry"]["signedRequest"]["body"]["$type"] = json!(bad_type);
+            assert!(
+                decode_direct_request_generated_view::<chat_dto::DirectRequestState>(
+                    &serde_json::to_vec(&value).unwrap(),
+                    "directRequestState",
+                    false
+                )
+                .is_err()
+            );
+        }
+        let mut value = state(true);
+        value["acceptanceProof"]["extra"] = json!(true);
+        assert!(
+            decode_direct_request_generated_view::<chat_dto::DirectRequestState>(
+                &serde_json::to_vec(&value).unwrap(),
+                "directRequestState",
+                false
+            )
+            .is_err()
+        );
     }
 }

@@ -31,6 +31,7 @@ pub(crate) struct RequestPushEligibilityDecision {
     pub first_message_id: Uuid,
     pub sender_did: String,
     pub eligible: bool,
+    pub checked_at: DateTime<Utc>,
 }
 
 /// Private witness minted only after the request, conversation, consent,
@@ -69,8 +70,8 @@ pub(crate) async fn evaluate_eligibility<T: PublicTransport>(
     if authenticated_credential_digest == [0; 32] {
         return Err(RequestPushEligibilityError::Invariant);
     }
-    let request_id = Uuid::parse_str(&request.request_id)
-        .map_err(|_| RequestPushEligibilityError::Invalid)?;
+    let request_id =
+        Uuid::parse_str(&request.request_id).map_err(|_| RequestPushEligibilityError::Invalid)?;
     let requested_event =
         Uuid::parse_str(&request.event_id).map_err(|_| RequestPushEligibilityError::Invalid)?;
     let requested_device =
@@ -141,22 +142,21 @@ pub(crate) async fn evaluate_eligibility<T: PublicTransport>(
     .await?;
     eligible &= pending;
 
-    let selected: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM chat.direct_request_push_event_recipients r \
+    let selected_import_until: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT d.import_until FROM chat.direct_request_push_event_recipients r \
           JOIN chat.direct_request_device_deliveries d \
             ON (d.request_id,d.owner_did,d.owner_device_id) \
              =(r.request_id,r.recipient_did,r.recipient_device_id) \
           WHERE r.event_id=$1 AND r.request_id=$2 AND r.recipient_did=$3 \
-            AND r.recipient_device_id=$4 AND d.import_until>$5)",
+            AND r.recipient_device_id=$4",
     )
     .bind(event_id)
     .bind(request_id)
     .bind(&recipient_did)
     .bind(requested_device)
-    .bind(now)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    eligible &= selected;
+    eligible &= selected_import_until.is_some_and(|deadline| deadline > now);
 
     let active_leaf: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.member_devices \
@@ -187,13 +187,13 @@ pub(crate) async fn evaluate_eligibility<T: PublicTransport>(
             )
         })
         .unwrap_or_default();
-    eligible &= device_status == "active"
-        && stored_auth_generation == request.device_auth_generation;
+    eligible &=
+        device_status == "active" && stored_auth_generation == request.device_auth_generation;
 
     let current_key: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM chat.device_keys \
           WHERE user_did=$1 AND device_id=$2 AND key_id=$3 AND revoked_at IS NULL \
-            AND enrollment_auth_generation=$4)",
+            AND enrollment_auth_generation <= $4)",
     )
     .bind(&recipient_did)
     .bind(requested_device)
@@ -257,10 +257,22 @@ pub(crate) async fn evaluate_eligibility<T: PublicTransport>(
             .map_err(|_| RequestPushEligibilityError::PolicyUnavailable)?;
     }
 
+    // The initial `now` is only an early rejection bound. Database locks and
+    // the live relationship fetch can wait, so the final signed authority must
+    // be bound to a database clock sampled after both. Crossing either retained
+    // import deadline while waiting produces a signed negative, never a fresh
+    // positive stamped after stale validation.
+    let checked_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    eligible &= import_until > checked_at
+        && selected_import_until.is_some_and(|deadline| deadline > checked_at);
+
     Ok(RequestPushEligibilityDecision {
         conversation_id,
         first_message_id,
         sender_did,
         eligible,
+        checked_at,
     })
 }

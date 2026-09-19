@@ -33,9 +33,17 @@
 
 pub mod federation_outbox;
 pub mod notification_outbox;
+pub mod request_push;
 
 pub use federation_outbox::run_federation_outbox_worker;
 pub use notification_outbox::run_notification_outbox_worker;
+#[cfg(feature = "test-support")]
+pub use request_push::renew_request_push_lease_for_test;
+#[cfg(feature = "test-support")]
+pub use request_push::run_request_push_event_once_for_test;
+#[cfg(feature = "test-support")]
+pub use request_push::run_request_push_once_for_test;
+pub use request_push::run_request_push_worker;
 
 use sqlx::PgPool;
 use std::time::Duration;

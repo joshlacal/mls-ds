@@ -431,7 +431,45 @@ fn normalize_def(
         ));
     };
     match definition {
-        LexUserType::Object(object) => normalize_object(doc, object, value, depth, path),
+        LexUserType::Object(object) => {
+            // Request proofs retain the exact signed body tag inside generated
+            // DTO extra_data. Permit only these schema-selected identities;
+            // an arbitrary or mismatched tag remains an unknown-field error.
+            let signed_request_body = matches!(
+                def_name,
+                "directRequestAcceptanceBody"
+                    | "directRequestAcceptanceCommitReceiptBody"
+                    | "directRequestGrantBody"
+            );
+            if signed_request_body {
+                if let CanonValue::Object(entries) = value {
+                    if let Some((_, tag)) = entries.iter().find(|(key, _)| key == "$type") {
+                        if tag != &CanonValue::String(format!("{TYPE_PREFIX}{def_name}")) {
+                            return Err(ProjectionError::new(
+                                ProjectionErrorKind::UnknownUnionTag,
+                                path,
+                                "request proof body type must match its exact schema",
+                            ));
+                        }
+                        let body = CanonValue::Object(
+                            entries
+                                .iter()
+                                .filter(|(key, _)| key != "$type")
+                                .cloned()
+                                .collect(),
+                        );
+                        let CanonValue::Object(mut normalized) =
+                            normalize_object(doc, object, &body, depth, path)?
+                        else {
+                            unreachable!("object normalizer returns an object")
+                        };
+                        normalized.push(("$type".into(), tag.clone()));
+                        return Ok(CanonValue::Object(normalized));
+                    }
+                }
+            }
+            normalize_object(doc, object, value, depth, path)
+        }
         LexUserType::Union(union) => normalize_union(doc, union, value, depth, path),
         LexUserType::String(string) => normalize_string(string, value, path),
         LexUserType::Integer(integer) => normalize_integer(integer, value, path),

@@ -26,11 +26,22 @@ pub async fn setup() -> PgPool {
         .await
         .expect("review historical bytes");
     let mut migrations = reviewed.migrations.to_vec();
+    let send_message =
+        include_str!("../../migrations/20260816000001_enable_send_message_operation_claims.sql");
+    use sha2::Digest as _;
+    assert_eq!(format!("{:x}", sha2::Sha384::digest(send_message.as_bytes())),
+        "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e");
+    migrations.push(Migration::new(
+        20260816000001,
+        Cow::Borrowed("enable send message operation claims"),
+        MigrationType::Simple,
+        Cow::Borrowed(send_message),
+    ));
+
     // Existing service-auth ledger omitted from the original fourteen-file
     // test baseline. Keep that baseline immutable and pin this dependency.
     let service_auth =
         include_str!("../../migrations/20260820000001_chat_service_auth_admissions.sql");
-    use sha2::Digest as _;
     assert_eq!(format!("{:x}", sha2::Sha384::digest(service_auth.as_bytes())),
         "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac");
     migrations.push(Migration::new(

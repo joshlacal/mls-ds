@@ -229,7 +229,12 @@ pub(crate) async fn load_request_projection(
     if let Some(proof) = acceptance_proof {
         value["acceptanceProof"] = proof;
     }
-    let view = serde_json::from_value(value).map_err(|_| E::InvalidMaterialization)?;
+    let view = crate::chat_protocol::transcript::decode_direct_request_generated_view(
+        &serde_json::to_vec(&value).map_err(|_| E::InvalidMaterialization)?,
+        "directRequestState",
+        false,
+    )
+    .map_err(|_| E::InvalidMaterialization)?;
     Ok(Some((publication, view)))
 }
 
@@ -255,10 +260,18 @@ pub(crate) async fn pending_request_welcomes(
         let provenance: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("provenance")?)
             .map_err(|_| E::InvalidMaterialization)?;
         let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView","welcomeId":request_id,"conversationId":row.try_get::<Uuid,_>("conversation_id")?,"transitionSeq":entry["seq"],"coordinates":publication["body"]["next"],"status":"pending","opaqueWelcome":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome")?),"sha256":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome_sha256")?),"recipientDid":user_did,"recipientDeviceId":device_id,"provenance":provenance});
-        let typed:catbird_atproto::generated::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutputItemsItem=serde_json::from_value(view).map_err(|_|E::InvalidMaterialization)?;
+        let typed:catbird_atproto::generated::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutputItemsItem=crate::chat_protocol::transcript::decode_direct_request_generated_view(&serde_json::to_vec(&view).map_err(|_|E::InvalidMaterialization)?, "directRequestWelcomeView", true).map_err(|_|E::InvalidMaterialization)?;
         items.push((
             request_id,
-            serde_json::to_vec(&typed).map_err(|_| E::InvalidMaterialization)?,
+            serde_json::to_vec(
+                &crate::chat_protocol::transcript::direct_request_generated_view_wire(
+                    &typed,
+                    "directRequestWelcomeView",
+                    true,
+                )
+                .map_err(|_| E::InvalidMaterialization)?,
+            )
+            .map_err(|_| E::InvalidMaterialization)?,
         ));
     }
     Ok(items)

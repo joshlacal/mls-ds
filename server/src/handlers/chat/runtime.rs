@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::request_push::RequestPushConfig;
 use crate::chat_protocol::repository::relationship::load_fixed_relationship_authority_startup_guard;
 use crate::chat_protocol::{relationship_policy::ProductionRelationshipAuthority, CursorSealer};
 
@@ -36,6 +37,7 @@ pub struct ChatRuntime {
     request_receipt_signer: Option<
         Arc<crate::chat_protocol::repository::direct_request_receipts::DirectRequestReceiptSigner>,
     >,
+    request_push: Option<Arc<RequestPushConfig>>,
     requests_ready: std::sync::atomic::AtomicBool,
     relationship_authority: Arc<ProductionRelationshipAuthority>,
     sse_state: Arc<SseState>,
@@ -49,6 +51,7 @@ impl fmt::Debug for ChatRuntime {
             .debug_struct("ChatRuntime")
             .field("cutover_enabled", &self.cutover_enabled)
             .field("relationship_authority", &"fixed-production-authority")
+            .field("request_push_enabled", &self.request_push.is_some())
             .field("sse_state", &"conversation-filtered")
             .field("cursor_sealer_configured", &self.cursor_sealer.is_some())
             .field(
@@ -94,7 +97,9 @@ impl ChatRuntime {
             );
         }
         let request_producers_enabled = env_flag("CHAT_DIRECT_REQUESTS_ENABLED");
+        let request_push_enabled = env_flag("CHAT_REQUEST_PUSH_ENABLED");
         let request_receipt_signer = if request_producers_enabled
+            || request_push_enabled
             || std::env::var_os("CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM").is_some()
         {
             if !cutover_enabled {
@@ -110,16 +115,39 @@ impl ChatRuntime {
         } else {
             None
         };
+        if request_push_enabled && !cutover_enabled {
+            return Err("request push requires chat cutover".into());
+        }
+        let request_push = RequestPushConfig::from_env(request_push_enabled)?;
         Ok(Self {
             cutover_enabled,
             request_producers_enabled,
             request_receipt_signer,
+            request_push,
             requests_ready: std::sync::atomic::AtomicBool::new(false),
             relationship_authority,
             sse_state,
             cursor_sealer,
             subscription_endpoint,
         })
+    }
+
+    /// Test-support-only loopback injection for the real internal route and
+    /// outbox worker. It changes only the fixed peer transport; receipt keys,
+    /// protocol fence, database authority and policy checks remain production.
+    #[cfg(feature = "test-support")]
+    pub fn with_test_request_push_loopback(
+        mut self,
+        event_endpoint: &str,
+        canonical_eligibility_bearer: &str,
+    ) -> Result<Self, String> {
+        let endpoint =
+            Url::parse(event_endpoint).map_err(|_| "test request-push endpoint is invalid")?;
+        self.request_push = Some(RequestPushConfig::loopback_for_test(
+            endpoint,
+            canonical_eligibility_bearer,
+        )?);
+        Ok(self)
     }
 
     /// The global cutover gate (OQ-2). `pub` so the binary crate can decide, at
@@ -229,6 +257,19 @@ impl ChatRuntime {
         self.requests_ready
             .load(std::sync::atomic::Ordering::Acquire)
             .then_some(self.request_receipt_signer.as_deref())
+            .flatten()
+    }
+
+    pub fn request_push_enabled(&self) -> bool {
+        self.request_push.is_some()
+            && self
+                .requests_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn request_push_config(&self) -> Option<&Arc<RequestPushConfig>> {
+        self.request_push_enabled()
+            .then_some(self.request_push.as_ref())
             .flatten()
     }
 

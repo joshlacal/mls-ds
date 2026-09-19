@@ -81,12 +81,68 @@ async fn main() -> Result<()> {
         .connect(&database_url)
         .await
         .context("connect guarded request database")?;
-    let runtime =
-        Arc::new(ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?);
+    let mut runtime =
+        ChatRuntime::from_env(Arc::new(SseState::new(64))).map_err(anyhow::Error::msg)?;
+    let push_event = match std::env::var("REQUEST_FIXTURE_PUSH_EVENT_URL") {
+        Ok(endpoint) => {
+            let bearer = std::env::var("REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER")
+                .context("REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER is required")?;
+            runtime = runtime
+                .with_test_request_push_loopback(&endpoint, &bearer)
+                .map_err(anyhow::Error::msg)?;
+            let event_id = std::env::var("REQUEST_FIXTURE_PUSH_EVENT_ID")
+                .context("REQUEST_FIXTURE_PUSH_EVENT_ID is required")?
+                .parse::<uuid::Uuid>()
+                .context("REQUEST_FIXTURE_PUSH_EVENT_ID is invalid")?;
+            let trigger = std::path::PathBuf::from(
+                std::env::var("REQUEST_FIXTURE_PUSH_TRIGGER")
+                    .context("REQUEST_FIXTURE_PUSH_TRIGGER is required")?,
+            );
+            let result = std::path::PathBuf::from(
+                std::env::var("REQUEST_FIXTURE_PUSH_RESULT")
+                    .context("REQUEST_FIXTURE_PUSH_RESULT is required")?,
+            );
+            anyhow::ensure!(
+                trigger.is_absolute() && result.is_absolute(),
+                "push fixture paths must be absolute"
+            );
+            Some((event_id, trigger, result))
+        }
+        Err(_) => None,
+    };
+    let runtime = Arc::new(runtime);
     runtime
         .validate_protocol_fence(&pool)
         .await
         .map_err(anyhow::Error::msg)?;
+    if let Some((event_id, trigger, result)) = push_event {
+        let push_pool = pool.clone();
+        let push_runtime = runtime.clone();
+        tokio::spawn(async move {
+            for _ in 0..9_000 {
+                if trigger.exists() {
+                    let outcome = catbird_server::workers::run_request_push_event_once_for_test(
+                        &push_pool,
+                        &push_runtime,
+                        event_id,
+                    )
+                    .await;
+                    let value = match outcome {
+                        Ok(claimed) => {
+                            serde_json::json!({"eventId":event_id,"claimed":claimed,"ok":claimed==1})
+                        }
+                        Err(error) => {
+                            serde_json::json!({"eventId":event_id,"ok":false,"error":error})
+                        }
+                    };
+                    let _ = std::fs::write(&result, serde_json::to_vec(&value).unwrap());
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let _ = std::fs::write(&result, b"{\"ok\":false,\"error\":\"trigger timeout\"}");
+        });
+    }
 
     let app: Router = chat_router::<FixtureState>().with_state(FixtureState {
         pool,

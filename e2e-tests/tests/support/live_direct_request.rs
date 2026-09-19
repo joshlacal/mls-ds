@@ -521,7 +521,7 @@ async fn checked_post(
 
 fn graph(conversation: Uuid) -> anyhow::Result<Value> {
     validate_request_test_database_url(std::env::var("REQUEST_TEST_DATABASE_URL").ok().as_deref())?;
-    let sql = format!("SELECT json_build_object('generation',c.current_generation,'stateVersion',c.current_state_version,'epoch',s.epoch,'nextSeq',c.next_entry_seq,'transitions',(SELECT count(*) FROM chat.transitions t WHERE t.conversation_id=c.conversation_id),'introductions',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#directRequestEntry'),'applications',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#applicationEntry'))::text FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE c.conversation_id='{conversation}'");
+    let sql = format!("SELECT json_build_object('generation',c.current_generation,'stateVersion',c.current_state_version,'generationStateVersion',(SELECT g.current_state_version FROM chat.generations g WHERE g.conversation_id=c.conversation_id AND g.generation=c.current_generation),'acceptanceClaims',(SELECT count(*) FROM chat.direct_request_acceptance_claims a JOIN chat.direct_request_publications p ON p.request_id=a.request_id WHERE p.conversation_id=c.conversation_id),'epoch',s.epoch,'nextSeq',c.next_entry_seq,'transitions',(SELECT count(*) FROM chat.transitions t WHERE t.conversation_id=c.conversation_id),'introductions',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#directRequestEntry'),'applications',(SELECT count(*) FROM chat.entries e WHERE e.conversation_id=c.conversation_id AND e.entry_kind='blue.catbird.chat.defs#applicationEntry'))::text FROM chat.conversations c JOIN chat.generation_states s ON s.conversation_id=c.conversation_id AND s.generation=c.current_generation AND s.state_version=c.current_state_version WHERE c.conversation_id='{conversation}'");
     let result = std::process::Command::new("psql")
         .args([
             REQUEST_TEST_DATABASE_URL,
@@ -546,6 +546,106 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     use catbird_mls::chat_v2::transcript::{decode_strict_json, VerifiedApplicationEntry};
     use catbird_mls::orchestrator::{canonical_application_aad_bytes, MLSMessagePayload};
     let mut f = publish_request(!accept_before_import).await?;
+    // Exercise pending point-read and retained Welcome presentation through
+    // the shipping HTTP facade before account consent changes.
+    let (pending_status, pending_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId".into(), f.conversation_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        pending_status == reqwest::StatusCode::OK,
+        "pending state failed {pending_status}: {}",
+        String::from_utf8_lossy(&pending_bytes)
+    );
+    let pending: Value = serde_json::from_slice(&pending_bytes)?;
+    assert_eq!(
+        pending["state"]["directRequest"]["consent"],
+        "incomingPending"
+    );
+    assert_eq!(
+        pending["state"]["directRequest"]["contextHash"],
+        f.publication["body"]["contextHash"]
+    );
+    let (inventory_status, inventory_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversations",
+            &[
+                ("limit".into(), "100".into()),
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        inventory_status == reqwest::StatusCode::OK,
+        "pending inventory failed {inventory_status}: {}",
+        String::from_utf8_lossy(&inventory_bytes)
+    );
+    let inventory: Value = serde_json::from_slice(&inventory_bytes)?;
+    let (welcomes_status, welcomes_bytes) = f
+        .bob
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getPendingWelcomes",
+            &[
+                ("limit".into(), "100".into()),
+                (
+                    "inventorySessionId".into(),
+                    inventory["inventorySessionId"]
+                        .as_str()
+                        .context("inventory session")?
+                        .into(),
+                ),
+                ("supportedProtocolVersions".into(), "1".into()),
+                ("supportedProtocolVersions".into(), "2".into()),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(
+        welcomes_status == reqwest::StatusCode::OK,
+        "pending Welcomes failed {welcomes_status}: {}",
+        String::from_utf8_lossy(&welcomes_bytes)
+    );
+    let welcomes: Value = serde_json::from_slice(&welcomes_bytes)?;
+    assert_eq!(
+        welcomes["items"].as_array().context("Welcome items")?.len(),
+        1
+    );
+    let welcome = &welcomes["items"][0];
+    assert_eq!(
+        welcome["$type"],
+        "blue.catbird.chat.defs#directRequestWelcomeView"
+    );
+    assert_eq!(welcome["welcomeId"], f.request_id.to_string());
+    let wire_bytes = |value: &Value| -> anyhow::Result<Vec<u8>> {
+        Ok(STANDARD.decode(
+            value
+                .as_str()
+                .or_else(|| value["$bytes"].as_str())
+                .context("wire bytes")?,
+        )?)
+    };
+    assert_eq!(
+        wire_bytes(&welcome["opaqueWelcome"])?,
+        STANDARD.decode(
+            f.publication["body"]["artifacts"]["welcome"]["opaqueWelcome"]
+                .as_str()
+                .unwrap()
+        )?
+    );
+    assert_eq!(
+        wire_bytes(&welcome["provenance"]["contextHash"])?,
+        wire_bytes(&f.publication["body"]["contextHash"])?
+    );
     let prior = f.welcome_input.bootstrap.coordinates.clone();
     let group = STANDARD.decode(prior["groupId"].as_str().context("group ID")?)?;
     let epoch = prior["epoch"].as_u64().context("epoch")?;
@@ -578,6 +678,40 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
             "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
         }),
     )?;
+    // A correctly signed but stale successor must leave the complete durable
+    // graph unchanged, including both pointers and the exact replay claim.
+    let stale_operation = Uuid::new_v4();
+    let mut stale_body = acceptance["body"].clone();
+    stale_body["transitionId"] = json!(stale_operation.to_string());
+    stale_body["idempotencyKey"] = json!(stale_operation.to_string());
+    stale_body["prior"]["stateVersion"] = next["stateVersion"].clone();
+    stale_body["next"]["stateVersion"] = json!(next["stateVersion"].as_u64().unwrap() + 1);
+    let stale = signed_mls_request(
+        &f.bob_engine,
+        &bob_identity,
+        DirectRequestKind::Accept,
+        stale_body,
+    )?;
+    let (stale_status, stale_bytes) = f
+        .bob
+        .post(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.acceptConversation",
+            &json!({"directRequest":stale}),
+            true,
+        )
+        .await?;
+    assert_eq!(stale_status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stale_bytes)?["error"],
+        "StaleCoordinates"
+    );
+    assert_eq!(
+        graph(f.conversation_id)?,
+        before,
+        "stale acceptance leaked durable effects"
+    );
     let envelope = json!({"directRequest":acceptance});
     let accepted_bytes = checked_post(
         &f,
@@ -665,6 +799,8 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     assert_eq!(after["generation"], before["generation"]);
     assert_eq!(after["epoch"], before["epoch"]);
     assert_eq!(after["stateVersion"], next["stateVersion"]);
+    assert_eq!(after["generationStateVersion"], next["stateVersion"]);
+    assert_eq!(after["acceptanceClaims"], 1);
     assert_eq!(
         after["transitions"].as_u64(),
         before["transitions"].as_u64().map(|n| n + 1)
@@ -674,6 +810,28 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
 
     let sender = offline_sender.reopen()?;
     assert_eq!(sender.epoch(&group)?, epoch);
+    let (state_status, state_bytes) = f
+        .alice
+        .get(
+            &f.client,
+            &f.server.base_url,
+            "blue.catbird.chat.getConversationState",
+            &[("conversationId".into(), f.conversation_id.to_string())],
+        )
+        .await?;
+    anyhow::ensure!(
+        state_status == reqwest::StatusCode::OK,
+        "sender state catch-up failed {state_status}: {}",
+        String::from_utf8_lossy(&state_bytes)
+    );
+    let state: Value = serde_json::from_slice(&state_bytes)?;
+    let sender_proof = protocol::verify_direct_request_acceptance_proof(
+        &serde_json::to_vec(&state["state"]["directRequest"]["acceptanceProof"])?,
+        &f.server.receipt_public_key,
+        &bob_public,
+    )?;
+    assert_eq!(sender_proof, proof);
+    assert_eq!(state["state"]["directRequest"]["consent"], "accepted");
     let (status, bytes) = f
         .alice
         .get(
@@ -695,6 +853,13 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     let page: Value = serde_json::from_slice(&bytes)?;
     let entries = page["entries"].as_array().context("entries")?;
     assert_eq!(
+        entries.len(),
+        3,
+        "only publication, acceptance and reply are present"
+    );
+    assert_eq!(page["hasMore"], false);
+    assert_eq!(page["nextAfterSeq"], 3);
+    assert_eq!(
         entries
             .iter()
             .filter(|e| e["$type"] == "blue.catbird.chat.defs#directRequestEntry")
@@ -707,6 +872,15 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
             .filter(|e| e["$type"] == "blue.catbird.chat.defs#directRequestAcceptanceEntry")
             .count(),
         1
+    );
+    let introduction_entry = entries
+        .iter()
+        .find(|e| e["$type"] == "blue.catbird.chat.defs#directRequestEntry")
+        .context("introduction entry")?;
+    assert_eq!(introduction_entry["signedRequest"], f.publication);
+    assert_eq!(
+        introduction_entry["signedRequest"]["body"]["firstMessageId"],
+        f.first_message_id.to_string()
     );
     let response_entry = entries
         .iter()

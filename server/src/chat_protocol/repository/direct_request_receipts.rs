@@ -296,19 +296,125 @@ mod tests {
             })
             .unwrap();
         let body = URL_SAFE_NO_PAD.decode(&envelope.body).unwrap();
-        let signature = Signature::from_slice(
-            &URL_SAFE_NO_PAD.decode(&envelope.signature).unwrap(),
-        )
-        .unwrap();
+        let signature =
+            Signature::from_slice(&URL_SAFE_NO_PAD.decode(&envelope.signature).unwrap()).unwrap();
         assert!(signature.normalize_s().is_none());
         let event_bytes = envelope_signing_bytes(REQUEST_PUSH_EVENT_DOMAIN, &body).unwrap();
-        receipt.verifying_key().verify(&event_bytes, &signature).unwrap();
-        let wrong_domain =
-            envelope_signing_bytes(REQUEST_PUSH_ELIGIBILITY_DOMAIN, &body).unwrap();
+        receipt
+            .verifying_key()
+            .verify(&event_bytes, &signature)
+            .unwrap();
+        let wrong_domain = envelope_signing_bytes(REQUEST_PUSH_ELIGIBILITY_DOMAIN, &body).unwrap();
         assert!(receipt
             .verifying_key()
             .verify(&wrong_domain, &signature)
             .is_err());
+    }
+
+    #[test]
+    fn deterministic_request_push_interoperability_vector() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::signature::Verifier;
+        use uuid::Uuid;
+
+        let receipt = key(41);
+        let service = key(42);
+        let pem = receipt.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let authority_document = document(&[&receipt]);
+        let signer = DirectRequestReceiptSigner::configured(
+            pem.as_str(),
+            service_pem.as_str(),
+            &authority_document,
+        )
+        .unwrap();
+        let event = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let request = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let conversation = Uuid::parse_str("00000000-0000-4000-8000-000000000003").unwrap();
+        let first = Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
+        let device = Uuid::parse_str("00000000-0000-4000-8000-000000000005").unwrap();
+        let registration = Uuid::parse_str("00000000-0000-4000-8000-000000000006").unwrap();
+        let payload = super::super::super::request_push::request_push_event_payload_digest(
+            event,
+            request,
+            conversation,
+            first,
+            "did:web:alice.example.org",
+            "did:web:bob.example.org",
+            &[device],
+        )
+        .unwrap();
+        let event_body = RequestPushEventBody {
+            protocol_version: 1,
+            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
+            key_id: signer.key_id().into(),
+            event_id: event.to_string(),
+            request_id: request.to_string(),
+            conversation_id: conversation.to_string(),
+            first_message_id: first.to_string(),
+            sender_did: "did:web:alice.example.org".into(),
+            recipient_did: "did:web:bob.example.org".into(),
+            recipient_device_ids: vec![device.to_string()],
+            payload_digest: URL_SAFE_NO_PAD.encode(payload),
+            issued_at: "2026-09-19T12:00:00.000Z".into(),
+            expires_at: "2026-09-19T12:00:30.000Z".into(),
+        };
+        let eligibility_body = RequestPushEligibilityBody {
+            protocol_version: 1,
+            authority_did: REQUEST_RECEIPT_AUTHORITY.into(),
+            key_id: signer.key_id().into(),
+            event_id: event.to_string(),
+            request_id: request.to_string(),
+            recipient_did: "did:web:bob.example.org".into(),
+            device_id: device.to_string(),
+            provider: "apns".into(),
+            registration_id: registration.to_string(),
+            token_generation: 7,
+            binding_digest: URL_SAFE_NO_PAD.encode([7; 32]),
+            target_key_id: URL_SAFE_NO_PAD.encode([8; 32]),
+            device_auth_generation: 3,
+            conversation_id: conversation.to_string(),
+            first_message_id: first.to_string(),
+            sender_did: "did:web:alice.example.org".into(),
+            eligible: true,
+            checked_at: "2026-09-19T12:00:01.000Z".into(),
+            expires_at: "2026-09-19T12:00:06.000Z".into(),
+        };
+        let encode = |body: Vec<u8>, domain: &[u8]| {
+            let signature = signer.sign(&envelope_signing_bytes(domain, &body).unwrap());
+            let parsed = Signature::from_slice(&signature).unwrap();
+            assert!(parsed.normalize_s().is_none());
+            receipt
+                .verifying_key()
+                .verify(&envelope_signing_bytes(domain, &body).unwrap(), &parsed)
+                .unwrap();
+            SignedInternalEnvelope {
+                body: URL_SAFE_NO_PAD.encode(body),
+                signature: URL_SAFE_NO_PAD.encode(signature),
+            }
+        };
+        let event_envelope = encode(
+            serde_json::to_vec(&event_body).unwrap(),
+            REQUEST_PUSH_EVENT_DOMAIN,
+        );
+        let eligibility_envelope = encode(
+            serde_json::to_vec(&eligibility_body).unwrap(),
+            REQUEST_PUSH_ELIGIBILITY_DOMAIN,
+        );
+        let vector = serde_json::json!({
+            "version": 1,
+            "authorityDidDocument": serde_json::from_str::<Value>(&authority_document).unwrap(),
+            "compressedP256PublicKeyHex": hex::encode(receipt.verifying_key().to_encoded_point(true).as_bytes()),
+            "keyId": signer.key_id(),
+            "eventDomainBase64url": URL_SAFE_NO_PAD.encode(REQUEST_PUSH_EVENT_DOMAIN),
+            "eligibilityDomainBase64url": URL_SAFE_NO_PAD.encode(REQUEST_PUSH_ELIGIBILITY_DOMAIN),
+            "event": {"body": event_body, "envelope": event_envelope},
+            "eligibility": {"body": eligibility_body, "envelope": eligibility_envelope}
+        });
+        println!(
+            "REQUEST_PUSH_VECTOR={}",
+            serde_json::to_string(&vector).unwrap()
+        );
     }
 }
 

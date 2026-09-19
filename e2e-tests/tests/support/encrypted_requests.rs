@@ -184,6 +184,10 @@ pub fn validate_request_test_database_url(value: Option<&str>) -> Result<&'stati
     }
 }
 
+fn reviewed_send_message_prerequisite() -> BaselineMigration {
+    baseline!(20260816000001, "enable send message operation claims", "20260816000001_enable_send_message_operation_claims.sql", "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e")
+}
+
 fn validate_reviewed_baseline_source() -> Result<()> {
     let baseline = reviewed_baseline();
     anyhow::ensure!(
@@ -311,10 +315,19 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         );
     }
     anyhow::ensure!(
-        ledger.len() >= baseline.len() + 1,
-        "migration ledger lost service-auth prerequisite"
+        ledger.len() >= baseline.len() + 2,
+        "migration ledger lost send-message or service-auth prerequisite"
     );
-    let service_auth = &ledger[baseline.len()];
+    let send_expected = reviewed_send_message_prerequisite();
+    let send_actual = &ledger[baseline.len()];
+    anyhow::ensure!(
+        send_actual.version == send_expected.version
+            && send_actual.description == send_expected.description
+            && send_actual.success
+            && send_actual.checksum == send_expected.reviewed_sha384,
+        "send-message prerequisite ledger drift"
+    );
+    let service_auth = &ledger[baseline.len() + 1];
     anyhow::ensure!(
         service_auth.version == SERVICE_AUTH_MIGRATION_VERSION
             && service_auth.description == SERVICE_AUTH_MIGRATION_DESCRIPTION
@@ -323,7 +336,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         "service-auth migration ledger drift"
     );
     let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + 1..];
+    let actual_request = &ledger[baseline.len() + 2..];
     anyhow::ensure!(
         actual_request.len() == expected_request.len(),
         "request migration ledger count drift: expected {}, found {}",
@@ -466,6 +479,14 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         }
     }
 
+    let send_message = reviewed_send_message_prerequisite();
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(send_message.sql.as_bytes())) == send_message.reviewed_sha384,
+        "send-message prerequisite source checksum mismatch"
+    );
+    if !installed_versions.contains(&send_message.version) {
+        apply_migration(&send_message)?;
+    }
     for migration in reviewed_request_migrations() {
         if !installed_versions.contains(&migration.version) {
             apply_migration(&migration)?;

@@ -42,6 +42,7 @@ mod publish_typing;
 mod recovery;
 mod recovery_scheduler;
 mod replenish_key_packages;
+pub(crate) mod request_push;
 mod reset;
 mod revoke_device;
 mod runtime;
@@ -293,6 +294,12 @@ where
         .route(
             &xrpc_path(ChatEndpoint::UpdatePushToken),
             post(update_push_token::handle),
+        )
+        .route(
+            "/internal/chat/request-push-eligibility",
+            post(request_push::eligibility).layer(DefaultBodyLimit::max(
+                crate::chat_protocol::request_push::MAX_INTERNAL_BODY_BYTES,
+            )),
         )
         .route(
             &xrpc_path(ChatEndpoint::GetBlob),

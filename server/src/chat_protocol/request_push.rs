@@ -147,7 +147,9 @@ pub(crate) fn request_push_event_payload_digest(
     BareDid::parse(recipient_did).map_err(|_| RequestPushWireError::Invalid)?;
     if sender_did == recipient_did
         || !(1..=20).contains(&recipient_device_ids.len())
-        || recipient_device_ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || recipient_device_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
     {
         return Err(RequestPushWireError::Invalid);
     }

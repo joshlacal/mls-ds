@@ -13,9 +13,7 @@ use sqlx::Acquire;
 
 #[test]
 fn publication_insert_does_not_claim_an_application_message_send() {
-    let source = include_str!(
-        "../src/chat_protocol/repository/direct_request_publication.rs"
-    );
+    let source = include_str!("../src/chat_protocol/repository/direct_request_publication.rs");
     let insert = source
         .split("INSERT INTO chat.entries(")
         .nth(1)
@@ -73,9 +71,7 @@ async fn request_entry_identity_is_bound_without_application_message_send() {
     .expect("inspect deferred publication assertion");
     assert!(assertion.contains("e.message_id IS NULL"));
     assert!(assertion.contains("body.b->>'firstMessageId'=p.first_message_id::text"));
-    assert!(assertion.contains(
-        "#>>'{signedRequest,body,firstMessageId}'=p.first_message_id::text"
-    ));
+    assert!(assertion.contains("#>>'{signedRequest,body,firstMessageId}'=p.first_message_id::text"));
 
     sqlx::raw_sql(
         "CREATE TEMP TABLE direct_request_entry_shape_probe \

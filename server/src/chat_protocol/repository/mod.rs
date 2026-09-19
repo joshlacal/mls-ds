@@ -15,10 +15,10 @@ pub(crate) mod device_directory;
 pub(crate) mod direct_request_preparation;
 #[allow(dead_code)]
 pub(crate) mod direct_request_publication;
+pub(crate) mod direct_request_push;
 #[allow(dead_code)]
 pub(crate) mod direct_request_receipts;
 pub(crate) mod direct_request_retention;
-pub(crate) mod direct_request_push;
 pub(crate) mod entry_read;
 #[allow(dead_code)]
 pub(crate) mod execution_context;

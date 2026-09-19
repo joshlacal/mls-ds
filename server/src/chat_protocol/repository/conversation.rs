@@ -97,8 +97,10 @@ async fn read_conversation_state_in_transaction(
     )
     .await
     .map_err(map_inventory_error)?;
-    let state =
-        conversation_state_view(&source).map_err(|_| ConversationStateReadError::Invariant)?;
+    let state = conversation_state_view(&source).map_err(|error| {
+        tracing::error!(class = ?error.kind(), "conversation state projection failed");
+        ConversationStateReadError::Invariant
+    })?;
     let (pending_leave_requests, pending_reset_requests) =
         load_pending_requests(transaction, conversation_id).await?;
 
@@ -113,8 +115,19 @@ async fn read_conversation_state_in_transaction(
             state,
             extra_data: None,
         };
+    let mut wire =
+        serde_json::to_value(&output).map_err(|_| ConversationStateReadError::Invariant)?;
+    if let Some(request) = &output.state.direct_request {
+        wire["state"]["directRequest"] =
+            crate::chat_protocol::transcript::direct_request_generated_view_wire(
+                request,
+                "directRequestState",
+                false,
+            )
+            .map_err(|_| ConversationStateReadError::Invariant)?;
+    }
     Ok(CanonicalConversationStateResponse {
-        bytes: serde_json::to_vec(&output).map_err(|_| ConversationStateReadError::Invariant)?,
+        bytes: serde_json::to_vec(&wire).map_err(|_| ConversationStateReadError::Invariant)?,
     })
 }
 
@@ -136,6 +149,10 @@ fn map_authority_error(error: ReadAuthorityError) -> ConversationStateReadError 
 fn map_inventory_error(
     error: super::inventory::InventoryRepositoryError,
 ) -> ConversationStateReadError {
+    tracing::error!(class = ?std::mem::discriminant(&error), "conversation state source failed");
+    if let super::inventory::InventoryRepositoryError::Projection(projection) = &error {
+        tracing::error!(class = ?projection.kind(), "conversation state source projection failed");
+    }
     match error {
         super::inventory::InventoryRepositoryError::Database(_) => {
             ConversationStateReadError::Storage
@@ -186,12 +203,12 @@ async fn load_pending_requests(
     ConversationStateReadError,
 > {
     let resets: Vec<PendingResetRow> = sqlx::query_as(
-        "SELECT reset_request_id, requester_did, requester_device_id, prior_generation,\
-                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,\
-                prior_confirmation_tag, reason, received_at, expires_at\
-           FROM chat.reset_requests\
-          WHERE conversation_id = $1 AND status = 'pending'\
-          ORDER BY reset_request_id",
+        r#"SELECT reset_request_id, requester_did, requester_device_id, prior_generation,
+                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,
+                prior_confirmation_tag, reason, received_at, expires_at
+           FROM chat.reset_requests
+          WHERE conversation_id = $1 AND status = 'pending'
+          ORDER BY reset_request_id"#,
     )
     .bind(conversation_id)
     .fetch_all(&mut **transaction)
@@ -199,12 +216,12 @@ async fn load_pending_requests(
     .map_err(|_| ConversationStateReadError::Storage)?;
 
     let leaves: Vec<PendingLeaveRow> = sqlx::query_as(
-        "SELECT leave_request_id, requester_did, requester_device_id, prior_generation,\
-                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,\
-                prior_confirmation_tag, received_at, expires_at\
-           FROM chat.leave_requests\
-          WHERE conversation_id = $1 AND status = 'pending'\
-          ORDER BY leave_request_id",
+        r#"SELECT leave_request_id, requester_did, requester_device_id, prior_generation,
+                prior_state_version, prior_group_id, prior_epoch, prior_group_context_hash,
+                prior_confirmation_tag, received_at, expires_at
+           FROM chat.leave_requests
+          WHERE conversation_id = $1 AND status = 'pending'
+          ORDER BY leave_request_id"#,
     )
     .bind(conversation_id)
     .fetch_all(&mut **transaction)

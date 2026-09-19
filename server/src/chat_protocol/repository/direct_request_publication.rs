@@ -9,6 +9,7 @@ use super::direct_request_receipts::DirectRequestReceiptSigner;
 use super::direct_request_retention;
 use crate::chat_protocol::{
     relationship_policy::{PublicTransport, RelationshipAuthority},
+    request_push::request_push_event_payload_digest,
     snapshot::{PublicGroupSnapshotCoordinate, PublicGroupSnapshotLifecycle},
     state_machine::direct_request::{self, GrantedRequestDevice, VerifiedBootstrap},
 };
@@ -683,8 +684,41 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         .bind(event_id).bind(&event).bind(Sha256::digest(&event).as_slice()).bind(now).fetch_one(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) SELECT $1,r.user_did,r.device_id,CASE WHEN EXISTS(SELECT 1 FROM chat.member_devices m WHERE m.conversation_id=r.conversation_id AND m.user_did=r.user_did AND m.device_id=r.device_id AND m.joined_transition_id=$4) THEN 'leaf' ELSE 'historicalSchedule' END,(SELECT max(previous.event_position) FROM chat.event_recipients previous WHERE previous.user_did=r.user_did AND previous.device_id=r.device_id) FROM chat.entry_recipients r WHERE r.conversation_id=$2 AND r.seq=$3 ORDER BY r.user_did,r.device_id")
         .bind(position).bind(convo).bind(seq).bind(request).execute(&mut **tx).await?;
-    for kind in ["stream", "notification"] {
-        sqlx::query("INSERT INTO chat.outbox(outbox_id,event_position,work_kind,status,next_attempt_at,created_at) VALUES($1,$2,$3,'pending',$4,$4)").bind(Uuid::new_v4()).bind(position).bind(kind).bind(now).execute(&mut **tx).await?;
+    let stream_outbox = Uuid::new_v4();
+    let notification_outbox = Uuid::new_v4();
+    for (outbox, kind) in [
+        (stream_outbox, "stream"),
+        (notification_outbox, "notification"),
+    ] {
+        sqlx::query("INSERT INTO chat.outbox(outbox_id,event_position,work_kind,status,next_attempt_at,created_at) VALUES($1,$2,$3,'pending',$4,$4)").bind(outbox).bind(position).bind(kind).bind(now).execute(&mut **tx).await?;
+    }
+    let recipient_devices: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT owner_device_id FROM chat.direct_request_device_deliveries \
+          WHERE request_id=$1 AND owner_did=$2 ORDER BY owner_device_id::text",
+    )
+    .bind(request)
+    .bind(recipient)
+    .fetch_all(&mut **tx)
+    .await?;
+    let first_message_id = id(&b["firstMessageId"])?;
+    let payload_digest = request_push_event_payload_digest(
+        event_id,
+        request,
+        convo,
+        first_message_id,
+        actor,
+        recipient,
+        &recipient_devices,
+    )
+    .map_err(|_| PublicationError::Invariant)?;
+    sqlx::query("INSERT INTO chat.direct_request_push_events(event_id,request_id,event_position,outbox_id,conversation_id,first_message_id,sender_did,recipient_did,payload_digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+        .bind(event_id).bind(request).bind(position).bind(notification_outbox).bind(convo)
+        .bind(first_message_id).bind(actor).bind(recipient).bind(payload_digest.as_slice())
+        .bind(now).execute(&mut **tx).await?;
+    let mapped = sqlx::query("INSERT INTO chat.direct_request_push_event_recipients(event_id,request_id,recipient_did,recipient_device_id) SELECT $1,$2,$3,owner_device_id FROM chat.direct_request_device_deliveries WHERE request_id=$2 AND owner_did=$3 ORDER BY owner_device_id::text")
+        .bind(event_id).bind(request).bind(recipient).execute(&mut **tx).await?;
+    if mapped.rows_affected() != recipient_devices.len() as u64 {
+        return Err(PublicationError::Invariant);
     }
     Ok(response)
 }

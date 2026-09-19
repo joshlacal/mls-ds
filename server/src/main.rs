@@ -1044,6 +1044,22 @@ async fn main() -> anyhow::Result<()> {
             .await;
         });
         tracing::info!("Clean-chat expiry sweeper worker started (cutover enabled)");
+        if chat_runtime.request_push_enabled() {
+            let request_push_pool = db_pool.clone();
+            let request_push_runtime = chat_runtime.clone();
+            tokio::spawn(async move {
+                catbird_server::workers::run_request_push_worker(
+                    request_push_pool,
+                    request_push_runtime,
+                )
+                .await;
+            });
+            tracing::info!("Direct-request push outbox worker started");
+        } else {
+            tracing::info!(
+                "Direct-request push outbox worker NOT started (CHAT_REQUEST_PUSH_ENABLED is off)"
+            );
+        }
     } else {
         tracing::info!(
             "Clean-chat expiry sweeper worker NOT started (CHAT_CUTOVER_ENABLED is off)"
