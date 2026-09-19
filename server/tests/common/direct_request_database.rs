@@ -50,6 +50,16 @@ pub async fn setup() -> PgPool {
         MigrationType::Simple,
         Cow::Borrowed(service_auth),
     ));
+    let inventory_gc =
+        include_str!("../../migrations/20260821000001_fix_expired_inventory_session_gc.sql");
+    assert_eq!(format!("{:x}", sha2::Sha384::digest(inventory_gc.as_bytes())),
+        "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a");
+    migrations.push(Migration::new(
+        20260821000001,
+        Cow::Borrowed("fix expired inventory session gc"),
+        MigrationType::Simple,
+        Cow::Borrowed(inventory_gc),
+    ));
     let pending_inventory =
         include_str!("../../migrations/20260907000001_chat_direct_pending_inventory.sql");
     assert_eq!(format!("{:x}",sha2::Sha384::digest(pending_inventory.as_bytes())),
@@ -215,5 +225,12 @@ pub async fn setup() -> PgPool {
         .await
         .unwrap();
     drop(connection);
+    let inventory_gc_contract: (bool, bool) = sqlx::query_as(
+        "SELECT position('device_inventory_items' in immutable.prosrc)>0 AND position('session_replication_role' in immutable.prosrc)=0, count(gc.oid)=2 AND bool_and(position('session_replication_role' in gc.prosrc)=0) FROM pg_proc immutable JOIN pg_namespace immutable_ns ON immutable_ns.oid=immutable.pronamespace LEFT JOIN pg_proc gc ON gc.pronamespace=immutable.pronamespace AND gc.proname IN ('gc_expired_inventory_sessions','gc_expired_device_inventory_sessions') WHERE immutable_ns.nspname='chat' AND immutable.proname='enforce_immutable_identity' GROUP BY immutable.prosrc",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read inventory GC contract");
+    assert_eq!(inventory_gc_contract, (true, true));
     pool
 }

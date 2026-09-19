@@ -188,6 +188,10 @@ fn reviewed_send_message_prerequisite() -> BaselineMigration {
     baseline!(20260816000001, "enable send message operation claims", "20260816000001_enable_send_message_operation_claims.sql", "ae9cc21dd145c3608a57e1f96654b67d53709dba17e3f347758aa8b93830c725d380230751d83f85c497132b8669a30e")
 }
 
+fn reviewed_inventory_gc_prerequisite() -> BaselineMigration {
+    baseline!(20260821000001, "fix expired inventory session gc", "20260821000001_fix_expired_inventory_session_gc.sql", "42790274fbeb43bce44aa9638d23328223042933af03e6453a0c8c3640b9bcf236d0bc0b8cd76e1e5d846be7c6bfc78a")
+}
+
 fn reviewed_pending_inventory_prerequisite() -> BaselineMigration {
     baseline!(20260907000001, "chat direct pending inventory", "20260907000001_chat_direct_pending_inventory.sql", "82708d24b2deb72452ebdaf28749aa86ed95075f7ed920c4cc5526962e2ae9f9d8561a5029fc853ba654564d76ef63f1")
 }
@@ -319,8 +323,8 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         );
     }
     anyhow::ensure!(
-        ledger.len() >= baseline.len() + 2,
-        "migration ledger lost send-message or service-auth prerequisite"
+        ledger.len() >= baseline.len() + 4,
+        "migration ledger lost reviewed prerequisite rows"
     );
     let send_expected = reviewed_send_message_prerequisite();
     let send_actual = &ledger[baseline.len()];
@@ -339,9 +343,20 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
             && service_auth.checksum == SERVICE_AUTH_MIGRATION_SHA384,
         "service-auth migration ledger drift"
     );
+    let inventory_gc_expected = reviewed_inventory_gc_prerequisite();
+    let inventory_gc_actual = ledger
+        .get(baseline.len() + 2)
+        .context("inventory-GC prerequisite missing")?;
+    anyhow::ensure!(
+        inventory_gc_actual.version == inventory_gc_expected.version
+            && inventory_gc_actual.description == inventory_gc_expected.description
+            && inventory_gc_actual.success
+            && inventory_gc_actual.checksum == inventory_gc_expected.reviewed_sha384,
+        "inventory-GC prerequisite ledger drift"
+    );
     let pending_expected = reviewed_pending_inventory_prerequisite();
     let pending_actual = ledger
-        .get(baseline.len() + 2)
+        .get(baseline.len() + 3)
         .context("pending-inventory prerequisite missing")?;
     anyhow::ensure!(
         pending_actual.version == pending_expected.version
@@ -351,7 +366,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         "pending-inventory prerequisite ledger drift"
     );
     let expected_request = reviewed_request_migrations();
-    let actual_request = &ledger[baseline.len() + 3..];
+    let actual_request = &ledger[baseline.len() + 4..];
     anyhow::ensure!(
         actual_request.len() == expected_request.len(),
         "request migration ledger count drift: expected {}, found {}",
@@ -502,6 +517,21 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
     if !installed_versions.contains(&send_message.version) {
         apply_migration(&send_message)?;
     }
+    let inventory_gc = reviewed_inventory_gc_prerequisite();
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(inventory_gc.sql.as_bytes())) == inventory_gc.reviewed_sha384,
+        "inventory-GC prerequisite source checksum mismatch"
+    );
+    if !installed_versions.contains(&inventory_gc.version) {
+        apply_migration(&inventory_gc)?;
+    }
+    let inventory_gc_contract = psql_query(
+        "SELECT (position('device_inventory_items' in immutable.prosrc)>0 AND position('session_replication_role' in immutable.prosrc)=0)::text||E'\\t'||(count(gc.oid)=2 AND bool_and(position('session_replication_role' in gc.prosrc)=0))::text FROM pg_proc immutable JOIN pg_namespace immutable_ns ON immutable_ns.oid=immutable.pronamespace LEFT JOIN pg_proc gc ON gc.pronamespace=immutable.pronamespace AND gc.proname IN ('gc_expired_inventory_sessions','gc_expired_device_inventory_sessions') WHERE immutable_ns.nspname='chat' AND immutable.proname='enforce_immutable_identity' GROUP BY immutable.prosrc",
+    )?;
+    anyhow::ensure!(
+        inventory_gc_contract.trim() == "true\ttrue",
+        "inventory-GC immutable-row allowlist contract is unavailable"
+    );
     let pending_inventory = reviewed_pending_inventory_prerequisite();
     anyhow::ensure!(
         hex::encode(Sha384::digest(pending_inventory.sql.as_bytes()))
