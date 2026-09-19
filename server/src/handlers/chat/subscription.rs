@@ -107,6 +107,7 @@ async fn issue(
     let endpoint = jacquard_common::types::string::UriValue::<DefaultStr>::new_owned(endpoint)
         .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let output = GetSubscriptionTicketOutput {
+        inventory_scope: None,
         endpoint,
         expires_at: chrono_to_datetime(expires_at),
         ticket: ticket.into(),

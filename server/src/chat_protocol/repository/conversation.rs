@@ -280,7 +280,7 @@ fn reset_view(
             requester_device_id: SmolStr::from(row.requester_device_id.to_string()),
             requester_did: requester_did(&row.requester_did)?,
             reset_request_id: SmolStr::from(row.reset_request_id.to_string()),
-            status: SmolStr::from("pending"),
+            status: catbird_atproto::generated::blue_catbird::chat::ResetRequestViewStatus::Pending,
             extra_data: None,
         },
     )

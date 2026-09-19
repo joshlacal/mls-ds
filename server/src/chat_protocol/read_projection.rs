@@ -2223,6 +2223,9 @@ pub(crate) fn conversation_state_view(
         ));
     };
     Ok(chat_dto::ConversationState {
+        direct_request: None,
+        sequencer_did: None,
+        sequencer_term: None,
         cipher_suite: state.cipher_suite.clone(),
         conversation_kind: state.conversation_kind.clone(),
         coordinates: conversation_coordinates_dto(&state.coordinates),
@@ -2338,7 +2341,11 @@ pub(crate) fn conversation_inventory_item(
         ConversationProjectionSource::State(state) => Ok(
             chat_dto::ConversationInventoryItem::ConversationInventoryState(Box::new(
                 chat_dto::ConversationInventoryState {
+                    direct_request: None,
                     state: chat_dto::ConversationState {
+                        direct_request: None,
+                        sequencer_did: None,
+                        sequencer_term: None,
                         cipher_suite: state.cipher_suite.clone(),
                         conversation_kind: state.conversation_kind.clone(),
                         coordinates: conversation_coordinates_dto(&state.coordinates),
