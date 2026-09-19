@@ -47,7 +47,7 @@ async fn cancellation_of_unknown_fences_delayed_preparation_and_publication() {
     .await
     .unwrap();
     assert_eq!(replay, result);
-    let lock = test_lock(&mut tx, i).await;
+    let lock = test_lock(&mut tx, i.clone()).await;
     let replay = finish_terminal_charged(
         &mut tx,
         lock,
@@ -61,7 +61,8 @@ async fn cancellation_of_unknown_fences_delayed_preparation_and_publication() {
     .unwrap();
     assert_eq!(replay, result);
     let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_selected_devices")
+        sqlx::query_scalar("SELECT count(*) FROM chat.direct_request_selected_devices WHERE request_id=$1")
+            .bind(i.request_id)
             .fetch_one(&mut *tx)
             .await
             .unwrap();

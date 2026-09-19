@@ -37,7 +37,28 @@ async fn restart_and_rotation_retain_historical_receipt_trust() {
     let old_pem = old.to_pkcs8_pem(LineEnding::LF).unwrap();
     let new_pem = new.to_pkcs8_pem(LineEnding::LF).unwrap();
     let service_pem = service.to_pkcs8_pem(LineEnding::LF).unwrap();
-    let all = document(&[&old, &new]);
+    // The shared guarded database can also contain real HTTP fixture receipt
+    // methods. Preserve their public bytes in this test's configured document;
+    // dropping any historical method must continue to fail closed.
+    let mut all: serde_json::Value = serde_json::from_str(&document(&[&old, &new])).unwrap();
+    let retained: Vec<(String, Vec<u8>)> =
+        sqlx::query_as("SELECT key_id,public_key FROM chat.direct_request_receipt_keys")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let methods = all["verificationMethod"].as_array_mut().unwrap();
+    for (id, public) in retained {
+        if methods
+            .iter()
+            .any(|method| method["id"].as_str() == Some(id.as_str()))
+        {
+            continue;
+        }
+        let mut multikey = vec![0x80, 0x24];
+        multikey.extend_from_slice(&public);
+        methods.push(serde_json::json!({"id":id,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,multikey)}));
+    }
+    let all = all.to_string();
     let old_signer =
         DirectRequestReceiptSigner::configured(old_pem.as_str(), service_pem.as_str(), &all)
             .unwrap();
