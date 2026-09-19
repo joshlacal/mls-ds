@@ -24,9 +24,9 @@ use catbird_mls::{
 };
 use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    reviewed_baseline, seed_service_device, signed_mls_request, validate_request_test_database_url,
-    DeterministicFaultTransport, FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
+    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
+    HttpsDidFixture, RequestRig, ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -76,6 +76,10 @@ async fn guarded_database_is_local_owned_and_contains_reviewed_baseline() -> any
     assert_eq!(authority.user, authority.owner);
     assert_eq!(authority.server_address, "127.0.0.1");
     assert_eq!(authority.baseline_migrations, 14);
+    assert_eq!(
+        authority.additive_migrations,
+        reviewed_request_migrations().len()
+    );
     Ok(())
 }
 
@@ -106,7 +110,10 @@ async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow
 async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() -> anyhow::Result<()>
 {
     let authority = connect_guarded_request_database(5).await?;
-    assert!(authority.additive_migrations >= 9);
+    assert_eq!(
+        authority.additive_migrations,
+        reviewed_request_migrations().len()
+    );
 
     let did_port = HttpsDidFixture::reserve_port()?;
     let run = Uuid::new_v4().simple().to_string();

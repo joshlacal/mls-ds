@@ -26,6 +26,19 @@ pub async fn setup() -> PgPool {
         .await
         .expect("review historical bytes");
     let mut migrations = reviewed.migrations.to_vec();
+    // Existing service-auth ledger omitted from the original fourteen-file
+    // test baseline. Keep that baseline immutable and pin this dependency.
+    let service_auth =
+        include_str!("../../migrations/20260820000001_chat_service_auth_admissions.sql");
+    use sha2::Digest as _;
+    assert_eq!(format!("{:x}", sha2::Sha384::digest(service_auth.as_bytes())),
+        "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac");
+    migrations.push(Migration::new(
+        20260820000001,
+        Cow::Borrowed("chat service auth admissions"),
+        MigrationType::Simple,
+        Cow::Borrowed(service_auth),
+    ));
     migrations.push(Migration::new(
         20260919000001,
         Cow::Borrowed("direct request preparation"),
@@ -120,6 +133,14 @@ pub async fn setup() -> PgPool {
         MigrationType::Simple,
         Cow::Borrowed(include_str!(
             "../../migrations/20260919000012_direct_request_welcome_slot_digest.sql"
+        )),
+    ));
+    migrations.push(Migration::new(
+        20260919000013,
+        Cow::Borrowed("direct request signed json projection"),
+        MigrationType::Simple,
+        Cow::Borrowed(include_str!(
+            "../../migrations/20260919000013_direct_request_signed_json_projection.sql"
         )),
     ));
     let migrator = Migrator {

@@ -83,6 +83,10 @@
         },
         {
           "name": "RateLimited"
+        },
+        {
+          "name": "CapacityUnavailable",
+          "description": "The bounded encrypted request lifecycle reserve cannot accommodate this operation. No first-execution effects are committed; retry the same signed operation after capacity is available."
         }
       ]
     }

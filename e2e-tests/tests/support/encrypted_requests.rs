@@ -46,6 +46,12 @@ const AUTH_JTI_MIGRATION: &str =
     include_str!("../../../server/migrations/20260214000002_auth_jti_nonce.sql");
 const AUTH_JTI_MIGRATION_SHA384: &str =
     "a653190a473ce3535c946769e8e269173fcf22c1cc6196063eb9461e4766bc084a57c61d2b3a4ffee4b5a1b4da06856b";
+const SERVICE_AUTH_MIGRATION: &str =
+    include_str!("../../../server/migrations/20260820000001_chat_service_auth_admissions.sql");
+const SERVICE_AUTH_MIGRATION_SHA384: &str =
+    "2e8cb6bf47498402e56ba5c2fc753114c1d46e0767c98aa243c47993eb4f51a84de89469a8ae9af6bfac751ddadd18ac";
+const SERVICE_AUTH_MIGRATION_VERSION: i64 = 20260820000001;
+const SERVICE_AUTH_MIGRATION_DESCRIPTION: &str = "chat service auth admissions";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -146,6 +152,24 @@ pub fn reviewed_baseline() -> [BaselineMigration; 14] {
     ]
 }
 
+pub fn reviewed_request_migrations() -> [BaselineMigration; 13] {
+    [
+        baseline!(20260919000001, "direct request preparation", "20260919000001_direct_request_preparation.sql", "d4d3527aa77b8fe91d8d754f72290b682571cc6731866d72c059f10d4b2f7cf8ef629069737addeedaabd6f6eee682ca"),
+        baseline!(20260919000002, "direct request publication", "20260919000002_direct_request_publication.sql", "7fda0b09fcdef20e4da2e1701f6a56c12f636f7881b46e2f6e249cb0d5fc2aa63c734dc07cbb543169398253e29cec9e"),
+        baseline!(20260919000003, "direct request lifecycle", "20260919000003_direct_request_lifecycle.sql", "c51bc3851c68556437867249e163fd320fd792f62401695df1c5e9182aa5141687c5e193fdb9d11a37d7ff6be3811572"),
+        baseline!(20260919000004, "direct request welcome delivery", "20260919000004_direct_request_welcome_delivery.sql", "a93682f234ab1c2efdf98d6da51c444d89d750a224b67117f65e34045d54e6ada28c69858433bfc93be70c8e4b7827c4"),
+        baseline!(20260919000005, "direct request budget release", "20260919000005_direct_request_budget_release.sql", "0c2e4c2b2b5f3fe662e5d91ae85969825ac932ad708e4840cfa3f426414462d678547e49e481ff9eeda531f40828fad0"),
+        baseline!(20260919000006, "direct request attempt null fences", "20260919000006_direct_request_attempt_null_fences.sql", "871e44752b1f8e35a684589ada95e2bdfdf88c667c6e371bdbae15f8ff2e6bb513fbc369b74bc4bd9244c6e693f9ac4c"),
+        baseline!(20260919000007, "direct request publication integrity", "20260919000007_direct_request_publication_integrity.sql", "6f6192cd5d620becadd5bcd47cb38e50b30ab999ea7c3c410804a527bcb23aaa10f3913098211ce072cafdb6591af6db"),
+        baseline!(20260919000008, "direct request lifecycle fences", "20260919000008_direct_request_lifecycle_fences.sql", "64dcfb75a6adc3ed3509cdb6e439ff745813286e7baad2b0ad3c71bc5722694eef13bd4e12e048636e5c27a2964e65d0"),
+        baseline!(20260919000009, "direct request acceptance claims", "20260919000009_direct_request_acceptance_claims.sql", "c1210eb15ecc821c380acd4fbc3fff471d6b42304d38f60f6c6acb9e7b91f233421e32ce18d99802b9e6fdd050d72e9a"),
+        baseline!(20260919000010, "direct request retained artifacts", "20260919000010_direct_request_retained_artifacts.sql", "598aea96b9a02d6c3c24937e81929c14496cdb24698dd8be9a091609c8d40975f5957242a5a81aeeedab2cb79cb36288"),
+        baseline!(20260919000011, "direct request lifecycle slots", "20260919000011_direct_request_lifecycle_slots.sql", "158cee3681184afb77ba824c3357717f945027d93ba75c33b1f5d5cc568d6098e33b0874a5465a6d76cbca72a2d604bf"),
+        baseline!(20260919000012, "direct request welcome slot digest", "20260919000012_direct_request_welcome_slot_digest.sql", "dbe9835b66cba3edd3c21ca1756ae1ee2b13a8c0fbb67fea3dc3b1f754bc5eca90d7a36fff1ff10c6ad568f52eb3312d"),
+        baseline!(20260919000013, "direct request signed json projection", "20260919000013_direct_request_signed_json_projection.sql", "d8170f613b3c2c2fc087b8ab7c5f24d15dd4379ba3605048390beccbdecdd85a525f5d70c3b340d98d053c543d924156"),
+    ]
+}
+
 pub fn validate_request_test_database_url(value: Option<&str>) -> Result<&'static str> {
     match value {
         Some(REQUEST_TEST_DATABASE_URL) => Ok(REQUEST_TEST_DATABASE_NAME),
@@ -182,6 +206,24 @@ fn validate_reviewed_baseline_source() -> Result<()> {
             anyhow::ensure!(
                 baseline[index - 1].version < entry.version,
                 "reviewed migrations are not strictly ordered"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_reviewed_request_sources() -> Result<()> {
+    let migrations = reviewed_request_migrations();
+    for (index, entry) in migrations.iter().enumerate() {
+        anyhow::ensure!(
+            hex::encode(Sha384::digest(entry.sql.as_bytes())) == entry.reviewed_sha384,
+            "reviewed request migration checksum mismatch for {}",
+            entry.filename
+        );
+        if index > 0 {
+            anyhow::ensure!(
+                migrations[index - 1].version < entry.version,
+                "reviewed request migrations are not strictly ordered"
             );
         }
     }
@@ -236,6 +278,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
 
     install_or_validate_reviewed_baseline()?;
     install_auth_replay_prerequisite()?;
+    install_service_auth_prerequisite()?;
     let ledger: Vec<InstalledMigration> = serde_json::from_str(&psql_query(
         "SELECT coalesce(json_agg(json_build_object('version',version,'description',description,'success',success,'checksum',encode(checksum,'hex')) ORDER BY version),'[]'::json)::text FROM public._sqlx_migrations",
     )?)
@@ -263,15 +306,44 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
             "reviewed baseline checksum drift"
         );
     }
-    for row in ledger.iter().skip(14) {
+    anyhow::ensure!(
+        ledger.len() >= baseline.len() + 1,
+        "migration ledger lost service-auth prerequisite"
+    );
+    let service_auth = &ledger[baseline.len()];
+    anyhow::ensure!(
+        service_auth.version == SERVICE_AUTH_MIGRATION_VERSION
+            && service_auth.description == SERVICE_AUTH_MIGRATION_DESCRIPTION
+            && service_auth.success
+            && service_auth.checksum == SERVICE_AUTH_MIGRATION_SHA384,
+        "service-auth migration ledger drift"
+    );
+    let expected_request = reviewed_request_migrations();
+    let actual_request = &ledger[baseline.len() + 1..];
+    anyhow::ensure!(
+        actual_request.len() == expected_request.len(),
+        "request migration ledger count drift: expected {}, found {}",
+        expected_request.len(),
+        actual_request.len()
+    );
+    for (row, expected) in actual_request.iter().zip(expected_request.iter()) {
         anyhow::ensure!(
-            row.version >= 20260919000000 && row.version < 20260920000000,
-            "non-request additive migration {} is installed in the request database",
+            row.version == expected.version,
+            "request migration version drift"
+        );
+        anyhow::ensure!(
+            row.description == expected.description,
+            "request migration description drift at {}",
             row.version
         );
         anyhow::ensure!(
             row.success,
             "request additive migration {} failed",
+            row.version
+        );
+        anyhow::ensure!(
+            row.checksum == expected.reviewed_sha384,
+            "request migration checksum drift at {}",
             row.version
         );
     }
@@ -281,7 +353,7 @@ pub async fn connect_guarded_request_database(max_connections: u32) -> Result<Da
         owner,
         server_address,
         baseline_migrations: 14,
-        additive_migrations: ledger.len() - 14,
+        additive_migrations: actual_request.len(),
     })
 }
 
@@ -298,6 +370,63 @@ fn install_auth_replay_prerequisite() -> Result<()> {
     Ok(())
 }
 
+fn install_service_auth_prerequisite() -> Result<()> {
+    anyhow::ensure!(
+        hex::encode(Sha384::digest(SERVICE_AUTH_MIGRATION.as_bytes()))
+            == SERVICE_AUTH_MIGRATION_SHA384,
+        "canonical service-auth admission migration checksum drift"
+    );
+    let exists =
+        psql_query("SELECT to_regclass('chat.service_auth_admissions') IS NOT NULL")? == "t\n";
+    if !exists {
+        psql_exec(SERVICE_AUTH_MIGRATION)?;
+    }
+    let columns = psql_query(
+        "SELECT string_agg(attname||':'||format_type(atttypid,atttypmod)||':'||attnotnull::text,',' ORDER BY attnum) \
+         FROM pg_attribute WHERE attrelid='chat.service_auth_admissions'::regclass \
+         AND attnum>0 AND NOT attisdropped",
+    )?;
+    anyhow::ensure!(
+        columns.trim() == "admission_id:uuid:true,issuer_did:text:true,endpoint_nsid:text:true,device_id:uuid:true,jti_sha256:bytea:true,token_sha256:bytea:true,token_iat:timestamp with time zone:true,token_exp:timestamp with time zone:true,consumed_at:timestamp with time zone:true",
+        "service-auth admission column contract drift"
+    );
+    let constraints = psql_query(
+        "SELECT string_agg(conname,',' ORDER BY conname) FROM pg_constraint \
+         WHERE conrelid='chat.service_auth_admissions'::regclass",
+    )?;
+    anyhow::ensure!(
+        constraints.trim() == "service_auth_admissions_endpoint_chat,service_auth_admissions_issuer_nonempty,service_auth_admissions_jti_digest,service_auth_admissions_jti_once,service_auth_admissions_pkey,service_auth_admissions_time_profile,service_auth_admissions_token_digest",
+        "service-auth admission constraint contract drift"
+    );
+    anyhow::ensure!(
+        psql_query("SELECT to_regclass('chat.service_auth_admissions_expiry_idx')::text")?.trim()
+            == "chat.service_auth_admissions_expiry_idx",
+        "service-auth admission expiry index is unavailable"
+    );
+    let ledger_row = psql_query(&format!(
+        "SELECT description||E'\\t'||success::text||E'\\t'||encode(checksum,'hex') \
+         FROM public._sqlx_migrations WHERE version={SERVICE_AUTH_MIGRATION_VERSION}"
+    ))?;
+    if ledger_row.trim().is_empty() {
+        psql_exec(&format!(
+            "INSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time) \
+             VALUES({SERVICE_AUTH_MIGRATION_VERSION},'{SERVICE_AUTH_MIGRATION_DESCRIPTION}',TRUE,decode('{SERVICE_AUTH_MIGRATION_SHA384}','hex'),0)"
+        ))?;
+    }
+    let ledger_row = psql_query(&format!(
+        "SELECT description||E'\\t'||success::text||E'\\t'||encode(checksum,'hex') \
+         FROM public._sqlx_migrations WHERE version={SERVICE_AUTH_MIGRATION_VERSION}"
+    ))?;
+    anyhow::ensure!(
+        ledger_row.trim()
+            == format!(
+                "{SERVICE_AUTH_MIGRATION_DESCRIPTION}\tt\t{SERVICE_AUTH_MIGRATION_SHA384}"
+            ),
+        "service-auth migration ledger row conflicts with reviewed source"
+    );
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct InstalledMigration {
     version: i64,
@@ -308,6 +437,7 @@ struct InstalledMigration {
 
 fn install_or_validate_reviewed_baseline() -> Result<()> {
     validate_reviewed_baseline_source()?;
+    validate_reviewed_request_sources()?;
     let ledger_exists = psql_query(
         "SELECT CASE WHEN to_regclass('public._sqlx_migrations') IS NULL THEN '0' ELSE '1' END",
     )? == "1\n";
@@ -332,47 +462,8 @@ fn install_or_validate_reviewed_baseline() -> Result<()> {
         }
     }
 
-    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../server/migrations");
-    let mut additive_paths = std::fs::read_dir(&migration_dir)
-        .with_context(|| format!("read migration directory {}", migration_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("20260919") && name.ends_with(".sql"))
-        })
-        .collect::<Vec<_>>();
-    additive_paths.sort();
-    anyhow::ensure!(
-        !additive_paths.is_empty(),
-        "no encrypted-request additive migration is present"
-    );
-    for path in additive_paths {
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("non-UTF8 migration filename")?;
-        let (raw_version, description) = filename
-            .trim_end_matches(".sql")
-            .split_once('_')
-            .context("invalid additive migration filename")?;
-        let version = raw_version
-            .parse::<i64>()
-            .context("invalid additive migration version")?;
-        anyhow::ensure!(
-            (20260919000000..20260920000000).contains(&version),
-            "additive migration outside reserved day range"
-        );
-        if !installed_versions.contains(&version) {
-            let sql = std::fs::read_to_string(&path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let migration = BaselineMigration {
-                filename: Box::leak(filename.to_owned().into_boxed_str()),
-                version,
-                description: Box::leak(description.replace('_', " ").into_boxed_str()),
-                reviewed_sha384: "",
-                sql: Box::leak(sql.into_boxed_str()),
-            };
+    for migration in reviewed_request_migrations() {
+        if !installed_versions.contains(&migration.version) {
             apply_migration(&migration)?;
         }
     }
