@@ -41,8 +41,6 @@ pub const REQUEST_TEST_DATABASE_ENV: &str = "REQUEST_TEST_DATABASE_URL";
 pub const REQUEST_SERVER_BINARY_ENV: &str = "REQUEST_SERVER_BINARY";
 pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
 pub const REQUEST_SERVER_FIXTURE_BINARY_ENV: &str = "REQUEST_SERVER_FIXTURE_BINARY";
-pub const ALICE_DID_HOST: &str = "alice.request-fixture.catbird.blue";
-pub const BOB_DID_HOST: &str = "bob.request-fixture.catbird.blue";
 pub const RELATIONSHIP_APPVIEW_HOST: &str = "public.api.bsky.app";
 const AUTH_JTI_MIGRATION: &str =
     include_str!("../../../server/migrations/20260214000002_auth_jti_nonce.sql");
@@ -557,6 +555,7 @@ pub struct HttpsDidFixture {
     pub port: u16,
     pub ca_pem: PathBuf,
     pub root: PathBuf,
+    pub hosts: Vec<String>,
     _process: FixtureProcess,
 }
 
@@ -581,9 +580,29 @@ impl HttpsDidFixture {
         let server_csr = root.join("server.csr");
         let server_pem = root.join("server.pem");
         let extension = root.join("server.ext");
+        let mut hosts = documents
+            .iter()
+            .map(|(did, _)| {
+                did.strip_prefix("did:web:")
+                    .context("fixture identity is not did:web")
+                    .map(str::to_owned)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            hosts.len() == documents.len() && hosts.iter().all(|host| !host.contains(':')),
+            "fixture identities must be bare did:web hosts"
+        );
+        hosts.push(RELATIONSHIP_APPVIEW_HOST.to_owned());
+        hosts.sort();
+        hosts.dedup();
+        let subject_alt_names = hosts
+            .iter()
+            .map(|host| format!("DNS:{host}"))
+            .collect::<Vec<_>>()
+            .join(",");
         std::fs::write(
             &extension,
-            &format!("subjectAltName=DNS:{ALICE_DID_HOST},DNS:{BOB_DID_HOST},DNS:{RELATIONSHIP_APPVIEW_HOST}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n"),
+            format!("subjectAltName={subject_alt_names}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n"),
         )?;
         run_checked(
             Command::new("openssl")
@@ -612,7 +631,7 @@ impl HttpsDidFixture {
                     "rsa:2048",
                     "-nodes",
                     "-subj",
-                    "/CN=alice.request-fixture.catbird.blue",
+                    "/CN=request-fixture.catbird.blue",
                     "-keyout",
                 ])
                 .arg(&server_key)
@@ -672,6 +691,7 @@ impl HttpsDidFixture {
             port,
             ca_pem,
             root,
+            hosts,
             _process: FixtureProcess { child },
         })
     }
@@ -929,16 +949,10 @@ impl ShippingServerFixture {
         );
         let mut child = Command::new(binary)
             .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
-            .env(
-                "REQUEST_FIXTURE_DID_HOSTS",
-                format!("{ALICE_DID_HOST},{BOB_DID_HOST},{RELATIONSHIP_APPVIEW_HOST}"),
-            )
+            .env("REQUEST_FIXTURE_DID_HOSTS", https.hosts.join(","))
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
             .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
-            .env(
-                "DID_RESOLUTION_HOST_ALLOWLIST",
-                format!("{ALICE_DID_HOST},{BOB_DID_HOST}"),
-            )
+            .env("DID_RESOLUTION_HOST_ALLOWLIST", https.hosts.join(","))
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
             .env("CHAT_CURSOR_KEY_ID", &cursor_key_id)
@@ -962,7 +976,10 @@ impl ShippingServerFixture {
                 "CHAT_REQUEST_RECEIPT_DID_DOCUMENT_JSON",
                 String::from_utf8(receipt_document.clone())?,
             )
-            .env("RUST_LOG", "warn")
+            .env(
+                "RUST_LOG",
+                std::env::var("REQUEST_SERVER_RUST_LOG").unwrap_or_else(|_| "warn".into()),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()

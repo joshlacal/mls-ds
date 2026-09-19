@@ -26,7 +26,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
     reviewed_baseline, seed_service_device, signed_mls_request, validate_request_test_database_url,
     DeterministicFaultTransport, FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity,
-    ShippingServerFixture, ALICE_DID_HOST, BOB_DID_HOST, REQUEST_TEST_DATABASE_URL,
+    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -109,8 +109,9 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
     assert!(authority.additive_migrations >= 9);
 
     let did_port = HttpsDidFixture::reserve_port()?;
-    let alice = ServiceIdentity::new(format!("did:web:{ALICE_DID_HOST}"));
-    let bob = ServiceIdentity::new(format!("did:web:{BOB_DID_HOST}"));
+    let run = Uuid::new_v4().simple().to_string();
+    let alice = ServiceIdentity::new(format!("did:web:alice-{run}.request-fixture.catbird.blue"));
+    let bob = ServiceIdentity::new(format!("did:web:bob-{run}.request-fixture.catbird.blue"));
     let https = HttpsDidFixture::start(
         did_port,
         &[
