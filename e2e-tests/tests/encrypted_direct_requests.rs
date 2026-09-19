@@ -21,11 +21,11 @@ use catbird_mls::{
     },
 };
 use encrypted_requests::{
-    canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
-    reviewed_baseline, reviewed_request_migrations, seed_service_device, signed_mls_request,
-    validate_request_test_database_url, DeterministicFaultTransport, FaultBoundary,
-    HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity, ShippingServerFixture,
-    REQUEST_TEST_DATABASE_URL,
+    canonical_future, canonical_now, connect_guarded_request_database, push_auth_snapshot,
+    request_database_snapshot, reviewed_baseline, reviewed_request_migrations, seed_service_device,
+    signed_mls_request, validate_request_test_database_url, DeterministicFaultTransport,
+    FaultBoundary, HttpsDidFixture, PushFixtureConfig, RequestRig, ServiceIdentity,
+    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -117,6 +117,149 @@ mod live_direct_request;
 async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() -> anyhow::Result<()>
 {
     let _fixture = live_direct_request::publish_request(true).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
+) -> anyhow::Result<()> {
+    const READ_NSID: &str = "blue.catbird.chat.getOwnDevices";
+    const PUSH_NSID: &str = "blue.catbird.chat.updatePushToken";
+
+    let fixture = live_direct_request::publish_request(false).await?;
+    let before = push_auth_snapshot(&fixture.bob, "apns")?;
+    anyhow::ensure!(
+        before.device_auth_generation == 1 && before.key_enrollment_auth_generation == 1,
+        "fixture device did not retain acknowledged enrollment generation"
+    );
+
+    let read_url = format!(
+        "{}/xrpc/{READ_NSID}?actorDeviceId={}",
+        fixture.server.base_url, fixture.bob.device_id
+    );
+    let first_jti = Uuid::new_v4();
+    let first_token = fixture.bob.scoped_jwt_with_jti(READ_NSID, first_jti);
+    let first = fixture
+        .client
+        .get(&read_url)
+        .bearer_auth(&first_token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        first.status() == reqwest::StatusCode::OK,
+        "first fresh service JWT was rejected: {}",
+        first.status()
+    );
+    let first_body: Value = serde_json::from_slice(&first.bytes().await?)?;
+    anyhow::ensure!(
+        first_body
+            .to_string()
+            .contains(&fixture.bob.device_id.to_string()),
+        "first authenticated read omitted the enrolled device"
+    );
+
+    let second_token = fixture.bob.scoped_jwt_with_jti(READ_NSID, Uuid::new_v4());
+    let second = fixture
+        .client
+        .get(&read_url)
+        .bearer_auth(second_token)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        second.status() == reqwest::StatusCode::OK,
+        "second fresh service JWT was rejected: {}",
+        second.status()
+    );
+    let second_body: Value = serde_json::from_slice(&second.bytes().await?)?;
+    anyhow::ensure!(
+        second_body
+            .to_string()
+            .contains(&fixture.bob.device_id.to_string()),
+        "second authenticated read omitted the enrolled device"
+    );
+
+    let after_fresh = push_auth_snapshot(&fixture.bob, "apns")?;
+    anyhow::ensure!(
+        after_fresh.device_auth_generation == before.device_auth_generation
+            && after_fresh.key_enrollment_auth_generation == before.key_enrollment_auth_generation
+            && after_fresh.registration_id == before.registration_id
+            && after_fresh.token_generation == before.token_generation
+            && after_fresh.binding_digest_hex == before.binding_digest_hex,
+        "fresh account service JWTs changed device or push-binding authority"
+    );
+    anyhow::ensure!(
+        after_fresh.service_jti_rows == before.service_jti_rows + 2
+            && after_fresh.chat_admission_rows == before.chat_admission_rows + 2,
+        "fresh service JWTs did not create two independent replay admissions"
+    );
+
+    let replay = fixture
+        .client
+        .get(&read_url)
+        .bearer_auth(&first_token)
+        .send()
+        .await?;
+    let replay_status = replay.status();
+    let replay_body = replay.bytes().await?;
+    anyhow::ensure!(
+        replay_status == reqwest::StatusCode::UNAUTHORIZED
+            && String::from_utf8_lossy(&replay_body).contains("NotAuthorized"),
+        "replayed service JTI did not fail closed: {replay_status} {}",
+        String::from_utf8_lossy(&replay_body)
+    );
+    anyhow::ensure!(
+        push_auth_snapshot(&fixture.bob, "apns")? == after_fresh,
+        "replayed service JTI changed durable authority rows"
+    );
+
+    let invented_token = format!("invented-generation-{}", Uuid::new_v4().simple());
+    let mut invented_body: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBody =
+        serde_json::from_value(fixture.push_registration_request["registration"]["body"].clone())?;
+    invented_body.auth_generation = before.device_auth_generation + 1;
+    invented_body.token_generation = before.token_generation + 1;
+    invented_body.token_sha256 = Sha256::digest(invented_token.as_bytes()).to_vec().into();
+    invented_body.signed_at = canonical_now().parse()?;
+    let transcript = catbird_mls::atproto::push_registration::transcript(&invented_body)?;
+    let bob_identity = format!("{}#{}", fixture.bob.did, fixture.bob.device_id);
+    let signature = fixture
+        .bob_engine
+        .sign_identity(&bob_identity, transcript)?;
+    let invented_registration = catbird_mls::atproto::blue_catbird::chat::SignedPushRegistration {
+        body: invented_body,
+        signature: signature.into(),
+        extra_data: None,
+    };
+    let invented_request = json!({"token":invented_token,"registration":invented_registration});
+    let invented = fixture
+        .client
+        .post(format!("{}/xrpc/{PUSH_NSID}", fixture.server.base_url))
+        .bearer_auth(fixture.bob.scoped_jwt_with_jti(PUSH_NSID, Uuid::new_v4()))
+        .json(&invented_request)
+        .send()
+        .await?;
+    let invented_status = invented.status();
+    let invented_response = invented.bytes().await?;
+    anyhow::ensure!(
+        invented_status == reqwest::StatusCode::CONFLICT
+            && String::from_utf8_lossy(&invented_response).contains("StaleAuthGeneration"),
+        "invented higher generation did not fail closed: {invented_status} {}",
+        String::from_utf8_lossy(&invented_response)
+    );
+    let after_invented = push_auth_snapshot(&fixture.bob, "apns")?;
+    anyhow::ensure!(
+        after_invented.device_auth_generation == after_fresh.device_auth_generation
+            && after_invented.key_enrollment_auth_generation
+                == after_fresh.key_enrollment_auth_generation
+            && after_invented.registration_id == after_fresh.registration_id
+            && after_invented.token_generation == after_fresh.token_generation
+            && after_invented.binding_digest_hex == after_fresh.binding_digest_hex,
+        "invented generation changed device or push-binding authority"
+    );
+    anyhow::ensure!(
+        after_invented.service_jti_rows == after_fresh.service_jti_rows + 1
+            && after_invented.chat_admission_rows == after_fresh.chat_admission_rows,
+        "failed higher-generation registration changed the wrong replay ledger"
+    );
     Ok(())
 }
 

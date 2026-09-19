@@ -710,6 +710,17 @@ pub struct ServerSnapshot {
     pub plaintext_matches: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PushAuthSnapshot {
+    pub device_auth_generation: i64,
+    pub key_enrollment_auth_generation: i64,
+    pub registration_id: Uuid,
+    pub token_generation: i64,
+    pub binding_digest_hex: String,
+    pub service_jti_rows: usize,
+    pub chat_admission_rows: usize,
+}
+
 pub struct FixtureProcess {
     child: Child,
 }
@@ -934,7 +945,7 @@ impl ServiceIdentity {
         })
     }
 
-    fn jwt(&self, nsid: &str, valid_signature: bool) -> String {
+    fn jwt_with_jti(&self, nsid: &str, valid_signature: bool, jti: Uuid) -> String {
         let now = chrono::Utc::now().timestamp();
         let header = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(
@@ -943,7 +954,7 @@ impl ServiceIdentity {
             .unwrap(),
         );
         let claims = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&json!({"iss":self.did,"aud":"did:web:chat.catbird.blue#atproto_mls","lxm":nsid,"iat":now,"exp":now+60,"jti":Uuid::new_v4().to_string()})).unwrap(),
+            serde_json::to_vec(&json!({"iss":self.did,"aud":"did:web:chat.catbird.blue#atproto_mls","lxm":nsid,"iat":now,"exp":now+60,"jti":jti.to_string()})).unwrap(),
         );
         let input = format!("{header}.{claims}");
         let signature: Signature = if valid_signature {
@@ -954,6 +965,17 @@ impl ServiceIdentity {
                 .sign(input.as_bytes())
         };
         format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn jwt(&self, nsid: &str, valid_signature: bool) -> String {
+        self.jwt_with_jti(nsid, valid_signature, Uuid::new_v4())
+    }
+
+    /// Mint a short-lived exact-NSID fixture token with a caller-selected JTI.
+    /// The signing key remains process-local; this exists only so the shipping
+    /// router replay store can be exercised with the exact same bearer twice.
+    pub fn scoped_jwt_with_jti(&self, nsid: &str, jti: Uuid) -> String {
+        self.jwt_with_jti(nsid, true, jti)
     }
 
     pub async fn post(
@@ -1147,6 +1169,37 @@ pub fn request_database_snapshot(request_id: Uuid) -> Result<ServerSnapshot> {
         message_rows: fields[1].parse()?,
         welcome_rows: fields[2].parse()?,
         plaintext_matches: fields[3].parse()?,
+    })
+}
+
+pub fn push_auth_snapshot(identity: &ServiceIdentity, provider: &str) -> Result<PushAuthSnapshot> {
+    anyhow::ensure!(
+        provider
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
+        "push provider is not canonical"
+    );
+    let row = psql_query(&format!(
+        "SELECT d.auth_generation,k.enrollment_auth_generation,b.registration_id,b.token_generation,encode(b.binding_digest,'hex'), \
+          (SELECT count(*) FROM auth_jti_nonce WHERE issuer_did='{did}'), \
+          (SELECT count(*) FROM chat.service_auth_admissions WHERE issuer_did='{did}') \
+         FROM chat.devices d \
+         JOIN chat.device_keys k USING(user_did,device_id) \
+         JOIN chat.request_push_bindings b USING(user_did,device_id) \
+         WHERE d.user_did='{did}' AND d.device_id='{device}' AND b.provider='{provider}'",
+        did = identity.did,
+        device = identity.device_id,
+    ))?;
+    let fields = row.trim().split('\t').collect::<Vec<_>>();
+    anyhow::ensure!(fields.len() == 7, "unexpected push auth snapshot");
+    Ok(PushAuthSnapshot {
+        device_auth_generation: fields[0].parse()?,
+        key_enrollment_auth_generation: fields[1].parse()?,
+        registration_id: Uuid::parse_str(fields[2])?,
+        token_generation: fields[3].parse()?,
+        binding_digest_hex: fields[4].to_owned(),
+        service_jti_rows: fields[5].parse()?,
+        chat_admission_rows: fields[6].parse()?,
     })
 }
 
