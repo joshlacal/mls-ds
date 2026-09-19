@@ -1172,7 +1172,26 @@ pub struct ShippingServerFixture {
 
 impl ShippingServerFixture {
     pub fn start(https: &HttpsDidFixture) -> Result<Self> {
-        Self::start_configured(https, None)
+        Self::start_configured(https, None, None)
+    }
+    pub fn start_with_client_runtime(
+        https: &HttpsDidFixture,
+        subscription_endpoint: &str,
+    ) -> Result<Self> {
+        let endpoint = reqwest::Url::parse(subscription_endpoint)
+            .context("client runtime subscription endpoint is not a URL")?;
+        anyhow::ensure!(
+            endpoint.scheme() == "wss"
+                && endpoint.host_str() == Some("chat.catbird.blue")
+                && endpoint.port().is_none()
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.query().is_none()
+                && endpoint.fragment().is_none()
+                && endpoint.path() == "/xrpc/blue.catbird.chat.subscribeEvents",
+            "client runtime subscription endpoint must be canonical chat.catbird.blue wss subscribeEvents URL"
+        );
+        Self::start_configured(https, None, Some(subscription_endpoint))
     }
     pub fn start_with_push(https: &HttpsDidFixture, push: &PushFixtureConfig) -> Result<Self> {
         anyhow::ensure!(
@@ -1181,9 +1200,13 @@ impl ShippingServerFixture {
                 && push.result_path.is_absolute(),
             "push listen port must be nonzero and trigger/result paths absolute"
         );
-        Self::start_configured(https, Some(push))
+        Self::start_configured(https, Some(push), None)
     }
-    fn start_configured(https: &HttpsDidFixture, push: Option<&PushFixtureConfig>) -> Result<Self> {
+    fn start_configured(
+        https: &HttpsDidFixture,
+        push: Option<&PushFixtureConfig>,
+        subscription_endpoint: Option<&str>,
+    ) -> Result<Self> {
         let binary = required_file(REQUEST_SERVER_FIXTURE_BINARY_ENV)?;
         anyhow::ensure!(
             binary.file_name().and_then(|name| name.to_str())
@@ -1267,7 +1290,8 @@ impl ShippingServerFixture {
             )
             .env(
                 "CHAT_SUBSCRIPTION_ENDPOINT",
-                "wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents",
+                subscription_endpoint
+                    .unwrap_or("wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents"),
             )
             .env(
                 "CHAT_REQUEST_RECEIPT_SIGNING_KEY_PEM",
