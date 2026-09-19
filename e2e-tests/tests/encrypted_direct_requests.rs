@@ -240,7 +240,7 @@ async fn fresh_service_jwts_preserve_device_generation_and_replay_fails_closed(
     let invented_status = invented.status();
     let invented_response = invented.bytes().await?;
     anyhow::ensure!(
-        invented_status == reqwest::StatusCode::CONFLICT
+        invented_status == reqwest::StatusCode::BAD_REQUEST
             && String::from_utf8_lossy(&invented_response).contains("StaleAuthGeneration"),
         "invented higher generation did not fail closed: {invented_status} {}",
         String::from_utf8_lossy(&invented_response)
