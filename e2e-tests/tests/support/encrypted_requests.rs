@@ -1061,6 +1061,23 @@ pub fn request_database_snapshot(request_id: Uuid) -> Result<ServerSnapshot> {
     })
 }
 
+/// Process-local test configuration; deliberately has no Debug implementation.
+pub struct PushFixtureConfig {
+    pub listen_port: u16,
+    pub event_url: String,
+    pub eligibility_bearer: String,
+    pub event_id: Uuid,
+    pub trigger_path: PathBuf,
+    pub result_path: PathBuf,
+}
+
+pub fn request_push_event_id(request_id: Uuid) -> Result<Uuid> {
+    let id = psql_query(&format!(
+        "SELECT event_id FROM chat.direct_request_push_events WHERE request_id='{request_id}'"
+    ))?;
+    Uuid::parse_str(id.trim()).context("exact request push event identity")
+}
+
 pub struct ShippingServerFixture {
     pub base_url: String,
     pub receipt_document: Vec<u8>,
@@ -1070,6 +1087,18 @@ pub struct ShippingServerFixture {
 
 impl ShippingServerFixture {
     pub fn start(https: &HttpsDidFixture) -> Result<Self> {
+        Self::start_configured(https, None)
+    }
+    pub fn start_with_push(https: &HttpsDidFixture, push: &PushFixtureConfig) -> Result<Self> {
+        anyhow::ensure!(
+            push.listen_port != 0
+                && push.trigger_path.is_absolute()
+                && push.result_path.is_absolute(),
+            "push listen port must be nonzero and trigger/result paths absolute"
+        );
+        Self::start_configured(https, Some(push))
+    }
+    fn start_configured(https: &HttpsDidFixture, push: Option<&PushFixtureConfig>) -> Result<Self> {
         let binary = required_file(REQUEST_SERVER_FIXTURE_BINARY_ENV)?;
         anyhow::ensure!(
             binary.file_name().and_then(|name| name.to_str())
@@ -1137,7 +1166,8 @@ impl ShippingServerFixture {
                 == cursor_key_id,
             "guarded database cursor fence differs from fixture key"
         );
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
             .env("REQUEST_FIXTURE_DID_HOSTS", https.hosts.join(","))
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
@@ -1171,9 +1201,23 @@ impl ShippingServerFixture {
                 std::env::var("REQUEST_SERVER_RUST_LOG").unwrap_or_else(|_| "warn".into()),
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("start shipping router fixture")?;
+            .stderr(Stdio::inherit());
+        if let Some(push) = push {
+            command
+                .env(
+                    "REQUEST_FIXTURE_LISTEN",
+                    format!("127.0.0.1:{}", push.listen_port),
+                )
+                .env("REQUEST_FIXTURE_PUSH_EVENT_URL", &push.event_url)
+                .env(
+                    "REQUEST_FIXTURE_PUSH_ELIGIBILITY_BEARER",
+                    &push.eligibility_bearer,
+                )
+                .env("REQUEST_FIXTURE_PUSH_EVENT_ID", push.event_id.to_string())
+                .env("REQUEST_FIXTURE_PUSH_TRIGGER", &push.trigger_path)
+                .env("REQUEST_FIXTURE_PUSH_RESULT", &push.result_path);
+        }
+        let mut child = command.spawn().context("start shipping router fixture")?;
         let ready = read_child_line(&mut child, "shipping router fixture")?;
         let ready: Value = serde_json::from_str(&ready)?;
         let base_url = ready["baseUrl"]

@@ -14,6 +14,10 @@ pub struct PublishedRequestFixture {
     pub welcome_input: DirectRequestWelcomeInput,
     pub publication: Value,
     pub receipt: Value,
+    pub push_event_id: Uuid,
+    // Synthetic provider token is retained only in this process-local object.
+    pub push_registration_request: Value,
+    pub push_registration_ack: Value,
     pub _https: HttpsDidFixture,
 }
 
@@ -49,6 +53,46 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
 
     let server = ShippingServerFixture::start(&https)?;
     let client = reqwest::Client::builder().build()?;
+    let synthetic_token = format!("request-fixture-{}", Uuid::new_v4().simple());
+    let registration_body: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBody =
+        serde_json::from_value(json!({
+            "protocolVersion":"2", "signatureDomain":"CATBIRD-CHAT-PUSH-BINDING\0",
+            "authorityDid":"did:web:chat.catbird.blue", "actorDid":bob.did,
+            "actorDeviceId":bob.device_id.to_string(), "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
+            "authGeneration":1,"registrationId":Uuid::new_v4().to_string(),"provider":"apns",
+            "appId":"blue.catbird","tokenGeneration":1,"tokenSha256":{"$bytes":STANDARD.encode(Sha256::digest(synthetic_token.as_bytes()))},
+            "enabled":true,"signedAt":canonical_now()
+        }))?;
+    let registration_transcript =
+        catbird_mls::atproto::push_registration::transcript(&registration_body)?;
+    let signature = bob_engine.sign_identity(&bob_identity, registration_transcript.clone())?;
+    let registration = catbird_mls::atproto::blue_catbird::chat::SignedPushRegistration {
+        body: registration_body.clone(),
+        signature: signature.into(),
+        extra_data: None,
+    };
+    let push_registration_request = json!({"token":synthetic_token,"registration":registration});
+    let (registration_status, registration_bytes) = bob
+        .post(
+            &client,
+            &server.base_url,
+            "blue.catbird.chat.updatePushToken",
+            &push_registration_request,
+            true,
+        )
+        .await?;
+    anyhow::ensure!(
+        registration_status == reqwest::StatusCode::OK,
+        "real signed push registration failed {registration_status}"
+    );
+    let push_registration_ack: Value = serde_json::from_slice(&registration_bytes)?;
+    let binding: catbird_mls::atproto::blue_catbird::chat::PushRegistrationBinding =
+        serde_json::from_value(push_registration_ack["pushBinding"].clone())?;
+    assert_eq!(binding.body, registration_body);
+    assert_eq!(
+        binding.binding_digest.as_ref(),
+        Sha256::digest(&registration_transcript).as_slice()
+    );
     let bob_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public));
     let alice_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public));
     let (device_key_status, device_key_response) = alice
@@ -475,6 +519,9 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
         welcome_input,
         publication,
         receipt,
+        push_event_id: super::encrypted_requests::request_push_event_id(request_id)?,
+        push_registration_request,
+        push_registration_ack,
         _https: https,
     })
 }
