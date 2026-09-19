@@ -9,6 +9,7 @@
 #[path = "support/encrypted_requests.rs"]
 mod encrypted_requests;
 
+use anyhow::Context as _;
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -25,7 +26,7 @@ use encrypted_requests::{
     canonical_future, canonical_now, connect_guarded_request_database, request_database_snapshot,
     reviewed_baseline, seed_service_device, signed_mls_request, validate_request_test_database_url,
     DeterministicFaultTransport, FaultBoundary, HttpsDidFixture, RequestRig, ServiceIdentity,
-    ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
+    ShippingServerFixture, ALICE_DID_HOST, BOB_DID_HOST, REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
 use serde_json::{json, Value};
@@ -108,8 +109,8 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
     assert!(authority.additive_migrations >= 9);
 
     let did_port = HttpsDidFixture::reserve_port()?;
-    let alice = ServiceIdentity::new(format!("did:web:localhost%3A{did_port}:alice"));
-    let bob = ServiceIdentity::new(format!("did:web:localhost%3A{did_port}:bob"));
+    let alice = ServiceIdentity::new(format!("did:web:{ALICE_DID_HOST}"));
+    let bob = ServiceIdentity::new(format!("did:web:{BOB_DID_HOST}"));
     let https = HttpsDidFixture::start(
         did_port,
         &[
@@ -138,17 +139,17 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         "signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\0",
         "protocolVersion":"2",
         "actorDid":bob.did,
-        "actorDeviceId":bob.device_id,
+        "actorDeviceId":bob.device_id.to_string(),
         "keyId":bob_key_id,
         "authGeneration":1,
-        "grantId":grant_id,
+        "grantId":grant_id.to_string(),
         "grantRevision":1,
         "purpose":"direct-request-bootstrap",
         "profile":"encryptedIntroduction1",
         "keyPackageRef":STANDARD.encode(&bob_package_ref),
         "keyPackageSha256":STANDARD.encode(Sha256::digest(&bob_package)),
         "expiresAt":canonical_future(29),
-        "idempotencyKey":grant_id,
+        "idempotencyKey":grant_id.to_string(),
         "signedAt":canonical_now()
     });
     let grant = signed_mls_request(&bob_engine, &bob_identity, DirectRequestKind::Grant, grant)?;
@@ -162,7 +163,7 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
             "signatureDomain":"CATBIRD-DIRECT-REQUEST-KEYS\0",
             "protocolVersion":"2",
             "actorDid":bob.did,
-            "actorDeviceId":bob.device_id,
+            "actorDeviceId":bob.device_id.to_string(),
             "keyId":bob_key_id,
             "authGeneration":1,
             "revision":1,
@@ -177,7 +178,7 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
                 },
                 "grant":grant
             }],
-            "idempotencyKey":keys_operation,
+            "idempotencyKey":keys_operation.to_string(),
             "signedAt":canonical_now()
         }),
     )?;
@@ -220,16 +221,16 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
             "signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0",
             "protocolVersion":"2",
             "actorDid":alice.did,
-            "actorDeviceId":alice.device_id,
+            "actorDeviceId":alice.device_id.to_string(),
             "keyId":alice_key_id,
             "authGeneration":1,
-            "requestId":request_id,
-            "firstMessageId":first_message_id,
-            "conversationId":conversation_id,
+            "requestId":request_id.to_string(),
+            "firstMessageId":first_message_id.to_string(),
+            "conversationId":conversation_id.to_string(),
             "recipientDid":bob.did,
             "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
             "profile":"encryptedIntroduction1",
-            "idempotencyKey":request_id,
+            "idempotencyKey":request_id.to_string(),
             "signedAt":canonical_now()
         }),
     )?;
@@ -271,12 +272,12 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
     .timestamp() as u64;
     let context = json!({
         "protocolVersion":"2",
-        "requestId":request_id,
-        "firstMessageId":first_message_id,
-        "conversationId":conversation_id,
+        "requestId":request_id.to_string(),
+        "firstMessageId":first_message_id.to_string(),
+        "conversationId":conversation_id.to_string(),
         "origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},
         "actorDid":alice.did,
-        "actorDeviceId":alice.device_id,
+        "actorDeviceId":alice.device_id.to_string(),
         "actorKeyId":alice_key_id,
         "recipientDid":bob.did,
         "preparationDigest":preparation["preparationDigest"]
@@ -331,7 +332,7 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
                 "recipientDid":device["actorDid"],
                 "recipientDeviceId":device["actorDeviceId"],
                 "provenance":{
-                    "requestId":request_id,
+                    "requestId":request_id.to_string(),
                     "preparationDigest":preparation["preparationDigest"],
                     "contextHash":STANDARD.encode(bootstrap.context_hash),
                     "grantId":device["grant"]["body"]["grantId"],
@@ -343,9 +344,9 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         })
         .collect::<Vec<_>>();
     let author = json!({
-        "authorDid":alice.did,"authorDeviceId":alice.device_id,"authorKeyId":alice_key_id,
+        "authorDid":alice.did,"authorDeviceId":alice.device_id.to_string(),"authorKeyId":alice_key_id,
         "signaturePublicKey":STANDARD.encode(&alice_public),"authGenerationAtOrigin":1,
-        "originTransitionId":request_id,"originSeq":1,"roleAtOrigin":"admin",
+        "originTransitionId":request_id.to_string(),"originSeq":1,"roleAtOrigin":"admin",
         "deviceStatusAtOrigin":"active"
     });
     publish_body["artifacts"] = json!({
@@ -356,7 +357,7 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         "initialCiphertext":STANDARD.encode(&bootstrap.initial_ciphertext),
         "metadataSnapshot":{
             "coordinate":metadata_coordinate(&bootstrap.coordinates)?,
-            "originTransitionId":request_id,"metadataVersion":1,
+            "originTransitionId":request_id.to_string(),"metadataVersion":1,
             "nonce":STANDARD.encode(&bootstrap.metadata_nonce),
             "ciphertext":STANDARD.encode(&bootstrap.metadata_ciphertext),
             "ciphertextSha256":STANDARD.encode(Sha256::digest(&bootstrap.metadata_ciphertext)),

@@ -352,7 +352,7 @@ pub struct AuthMiddleware {
 #[cfg(feature = "test-support")]
 #[derive(Clone)]
 struct TestHttpsDidFixture {
-    host: String,
+    hosts: Vec<String>,
     port: u16,
 }
 
@@ -427,17 +427,26 @@ impl AuthMiddleware {
     /// and operation admission checks run unchanged.
     #[cfg(feature = "test-support")]
     fn with_test_https_did_fixture(
-        host: &str,
+        hosts: &[String],
         port: u16,
         ca_certificate_pem: &[u8],
     ) -> Result<Self, String> {
-        let normalized_host = host.trim().to_ascii_lowercase();
-        let fixture_is_loopback = normalized_host == "localhost"
-            || normalized_host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback());
-        if !fixture_is_loopback || port == 0 {
-            return Err("test HTTPS DID fixture must be an explicit loopback host and port".into());
+        let normalized_hosts = hosts
+            .iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if normalized_hosts.is_empty()
+            || normalized_hosts.iter().any(|host| {
+                host.is_empty()
+                    || host == "localhost"
+                    || host.parse::<std::net::IpAddr>().is_ok()
+                    || url::Host::parse(host).is_err()
+            })
+            || port == 0
+        {
+            return Err(
+                "test HTTPS DID fixture requires explicit non-IP DNS hosts and a port".into(),
+            );
         }
         let certificate = reqwest::Certificate::from_pem(ca_certificate_pem)
             .map_err(|_| "test HTTPS DID fixture CA is not a PEM certificate".to_owned())?;
@@ -447,15 +456,20 @@ impl AuthMiddleware {
             .filter(|value| *value > 0)
             .unwrap_or(10);
         let mut middleware = Self::with_config(300, 100, 60);
-        middleware.http_client = reqwest::Client::builder()
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .redirect(reqwest::redirect::Policy::none())
             .tls_built_in_root_certs(false)
-            .add_root_certificate(certificate)
+            .add_root_certificate(certificate);
+        for host in &normalized_hosts {
+            client = client.resolve(host, loopback);
+        }
+        middleware.http_client = client
             .build()
             .map_err(|_| "failed to construct test HTTPS DID resolver".to_owned())?;
         middleware.test_https_fixture = Some(TestHttpsDidFixture {
-            host: normalized_host,
+            hosts: normalized_hosts,
             port,
         });
         Ok(middleware)
@@ -799,14 +813,40 @@ impl AuthMiddleware {
     async fn resolve_web_did(&self, did: &str) -> Result<DidDocument, AuthError> {
         let url = did_web_document_url(did)
             .ok_or_else(|| AuthError::InvalidDid(format!("Invalid WEB DID: {}", did)))?;
-        let parsed = url::Url::parse(&url).map_err(|e| {
+        let mut parsed = url::Url::parse(&url).map_err(|e| {
             AuthError::DidResolutionFailed(format!("Invalid did:web URL for {}: {}", did, e))
         })?;
+        // A test-support resolver connects a standards-shaped did:web identity
+        // to its injected ephemeral HTTPS port.  The logical DID remains
+        // `did:web:localhost:<path>` (and therefore passes the production bare
+        // DID constraints); only this explicitly trusted resolver's transport
+        // destination changes.  Hostname verification, CA validation, and all
+        // JWT checks still run through the normal path.
+        #[cfg(feature = "test-support")]
+        if let Some(fixture) = &self.test_https_fixture {
+            if parsed.host_str().is_some_and(|host| {
+                fixture
+                    .hosts
+                    .iter()
+                    .any(|allowed| host.eq_ignore_ascii_case(allowed))
+            }) && parsed.port().is_none()
+            {
+                parsed.set_port(Some(fixture.port)).map_err(|_| {
+                    AuthError::DidResolutionFailed(
+                        "failed to bind test did:web resolver port".into(),
+                    )
+                })?;
+            }
+        }
         let host = parsed.host_str().unwrap_or("");
         let port = parsed.port_or_known_default().unwrap_or(443);
         #[cfg(feature = "test-support")]
         let is_exact_test_fixture = self.test_https_fixture.as_ref().is_some_and(|fixture| {
-            host.eq_ignore_ascii_case(&fixture.host) && port == fixture.port
+            fixture
+                .hosts
+                .iter()
+                .any(|allowed| host.eq_ignore_ascii_case(allowed))
+                && port == fixture.port
         });
         #[cfg(not(feature = "test-support"))]
         let is_exact_test_fixture = false;
@@ -826,7 +866,7 @@ impl AuthMiddleware {
             validate_resolved_host_is_public(host, port).await?;
         }
 
-        self.send_and_decode_did_document(self.http_client.get(&url), |status| {
+        self.send_and_decode_did_document(self.http_client.get(parsed.as_str()), |status| {
             format!("Web server returned status {status}")
         })
         .await
@@ -983,11 +1023,11 @@ fn shared_auth_middleware() -> &'static AuthMiddleware {
 /// authority underneath an already authenticated process.
 #[cfg(feature = "test-support")]
 pub fn install_test_https_did_resolver(
-    host: &str,
+    hosts: &[String],
     port: u16,
     ca_certificate_pem: &[u8],
 ) -> Result<(), String> {
-    let middleware = AuthMiddleware::with_test_https_did_fixture(host, port, ca_certificate_pem)?;
+    let middleware = AuthMiddleware::with_test_https_did_fixture(hosts, port, ca_certificate_pem)?;
     TEST_AUTH_MIDDLEWARE
         .set(middleware)
         .map_err(|_| "test HTTPS DID resolver is already installed".to_owned())

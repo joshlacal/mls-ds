@@ -23,9 +23,6 @@ use base64::{
     Engine as _,
 };
 use catbird_mls::chat_v2::transcript::direct_request::{self as protocol, DirectRequestKind};
-use catbird_mls::orchestrator::direct_request_bootstrap::{
-    DirectRequestBootstrapInput, DirectRequestWelcomeInput,
-};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::{
     ecdsa::{signature::Signer as _, Signature, SigningKey},
@@ -44,6 +41,8 @@ pub const REQUEST_TEST_DATABASE_ENV: &str = "REQUEST_TEST_DATABASE_URL";
 pub const REQUEST_SERVER_BINARY_ENV: &str = "REQUEST_SERVER_BINARY";
 pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
 pub const REQUEST_SERVER_FIXTURE_BINARY_ENV: &str = "REQUEST_SERVER_FIXTURE_BINARY";
+pub const ALICE_DID_HOST: &str = "alice.request-fixture.catbird.blue";
+pub const BOB_DID_HOST: &str = "bob.request-fixture.catbird.blue";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -565,7 +564,7 @@ impl HttpsDidFixture {
         let extension = root.join("server.ext");
         std::fs::write(
             &extension,
-            "subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n",
+            &format!("subjectAltName=DNS:{ALICE_DID_HOST},DNS:{BOB_DID_HOST}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n"),
         )?;
         run_checked(
             Command::new("openssl")
@@ -594,7 +593,7 @@ impl HttpsDidFixture {
                     "rsa:2048",
                     "-nodes",
                     "-subj",
-                    "/CN=localhost",
+                    "/CN=alice.request-fixture.catbird.blue",
                     "-keyout",
                 ])
                 .arg(&server_key)
@@ -625,10 +624,14 @@ impl HttpsDidFixture {
             "sign HTTPS fixture certificate",
         )?;
         for (did, document) in documents {
-            let path = did
-                .strip_prefix(&format!("did:web:localhost%3A{port}:"))
-                .context("fixture DID does not bind its exact HTTPS port")?;
-            let directory = root.join(path.replace(':', "/"));
+            let host = did
+                .strip_prefix("did:web:")
+                .context("fixture identity is not did:web")?;
+            anyhow::ensure!(
+                !host.contains(':'),
+                "fixture identity must be a bare did:web"
+            );
+            let directory = root.join(host).join(".well-known");
             std::fs::create_dir_all(&directory)?;
             std::fs::write(directory.join("did.json"), serde_json::to_vec(document)?)?;
         }
@@ -857,10 +860,16 @@ impl ShippingServerFixture {
             psql_query("SELECT cursor_key_id FROM chat.protocol_instances WHERE singleton=TRUE")?;
         let mut child = Command::new(binary)
             .env("TEST_DATABASE_URL", REQUEST_TEST_DATABASE_URL)
-            .env("REQUEST_FIXTURE_DID_HOST", "localhost")
+            .env(
+                "REQUEST_FIXTURE_DID_HOSTS",
+                format!("{ALICE_DID_HOST},{BOB_DID_HOST}"),
+            )
             .env("REQUEST_FIXTURE_DID_PORT", https.port.to_string())
             .env("REQUEST_FIXTURE_DID_CA_PEM", &https.ca_pem)
-            .env("DID_RESOLUTION_HOST_ALLOWLIST", "localhost")
+            .env(
+                "DID_RESOLUTION_HOST_ALLOWLIST",
+                format!("{ALICE_DID_HOST},{BOB_DID_HOST}"),
+            )
             .env("CHAT_CUTOVER_ENABLED", "1")
             .env("CHAT_DIRECT_REQUESTS_ENABLED", "1")
             .env("CHAT_CURSOR_KEY_ID", cursor_key_id.trim())

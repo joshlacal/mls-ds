@@ -18,6 +18,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+#[path = "direct_request_publication_charge.rs"]
+mod retained_charge;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PublicationError {
     #[error("request publication producers disabled")]
@@ -440,17 +443,69 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
     let final_info = binary(&a["finalGroupInfo"]["bytes"])?;
     let welcome = binary(&a["welcome"]["opaqueWelcome"])?;
     let initial = binary(&a["initialCiphertext"])?;
+    let genesis_info = binary(&a["genesisGroupInfo"]["bytes"])?;
+    let unsigned_body = encode(&b)?;
+    let tree = crate::chat_protocol::public_state::encode_public_tree_summary(
+        final_state.binding().tree_summary(),
+    )
+    .map_err(|_| PublicationError::Invariant)?;
+    let event = encode(
+        &json!({"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":convo.to_string()}),
+    )?;
     let import_until = DateTime::from_timestamp(prepared.bootstrap.import_until() as i64, 0)
         .ok_or(PublicationError::Invariant)?;
     // Seal the receipt while package reservations are still present. Every
     // subsequent write is in this same transaction, so a failed effect also
     // rolls this receipt back.
     let receipt=signer.seal_outcome(json!({"$type":"blue.catbird.chat.defs#directRequestReceiptBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-OUTCOME\u{0}","protocolVersion":"2","authorityDid":"did:web:chat.catbird.blue","keyId":signer.key_id(),"receipt":{"$type":"blue.catbird.chat.defs#directRequestPublishedReceipt","requestId":b["requestId"],"requestDigest":STANDARD.encode(prepared.bootstrap.publication_digest()),"preparationRequestDigest":b["preparationRequestDigest"],"actorDid":actor,"actorDeviceId":actor_device.to_string(),"actorKeyId":actor_key,"authGeneration":auth,"requestKind":"publish","recordedAt":time(now),"conversationId":convo.to_string(),"firstMessageId":b["firstMessageId"],"coordinates":b["next"]}})).map_err(|_|PublicationError::Invariant)?;
+    let existing_charge = prepared.candidate.existing_artifact_bytes(tx).await?;
+    let mut remaining_blobs = 0u64;
+    let mut add_blob = |length: usize| -> Result<(), PublicationError> {
+        remaining_blobs = remaining_blobs
+            .checked_add(u64::try_from(length).map_err(|_| PublicationError::Invariant)?)
+            .ok_or(PublicationError::Invariant)?;
+        Ok(())
+    };
+    for blob in [
+        server_fields.as_slice(), genesis_info.as_slice(), final_state.snapshot(),
+        tree.bytes(), metadata_ciphertext.as_slice(), final_info.as_slice(),
+        welcome.as_slice(), initial.as_slice(), metadata_bytes.as_slice(), event.as_slice(),
+    ] {
+        add_blob(blob.len())?;
+    }
+    let deliveries = a["welcome"]["deliveries"].as_array().ok_or(PublicationError::Invariant)?;
+    for delivery in deliveries {
+        add_blob(encode(&delivery["provenance"])?.len())?;
+    }
+    for leaf in final_state.binding().tree_summary().leaves() {
+        add_blob(leaf.basic_credential().len())?;
+        add_blob(leaf.signature_key().len())?;
+    }
+    let predecessor_intervals = if let Some(prior) = prepared.prior {
+        let (snapshot_bytes, tree_bytes, intervals): (i64, i64, i64) = sqlx::query_as(
+            "SELECT octet_length(s.public_snapshot_bytes)::bigint, octet_length(s.tree_summary_bytes)::bigint, (SELECT count(*) FROM chat.application_intervals i WHERE i.conversation_id=s.conversation_id AND i.generation=s.generation AND i.terminal_seq IS NULL) FROM chat.generation_states s WHERE s.conversation_id=$1 AND s.generation=$2 AND s.state_version=$3",
+        ).bind(convo).bind(prior.generation() as i64).bind(prior.state_version() as i64)
+            .fetch_one(&mut **tx).await?;
+        add_blob(usize::try_from(snapshot_bytes).map_err(|_| PublicationError::Invariant)?)?;
+        add_blob(usize::try_from(tree_bytes).map_err(|_| PublicationError::Invariant)?)?;
+        u64::try_from(intervals).map_err(|_| PublicationError::Invariant)?
+    } else {
+        0
+    };
+    let retained_artifact_bytes = retained_charge::charge(existing_charge, receipt.bytes().len(), &retained_charge::PublicationArtifactLengths {
+        signed_wrapper: signed_bytes.len(), accepted_entry: entry_bytes.len(),
+        unsigned_body: unsigned_body.len(), transcript: transcript.len(), signature: signature.len(),
+        remaining_blobs,
+        final_leaves: final_state.binding().tree_summary().leaves().len() as u64,
+        deliveries: deliveries.len() as u64, predecessor_intervals,
+        legacy_successor: prepared.prior.is_some(),
+    }).ok_or(PublicationError::Invariant)?;
     let response = match preparation::complete_published_publication(
         tx,
         prepared.candidate,
         &receipt,
         signer,
+        retained_artifact_bytes,
     )
     .await?
     {
@@ -490,16 +545,12 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
             .bind(convo).bind(low).bind(high).bind(now).execute(&mut **tx).await?;
     }
     sqlx::query("INSERT INTO chat.generations(conversation_id,generation,group_id,lifecycle,genesis_group_info_bytes,genesis_group_info_sha256,current_state_version,activated_seq,activated_at) VALUES($1,$2,$3,'active',$4,$5,1,$6,$7)")
-        .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(binary(&a["genesisGroupInfo"]["bytes"])?).bind(binary(&a["genesisGroupInfo"]["sha256"])?).bind(seq).bind(now).execute(&mut **tx).await?;
-    let tree = crate::chat_protocol::public_state::encode_public_tree_summary(
-        final_state.binding().tree_summary(),
-    )
-    .map_err(|_| PublicationError::Invariant)?;
+        .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(&genesis_info).bind(binary(&a["genesisGroupInfo"]["sha256"])?).bind(seq).bind(now).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.generation_states(conversation_id,generation,state_version,group_id,epoch,group_context_hash,confirmation_tag,lifecycle,state_kind,producing_transition_id,public_snapshot_bytes,snapshot_sha256,tree_summary_bytes,tree_summary_sha256,leaf_count,created_at) VALUES($1,$2,1,$3,1,$4,$5,'active','directRequestPublication',$6,$7,$8,$9,$10,$11,$12)")
         .bind(convo).bind(generation).bind(next.group_id().as_slice()).bind(next.group_context_hash().as_slice()).bind(next.confirmation_tag().as_slice()).bind(request).bind(final_state.snapshot()).bind(final_state.snapshot_sha256().as_slice()).bind(tree.bytes()).bind(tree.sha256().as_slice()).bind(final_state.binding().tree_summary().leaves().len() as i64).bind(now).execute(&mut **tx).await?;
     let metadata_id = Uuid::new_v4();
     sqlx::query("INSERT INTO chat.transitions(transition_id,conversation_id,kind,actor_did,actor_device_id,actor_key_id,actor_auth_generation,actor_role,actor_device_status,signed_request_bytes,unsigned_projection_bytes,signing_transcript_bytes,request_digest,signature,prior_generation,prior_state_version,next_generation,next_state_version,retired_generation,retired_state_version,successor_generation,successor_state_version,metadata_snapshot_id,entry_seq,accepted_at) VALUES($1,$2,'directRequestPublication',$3,$4,$5,$6,'admin','active',$7,$8,$9,$10,$11,$12,$13,$14,1,$15,$16,$17,$18,$19,$20,$21)")
-        .bind(request).bind(convo).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(&signed_bytes).bind(encode(&b)?).bind(&transcript).bind(digest).bind(&signature).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64)).bind(generation).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64+1)).bind(prepared.prior.map(|_|generation)).bind(prepared.prior.map(|_|1i64)).bind(metadata_id).bind(seq).bind(now).execute(&mut **tx).await?;
+        .bind(request).bind(convo).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(&signed_bytes).bind(&unsigned_body).bind(&transcript).bind(digest).bind(&signature).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64)).bind(generation).bind(prepared.prior.map(|p|p.generation() as i64)).bind(prepared.prior.map(|p|p.state_version() as i64+1)).bind(prepared.prior.map(|_|generation)).bind(prepared.prior.map(|_|1i64)).bind(metadata_id).bind(seq).bind(now).execute(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.entries(conversation_id,seq,entry_id,entry_kind,accepted_payload_bytes,accepted_payload_sha256,signed_request_bytes,request_digest,signature,server_fields_bytes,outer_entry_fingerprint,actor_did,actor_device_id,actor_key_id,actor_auth_generation,generation,state_version,transition_id,received_at,message_id) VALUES($1,$2,$3,'blue.catbird.chat.defs#directRequestEntry',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1,$16,$17,$18)")
         .bind(convo).bind(seq).bind(entry_id).bind(&entry_bytes).bind(Sha256::digest(&entry_bytes).as_slice()).bind(&signed_bytes).bind(digest).bind(&signature).bind(&server_fields).bind(fingerprint.as_slice()).bind(actor).bind(actor_device).bind(actor_key).bind(auth).bind(generation).bind(request).bind(now).bind(id(&b["firstMessageId"])?).execute(&mut **tx).await?;
     // A successor entry also closes every predecessor device's schedule.
@@ -562,9 +613,6 @@ pub(crate) async fn execute_publication<T: PublicTransport>(
         }
     }
     let event_id = Uuid::new_v4();
-    let event = encode(
-        &json!({"$type":"blue.catbird.chat.defs#conversationChangedEvent","conversationId":convo.to_string()}),
-    )?;
     let position:i64=sqlx::query_scalar("INSERT INTO chat.events(event_id,event_kind,payload_bytes,payload_sha256,created_at,protocol_instance_id) SELECT $1,'conversationChanged',$2,$3,$4,protocol_instance_id FROM chat.protocol_instances RETURNING event_position")
         .bind(event_id).bind(&event).bind(Sha256::digest(&event).as_slice()).bind(now).fetch_one(&mut **tx).await?;
     sqlx::query("INSERT INTO chat.event_recipients(event_position,user_did,device_id,entitlement_kind,audience_predecessor_position) SELECT $1,r.user_did,r.device_id,CASE WHEN EXISTS(SELECT 1 FROM chat.member_devices m WHERE m.conversation_id=r.conversation_id AND m.user_did=r.user_did AND m.device_id=r.device_id AND m.joined_transition_id=$4) THEN 'leaf' ELSE 'historicalSchedule' END,(SELECT max(previous.event_position) FROM chat.event_recipients previous WHERE previous.user_did=r.user_did AND previous.device_id=r.device_id) FROM chat.entry_recipients r WHERE r.conversation_id=$2 AND r.seq=$3 ORDER BY r.user_did,r.device_id")

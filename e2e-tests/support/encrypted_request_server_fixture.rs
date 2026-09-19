@@ -52,8 +52,17 @@ async fn main() -> Result<()> {
         database_url == EXACT_DATABASE_URL,
         "server fixture refuses every database except {EXACT_DATABASE_URL}"
     );
-    let resolver_host = std::env::var("REQUEST_FIXTURE_DID_HOST")
-        .context("REQUEST_FIXTURE_DID_HOST is required")?;
+    let resolver_hosts = std::env::var("REQUEST_FIXTURE_DID_HOSTS")
+        .context("REQUEST_FIXTURE_DID_HOSTS is required")?
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !resolver_hosts.is_empty(),
+        "REQUEST_FIXTURE_DID_HOSTS is empty"
+    );
     let resolver_port = std::env::var("REQUEST_FIXTURE_DID_PORT")
         .context("REQUEST_FIXTURE_DID_PORT is required")?
         .parse::<u16>()
@@ -62,7 +71,7 @@ async fn main() -> Result<()> {
         .context("REQUEST_FIXTURE_DID_CA_PEM is required")?;
     let resolver_ca = std::fs::read(&resolver_ca_path)
         .with_context(|| format!("read resolver CA {resolver_ca_path}"))?;
-    install_test_https_did_resolver(&resolver_host, resolver_port, &resolver_ca)
+    install_test_https_did_resolver(&resolver_hosts, resolver_port, &resolver_ca)
         .map_err(anyhow::Error::msg)?;
 
     let pool = PgPoolOptions::new()
