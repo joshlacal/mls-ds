@@ -32,6 +32,63 @@ pub const REQUEST_AUTH_FIXTURE_ENV: &str = "REQUEST_AUTH_FIXTURE";
 
 static DATABASE_SETUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FaultBoundary {
+    BeforeRequest,
+    AfterRequestBeforeResponse,
+    AfterCommittedResponse,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicFaultTransport {
+    remaining: HashMap<FaultBoundary, usize>,
+    trace: Vec<FaultBoundary>,
+}
+
+impl DeterministicFaultTransport {
+    pub fn fail_on(mut self, boundary: FaultBoundary, occurrence: usize) -> Result<Self> {
+        anyhow::ensure!(occurrence > 0, "fault occurrence must be positive");
+        self.remaining.insert(boundary, occurrence);
+        Ok(self)
+    }
+
+    pub fn checkpoint(&mut self, boundary: FaultBoundary) -> Result<()> {
+        self.trace.push(boundary);
+        if let Some(remaining) = self.remaining.get_mut(&boundary) {
+            *remaining -= 1;
+            if *remaining == 0 {
+                self.remaining.remove(&boundary);
+                bail!("deterministic transport fault at {boundary:?}")
+            }
+        }
+        Ok(())
+    }
+
+    pub fn trace(&self) -> &[FaultBoundary] {
+        &self.trace
+    }
+
+    pub async fn post_json(
+        &mut self,
+        client: &reqwest::Client,
+        url: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        self.checkpoint(FaultBoundary::BeforeRequest)?;
+        let response = client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .context("deterministic request transport")?;
+        // Failing here deliberately discards a real response after the server
+        // could have committed, reproducing an unknown publication outcome.
+        self.checkpoint(FaultBoundary::AfterRequestBeforeResponse)?;
+        self.checkpoint(FaultBoundary::AfterCommittedResponse)?;
+        Ok(response)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BaselineMigration {
     pub filename: &'static str,
@@ -364,6 +421,18 @@ impl HarnessPrerequisites {
             metadata.is_file() && metadata.len() > 0,
             "server binary is empty"
         );
+        anyhow::ensure!(
+            server_binary.file_name().and_then(|name| name.to_str()) == Some("catbird-server"),
+            "{REQUEST_SERVER_BINARY_ENV} must name the shipping catbird-server executable"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(
+                metadata.permissions().mode() & 0o111 != 0,
+                "server binary is not executable"
+            );
+        }
         let fixture_bytes = std::fs::read(&auth_fixture)
             .with_context(|| format!("read auth fixture {}", auth_fixture.display()))?;
         serde_json::from_slice::<Value>(&fixture_bytes).context("auth fixture is not JSON")?;
@@ -453,6 +522,7 @@ pub struct RequestRig {
     pub database_authority: DatabaseAuthority,
     pub prerequisites: HarnessPrerequisites,
     accounts: HashMap<String, AccountState>,
+    pub fault_transport: DeterministicFaultTransport,
 }
 
 impl RequestRig {
@@ -463,6 +533,7 @@ impl RequestRig {
             database_authority,
             prerequisites,
             accounts: HashMap::new(),
+            fault_transport: DeterministicFaultTransport::default(),
         })
     }
 

@@ -11,7 +11,7 @@ mod encrypted_requests;
 
 use encrypted_requests::{
     connect_guarded_request_database, reviewed_baseline, validate_request_test_database_url,
-    RequestRig, REQUEST_TEST_DATABASE_URL,
+    DeterministicFaultTransport, FaultBoundary, RequestRig, REQUEST_TEST_DATABASE_URL,
 };
 
 #[test]
@@ -35,6 +35,21 @@ fn reviewed_baseline_has_exactly_fourteen_ordered_entries() {
         .all(|pair| pair[0].version < pair[1].version));
 }
 
+#[test]
+fn deterministic_fault_transport_fires_at_the_selected_occurrence() -> anyhow::Result<()> {
+    let mut transport = DeterministicFaultTransport::default()
+        .fail_on(FaultBoundary::AfterRequestBeforeResponse, 2)?;
+    transport.checkpoint(FaultBoundary::BeforeRequest)?;
+    transport.checkpoint(FaultBoundary::AfterRequestBeforeResponse)?;
+    let error = transport
+        .checkpoint(FaultBoundary::AfterRequestBeforeResponse)
+        .unwrap_err();
+    assert!(error.to_string().contains("AfterRequestBeforeResponse"));
+    assert_eq!(transport.trace().len(), 3);
+    let _future_boundary = FaultBoundary::AfterCommittedResponse;
+    Ok(())
+}
+
 #[tokio::test]
 async fn guarded_database_is_local_owned_and_contains_reviewed_baseline() -> anyhow::Result<()> {
     let authority = connect_guarded_request_database(1).await?;
@@ -47,10 +62,6 @@ async fn guarded_database_is_local_owned_and_contains_reviewed_baseline() -> any
 
 #[tokio::test]
 async fn enrollment_uses_independent_real_mls_stores() -> anyhow::Result<()> {
-    let server_binary = std::env::current_exe()?;
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/alice_did.json");
-    std::env::set_var("REQUEST_SERVER_BINARY", server_binary);
-    std::env::set_var("REQUEST_AUTH_FIXTURE", fixture);
     let mut rig = RequestRig::local().await?;
     rig.enroll("alice", 2).await?;
     rig.enroll("bob", 1).await?;
@@ -61,10 +72,6 @@ async fn enrollment_uses_independent_real_mls_stores() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn unavailable_request_handlers_fail_closed_instead_of_passing() -> anyhow::Result<()> {
-    let server_binary = std::env::current_exe()?;
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/alice_did.json");
-    std::env::set_var("REQUEST_SERVER_BINARY", server_binary);
-    std::env::set_var("REQUEST_AUTH_FIXTURE", fixture);
     let mut rig = RequestRig::local().await?;
     rig.enroll("alice", 1).await?;
     rig.enroll("bob", 1).await?;
