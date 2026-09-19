@@ -395,6 +395,53 @@ async fn c01_real_router_auth_live_preparation_and_native_recipient_preview() ->
         .as_object_mut()
         .context("published outcome object")?
         .remove("$type");
+    let verified_publication = protocol::verify_signed_request(
+        DirectRequestKind::Publish,
+        &serde_json::to_vec(&publication)?,
+        &alice_public,
+    )?;
+    let verified_receipt = protocol::verify_signed_request(
+        DirectRequestKind::Outcome,
+        &serde_json::to_vec(&receipt)?,
+        &server.receipt_public_key,
+    )?;
+    let proof = &verified_receipt.body()["receipt"];
+    let expected_publication_digest = STANDARD.encode(verified_publication.request_digest());
+    let expected_preparation_digest = STANDARD.encode(verified_prepare.request_digest());
+    let mut receipt_mismatches = Vec::new();
+    for (field, matches) in [
+        (
+            "$type",
+            proof["$type"] == "blue.catbird.chat.defs#directRequestPublishedReceipt",
+        ),
+        ("requestId", proof["requestId"] == request_id.to_string()),
+        ("requestKind", proof["requestKind"] == "publish"),
+        ("coordinates", proof["coordinates"] == bootstrap.coordinates),
+        (
+            "conversationId",
+            proof["conversationId"] == conversation_id.to_string(),
+        ),
+        (
+            "firstMessageId",
+            proof["firstMessageId"] == first_message_id.to_string(),
+        ),
+        (
+            "requestDigest",
+            proof["requestDigest"] == expected_publication_digest,
+        ),
+        (
+            "preparationRequestDigest",
+            proof["preparationRequestDigest"] == expected_preparation_digest,
+        ),
+    ] {
+        if !matches {
+            receipt_mismatches.push(field);
+        }
+    }
+    anyhow::ensure!(
+        receipt_mismatches.is_empty(),
+        "shipping receipt differs from native Welcome contract in fields: {receipt_mismatches:?}"
+    );
     let welcome_input = DirectRequestWelcomeInput {
         bootstrap: bootstrap.clone(),
         local_identity: bob_identity.as_bytes().to_vec(),
