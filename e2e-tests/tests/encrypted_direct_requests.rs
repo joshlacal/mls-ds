@@ -164,9 +164,11 @@ async fn wait_json(path: &std::path::Path, timeout: Duration) -> anyhow::Result<
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn t16_live_ds_worker_to_nest_and_fake_apns() -> anyhow::Result<()> {
+async fn run_t16_paired(expect_canonical_ineligible: bool) -> anyhow::Result<()> {
     let fixture = live_direct_request::publish_request(true).await?;
+    if expect_canonical_ineligible {
+        live_direct_request::accept_existing_fixture(&fixture).await?;
+    }
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let ds_port = listener.local_addr()?.port();
     drop(listener);
@@ -214,6 +216,7 @@ async fn t16_live_ds_worker_to_nest_and_fake_apns() -> anyhow::Result<()> {
         "eligibilityCredential": eligibility_credential,
         "registrationRequest": fixture.push_registration_request,
         "registrationAck": fixture.push_registration_ack,
+        "expectCanonicalIneligible": expect_canonical_ineligible,
     });
     child
         .stdin
@@ -254,9 +257,17 @@ async fn t16_live_ds_worker_to_nest_and_fake_apns() -> anyhow::Result<()> {
     );
     let nest_result = wait_json(&nest_result_path, Duration::from_secs(180)).await?;
     anyhow::ensure!(nest_result["eventId"] == fixture.push_event_id.to_string());
-    anyhow::ensure!(nest_result["status"] == "delivered");
-    anyhow::ensure!(nest_result["result"] == "provider_accepted");
-    anyhow::ensure!(nest_result["apnsCalls"] == 2 && nest_result["fcmCalls"] == 0);
+    if expect_canonical_ineligible {
+        anyhow::ensure!(nest_result["status"] == "suppressed");
+        anyhow::ensure!(nest_result["result"] == "canonical_ineligible");
+        anyhow::ensure!(nest_result["apnsCalls"] == 0 && nest_result["fcmCalls"] == 0);
+        anyhow::ensure!(nest_result["exactGenericPayloadVerified"] == false);
+    } else {
+        anyhow::ensure!(nest_result["status"] == "delivered");
+        anyhow::ensure!(nest_result["result"] == "provider_accepted");
+        anyhow::ensure!(nest_result["apnsCalls"] == 2 && nest_result["fcmCalls"] == 0);
+        anyhow::ensure!(nest_result["exactGenericPayloadVerified"] == true);
+    }
 
     let status = tokio::task::spawn_blocking(move || nest.wait())
         .await
@@ -266,4 +277,20 @@ async fn t16_live_ds_worker_to_nest_and_fake_apns() -> anyhow::Result<()> {
         "paired Nest test process failed: {status}"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t16_live_ds_worker_to_nest_and_fake_apns() -> anyhow::Result<()> {
+    run_t16_paired(false).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t16_accepted_request_is_canonically_ineligible_before_provider() -> anyhow::Result<()> {
+    run_t16_paired(true).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c06_both_recipient_devices_import_same_welcome_after_account_acceptance(
+) -> anyhow::Result<()> {
+    live_direct_request::accept_before_both_recipient_imports().await
 }

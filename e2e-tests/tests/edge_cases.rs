@@ -48,10 +48,7 @@ async fn test_empty_convo_messages() {
     let mut alice = client.test_user("alice");
     alice.register_device().await.expect("register");
 
-    let convo = alice
-        .create_convo(&[], None)
-        .await
-        .expect("create_convo");
+    let convo = alice.create_convo(&[], None).await.expect("create_convo");
     let convo_id = convo["groupId"].as_str().expect("groupId");
 
     let resp = alice
@@ -142,10 +139,7 @@ async fn test_large_message() {
         .await
         .expect("bob get_messages");
     let messages = resp["messages"].as_array().expect("messages array");
-    assert!(
-        !messages.is_empty(),
-        "bob should receive the large message"
-    );
+    assert!(!messages.is_empty(), "bob should receive the large message");
 }
 
 /// Pagination via sinceSeq: send many messages, then page through them.
@@ -216,10 +210,7 @@ async fn test_cursor_pagination() {
     );
 
     // Verify sequence numbers are monotonically increasing
-    let seqs: Vec<i64> = collected
-        .iter()
-        .filter_map(|m| m["seq"].as_i64())
-        .collect();
+    let seqs: Vec<i64> = collected.iter().filter_map(|m| m["seq"].as_i64()).collect();
     for window in seqs.windows(2) {
         assert!(
             window[0] < window[1],

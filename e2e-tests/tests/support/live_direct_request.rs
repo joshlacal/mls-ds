@@ -21,7 +21,18 @@ pub struct PublishedRequestFixture {
     pub _https: HttpsDidFixture,
 }
 
+#[path = "live_direct_request_siblings.rs"]
+mod siblings;
+pub use siblings::accept_before_both_recipient_imports;
+
 pub async fn publish_request(import_recipient: bool) -> anyhow::Result<PublishedRequestFixture> {
+    Ok(publish_request_variant(import_recipient, false).await?.0)
+}
+
+async fn publish_request_variant(
+    import_recipient: bool,
+    include_sibling: bool,
+) -> anyhow::Result<(PublishedRequestFixture, Option<siblings::RecipientSibling>)> {
     let authority = connect_guarded_request_database(5).await?;
     assert_eq!(
         authority.additive_migrations,
@@ -223,6 +234,12 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
         String::from_utf8_lossy(&keys_response)
     );
 
+    let sibling = if include_sibling {
+        Some(siblings::enroll(&bob, &client, &server.base_url).await?)
+    } else {
+        None
+    };
+
     let request_id = Uuid::new_v4();
     let first_message_id = Uuid::new_v4();
     let conversation_id = Uuid::new_v4();
@@ -279,8 +296,8 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
         .as_array()
         .context("preparation selectedDevices")?;
     anyhow::ensure!(
-        selected.len() == 1,
-        "C01 expected one selected recipient device"
+        selected.len() == 1 + usize::from(include_sibling),
+        "preparation selected an unexpected recipient audience"
     );
     let minimum_import_until = u64::try_from(
         chrono::DateTime::parse_from_rfc3339(
@@ -292,10 +309,20 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
     )?;
     let mut authority_import_until = u64::MAX;
     for device in selected {
+        let selected_public = if device["actorDeviceId"] == bob.device_id.to_string() {
+            bob_public.clone()
+        } else {
+            let sibling = sibling.as_ref().context("unexpected selected sibling")?;
+            anyhow::ensure!(
+                device["actorDeviceId"] == sibling.service.device_id.to_string(),
+                "unknown selected device"
+            );
+            sibling.engine.identity_public_key(&sibling.identity)?
+        };
         let grant = protocol::verify_signed_request(
             DirectRequestKind::Grant,
             &serde_json::to_vec(&device["grant"])?,
-            &bob_public,
+            &selected_public,
         )?;
         let expires_at = u64::try_from(
             chrono::DateTime::parse_from_rfc3339(
@@ -329,8 +356,26 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
         group_id: rand::random::<[u8; 32]>().to_vec(),
         generation: 0,
         state_version: 1,
-        key_packages: vec![bob_package.clone()],
-        expected_package_refs: vec![bob_package_ref.clone()],
+        key_packages: selected
+            .iter()
+            .map(|device| {
+                Ok(STANDARD.decode(
+                    device["keyPackage"]["bytes"]
+                        .as_str()
+                        .context("selected package bytes")?,
+                )?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        expected_package_refs: selected
+            .iter()
+            .map(|device| {
+                Ok(STANDARD.decode(
+                    device["keyPackage"]["keyPackageRef"]
+                        .as_str()
+                        .context("selected package ref")?,
+                )?)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
         authority_import_until,
         preparation_request_digest: *verified_prepare.request_digest(),
         receipt_authority_key: server.receipt_public_key.clone(),
@@ -504,26 +549,29 @@ pub async fn publish_request(import_recipient: bool) -> anyhow::Result<Published
     let snapshot = request_database_snapshot(request_id)?;
     assert_eq!(snapshot.request_rows, 1);
     assert_eq!(snapshot.message_rows, 1);
-    assert_eq!(snapshot.welcome_rows, 1);
+    assert_eq!(snapshot.welcome_rows, 1 + usize::from(include_sibling));
     assert_eq!(snapshot.plaintext_matches, 0);
-    Ok(PublishedRequestFixture {
-        alice,
-        bob,
-        alice_engine: Some(alice_engine),
-        bob_engine,
-        server,
-        client,
-        request_id,
-        conversation_id,
-        first_message_id,
-        welcome_input,
-        publication,
-        receipt,
-        push_event_id: super::encrypted_requests::request_push_event_id(request_id)?,
-        push_registration_request,
-        push_registration_ack,
-        _https: https,
-    })
+    Ok((
+        PublishedRequestFixture {
+            alice,
+            bob,
+            alice_engine: Some(alice_engine),
+            bob_engine,
+            server,
+            client,
+            request_id,
+            conversation_id,
+            first_message_id,
+            welcome_input,
+            publication,
+            receipt,
+            push_event_id: super::encrypted_requests::request_push_event_id(request_id)?,
+            push_registration_request,
+            push_registration_ack,
+            _https: https,
+        },
+        sibling,
+    ))
 }
 
 fn signed_ordinary(engine: &MlsEngine, identity: &str, body: Value) -> anyhow::Result<Value> {
@@ -971,5 +1019,65 @@ pub async fn accept_reply_offline(accept_before_import: bool) -> anyhow::Result<
     );
     assert_eq!(sender.epoch(&group)?, epoch);
     assert_eq!(request_database_snapshot(f.request_id)?.message_rows, 1);
+    Ok(())
+}
+
+/// Accept a retained live fixture without importing a Welcome or dropping its
+/// processes. Used to prove canonical suppression of its original push event.
+pub async fn accept_existing_fixture(f: &PublishedRequestFixture) -> anyhow::Result<()> {
+    let prior = f.welcome_input.bootstrap.coordinates.clone();
+    let before = graph(f.conversation_id)?;
+    let identity = format!("{}#{}", f.bob.did, f.bob.device_id);
+    let public_key = f.bob_engine.identity_public_key(&identity)?;
+    let transition = Uuid::new_v4();
+    let mut next = prior.clone();
+    next["stateVersion"] = json!(prior["stateVersion"].as_u64().context("state version")? + 1);
+    let signed = signed_mls_request(
+        &f.bob_engine,
+        &identity,
+        DirectRequestKind::Accept,
+        json!({
+            "$type":"blue.catbird.chat.defs#directRequestAcceptanceBody",
+            "signatureDomain":"CATBIRD-DIRECT-REQUEST-ACCEPT\0", "protocolVersion":"2",
+            "actorDid":f.bob.did, "actorDeviceId":f.bob.device_id.to_string(),
+            "keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public_key)), "authGeneration":1,
+            "requestId":f.request_id.to_string(), "transitionId":transition.to_string(),
+            "prior":prior, "next":next,
+            "invitationProvenance":{"invitationTransitionId":f.request_id.to_string(),
+                "invitedByDid":f.alice.did,"invitedByDeviceId":f.alice.device_id.to_string()},
+            "idempotencyKey":transition.to_string(),"signedAt":canonical_now()
+        }),
+    )?;
+    let envelope = json!({"directRequest":signed});
+    let bytes = checked_post(f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?;
+    let accepted: Value = serde_json::from_slice(&bytes)?;
+    let proof = protocol::verify_direct_request_acceptance_proof(
+        &serde_json::to_vec(&accepted["acceptanceProof"])?,
+        &f.server.receipt_public_key,
+        &public_key,
+    )?;
+    assert_eq!(
+        proof["receipt"]["body"]["requestId"],
+        f.request_id.to_string()
+    );
+    assert_eq!(proof["receipt"]["body"]["prior"], prior);
+    assert_eq!(proof["receipt"]["body"]["next"], next);
+    assert_eq!(proof["entry"]["signedRequest"], signed);
+    assert_eq!(
+        checked_post(f, &f.bob, "blue.catbird.chat.acceptConversation", &envelope).await?,
+        bytes
+    );
+    let after = graph(f.conversation_id)?;
+    assert_eq!(after["generation"], before["generation"]);
+    assert_eq!(after["epoch"], before["epoch"]);
+    assert_eq!(after["applications"], before["applications"]);
+    assert_eq!(after["introductions"], before["introductions"]);
+    assert_eq!(after["stateVersion"], next["stateVersion"]);
+    assert_eq!(after["generationStateVersion"], next["stateVersion"]);
+    assert_eq!(after["acceptanceClaims"], 1);
+    assert_eq!(
+        after["transitions"].as_u64(),
+        before["transitions"].as_u64().map(|n| n + 1)
+    );
     Ok(())
 }

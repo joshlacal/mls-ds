@@ -49,7 +49,9 @@ async fn admin_manual_reset_with_group_info_does_not_allow_bootstrap() {
     let mut bob = client.test_user("manual-bob");
     for u in [&mut alice, &mut bob] {
         u.register_device().await.expect("register_device");
-        u.publish_key_packages(3).await.expect("publish_key_packages");
+        u.publish_key_packages(3)
+            .await
+            .expect("publish_key_packages");
     }
 
     let convo = alice
@@ -77,8 +79,7 @@ async fn admin_manual_reset_with_group_info_does_not_allow_bootstrap() {
         .await
         .expect("resetGroup call");
     let reset_status = reset_resp.status();
-    let reset_json: serde_json::Value =
-        reset_resp.json().await.expect("resetGroup json");
+    let reset_json: serde_json::Value = reset_resp.json().await.expect("resetGroup json");
     assert_eq!(
         reset_status, 200,
         "admin manual reset must succeed; body={}",
@@ -103,12 +104,14 @@ async fn admin_manual_reset_with_group_info_does_not_allow_bootstrap() {
         "currentEpoch": 1,
     });
     let bob_resp = bob
-        .raw_post_xrpc("blue.catbird.mlsChat.bootstrapResetGroup", &bob_bootstrap_body)
+        .raw_post_xrpc(
+            "blue.catbird.mlsChat.bootstrapResetGroup",
+            &bob_bootstrap_body,
+        )
         .await
         .expect("bootstrapResetGroup call");
     let bob_status = bob_resp.status();
-    let bob_json: serde_json::Value =
-        bob_resp.json().await.expect("bootstrap json");
+    let bob_json: serde_json::Value = bob_resp.json().await.expect("bootstrap json");
     assert_eq!(
         bob_status, 409,
         "bootstrapResetGroup against an already-bootstrapped row must be 409; body={}",
